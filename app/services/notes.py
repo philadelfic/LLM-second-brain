@@ -24,6 +24,7 @@ import sqlite3
 from typing import Any
 
 from app.config import Settings
+from app.services.emit import summary_of
 from app.storage.db import session, transaction
 
 # Фиксированные верхние границы контрактов (REQUIREMENTS §5.1/NFR-6; env —
@@ -115,7 +116,7 @@ class NoteService:
         items = [
             {
                 "id": row["id"],
-                "summary": self._display_summary(row),
+                "summary": summary_of(row, self._settings),
                 "summary_status": row["summary_status"],
                 "author": row["author"],
                 "created_at": row["created_at"],
@@ -185,20 +186,12 @@ class NoteService:
                 f"{self._settings.max_note_chars} символов, получено {len(text)}"
             )
 
-    def _display_summary(self, row: sqlite3.Row) -> str:
-        """Fallback-усечение: при pending (Фаза 2 — всегда) первые
-        MAX_SUMMARY_CHARS символов текста (REQUIREMENTS §5.5)."""
-        if row["summary_status"] == "ok" and row["summary"]:
-            return row["summary"]
-        max_chars = self._settings.max_summary_chars
-        return row["text"][:max_chars]
-
     def _full_note(self, row: sqlite3.Row) -> dict[str, Any]:
         """Формат выдачи memory_get (FR-3): полный текст + метаданные."""
         return {
             "id": row["id"],
             "text": row["text"],
-            "summary": self._display_summary(row),
+            "summary": summary_of(row, self._settings),
             "summary_status": row["summary_status"],
             "author": row["author"],
             "created_at": row["created_at"],
