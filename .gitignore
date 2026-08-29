@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Тесты и кэши
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Конфигурация оператора (содержит секреты)
+.env
+
+# Runtime-данные: SQLite, вектора, снапшоты
+data/
+*.db
+
+# Локальные артефакты
+*.log
