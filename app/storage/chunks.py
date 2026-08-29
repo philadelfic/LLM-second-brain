@@ -174,6 +174,22 @@ def pending_chunks(conn, limit: int) -> list[tuple[int, str]]:
     ]
 
 
+def pending_chunk_rows(conn, limit: int) -> list:
+    """Вычитка партии pending для воркера (шаг 5): id, text, tokens, note_id.
+
+    Расширенный вариант `pending_chunks` (тот же анти-джойн и порядок, ещё
+    две колонки): воркеру нужны note_id — для reuse единичного чанка сверяется
+    с заметкой — и text/tokens — защита записи от гонки с update (ARCH §4.5).
+    Прочим потребителям (скрипты, тесты шага 4) хватает (id, text).
+    """
+    return conn.execute(
+        f"SELECT c.id, c.text, c.tokens, c.note_id FROM {CHUNKS_TABLE} c "
+        f"LEFT JOIN {CHUNKS_VEC_TABLE} v ON v.chunk_id = c.id "
+        "WHERE v.chunk_id IS NULL ORDER BY c.id LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
 def count_pending(conn) -> int:
     """Число чанков без векторов (/health Фазы 7, метрики воркера)."""
     return int(
@@ -195,6 +211,28 @@ def upsert_vector(conn, chunk_id: int, vector: list[float]) -> None:
         f"INSERT INTO {CHUNKS_VEC_TABLE} (chunk_id, embedding) VALUES (?, ?)",
         (chunk_id, pack(vector)),
     )
+
+
+def upsert_vector_if_exists(
+    conn, chunk_id: int, vector: list[float], text: str, tokens: int
+) -> bool:
+    """Записать вектор чанка, только если чанк не менялся с момента вычитки.
+
+    Гонка с memory_update (ARCH §4.5, аналог `AND text = ?` у суммари):
+    между вычиткой очереди и концом кодирования update мог заменить чанки
+    (DELETE+INSERT — id при повторной вставке переиспользуются), и вектор
+    старого текста нельзя писать на новый чанк. Проверка (id, text, tokens);
+    False — чанка уже нет/заменён: вектор не записан (не рождается сирота),
+    актуальные чанки догонятся следующей партией очереди.
+    """
+    conn.execute(f"DELETE FROM {CHUNKS_VEC_TABLE} WHERE chunk_id = ?", (chunk_id,))
+    cursor = conn.execute(
+        f"INSERT INTO {CHUNKS_VEC_TABLE} (chunk_id, embedding) "
+        f"SELECT ?, ? WHERE EXISTS (SELECT 1 FROM {CHUNKS_TABLE} "
+        "WHERE id = ? AND text = ? AND tokens = ?)",
+        (chunk_id, pack(vector), chunk_id, text, tokens),
+    )
+    return cursor.rowcount > 0
 
 
 def get_vector(conn, chunk_id: int) -> list[float] | None:
