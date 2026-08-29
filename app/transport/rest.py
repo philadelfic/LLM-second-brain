@@ -64,15 +64,16 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
         `embedding_ok` — исход последней попытки векторизации (None — попыток
         не было; обновляет EmbeddingService — единая точка всех кодирований);
-        `summarizer_ok` — None до Фазы 4. Счётчики — из БД: активные заметки
-        (trash не обслуживается).
+        `summarizer_ok` — исход последней генерации суммари (None — попыток не
+        было; обновляет SummaryService — все генерации идут из воркера).
+        Счётчики — из БД: активные заметки (trash не обслуживается).
         """
         services = _services(request)
         counts = await asyncio.to_thread(services.notes.health_counts)
         return HealthResponse(
             status="ok",
             embedding_ok=services.embedding.last_attempt_ok,
-            summarizer_ok=None,
+            summarizer_ok=services.summary.last_attempt_ok,
             notes_count=counts["notes_count"],
             pending_vector=counts["pending_vector"],
             pending_summary=counts["pending_summary"],

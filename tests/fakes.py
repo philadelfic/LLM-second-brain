@@ -16,6 +16,8 @@ HashEmbedder подменяет EmbeddingService там, где внешняя �
 Суммаризаторы (Фаза 4, режим «Б») подменяют SummaryService в воркере:
 FixedSummarizer — детерминированный успешный ответ (с логом вызовов);
 FailingSummarizer — всегда отказ (деградация: back-off, pending остаётся).
+Оба ведут `last_attempt_ok` — как настоящий SummaryService: e2e-тесты
+с DI-сборкой проверяют и `/health.summarizer_ok` (NFR-4).
 """
 
 from __future__ import annotations
@@ -105,9 +107,11 @@ class FixedSummarizer:
     def __init__(self, summary: str = "Фикс-суммари одной строкой.") -> None:
         self.summary = summary
         self.calls: list[str] = []
+        self.last_attempt_ok: bool | None = None  # для /health.summarizer_ok
 
     def summarize(self, text: str) -> str:
         self.calls.append(text)
+        self.last_attempt_ok = True
         return self.summary
 
     def close(self) -> None:  # интерфейс-совместимость с SummaryService
@@ -124,9 +128,11 @@ class FailingSummarizer:
     def __init__(self, message: str = "суммаризация недоступна") -> None:
         self.message = message
         self.calls: list[str] = []
+        self.last_attempt_ok: bool | None = None  # для /health.summarizer_ok
 
     def summarize(self, text: str) -> str:
         self.calls.append(text)
+        self.last_attempt_ok = False
         raise SummaryError(self.message)
 
     def close(self) -> None:  # интерфейс-совместимость с SummaryService

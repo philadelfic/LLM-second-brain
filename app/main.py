@@ -4,8 +4,10 @@
 Bearer-миддлварь на всё, кроме `/health` (NFR-2). Фаза 2: при старте
 инициализируется хранилище (SQLite, ARCH §3.3); MCP и REST работают
 над общим service-слоем (ARCH §1) через `app.state.services`.
-Фаза 3: в lifespan поднимается фоновый воркер до-векторизации (ARCH §3.4) —
-очередь pending живёт в БД и переживает рестарт; при останове — graceful отмена.
+Фаза 3–4: в lifespan поднимается фоновый воркер (ARCH §3.4) — две
+независимые очереди pending_vector (до-векторизация) и pending_summary
+(до-суммаризация, режим «Б» — единственный путь генерации summary);
+очереди живут в БД и переживают рестарт; при останове — graceful отмена.
 
 Запуск: `python -m app` (uvicorn) — порт и уровень логов из окружения.
 """
@@ -44,7 +46,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     services = build_services(settings)  # один Settings-снимок на процесс
     mcp = build_mcp(settings, services)
-    worker = BackgroundWorker(settings, services.embedding)  # §3.4, Фаза 3
+    # §3.4: две очереди — векторы (Фаза 3) и summary (Фаза 4, режим «Б»);
+    # суммаризатор из DI — тот же экземпляр, что в /health.summarizer_ok.
+    worker = BackgroundWorker(settings, services.embedding, services.summary)
     # Внутренний маршрут MCP-сервера — ровно MCP_PATH. host="0.0.0.0" — не
     # localhost, поэтому SDK не включает DNS-rebinding protection (сервис
     # живёт в LAN за Bearer-токеном; Open WebUI ходит с не-localhost Host).
@@ -64,9 +68,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise SystemExit(2) from exc
         # Жизненный цикл MCP-сессий Streamable HTTP = жизни процесса.
         async with mcp.session_manager.run():
-            # Фоновый воркер: очередь pending живёт в БД — после рестарта
-            # дорезюмируется сама (ARCH §3.4); при останове — отмена таски.
-            worker_task = asyncio.create_task(worker.run(), name="vector-backlog")
+            # Фоновый воркер: очереди pending живут в БД — после рестарта
+            # дорезюмируются/довекторизуются сами (ARCH §3.4); при останове —
+            # отмена таски.
+            worker_task = asyncio.create_task(worker.run(), name="pending-backlog")
             try:
                 yield
             finally:
