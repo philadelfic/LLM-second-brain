@@ -16,12 +16,14 @@ InvalidSignature (см. журнал Фазы 1, подтверждено ещё
 """
 
 import asyncio
+import time
 from typing import Annotated, Any
 
 from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
 from app.config import Settings
+from app.observability import log_tool_call, preview
 from app.services import Services
 
 SERVER_NAME = "LLM Second Brain"
@@ -103,7 +105,18 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             Field(description="Число результатов", ge=1, le=20),
         ] = settings.default_top_k,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(services.search.search, query, top_k)
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.search.search, query, top_k)
+        # NFR-4: вызов инструмента с латентностью и числом результатов;
+        # текст запроса — превью (первые 80 симв.); заметки не логируются.
+        log_tool_call(
+            "memory_search",
+            started,
+            results=len(result["results"]),
+            top_k=top_k,
+            query=preview(query),
+        )
+        return result
 
     @mcp.tool(name="memory_list", description=TOOL_DESCRIPTIONS["memory_list"])
     async def memory_list(
@@ -116,7 +129,12 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             Field(description="Смещение страницы", ge=0),
         ] = 0,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(services.notes.list, limit, offset)
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.notes.list, limit, offset)
+        log_tool_call(
+            "memory_list", started, results=len(result["items"]), limit=limit, offset=offset
+        )
+        return result
 
     @mcp.tool(name="memory_get", description=TOOL_DESCRIPTIONS["memory_get"])
     async def memory_get(
@@ -138,7 +156,12 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             if id is None:
                 raise ValueError("передай ids (список) или одиночный id")
             ids = [id]
-        return await asyncio.to_thread(services.notes.get, ids)
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.notes.get, ids)
+        log_tool_call(
+            "memory_get", started, requested=len(ids), results=len(result["notes"])
+        )
+        return result
 
     @mcp.tool(name="memory_save", description=TOOL_DESCRIPTIONS["memory_save"])
     async def memory_save(
@@ -151,7 +174,17 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             ),
         ],
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(services.notes.save, text)
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.notes.save, text)
+        # Приватность (NFR-4): сам текст не пишется — только длина и флаги.
+        log_tool_call(
+            "memory_save",
+            started,
+            results=1 if result.get("stored") else 0,
+            duplicated=bool(result.get("duplicated")),
+            note_chars=len(text),
+        )
+        return result
 
     @mcp.tool(name="memory_update", description=TOOL_DESCRIPTIONS["memory_update"])
     async def memory_update(
@@ -165,12 +198,25 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             ),
         ],
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(services.notes.update, id, text)
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.notes.update, id, text)
+        log_tool_call(
+            # Приватность (NFR-4): текст не пишется — только длина.
+            "memory_update",
+            started,
+            id=id,
+            updated=bool(result.get("updated")),
+            note_chars=len(text),
+        )
+        return result
 
     @mcp.tool(name="memory_delete", description=TOOL_DESCRIPTIONS["memory_delete"])
     async def memory_delete(
         id: Annotated[int, Field(description="Id заметки")],
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(services.notes.delete, id)
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.notes.delete, id)
+        log_tool_call("memory_delete", started, id=id, deleted=bool(result.get("deleted")))
+        return result
 
     return mcp

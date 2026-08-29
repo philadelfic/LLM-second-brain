@@ -15,6 +15,7 @@ Bearer-миддлварь на всё, кроме `/health` (NFR-2). Фаза 2:
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -23,6 +24,7 @@ from fastapi import FastAPI
 
 from app import __version__
 from app.config import ConfigError, Settings, get_settings
+from app.observability import setup_logging
 from app.services import build_services
 from app.services.worker import BackgroundWorker
 from app.storage.db import StorageError, init_db
@@ -45,6 +47,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise SystemExit(2) from exc
 
     services = build_services(settings)  # один Settings-снимок на процесс
+    # JSON-логи stdout (NFR-4): включаются при сборке приложения (импорт
+    # app.main / тесты / uvicorn — один и тот же идемпотентный setup).
+    setup_logging(settings.log_level)
     mcp = build_mcp(settings, services)
     # §3.4: две очереди — векторы (Фаза 3) и summary (Фаза 4, режим «Б»);
     # суммаризатор из DI — тот же экземпляр, что в /health.summarizer_ok.
@@ -66,6 +71,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except StorageError as exc:
             print(f"FATAL: {exc}", file=sys.stderr)
             raise SystemExit(2) from exc
+        logging.getLogger("app").info(
+            "service started",
+            extra={
+                "event": "startup",
+                "version": __version__,
+                "port": settings.port,
+                "mcp_path": settings.mcp_path,
+                "db_path": settings.db_path,
+            },
+        )
         # Жизненный цикл MCP-сессий Streamable HTTP = жизни процесса.
         async with mcp.session_manager.run():
             # Фоновый воркер: очереди pending живут в БД — после рестарта
