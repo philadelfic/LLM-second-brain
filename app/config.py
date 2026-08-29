@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     embedding_model: str = "qwen3-embedding:8b"
     embedding_dim: int = 4096  # фиксируется при создании БД (vec0-таблица)
 
+    # --- чанковая индексация (Фаза 7): вектора — по чанкам заметки ---
+    text_splitter: str = "tiktoken"  # токен-сплиттер; encoding фикс: cl100k_base
+    chunk_size: int = 1024  # окно чанка, токенов
+    chunk_overlap: int = 180  # перекрытие соседних окон, токенов
+    chunk_min_target: int = 200  # хвостовой чанк короче — слить с предыдущим
+    embedding_batch_size: int = 32  # чанков в одном /api/embed запросе воркера
+    embedding_concurrent_requests: int = 3  # параллельных embed-запросов воркера
+
     # --- суммаризация ---
     max_summary_chars: int = 200
     summary_think: bool = True  # при false в вызов идёт "think": false
@@ -162,6 +170,17 @@ class Settings(BaseSettings):
         need_low("embedding_dim", self.embedding_dim, 1)
         need_low("summary_num_predict", self.summary_num_predict, 1)
         need_low("summary_timeout_sec", self.summary_timeout_sec, 1)
+
+        # --- чанковая индексация (Фаза 7) ---
+        if self.text_splitter.strip().lower() != "tiktoken":
+            errors.append("  - text_splitter: поддерживается только «tiktoken»")
+        need_range("chunk_size", self.chunk_size, 64, 16384)
+        # перекрытие < окна (иначе окна не сдвигаются / нет прогресса);
+        # верхняя граница вычисляется от chunk_size — реляционные проверки.
+        need_range("chunk_overlap", self.chunk_overlap, 0, self.chunk_size - 1)
+        need_range("chunk_min_target", self.chunk_min_target, 1, self.chunk_size)
+        need_low("embedding_batch_size", self.embedding_batch_size, 1)
+        need_low("embedding_concurrent_requests", self.embedding_concurrent_requests, 1)
 
         # --- фоновые операции (0 допускается: у юнит-тестов — режим без пауз) ---
         need_low("pending_retry_sec", self.pending_retry_sec, 0)

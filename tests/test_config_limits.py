@@ -134,6 +134,63 @@ class TestStringValidation:
             load_env(monkeypatch, AUTHOR_DEFAULT="")
 
 
+class TestChunkingParams:
+    """Чанковая индексация (Фаза 7): дефолты brief §4 и реляционные границы."""
+
+    def test_brief_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        settings = load_env(monkeypatch)
+        assert settings.text_splitter == "tiktoken"
+        assert settings.chunk_size == 1024
+        assert settings.chunk_overlap == 180
+        assert settings.chunk_min_target == 200
+        assert settings.embedding_batch_size == 32
+        assert settings.embedding_concurrent_requests == 3
+
+    def test_unknown_splitter_is_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with pytest.raises(ConfigError, match="text_splitter"):
+            load_env(monkeypatch, TEXT_SPLITTER="markdown")
+
+    def test_chunk_overlap_must_stay_below_chunk_size(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with pytest.raises(ConfigError, match="chunk_overlap"):
+            load_env(monkeypatch, CHUNK_OVERLAP="1024", CHUNK_SIZE="1024")
+        assert load_env(monkeypatch, CHUNK_OVERLAP="0").chunk_overlap == 0
+
+    def test_chunk_min_target_vs_chunk_size(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with pytest.raises(ConfigError, match="chunk_min_target"):
+            load_env(monkeypatch, CHUNK_MIN_TARGET="1025", CHUNK_SIZE="1024")
+        assert load_env(
+            monkeypatch, CHUNK_MIN_TARGET="1024", CHUNK_SIZE="1024"
+        ).chunk_min_target == 1024
+
+    @pytest.mark.parametrize(
+        ("env_name", "bad_value"),
+        [("CHUNK_SIZE", "63"), ("CHUNK_SIZE", "16385"), ("EMBEDDING_BATCH_SIZE", "0"),
+         ("EMBEDDING_CONCURRENT_REQUESTS", "0")],
+    )
+    def test_chunk_worker_bounds_are_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, env_name: str, bad_value: str
+    ) -> None:
+        with pytest.raises(ConfigError, match=env_name.lower()):
+            load_env(monkeypatch, **{env_name: bad_value})
+
+    def test_worker_param_bounds_are_valid(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings = load_env(
+            monkeypatch,
+            CHUNK_SIZE="64",
+            CHUNK_OVERLAP="10",
+            CHUNK_MIN_TARGET="50",
+            EMBEDDING_BATCH_SIZE="1",
+            EMBEDDING_CONCURRENT_REQUESTS="1",
+        )
+        assert settings.chunk_size == 64
+        assert settings.embedding_batch_size == 1
+        assert settings.embedding_concurrent_requests == 1
+
+
 class TestBoundaryAcceptance:
     """Штатные переопределения проходят (0 для PENDING_RETRY_SEC — тестовый режим)."""
 
