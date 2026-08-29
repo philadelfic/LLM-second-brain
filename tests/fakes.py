@@ -12,6 +12,10 @@ HashEmbedder подменяет EmbeddingService там, где внешняя �
 
 Качество «настоящих» перефразов — зона интеграционных тестов с живой Ollama
 (шаг 3.6); фейк даёт грубое сходство по совпадающим подстрокам.
+
+Суммаризаторы (Фаза 4, режим «Б») подменяют SummaryService в воркере:
+FixedSummarizer — детерминированный успешный ответ (с логом вызовов);
+FailingSummarizer — всегда отказ (деградация: back-off, pending остаётся).
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import hashlib
 import math
 
 from app.services.embedding import EmbeddingError
+from app.services.summary import SummaryError
 
 
 class HashEmbedder:
@@ -86,4 +91,43 @@ class FailingEmbedder:
         return [self.embed(text) for text in texts]
 
     def close(self) -> None:  # интерфейс-совместимость с EmbeddingService
+        return None
+
+
+class FixedSummarizer:
+    """Фейк-суммаризатор: фиксированный ответ, помнит факты вызовов.
+
+    Интерфейс Summarizer (`summarize`/`close`); детерминирован — всегда тот
+    же ответ. `calls` — список запрошенных текстов (в порядке вызовов):
+    тесты проверяют, что воркер гоняет именно pending тексты.
+    """
+
+    def __init__(self, summary: str = "Фикс-суммари одной строкой.") -> None:
+        self.summary = summary
+        self.calls: list[str] = []
+
+    def summarize(self, text: str) -> str:
+        self.calls.append(text)
+        return self.summary
+
+    def close(self) -> None:  # интерфейс-совместимость с SummaryService
+        return None
+
+
+class FailingSummarizer:
+    """Фейк-отказ: суммаризация всегда недоступна (деградация §5.5).
+
+    Статусы заметок остаются pending — воркер ждёт back-off; вызовы
+    логируются (`calls`), чтобы тест проверил и попытки, и безрезультатность.
+    """
+
+    def __init__(self, message: str = "суммаризация недоступна") -> None:
+        self.message = message
+        self.calls: list[str] = []
+
+    def summarize(self, text: str) -> str:
+        self.calls.append(text)
+        raise SummaryError(self.message)
+
+    def close(self) -> None:  # интерфейс-совместимость с SummaryService
         return None
