@@ -45,11 +45,12 @@ Self-hosted MCP-сервер «второго мозга» для LLM, крут�
 
 ```bash
 git clone <repo> llm-second-brain && cd llm-second-brain
-cp .env.example .env
-# Обязательное в .env:
+# Вся конфигурация — в docker-compose.yml (без .env).
+# Обязательное там же:
 #   OLLAMA_BASE_URL, SUMMARY_OLLAMA_BASE_URL, SUMMARY_MODEL,
 #   MCP_AUTH_TOKEN  (сгенерируй: openssl rand -hex 32)
-# Необязательные — оставить умолчания (см. .env.example / REQUIREMENTS §8).
+# Дефолты всех прочих переменных — канонические из REQUIREMENTS §8, видно
+# рядом с каждой; фактические значения переопределяются там же, в compose.
 mkdir -p data          # каталог volume: notes.db + backups (uid/gid 1000)
 docker compose up -d --build
 curl -s http://localhost:8080/health | python -m json.tool
@@ -79,7 +80,7 @@ Streamable HTTP нативно.
    - **URL**: `http://<хост-сервиса>:8080/mcp` — путь `MCP_PATH`, по
      умолчанию `/mcp`. Если Open WebUI в другом контейнере того же
      docker-хоста → `http://<ip-хоста>:8080/mcp` (или имя сети compose);
-   - **Auth**: `Bearer`; **token** — значение `MCP_AUTH_TOKEN` из `.env`.
+   - **Auth**: `Bearer`; **token** — значение `MCP_AUTH_TOKEN` из `docker-compose.yml`.
 3. Сохрани. В списке появятся 6 инструментов `memory_*` — они доступны всем
    моделям, достаточно включить у модели «вызов инструментов».
 4. Проверка в чате: «найди в памяти …» → модель вызывает `memory_search`.
@@ -97,10 +98,11 @@ curl -s http://localhost:8080/mcp \
 
 ## Конфигурация
 
-Источник истины — таблица REQUIREMENTS §8 (все 28 переменных):
-обязательные — `OLLAMA_BASE_URL`, `SUMMARY_OLLAMA_BASE_URL`,
-`SUMMARY_MODEL`, `MCP_AUTH_TOKEN` (пустой токен — фатальная ошибка старта);
-остальные имеют умолчания и переопределяются env. Ключевые:
+Вся конфигурация — в `docker-compose.yml`, блок `environment` (все 28
+переменных §8 с дефолтами; фактические значения правятся там же, `.env` нет).
+Обязательные — `OLLAMA_BASE_URL`, `SUMMARY_OLLAMA_BASE_URL`,
+`SUMMARY_MODEL`, `MCP_AUTH_TOKEN` (пустой токен — фатальная ошибка старта).
+Канонические дефолты снять из REQUIREMENTS §8, ключевые:
 
 | Переменная | Умолчание | Смысл |
 |---|---|---|
@@ -108,7 +110,7 @@ curl -s http://localhost:8080/mcp \
 | `OLLAMA_BASE_URL` | — (обязателен) | Ollama векторизации (`/api/embed`) |
 | `SUMMARY_OLLAMA_BASE_URL` | — (обязателен) | Ollama суммаризации (`/api/chat`) |
 | `SUMMARY_MODEL` | — (обязателен) | модель суммаризации, напр. `ornith-1.5:35b` |
-| `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `qwen3-embedding:8b` / `4096` | embedding; размерность фиксируется при создании БД (смена — скрипт переиндексации) |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `qwen3-embedding:8b` / `4096` | embedding; смена модели/размерности — автоматическая реиндексация при старте (все заметки уходят в pending, воркер пере-кодирует) |
 | `PORT` / `MCP_PATH` | `8080` / `/mcp` | HTTP и путь MCP |
 | `DB_PATH` | `/data/notes.db` | файл SQLite (WAL) |
 | `BACKUP_DIR` / `BACKUP_INTERVAL_SEC` / `BACKUP_KEEP` | `/data/backups` / `86400` / `7` | снапшоты: каталог, интервал, ротация |
