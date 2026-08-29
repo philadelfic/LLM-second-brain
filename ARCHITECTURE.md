@@ -11,6 +11,10 @@
   0.3 → 0.4 — фокус «легче моделям»: FTS5 `trigram`; `snippet` +
   `summary_status` в выдачах; дедуп-фоллбек по FTS.
   0.4 → 0.5 — batch `memory_get` (список `ids`).
+  2026-08-30, правки содержания без подъёма версии — Фаза 7: вектора по
+  чанкам (notes_chunks / notes_chunks_vec), третья петля воркера, поиск
+  по лучшему чанку, автореиндексация чанк-параметров (§3.2–§3.4, §4.1,
+  §4.2, §7).
 
 ---
 
@@ -66,7 +70,7 @@ services:
     build: .
     restart: unless-stopped
     ports: ["8080:8080"]
-    env_file: .env
+    environment:            # вся конфигурация §8 — литерально (без .env)
     volumes: ["./data:/data"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
@@ -92,10 +96,19 @@ services:
 ### 3.2 Services
 
 - **NoteService** — CRUD + валидации, выставление/снятие
-  `vector_status`/`summary_status`; delete — soft (ставит `deleted_at`).
-- **SearchService** — гибрид (вектор по полному тексту + FTS) → RRF.
+  `vector_status`/`summary_status`; delete — soft (ставит `deleted_at`,
+  чанки сохраняются). В save/update текст раскладывается на чанки
+  (Splitter) до транзакции и пишется той же транзакцией; единственный
+  чанк ≤ CHUNK_SIZE переиспользует полный вектор (кодировщик — один вызов).
+- **Splitter** (`services/splitter.py`) — токен-сплиттер (tiktoken,
+  `cl100k_base`): окна `CHUNK_SIZE`, перекрытие `CHUNK_OVERLAP`, хвостовые
+  чанки < `CHUNK_MIN_TARGET` сливаются с предыдущим.
+- **SearchService** — гибрид: вектора по чанкам (KNN топ-50 → агрегация
+  до заметок: лучший чанк задаёт cosine и snippet; fallback на полный
+  вектор `notes_vec` для заметок без готовых чанк-векторов) + FTS → RRF.
 - **EmbeddingService** — клиент к Ollama векторизации (192.168.3.113):
-  `/api/embed`, batch, таймауты, один ретрай в синхронном пути.
+  `/api/embed`, batch, таймауты (connect 2 с, read 720 с — CPU-инференс
+  длинных текстов, решение 2026-08-30), один ретрай в синхронном пути.
 - **SummaryService** — клиент к Ollama суммаризации (192.168.3.112,
   `ornith-1.5:35b`, Qwen3.5-MoE 35.5B Q4_K_M): генерация `summary` ≤
   `MAX_SUMMARY_CHARS` (промпт и параметры — §4.7). Вызывается **только из
@@ -103,9 +116,11 @@ services:
   fallback «усечение текста», метка `summary_status=pending`.
 - **DedupService** — топ-1 косинусная близость полного текста, решение
   по `DEDUP_SIMILARITY`.
-- **BackgroundWorker** — единственный asyncio-воркер: до-векторизация
-  (`vector_status=pending`) и до-суммаризация (`summary_status=pending`),
-  раздельные back-off-очереди.
+- **BackgroundWorker** — единственный asyncio-воркер, три независимые
+  петли: до-векторизация заметок (`vector_status=pending`),
+  до-суммаризация (`summary_status=pending`) и до-векторизация чанков
+  (анти-джойн `notes_chunks`/`notes_chunks_vec`); раздельные back-off
+  очереди (§3.4).
 - **BackupService** — периодический снапшот БД через SQLite `backup` API
   (онлайн, без остановки) в `BACKUP_DIR`, ротация по `BACKUP_KEEP`.
 
@@ -117,7 +132,7 @@ services:
 ```sql
 CREATE TABLE notes (
   id             INTEGER PRIMARY KEY,
-  text           TEXT    NOT NULL CHECK(length(text) BETWEEN 1 AND 2000),
+  text           TEXT    NOT NULL CHECK(length(text) BETWEEN 1 AND :max_note_chars),
   summary        TEXT    NOT NULL DEFAULT '',     -- '' пока не сгенерировано
   author         TEXT    NOT NULL DEFAULT 'unknown',
   vector_status  TEXT    NOT NULL DEFAULT 'pending', -- ok | pending
@@ -137,27 +152,63 @@ CREATE VIRTUAL TABLE notes_vec USING vec0(
   note_id    INTEGER PRIMARY KEY,
   embedding  float[4096]      -- размерность фиксируется при создании БД
 );
+
+CREATE TABLE notes_chunks (
+  id      INTEGER PRIMARY KEY,
+  note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+  idx     INTEGER NOT NULL,   -- порядок чанка в заметке
+  text    TEXT    NOT NULL,
+  tokens  INTEGER NOT NULL,
+  UNIQUE(note_id, idx)
+);
+
+CREATE VIRTUAL TABLE notes_chunks_vec USING vec0(
+  chunk_id   INTEGER PRIMARY KEY,
+  embedding  float[4096] distance_metric=cosine
+);
 ```
 
+- вектора чанков живут в `notes_chunks_vec`; «pending» для чанка —
+  отсутствие строки там (анти-джойн, статус-колонки нет): дроп индекса
+  делает все чанки pending, воркер кодирует заново;
 - `vector_status=pending` → заметка участвует только в FTS-поиске, пока
   воркер не запишет вектор.
 - `summary_status=pending` → в выдачах используется fallback (усечение
   текста), воркер догенерирует `summary`.
 - `summary` не векторизуется и не индексируется FTS.
-- Смена `EMBEDDING_DIM`: при старте сверка размерности vec0-таблицы с env;
-  несовпадение → отказ запуска + скрипт `scripts/reindex.py`.
+- Автореиндексация при старте (таблица `meta`, механика b972386): env
+  сверяется с meta (`embedding_model`, `embedding_dim`, `chunk_size`,
+  `chunk_overlap`, `chunk_min_target`). Смена модели/размерности → дропаются
+  оба векторных индекса, все заметки (включая trash) — pending. Смена
+  чанковых параметров → дропается только `notes_chunks_vec` (полные
+  вектора и статусы не трогаются). В обоих случаях — полная пере-чанковка
+  всех заметок сплиттером (легаси получают чанки впервые, reuse
+  одиночного чанка срабатывает сразу при пере-чанковке); pending догоняет
+  воркер. Ручной `scripts/reindex.py` остаётся (идемпотентен с meta).
 - SQLite в WAL-режиме с `busy_timeout`; записи сериализуются (один писатель) —
   обработчики запросов и фоновый воркер не конфликтуют за файл БД.
 
 ### 3.4 Фоновый воркер
 
-- Один asyncio-воркер, две независимые очереди: `pending_vector` и
-  `pending_summary`.
+- Один asyncio-воркер, **три** независимые очереди: pending-вектора
+  заметок, pending-суммари, pending-чанки (`notes_chunks` без строки в
+  `notes_chunks_vec`).
 - Для `pending_summary` воркер — **основной** путь генерации (режим «Б»):
   запись в очередь ставит `NoteService` сразу после INSERT/UPDATE (вместе
   со статусом), плюс догоняются статусы при старте сервиса; при отказе
   суммаризатора — повтор.
-- back-off: 30s → ×2 → max 15 мин, независимо по каждой очереди.
+- Чанковая петля (Фаза 7): вычитывающая партия `EMBEDDING_BATCH_SIZE` ×
+  `EMBEDDING_CONCURRENT_REQUESTS` чанков (32 × 3), резка на подъёмки по
+  `EMBEDDING_BATCH_SIZE`, кодирование параллельно под `Semaphore` +
+  `asyncio.to_thread` (HTTP-вызовы не занимают event loop). Отказ
+  подъёмки не портит остальных: вектора успешных записываются короткими
+  транзакциями, отказавшие чанки остаются pending (NFR-3), полный отказ —
+  0 + back-off. Reuse: одиночный чанк ≤ `CHUNK_SIZE` копирует вектор
+  полного текста из `notes_vec` без кодирования. Гонка с `memory_update`:
+  вектор пишется только при неизменных с вычитки (id, text, tokens) —
+  `upsert_vector_if_exists` (SQLite переиспользует rowid после
+  DELETE+INSERT).
+- back-off: 30s → ×2 → max 15 мин, независимо по каждой из трёх очередей.
 
 ## 4. Потоки
 
@@ -180,6 +231,11 @@ CREATE VIRTUAL TABLE notes_vec USING vec0(
               → {id, stored: true, summary_pending: true,
                  warning: "векторизация отложена, дедуп только по тексту
                  (перефразы не ловятся)"}
+  чанкование (Фаза 7, до транзакции записи): текст раскладывается
+      сплиттером; один чанк ≤ CHUNK_SIZE → вектор чанка = готовый полный
+      (reuse, кодировщик — один вызов), иначе чанки pending и их вектора
+      строит воркер (§3.4); отказ векторизации полного текста — чанки
+      тоже pending
   суммаризация в синхронном пути НЕ выполняется (режим «Б»):
       воркер сгенерирует summary; в выдачах до готовности —
       fallback-усечение текста
@@ -193,16 +249,23 @@ CREATE VIRTUAL TABLE notes_vec USING vec0(
 ```
 кодирование запроса (sync)
       успех:
-        vec0: топ-50 по косинусу (по полным текстам, только активные)
+        vec0 чанков: топ-50 по notes_chunks_vec
+            (только чанки активных заметок)
+        агрегация до заметок: лучший чанк задаёт cosine и snippet;
+            заметки без готовых чанк-векторов (легаси/pending) —
+            fallback по вектору полного текста notes_vec (reuse-заметки
+            не дублируются)
         FTS5: топ-50 по BM25 (только активные)
         RRF: score(d) = Σ_sources 1 / (RRF_K + rank_source(d))
-        отсечение: кандидатам с векторным hit — cosine ≥ SCORE_THRESHOLD
+        отсечение: кандидатам с векторным hit — cosine ЛУЧШЕГО чанка
+                   ≥ SCORE_THRESHOLD
         → топ top_k по rrf_score
       отказ Ollama → FTS-only, warning="поиск без семантики"
 сборка выдачи: {id, summary, snippet, summary_status, rrf_score,
                 cosine|null, created_at, updated_at, author}
   - summary_status=pending → summary = fallback-усечение text
-  - snippet = первые SNIPPET_CHARS символов text (всегда)
+  - snippet = первые SNIPPET_CHARS символов лучшего чанка
+    (fallback-хит — от начала полного текста)
   - пусто → hint «переформулируй шире»
   - полный текст заметки НЕ возвращается (memory_get адресно)
 ```
@@ -232,6 +295,8 @@ updated_at, author}` — без текстов, плюс `total` (число а�
 да → UPDATE text, updated_at (транзакционно); summary='' и
      summary_status=pending (старое суммари невалидно) + очередь воркера
   → ре-векторизация (sync; отказ → vector_status=pending + воркер)
+  → пере-чанковка текста: старые чанки и их вектора заменяются,
+     новые pending (guard воркера не пишет вектор на заменённый чанк)
   → {id, updated: true, summary_pending: true}
 ```
 
@@ -365,7 +430,11 @@ fallback-усечение + `summary_status=pending` + повтор воркер
   векторизации (192.168.3.113, `qwen3-embedding:8b`) и живая Ollama
   суммаризации (192.168.3.112, `ornith-1.5:35b`): качество поиска на
   русскоязычных перефразах, реальная длина summary, латентность фоновой
-  генерации суммари и поведение таймаута. Скип при недоступности серверов.
+  генерации суммари и поведение таймаута; Фаза 7 — чанк-индексация:
+  заметка ~15k символов → pending-чанки → воркер довекторизует живой
+  моделью → поиск по фрагменту из середины находит заметку по лучшему
+  чанку (ретро-замер против вектора полного текста — поведение Фазы 3).
+  Скип при недоступности серверов.
 - **MCP-поверхность**: handshake (в т.ч. поле `instructions`), `tools/list`
   → все 6, вызовы mcp-клиентом, негативы токена (нет/неверный → 401).
 - **Отказы внешних серверов**: падение embedding → pending + деградация

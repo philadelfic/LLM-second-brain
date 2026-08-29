@@ -12,6 +12,8 @@ qwen3-embedding:8b, dim 4096); суммаризатор — из `LIVE_SUMMARY_U
 
 from __future__ import annotations
 
+import asyncio
+import httpx
 import os
 import socket
 import time
@@ -19,15 +21,15 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import pytest
-from fakes import FailingEmbedder
+from fakes import FailingEmbedder, cosine
 
 from app.config import Settings
-from app.services.embedding import EmbeddingService
+from app.services.embedding import EmbeddingError, EmbeddingService
 from app.services.notes import NoteService
 from app.services.search import SearchService
 from app.services.summary import SummaryError, SummaryService
 from app.services.worker import BackgroundWorker
-from app.storage import vectors
+from app.storage import chunks, vectors
 from app.storage.db import init_db, session
 
 # Дефолт из REQUIREMENTS §4 (операторский адрес); перебить env при другом.
@@ -310,3 +312,194 @@ def test_live_worker_backfills_summary_mode_b(live_summary, tmp_path_factory) ->
     print(f"[live-summary] суммари воркера: {row['summary']}")
     embedding.close()
     summary.close()
+
+
+# --- Фаза 7: чанк-индексация длинной заметки (живая Ollama) -------------------
+
+CHUNKS_FACT = (
+    "Контрольный факт Фазы 7: счётчик подшипника конвейера B-12 заменён "
+    "17 марта 2027 по наряду 84031, исполнитель Пётр Хомяков, склад №4."
+)
+CHUNKS_QUERY = "наряд 84031 счётчик конвейера B-12"
+
+
+def _chunks_note_text() -> str:
+    """Заметка ~15k символов: контрольный факт — точно в середине текста
+    (не в первом и не в последнем чанке)."""
+    para = (
+        "Логбук эксплуатации: резервные копии БД сходятся по расписанию, "
+        "проверка дисковой подсистемы пройдена без замечаний. "
+        "Мониторинг отдаёт штатные значения, отчёты выгружены в архив. "
+        "Запланированные окна обслуживания не пересекаются с дежурством. "
+    )
+    half = para * 30
+    text = half + CHUNKS_FACT + half
+    assert 14000 <= len(text) <= 20000
+    return text
+
+
+@pytest.fixture(scope="session")
+def live_chunks(tmp_path_factory) -> SimpleNamespace:
+    """Живой векторизатор + дефолты §8, MAX_NOTE_CHARS=20000.
+
+    Отдельная БД (tmp) — живые заметки фаз 3–4 не мешают ранжированию
+    контрольного факта. Ollama недоступна — SKIP (skip расставит fixture).
+
+    Прогрев обязателен: 8B-модель на CPU 113 грузится минуты; с
+    read-таймаутом 720 с (решение О. 2026-08-30) дефолты §8 (32×3)
+    влезают, подъёмки идут по канону как в проде.
+    """
+    url = os.environ.get("LIVE_OLLAMA_URL", LIVE_URL_DEFAULT)
+    if not _reachable(url):
+        pytest.skip(f"живая Ollama недоступна: {url}")
+    settings = Settings(
+        ollama_base_url=url,
+        summary_ollama_base_url=url,
+        summary_model="unused-in-phase-7",
+        mcp_auth_token="live-chunk-token",
+        db_path=str(tmp_path_factory.mktemp("live-chunks") / "notes.db"),
+        embedding_dim=DIM,
+        max_note_chars=20000,
+    )
+    init_db(settings)
+    embedding = EmbeddingService(settings)
+    for attempt in range(1, 3):  # модель 8B на CPU 113 грузится минуты
+        try:
+            embedding.embed("прогрев живого эмбеддинга перед чанковым тестом")
+            break
+        except EmbeddingError:
+            print(f"\n[live-chunks] прогрев {attempt}: модель ещё не готова")
+            time.sleep(5)
+    return SimpleNamespace(
+        settings=settings,
+        embedding=embedding,
+        notes=NoteService(settings, embedding),
+        search=SearchService(settings, embedding),
+    )
+
+
+def _embed_full_slow(settings: Settings, text: str) -> list[float]:
+    """Живой embed ПОЛНОГО текста с расширенным read-таймаутом.
+
+    Ретро-справка для сравнения с Фазой 3: EmbeddingService держит
+    read-таймаут 20 c, а 3.7k токенов одним запросом на стенде 113
+    кодируются минуты — полный вектор в notes_vec может остаться pending.
+    Для замера это не важно: тот же текст → тот же вектор (модель
+    детерминирована), есть httpx-вызов напрямую, ollama /api/embed.
+    """
+    response = httpx.post(
+        str(settings.ollama_base_url).rstrip("/") + "/api/embed",
+        json={"model": settings.embedding_model, "input": text},
+        timeout=httpx.Timeout(2.0, read=300.0),
+    )
+    response.raise_for_status()
+    embeddings = response.json()["embeddings"]
+    assert len(embeddings) == 1 and len(embeddings[0]) == DIM
+    return embeddings[0]
+
+
+def test_long_note_chunk_relevance(live_chunks) -> None:
+    """Бриф §7: релевантность на длинной 15k-заметке, сравнение с Фазой 3.
+
+    save → заметка сразу с чанками; чанки лежат в notes_chunks БЕЗ
+    векторов (pending по анти-джойну, векторной строки нет). Этот момент —
+    поведение Фазы 3: векторная сторона — вектор ПОЛНОГО текста (fallback),
+    snippet от начала текста; его cosine печатаем как ретро-справку. Затем
+    воркер довекторизует чанки живой Ollama, и тот же запрос по
+    специфичному фрагменту из середины находит заметку через ЛУЧШИЙ чанк:
+    cosine и snippet — из него.
+
+    Замер стенда: 8B-модель на CPU кодирует полный 15k-текст ~2 мин — по
+    решению О. (2026-08-30) read-таймаут EmbeddingService поднят до 720 с,
+    поэтому полный вектор успевает прямо в sync-пути save (важно для
+    дедупа перефразов); вектора чанков добирает воркер, поиск по факту
+    из середины идёт через ЛУЧШИЙ чанк — косинус и snippet из него.
+    """
+    settings = live_chunks.settings
+    text = _chunks_note_text()
+    saved = live_chunks.notes.save(text)  # полный embed ~2 мин на CPU-113
+    note_id = saved["id"]
+    assert saved["stored"] is True
+    assert saved.get("warning") is None  # read 720 с — полный текст успевает
+
+    # Нейтральные заметки — чтобы «top-1» был осмысленным ранжированием.
+    live_chunks.notes.save("Штатная заметка А: ретрит команды в мае, Тбилиси")
+    live_chunks.notes.save("Штатная заметка Б: отчётный период Q3 закрывается")
+
+    with session(settings) as conn:
+        chunk_rows = chunks.get_note_chunks(conn, note_id)
+        assert len(chunk_rows) >= 2  # заметка многочанковая
+        # Все чанки длинной заметки pending (анти-джойн, статус-колонки
+        # нет); счётчик по ВСЕЙ БД не вяжем — соседние мелкие save'ы на
+        # медленном стенде могут эпизодически не успеть в read-таймаут
+        # (их добьёт тот же воркер) и не мешают сценарию.
+        assert all(
+            chunks.get_vector(conn, chunk_id) is None
+            for chunk_id, _idx, _text, _tokens in chunk_rows
+        )
+        pending_before = chunks.count_pending(conn)
+
+    query = CHUNKS_QUERY
+    query_vector = live_chunks.embedding.embed(query)
+
+    # Ретро-справка Фазы 3: cosine запроса к вектору ПОЛНОГО текста,
+    # записанному при save в notes_vec; если БД его не получила — прямой
+    # живой вызов (_embed_full_slow), замер не зависит от состояний БД.
+    with session(settings) as conn:
+        full_vector = vectors.get_vector(conn, note_id)
+    if full_vector is None:
+        full_vector = _embed_full_slow(settings, text)
+    retro_cosine = cosine(query_vector, full_vector)
+
+    # Поведение Фазы 3 до векторизации чанков: если полный вектор успел
+    # в sync-путь (быстрый стенд) — поиск даёт fallback-хит против него
+    # (snippet от начала текста); на медленном стенде заметка вектора не
+    # имеет и живёт в поиске только FTS-плечом до догонки воркером.
+    retro = live_chunks.search.search(query)["results"]
+    retro_hit = next((r for r in retro if r["id"] == note_id), None)
+    retro_rank = (
+        [r["id"] for r in retro].index(note_id) + 1 if retro_hit else None
+    )
+    if retro_hit and retro_hit["cosine"] is not None:
+        assert retro_hit["cosine"] == pytest.approx(retro_cosine, abs=1e-3)
+        assert retro_hit["snippet"] == text[: settings.snippet_chars]
+
+    # Воркер довекторизует pending-чанки живой Ollama; вычитывающая
+    # партия мала (batch×concurrency), выгребаем очередь по кругу.
+    worker = BackgroundWorker(settings, live_chunks.embedding)
+    vectorized = 0
+    for _ in range(30):  # защита от вечного цикла
+        processed = asyncio.run(worker.process_pending_chunks())
+        vectorized += processed
+        if not processed:
+            break
+    assert vectorized == pending_before
+    with session(settings) as conn:
+        assert chunks.count_pending(conn) == 0
+        # вектора у всех чанков БД (длинной заметки + shorts после reuse):
+        assert chunks.count_vectors(conn) == chunks.count_chunks(conn)
+
+    # Тот же запрос: заметка найдена через ЛУЧШИЙ чанк.
+    results = live_chunks.search.search(query)["results"]
+    assert results and results[0]["id"] == note_id
+    hit = results[0]
+    scored = [
+        (cosine(query_vector, live_chunks.embedding.embed(chunk_text)), chunk_id)
+        for chunk_id, _idx, chunk_text, _tokens in chunk_rows
+    ]
+    best_cosine, best_chunk_id = max(scored)
+    best_chunk_text = next(
+        chunk_text
+        for chunk_id, _idx, chunk_text, _tokens in chunk_rows
+        if chunk_id == best_chunk_id
+    )
+    assert "наряду 84031" in best_chunk_text  # факт целиком в лучшем чанке
+    assert hit["cosine"] == pytest.approx(best_cosine, abs=1e-3)
+    assert hit["snippet"] == best_chunk_text[: settings.snippet_chars]
+    assert hit["snippet"] != text[: settings.snippet_chars]
+    print(
+        f"\n[live-chunks] Фаза 3 (полный вектор): cosine={retro_cosine:.3f}, "
+        f"rank={retro_rank if retro_rank else 'нет (ниже порога)'}; "
+        f"Фаза 7 (лучший чанк): cosine={best_cosine:.3f}, top-1; "
+        f"чанков={len(chunk_rows)}, чанк-векторов добито={vectorized}/{pending_before}"
+    )
