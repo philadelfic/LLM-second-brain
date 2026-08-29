@@ -64,6 +64,9 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
     get_settings.cache_clear()
     for name in REQUIRED_ENV:
         monkeypatch.delenv(name, raising=False)
+    # Общая фикстура tests/conftest ставит DB_PATH во tmp; этот модуль тестирует
+    # сам env-парсер — ему надо «никакого DB_PATH» (умолчание §8).
+    monkeypatch.delenv("DB_PATH", raising=False)
 
 
 class TestCompleteness:

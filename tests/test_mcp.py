@@ -76,15 +76,17 @@ def _start_server(port: int, extra_env: dict[str, str]) -> Iterator[str]:
 
 
 @pytest.fixture(scope="session")
-def server_url() -> Iterator[str]:
-    """Сервер с настройками по умолчанию (MCP_PATH=/mcp)."""
-    yield from _start_server(SERVER_PORT, {})
+def server_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+    """Сервер с настройками по умолчанию (MCP_PATH=/mcp, своя БД)."""
+    db = tmp_path_factory.mktemp("mcp-server") / "notes.db"
+    yield from _start_server(SERVER_PORT, {"DB_PATH": str(db)})
 
 
 @pytest.fixture(scope="session")
-def custom_path_url() -> Iterator[str]:
-    """Сервер с переопределённым MCP_PATH=/memory."""
-    yield from _start_server(CUSTOM_PORT, {"MCP_PATH": "/memory"})
+def custom_path_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+    """Сервер с переопределённым MCP_PATH=/memory (и своей БД)."""
+    db = tmp_path_factory.mktemp("mcp-custom") / "notes.db"
+    yield from _start_server(CUSTOM_PORT, {"MCP_PATH": "/memory", "DB_PATH": str(db)})
 
 
 @asynccontextmanager

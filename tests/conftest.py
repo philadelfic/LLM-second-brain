@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 from collections.abc import Iterator
 
 import pytest
@@ -31,12 +32,15 @@ from app.main import create_app  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def test_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, str]]:
-    """Каждый тест стартует с чистым кэшем настроек и валидным окружением."""
+def test_env(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[dict[str, str]]:
+    """Чистый кэш настроек, валидное окружение и БД во временной папке."""
+    db_path = tmp_path / "notes.db"
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    env = {**TEST_ENV, "DB_PATH": str(db_path)}
     get_settings.cache_clear()
-    for name, value in TEST_ENV.items():
-        monkeypatch.setenv(name, value)
-    yield TEST_ENV
+    yield env
     get_settings.cache_clear()
 
 
