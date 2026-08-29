@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 
@@ -22,8 +23,6 @@ from mcp.client.streamable_http import (
     create_mcp_http_client,
     streamable_http_client,
 )
-
-import uuid
 
 from app.transport.mcp import (
     SERVER_INSTRUCTIONS,
@@ -110,9 +109,8 @@ class TestHandshake:
         headers = {"Authorization": f"Bearer {TOKEN}"}
         async with streamable_http_client(
             f"{server_url}/mcp", http_client=create_mcp_http_client(headers=headers)
-        ) as streams:
-            async with ClientSession(*streams) as session:
-                result = await session.initialize()
+        ) as streams, ClientSession(*streams) as session:
+            result = await session.initialize()
         assert result.server_info.name == SERVER_NAME
         assert result.instructions == SERVER_INSTRUCTIONS
         assert result.protocol_version  # версия согласована при handshake

@@ -73,7 +73,13 @@ class Embedder(Protocol):
 
 
 class EmbeddingService:
-    """Кодирование текстов через Ollama `POST /api/embed` (batch)."""
+    """Кодирование текстов через Ollama `POST /api/embed` (batch).
+
+    Попутно ведёт `last_attempt_ok` (NFR-4) — источник `/health.embedding_ok`:
+    None — попыток ещё не было, True/False — исход последней попытки. Статус
+    обновляется в `embed_texts`, то есть единой точке всех кодирований
+    (save/update/query/фоновый воркер).
+    """
 
     def __init__(
         self,
@@ -91,6 +97,8 @@ class EmbeddingService:
             timeout=httpx.Timeout(READ_TIMEOUT_SEC, connect=CONNECT_TIMEOUT_SEC),
             transport=transport,
         )
+        # None — попыток не было (health не врёт до первых данных).
+        self.last_attempt_ok: bool | None = None
 
     def embed(self, text: str) -> list[float]:
         """Кодировать один текст (синхронный путь save/update/запрос)."""
@@ -100,7 +108,17 @@ class EmbeddingService:
         """Кодировать batch текстов; порядок результата = порядку входа."""
         if not texts:
             raise ValueError("embed_texts: пустой список текстов")
-        payload = {"model": self._settings.embedding_model, "input": list(texts)}
+        try:
+            embeddings = self._request_and_parse(list(texts))
+        except EmbeddingError:
+            self.last_attempt_ok = False  # dеградация станет видна в /health
+            raise
+        self.last_attempt_ok = True
+        return embeddings
+
+    def _request_and_parse(self, texts: list[str]) -> list[list[float]]:
+        """HTTP-цикл с единственным ретраем + проверки контракта ответа."""
+        payload = {"model": self._settings.embedding_model, "input": texts}
         for attempt in range(1, MAX_ATTEMPTS + 1):
             final = attempt == MAX_ATTEMPTS
             try:

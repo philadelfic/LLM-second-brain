@@ -192,7 +192,8 @@ class TestHealthCounters:
         assert body["notes_count"] == 1
         assert body["pending_vector"] == 1  # Фаза 2 — все pending
         assert body["pending_summary"] == 1
-        assert body["embedding_ok"] is None and body["summarizer_ok"] is None
+        assert body["embedding_ok"] is False  # попытка вектора была (offline)
+        assert body["summarizer_ok"] is None
         client.delete("/notes/1", headers={"Authorization": f"Bearer {token}"})
         assert health()["notes_count"] == 0
         assert health()["pending_vector"] == 0  # trash не в счётчиках

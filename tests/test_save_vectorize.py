@@ -8,31 +8,13 @@ Update: ре-векторизация sync; отказ → pending, ответ �
 from __future__ import annotations
 
 import pytest
-from fakes import HashEmbedder
+from fakes import FailingEmbedder, HashEmbedder
 
 from app.config import get_settings
 from app.services.dedup import DEDUP_HINT
-from app.services.embedding import EmbeddingError
 from app.services.notes import WARNING_VECTOR_PENDING, NoteService
 from app.storage import vectors
 from app.storage.db import init_db, session
-
-
-class FailingEmbedder:
-    """Фейк-сервис: векторизация всегда падает (сервер «вон» — NFR-3)."""
-
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-
-    def embed(self, text: str) -> list[float]:
-        self.calls.append(text)
-        raise EmbeddingError("векторизация недоступна")
-
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        return [self.embed(text) for text in texts]
-
-    def close(self) -> None:
-        return None
 
 
 @pytest.fixture

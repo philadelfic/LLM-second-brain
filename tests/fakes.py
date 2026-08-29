@@ -19,6 +19,8 @@ from __future__ import annotations
 import hashlib
 import math
 
+from app.services.embedding import EmbeddingError
+
 
 class HashEmbedder:
     """Символьные триграммы → hashing trick → L2-нормированный вектор."""
@@ -63,3 +65,25 @@ class HashEmbedder:
 def cosine(a: list[float], b: list[float]) -> float:
     """Косинус для нормированных векторов (dot product)."""
     return sum(x * y for x, y in zip(a, b))
+
+
+class FailingEmbedder:
+    """Фейк-отказ: векторизация всегда недоступна (NFR-3, деградация).
+
+    Учитывает вызовы (`calls`) — тесты проверяют, что внешний вызов не тратится
+    зря (например, update несуществующего id).
+    """
+
+    def __init__(self, message: str = "векторизация недоступна") -> None:
+        self.message = message
+        self.calls: list[str] = []
+
+    def embed(self, text: str) -> list[float]:
+        self.calls.append(text)
+        raise EmbeddingError(self.message)
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        return [self.embed(text) for text in texts]
+
+    def close(self) -> None:  # интерфейс-совместимость с EmbeddingService
+        return None

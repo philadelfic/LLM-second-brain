@@ -32,8 +32,8 @@ for _name, _value in TEST_ENV.items():
 
 # Импорт после выставления окружения: app.main на уровне модуля вызывает
 # create_app(), который без обязательных переменных фатален.
-from app.config import get_settings  # noqa: E402
-from app.main import create_app  # noqa: E402
+from app.config import get_settings
+from app.main import create_app
 
 
 @pytest.fixture(autouse=True)
