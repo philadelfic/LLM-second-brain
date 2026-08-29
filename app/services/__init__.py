@@ -2,8 +2,8 @@
 
 `build_services` собирает все сервисы поверх одного `Settings` (frozen на
 время жизни процесса); главное приложение держит их на `app.state`.
-Фаза 3: появляется EmbeddingService (клиент Ollama-векторизации) — пока
-без потребителей (гибрид поиска — шаг 3.3, дедуп — шаг 3.4).
+Фаза 3: EmbeddingService один на процесс и разделяется — дедуп в save/update
+и гибридный поиск кодируют тексты через один httpx-пул (сoney keep-alive).
 """
 
 from __future__ import annotations
@@ -35,8 +35,9 @@ class Services:
 
 def build_services(settings: Settings) -> Services:
     """Собрать сервисы из настроек (Settings frozen — снимок на процесс)."""
+    embedding = EmbeddingService(settings)
     return Services(
         notes=NoteService(settings),
-        search=SearchService(settings),
-        embedding=EmbeddingService(settings),
+        search=SearchService(settings, embedding),
+        embedding=embedding,
     )

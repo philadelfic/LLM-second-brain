@@ -1,24 +1,32 @@
-"""Тесты SearchService (Фаза 2, Шаг 2.3): FTS-only, BM25, snippet, hint.
+"""Тесты SearchService (Фаза 3, шаг 3.3): FTS-сторона, BM25, snippet, hint.
 
-REQUIREMENTS FR-1 в ограничении Фазы 2 (векторов нет): rrf_score по одному
-источнику, cosine=null, warning «без семантики»; выдача без полного текста.
+База гибрида (векторная сторона — vec0 ортогональные критерии, деградация,
+RRF-слияние — tests/test_search_hybrid.py). Здесь trigram-контракт FTS:
+подстроки/словоформы, AND, кавычки, выдача без полного текста.
 """
 
 from __future__ import annotations
 
 import pytest
+from fakes import HashEmbedder
 
 from app.config import get_settings
 from app.services.notes import NoteService
 from app.services.search import MAX_TOP_K, SearchService, SearchValidationError
-from app.storage.db import init_db, session
+from app.storage.db import init_db
+
+
+def _searcher(settings=None) -> SearchService:
+    """SearchService с детерминированным HashEmbedder (без сети, ARCH §7)."""
+    settings = settings or get_settings()
+    return SearchService(settings, HashEmbedder(settings.embedding_dim))
 
 
 @pytest.fixture
 def service() -> tuple[SearchService, NoteService]:
-    init_db(get_settings())
     settings = get_settings()
-    return SearchService(settings), NoteService(settings)
+    init_db(settings)
+    return _searcher(settings), NoteService(settings)
 
 
 def long_text(n_chars: int) -> str:
@@ -72,7 +80,7 @@ class TestMatching:
         notes_service.save(
             "TaskFlow помянут. TaskFlow снова. TaskFlow в конце"
         )  # id=2, три вхождения
-        results = SearchService(get_settings()).search("TaskFlow")
+        results = _searcher().search("TaskFlow")
         assert [r["id"] for r in results["results"]] == [2, 1]
 
     def test_deleted_notes_not_searchable(self, service) -> None:
@@ -132,13 +140,13 @@ class TestOutput:
         assert scores[1] == 1 / (get_settings().rrf_k + 2)
         assert all(score > 0 and score <= 1 / 61 for score in scores)
 
-    def test_warning_marks_no_semantics(self, service) -> None:
-        """Фаза 2: warning в каждом ответе — семантики пока нет (ARCH §4.2)."""
+    def test_no_warning_when_semantics_alive(self, service) -> None:
+        """Фаза 3: warning только при деградации (отказ кодирования запроса);
+        при живой векторизации warning отсутствует."""
         _, notes_service = service
         notes_service.save("TaskFlow заметка")
-        result = SearchService(get_settings()).search("TaskFlow")
-        assert result["warning"]
-        assert "семантик" in result["warning"]
+        result = _searcher().search("TaskFlow")
+        assert result["warning"] is None
 
 
 class TestEmptyAndValidation:
@@ -174,7 +182,7 @@ class TestEmptyAndValidation:
         _, notes_service = service
         for i in range(1, 8):  # 7 подходящих заметок
             notes_service.save(f"TaskFlow догма номер {i}")
-        searcher = SearchService(get_settings())
+        searcher = _searcher()
         assert len(searcher.search("TaskFlow")["results"]) == 5  # DEFAULT_TOP_K
         assert len(searcher.search("TaskFlow", top_k=3)["results"]) == 3
 
@@ -189,5 +197,5 @@ class TestEmptyAndValidation:
         notes_service = NS(get_settings())
         for i in range(1, 5):
             notes_service.save(f"TaskFlow число {i}")
-        result = SearchService(get_settings()).search("TaskFlow")
+        result = _searcher().search("TaskFlow")
         assert len(result["results"]) == 2

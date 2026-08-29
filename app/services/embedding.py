@@ -28,6 +28,7 @@ EMBEDDING_MODEL. Кодируются **полные тексты** (замет�
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Protocol
 
 import httpx
 
@@ -52,6 +53,23 @@ _ERROR_BODY_CHARS = 120
 
 class EmbeddingError(RuntimeError):
     """Векторизация не выполнена: сервер недоступен или ответ некорректен."""
+
+
+class Embedder(Protocol):
+    """Контракт кодировщика текста: природы реализации он не знает.
+
+    Реализации: EmbeddingService (живая Ollama) и тестовый HashEmbedder
+    (tests/fakes.py) — потребители (SearchService, DedupService, воркер)
+    зависят от протокола, а не от класса клиента.
+    """
+
+    def embed(self, text: str) -> list[float]:
+        """Закодировать один текст."""
+        ...
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """Закодировать batch текстов; порядок результата = порядку входа."""
+        ...
 
 
 class EmbeddingService:

@@ -15,9 +15,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 # Валидное окружение по умолчанию для всех тестов.
+# Loopback:1 — гарантированно закрытый порт: соединение с «Ollama» падает
+# мгновенно (ConnectError), без DNS-таймаутов. Юнит/e2e по умолчанию живут
+# в режиме «внешние LLM недоступны» (NFR-3) — это штатная деградация;
+# живая Ollama — integration-тесты с отдельным маркером (шаг 3.6),
+# успешный же путь тестируется через детерминированный HashEmbedder.
 TEST_ENV: dict[str, str] = {
-    "OLLAMA_BASE_URL": "http://embedding.test:11434",
-    "SUMMARY_OLLAMA_BASE_URL": "http://summary.test:11434",
+    "OLLAMA_BASE_URL": "http://127.0.0.1:1",
+    "SUMMARY_OLLAMA_BASE_URL": "http://127.0.0.1:1",
     "SUMMARY_MODEL": "test-summary-model",
     "MCP_AUTH_TOKEN": "test-secret-token",
 }
