@@ -122,7 +122,7 @@ school = (
     "Школьный архив: совет родителей учеников за 1998 год лежит в "
     "кабинете 12, ключ у завуча Ирины Павловны, вход со двора. "
 )
-text = para * 30 + school + para * 30
+text = para * 42 + school + para * 42  # ~1.5e4 симв. (assert 14k..20k)
 assert 14000 <= len(text) <= 20000, len(text)
 with open("/tmp/smoke-15k.json", "w") as f:
     json.dump({"text": text, "author": "deploy-smoke"}, f, ensure_ascii=False)
