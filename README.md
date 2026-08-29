@@ -38,4 +38,14 @@ Self-hosted MCP-сервер «второго мозга» для LLM, крут�
 
 ## Статус
 
-Документация v0.6 (согласована) → Фаза 1. Roadmap: REQUIREMENTS §10.
+- **Фаза 1 — каркас: ЗАВЕРШЕНА.** FastAPI + MCP Streamable HTTP (`/mcp`),
+  6 инструментов `memory_*`, Bearer-миддлварь, env-парсер, Docker (non-root),
+  healthcheck.
+- **Фаза 2 — хранилище: ЗАВЕРШЕНА.** SQLite (`notes` + FTS5 trigram,
+  триггеры синхронизации, WAL), CRUD всех 6 методов, soft delete, пагинация,
+  batch-get, FTS-only поиск (BM25), fallback-усечение вместо summary.
+  REST `/notes*` + `/search` — тот же сервис-слой; счётчики `/health` из БД.
+- **Далее:** Фаза 3 — векторизация и поиск (Ollama embedding, sqlite-vec,
+  гибридный RRF, дедуп, фоновая до-векторизация).
+
+Roadmap: REQUIREMENTS §10. Тесты: `pytest` (юнит + e2e по живому серверу).
