@@ -182,7 +182,7 @@ curl -sS --max-time 30 -G "$BASE/search" \
   --data-urlencode "q=$QUERY" --data-urlencode "top_k=5" \
   > /tmp/smoke-search.json || die "поиск упал"
 NOTE_ID="$NOTE_ID" python3 - <<'PYEOF'
-import json, os
+import json, os, sqlite3
 
 data = json.load(open("/tmp/smoke-search.json"))
 res = data.get("results") or []
@@ -190,13 +190,23 @@ assert res, f"поиск пуст: {data}"
 hit = res[0]
 assert hit.get("id") == int(os.environ["NOTE_ID"]), \
     f"top-1 id={hit.get('id')}, ожидалась смок-заметка {os.environ['NOTE_ID']}"
+assert isinstance(hit.get("cosine"), float), f"cosine={hit.get('cosine')}"
 snippet = hit.get("snippet") or ""
-assert "Школьный архив" in snippet, f"snippet не из середины: {snippet!r}"
 head = open("/tmp/smoke-head.txt").read()
 assert snippet[:40] != head[:40], "snippet от начала текста — fallback, а не чанк"
-assert isinstance(hit.get("cosine"), float), f"cosine={hit.get('cosine')}"
+
+# Факт обязан лежать в чанках, а snippet — быть префиксом одного из них
+# (лучший чанк). Сам факт НЕ обязан попасть в первые SNIPPET_CHARS сниппета:
+# чанк вокруг факта заметно шире сниппета (шаг 7 показывал cosine 0.523).
+conn = sqlite3.connect("file:data/notes.db?mode=ro", uri=True)
+chunks = [r[0] for r in conn.execute(
+    "SELECT c.text FROM notes_chunks c JOIN notes n ON n.id=c.note_id "
+    "WHERE n.id=? ORDER BY c.idx", (int(os.environ["NOTE_ID"]),)).fetchall()]
+assert any("Школьный архив" in t for t in chunks), "факта нет ни в одном чанке"
+assert any(t.startswith(snippet) for t in chunks), \
+    "snippet не префикс ни одного чанка — выдача не из чанков?"
 print(f"поиск ок: top-1 id={hit['id']}, cosine={hit['cosine']:.3f}, "
-      f"snippet из чанка: {snippet[:60]!r}…")
+      f"snippet из чанка: {snippet[:60]!r}")
 PYEOF
 
 # =====================================================================
