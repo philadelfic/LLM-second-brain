@@ -1,4 +1,5 @@
-"""NoteService — CRUD заметок (REQUIREMENTS FR-2…FR-6, ARCHITECTURE §4.1–§4.6).
+"""NoteService — CRUD заметок (REQUIREMENTS FR-2…FR-6, ARCHITECTURE §4.1–§4.6;
+Фаза 7: чанки в save/update).
 
 Один код сервисов для MCP и REST (ARCH §1). С Фазы 3 — синхронное кодирование
 текста и дедуп в save/update (EmbeddingService + DeduplicationService иньектируются;
@@ -24,7 +25,16 @@
 возраста (FR-2); метки времени живут с точностью до секунды (DDL-формат
 ARCH §3.3), поэтому внутри одной секунды определения «свежее» даёт id
 (более поздняя запись больше) — детерминированный порядок без sleep'ов.
-"""
+
+Фаза 7 (шаг 3): заметка хранится целиком, а чанки — только для векторов.
+В save/update чанки раскладываются чистым токен-сплиттером (без Ollama) и
+пишутся в notes_chunks той же транзакцией; вектора чанков строит фоновый
+воркер (шаг 5) — pending по анти-джойну. Исключение — reuse: единственный
+чанк ≤ CHUNK_SIZE переиспользует полный вектор заметки, не кодируя текст
+второй раз. Дедуп по-прежнему только по полному тексту (notes_vec) —
+чанк-вектора в дедупе не участвуют. Soft delete чанки не трогает (trash);
+физическая чистка чанков — замена при update, каскад + самолечение
+сирот при физическом удалении (шаг 2)."""
 
 from __future__ import annotations
 
@@ -35,7 +45,8 @@ from app.config import Settings
 from app.services.dedup import DeduplicationService, duplicate_response
 from app.services.embedding import Embedder, EmbeddingError, EmbeddingService
 from app.services.emit import summary_of
-from app.storage import vectors
+from app.services.splitter import split_text
+from app.storage import chunks, vectors
 from app.storage.db import session, transaction
 
 # Фиксированные верхние границы контрактов (REQUIREMENTS §5.1/NFR-6; env —
@@ -77,9 +88,12 @@ class NoteService:
     # --- FR-4 memory_save (ARCH §4.1) --------------------------------------
 
     def save(self, text: str, author: str | None = None) -> dict[str, Any]:
-        """Валидация → кодирование → дедуп → INSERT (+вектор) одной транзакцией."""
+        """Валидация → кодирование → дедуп → INSERT (+вектор+чанки) транзакцией."""
         self._validate_text(text)
         vector = self._note_vector(text)
+        # Чанки считаем чистым сплиттером ДО записи (~миллисекунды) —
+        # транзакция остаётся короткой; Ollama для чанков не зовётся.
+        chunks_data = self._chunks_of(text)
         if vector is not None:
             duplicate = self._dedup.find_by_cosine(vector)
             if duplicate is not None:
@@ -87,6 +101,7 @@ class NoteService:
             with session(self._settings) as conn, transaction(conn):
                 note_id = self._insert(conn, text, author, vector_status="ok")
                 vectors.upsert(conn, note_id, vector)
+                self._store_chunks(conn, note_id, chunks_data, vector)
             return {"id": note_id, "stored": True, "summary_pending": True}
 
         # Отказ векторизации: заметка сохраняется, дедуп — по тексту (дословный),
@@ -96,6 +111,7 @@ class NoteService:
             return duplicate_response(duplicate)
         with session(self._settings) as conn, transaction(conn):
             note_id = self._insert(conn, text, author)
+            self._store_chunks(conn, note_id, chunks_data, None)
         return {
             "id": note_id,
             "stored": True,
@@ -210,6 +226,7 @@ class NoteService:
         if exists is None:
             return self._not_found(note_id)
         vector = self._note_vector(text)
+        chunks_data = self._chunks_of(text)
         with session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
                 "UPDATE notes SET text = ?, vector_status = ?, "
@@ -225,6 +242,9 @@ class NoteService:
             updated = cursor.rowcount  # 0 = нет такой активной заметки
             if vector is not None:
                 vectors.upsert(conn, note_id, vector)
+            # Фаза 7: старые чанки (и их вектора) заменяются новыми одной
+            # транзакцией — в том числе при отказе ре-векторизации.
+            self._store_chunks(conn, note_id, chunks_data, vector)
         if not updated:
             return self._not_found(note_id)
         return {"id": note_id, "updated": True, "summary_pending": True}
@@ -272,6 +292,43 @@ class NoteService:
         }
 
     # --- внутренне ---------------------------------------------------------
+
+    # --- Фаза 7: чанковая индексация (brief §6) ------------------------------
+
+    def _chunks_of(self, text: str) -> list[tuple[str, int]]:
+        """Чанки заметки чистым токен-сплиттером (без внешних вызовов): текст
+        + размер в токенах — содержимое notes_chunks. Порядок = idx."""
+        splits = split_text(
+            text,
+            chunk_size=self._settings.chunk_size,
+            chunk_overlap=self._settings.chunk_overlap,
+            chunk_min_target=self._settings.chunk_min_target,
+        )
+        return [(chunk.text, chunk.tokens) for chunk in splits]
+
+    def _store_chunks(
+        self,
+        conn: sqlite3.Connection,
+        note_id: int,
+        chunks_data: list[tuple[str, int]],
+        note_vector: list[float] | None,
+    ) -> None:
+        """Записать чанки заметки (в открытой транзакции); при update — полная
+        замена: старые чанки и их вектора уходят вместе со строками.
+
+        Reuse (brief §6): единственный чанк размера ≤ CHUNK_SIZE при готовом
+        полном векторе получает вектор заметки без повторного кодирования —
+        текст такого чанка равен тексту заметки, схема вырождается в текущую
+        (заметки ≤3 000 симв. = 1 чанк). Иначе чанки остаются без векторов —
+        фоновый воркер до-кодирует (pending выведен анти-джойном, шаг 5);
+        вектор None (отказ Ollama) — тоже оставляет чанки в pending."""
+        chunk_ids = chunks.replace_note_chunks(conn, note_id, chunks_data)
+        if (
+            note_vector is not None
+            and len(chunk_ids) == 1
+            and chunks_data[0][1] <= self._settings.chunk_size
+        ):
+            chunks.upsert_vector(conn, chunk_ids[0], note_vector)
 
     def _note_vector(self, text: str) -> list[float] | None:
         """Синхронное кодирование; отказ векторизации — None (не исключение)."""
