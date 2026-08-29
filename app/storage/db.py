@@ -316,17 +316,33 @@ def selfheal_chunk_orphans(conn: sqlite3.Connection) -> None:
 
 
 def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
-    """Сверить (модель, размерность) эмбеддинга с записью в meta; разошлись —
-    полная автореиндексация: ОБА векторных индекса (notes_vec и
-    notes_chunks_vec) пересоздаются под текущую размерность, все заметки
-    (включая trash — их вектора тоже невалидны) уходят в pending; вектора
-    чанков сброшены дропом notes_chunks_vec (pending выводится анти-джойном).
+    """Сверить конфигурацию векторизации/чанков с записями в meta; разошлись —
+    автореиндексация при старте.
+
+    Две разные причины, одна механика (b972386, решение О. 2026-08-29):
+    - смена модели/размерности (env vs meta embedding_model/embedding_dim):
+      ОБА векторных индекса пересоздаются под текущую размерность, все заметки
+      (включая trash — их вектора тоже невалидны) уходят в pending, воркер
+      пере-кодирует полные вектора;
+    - смена чанк-параметров (env vs meta chunk_*, Фаза 7, brief §6): вектора
+      полного текста остаются валидными (текст не менялся) — дропается только
+      notes_chunks_vec; тексты чанков ПЕРЕСЧИТЫВАЮТСЯ у всех заметок
+      (включая trash) по текущим параметрам сплиттера, воркер до-векторизует.
+    Оба изменения сразу — работает по совокупности: один reindex_started/done,
+    пересоздание обоих индексов, все заметки pending + пере-чанковка.
+
+    Reuse при пере-чанковке: у заметки с ровно одним чанком ≤ CHUNK_SIZE
+    вектор чанка = вектор полного текста из notes_vec без кодирования —
+    вектор не зависит от чанк-параметров, а при сменившейся модели notes_vec
+    уже пуст (дропнут до пере-чанковки) — reuse сам не сработает там, где
+    полный вектор невалиден.
 
     Наследие: у БД без meta (созданных до этой правки) запись создаётся из
-    текущего env без реиндексации — нулевой миграцией; их вектора и так
+    текущего env без реиндексации — нулевая миграция; их вектора и так
     были построены той же моделью (иначе оператор потратил бы reindex.py).
     Чанк-параметры в meta пишутся аналогично — только отсутствующие ключи
-    (сравнение/пере-чанковка — шаг 6)."""
+    (отсутствие = «не менялись», сравнение с env только по существующим).
+    """
     conn.execute(_META_DDL)
     stored = _get_meta(conn, "embedding_model")
     stored_dim_raw = _get_meta(conn, "embedding_dim")
@@ -341,7 +357,18 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
         _set_meta(conn, "embedding_dim", str(settings.embedding_dim))
         return
     stored_dim = int(stored_dim_raw)
-    if stored == settings.embedding_model and stored_dim == settings.embedding_dim:
+    model_changed = (
+        stored != settings.embedding_model or stored_dim != settings.embedding_dim
+    )
+    # Чанк-параметры: сравниваем ТОЛЬКО зафиксированные ранее ключи
+    # (отсутствующий ключ — нулевая миграция, «не менялись», пишется ниже).
+    chunk_changes = {
+        key: (str(stored_value), str(getattr(settings, key)))
+        for key in _CHUNK_META_KEYS
+        if (stored_value := _get_meta(conn, key)) is not None
+        and stored_value != str(getattr(settings, key))
+    }
+    if not model_changed and not chunk_changes:
         # Совпало: но notes_chunks_vec могла ещё не существовать на живой БД
         # (Фаза 7 поверх Фазы 5) — создать при отсутствии.
         _create_chunk_vec_if_missing(conn, settings.embedding_dim)
@@ -350,31 +377,99 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
     notes_count = int(
         conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
     )
-    logging.getLogger("app").warning(
-        "embedding model/dim changed: rebuilding vector index",
-        extra={
-            "event": "reindex_started",
-            "from_model": stored,
-            "to_model": settings.embedding_model,
-            "from_dim": stored_dim,
-            "to_dim": settings.embedding_dim,
-            "notes": notes_count,
-        },
-    )
-    conn.execute("DROP TABLE IF EXISTS notes_vec")
-    vectors.create_vec_table(conn, settings.embedding_dim)
-    # Фаза 7: дропнуть и вектора чанков — невалидны той же причиной
-    # (модель/размерность); тексты чанков остаются, воркер пере-кодирует.
+    started_extra: dict[str, object] = {
+        "event": "reindex_started",
+        "notes": notes_count,
+    }
+    message = "chunk parameters changed: re-chunking all notes"
+    if model_changed:
+        message = "embedding model/dim changed: rebuilding vector index"
+        started_extra.update(
+            from_model=stored,
+            to_model=settings.embedding_model,
+            from_dim=stored_dim,
+            to_dim=settings.embedding_dim,
+        )
+    for key, (old_value, new_value) in chunk_changes.items():
+        started_extra[f"from_{key}"] = old_value
+        started_extra[f"to_{key}"] = new_value
+    logging.getLogger("app").warning(message, extra=started_extra)
+    if model_changed:
+        conn.execute("DROP TABLE IF EXISTS notes_vec")
+        vectors.create_vec_table(conn, settings.embedding_dim)
+        # Вектора полных текстов невалидны — все заметки (вкл. trash) в очередь.
+        conn.execute("UPDATE notes SET vector_status = 'pending'")
+    # Вектора чанков невалидны при любой из причин (другая модель — другая
+    # векторизация; другие параметры — другие чанки, их вектора больше не
+    # соответствуют их же новым текстам). Дроп: все чанки → pending
+    # (анти-джойн), воркер пере-кодирует.
     conn.execute("DROP TABLE IF EXISTS notes_chunks_vec")
     chunks.create_vec_table(conn, settings.embedding_dim)
-    conn.execute("UPDATE notes SET vector_status = 'pending'")
-    _set_meta(conn, "embedding_model", settings.embedding_model)
-    _set_meta(conn, "embedding_dim", str(settings.embedding_dim))
-    _set_chunk_meta_defaults(conn, settings)
-    logging.getLogger("app").info(
-        "vector index rebuilt; background worker will re-encode all notes",
-        extra={"event": "reindex_done", "pending_vector": notes_count},
+    # Пере-чанковка + записи meta — одним атомарным блоком: rollback вернёт
+    # и чанки, и meta предыдущей конфигурации, если что-то пойдёт не так.
+    with transaction(conn):
+        rechunked, reused = _rechunk_all_notes(conn, settings)
+        if model_changed:
+            _set_meta(conn, "embedding_model", settings.embedding_model)
+            _set_meta(conn, "embedding_dim", str(settings.embedding_dim))
+        for key in _CHUNK_META_KEYS:
+            _set_meta(conn, key, str(getattr(settings, key)))
+    pending_chunks = int(chunks.count_pending(conn))
+    done_extra: dict[str, object] = {
+        "event": "reindex_done",
+        "notes_rechunked": rechunked,
+        "chunk_vectors_reused": reused,
+        "pending_chunks": pending_chunks,
+    }
+    if model_changed:
+        done_extra["pending_vector"] = notes_count
+    message_done = (
+        "vector index rebuilt; background worker will re-encode all notes"
+        if model_changed
+        else "notes re-chunked; chunk vectors pending for background worker"
     )
+    logging.getLogger("app").info(message_done, extra=done_extra)
+
+
+def _rechunk_all_notes(
+    conn: sqlite3.Connection, settings: Settings
+) -> tuple[int, int]:
+    """Пере-чанковать все заметки (включая trash) по текущим параметрам.
+
+    Миграционная операция (вызывается только из _sync_embedding_meta при
+    сменившихся модели/размерности или чанк-параметрах — brief §6): тексты
+    пересчитываются чистым сплиттером, чанки и их вектора заменяются
+    (replace_note_chunks чистит vec-строки явно). Импорт сплиттера —
+    локальный: storage не тянет домен на импорте, пере-чанковка здесь —
+    как некогда реиндекс в init_db (b972386), one-shot на старте сервиса.
+
+    Reuse: заметка с ровно одним чанком ≤ CHUNK_SIZE получает вектор чанка
+    = вектор полного текста из notes_vec — без кодирования; при сменившейся
+    модели notes_vec к этому моменту пуст — reuse сам не срабатывает.
+
+    Возвращает (пере-чанковано заметок, reuse-векторов записано).
+    """
+    from app.services.splitter import split_text  # локально, см. докстринг
+
+    rows = conn.execute("SELECT id, text FROM notes ORDER BY id").fetchall()
+    rechunked = reused = 0
+    for row in rows:
+        spans = split_text(
+            row["text"],
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap,
+            chunk_min_target=settings.chunk_min_target,
+        )
+        chunk_ids = chunks.replace_note_chunks(
+            conn, row["id"], [(chunk.text, chunk.tokens) for chunk in spans]
+        )
+        rechunked += 1
+        if len(chunk_ids) == 1 and spans[0].tokens <= settings.chunk_size:
+            note_vector = vectors.get_vector(conn, row["id"])
+            if note_vector is not None:
+                chunks.upsert_vector(conn, chunk_ids[0], note_vector)
+                reused += 1
+    return rechunked, reused
 
 
 def _check_fts_integrity(conn: sqlite3.Connection) -> None:
