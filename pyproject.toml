@@ -10,6 +10,7 @@ dependencies = [
     "httpx==0.28.1",
     "pydantic-settings==2.14.2",
     "sqlite-vec==0.1.6",
+    "tiktoken==0.14.0",  # Фаза 7: токен-сплиттер чанков (encoding cl100k_base)
 ]
 
 [project.optional-dependencies]

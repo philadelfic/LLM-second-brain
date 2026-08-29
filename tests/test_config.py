@@ -24,6 +24,13 @@ REQUIRED_ENV: dict[str, str] = {
 OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "EMBEDDING_MODEL": ("embedding_model", "qwen3-embedding:8b"),
     "EMBEDDING_DIM": ("embedding_dim", 4096),
+    # Фаза 7: чанковая индексация (bundle §4 brief — в compose как §8).
+    "TEXT_SPLITTER": ("text_splitter", "tiktoken"),
+    "CHUNK_SIZE": ("chunk_size", 1024),
+    "CHUNK_OVERLAP": ("chunk_overlap", 180),
+    "CHUNK_MIN_TARGET": ("chunk_min_target", 200),
+    "EMBEDDING_BATCH_SIZE": ("embedding_batch_size", 32),
+    "EMBEDDING_CONCURRENT_REQUESTS": ("embedding_concurrent_requests", 3),
     "MAX_SUMMARY_CHARS": ("max_summary_chars", 200),
     "SNIPPET_CHARS": ("snippet_chars", 120),
     "MAX_GET_BATCH": ("max_get_batch", 20),
@@ -71,7 +78,8 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 28 полей §8: 4 обязательных + 24 с умолчаниями."""
+        """В Settings — ровно 34 поля: 4 обязательных + 30 с умолчаниями
+        (28 §8 + 6 чанковых Фазы 7, brief §4)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected
