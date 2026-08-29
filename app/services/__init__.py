@@ -2,8 +2,9 @@
 
 `build_services` собирает все сервисы поверх одного `Settings` (frozen на
 время жизни процесса); главное приложение держит их на `app.state`.
-Фаза 3: EmbeddingService один на процесс и разделяется — дедуп в save/update
-и гибридный поиск кодируют тексты через один httpx-пул (сoney keep-alive).
+Фаза 3: EmbeddingService один на процесс — общий httpx-пул для гибридного
+поиска и дедупа записи; NoteService через DeduplicationService решает
+«дубликат / сохранить» (FR-4), SearchService — гибридный поиск (ARCH §4.2).
 """
 
 from __future__ import annotations
@@ -11,11 +12,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.config import Settings
+from app.services.dedup import DeduplicationService
 from app.services.embedding import EmbeddingService
 from app.services.notes import NoteService
 from app.services.search import SearchService
 
 __all__ = [
+    "DeduplicationService",
     "EmbeddingService",
     "NoteService",
     "SearchService",
@@ -31,13 +34,16 @@ class Services:
     notes: NoteService
     search: SearchService
     embedding: EmbeddingService
+    dedup: DeduplicationService
 
 
 def build_services(settings: Settings) -> Services:
     """Собрать сервисы из настроек (Settings frozen — снимок на процесс)."""
     embedding = EmbeddingService(settings)
+    dedup = DeduplicationService(settings)
     return Services(
-        notes=NoteService(settings),
+        notes=NoteService(settings, embedding, dedup),
         search=SearchService(settings, embedding),
         embedding=embedding,
+        dedup=dedup,
     )

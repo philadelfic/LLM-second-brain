@@ -1,16 +1,24 @@
-"""NoteService — CRUD заметок (REQUIREMENTS FR-2…FR-6, ARCHITECTURE §4.3–§4.6).
+"""NoteService — CRUD заметок (REQUIREMENTS FR-2…FR-6, ARCHITECTURE §4.1–§4.6).
 
-Один код сервисов для MCP и REST (ARCH §1): все методы кроме search (search —
-SearchService, шаг 2.3). Внешние вызовы отсутствуют (Фаза 2): `vector_status`/`summary_status` всегда `pending`, `summary`
-в выдачах — fallback-усечение текста (REQUIREMENTS §5.5).
+Один код сервисов для MCP и REST (ARCH §1). С Фазы 3 — синхронное кодирование
+текста и дедуп в save/update (EmbeddingService + DeduplicationService иньектируются;
+отказ векторизации не ломает операцию — NFR-3): заметка сохраняется, дедуп
+деградирует к FTS, до-векторизация — фоновым воркером (§3.4). Суммаризации в
+синхронном пути нет (режим «Б», Фаза 4): summary всегда fallback-усечение.
 
 Контракты ответов (то, что уйдёт моделям через MCP-инструменты):
-- save   → {id, stored: True, summary_pending: True}
+- save (успех с вектором)  → {id, stored: True, summary_pending: True}
+- save (векторизация упала)→ + warning «дедуп только по тексту» (ARCH §4.1)
+- save (дубль)             → {duplicated: True, id, text, hint} (не создаётся)
 - get    → {notes: [...]} (массив даже для одного id; отсутствующие/удалённые
            id пропускаются; пустой результат — мягкий ответ с hint)
 - list   → {items: [...], total} (без полных текстов) (+hint, если пусто)
 - update → {id, updated: True, summary_pending: True} | мягкий ответ updated: False
 - delete → {id, deleted: True} | мягкий ответ deleted: False (soft delete)
+
+Про update **без warning**: контрактом FR-5 warning не предусмотрен — модель
+учится только по ответам save/search (§5.3), сам факт retry-векторизации
+ремонтируется воркером прозрачно.
 
 Пагинация/сортировка: `ORDER BY updated_at DESC, id DESC` — свежесть важнее
 возраста (FR-2); метки времени живут с точностью до секунды (DDL-формат
@@ -24,12 +32,22 @@ import sqlite3
 from typing import Any
 
 from app.config import Settings
+from app.services.dedup import DeduplicationService, duplicate_response
+from app.services.embedding import Embedder, EmbeddingError, EmbeddingService
 from app.services.emit import summary_of
+from app.storage import vectors
 from app.storage.db import session, transaction
 
 # Фиксированные верхние границы контрактов (REQUIREMENTS §5.1/NFR-6; env —
 # только для умолчаний: DEFAULT_LIST_LIMIT), поэтому не настраиваются.
 MAX_LIST_LIMIT = 50
+
+# Векторизация записи не удалась: если заметка сохранена — предупреждаем
+# модель честно, что семантический дедуп/поиск недоступны (ARCH §4.1, §5.3).
+WARNING_VECTOR_PENDING = (
+    "векторизация отложена: дедуп только по тексту (перефразы не ловятся), "
+    "поиск по этой заметке появится после до-векторизации фоновым воркером"
+)
 
 
 class NoteValidationError(ValueError):
@@ -41,23 +59,63 @@ class NoteValidationError(ValueError):
 
 
 class NoteService:
-    """CRUD над банком заметок; статусы pending — Фазы 3–4 их меняют."""
+    """CRUD банком заметок; save/update — векторизация, delete — soft."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        embedding: Embedder | None = None,
+        dedup: DeduplicationService | None = None,
+    ) -> None:
         self._settings = settings
+        # DI для тестов: HashEmbedder/фейк вместо живого Ollama.
+        self._embedding: Embedder = (
+            embedding if embedding is not None else EmbeddingService(settings)
+        )
+        self._dedup = dedup if dedup is not None else DeduplicationService(settings)
 
-    # --- FR-4 memory_save (без векторизации/дедупа — Фаза 3) --------------
+    # --- FR-4 memory_save (ARCH §4.1) --------------------------------------
 
     def save(self, text: str, author: str | None = None) -> dict[str, Any]:
-        """INSERT новой заметки; статусы pending; summary пуст до Фазы 4."""
+        """Валидация → кодирование → дедуп → INSERT (+вектор) одной транзакцией."""
         self._validate_text(text)
+        vector = self._note_vector(text)
+        if vector is not None:
+            duplicate = self._dedup.find_by_cosine(vector)
+            if duplicate is not None:
+                return duplicate_response(duplicate)
+            with session(self._settings) as conn, transaction(conn):
+                note_id = self._insert(conn, text, author, vector_status="ok")
+                vectors.upsert(conn, note_id, vector)
+            return {"id": note_id, "stored": True, "summary_pending": True}
+
+        # Отказ векторизации: заметка сохраняется, дедуп — по тексту (дословный),
+        # перефразы пропускаются (warning — канал обучения, §5.3).
+        duplicate = self._dedup.find_by_text(text)
+        if duplicate is not None:
+            return duplicate_response(duplicate)
         with session(self._settings) as conn, transaction(conn):
-            cursor = conn.execute(
-                "INSERT INTO notes (text, author) VALUES (?, ?)",
-                (text, author if author else self._settings.author_default),
-            )
-            note_id = cursor.lastrowid
-        return {"id": note_id, "stored": True, "summary_pending": True}
+            note_id = self._insert(conn, text, author)
+        return {
+            "id": note_id,
+            "stored": True,
+            "summary_pending": True,
+            "warning": WARNING_VECTOR_PENDING,
+        }
+
+    def _insert(
+        self,
+        conn: sqlite3.Connection,
+        text: str,
+        author: str | None,
+        vector_status: str = "pending",
+    ) -> int:
+        """INSERT строки заметки (внутри открытой транзакции)."""
+        cursor = conn.execute(
+            "INSERT INTO notes (text, author, vector_status) VALUES (?, ?, ?)",
+            (text, author if author else self._settings.author_default, vector_status),
+        )
+        return int(cursor.lastrowid or 0)
 
     # --- FR-3 memory_get (batch, алиас id нормализует транспорт) ----------
 
@@ -134,32 +192,47 @@ class NoteService:
             }
         return {"items": items, "total": total}
 
-    # --- FR-5 memory_update (перезапись целиком) ---------------------------
+    # --- FR-5 memory_update (перезапись целиком + ре-векторизация §4.5) ----
 
     def update(self, note_id: int, text: str) -> dict[str, Any]:
-        """UPDATE text целиком; старое summary невалидно → pending (§4.5)."""
+        """UPDATE text целиком; summary reset; sync ре-векторизация.
+
+        Отказ ре-векторизации — рядовой pending (воркер догонит); warning
+        контрактом FR-5 не предусмотрен, ответ не меняется.
+        """
         self._validate_text(text)
+        # Быстрая проверка до внешнего вызова: несуществующий id не кодируем.
+        with session(self._settings) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM notes WHERE id = ? AND deleted_at IS NULL",
+                (note_id,),
+            ).fetchone()
+        if exists is None:
+            return self._not_found(note_id)
+        vector = self._note_vector(text)
         with session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
-                "UPDATE notes SET text = ?, "
+                "UPDATE notes SET text = ?, vector_status = ?, "
                 "summary = '', summary_status = 'pending', "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
                 "WHERE id = ? AND deleted_at IS NULL",
-                (text, note_id),
+                (
+                    text,
+                    "ok" if vector is not None else "pending",
+                    note_id,
+                ),
             )
             updated = cursor.rowcount  # 0 = нет такой активной заметки
+            if vector is not None:
+                vectors.upsert(conn, note_id, vector)
         if not updated:
-            return {
-                "id": note_id,
-                "updated": False,
-                "hint": "заметка не найдена (возможно, удалена)",
-            }
+            return self._not_found(note_id)
         return {"id": note_id, "updated": True, "summary_pending": True}
 
     # --- FR-6 memory_delete (soft delete) ----------------------------------
 
     def delete(self, note_id: int) -> dict[str, Any]:
-        """Soft delete: `deleted_at` = now, физически строка/индекс живы (§4.6)."""
+        """Soft delete: `deleted_at` = now, физически строка/индекс/вектор живы."""
         with session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
                 "UPDATE notes SET deleted_at = "
@@ -199,6 +272,21 @@ class NoteService:
         }
 
     # --- внутренне ---------------------------------------------------------
+
+    def _note_vector(self, text: str) -> list[float] | None:
+        """Синхронное кодирование; отказ векторизации — None (не исключение)."""
+        try:
+            return self._embedding.embed(text)
+        except EmbeddingError:
+            return None
+
+    @staticmethod
+    def _not_found(note_id: int) -> dict[str, Any]:
+        return {
+            "id": note_id,
+            "updated": False,
+            "hint": "заметка не найдена (возможно, удалена)",
+        }
 
     def _validate_text(self, text: str) -> None:
         """1..MAX_NOTE_CHARS — доменное правило REQUIREMENTS FR-4/FR-5."""

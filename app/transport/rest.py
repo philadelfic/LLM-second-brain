@@ -77,7 +77,9 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.post("/notes", status_code=201)
     async def create_note(payload: NoteCreate, request: Request) -> dict:
-        """Создать заметку (аналог memory_save без векторизации/дедупа)."""
+        """Создать заметку (memory_save FR-4: векторизация + дедуп).
+
+        Среда без Ollama → деградация (pending + warning, дедуп по тексту)."""
         try:
             return await asyncio.to_thread(
                 _services(request).notes.save, payload.text, payload.author
@@ -145,7 +147,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
         q: str = Query(..., min_length=1, max_length=settings.max_query_chars),
         top_k: int | None = Query(default=None, ge=1, le=20),
     ) -> dict:
-        """FTS-поиск (Фаза 2 — без семантики): выдача FR-1."""
+        """Поиск (Фаза 3 — гибрид vec0+FTS, выдача FR-1; offline → FTS-only)."""
         try:
             return await asyncio.to_thread(
                 _services(request).search.search, q, top_k
