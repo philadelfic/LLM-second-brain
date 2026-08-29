@@ -11,8 +11,11 @@ CRUD (валидации, статусы, soft delete) — в `app.services.note
   AFTER INSERT / AFTER UPDATE OF text. DELETE-триггер не нужен: удаление —
   soft (`deleted_at`), строка и FTS-индекс физически остаются в trash.
 - `notes_vec` — vec0-таблица, размерность фиксируется при создании БД
-  (ARCH §3.3); несовпадение с EMBEDDING_DIM при старте — отказ запуска
-  (переиндексация — scripts/reindex.py).
+  (ARCH §3.3); при несовпадении конфигурации с зафиксированной в БД
+  (EMBEDDING_DIM или смена EMBEDDING_MODEL, записанная в таблице meta)
+  запускается ПОЛНАЯ автореиндексация при старте: индекс пересоздаётся,
+  все заметки (включая trash) становятся vector_status='pending',
+  догоняются фоновым воркером (решение 2026-08-29).
 - WAL + busy_timeout (ARCH §3.3): чтения конкурентны, писатели сериализуются,
   спор за блокировку разрешается ожиданием до BUSY_TIMEOUT_MS, а не
   мгновенным «database is locked».
@@ -29,6 +32,7 @@ CRUD (валидации, статусы, soft delete) — в `app.services.note
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 from collections.abc import Iterator
@@ -83,7 +87,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
 """
 
 # Вектора (Фаза 3): физическая схема в `app.storage.vectors` (размерность и
-# cosine-метрика — там же); в init_db — только создание/сверка при старте.
+# cosine-метрика — там же); в init_db — создание/сверка при старте. Модель
+# эмбеддинга, на которой построен индекс, — в таблице meta (см. ниже):
+# смена модели/размерности поверх живой БД = автоматическая переиндексация.
+_META_DDL = """
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+)
+"""
 
 # Синхронизация FTS с notes. Для внешнего контента удаление из индекса —
 # спец-команда 'delete' со СТАРЫМИ значениями индексируемых колонок.
@@ -202,10 +214,14 @@ def _assert_note_chars_limit(conn: sqlite3.Connection, settings: Settings) -> No
 def init_db(settings: Settings) -> None:
     """Создать схему при старте (критерий приёмки Фазы 2); идемпотентно.
 
+    При смене EMBEDDING_MODEL или EMBEDDING_DIM поверх существующей БД
+    автоматически перестраивается векторный индекс: солёные вектора другой
+    модели несовместимы, все заметки уходят в pending и догоняются воркером
+    (NFR-3 — данные не теряются, поиск деградирует к FTS до готовности).
+
     Raises:
         StorageError: БД недоступна, нет FTS5/vec0, схема повреждена,
-        env разошёлся с зафиксированной схемой (несовпадение размерности
-        vec0-таблицы с EMBEDDING_DIM или лимита CHECK с MAX_NOTE_CHARS).
+        env разошёлся с зафиксированной схемой (CHECK-лимит MAX_NOTE_CHARS).
     """
     path = Path(settings.db_path)
     try:
@@ -217,23 +233,80 @@ def init_db(settings: Settings) -> None:
             # готовой БД — разрыв конфигурации: CHECK не меняется на лету,
             # крупные заметки стали бы падать в рантайме с невнятным
             # IntegrityError (сообщение CHECK-а ничего не говорит об env).
-            # Отказ старта с подсказкой — по образцу EMBEDDING_DIM (§8).
             _assert_note_chars_limit(conn, settings)
             conn.execute(_FTS_DDL)
             for trigger in _TRIGGERS:
                 conn.execute(trigger)
             _check_fts_integrity(conn)
-            # Вектора (Фаза 3): создание при первом старте; при последующих —
-            # сверка размерности с env, несовпадение — понятный отказ запуска
-            # вместо молчаливо невалидного индекса (REQUIREMENTS §8).
-            try:
-                vectors.ensure_vec_table(conn, settings.embedding_dim)
-            except vectors.VectorError as exc:
-                raise StorageError(str(exc)) from exc
+            # Вектора (Фаза 3 + решение 2026-08-29): создание при первом
+            # старте; при несовпадении зафиксированной конфигурации
+            # (модель/размерность) с env — полная автореиндексация.
+            _sync_embedding_meta(conn, settings)
     except (sqlite3.Error, OSError) as exc:
         raise StorageError(
             f"не удалось инициализировать БД {settings.db_path}: {exc}"
         ) from exc
+
+
+def _get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return None if row is None else str(row[0])
+
+
+def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
+def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
+    """Сверить (модель, размерность) эмбеддинга с записью в meta; разошлись —
+    полная автореиндексация: notes_vec пересоздаётся под текущую размерность,
+    все заметки (включая trash — их вектора тоже невалидны) уходят в pending.
+
+    Наследие: у БД без meta (созданных до этой правки) запись создаётся из
+    текущего env без реиндексации — нулевой миграцией; их вектора и так
+    были построены той же моделью (иначе оператор потратил бы reindex.py).
+    """
+    conn.execute(_META_DDL)
+    stored = _get_meta(conn, "embedding_model")
+    stored_dim_raw = _get_meta(conn, "embedding_dim")
+    existing_dim = vectors.existing_vec_dim(conn)
+    if stored is None or stored_dim_raw is None:
+        # Свежая БД (нет таблицы) или унаследованная (не трогаем, см. docstring).
+        if existing_dim is None:
+            vectors.create_vec_table(conn, settings.embedding_dim)
+        _set_meta(conn, "embedding_model", settings.embedding_model)
+        _set_meta(conn, "embedding_dim", str(settings.embedding_dim))
+        return
+    stored_dim = int(stored_dim_raw)
+    if stored == settings.embedding_model and stored_dim == settings.embedding_dim:
+        return
+    notes_count = int(
+        conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    )
+    logging.getLogger("app").warning(
+        "embedding model/dim changed: rebuilding vector index",
+        extra={
+            "event": "reindex_started",
+            "from_model": stored,
+            "to_model": settings.embedding_model,
+            "from_dim": stored_dim,
+            "to_dim": settings.embedding_dim,
+            "notes": notes_count,
+        },
+    )
+    conn.execute("DROP TABLE IF EXISTS notes_vec")
+    vectors.create_vec_table(conn, settings.embedding_dim)
+    conn.execute("UPDATE notes SET vector_status = 'pending'")
+    _set_meta(conn, "embedding_model", settings.embedding_model)
+    _set_meta(conn, "embedding_dim", str(settings.embedding_dim))
+    logging.getLogger("app").info(
+        "vector index rebuilt; background worker will re-encode all notes",
+        extra={"event": "reindex_done", "pending_vector": notes_count},
+    )
 
 
 def _check_fts_integrity(conn: sqlite3.Connection) -> None:
