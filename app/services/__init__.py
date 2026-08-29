@@ -16,12 +16,14 @@ from app.services.dedup import DeduplicationService
 from app.services.embedding import EmbeddingService
 from app.services.notes import NoteService
 from app.services.search import SearchService
+from app.services.summary import SummaryService
 
 __all__ = [
     "DeduplicationService",
     "EmbeddingService",
     "NoteService",
     "SearchService",
+    "SummaryService",
     "Services",
     "build_services",
 ]
@@ -35,10 +37,18 @@ class Services:
     search: SearchService
     embedding: EmbeddingService
     dedup: DeduplicationService
+    summary: SummaryService  # воркер — единственный потребитель (режим «Б»)
 
 
-def build_services(settings: Settings) -> Services:
-    """Собрать сервисы из настроек (Settings frozen — снимок на процесс)."""
+def build_services(
+    settings: Settings,
+    summary: SummaryService | None = None,
+) -> Services:
+    """Собрать сервисы из настроек (Settings frozen — снимок на процесс).
+
+    `summary` — DI e2e-тестов (фейк вместо живой Ollama суммаризации);
+    по умолчанию — настоящий SummaryService на SUMMARY_OLLAMA_BASE_URL.
+    """
     embedding = EmbeddingService(settings)
     dedup = DeduplicationService(settings)
     return Services(
@@ -46,4 +56,5 @@ def build_services(settings: Settings) -> Services:
         search=SearchService(settings, embedding),
         embedding=embedding,
         dedup=dedup,
+        summary=summary if summary is not None else SummaryService(settings),
     )
