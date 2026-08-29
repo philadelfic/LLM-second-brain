@@ -53,10 +53,25 @@ Self-hosted MCP-сервер «второго мозга» для LLM, крут�
   `python -m scripts.reindex`; `embedding_ok` в `/health`. Тесты: unit
   с детерминированным HashEmbedder + интеграционные с живой Ollama
   (маркер `integration`, SKIP при недоступности сервера).
-- **Далее:** Фаза 4 — суммаризация (фоновая, режим «Б», вторая Ollama).
+- **Фаза 4 — суммаризация (режим «Б»): ЗАВЕРШЕНА.** SummaryService — клиент
+  ко второй Ollama `POST /api/chat` (SUMMARY_OLLAMA_BASE_URL,
+  `ornith-1.5:35b`): промпт одно предложение ≤ MAX_SUMMARY_CHARS, имена/
+  числа/даты, язык заметки; thinking не ограничивается (`message.thinking`
+  отбрасывается), пустой content = отказ, страховка-обрезка до 200 симв.
+  Генерация — **только фоновым воркером**: вторая очередь `pending_summary`
+  с независимым back-off (30с→×2→15мин), догон при старте, trash пропускается,
+  защита от гонки с `memory_update` (суммари пишется по неизменённому тексту);
+  до готовности выдачи отдают fallback-усечение + `summary_status=pending`;
+  `/health.summarizer_ok` отражает исход последней генерации. Замеры
+  `python -m scripts.benchmark_summary` (модель суммаризации, латентность
+  think vs no-think, актуальность догенерации).
+- **Далее:** Фаза 5 — hardening и деплой (лимиты, логирование, backup,
+  сборка образа, подъём на целевом сервере).
 
 Запуск тестов: `pytest -m "not integration"` — слой без сети; live-прогон
-`pytest -m integration` (адрес живой Ollama — env `LIVE_OLLAMA_URL`,
-дефолт 192.168.3.113:11434, скип при недоступности).
+`pytest -m integration` — живые Ollama: векторизатор (`LIVE_OLLAMA_URL`,
+дефолт 192.168.3.113:11434) и суммаризатор (`LIVE_SUMMARY_URL`, дефолт
+192.168.3.112:11434, `LIVE_SUMMARY_MODEL` — ornith-1.5:35b); SKIP при
+недоступности серверов. Замеры суммаризации: `python -m scripts.benchmark_summary`.
 
 Roadmap: REQUIREMENTS §10. Тесты: `pytest` (юнит + e2e по живому серверу).
