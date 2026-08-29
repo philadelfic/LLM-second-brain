@@ -1,17 +1,28 @@
 """MCP-поверхность (ARCHITECTURE §3.1, §5): 6 инструментов `memory_*` + инструкции.
 
 `MCPServer` — официальный высокоуровневый API mcp SDK 2.x (ex-`FastMCP`).
-Фаза 1: инструменты объявлены сигнатурами и обучающими описаниями
-(«канонические черновики» ARCHITECTURE §5.2), вызовы возвращают заглушку —
-реализация в Фазе 2+ (хранилище), гибридный поиск — Фаза 3.
+Фаза 2: инструменты вызывают тот же service-слой, что и REST (ARCH §1);
+внешних LLM-вызовов нет — summary/vector pending, поиск FTS-only (Фазы 3–4
+добавят семантику и суммаризацию в фоновом воркере).
+
+ВАЖНО: не добавлять `from __future__ import annotations` — SDK вычисляет
+аннотации инструментов (eval/logging.get_type_hints на реальных объектах);
+со строковыми аннотациями from_function не видит замыкание settings и падает
+InvalidSignature (см. журнал Фазы 1, подтверждено ещё раз в Фазе 2).
+
+Блокирующие вызовы SQLite — короткие (мс), но event loop не занимаем:
+каждый вызов сервиса уходит в `asyncio.to_thread`, а соединение с БД целиком
+живёт внутри рабочего потока.
 """
 
+import asyncio
 from typing import Annotated, Any
 
 from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
 from app.config import Settings
+from app.services import Services
 
 SERVER_NAME = "LLM Second Brain"
 
@@ -66,21 +77,11 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     ),
 }
 
-STUB_NOTE = (
-    "Инструмент объявлен в каркасе Фазы 1; реализация — Фаза 2 (хранилище), "
-    "полный гибридный поиск — Фаза 3."
-)
-
 TOOL_NAMES = frozenset(TOOL_DESCRIPTIONS)
 
 
-def _stub() -> dict[str, Any]:
-    """Ответ заглушки Фазы 1 (реализация контрактов — Фаза 2+)."""
-    return {"implemented": False, "note": STUB_NOTE}
-
-
-def build_mcp(settings: Settings) -> MCPServer:
-    """Собрать MCP-сервер: инструкции (§5.1) + 6 инструментов (§5.2).
+def build_mcp(settings: Settings, services: Services) -> MCPServer:
+    """Собрать MCP-сервер: инструкции (§5.1) + 6 инструментов над сервисами.
 
     Сигнатуры и ограничения параметров — контракты REQUIREMENTS §5.1;
     значения по умолчанию (DEFAULT_TOP_K, DEFAULT_LIST_LIMIT) — из env.
@@ -102,7 +103,7 @@ def build_mcp(settings: Settings) -> MCPServer:
             Field(description="Число результатов", ge=1, le=20),
         ] = settings.default_top_k,
     ) -> dict[str, Any]:
-        return _stub()
+        return await asyncio.to_thread(services.search.search, query, top_k)
 
     @mcp.tool(name="memory_list", description=TOOL_DESCRIPTIONS["memory_list"])
     async def memory_list(
@@ -115,7 +116,7 @@ def build_mcp(settings: Settings) -> MCPServer:
             Field(description="Смещение страницы", ge=0),
         ] = 0,
     ) -> dict[str, Any]:
-        return _stub()
+        return await asyncio.to_thread(services.notes.list, limit, offset)
 
     @mcp.tool(name="memory_get", description=TOOL_DESCRIPTIONS["memory_get"])
     async def memory_get(
@@ -129,10 +130,15 @@ def build_mcp(settings: Settings) -> MCPServer:
         ] = None,
         id: Annotated[
             int | None,
-            Field(description="Одиночный id — алиас для ids"),
+            Field(description="Одиночный id — алиас для списка из одного"),
         ] = None,
     ) -> dict[str, Any]:
-        return _stub()
+        # FR-3: id (int) — алиас одного id (оборачивается в список).
+        if ids is None:
+            if id is None:
+                raise ValueError("передай ids (список) или одиночный id")
+            ids = [id]
+        return await asyncio.to_thread(services.notes.get, ids)
 
     @mcp.tool(name="memory_save", description=TOOL_DESCRIPTIONS["memory_save"])
     async def memory_save(
@@ -145,7 +151,7 @@ def build_mcp(settings: Settings) -> MCPServer:
             ),
         ],
     ) -> dict[str, Any]:
-        return _stub()
+        return await asyncio.to_thread(services.notes.save, text)
 
     @mcp.tool(name="memory_update", description=TOOL_DESCRIPTIONS["memory_update"])
     async def memory_update(
@@ -159,12 +165,12 @@ def build_mcp(settings: Settings) -> MCPServer:
             ),
         ],
     ) -> dict[str, Any]:
-        return _stub()
+        return await asyncio.to_thread(services.notes.update, id, text)
 
     @mcp.tool(name="memory_delete", description=TOOL_DESCRIPTIONS["memory_delete"])
     async def memory_delete(
         id: Annotated[int, Field(description="Id заметки")],
     ) -> dict[str, Any]:
-        return _stub()
+        return await asyncio.to_thread(services.notes.delete, id)
 
     return mcp

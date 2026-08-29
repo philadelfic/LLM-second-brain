@@ -62,12 +62,16 @@ class TestBearerMiddleware:
     ) -> None:
         """Схема нечувствительна к регистру (RFC 7235)."""
         response = client.get("/notes", headers={"Authorization": f"bearer {token}"})
-        assert response.status_code == 404  # прошёл авторизацию, маршрута нет
+        assert response.status_code == 200  # прошёл авторизацию, REST-маршрут есть
+        assert response.json()["items"] == []
 
     def test_valid_token_passes(self, client: TestClient, token: str) -> None:
-        """Верный токен → запрос доходит до роутера (404: маршрута ещё нет)."""
+        """Верный токен → запрос доходит до роутера (GET /notes — REST Фазы 2)."""
         response = client.get("/notes", headers={"Authorization": f"Bearer {token}"})
-        assert response.status_code == 404
+        assert response.status_code == 200
+        body = response.json()
+        assert body["items"] == []  # среда чистая, заметок ещё нет
+        assert body["total"] == 0
 
     def test_post_to_mcp_path_requires_token(self, client: TestClient) -> None:
         """MCP-путь (POST /mcp, Шаг 3) тоже за миддлварью."""
