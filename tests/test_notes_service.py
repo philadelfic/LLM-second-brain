@@ -1,16 +1,30 @@
-"""Тесты NoteService (Фаза 2, Шаг 2.2): CRUD, soft delete, пагинация, batch.
+"""Тесты NoteService (Фаза 3, шаг 3.4): CRUD, дедуп, векторизация, soft delete.
 
-REQUIREMENTS FR-2…FR-6 в ограничении Фазы 2 (без внешних вызовов): статусы
-всегда pending, summary в выдачах — fallback-усечение MAX_SUMMARY_CHARS.
+REQUIREMENTS FR-2…FR-6. Векторизация/дедуп в save/update — через детерминированный
+HashEmbedder (успешный путь); режимы деградации и живой дедуп —
+tests/test_save_vectorize.py. Summary — fallback-усечение (Фаза 4).
 """
 
 from __future__ import annotations
 
 import pytest
+from fakes import HashEmbedder
 
 from app.config import get_settings
 from app.services.notes import MAX_LIST_LIMIT, NoteService, NoteValidationError
+from app.storage import vectors
 from app.storage.db import init_db, session
+
+
+def unique(text: str) -> str:
+    """Уникальный текст: HashEmbedder не примет нумерованные siblings за дубли.
+
+    Дедуп (Фаза 3) отсекает близкие тексты — тестам счётчиков/пагинации нужны
+    гарантированно «разные» заметки; вводим uuid-хвост в текст.
+    """
+    import uuid
+
+    return f"{text} [{uuid.uuid4().hex[:8]}]"
 
 
 def long_text(n_chars: int) -> str:
@@ -19,10 +33,17 @@ def long_text(n_chars: int) -> str:
     return (word * (n_chars // len(word) + 1))[:n_chars]
 
 
+def _notes(settings=None) -> NoteService:
+    """NoteService с детерминированным HashEmbedder (без сети, ARCH §7)."""
+    settings = settings or get_settings()
+    return NoteService(settings, HashEmbedder(settings.embedding_dim))
+
+
 @pytest.fixture
 def service() -> NoteService:
-    init_db(get_settings())
-    return NoteService(get_settings())
+    settings = get_settings()
+    init_db(settings)
+    return _notes(settings)
 
 
 def _set_updated_at(note_id: int, stamp: str) -> None:
@@ -43,10 +64,16 @@ class TestSave:
         service.save("Заметка о сервисе")
         with session(get_settings()) as conn:
             row = conn.execute("SELECT * FROM notes WHERE id = 1").fetchone()
+            # вектор записан в notes_vec и согласован с HashEmbedder
+            stored_vector = vectors.get_vector(conn, 1)
         assert row["summary"] == ""  # сгенерируется в Фазе 4
-        assert row["vector_status"] == "pending"  # векторизация — Фаза 3
+        assert row["vector_status"] == "ok"  # синхронная векторизация удалась
         assert row["summary_status"] == "pending"
         assert row["deleted_at"] is None
+        assert stored_vector == pytest.approx(
+            HashEmbedder(get_settings().embedding_dim).embed("Заметка о сервисе"),
+            abs=1e-6,
+        )
 
     def test_author_default_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """AUTHOR_DEFAULT из env (по умолчанию unknown) — автор, если харнес
@@ -54,7 +81,7 @@ class TestSave:
         monkeypatch.setenv("AUTHOR_DEFAULT", "test-model")
         get_settings.cache_clear()
         init_db(get_settings())
-        NoteService(get_settings()).save("Заметка о сервисе")
+        _notes().save("Заметка о сервисе")
         with session(get_settings()) as conn:
             author = conn.execute("SELECT author FROM notes WHERE id=1").fetchone()[0]
         assert author == "test-model"
@@ -102,7 +129,7 @@ class TestGet:
 
     def test_batch_order_follows_request(self, service: NoteService) -> None:
         for i in range(1, 4):
-            service.save(f"Заметка {i}")
+            service.save(unique(f"Заметка {i}"))
         result = service.get([3, 1])
         assert [n["id"] for n in result["notes"]] == [3, 1]
 
@@ -155,7 +182,7 @@ class TestGet:
         monkeypatch.setenv("MAX_SUMMARY_CHARS", "10")
         get_settings.cache_clear()
         init_db(get_settings())
-        service = NoteService(get_settings())
+        service = _notes()
         service.save(long_text(30))
         note = service.get([1])["notes"][0]
         assert note["summary"] == long_text(30)[:10]
@@ -182,7 +209,7 @@ class TestList:
 
     def test_total_and_pagination(self, service: NoteService) -> None:
         for i in range(1, 26):  # 25 заметок
-            service.save(f"Заметка номер {i}")
+            service.save(unique(f"Заметка номер {i}"))
         first = service.list()
         assert len(first["items"]) == 20  # DEFAULT_LIST_LIMIT
         assert first["total"] == 25
@@ -208,7 +235,7 @@ class TestList:
     def test_same_second_tiebreak_by_id_desc(self, service: NoteService) -> None:
         """Одна секунда DDL → порядок внутри секунды определяет id."""
         for i in range(1, 4):
-            service.save(f"Быстрая {i}")
+            service.save(unique(f"Быстрая {i}"))
         ids = [item["id"] for item in service.list()["items"]]
         assert ids == [3, 2, 1]
 
@@ -271,14 +298,17 @@ class TestUpdate:
         with pytest.raises(NoteValidationError):
             service.update(1, long_text(2001))
 
-    def test_vector_status_untouched(self, service: NoteService) -> None:
-        """Фаза 2: синхронной ре-векторизации нет — pending не трогаем;
-        (Фаза 3: там появится sync-ре-векторизация + pending при отказе)."""
+    def test_vector_status_reflects_revectorize(self, service: NoteService) -> None:
+        """Фаза 3: update ре-векторизует sync — 'ok' и вектор от нового текста."""
         service.save("Текст")
         service.update(1, "Другой текст")
         with session(get_settings()) as conn:
             row = conn.execute("SELECT vector_status FROM notes WHERE id=1").fetchone()
-        assert row["vector_status"] == "pending"
+            stored_vector = vectors.get_vector(conn, 1)
+        assert row["vector_status"] == "ok"
+        assert stored_vector == pytest.approx(
+            HashEmbedder(get_settings().embedding_dim).embed("Другой текст"), abs=1e-6
+        )
 
 
 class TestDelete:
@@ -339,7 +369,7 @@ class TestSettingsSnapshot:
         monkeypatch.setenv("MAX_SUMMARY_CHARS", "10")
         get_settings.cache_clear()
         init_db(get_settings())
-        service = NoteService(get_settings())
+        service = _notes()
         service.save(long_text(50))
         get_settings.cache_clear()
         assert len(service.get([1])["notes"][0]["summary"]) == 10

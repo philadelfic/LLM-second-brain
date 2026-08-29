@@ -29,6 +29,17 @@ def service() -> tuple[SearchService, NoteService]:
     return _searcher(settings), NoteService(settings)
 
 
+def unique(text: str) -> str:
+    """Уникальный текст: HashEmbedder не примет нумерованные siblings за дубли.
+
+    Дедуп (Фаза 3) отсекает близкие тексты — тестам счётчиков/пагинации нужны
+    гарантированно «разные» заметки; вводим uuid-хвост в текст.
+    """
+    import uuid
+
+    return f"{text} [{uuid.uuid4().hex[:8]}]"
+
+
 def long_text(n_chars: int) -> str:
     word = "слово "
     return (word * (n_chars // len(word) + 1))[:n_chars]
@@ -181,7 +192,7 @@ class TestEmptyAndValidation:
     def test_top_k_limits_output(self, service) -> None:
         _, notes_service = service
         for i in range(1, 8):  # 7 подходящих заметок
-            notes_service.save(f"TaskFlow догма номер {i}")
+            notes_service.save(unique(f"TaskFlow догма номер {i}"))
         searcher = _searcher()
         assert len(searcher.search("TaskFlow")["results"]) == 5  # DEFAULT_TOP_K
         assert len(searcher.search("TaskFlow", top_k=3)["results"]) == 3
@@ -196,6 +207,6 @@ class TestEmptyAndValidation:
 
         notes_service = NS(get_settings())
         for i in range(1, 5):
-            notes_service.save(f"TaskFlow число {i}")
+            notes_service.save(unique(f"TaskFlow число {i}"))
         result = _searcher().search("TaskFlow")
         assert len(result["results"]) == 2

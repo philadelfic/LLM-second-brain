@@ -9,6 +9,15 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from app.services.notes import WARNING_VECTOR_PENDING
+
+
+def unique(text: str) -> str:
+    """Уникальный текст: дедуп Фазы 3 не примет нумерованные siblings за дубли."""
+    import uuid
+
+    return f"{text} [{uuid.uuid4().hex[:8]}]"
+
 
 class TestNotesCrud:
     def _create(self, client: TestClient, token: str, text: str, **kw) -> dict:
@@ -20,7 +29,25 @@ class TestNotesCrud:
 
     def test_create_returns_contract(self, client: TestClient, token: str) -> None:
         result = self._create(client, token, "Рест: заметка о деплое")
-        assert result == {"id": 1, "stored": True, "summary_pending": True}
+        # Тестовая среда без Ollama → сохранение по FR-4 в режиме деградации:
+        # векторизация отложена, дедуп по тексту — обязательный warning.
+        assert result == {
+            "id": 1,
+            "stored": True,
+            "summary_pending": True,
+            "warning": WARNING_VECTOR_PENDING,
+        }
+
+    def test_create_duplicate_rejected_by_text_fallback(
+        self, client: TestClient, token: str
+    ) -> None:
+        """Дедуп Фазы 3 с деградацией векторизации: дословный дубль ловится."""
+        self._create(client, token, "Рест: дословный дубликат тест")
+        second = self._create(client, token, "Рест: дословный дубликат тест")
+        assert second["duplicated"] is True
+        assert second["id"] == 1
+        assert second["text"] == "Рест: дословный дубликат тест"
+        assert "memory_update" in second["hint"]
 
     def test_get_single_note_with_full_text(
         self, client: TestClient, token: str
@@ -51,7 +78,7 @@ class TestNotesCrud:
 
     def test_list_pagination_params(self, client: TestClient, token: str) -> None:
         for i in range(1, 6):
-            self._create(client, token, f"Рест: пагинация {i}")
+            self._create(client, token, unique(f"Рест: пагинация {i}"))
         page = client.get(
             "/notes",
             params={"limit": 2, "offset": 3},
