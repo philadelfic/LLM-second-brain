@@ -2,6 +2,7 @@
 
 Собирает каркас Фазы 1: REST-ручки (`/health`), MCP-сервер (`/mcp`, 6
 инструментов `memory_*`), Bearer-миддлварь на всё, кроме `/health` (NFR-2).
+Фаза 2: при старте инициализируется хранилище (SQLite-схема, ARCH §3.3).
 
 Запуск: `python -m app` (uvicorn) — порт и уровень логов из окружения.
 """
@@ -16,6 +17,7 @@ from fastapi import FastAPI
 
 from app import __version__
 from app.config import ConfigError, Settings, get_settings
+from app.storage.db import StorageError, init_db
 from app.transport.auth import BearerAuthMiddleware
 from app.transport.mcp import build_mcp
 from app.transport.rest import rest_router
@@ -45,6 +47,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # Инициализация хранилища при старте (критерий приёмки Фазы 2):
+        # схема создаётся/сверяется до первого запроса; ошибка — фатальна.
+        try:
+            init_db(settings)
+        except StorageError as exc:
+            print(f"FATAL: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
         # Жизненный цикл MCP-сессий Streamable HTTP = жизни процесса.
         async with mcp.session_manager.run():
             yield
