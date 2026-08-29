@@ -92,6 +92,31 @@ class TestSchemaCreated:
             with pytest.raises(sqlite3.IntegrityError):
                 conn.execute("INSERT INTO notes(text) VALUES (?)", ("x" * 11,))
 
+    def test_start_fails_when_max_note_chars_diverged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Смена MAX_NOTE_CHARS поверх готовой БД — фатальный отказ старта.
+
+        Лимит «запечён» в CHECK при первом создании; запуск сервиса с другим
+        значением невозможен — крупные заметки падали бы в рантайме с
+        невнятным IntegrityError (Фаза 5: аналог гейта EMBEDDING_DIM).
+        """
+        monkeypatch.setenv("MAX_NOTE_CHARS", "10")
+        get_settings.cache_clear()
+        init_db(get_settings())  # БД создана с лимитом 10
+        monkeypatch.setenv("MAX_NOTE_CHARS", "500")
+        get_settings.cache_clear()
+        with pytest.raises(StorageError, match="MAX_NOTE_CHARS") as exc_info:
+            init_db(get_settings())
+        # Сообщение называет оба значения — оператор сразу видит конфликт.
+        assert "10" in str(exc_info.value)
+        assert "500" in str(exc_info.value)
+
+    def test_start_ok_with_same_limit(self) -> None:
+        """Перезапуск с тем же лимитом — сверка не мешает (идемпотентность)."""
+        init_db(get_settings())
+        init_db(get_settings())
+
     def test_idempotent_and_data_preserved(self) -> None:
         settings = get_settings()
         init_db(settings)

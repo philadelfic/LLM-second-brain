@@ -29,6 +29,7 @@ CRUD (валидации, статусы, soft delete) — в `app.services.note
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -42,6 +43,10 @@ from app.storage import vectors
 # Сколько ждать блокировку записи, прежде чем сдаться (как timeout sqlite3,
 # так и PRAGMA busy_timeout).
 BUSY_TIMEOUT_MS = 5000
+
+# Как выцупоть лимит CHECK(length(text) BETWEEN 1 AND ?) из DDL живой таблицы
+# notes (сверка с MAX_NOTE_CHARS при старте — см. init_db).
+_CHECK_LIMIT_RE = re.compile(r"length\(\s*text\s*\)\s+BETWEEN\s+1\s+AND\s+(\d+)")
 
 
 class StorageError(RuntimeError):
@@ -168,18 +173,52 @@ def _load_vec_extension(conn: sqlite3.Connection) -> None:
 
 # --- инициализация ------------------------------------------------------
 
+
+def _assert_note_chars_limit(conn: sqlite3.Connection, settings: Settings) -> None:
+    """Сверить MAX_NOTE_CHARS с фактическим CHECK-лимитом живой таблицы.
+
+    Для свежей таблицы совпадение гарантировано (DDL выше); сверка ловит
+    смену env поверх существующей БД — несовпадение — фатальная ошибка
+    конфигурации: лимит зафиксирован в схеме при первой инициализации.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'notes'"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return  # таблица не создана — init_db упал выше по-своему
+    match = _CHECK_LIMIT_RE.search(row[0])
+    if match is None:
+        return  # без CHECK (рукотворная схема) — сверки нет, не виноваты
+    stored = int(match.group(1))
+    if stored != settings.max_note_chars:
+        raise StorageError(
+            f"MAX_NOTE_CHARS разошёлся с БД: таблица создана с лимитом "
+            f"{stored}, окружение задаёт {settings.max_note_chars}. "
+            f"CHECK не меняется на лету: верни MAX_NOTE_CHARS={stored} "
+            f"или пересоздай БД (сохрани заметки: sqlite3 {settings.db_path} .dump)."
+        )
+
+
 def init_db(settings: Settings) -> None:
     """Создать схему при старте (критерий приёмки Фазы 2); идемпотентно.
 
     Raises:
-        StorageError: БД недоступна, нет FTS5/vec0 или схема повреждена
-        (в том числе несовпадение размерности vec0-таблицы с EMBEDDING_DIM).
+        StorageError: БД недоступна, нет FTS5/vec0, схема повреждена,
+        env разошёлся с зафиксированной схемой (несовпадение размерности
+        vec0-таблицы с EMBEDDING_DIM или лимита CHECK с MAX_NOTE_CHARS).
     """
     path = Path(settings.db_path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with session(settings) as conn:
             conn.execute(_NOTES_DDL.format(max_note_chars=settings.max_note_chars))
+            # Лимит CHECK «запечён» в DDL при первом создании (ARCH §3.3:
+            # «лимиты подставляются из env»); смена MAX_NOTE_CHARS поверх
+            # готовой БД — разрыв конфигурации: CHECK не меняется на лету,
+            # крупные заметки стали бы падать в рантайме с невнятным
+            # IntegrityError (сообщение CHECK-а ничего не говорит об env).
+            # Отказ старта с подсказкой — по образцу EMBEDDING_DIM (§8).
+            _assert_note_chars_limit(conn, settings)
             conn.execute(_FTS_DDL)
             for trigger in _TRIGGERS:
                 conn.execute(trigger)
