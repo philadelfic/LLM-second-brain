@@ -1,21 +1,28 @@
-"""SearchService — гибридный поиск (Фаза 3, ARCHITECTURE §4.2).
+"""SearchService — гибридный поиск (Фаза 3, ARCHITECTURE §4.2; Фаза 7 — вектора
+строятся по чанкам).
 
 Два источника кандидатов, слияние Reciprocal Rank Fusion, единый top_k:
-- вектор: vec0 топ-50 по косинусу **по полным текстам** (не summary) — ловит
-  перефразы; отсечение: cosine ≥ SCORE_THRESHOLD (мусор не проходит в fusion);
+- вектор (Фаза 7): KNN по чанкам (топ-50) → агрегация до заметок: лучший чанк
+  заметки задаёт близость (cosine = лучшего чанка, сравним с SCORE_THRESHOLD);
+  заметки без ГОТОВЫХ чанков (унаследованные до Фазы 7 и pending у воркера) —
+  fallback на вектор полного текста (notes_vec) как в Фазе 3. Полный текст и
+  summary на качество поиска не влияли раньше — не влияют и сейчас: векторам
+  всё равно, а summary только в выдаче;
 - полнотекст: FTS5/BM25 топ-50 (trigram: русские словоформы, точные токены) —
   ловит идентификаторы/даты; порогу не подлежит (REQUIREMENTS FR-1).
 - RRF устойчив к несопоставимым шкалам (косинус vs BM25): score(d) =
-  Σ_sources 1/(RRF_K + rank_source), rank с 1.
+  Σ_sources 1/(RRF_K + rank_source), rank с 1. Векторная сторона после
+  агрегации — один список, ранжирование как в Фазе 3.
 
 Деградация (NFR-3): отказ кодирования запроса → поиск FTS-only + `warning`
 (обучающий текст §5.3); НЕ жёсткая ошибка — поиск не ломается от внешней
-зависимости. Кандидаты с векторным hit ниже порога вылетают до слияния —
-их `cosine` в выдаче null (векторный hit валиден только ≥ порога).
+зависимости. Кандидаты с лучшим векторным hit ниже порога вылетают до слияния.
 
 Выдача FR-1: summary/snippet, без полного текста (memory_get адресно).
-Ties (равный rrf_score) — по updated_at DESC, id DESC: свежее полезнее
-(в духе FR-2), детерминированно без случайности.
+Snippet — из ЛУЧШЕГО чанка (первые SNIPPET_CHARS символов чанка): модель видит
+релевантный фрагмент длинной заметки, а не её начало; у fallback-кандидатов —
+из полного текста, как в Фазе 3. Ties (равный rrf_score) — по updated_at DESC,
+id DESC: свежее полезнее (в духе FR-2), детерминированно без случайности.
 """
 
 from __future__ import annotations
@@ -26,7 +33,7 @@ from typing import Any
 from app.config import Settings
 from app.services.embedding import Embedder, EmbeddingError, EmbeddingService
 from app.services.emit import snippet, summary_of
-from app.storage import vectors
+from app.storage import chunks, vectors
 from app.storage.db import session
 
 # Верхняя граница контракта (REQUIREMENTS FR-1: top_k 1..20); env задаёт
@@ -58,7 +65,7 @@ class SearchValidationError(ValueError):
 
 
 class SearchService:
-    """Гибрид vec0 + FTS5 → RRF; дефолт-эмбеддер — EmbeddingService."""
+    """Гибрид vec0+chunk-vec0 (агрегация) + FTS5 → RRF; эмбеддер — DI."""
 
     def __init__(
         self, settings: Settings, embedding: Embedder | None = None
@@ -68,7 +75,7 @@ class SearchService:
         self._embedding: Embedder = embedding if embedding is not None else EmbeddingService(settings)
 
     def search(self, query: str, top_k: int | None = None) -> dict[str, Any]:
-        """Гибридный поиск (ARCH §4.2); выдача FR-1 без полного текста."""
+        """Гибридный поиск (ARCH §4.2 + Фаза 7); выдача FR-1 без полного текста."""
         query = self._validate_query(query)
         top_k = self._default_top_k() if top_k is None else top_k
         if not 1 <= top_k <= MAX_TOP_K:
@@ -87,20 +94,24 @@ class SearchService:
             fts_rows = self._fts_candidates(conn, expression) if expression else []
 
             # --- слияние RRF: score(d) = Σ 1/(RRF_K + rank) -----------------
+            # Векторный источник — уже агрегированный список заметок
+            # (лучший чанк задал cosine и snippet), Фаза 3 — полный вектор.
             scores: dict[int, float] = {}
             cosine_by_id: dict[int, float] = {}
-            for rank, (note_id, cosine) in enumerate(vector_hits, start=1):
+            snippet_source: dict[int, str | None] = {}
+            for rank, (note_id, cosine, chunk_text) in enumerate(vector_hits, start=1):
                 scores[note_id] = scores.get(note_id, 0.0) + 1.0 / (
                     self._settings.rrf_k + rank
                 )
                 cosine_by_id[note_id] = cosine
+                snippet_source[note_id] = chunk_text
             for rank, row in enumerate(fts_rows, start=1):
                 scores[row["id"]] = scores.get(row["id"], 0.0) + 1.0 / (
                     self._settings.rrf_k + rank
                 )
 
             rows = self._fetch_rows(conn, list(scores))
-        results = self._merge(scores, cosine_by_id, rows)[:top_k]
+        results = self._merge(scores, cosine_by_id, snippet_source, rows)[:top_k]
         warning = None if query_vector is not None else WARNING_FTS_ONLY
         if not results:
             hint = (
@@ -115,12 +126,81 @@ class SearchService:
 
     def _vector_candidates(
         self, conn: sqlite3.Connection, query_vector: list[float]
-    ) -> list[tuple[int, float]]:
-        """Топ-50 активных по косинусу + гейт порога (FR-1).
+    ) -> list[tuple[int, float, str | None]]:
+        """Векторные кандидаты: чанки → агрегация до заметок + fallback.
 
-        KNN у vec0 идёт по всем векторам (trash вектора физически живы —
-        ARCH §3.3), поэтому окно расширяется на число удалённых с векторами,
-        а пост-фильтр оставляет только активные.
+        Каждая заметка входит в источник ОДИН раз: близость задаёт её лучший
+        чанк; заметки без готовых чанков (нет строк notes_chunks вообще или
+        векторов у чанков) получают cosine полного вектора (notes_vec).
+        Возврат уже отсортирован по cosine (для ранга в RRF) и отфильтрован
+        по активности и порогу.
+        """
+        by_chunk_source = self._chunk_candidates(conn, query_vector)
+        # Fallback Фазы 7: заметки, у которых нет готовых чанк-векторов
+        # (legacy/пending), ищутся по полному тексту, как в Фазе 3.
+        for note_id, cosine in self._full_text_candidates(conn, query_vector):
+            if note_id not in by_chunk_source:
+                by_chunk_source[note_id] = (cosine, None)
+        ranked = sorted(
+            by_chunk_source.items(), key=lambda pair: pair[1][0], reverse=True
+        )
+        return [
+            (note_id, cosine, chunk_text)
+            for note_id, (cosine, chunk_text) in ranked
+        ]
+
+    def _chunk_candidates(
+        self, conn: sqlite3.Connection, query_vector: list[float]
+    ) -> dict[int, tuple[float, str]]:
+        """KNN по notes_chunks_vec (топ-50) → одна запись на заметку.
+
+        Первый чанк заметки в отсортированной по близости выдаче KNN — её
+        лучший чанк: он задаёт cosine и текст для snippet. Порог сравнивается
+        с cosine лучшего чанка (brief §6). Чанки trash-заметок отбрасываются
+        пост-фильтром (vec0 не знает о notes).
+        """
+        trash = conn.execute(
+            "SELECT COUNT(*) FROM notes_chunks_vec WHERE chunk_id IN "
+            "(SELECT c.id FROM notes_chunks c JOIN notes n ON n.id = c.note_id "
+            " WHERE n.deleted_at IS NOT NULL)"
+        ).fetchone()[0]
+        hits = chunks.knn(conn, query_vector, CANDIDATE_LIMIT + trash)
+        hits = hits[:CANDIDATE_LIMIT]
+        if not hits:
+            return {}
+        placeholders = ",".join("?" * len(hits))
+        # один заход: note_id и text чанка + активность заметки
+        chunk_meta = {
+            row["id"]: (row["note_id"], row["text"])
+            for row in conn.execute(
+                "SELECT c.id, c.note_id, c.text FROM notes_chunks c "
+                "JOIN notes n ON n.id = c.note_id "
+                f"WHERE n.deleted_at IS NULL AND c.id IN ({placeholders})",
+                [chunk_id for chunk_id, _ in hits],
+            )
+        }
+        by_note: dict[int, tuple[float, str]] = {}
+        threshold = self._settings.score_threshold
+        for chunk_id, cosine_value in hits:  # порядок KNN: лучший чанк — первым
+            meta = chunk_meta.get(chunk_id)
+            if meta is None:
+                continue  # чанк trash-заметки
+            note_id, text = meta
+            if note_id in by_note:
+                continue  # лучший чанк заметки уже учтён
+            if cosine_value < threshold:
+                continue  # лучший чанк ниже порога — остальные тем более
+            by_note[note_id] = (cosine_value, text)
+        return by_note
+
+    def _full_text_candidates(
+        self, conn: sqlite3.Connection, query_vector: list[float]
+    ) -> list[tuple[int, float]]:
+        """Топ-50 активных по косинусу полного текста + гейт порога (FR-1).
+
+        Окно KNN расширяется на число trash-векторов, пост-фильтр оставляет
+        только активные. Заметки, уже попавшие в чанк-агрегацию, здесь
+        отфильтруются наверху (они не fallback).
         """
         trash = conn.execute(
             "SELECT COUNT(*) FROM notes_vec WHERE note_id IN "
@@ -180,6 +260,7 @@ class SearchService:
         self,
         scores: dict[int, float],
         cosine_by_id: dict[int, float],
+        snippet_source: dict[int, str | None],
         rows: dict[int, sqlite3.Row],
     ) -> list[dict[str, Any]]:
         """Сортировка: rrf_score DESC → updated_at DESC → id DESC; сборка FR-1."""
@@ -193,20 +274,30 @@ class SearchService:
             reverse=True,
         )
         # Совместимость: rrf_score по итоговому слиянию; cosine — только у
-        # кандидатов с валидным векторным hit (≥ SCORE_THRESHOLD).
+        # кандидатов с валидным векторным hit (≥ SCORE_THRESHOLD); snippet —
+        # из лучшего чанка, если он есть, иначе из полного текста (fallback).
         return [
-            self._result(row, score, cosine_by_id.get(row["id"]))
+            self._result(
+                row,
+                score,
+                cosine_by_id.get(row["id"]),
+                snippet_source.get(row["id"]),
+            )
             for score, row in candidates
         ]
 
     def _result(
-        self, row: sqlite3.Row, rrf_score: float, cosine: float | None
+        self,
+        row: sqlite3.Row,
+        rrf_score: float,
+        cosine: float | None,
+        snippet_source: str | None,
     ) -> dict[str, Any]:
         """Формат элемента FR-1: без текста заметки (memory_get адресно)."""
         return {
             "id": row["id"],
             "summary": summary_of(row, self._settings),
-            "snippet": snippet(row["text"], self._settings),
+            "snippet": snippet(snippet_source or row["text"], self._settings),
             "summary_status": row["summary_status"],
             "rrf_score": rrf_score,
             "cosine": cosine,
