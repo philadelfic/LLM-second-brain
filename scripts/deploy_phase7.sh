@@ -49,7 +49,7 @@ step 2 "SNAPSHOT: онлайн-снапшот живой БД (VACUUM INTO) в v
 # Имя НЕ на «notes-» — ротация BackupService трогает только notes-*.db.
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 SNAP="prephase7-$STAMP.db"
-docker exec "$CONTAINER" python - <<PY
+docker exec -i "$CONTAINER" python - <<PY
 import sqlite3
 sqlite3.connect("/data/notes.db").execute("VACUUM INTO '/data/backups/$SNAP'")
 print("snapshot ok")
