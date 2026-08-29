@@ -48,31 +48,108 @@ def test_vec_table_default_dim_4096(tmp_path, monkeypatch) -> None:
         assert "float[4096]" in conn.execute(DDL_SQL).fetchone()[0]
 
 
-def test_dim_mismatch_refuses_startup(tmp_path, monkeypatch) -> None:
-    """Смена EMBEDDING_DIM после создания БД — отказ старта с подсказкой."""
-    db_path = tmp_path / "notes.db"
-    monkeypatch.setenv("DB_PATH", str(db_path))
+def _insert_note_with_vector(settings, note_id: int, vector: list[float]) -> None:
+    with session(settings) as conn, transaction(conn):
+        conn.execute("INSERT INTO notes (id, text) VALUES (?, 'текст')", (note_id,))
+        vectors.upsert(conn, note_id, vector)
 
-    # БД создана с dim=4; старт с dim=8 — фатальная ошибка старта
+
+def test_dim_mismatch_reindexes(tmp_path, monkeypatch) -> None:
+    """Смена EMBEDDING_DIM после создания БД — автореиндексация при старте.
+
+    Индекс пересоздаётся под новую размерность, все заметки (включая trash)
+    уходят в vector_status='pending' — их догоняет фоновый воркер (NFR-3);
+    сама заметка не теряется.
+    """
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
+
     make_settings(monkeypatch, dim=4)
-    init_db(get_settings())
+    settings = get_settings()
+    init_db(settings)
+    _insert_note_with_vector(settings, 1, [1.0, 0.0, 0.0, 0.0])
 
     monkeypatch.setenv("EMBEDDING_DIM", "8")
     get_settings.cache_clear()
-    with pytest.raises(StorageError) as mismatch:
-        init_db(get_settings())
-    message = str(mismatch.value)
-    assert "(4)" in message and "(8)" in message
-    assert "reindex.py" in message  # путь лечения переиндексации в сообщении
+    init_db(get_settings())  # ок: реиндекс вместо отказа
 
-    # и в обратную сторону: БД 8, конфиг 4 — тоже отказ
-    monkeypatch.setenv("DB_PATH", str(tmp_path / "other.db"))
-    make_settings(monkeypatch, dim=8)
-    init_db(get_settings())
-    monkeypatch.setenv("EMBEDDING_DIM", "4")
+    new_settings = get_settings()
+    with session(new_settings) as conn:
+        assert "float[8]" in conn.execute(DDL_SQL).fetchone()[0]
+        assert vectors.count(conn) == 0  # старые вектора невалидны — сброшены
+        assert conn.execute(
+            "SELECT vector_status FROM notes WHERE id = 1"
+        ).fetchone()[0] == "pending"
+        # meta зафиксировала новую конфигурацию (повторный запуск — не трогает)
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key = 'embedding_dim'"
+        ).fetchone()[0] == "8"
+    init_db(new_settings)
+    with session(new_settings) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 1
+
+
+def test_dim_mismatch_reindexes_trash_too(tmp_path, monkeypatch) -> None:
+    """Вектора trash при реиндексации тоже сбрасываются (иначе undo вернёт
+    невалидный вектор старой модели)."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
+    make_settings(monkeypatch, dim=4)
+    settings = get_settings()
+    init_db(settings)
+    _insert_note_with_vector(settings, 5, [0.0, 0.5, 0.5, 0.0])
+    with session(settings) as conn, transaction(conn):
+        conn.execute(
+            "UPDATE notes SET deleted_at = '2026-01-01T00:00:00Z' WHERE id = 5"
+        )
+
+    monkeypatch.setenv("EMBEDDING_DIM", "8")
     get_settings.cache_clear()
-    with pytest.raises(StorageError, match="переиндексации"):
-        init_db(get_settings())
+    init_db(get_settings())
+    with session(get_settings()) as conn:
+        assert conn.execute(
+            "SELECT vector_status FROM notes WHERE id = 5"
+        ).fetchone()[0] == "pending"
+
+
+def test_model_change_reindexes_same_dim(tmp_path, monkeypatch) -> None:
+    """Смена EMBEDDING_MODEL при той же размерности — тоже автореиндексация:
+    вычисления другой модели живут в другом векторном пространстве, старые
+    вектора несовместимы с новыми даже при равной размерности.
+    """
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
+    make_settings(monkeypatch, dim=4)
+    settings = get_settings()
+    init_db(settings)
+    _insert_note_with_vector(settings, 1, [1.0, 0.0, 0.0, 0.0])
+
+    monkeypatch.setenv("EMBEDDING_MODEL", "bge-m3:other")
+    get_settings.cache_clear()
+    init_db(get_settings())
+    with session(get_settings()) as conn:
+        assert vectors.count(conn) == 0
+        assert conn.execute(
+            "SELECT vector_status FROM notes WHERE id = 1"
+        ).fetchone()[0] == "pending"
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key = 'embedding_model'"
+        ).fetchone()[0] == "bge-m3:other"
+
+
+def test_meta_initialized_on_legacy_db_without_reindex(tmp_path, monkeypatch) -> None:
+    """Унаследованная БД без meta: запись создаётся из env, данные не трогаются
+    (нулевая миграция — вектора этой базы и так построены текущей моделью)."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
+    settings = make_settings(monkeypatch, dim=4)
+    init_db(settings)
+    _insert_note_with_vector(settings, 1, [1.0, 0.0, 0.0, 0.0])
+    # убрать meta — имитация наследия до этой правки
+    with session(settings) as conn:
+        conn.execute("DROP TABLE meta")
+    init_db(settings)
+    with session(settings) as conn:
+        assert vectors.count(conn) == 1  # вектора целы
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key = 'embedding_model'"
+        ).fetchone()[0] == get_settings().embedding_model
 
 
 def test_init_db_idempotent_keeps_vectors(tmp_path, monkeypatch) -> None:
