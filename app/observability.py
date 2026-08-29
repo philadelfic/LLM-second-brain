@@ -42,6 +42,8 @@ _RESERVED_FIELDS = frozenset(
         "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
         "created", "msecs", "relativeCreated", "thread", "threadName",
         "processName", "process", "taskName", "message", "asctime",
+        # uvicorn кладёт раскрашенную копию message в extra — в JSON она шум.
+        "color_message",
     }
 )
 
