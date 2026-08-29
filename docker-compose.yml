@@ -1,63 +1,60 @@
 # LLM Second Brain — self-hosted MCP-сервер долговременной памяти (NFR-1).
 #
-# Вся конфигурация запуска — здесь, в `environment` (REQUIREMENTS §8):
-# обязательные переменные берутся из .env (compose читает его автоматически)
-# и при отсутствии роняют `compose up` с понятной ошибкой (`:?`), опциональные
-# имеют канонические дефолты (`:-`). Значение рядом с переменной — дефолт;
-# фактическое значение переопределяется через .env.
-#
-# Перед запуском: cp .env.example .env — заполнить обязательные переменные.
+# ПОЛНАЯ конфигурация запуска живёт здесь (решение О. 2026-08-29: без .env).
+# Перед первым запуском заполнить четыре обязательных значения ниже
+# (MCP_AUTH_TOKEN сгенерируй: openssl rand -hex 32) — пустой токен или
+# недоступная Ollama не пройдут стартовые проверки конфигурации.
 # Каталог данных: mkdir -p data.
 
 services:
   second-brain:
     build: .
     image: llm-second-brain:latest
-    container_name: llm-second-brain  # явное имя вместо сгенерированного llm-second-brain-second-brain-1
+    container_name: llm-second-brain  # явное имя вместо сгенерированного
     restart: unless-stopped
     ports:
-      - "8080:8080"  # host:container; PORT из env меняет только container-side
+      - "8080:8080"  # host:container
     environment:
-      # --- обязательные (без .env старт не пройдёт) ---
-      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:?обязательна: Ollama векторизации, напр. http://192.168.3.113:11434}"
-      SUMMARY_OLLAMA_BASE_URL: "${SUMMARY_OLLAMA_BASE_URL:?обязательна: Ollama суммаризации, напр. http://192.168.3.112:11434}"
-      SUMMARY_MODEL: "${SUMMARY_MODEL:?обязательна: модель суммаризации, напр. ornith-1.5:35b}"
-      MCP_AUTH_TOKEN: "${MCP_AUTH_TOKEN:?обязателен: Bearer-токен, сгенерируй openssl rand -hex 32}"
-      # --- векторизация/суммаризация: тонкая настройка ---
-      EMBEDDING_MODEL: "${EMBEDDING_MODEL:-qwen3-embedding:8b}"
-      EMBEDDING_DIM: "${EMBEDDING_DIM:-4096}"          # фиксируется при создании БД
-      MAX_SUMMARY_CHARS: "${MAX_SUMMARY_CHARS:-200}"
-      SNIPPET_CHARS: "${SNIPPET_CHARS:-120}"
-      MAX_GET_BATCH: "${MAX_GET_BATCH:-20}"
-      SUMMARY_THINK: "${SUMMARY_THINK:-true}"          # режим «Б»: рассуждения не ограничиваются
-      SUMMARY_NUM_PREDICT: "${SUMMARY_NUM_PREDICT:-1500}"
-      SUMMARY_TIMEOUT_SEC: "${SUMMARY_TIMEOUT_SEC:-240}"  # 240 = решение 2026-08-29 (боевые заметки думают ~60 c)
+      # --- обязательные ---
+      OLLAMA_BASE_URL: "http://192.168.3.113:11434"        # Ollama векторизации (/api/embed)
+      SUMMARY_OLLAMA_BASE_URL: "http://192.168.3.112:11434" # Ollama суммаризации (/api/chat)
+      SUMMARY_MODEL: "ornith-1.5:35b"                       # генеративная модель суммаризации
+      MCP_AUTH_TOKEN: "b5e5085482a05119f193f4b064dd8e202dbd193056f14698241c4d4da6557f53"                  # Bearer-токен всех ручек, кроме /health
+      # --- векторизация: все параметры эмбеддинга ---
+      EMBEDDING_MODEL: "qwen3-embedding:8b"  # смена → автоматическая реиндексация БД при старте
+      EMBEDDING_DIM: "4096"                  # размерность; фиксируется в БД (meta), смена → реиндексация
+      SCORE_THRESHOLD: "0.35"                # порог косинуса для отсечения в поиске
+      DEDUP_SIMILARITY: "0.92"               # порог «почти дубликата» в memory_save
+      # --- суммаризация (режим «Б»: режимы think не ограничиваются) ---
+      MAX_SUMMARY_CHARS: "200"
+      SUMMARY_THINK: "true"                  # оставить размышления модели
+      SUMMARY_NUM_PREDICT: "1500"            # бюджет thinking+content
+      SUMMARY_TIMEOUT_SEC: "240"             # 4 мин: боевые заметки думают ~60 c (решение 2026-08-29)
       # --- HTTP/MCP ---
-      PORT: "${PORT:-8080}"
-      MCP_PATH: "${MCP_PATH:-/mcp}"
+      PORT: "8080"
+      MCP_PATH: "/mcp"
       # --- хранилище ---
-      DB_PATH: "${DB_PATH:-/data/notes.db}"
-      MAX_NOTE_CHARS: "${MAX_NOTE_CHARS:-2000}"        # дефолт §8; у нас в .env = 20000
-      PENDING_RETRY_SEC: "${PENDING_RETRY_SEC:-30}"
+      DB_PATH: "/data/notes.db"
+      MAX_NOTE_CHARS: "20000"                # расширен 2000→20000 по решению О. (2026-08-29)
+      PENDING_RETRY_SEC: "30"                # стартовый интервал фонового воркера (×2 → 15 мин)
       # --- поиск ---
-      DEFAULT_TOP_K: "${DEFAULT_TOP_K:-5}"
-      DEFAULT_LIST_LIMIT: "${DEFAULT_LIST_LIMIT:-20}"
-      SCORE_THRESHOLD: "${SCORE_THRESHOLD:-0.35}"
-      DEDUP_SIMILARITY: "${DEDUP_SIMILARITY:-0.92}"
-      RRF_K: "${RRF_K:-60}"
-      MAX_QUERY_CHARS: "${MAX_QUERY_CHARS:-512}"
+      DEFAULT_TOP_K: "5"
+      DEFAULT_LIST_LIMIT: "20"
+      RRF_K: "60"
+      MAX_QUERY_CHARS: "512"
+      MAX_GET_BATCH: "20"
+      SNIPPET_CHARS: "120"
       # --- прочее/наблюдаемость/backup ---
-      AUTHOR_DEFAULT: "${AUTHOR_DEFAULT:-unknown}"
-      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
-      BACKUP_DIR: "${BACKUP_DIR:-/data/backups}"
-      BACKUP_INTERVAL_SEC: "${BACKUP_INTERVAL_SEC:-86400}"
-      BACKUP_KEEP: "${BACKUP_KEEP:-7}"
+      AUTHOR_DEFAULT: "unknown"
+      LOG_LEVEL: "INFO"
+      BACKUP_DIR: "/data/backups"
+      BACKUP_INTERVAL_SEC: "86400"
+      BACKUP_KEEP: "7"
     volumes:
-      - ./data:/data  # SQLite notes.db, снапшоты (Фаза 2+)
+      - ./data:/data  # SQLite notes.db, снапшоты
     healthcheck:
-      # python:3.12-slim не содержит curl — проверяем штатным python;
-      # ${PORT:-8080} интерполируется compose из .env (NFR-4: /health без токена).
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:${PORT:-8080}/health', timeout=3).status == 200 else 1)"]
+      # python:3.12-slim не содержит curl — проверяем штатным python (NFR-4: /health без токена).
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
