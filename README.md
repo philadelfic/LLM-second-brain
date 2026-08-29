@@ -16,8 +16,8 @@ Self-hosted MCP-сервер «второго мозга» для LLM, крут�
 
 ## Ключевые свойства
 
-- Один контейнер Docker, self-host.
-- MCP Streamable HTTP (нативно поддерживается Open WebUI) + Bearer-токен.
+- Один контейнер Docker, self-host, non-root.
+- MCP Streamable HTTP (`/mcp`, нативно поддерживается Open WebUI) + Bearer-токен.
 - 6 инструментов с префиксом `memory_*`: search, list, get, save, update, delete.
 - Хранилище: SQLite + `sqlite-vec` (векторный поиск) + FTS5 (полнотекстовый),
   слияние через Reciprocal Rank Fusion.
@@ -26,15 +26,129 @@ Self-hosted MCP-сервер «второго мозга» для LLM, крут�
   `summary` каждой заметки; в поиске выдача дополняется `snippet` (фрагмент
   текста), в списках — только `summary`. Генерация — фоновая, не блокирует
   запись; рассуждения модели не сохраняются.
+- Резервное копирование: периодический онлайн-снапшот БД в `BACKUP_DIR`
+  (SQLite `backup` API), ротация по `BACKUP_KEEP`.
+- Логи — одна JSON-строка на событие в stdout (вызовы инструментов с
+  латентностью и числом результатов; тексты запросов — первые 80 символов;
+  содержимое заметок в логи не пишется).
 - Пользовательского интерфейса нет — пишут и читают только модели;
   оператор имеет доступ к файлу БД напрямую.
 
 ## Документация
 
 - [Требования](REQUIREMENTS.md) — цели, функциональные и нефункциональные
-  требования, контракты всех инструментов, конфигурация, риски.
+  требования, контракты всех инструментов, конфигурация (§8), риски.
 - [Архитектура](ARCHITECTURE.md) — компоненты, схема данных, потоки,
   интеграция с Open WebUI, подход к «обучению» моделей, тестирование, деплой.
+
+## Быстрый старт (docker compose)
+
+```bash
+git clone <repo> llm-second-brain && cd llm-second-brain
+cp .env.example .env
+# Обязательное в .env:
+#   OLLAMA_BASE_URL, SUMMARY_OLLAMA_BASE_URL, SUMMARY_MODEL,
+#   MCP_AUTH_TOKEN  (сгенерируй: openssl rand -hex 32)
+# Необязательные — оставить умолчания (см. .env.example / REQUIREMENTS §8).
+mkdir -p data          # каталог volume: notes.db + backups (uid/gid 1000)
+docker compose up -d --build
+curl -s http://localhost:8080/health | python -m json.tool
+```
+
+`/health` отвечает без токена:
+
+```json
+{"status":"ok","embedding_ok":null,"summarizer_ok":null,
+ "notes_count":0,"pending_vector":0,"pending_summary":0}
+```
+
+`embedding_ok`/`summarizer_ok` — исход последних попыток (`null` — попыток
+ещё не было; обеих Ollama может не быть на старте — сервис поднимется
+штатно, записи уйдут в pending и догонятся фоновым воркером, NFR-3).
+
+## Подключение Open WebUI
+
+Требуется Open WebUI **v0.6.31+** — с этой версии поддерживается MCP
+Streamable HTTP нативно.
+
+1. Открой **Admin Panel → Settings → Integrations** → блок «External Tool
+   Servers» → **«+ Add Connection»** (в старых версиях пункт называется
+   «Tools → Add Connection»).
+2. Заполни поля диалога:
+   - **Type**: `MCP Streamable HTTP`;
+   - **URL**: `http://<хост-сервиса>:8080/mcp` — путь `MCP_PATH`, по
+     умолчанию `/mcp`. Если Open WebUI в другом контейнере того же
+     docker-хоста → `http://<ip-хоста>:8080/mcp` (или имя сети compose);
+   - **Auth**: `Bearer`; **token** — значение `MCP_AUTH_TOKEN` из `.env`.
+3. Сохрани. В списке появятся 6 инструментов `memory_*` — они доступны всем
+   моделям, достаточно включить у модели «вызов инструментов».
+4. Проверка в чате: «найди в памяти …» → модель вызывает `memory_search`.
+
+Дополнительные MCP-клиенты подключаются так же: URL `http://<host>:8080/mcp`,
+заголовок `Authorization: Bearer <MCP_AUTH_TOKEN>`. Handshake curl'ом:
+
+```bash
+curl -s http://localhost:8080/mcp \
+  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+```
+
+## Конфигурация
+
+Источник истины — таблица REQUIREMENTS §8 (все 28 переменных):
+обязательные — `OLLAMA_BASE_URL`, `SUMMARY_OLLAMA_BASE_URL`,
+`SUMMARY_MODEL`, `MCP_AUTH_TOKEN` (пустой токен — фатальная ошибка старта);
+остальные имеют умолчания и переопределяются env. Ключевые:
+
+| Переменная | Умолчание | Смысл |
+|---|---|---|
+| `MCP_AUTH_TOKEN` | — (обязателен) | Bearer-токен всех ручек, кроме `/health` |
+| `OLLAMA_BASE_URL` | — (обязателен) | Ollama векторизации (`/api/embed`) |
+| `SUMMARY_OLLAMA_BASE_URL` | — (обязателен) | Ollama суммаризации (`/api/chat`) |
+| `SUMMARY_MODEL` | — (обязателен) | модель суммаризации, напр. `ornith-1.5:35b` |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `qwen3-embedding:8b` / `4096` | embedding; размерность фиксируется при создании БД (смена — скрипт переиндексации) |
+| `PORT` / `MCP_PATH` | `8080` / `/mcp` | HTTP и путь MCP |
+| `DB_PATH` | `/data/notes.db` | файл SQLite (WAL) |
+| `BACKUP_DIR` / `BACKUP_INTERVAL_SEC` / `BACKUP_KEEP` | `/data/backups` / `86400` / `7` | снапшоты: каталог, интервал, ротация |
+| `LOG_LEVEL` | `INFO` | уровень JSON-логов stdout |
+| `MAX_NOTE_CHARS` / `MAX_QUERY_CHARS` | `2000` / `512` | лимиты ввода |
+
+Все лимиты валидируются при старте: некорректное значение (вне диапазона,
+мусор) — фатальная ошибка конфигурации с перечнем всех нарушений сразу.
+Смена `MAX_NOTE_CHARS` поверх существующей БД запрещена (лимит «запечён»
+в CHECK-схеме) — верни прежнее значение или пересоздай БД.
+
+## Эксплуатация
+
+**Логи.** Весь stdout — JSON (`docker compose logs -f second-brain`):
+`tool_call`-события по всем 6 инструментам (`tool`, `latency_ms`, число
+результатов; поисковый запрос — первые 80 символов; тексты заметок в логи
+не пишутся), `startup`, `backup_created`/`backup_failed`, access/error
+uvicorn. Уровень — `LOG_LEVEL`.
+
+**Backup.** Файлы `notes-<UTC>.db` в `BACKUP_DIR` (по умолчанию
+`/data/backups`, внутри volume `./data`); первый — сразу после старта, далее
+раз в сутки; каталог держит `BACKUP_KEEP` свежайших. Восстановление —
+останови сервис, замени `notes.db` снапшотом (рядом `-wal`/`-shm` исходной
+БД тоже убери/учти), запусти снова. Копии читаются обычным `sqlite3`.
+
+**Прямой доступ оператора к БД** (REQUIREMENTS §3): `sqlite3 data/notes.db`.
+Undo soft-delete — снять метку: `UPDATE notes SET deleted_at = NULL WHERE id = ?;`
+FTS-синхронизация сверится и починится сама на следующем старте.
+
+**Проверка MCP:** `curl`-handshake из раздела о подключении; `tools/list`
+возвращает ровно 6 инструментов `memory_*`; без/с неверным токеном — 401.
+
+## Архитектура в двух словах
+
+Один FastAPI-процесс: REST (`/health`, `/notes`, `/search` — для оператора)
++ MCP Streamable HTTP (`/mcp`) над одним service-слоем. SQLite (WAL):
+`notes` + FTS5 trigram + vec0 (косинус). Векторизация и суммаризация —
+внешние Ollama; отказ любой не ломает CRUD (pending-статусы + фоновый
+воркер с back-off 30с→×2→15мин и деградация поиска до FTS-only).
+Подробности — [архитектура](ARCHITECTURE.md), потоки §4.
 
 ## Статус
 
@@ -50,28 +164,34 @@ Self-hosted MCP-сервер «второго мозга» для LLM, крут�
   vec0+FTS5 → RRF с отсечением по SCORE_THRESHOLD; дедуп в `memory_save`
   (косинус ≥ DEDUP_SIMILARITY + FTS-фоллбек дословных дублей); фоновая
   до-векторизация (back-off 30с→×2→15мин); скрипт переиндексации
-  `python -m scripts.reindex`; `embedding_ok` в `/health`. Тесты: unit
-  с детерминированным HashEmbedder + интеграционные с живой Ollama
-  (маркер `integration`, SKIP при недоступности сервера).
+  `python -m scripts.reindex`; `embedding_ok` в `/health`.
 - **Фаза 4 — суммаризация (режим «Б»): ЗАВЕРШЕНА.** SummaryService — клиент
-  ко второй Ollama `POST /api/chat` (SUMMARY_OLLAMA_BASE_URL,
-  `ornith-1.5:35b`): промпт одно предложение ≤ MAX_SUMMARY_CHARS, имена/
-  числа/даты, язык заметки; thinking не ограничивается (`message.thinking`
-  отбрасывается), пустой content = отказ, страховка-обрезка до 200 симв.
-  Генерация — **только фоновым воркером**: вторая очередь `pending_summary`
-  с независимым back-off (30с→×2→15мин), догон при старте, trash пропускается,
-  защита от гонки с `memory_update` (суммари пишется по неизменённому тексту);
-  до готовности выдачи отдают fallback-усечение + `summary_status=pending`;
-  `/health.summarizer_ok` отражает исход последней генерации. Замеры
-  `python -m scripts.benchmark_summary` (модель суммаризации, латентность
-  think vs no-think, актуальность догенерации).
-- **Далее:** Фаза 5 — hardening и деплой (лимиты, логирование, backup,
-  сборка образа, подъём на целевом сервере).
+  ко второй Ollama `POST /api/chat`: промпт одно предложение ≤
+  MAX_SUMMARY_CHARS, thinking не ограничивается (в БД не попадает), пустой
+  content = отказ, страховка-обрезка. Генерация — только фоновым воркером
+  (вторая очередь `pending_summary`, независимый back-off, догон при старте,
+  защита от гонки с `memory_update`); до готовности — fallback-усечение +
+  `summary_status=pending`; `/health.summarizer_ok`. Замеры:
+  `python -m scripts.benchmark_summary`.
+- **Фаза 5 — hardening и деплой: ЗАВЕРШЕНА.** Лимиты NFR-6 валидируются при
+  старте (диапазоны, потолки контрактов, сверка MAX_NOTE_CHARS со схемой БД);
+  JSON-логи stdout (NFR-4) — `tool_call` с латентностью/числом результатов,
+  запросы ≤80 симв., содержимое заметок не логируется; BackupService —
+  онлайн-снапшоты + ротация (`BACKUP_DIR`/`BACKUP_INTERVAL_SEC`/`BACKUP_KEEP`);
+  README с подключением Open WebUI; сборка образа и деплой (compose,
+  restart: unless-stopped, non-root, volume `/data`, healthcheck).
+- **Далее:** Фаза 6 (опционально) — Function-фильтр Open WebUI для
+  авто-подмешивания топ-K суммари к первому сообщению чата.
 
-Запуск тестов: `pytest -m "not integration"` — слой без сети; live-прогон
-`pytest -m integration` — живые Ollama: векторизатор (`LIVE_OLLAMA_URL`,
-дефолт 192.168.3.113:11434) и суммаризатор (`LIVE_SUMMARY_URL`, дефолт
-192.168.3.112:11434, `LIVE_SUMMARY_MODEL` — ornith-1.5:35b); SKIP при
-недоступности серверов. Замеры суммаризации: `python -m scripts.benchmark_summary`.
+## Разработка и тесты
 
-Roadmap: REQUIREMENTS §10. Тесты: `pytest` (юнит + e2e по живому серверу).
+Запуск тестов: `pytest -m "not integration"` — слой без сети (фейк-эмбеддер
+и фиксированный суммаризатор); live-прогон `pytest -m integration` — живые
+Ollama: векторизатор (`LIVE_OLLAMA_URL`, дефолт 192.168.3.113:11434) и
+суммаризатор (`LIVE_SUMMARY_URL`, дефолт 192.168.3.112:11434,
+`LIVE_SUMMARY_MODEL` — ornith-1.5:35b); SKIP при недоступности серверов.
+
+Структура: `app/transport` (MCP/REST/Bearer), `app/services` (notes, search,
+embedding, dedup, summary, worker, backup), `app/storage` (SQLite+FTS5+vec0),
+`app/observability` (JSON-логи), `scripts/` (reindex, benchmark). Ритм
+разработки и roadmap — REQUIREMENTS §10.
