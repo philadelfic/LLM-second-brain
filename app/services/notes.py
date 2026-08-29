@@ -176,7 +176,29 @@ class NoteService:
             }
         return {"id": note_id, "deleted": True}
 
-    # --- внутреннее ---------------------------------------------------------
+    # --- NFR-4 /health ------------------------------------------------------
+
+    def health_counts(self) -> dict[str, int]:
+        """Счётчики для /health: активные заметки и pending-статусы.
+
+        trash не считается: фоновой догенерации для удалённых заметок нет
+        (REQUIREMENTS FR-6), undo оператора возвращает заметку в активные —
+        и она снова считается pending до догенерации в Фазах 3–4.
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS notes_count, "
+                "COALESCE(SUM(vector_status = 'pending'), 0) AS pending_vector, "
+                "COALESCE(SUM(summary_status = 'pending'), 0) AS pending_summary "
+                "FROM notes WHERE deleted_at IS NULL"
+            ).fetchone()
+        return {
+            "notes_count": row["notes_count"],
+            "pending_vector": row["pending_vector"],
+            "pending_summary": row["pending_summary"],
+        }
+
+    # --- внутренне ---------------------------------------------------------
 
     def _validate_text(self, text: str) -> None:
         """1..MAX_NOTE_CHARS — доменное правило REQUIREMENTS FR-4/FR-5."""

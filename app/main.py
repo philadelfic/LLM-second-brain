@@ -1,8 +1,9 @@
 """FastAPI-приложение LLM Second Brain.
 
-Собирает каркас Фазы 1: REST-ручки (`/health`), MCP-сервер (`/mcp`, 6
-инструментов `memory_*`), Bearer-миддлварь на всё, кроме `/health` (NFR-2).
-Фаза 2: при старте инициализируется хранилище (SQLite-схема, ARCH §3.3).
+Каркас Фазы 1: REST, MCP-сервер (`/mcp`, 6 инструментов `memory_*`),
+Bearer-миддлварь на всё, кроме `/health` (NFR-2). Фаза 2: при старте
+инициализируется хранилище (SQLite, ARCH §3.3); MCP и REST работают
+над общим service-слоем (ARCH §1) через `app.state.services`.
 
 Запуск: `python -m app` (uvicorn) — порт и уровень логов из окружения.
 """
@@ -17,10 +18,11 @@ from fastapi import FastAPI
 
 from app import __version__
 from app.config import ConfigError, Settings, get_settings
+from app.services import Services, build_services
 from app.storage.db import StorageError, init_db
 from app.transport.auth import BearerAuthMiddleware
 from app.transport.mcp import build_mcp
-from app.transport.rest import rest_router
+from app.transport.rest import build_rest_router
 
 # Пути, доступные без Bearer-токена (NFR-2: только /health).
 OPEN_PATHS = frozenset({"/health"})
@@ -36,7 +38,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             print(f"FATAL: {exc}", file=sys.stderr)
             raise SystemExit(2) from exc
 
-    mcp = build_mcp(settings)
+    services = build_services(settings)  # один Settings-снимок на процесс
+    mcp = build_mcp(settings, services)
     # Внутренний маршрут MCP-сервера — ровно MCP_PATH. host="0.0.0.0" — не
     # localhost, поэтому SDK не включает DNS-rebinding protection (сервис
     # живёт в LAN за Bearer-токеном; Open WebUI ходит с не-localhost Host).
@@ -68,7 +71,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url=None,
         lifespan=lifespan,
     )
-    app.include_router(rest_router)
+    app.include_router(build_rest_router(settings))
+    app.state.services = services  # REST-ручки достают сервисы отсюда
     # Монтирование в корень: MCP_PATH задаёт точный путь MCP-эндпоинта;
     # маршруты FastAPI (/health и будущие REST) матчатся раньше mount.
     app.mount("/", mcp_app)

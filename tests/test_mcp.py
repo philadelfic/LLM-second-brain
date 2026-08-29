@@ -23,10 +23,11 @@ from mcp.client.streamable_http import (
     streamable_http_client,
 )
 
+import uuid
+
 from app.transport.mcp import (
     SERVER_INSTRUCTIONS,
     SERVER_NAME,
-    STUB_NOTE,
     TOOL_DESCRIPTIONS,
     TOOL_NAMES,
 )
@@ -191,21 +192,6 @@ class TestToolsList:
 
 class TestToolCalls:
     @pytest.mark.asyncio
-    async def test_stub_response(self, server_url: str) -> None:
-        """Вызов реальным клиентом: заглушка Фазы 1 отвечает структурно."""
-        async with connect(server_url) as session:
-            call = await session.call_tool("memory_search", {"query": "тест"})
-        assert call.is_error is False
-        assert call.structured_content == {"implemented": False, "note": STUB_NOTE}
-
-    @pytest.mark.asyncio
-    async def test_stub_batch_get(self, server_url: str) -> None:
-        async with connect(server_url) as session:
-            call = await session.call_tool("memory_get", {"ids": [1, 2, 3]})
-        assert call.is_error is False
-        assert call.structured_content["implemented"] is False
-
-    @pytest.mark.asyncio
     async def test_schema_rejects_empty_query(self, server_url: str) -> None:
         """Ограничения схемы реально отклоняют мусорные аргументы."""
         async with connect(server_url) as session:
@@ -297,3 +283,115 @@ def _has_mcp_error(exc: BaseException) -> bool:
     if subs:
         return any(_has_mcp_error(sub) for sub in subs)
     return False
+
+class TestMemoryFlow:
+    """E2E по живому серверу: полный CRUD + поиск через MCP-клиента."""
+
+    marker = f"genmarker-{uuid.uuid4().hex[:8]}"
+
+    async def _saved_id(self, session: ClientSession, text: str) -> int:
+        call = await session.call_tool("memory_save", {"text": text})
+        assert call.is_error is False, call.content
+        content = call.structured_content
+        assert content["stored"] is True
+        assert content["summary_pending"] is True  # режим суммаризации
+        return content["id"]
+
+    @pytest.mark.asyncio
+    async def test_save_get_roundtrip(self, server_url: str) -> None:
+        text = f"{self.marker}: деплой TaskFlow прошёл 2026-08-29"
+        async with connect(server_url) as session:
+            note_id = await self._saved_id(session, text)
+            got = (await session.call_tool("memory_get", {"ids": [note_id]})).structured_content
+        note = got["notes"][0]
+        assert note["text"] == text
+        assert note["summary_status"] == "pending"
+        assert note["summary"] == text[:200]  # fallback-усечение (Фаза 2)
+        assert note["author"] == "unknown"  # AUTHOR_DEFAULT
+        assert note["created_at"].endswith("Z") and note["updated_at"].endswith("Z")
+
+    @pytest.mark.asyncio
+    async def test_single_id_alias(self, server_url: str) -> None:
+        text = f"{self.marker}: алиас одиночного id"
+        async with connect(server_url) as session:
+            note_id = await self._saved_id(session, text)
+            got = (await session.call_tool("memory_get", {"id": note_id})).structured_content
+        assert got["notes"][0]["id"] == note_id
+
+    @pytest.mark.asyncio
+    async def test_search_returns_no_full_text(self, server_url: str) -> None:
+        """FR-1: только summary + snippet; полный текст — memory_get."""
+        text = f"{self.marker}: квантовый кулер в стойке 192.168.7.7"
+        async with connect(server_url) as session:
+            await self._saved_id(session, text)
+            found = (await session.call_tool(
+                "memory_search", {"query": "квантовый кулер"}
+            )).structured_content
+        hit = next(r for r in found["results"] if r["snippet"].startswith(f"{self.marker}"))
+        assert set(hit) == {
+            "id", "summary", "snippet", "summary_status", "rrf_score",
+            "cosine", "created_at", "updated_at", "author",
+        }
+        assert hit["cosine"] is None
+        assert "text" not in hit
+        assert found["warning"]  # Фаза 2: поиск без семантики
+
+    @pytest.mark.asyncio
+    async def test_list_shows_summaries_only(self, server_url: str) -> None:
+        async with connect(server_url) as session:
+            await self._saved_id(session, f"{self.marker}: для списка")
+            listed = (await session.call_tool(
+                "memory_list", {"limit": 5}
+            )).structured_content
+        assert listed["total"] >= 1
+        assert listed["items"]  # среди первой страницы есть наша
+        assert all("text" not in item for item in listed["items"])
+
+    @pytest.mark.asyncio
+    async def test_update_full_rewrite(self, server_url: str) -> None:
+        async with connect(server_url) as session:
+            note_id = await self._saved_id(
+                session, f"{self.marker}: старый текст для апдейта"
+            )
+            updated = (await session.call_tool("memory_update", {
+                "id": note_id, "text": f"{self.marker}: новый полный текст",
+            })).structured_content
+            assert updated == {"id": note_id, "updated": True, "summary_pending": True}
+            got = (await session.call_tool("memory_get", {"ids": [note_id]})).structured_content
+        assert got["notes"][0]["text"] == f"{self.marker}: новый полный текст"
+
+    @pytest.mark.asyncio
+    async def test_delete_is_soft(self, server_url: str) -> None:
+        async with connect(server_url) as session:
+            note_id = await self._saved_id(session, f"{self.marker}: на удаление")
+            deleted = (await session.call_tool("memory_delete", {"id": note_id})).structured_content
+            assert deleted == {"id": note_id, "deleted": True}
+            got = (await session.call_tool("memory_get", {"ids": [note_id]})).structured_content
+            listed = (await session.call_tool("memory_list", {})).structured_content
+        # Мягкий ответ: ни в get, ни в list удалённая не видна (rowcount-wise trash).
+        assert got["notes"] == []
+        assert all(item["id"] != note_id for item in listed["items"])
+
+    @pytest.mark.asyncio
+    async def test_soft_answers_for_missing_ids(self, server_url: str) -> None:
+        """FR-3/FR-5/FR-6: неизвестные id — мягкие ответы, не ошибки."""
+        async with connect(server_url) as session:
+            got = (await session.call_tool("memory_get", {"ids": [10**9]})).structured_content
+            assert got["notes"] == [] and got["hint"]
+            upd = (await session.call_tool(
+                "memory_update", {"id": 10**9, "text": "_body_"}
+            )).structured_content
+            assert upd["updated"] is False and upd["hint"]
+            dele = (await session.call_tool(
+                "memory_delete", {"id": 10**9}
+            )).structured_content
+            assert dele["deleted"] is False and dele["hint"]
+
+    @pytest.mark.asyncio
+    async def test_empty_search_gives_hint(self, server_url: str) -> None:
+        async with connect(server_url) as session:
+            found = (await session.call_tool(
+                "memory_search", {"query": "неттакогословафффф"}
+            )).structured_content
+        assert found["results"] == []
+        assert "переформулируй" in found["hint"]
