@@ -1,0 +1,17 @@
+# Контекст сборки — только код и манифест зависимостей.
+
+.git
+.gitignore
+.dockerignore
+.env
+.env.example
+data/
+tests/
+briefs/
+*.md
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+.venv/

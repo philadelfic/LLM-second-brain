@@ -1,0 +1,25 @@
+# LLM Second Brain — self-hosted MCP-сервер долговременной памяти (NFR-1).
+#
+# Перед запуском: cp .env.example .env — заполнить обязательные переменные
+# (OLLAMA_BASE_URL, SUMMARY_OLLAMA_BASE_URL, SUMMARY_MODEL, MCP_AUTH_TOKEN;
+# пустой токен — фатальная ошибка старта). Каталог данных: mkdir -p data.
+
+services:
+  second-brain:
+    build: .
+    image: llm-second-brain:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"  # хост:контейнер; PORT из .env меняет только контейнерную часть
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data  # SQLite notes.db, снапшоты (Фаза 2+)
+    healthcheck:
+      # python:3.12-slim не содержит curl — проверяем штатным python;
+      # ${PORT:-8080} интерполируется compose из .env (NFR-4: /health без токена).
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:${PORT:-8080}/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
