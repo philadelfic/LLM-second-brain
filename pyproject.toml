@@ -1,0 +1,29 @@
+[project]
+name = "llm-second-brain"
+version = "0.1.0"
+description = "Self-hosted MCP-сервер долговременной памяти для LLM (LLM Second Brain)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn==0.52.4",
+    "mcp==2.1.1",
+    "httpx==0.28.1",
+    "pydantic-settings==2.14.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
