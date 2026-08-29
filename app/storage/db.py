@@ -1,7 +1,8 @@
-"""Хранилище (ARCHITECTURE §3.3): SQLite-схема notes + FTS5 (trigram).
+"""Хранилище (ARCHITECTURE §3.3): SQLite-схема notes + FTS5 (trigram) + vec0.
 
 Слой без доменных правил: только схема, соединения и транзакции. Семантика
-CRUD (валидации, статусы, soft delete) — в `app.services.notes`.
+CRUD (валидации, статусы, soft delete) — в `app.services.notes`; векторные
+операции (сериализация vec0, KNN) — в `app.storage.vectors` (Фаза 3).
 
 Ключевые решения:
 - Схема создаётся идемпотентно при старте (`init_db`, `IF NOT EXISTS`).
@@ -9,6 +10,9 @@ CRUD (валидации, статусы, soft delete) — в `app.services.note
   `content_rowid='id'`, `tokenize='trigram'`), синхронизируется триггерами
   AFTER INSERT / AFTER UPDATE OF text. DELETE-триггер не нужен: удаление —
   soft (`deleted_at`), строка и FTS-индекс физически остаются в trash.
+- `notes_vec` — vec0-таблица, размерность фиксируется при создании БД
+  (ARCH §3.3); несовпадение с EMBEDDING_DIM при старте — отказ запуска
+  (переиндексация — scripts/reindex.py).
 - WAL + busy_timeout (ARCH §3.3): чтения конкурентны, писатели сериализуются,
   спор за блокировку разрешается ожиданием до BUSY_TIMEOUT_MS, а не
   мгновенным «database is locked».
@@ -30,7 +34,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+import sqlite_vec
+
 from app.config import Settings
+from app.storage import vectors
 
 # Сколько ждать блокировку записи, прежде чем сдаться (как timeout sqlite3,
 # так и PRAGMA busy_timeout).
@@ -69,6 +76,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
   text, content='notes', content_rowid='id', tokenize='trigram'
 )
 """
+
+# Вектора (Фаза 3): физическая схема в `app.storage.vectors` (размерность и
+# cosine-метрика — там же); в init_db — только создание/сверка при старте.
 
 # Синхронизация FTS с notes. Для внешнего контента удаление из индекса —
 # спец-команда 'delete' со СТАРЫМИ значениями индексируемых колонок.
@@ -112,6 +122,7 @@ def session(settings: Settings) -> Iterator[sqlite3.Connection]:
         conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        _load_vec_extension(conn)
         yield conn
     except sqlite3.Error as exc:
         raise StorageError(f"ошибка БД ({settings.db_path}): {exc}") from exc
@@ -136,13 +147,33 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         conn.execute("COMMIT")
 
 
+# --- расширение sqlite-vec ------------------------------------------------
+
+def _load_vec_extension(conn: sqlite3.Connection) -> None:
+    """Загрузить sqlite-vec в соединение (нужно на каждом соединении).
+
+    Загрузка расширения — свойство соединения, а не файла БД; стоимость —
+    микросекунды. Без расширения vec0-таблицы не открываются вовсе, поэтому
+    ошибка загрузки — StorageError (фатально на старте).
+    """
+    try:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+    except (AttributeError, sqlite3.Error) as exc:
+        raise StorageError(
+            f"расширение sqlite-vec недоступно (vec0): {exc}"
+        ) from exc
+
+
 # --- инициализация ------------------------------------------------------
 
 def init_db(settings: Settings) -> None:
     """Создать схему при старте (критерий приёмки Фазы 2); идемпотентно.
 
     Raises:
-        StorageError: БД недоступна, нет FTS5 или схема повреждена.
+        StorageError: БД недоступна, нет FTS5/vec0 или схема повреждена
+        (в том числе несовпадение размерности vec0-таблицы с EMBEDDING_DIM).
     """
     path = Path(settings.db_path)
     try:
@@ -153,6 +184,13 @@ def init_db(settings: Settings) -> None:
             for trigger in _TRIGGERS:
                 conn.execute(trigger)
             _check_fts_integrity(conn)
+            # Вектора (Фаза 3): создание при первом старте; при последующих —
+            # сверка размерности с env, несовпадение — понятный отказ запуска
+            # вместо молчаливо невалидного индекса (REQUIREMENTS §8).
+            try:
+                vectors.ensure_vec_table(conn, settings.embedding_dim)
+            except vectors.VectorError as exc:
+                raise StorageError(str(exc)) from exc
     except (sqlite3.Error, OSError) as exc:
         raise StorageError(
             f"не удалось инициализировать БД {settings.db_path}: {exc}"
