@@ -1,8 +1,13 @@
 # LLM Second Brain — self-hosted MCP-сервер долговременной памяти (NFR-1).
 #
-# Перед запуском: cp .env.example .env — заполнить обязательные переменные
-# (OLLAMA_BASE_URL, SUMMARY_OLLAMA_BASE_URL, SUMMARY_MODEL, MCP_AUTH_TOKEN;
-# пустой токен — фатальная ошибка старта). Каталог данных: mkdir -p data.
+# Вся конфигурация запуска — здесь, в `environment` (REQUIREMENTS §8):
+# обязательные переменные берутся из .env (compose читает его автоматически)
+# и при отсутствии роняют `compose up` с понятной ошибкой (`:?`), опциональные
+# имеют канонические дефолты (`:-`). Значение рядом с переменной — дефолт;
+# фактическое значение переопределяется через .env.
+#
+# Перед запуском: cp .env.example .env — заполнить обязательные переменные.
+# Каталог данных: mkdir -p data.
 
 services:
   second-brain:
@@ -11,9 +16,42 @@ services:
     container_name: llm-second-brain  # явное имя вместо сгенерированного llm-second-brain-second-brain-1
     restart: unless-stopped
     ports:
-      - "8080:8080"  # хост:контейнер; PORT из .env меняет только контейнерную часть
-    env_file:
-      - .env
+      - "8080:8080"  # host:container; PORT из env меняет только container-side
+    environment:
+      # --- обязательные (без .env старт не пройдёт) ---
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:?обязательна: Ollama векторизации, напр. http://192.168.3.113:11434}"
+      SUMMARY_OLLAMA_BASE_URL: "${SUMMARY_OLLAMA_BASE_URL:?обязательна: Ollama суммаризации, напр. http://192.168.3.112:11434}"
+      SUMMARY_MODEL: "${SUMMARY_MODEL:?обязательна: модель суммаризации, напр. ornith-1.5:35b}"
+      MCP_AUTH_TOKEN: "${MCP_AUTH_TOKEN:?обязателен: Bearer-токен, сгенерируй openssl rand -hex 32}"
+      # --- векторизация/суммаризация: тонкая настройка ---
+      EMBEDDING_MODEL: "${EMBEDDING_MODEL:-qwen3-embedding:8b}"
+      EMBEDDING_DIM: "${EMBEDDING_DIM:-4096}"          # фиксируется при создании БД
+      MAX_SUMMARY_CHARS: "${MAX_SUMMARY_CHARS:-200}"
+      SNIPPET_CHARS: "${SNIPPET_CHARS:-120}"
+      MAX_GET_BATCH: "${MAX_GET_BATCH:-20}"
+      SUMMARY_THINK: "${SUMMARY_THINK:-true}"          # режим «Б»: рассуждения не ограничиваются
+      SUMMARY_NUM_PREDICT: "${SUMMARY_NUM_PREDICT:-1500}"
+      SUMMARY_TIMEOUT_SEC: "${SUMMARY_TIMEOUT_SEC:-240}"  # 240 = решение 2026-08-29 (боевые заметки думают ~60 c)
+      # --- HTTP/MCP ---
+      PORT: "${PORT:-8080}"
+      MCP_PATH: "${MCP_PATH:-/mcp}"
+      # --- хранилище ---
+      DB_PATH: "${DB_PATH:-/data/notes.db}"
+      MAX_NOTE_CHARS: "${MAX_NOTE_CHARS:-2000}"        # дефолт §8; у нас в .env = 20000
+      PENDING_RETRY_SEC: "${PENDING_RETRY_SEC:-30}"
+      # --- поиск ---
+      DEFAULT_TOP_K: "${DEFAULT_TOP_K:-5}"
+      DEFAULT_LIST_LIMIT: "${DEFAULT_LIST_LIMIT:-20}"
+      SCORE_THRESHOLD: "${SCORE_THRESHOLD:-0.35}"
+      DEDUP_SIMILARITY: "${DEDUP_SIMILARITY:-0.92}"
+      RRF_K: "${RRF_K:-60}"
+      MAX_QUERY_CHARS: "${MAX_QUERY_CHARS:-512}"
+      # --- прочее/наблюдаемость/backup ---
+      AUTHOR_DEFAULT: "${AUTHOR_DEFAULT:-unknown}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      BACKUP_DIR: "${BACKUP_DIR:-/data/backups}"
+      BACKUP_INTERVAL_SEC: "${BACKUP_INTERVAL_SEC:-86400}"
+      BACKUP_KEEP: "${BACKUP_KEEP:-7}"
     volumes:
       - ./data:/data  # SQLite notes.db, снапшоты (Фаза 2+)
     healthcheck:
