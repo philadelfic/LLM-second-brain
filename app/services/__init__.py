@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.config import Settings
+from app.services.backup import BackupService
 from app.services.dedup import DeduplicationService
 from app.services.embedding import EmbeddingService
 from app.services.notes import NoteService
@@ -19,12 +20,13 @@ from app.services.search import SearchService
 from app.services.summary import SummaryService
 
 __all__ = [
+    "BackupService",
     "DeduplicationService",
     "EmbeddingService",
     "NoteService",
     "SearchService",
-    "SummaryService",
     "Services",
+    "SummaryService",
     "build_services",
 ]
 
@@ -38,6 +40,7 @@ class Services:
     embedding: EmbeddingService
     dedup: DeduplicationService
     summary: SummaryService  # воркер — единственный потребитель (режим «Б»)
+    backup: BackupService  # петля снапшотов — asyncio-таска в lifespan
 
 
 def build_services(
@@ -57,4 +60,5 @@ def build_services(
         embedding=embedding,
         dedup=dedup,
         summary=summary if summary is not None else SummaryService(settings),
+        backup=BackupService(settings),
     )

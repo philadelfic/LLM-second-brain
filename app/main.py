@@ -87,6 +87,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # дорезюмируются/довекторизуются сами (ARCH §3.4); при останове —
             # отмена таски.
             worker_task = asyncio.create_task(worker.run(), name="pending-backlog")
+            # BackupService (Фаза 5, NFR-3): снапшот сразу после старта,
+            # далее — раз в BACKUP_INTERVAL_SEC; отказы — в лог, петля живёт.
+            backup_task = asyncio.create_task(
+                services.backup.run(), name="backup-snapshots"
+            )
             try:
                 yield
             finally:
@@ -94,6 +99,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 worker_task.cancel()  # и прервать ожидание, если спит
                 with suppress(asyncio.CancelledError):
                     await worker_task
+                services.backup.stop()
+                backup_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await backup_task
 
     app = FastAPI(
         title="LLM Second Brain",

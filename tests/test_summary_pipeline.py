@@ -30,6 +30,7 @@ from app.services import (
     SearchService,
     Services,
 )
+from app.services.backup import BackupService
 from app.services.notes import WARNING_VECTOR_PENDING
 
 AUTH = "Bearer test-secret-token"
@@ -63,6 +64,7 @@ def _make_client(
             embedding=embedding,
             dedup=dedup,
             summary=summarizer,
+            backup=BackupService(settings),  # Фаза 5: петля снапшотов в lifespan
         )
 
     monkeypatch.setattr("app.main.build_services", builder)
