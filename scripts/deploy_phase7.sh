@@ -27,7 +27,7 @@ die()  { printf 'FATAL: %s\n' "$1" >&2; exit 1; }
   || die "запускать из корня репо llm-second-brain (сейчас: $(pwd))"
 
 # Токен из compose (единственное место конфигурации, .env нет — решение Фазы 5)
-TOKEN="$(grep 'MCP_AUTH_TOKEN' docker-compose.yml | head -n1 \
+TOKEN="$(grep -E '^ *(- )?MCP_AUTH_TOKEN: *"' docker-compose.yml | head -n1 \
           | sed -E 's/.*MCP_AUTH_TOKEN:[[:space:]]*"([^"]+)".*/\1/')"
 [ -n "$TOKEN" ] || die "не нашёл MCP_AUTH_TOKEN в docker-compose.yml"
 
