@@ -76,10 +76,14 @@ while :; do
 done
 echo "health: $HEALTH"
 
-# Нулевая миграция Фазы 7 на живой БД: 2 активные заметки → по 1 чанку
-# каждая (reuse вектора полного текста прямо при пере-чанковке), чанковый
-# pending = 0. Счётчики сверяются с состоянием до деплоя (2/2).
+# Нулевая миграция Фазы 7 на живой БД: таблицы чанков создаются, chunk-ключи
+# meta засеиваются, НО пере-чанковка легаси-заметок не запускается (решение
+# шагов 2/6: отсутствующие в meta ключи = «не менялись»). Ожидание после
+# старта: notes=2, chunks=chunk_vec=0 — это норма, легаси-заметки ищутся
+# по полному вектору (fallback), чанки появятся при update/смене параметров.
+
 docker exec -i "$CONTAINER" python - <<'PY'
+
 import sqlite3, sqlite_vec
 
 conn = sqlite3.connect("/data/notes.db")
@@ -95,11 +99,11 @@ pending_c = one("""SELECT COUNT(*) FROM notes_chunks c
 pending_v = one("""SELECT COUNT(*) FROM notes
                    WHERE vector_status='pending' AND deleted_at IS NULL""")
 assert notes == 2,   f"ожидались 2 живые заметки, есть {notes}"
-assert chunks == 2 and cvecs == 2, \
-    f"пере-чанковка/reuse не сработали: chunks={chunks}, chunk_vec={cvecs}"
+assert chunks == cvecs, \
+    f"рассинхрон чанков и векторов: chunks={chunks}, chunk_vec={cvecs}"
 assert pending_c == 0, f"чанковых pending после старта: {pending_c}"
 assert pending_v == 0, f"векторо-pending после старта: {pending_v}"
-print(f"миграция ок: notes={notes}, chunks={chunks}, chunk_vec={cvecs}, pending=0")
+print(f"миграция ок (нулевая: чанков у легаси нет — норма): notes={notes}, chunks={chunks}, chunk_vec={cvecs}, pending=0")
 PY
 
 # =====================================================================
