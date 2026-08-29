@@ -108,12 +108,13 @@ def test_meta_chunk_params_value_migration_on_legacy_db(tmp_path, monkeypatch) -
     assert note_chunks[0][2] == "первый чанк"
 
 
-def test_dim_change_drops_chunk_vectors_but_keeps_chunk_texts(
+def test_dim_change_rechunks_notes_and_drops_chunk_vectors(
     tmp_path, monkeypatch
 ) -> None:
-    """Смена размерности: ОБА векторных индекса пересоздаются; тексты чанков
-    (слит от сплиттера, не от модели) остаются — воркер пере-кодирует их
-    вектора (pending по анти-джойну) — данные не теряются (NFR-3)."""
+    """Смена размерности: ОБА векторных индекса пересоздаются; по brief §6
+    тексты чанков при этом пересчитываются сплиттером (детерминированным:
+    чанки от тех же параметров не меняются, легаси-заметки получают чанки
+    впервые), вектора сброшены — всё в pending воркера (NFR-3)."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     make_settings(monkeypatch, dim=4)
     settings = get_settings()
@@ -128,9 +129,11 @@ def test_dim_change_drops_chunk_vectors_but_keeps_chunk_texts(
     new_settings = get_settings()
     with session(new_settings) as conn:
         assert "float[8]" in conn.execute(DDL_CHUNKS_VEC).fetchone()[0]
-        assert chunks.count_chunks(conn) == 1  # тексты чанков целы
+        assert chunks.count_chunks(conn) == 1  # чанк от сплиттера на месте
         assert chunks.count_vectors(conn) == 0  # вектора сброшены дропом
-        assert chunks.pending_chunks(conn, limit=10)[0][1] == "текст чанка"
+        # пере-чанковка (brief §6): текст чанка пересчитан от текста заметки,
+        # рукотворный «текст чанка» заменён честным сплиттер-выходом
+        assert chunks.pending_chunks(conn, limit=10)[0][1] == "текст заметки"
     init_db(new_settings)  # повторный старт ничего не портит
     with session(new_settings) as conn:
         assert chunks.count_chunks(conn) == 1
