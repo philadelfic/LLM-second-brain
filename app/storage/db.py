@@ -16,6 +16,11 @@ CRUD (валидации, статусы, soft delete) — в `app.services.note
   запускается ПОЛНАЯ автореиндексация при старте: индекс пересоздаётся,
   все заметки (включая trash) становятся vector_status='pending',
   догоняются фоновым воркером (решение 2026-08-29).
+- `notes_chunks` + `notes_chunks_vec` (Фаза 7): вектора строятся по чанкам
+  заметки; схема и операции — `app.storage.chunks`. FK note_id+CASCADE и
+  PRAGMA foreign_keys=ON в session(); сироты после прямых правок оператора
+  чинятся при старте. Смена чанк-параметров (meta) — пере-чанковка (шаг 6),
+  смена модели/размерности — дроп ОБОИХ векторных индексов.
 - WAL + busy_timeout (ARCH §3.3): чтения конкурентны, писатели сериализуются,
   спор за блокировку разрешается ожиданием до BUSY_TIMEOUT_MS, а не
   мгновенным «database is locked».
@@ -42,7 +47,7 @@ from pathlib import Path
 import sqlite_vec
 
 from app.config import Settings
-from app.storage import vectors
+from app.storage import chunks, vectors
 
 # Сколько ждать блокировку записи, прежде чем сдаться (как timeout sqlite3,
 # так и PRAGMA busy_timeout).
@@ -137,6 +142,9 @@ def session(settings: Settings) -> Iterator[sqlite3.Connection]:
         ) from exc
     try:
         conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        # Фаза 7: FK ON — без него ON DELETE CASCADE у notes_chunks молча
+        # не срабатывает (в SQLite внешние ключи выключены по умолчанию).
+        conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         _load_vec_extension(conn)
@@ -215,9 +223,10 @@ def init_db(settings: Settings) -> None:
     """Создать схему при старте (критерий приёмки Фазы 2); идемпотентно.
 
     При смене EMBEDDING_MODEL или EMBEDDING_DIM поверх существующей БД
-    автоматически перестраивается векторный индекс: солёные вектора другой
-    модели несовместимы, все заметки уходят в pending и догоняются воркером
-    (NFR-3 — данные не теряются, поиск деградирует к FTS до готовности).
+    автоматически перестраиваются ОБА векторных индекса (полный текст и
+    чанки): вектора другой модели несовместимы, все заметки уходят в pending
+    и догоняются воркером (NFR-3 — данные не теряются, поиск деградирует
+    к FTS до готовности).
 
     Raises:
         StorageError: БД недоступна, нет FTS5/vec0, схема повреждена,
@@ -238,10 +247,15 @@ def init_db(settings: Settings) -> None:
             for trigger in _TRIGGERS:
                 conn.execute(trigger)
             _check_fts_integrity(conn)
-            # Вектора (Фаза 3 + решение 2026-08-29): создание при первом
-            # старте; при несовпадении зафиксированной конфигурации
-            # (модель/размерность) с env — полная автореиндексация.
+            # Чанки (Фаза 7): таблица текстов чанков — до векторной сверки,
+            # при несовпадении конфигурации дропается и notes_chunks_vec.
+            chunks.create_table(conn)
+            # Вектора (Фаза 3 + решение 2026-08-29; Фаза 7: + вектора чанков):
+            # создание при первом старте; при несовпадении зафиксированной
+            # конфигурации (модель/размерность) с env — полная автореиндексация
+            # обоих индексов.
             _sync_embedding_meta(conn, settings)
+            selfheal_chunk_orphans(conn)
     except (sqlite3.Error, OSError) as exc:
         raise StorageError(
             f"не удалось инициализировать БД {settings.db_path}: {exc}"
@@ -261,15 +275,58 @@ def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
+# Описания чанк-параметров (Фаза 7, brief §4): фиксируются в meta —
+# смена любого из них поверх живой БД означает пере-чанковку (шаг 6).
+_CHUNK_META_KEYS = ("chunk_size", "chunk_overlap", "chunk_min_target")
+
+
+def _set_chunk_meta_defaults(conn: sqlite3.Connection, settings: Settings) -> None:
+    """Зафиксировать чанк-параметры в meta (нулевая миграция: отсутствующий
+    ключ — из env, без пере-чанковки; сравнение с env и пере-чанковка при
+    смене значения — шаг 6 Фазы 7)."""
+    for key in _CHUNK_META_KEYS:
+        if _get_meta(conn, key) is None:
+            _set_meta(conn, key, str(getattr(settings, key)))
+
+
+def _create_chunk_vec_if_missing(conn: sqlite3.Connection, dim: int) -> None:
+    """notes_chunks_vec появилась в Фазе 7 поверх живых БД — создать, если
+    её ещё нет (не реиндексируя заметки — их вектора и так текущие)."""
+    if chunks.existing_vec_dim(conn) is None:
+        chunks.create_vec_table(conn, dim)
+
+
+def selfheal_chunk_orphans(conn: sqlite3.Connection) -> None:
+    """Вычистить сироты чанков при старте (Фаза 7, как FTS-integrity).
+
+    Операторский sqlite3-CLI без PRAGMA foreign_keys=ON не каскадирует
+    физическое удаление заметки в чанки, а vec0 FK не поддерживает вовсе:
+    чанки без заметки и вектора без чанка убираются самолечением, событие в
+    лог — только если чистить было что."""
+    dead_chunks, dead_vectors = chunks.clean_orphans(conn)
+    if dead_chunks or dead_vectors:
+        logging.getLogger("app").warning(
+            "cleaned chunk orphans left by direct DB edits",
+            extra={
+                "event": "chunks_orphans_cleaned",
+                "chunks": dead_chunks,
+                "chunk_vectors": dead_vectors,
+            },
+        )
+
+
 def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
     """Сверить (модель, размерность) эмбеддинга с записью в meta; разошлись —
-    полная автореиндексация: notes_vec пересоздаётся под текущую размерность,
-    все заметки (включая trash — их вектора тоже невалидны) уходят в pending.
+    полная автореиндексация: ОБА векторных индекса (notes_vec и
+    notes_chunks_vec) пересоздаются под текущую размерность, все заметки
+    (включая trash — их вектора тоже невалидны) уходят в pending; вектора
+    чанков сброшены дропом notes_chunks_vec (pending выводится анти-джойном).
 
     Наследие: у БД без meta (созданных до этой правки) запись создаётся из
     текущего env без реиндексации — нулевой миграцией; их вектора и так
     были построены той же моделью (иначе оператор потратил бы reindex.py).
-    """
+    Чанк-параметры в meta пишутся аналогично — только отсутствующие ключи
+    (сравнение/пере-чанковка — шаг 6)."""
     conn.execute(_META_DDL)
     stored = _get_meta(conn, "embedding_model")
     stored_dim_raw = _get_meta(conn, "embedding_dim")
@@ -278,11 +335,17 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
         # Свежая БД (нет таблицы) или унаследованная (не трогаем, см. docstring).
         if existing_dim is None:
             vectors.create_vec_table(conn, settings.embedding_dim)
+        _create_chunk_vec_if_missing(conn, settings.embedding_dim)
+        _set_chunk_meta_defaults(conn, settings)
         _set_meta(conn, "embedding_model", settings.embedding_model)
         _set_meta(conn, "embedding_dim", str(settings.embedding_dim))
         return
     stored_dim = int(stored_dim_raw)
     if stored == settings.embedding_model and stored_dim == settings.embedding_dim:
+        # Совпало: но notes_chunks_vec могла ещё не существовать на живой БД
+        # (Фаза 7 поверх Фазы 5) — создать при отсутствии.
+        _create_chunk_vec_if_missing(conn, settings.embedding_dim)
+        _set_chunk_meta_defaults(conn, settings)
         return
     notes_count = int(
         conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
@@ -300,9 +363,14 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
     )
     conn.execute("DROP TABLE IF EXISTS notes_vec")
     vectors.create_vec_table(conn, settings.embedding_dim)
+    # Фаза 7: дропнуть и вектора чанков — невалидны той же причиной
+    # (модель/размерность); тексты чанков остаются, воркер пере-кодирует.
+    conn.execute("DROP TABLE IF EXISTS notes_chunks_vec")
+    chunks.create_vec_table(conn, settings.embedding_dim)
     conn.execute("UPDATE notes SET vector_status = 'pending'")
     _set_meta(conn, "embedding_model", settings.embedding_model)
     _set_meta(conn, "embedding_dim", str(settings.embedding_dim))
+    _set_chunk_meta_defaults(conn, settings)
     logging.getLogger("app").info(
         "vector index rebuilt; background worker will re-encode all notes",
         extra={"event": "reindex_done", "pending_vector": notes_count},
