@@ -4,21 +4,25 @@
 Bearer-миддлварь на всё, кроме `/health` (NFR-2). Фаза 2: при старте
 инициализируется хранилище (SQLite, ARCH §3.3); MCP и REST работают
 над общим service-слоем (ARCH §1) через `app.state.services`.
+Фаза 3: в lifespan поднимается фоновый воркер до-векторизации (ARCH §3.4) —
+очередь pending живёт в БД и переживает рестарт; при останове — graceful отмена.
 
 Запуск: `python -m app` (uvicorn) — порт и уровень логов из окружения.
 """
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
 from app import __version__
 from app.config import ConfigError, Settings, get_settings
-from app.services import Services, build_services
+from app.services import build_services
+from app.services.worker import BackgroundWorker
 from app.storage.db import StorageError, init_db
 from app.transport.auth import BearerAuthMiddleware
 from app.transport.mcp import build_mcp
@@ -40,6 +44,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     services = build_services(settings)  # один Settings-снимок на процесс
     mcp = build_mcp(settings, services)
+    worker = BackgroundWorker(settings, services.embedding)  # §3.4, Фаза 3
     # Внутренний маршрут MCP-сервера — ровно MCP_PATH. host="0.0.0.0" — не
     # localhost, поэтому SDK не включает DNS-rebinding protection (сервис
     # живёт в LAN за Bearer-токеном; Open WebUI ходит с не-localhost Host).
@@ -59,7 +64,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise SystemExit(2) from exc
         # Жизненный цикл MCP-сессий Streamable HTTP = жизни процесса.
         async with mcp.session_manager.run():
-            yield
+            # Фоновый воркер: очередь pending живёт в БД — после рестарта
+            # дорезюмируется сама (ARCH §3.4); при останове — отмена таски.
+            worker_task = asyncio.create_task(worker.run(), name="vector-backlog")
+            try:
+                yield
+            finally:
+                worker.stop()  # мягкий флаг: не начинать новую партию
+                worker_task.cancel()  # и прервать ожидание, если спит
+                with suppress(asyncio.CancelledError):
+                    await worker_task
 
     app = FastAPI(
         title="LLM Second Brain",

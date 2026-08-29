@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from app.config import Settings
 from app.services import Services
@@ -62,13 +62,16 @@ def build_rest_router(settings: Settings) -> APIRouter:
     async def health(request: Request) -> HealthResponse:
         """Живость процесса. Отвечает без токена (исключение из NFR-2).
 
-        `embedding_ok`/`summarizer_ok` — None до Фаз 3/4 (внешние LLM);
-        счётчики — из БД: активные заметки (trash не обслуживается).
+        `embedding_ok` — исход последней попытки векторизации (None — попыток
+        не было; обновляет EmbeddingService — единая точка всех кодирований);
+        `summarizer_ok` — None до Фазы 4. Счётчики — из БД: активные заметки
+        (trash не обслуживается).
         """
-        counts = await asyncio.to_thread(_services(request).notes.health_counts)
+        services = _services(request)
+        counts = await asyncio.to_thread(services.notes.health_counts)
         return HealthResponse(
             status="ok",
-            embedding_ok=None,
+            embedding_ok=services.embedding.last_attempt_ok,
             summarizer_ok=None,
             notes_count=counts["notes_count"],
             pending_vector=counts["pending_vector"],
