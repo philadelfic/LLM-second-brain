@@ -28,3 +28,6 @@ include = ["app*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "integration: живые интеграционные тесты (Ollama); при недоступности сервера — SKIP",
+]

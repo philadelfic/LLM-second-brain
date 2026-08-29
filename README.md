@@ -44,8 +44,19 @@ Self-hosted MCP-сервер «второго мозга» для LLM, крут�
 - **Фаза 2 — хранилище: ЗАВЕРШЕНА.** SQLite (`notes` + FTS5 trigram,
   триггеры синхронизации, WAL), CRUD всех 6 методов, soft delete, пагинация,
   batch-get, FTS-only поиск (BM25), fallback-усечение вместо summary.
-  REST `/notes*` + `/search` — тот же сервис-слой; счётчики `/health` из БД.
-- **Далее:** Фаза 3 — векторизация и поиск (Ollama embedding, sqlite-vec,
-  гибридный RRF, дедуп, фоновая до-векторизация).
+- **Фаза 3 — векторизация и поиск: ЗАВЕРШЕНА.** Клиент Ollama `/api/embed`
+  (batch, таймауты, один ретрай); vec0 `notes_vec` (cosine, размерность
+  фиксируется при создании, гейт несовпадения при старте); гибридный поиск
+  vec0+FTS5 → RRF с отсечением по SCORE_THRESHOLD; дедуп в `memory_save`
+  (косинус ≥ DEDUP_SIMILARITY + FTS-фоллбек дословных дублей); фоновая
+  до-векторизация (back-off 30с→×2→15мин); скрипт переиндексации
+  `python -m scripts.reindex`; `embedding_ok` в `/health`. Тесты: unit
+  с детерминированным HashEmbedder + интеграционные с живой Ollama
+  (маркер `integration`, SKIP при недоступности сервера).
+- **Далее:** Фаза 4 — суммаризация (фоновая, режим «Б», вторая Ollama).
+
+Запуск тестов: `pytest -m "not integration"` — слой без сети; live-прогон
+`pytest -m integration` (адрес живой Ollama — env `LIVE_OLLAMA_URL`,
+дефолт 192.168.3.113:11434, скип при недоступности).
 
 Roadmap: REQUIREMENTS §10. Тесты: `pytest` (юнит + e2e по живому серверу).
