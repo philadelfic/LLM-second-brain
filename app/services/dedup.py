@@ -1,17 +1,29 @@
-"""DeduplicationService (ARCHITECTURE §3.2, REQUIREMENTS FR-4).
+"""DeduplicationService (ARCHITECTURE §3.2, REQUIREMENTS FR-4; Фаза 8, Этап 2).
 
-Основной путь — топ-1 по косинусной близости **полного текста** среди активных
-заметок: близость ≥ DEDUP_SIMILARITY (0.92) → «почти дословный повтор», запись
-не создаётся, возвращается существующая ({id, text, hint}). Порог ловит
-дословные повторы; перефразы (типично 0.80–0.85) сохраняются как новые.
+Дедуп разложен на два пути:
 
-Деградация (отказ векторизации) — фоллбек «по тексту»: точное совпадение
-(SQL) и «почти точное» по нормализованному тексту (регистр/пробелы) через
-FTS5-фразу. Дословные дубли отсекаются, перефразы пропускаются — это
-заявленная деградация, `memory_save` сопровождает её warning (ARCH §4.1).
+- **Синхронный, при записи (save/update)** — только дословный дубль по тексту
+  (`find_by_text`): точное совпадение (SQL) и «почти точное» по
+  нормализованному тексту (регистр/пробелы) через FTS5-слова. Мгновенно, без
+  Ollama; перефразы не ловит — с Фазы 8 (Этап 1) это штатно: вектор в момент
+  записи не строится, косинус-сравнение невозможно на синхронном пути.
+- **Фоновый, после довекторизации (Этапы 2–3)**: воркер ищет топ-N
+  косинус-кандидатов (`find_candidates`, нижний порог
+  DEDUP_CANDIDATE_SIMILARITY ~0.80 — специально шире «дубль»-порога, чтобы
+  ловить перефразы 0.80–0.85). Приговор «дубль» принимает LLM-судья
+  (Этап 3.2, JudgeService — модель DEDUP_JUDGE_MODEL `ornith-1.5:35b`,
+  think:false): каждый кандидат опрашивается по паре текстов, косинус —
+  лишь предфильтр; без судьи (DI None, тестовый режим) воркер сводит по
+  косинусу ≥ DEDUP_SIMILARITY (фоллбек Этапа 2.2).
 
-Trash (soft delete) не участвует: удалённая заметка — не кандидат в дубликаты
-(undo оператора вернёт её как отдельную заметку, REQUIREMENTS FR-6).
+`find_by_cosine` (топ-1 по DEDUP_SIMILARITY) — прежний синхронный путь Фаз
+3–7: прод-код его с Этапа 1 не вызывает (сведение живёт в воркере — Этап
+2.2), оставлен как проверочное API (вопрос об удалении — по ходу Этапа 3).
+
+Trash (soft delete) не участвует ни в одном пути: удалённая заметка — не
+кандидат в дубликаты (undo оператора вернёт её как отдельную заметку,
+REQUIREMENTS FR-6); вектора trash живы (ARCH §3.3), дедуп читает только
+активные.
 """
 
 from __future__ import annotations
@@ -48,7 +60,7 @@ def normalize_text(text: str) -> str:
 
 
 class DeduplicationService:
-    """Топ-1 косинус по вектору; при отказе векторизации — фоллбек по тексту."""
+    """Дословный дедуп по тексту + топ-N косинус-кандидатов (предфильтр Этапа 2)."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -58,8 +70,12 @@ class DeduplicationService:
     def find_by_cosine(self, vector: list[float]) -> sqlite3.Row | None:
         """Топ-1 активная заметка с cosine ≥ DEDUP_SIMILARITY (иначе None).
 
-        Хит на удалённую (trash) заметку — не дубликат: вектора trash живы
-        для поиска-восстановления, но дедуп читает только активные.
+        С Фазы 8 прод-код метод не вызывает (синхронной векторизации больше
+        нет — Этап 1; вердикт фонового дедупа принял судья — Этап 3.2):
+        оставлен как проверочное API (решение об удалении — открытое,
+        за ответом к Олегу). Хит на удалённую (trash) заметку — не
+        дубликат: вектора trash живы для поиска-восстановления, но дедуп
+        читает только активные.
         """
         with session(self._settings) as conn:
             hits = vectors.knn(conn, vector, 1)
@@ -73,6 +89,59 @@ class DeduplicationService:
                 "WHERE id = ? AND deleted_at IS NULL",
                 (note_id,),
             ).fetchone()
+
+    # --- фоновый дедуп: кандидаты (Фаза 8, Этап 2.1) -------------------------
+
+    def find_candidates(
+        self, vector: list[float], exclude_id: int | None = None
+    ) -> list[tuple[int, float]]:
+        """Топ-N активных кандидатов по косинусу (кандидат-предфильтр Этапа 2).
+
+        Нижний порог DEDUP_CANDIDATE_SIMILARITY (~0.80) нарочно шире
+        фоллбек-порога DEDUP_SIMILARITY: кандидат — «возможно, перефраз»
+        (типичные перефразы 0.80–0.85, которых порог 0.92 не видит).
+        Финальное решение — за судьёй (Этап 3.2): воркер опрашивает
+        JudgeService по каждому кандидату (think:false), сводит первый
+        «ДУБЛЬ» (_merge_duplicates: merge суммаризатором, ранний
+        обновляется, поздний — trash); без судьи (DI None, тестовый
+        режим) — косинус-фоллбек Этапа 2.2 по DEDUP_SIMILARITY.
+
+        exclude_id — свежевекторизованная заметка: её вектор уже в notes_vec
+        и без исключения занял бы слот топ-N с cosine 1.0. Trash не кандидат:
+        окно KNN расширяется на число trash-векторов, пост-фильтр оставляет
+        только активные (как в SearchService — vec0 не знает о notes).
+        Возврат — [(note_id, cosine)] по убыванию близости, не более топ-N.
+        """
+        top_n = self._settings.dedup_candidate_top_n
+        threshold = self._settings.dedup_candidate_similarity
+        with session(self._settings) as conn:
+            trash = conn.execute(
+                "SELECT COUNT(*) FROM notes_vec WHERE note_id IN "
+                "(SELECT id FROM notes WHERE deleted_at IS NOT NULL)"
+            ).fetchone()[0]
+            window = top_n + trash + (1 if exclude_id is not None else 0)
+            hits = vectors.knn(conn, vector, window)
+            if not hits:
+                return []
+            placeholders = ",".join("?" * len(hits))
+            active = {
+                row[0]
+                for row in conn.execute(
+                    f"SELECT id FROM notes WHERE deleted_at IS NULL "
+                    f"AND id IN ({placeholders})",
+                    [note_id for note_id, _ in hits],
+                )
+            }
+            result: list[tuple[int, float]] = []
+            for candidate_id, cosine_value in hits:
+                if cosine_value < threshold:
+                    break  # выдача KNN отсортирована — дальше только ниже
+                if candidate_id == exclude_id or candidate_id not in active:
+                    continue  # сама свежая заметка / trash — не кандидаты
+                result.append((candidate_id, cosine_value))
+                if len(result) == top_n:
+                    break
+            return result
 
     # --- фоллбек --------------------------------------------------------
 

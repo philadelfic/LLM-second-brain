@@ -187,16 +187,17 @@ def test_app_lifespan_starts_and_stops_worker(client, test_env) -> None:
     assert response.json()["embedding_ok"] is None  # попыток не было
 
 
-def test_health_reflects_last_embedding_attempt(client, token) -> None:
-    """/health.embedding_ok: False после неудачной попытки кодирования."""
+def test_save_makes_no_embedding_attempt(client, token) -> None:
+    """Фаза 8: save не кодирует синхронно — embedding_ok остаётся None
+    (попыток кодирования не было), заметка стоит в очереди pending_vector."""
     client.post(
         "/notes",
         json={"text": "заметка до health-опроса"},
         headers={"Authorization": f"Bearer {token}"},
     )
     body = client.get("/health").json()
-    assert body["embedding_ok"] is False
-    assert body["pending_vector"] == 1  # воркер ещё не векторизовал (offline)
+    assert body["embedding_ok"] is None  # попыток кодирования не было
+    assert body["pending_vector"] == 1  # очередь вектора — воркеру
 
 # --- суммаризационная очередь (Фаза 4, режим «Б») -----------------------------
 

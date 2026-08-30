@@ -1,6 +1,6 @@
 """Тесты env-парсера — все переменные REQUIREMENTS §8.
 
-Проверяем: полноту покрытия таблицы §8, обязательность четырёх переменных
+Проверяем: полноту покрытия таблицы §8, обязательность шести переменных
 (отсутствие и пустое значение — фатально), значения по умолчанию,
 приведение типов (int/float/bool) и отказ на мусорных значениях.
 """
@@ -16,6 +16,8 @@ REQUIRED_ENV: dict[str, str] = {
     "OLLAMA_BASE_URL": "http://192.168.3.113:11434",
     "SUMMARY_OLLAMA_BASE_URL": "http://192.168.3.112:11434",
     "SUMMARY_MODEL": "ornith-1.5:35b",
+    "DEDUP_JUDGE_OLLAMA_BASE_URL": "http://192.168.3.112:11434",
+    "DEDUP_JUDGE_MODEL": "ornith-1.5:35b",
     "MCP_AUTH_TOKEN": "test-secret-token",
 }
 
@@ -44,6 +46,13 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "DEFAULT_LIST_LIMIT": ("default_list_limit", 20),
     "SCORE_THRESHOLD": ("score_threshold", 0.35),
     "DEDUP_SIMILARITY": ("dedup_similarity", 0.92),
+    # Фаза 8 (Этап 2.1): фоновый дедуп — косинус-кандидаты.
+    "DEDUP_CANDIDATE_TOP_N": ("dedup_candidate_top_n", 3),
+    "DEDUP_CANDIDATE_SIMILARITY": ("dedup_candidate_similarity", 0.80),
+    # Фаза 8 (Этап 3.1): LLM-судья дедупа ornith-1.5:35b (think:false).
+    "DEDUP_JUDGE_THINK": ("dedup_judge_think", False),
+    "DEDUP_JUDGE_NUM_PREDICT": ("dedup_judge_num_predict", 256),
+    "DEDUP_JUDGE_TIMEOUT_SEC": ("dedup_judge_timeout_sec", 30),
     "RRF_K": ("rrf_k", 60),
     "MAX_NOTE_CHARS": ("max_note_chars", 2000),
     "MAX_QUERY_CHARS": ("max_query_chars", 512),
@@ -78,8 +87,8 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 34 поля: 4 обязательных + 30 с умолчаниями
-        (28 §8 + 6 чанковых Фазы 7, brief §4)."""
+        """В Settings — ровно 41 поле: 6 обязательных + 35 с умолчаниями
+        (24 §8 + 6 чанковых Фазы 7 + 2 фонового дедупа + 3 судьи Фазы 8)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected
@@ -139,6 +148,8 @@ class TestDefaults:
         assert settings.ollama_base_url == "http://192.168.3.113:11434"
         assert settings.summary_ollama_base_url == "http://192.168.3.112:11434"
         assert settings.summary_model == "ornith-1.5:35b"
+        assert settings.dedup_judge_ollama_base_url == "http://192.168.3.112:11434"
+        assert settings.dedup_judge_model == "ornith-1.5:35b"
         assert settings.mcp_auth_token == "test-secret-token"
 
 
@@ -162,8 +173,14 @@ class TestOverrides:
     def test_bool_coercion(self, monkeypatch: pytest.MonkeyPatch) -> None:
         for value in ("false", "0", "off"):
             assert load_env(monkeypatch, SUMMARY_THINK=value).summary_think is False
+            assert load_env(
+                monkeypatch, DEDUP_JUDGE_THINK=value
+            ).dedup_judge_think is False
         for value in ("true", "1", "on"):
             assert load_env(monkeypatch, SUMMARY_THINK=value).summary_think is True
+            assert load_env(
+                monkeypatch, DEDUP_JUDGE_THINK=value
+            ).dedup_judge_think is True
 
     def test_string_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         settings = load_env(monkeypatch, MCP_PATH="/memory", LOG_LEVEL="DEBUG")

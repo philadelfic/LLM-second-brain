@@ -29,14 +29,22 @@ services:
       CHUNK_OVERLAP: "180"                   # перекрытие соседних окон, токенов (< CHUNK_SIZE)
       CHUNK_MIN_TARGET: "200"                # хвостовой чанк меньше — слить с предыдущим
       EMBEDDING_BATCH_SIZE: "32"             # чанков в одном /api/embed запросе воркера
-      EMBEDDING_CONCURRENT_REQUESTS: "3"     # параллельных embed-запросов воркера
+      EMBEDDING_CONCURRENT_REQUESTS: "1"     # сервер = одна генерация; очередь ollama_slot гарантирует это и кодом (F1, решение О. 2026-08-30)
       SCORE_THRESHOLD: "0.35"                # порог косинуса для отсечения в поиске
-      DEDUP_SIMILARITY: "0.92"               # порог «почти дубликата» в memory_save
+      DEDUP_SIMILARITY: "0.92"               # порог «дубль» в фоновом дедупе (Фаза 8)
+      DEDUP_CANDIDATE_TOP_N: "3"             # топ-N косинус-кандидатов дедупа (Этап 2.1)
+      DEDUP_CANDIDATE_SIMILARITY: "0.80"     # нижний порог кандидата-перефраза (≤ DEDUP_SIMILARITY)
       # --- суммаризация (режим «Б»: режимы think не ограничиваются) ---
       MAX_SUMMARY_CHARS: "200"
       SUMMARY_THINK: "true"                  # оставить размышления модели
       SUMMARY_NUM_PREDICT: "1500"            # бюджет thinking+content
-      SUMMARY_TIMEOUT_SEC: "240"             # 4 мин: боевые заметки думают ~60 c (решение 2026-08-29)
+      SUMMARY_TIMEOUT_SEC: "600"             # 10 мин: merge длинной пары 372 c (замер E2E 2026-08-30), боевые суммари ~60 c
+      # --- LLM-судья дедупа (Фаза 8, Этап 3, решение О. 2026-08-30: ornith-1.5:35b) ---
+      DEDUP_JUDGE_OLLAMA_BASE_URL: "http://192.168.3.112:11434"  # Ollama судьи (/api/chat)
+      DEDUP_JUDGE_MODEL: "ornith-1.5:35b"                        # модель-судья дедупа
+      DEDUP_JUDGE_THINK: "true"              # думающий судья: think:false давал ложные ДУБЛИ на длинных заметках (E2E); решение О. 2026-08-30
+      DEDUP_JUDGE_NUM_PREDICT: "1024"        # бюджет thinking+вердикт (замер: ~1200 токенов, done_reason=stop)
+      DEDUP_JUDGE_TIMEOUT_SEC: "120"         # думающий судья: длинная пара 46 c + холодный старт ~17 c; решение О. «увеличим»
       # --- HTTP/MCP ---
       PORT: "8080"
       MCP_PATH: "/mcp"

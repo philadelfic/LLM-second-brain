@@ -21,7 +21,7 @@ import threading
 import time
 
 import pytest
-from fakes import FailingEmbedder, HashEmbedder
+from fakes import FailingEmbedder, HashEmbedder, vectorize_notes
 from test_notes_chunks import CountingHashEmbedder, text_with_tokens
 
 from app.config import get_settings
@@ -224,9 +224,11 @@ def test_batches_of_batch_size_by_fake_counter(settings) -> None:
 
 
 def test_note_vector_queue_untouched_by_chunk_queue(settings) -> None:
-    """Чанковая петля не трогает notes-статусы: полные вектора — своя очередь."""
+    """Чанковая петля не трогает notes-статусы: полный вектор пишет только
+    notes-очередь (Фаза 8: после save он ещё pending)."""
     notes = make_notes(settings, HashEmbedder(8))
     note_id = notes.save(text_with_tokens(3000))["id"]
+    assert vectorize_notes(settings, HashEmbedder(8)) == 1  # Фаза 8: очередь notes
     worker = BackgroundWorker(settings, HashEmbedder(8))
     assert asyncio.run(worker.process_pending_chunks()) == 4
     with session(settings) as conn:

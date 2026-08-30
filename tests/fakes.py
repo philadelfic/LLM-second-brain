@@ -13,11 +13,31 @@ HashEmbedder подменяет EmbeddingService там, где внешняя �
 Качество «настоящих» перефразов — зона интеграционных тестов с живой Ollama
 (шаг 3.6); фейк даёт грубое сходство по совпадающим подстрокам.
 
+vectorize_notes — хелпер Фазы 8: один прогон notes-очереди воркера
+(process_pending) догоняет очередь pending_vector в тестах, которым нужно
+состояние «вектор готов» (save кодировщик больше не зовёт).
+
+RecordingDedup (Фаза 8, Этап 2.1) подменяет DeduplicationService в воркере:
+готовый список косинус-кандидатов + журнал вызовов — тесты проверяют,
+что фоновый конвейер зовёт поиск кандидатов и режет их «только ранние».
+
 Суммаризаторы (Фаза 4, режим «Б») подменяют SummaryService в воркере:
 FixedSummarizer — детерминированный успешный ответ (с логом вызовов);
 FailingSummarizer — всегда отказ (деградация: back-off, pending остаётся).
+Фаза 8, Этап 2.2: у суммаризаторов есть и `merge` (слияние дублей);
+MergeFailingSummarizer — суммаризация работает, слияние отказывает
+(флаг fail переключается тестом — повтор слияния по back-off).
+
 Оба ведут `last_attempt_ok` — как настоящий SummaryService: e2e-тесты
 с DI-сборкой проверяют и `/health.summarizer_ok` (NFR-4).
+
+ScriptedJudge (Фаза 8, Этап 3.2) подменяет JudgeService в воркере
+(интерфейс Judge): вердикты вычерпываются из скриптованной очереди
+(True — «ДУБЛЬ»), исчерпанная очередь замещается дефолтом; `fail=True` —
+отказ JudgeError (тест повторного слияния по back-off, NFR-3). Журнал
+`judge_calls` — пары текстов (text_new, text_candidate) в порядке опроса:
+тесты проверяют, что судьёй спрашивают именно живых косинус-кандидатов,
+а приговор принимает первый вердикт «ДУБЛЬ».
 """
 
 from __future__ import annotations
@@ -26,7 +46,9 @@ import hashlib
 import math
 
 from app.services.embedding import EmbeddingError
+from app.services.judge import JudgeError
 from app.services.summary import SummaryError
+from app.services.worker import BackgroundWorker
 
 
 class HashEmbedder:
@@ -74,6 +96,19 @@ def cosine(a: list[float], b: list[float]) -> float:
     return sum(x * y for x, y in zip(a, b))
 
 
+def vectorize_notes(settings, embedder) -> int:
+    """Фаза 8: догнать очередь pending_vector — как это делает воркер в проде.
+
+    С Этапа 1 save/update записывают текст мгновенно, с
+    vector_status='pending', и НЕ вызывают кодировщик. Тестам, которым нужно
+    состояние «вектор готов» (поиск по вектору, косинусный дедуп), следует
+    вызвать этот хелпер: один прогон notes-очереди BackgroundWorker
+    (process_pending) — тот же код, что гоняет живой воркер. Возвращает
+    число довекторизованных заметок.
+    """
+    return BackgroundWorker(settings, embedder).process_pending()
+
+
 class FailingEmbedder:
     """Фейк-отказ: векторизация всегда недоступна (NFR-3, деградация).
 
@@ -104,15 +139,27 @@ class FixedSummarizer:
     тесты проверяют, что воркер гоняет именно pending тексты.
     """
 
-    def __init__(self, summary: str = "Фикс-суммари одной строкой.") -> None:
+    def __init__(
+        self,
+        summary: str = "Фикс-суммари одной строкой.",
+        merged: str = "Объединённый текст дубликатов одной строкой.",
+    ) -> None:
         self.summary = summary
+        self.merge_result = merged
         self.calls: list[str] = []
+        self.merge_calls: list[tuple[str, str]] = []
         self.last_attempt_ok: bool | None = None  # для /health.summarizer_ok
 
     def summarize(self, text: str) -> str:
         self.calls.append(text)
         self.last_attempt_ok = True
         return self.summary
+
+    def merge(self, text_a: str, text_b: str) -> str:
+        """Слияние дубликатов (Этап 2.2): фиксированный ответ, журнал пар."""
+        self.merge_calls.append((text_a, text_b))
+        self.last_attempt_ok = True
+        return self.merge_result
 
     def close(self) -> None:  # интерфейс-совместимость с SummaryService
         return None
@@ -135,5 +182,99 @@ class FailingSummarizer:
         self.last_attempt_ok = False
         raise SummaryError(self.message)
 
+    def merge(self, text_a: str, text_b: str) -> str:
+        """Слияние дубликатов всегда отказывает (как summarize)."""
+        self.merge_calls.append((text_a, text_b))
+        self.last_attempt_ok = False
+        raise SummaryError(self.message)
+
     def close(self) -> None:  # интерфейс-совместимость с SummaryService
+        return None
+
+
+class RecordingDedup:
+    """Фейк-дедуп для фонового конвейера воркера (Фаза 8, Этап 2.1).
+
+    Реализует только то, что воркер зовёт (`find_candidates`): возвращает
+    заранее заданный список кандидатов и ведёт журнал вызовов
+    `calls: [(exclude_id, vector), ...]` — тест проверяет, что
+    process_pending ищет кандидатов для каждой довекторизованной заметки
+    с exclude_id = её id, а воркер оставляет только ранних (id < note_id).
+    """
+
+    def __init__(self, candidates: list[tuple[int, float]] | None = None) -> None:
+        self.candidates = list(candidates or [])
+        self.calls: list[tuple[int | None, list[float]]] = []
+
+    def find_candidates(
+        self, vector: list[float], exclude_id: int | None = None
+    ) -> list[tuple[int, float]]:
+        self.calls.append((exclude_id, list(vector)))
+        return list(self.candidates)
+
+    def close(self) -> None:  # интерфейс-совместимость с DeduplicationService
+        return None
+
+
+class MergeFailingSummarizer(FixedSummarizer):
+    """Фейк: суммаризация работает, слияние дедупа отказывает (Фаза 8, 2.2).
+
+    Для NFR-3 теста слияния: merge() raise SummaryError, пока `fail` True
+    (обе заметки остаются, свежая возвращается в pending_vector); тест
+    переключает `fail = False` — повтор воркера завершает сведение.
+    """
+
+    def __init__(
+        self,
+        summary: str = "Фикс-суммари одной строкой.",
+        merged: str = "Объединённый текст после исправления слияния.",
+    ) -> None:
+        super().__init__(summary)
+        self.merge_result = merged
+        self.merge_calls: list[tuple[str, str]] = []
+        self.fail: bool = True  # False — слияние восстановилось
+
+    def merge(self, text_a: str, text_b: str) -> str:
+        self.merge_calls.append((text_a, text_b))
+        if self.fail:
+            self.last_attempt_ok = False
+            raise SummaryError("слияние недоступно")
+        self.last_attempt_ok = True
+        return self.merge_result
+
+
+class ScriptedJudge:
+    """Фейк-судья дедупа (Фаза 8, Этап 3.2): скриптованные вердикты.
+
+    `judge()` вычерпывает `verdicts` по порядку (True — «ДУБЛЬ», False —
+    «НЕ ДУБЛЬ»); исчерпанная очередь замещается `default`. `fail=True` —
+    JudgeError при каждом вызове (деградация: воркер держит обе заметки
+    и повторяет по back-off, NFR-3; тест снимает флаг — «судья
+    восстановился»). Журнал `judge_calls` — пары (text_new,
+    text_candidate) в порядке опроса; `last_attempt_ok` — как у
+    JudgeService (NFR-4, /health).
+    """
+
+    def __init__(
+        self,
+        verdicts: list[bool] | None = None,
+        default: bool = False,
+        fail: bool = False,
+    ) -> None:
+        self.verdicts = list(verdicts or [])
+        self.default = default
+        self.fail = fail
+        self.judge_calls: list[tuple[str, str]] = []
+        self.last_attempt_ok: bool | None = None
+
+    def judge(self, text_new: str, text_candidate: str) -> bool:
+        """Вердикт из очереди; отказ — JudgeError (интерфейс Judge)."""
+        self.judge_calls.append((text_new, text_candidate))
+        if self.fail:
+            self.last_attempt_ok = False
+            raise JudgeError("судья недоступен")
+        self.last_attempt_ok = True
+        return self.verdicts.pop(0) if self.verdicts else self.default
+
+    def close(self) -> None:  # интерфейс-совместимость с JudgeService
         return None

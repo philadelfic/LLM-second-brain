@@ -3,7 +3,8 @@
 Сквозная связка каркаса: save/update сразу возвращаются (суммаризация —
 только из воркера), воркер догоняет pending_summary; `/health` ведёт
 `summarizer_ok`/`pending_summary`; выдачи — fallback-усечение до готовности,
-настоящее суммари после догонки (get/list/search). Внешняя сеть не нужна:
+настоящее суммари после догонки (get/list/search). С Фазы 8 векторизация
+тоже фоновая (save не ждёт embed). Внешняя сеть не нужна:
 `app.main.build_services` подменяется DI-сборкой с фейк-суммаризатором
 (FixedSummarizer/FailingSummarizer), векторизация — живой EmbeddingService
 на loopback:1 (штатная деградация Фазы 2/3, не отвлекает от Фазы 4).
@@ -14,6 +15,7 @@ MCP-инструменты идут через тот же сервис-слой
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable, Iterator
 
@@ -31,7 +33,7 @@ from app.services import (
     Services,
 )
 from app.services.backup import BackupService
-from app.services.notes import WARNING_VECTOR_PENDING
+from app.services.judge import JudgeService
 
 AUTH = "Bearer test-secret-token"
 
@@ -47,11 +49,13 @@ assert len(NOTE_TEXT) > 200  # fallback-усечение по MAX_SUMMARY_CHARS 
 
 
 def _make_client(
-    monkeypatch: pytest.MonkeyPatch, summarizer, retry_sec: str = "0"
+    monkeypatch: pytest.MonkeyPatch, summarizer, retry_sec: str = "0",
+    notify: bool = True,
 ) -> TestClient:
     """Приложение с DI-подменой build_services; retry_sec задаёт темп воркера:
     0 — мгновенная догонка (для поллинга), 30 — воркер спит (детерминированные
-    проверки «до готовности» без гонок с фоновой догонкой)."""
+    проверки «до готовности» без гонок с фоновой догонкой). `notify=False`
+    отключает notifier суммаризации — воркер не будится сразу при save."""
     monkeypatch.setenv("PENDING_RETRY_SEC", retry_sec)
     get_settings.cache_clear()
 
@@ -64,11 +68,15 @@ def _make_client(
             embedding=embedding,
             dedup=dedup,
             summary=summarizer,
+            dedup_judge=JudgeService(settings),  # loopback:1: недоступен — Eтап 3.2
             backup=BackupService(settings),  # Фаза 5: петля снапшотов в lifespan
         )
 
     monkeypatch.setattr("app.main.build_services", builder)
-    return TestClient(create_app())
+    client = TestClient(create_app())
+    if not notify:
+        client.app.state.services.notes.set_summary_notifier(None)
+    return client
 
 
 @pytest.fixture
@@ -85,7 +93,8 @@ def paused_app(monkeypatch) -> Iterator[TestClient]:
     """Приложение, где воркер спит (retry 30с): детерминированные проверки
     «до готовности» — без гонок с фоновой догонкой."""
     with _make_client(
-        monkeypatch, FixedSummarizer("Ретроспектива 12 сентября в 14:00."), "30"
+        monkeypatch, FixedSummarizer("Ретроспектива 12 сентября в 14:00."), "30",
+        notify=False,
     ) as test_client:
         yield test_client
 
@@ -125,8 +134,8 @@ def _wait_until(fn: Callable[[], bool], timeout: float = 5.0) -> bool:
 def test_save_returns_immediately_in_mode_b(paused_app, token) -> None:
     """Контракт режима «Б»: save отвечает сразу, воркер ещё не пытался."""
     result = _create(paused_app, token, NOTE_TEXT)
-    assert result["summary_pending"] is True
-    assert result["warning"] == WARNING_VECTOR_PENDING  # векторизация offline
+    # Фаза 8: контракт без warning — векторизация тоже фоновая.
+    assert result == {"id": 1, "stored": True, "summary_pending": True}
     note = paused_app.get(
         "/notes/1", headers={"Authorization": f"Bearer {token}"}
     ).json()
@@ -136,7 +145,26 @@ def test_save_returns_immediately_in_mode_b(paused_app, token) -> None:
     assert note["summary"] != ""
     body = _health(paused_app)
     assert body["pending_summary"] == 1  # заметка стоит в очереди на суммаризацию
+    assert body["pending_vector"] == 1  # и в очереди на векторизацию тоже (Фаза 8)
     assert body["summarizer_ok"] is None  # воркер ещё не генерировал
+
+
+def test_notifier_wakes_worker_without_blocking_save(monkeypatch, token) -> None:
+    """Notifier: save отвечает сразу (не блокируется), но воркер догоняет
+    немедленно — даже при большом back-off (retry 30с)."""
+    with _make_client(
+        monkeypatch, FixedSummarizer("Ретроспектива 12 сентября в 14:00."), "30",
+        notify=True,
+    ) as test_client:
+        result = _create(test_client, token, NOTE_TEXT)
+        assert result["summary_pending"] is True  # save не ждал суммаризацию
+        # воркер догоняет сразу (notifier), не дожидаясь 30с back-off
+        assert _wait_until(
+            lambda: test_client.get(
+                "/notes/1", headers={"Authorization": f"Bearer {token}"}
+            ).json()["summary_status"] == "ok",
+            timeout=3.0,
+        )
 
 
 def test_worker_backfills_summary_and_health(ok_app, token) -> None:
@@ -245,6 +273,28 @@ def test_failure_is_retried_by_worker(dead_app, token) -> None:
         "/notes/1", headers={"Authorization": f"Bearer {token}"}
     ).json()
     assert note["summary_status"] == "pending"  # по-прежнему не догнали
+
+
+def test_failure_logs_summary_failed_event(dead_app, token, caplog) -> None:
+    """Хвост Фазы 5: отказ генерации — WARNING event=summary_failed (note_id).
+
+    Наблюдаемость деградации: молчаливый `continue` не отличить в логах от
+    пустой очереди; воркер теперь громко говорит, ЧТО и ДЛЯ какой заметки
+    не смог сгенерировать (наблюдаемость E2E-находки F1).
+    """
+    _create(dead_app, token, NOTE_TEXT)
+    assert _wait_until(lambda: _health(dead_app)["summarizer_ok"] is False)
+    with caplog.at_level(logging.WARNING, logger="app"):
+        fake = dead_app.app.state.services.summary  # FailingSummarizer (DI)
+        calls_before = len(fake.calls)
+        # воркер крутится с PENDING_RETRY_SEC=0 — следующая попытка мгновенно
+        assert _wait_until(lambda: len(fake.calls) > calls_before, timeout=3.0)
+    events = [
+        r for r in caplog.records if r.__dict__.get("event") == "summary_failed"
+    ]
+    assert events, "нет WARNING event=summary_failed при отказе генерации"
+    assert events[0].levelno == logging.WARNING
+    assert events[0].__dict__.get("note_id") == 1
 
 
 def test_mcp_and_rest_share_summary_outputs(ok_app, token) -> None:

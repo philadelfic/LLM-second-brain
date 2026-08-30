@@ -24,6 +24,9 @@ TEST_ENV: dict[str, str] = {
     "OLLAMA_BASE_URL": "http://127.0.0.1:1",
     "SUMMARY_OLLAMA_BASE_URL": "http://127.0.0.1:1",
     "SUMMARY_MODEL": "test-summary-model",
+    # LLM-судья дедупа (Фаза 8, Этап 3.1): обязательные как у суммаризатора.
+    "DEDUP_JUDGE_OLLAMA_BASE_URL": "http://127.0.0.1:1",
+    "DEDUP_JUDGE_MODEL": "test-judge-model",
     "MCP_AUTH_TOKEN": "test-secret-token",
 }
 
@@ -51,8 +54,14 @@ def test_env(
 
 @pytest.fixture
 def client(test_env: dict[str, str]) -> Iterator[TestClient]:
-    """Клиент к приложению, собранному из тестового окружения."""
+    """Клиент к приложению, собранному из тестового окружения.
+
+    Notifier суммаризации отключён: REST-тесты проверяют контракты CRUD и
+    pending-счётчики детерминированно (воркер спит на back-off, а не
+    будится сразу при save).
+    """
     with TestClient(create_app()) as test_client:
+        test_client.app.state.services.notes.set_summary_notifier(None)
         yield test_client
 
 

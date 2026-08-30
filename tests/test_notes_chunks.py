@@ -1,10 +1,10 @@
-"""NoteService и чанки (Фаза 7, шаг 3): save/update/delete поверх notes_chunks.
+"""NoteService и чанки (Фаза 7/8): save/update/delete поверх notes_chunks.
 
-Проверяются (brief §6): чанковка в save/update (без Ollama для чанков),
-reuse единичного чанка (на заметку ≤ CHUNK_SIZE — ровно ОДИН вызов
-кодировщика: «1-чанная заметка ≠ дубликат чанка-векторов»), pending по
-анти-джойну для многочанковых заметок, замена чанков при update (в т.ч. при
-отказе ре-векторизации), сохранение чанков trash при soft delete, неприкосновенность
+Проверяются (brief §6 + Фаза 8, Этап 1): чанковка в save/update чистым
+сплиттером (кодировщик в синхронном пути не зовётся вовсе), чанки пишутся
+без векторов — их строит фоновый воркер (notes- и чанковая очереди,
+reuse единичного чанка из notes_vec — после догонки), замена чанков при
+update, сохранение чанков trash при soft delete, неприкосновенность
 чанков при дедуп-отказе. Свечение текстов чанков против сплиттера — в тестах
 размерности/схемы (test_chunks_storage), здесь — доменные правила.
 
@@ -15,13 +15,16 @@ MAX_NOTE_CHARS поднят до боевого значения compose (20000,
 
 from __future__ import annotations
 
+import asyncio
+
 from collections.abc import Iterator
 
 import pytest
-from fakes import FailingEmbedder, HashEmbedder
+from fakes import FailingEmbedder, HashEmbedder, vectorize_notes
 
 from app.config import get_settings
 from app.services.notes import NoteService
+from app.services.worker import BackgroundWorker
 from app.services.splitter import count_tokens, encoding, split_text, token_windows
 from app.storage import chunks, vectors
 from app.storage.db import init_db, session
@@ -85,11 +88,13 @@ def service() -> tuple[NoteService, CountingHashEmbedder]:
 
 
 class TestSaveChunking:
-    def test_small_note_single_chunk_reuses_note_vector(
+    def test_small_note_single_chunk_written_without_vectors(
         self, service: tuple[NoteService, CountingHashEmbedder]
     ) -> None:
-        """Бриф §6: 1 чанк ≤ CHUNK_SIZE → вектор чанка = полный вектор заметки;
-        кодировщик отработал ровно ОДИН раз (не дважды — не дубль-вызов)."""
+        """Фаза 8: save пишет единственный чанк текстом без вектора;
+        кодировщик в синхронном пути не зовётся вовсе (векторизация — фон).
+        Reuse «вектор чанка = вектор заметки» теперь делает чанковая
+        очередь воркера после догонки notes_vec (test_worker_chunks)."""
         svc, embedder = service
         text = "Короткая заметка о чанковой механике"
         note_id = svc.save(text)["id"]
@@ -101,9 +106,10 @@ class TestSaveChunking:
         assert len(rows) == 1
         assert rows[0][2] == text  # чанк == полный текст
         assert rows[0][3] == count_tokens(text)
-        assert pending == 0
-        assert chunk_vector == pytest.approx(note_vector, abs=1e-7)
-        assert embedder.texts == [text]  # только полный текст, чанк не кодировался
+        assert pending == 1  # чанк ждёт воркера
+        assert note_vector is None  # вектор заметки — тоже очередь воркера
+        assert chunk_vector is None
+        assert embedder.texts == []  # кодировщик в save не участвует
 
     def test_long_note_chunks_are_pending_without_extra_encoding(
         self, service
@@ -125,7 +131,7 @@ class TestSaveChunking:
         assert [row[3] for row in rows] == [end - start for start, end in windows]
         assert pending == 4
         assert vectorized == 0  # вектора чанков — воркеру
-        assert embedder.texts == [text]  # кодировщик: только полный текст
+        assert embedder.texts == []  # Фаза 8: save кодировщик не зовёт
 
     def test_merged_single_chunk_above_chunk_size_is_not_reused(self, service) -> None:
         """1025 токенов → 1 чанк, но > CHUNK_SIZE — reuse не применяется
@@ -151,15 +157,18 @@ class TestSaveChunking:
         with session(get_settings()) as conn:
             assert chunks.count_chunks(conn) == 2  # только от первой записи
 
-    def test_vectorization_failure_keeps_chunks_pending(self, service) -> None:
-        """NFR-3: отказ Ollama — заметка+чанки сохранены, всё в pending."""
+    def test_save_stores_chunks_pending_regardless_of_embedder(self, service) -> None:
+        """Фаза 8: ответ save не зависит от эмбеддера (NFR-3 запрещает
+        ломать запись при отказе внешнего сервера) — контракт без warning,
+        заметка+чанки сохранены, всё в pending, кодировщик не тронут."""
         settings = get_settings()
         init_db(settings)
         failing = NoteService(settings, FailingEmbedder())
         text = text_with_tokens(1500)  # ~2 чанка
         result = failing.save(text)
         assert result["stored"] is True
-        assert "warning" in result
+        assert result["summary_pending"] is True
+        assert "warning" not in result  # векторизация всегда фоновая (Фаза 8)
         with session(settings) as conn:
             assert chunks.count_chunks(conn) == len(
                 token_windows(count_tokens(text), **DEFS)
@@ -191,8 +200,10 @@ class TestUpdateChunking:
         assert pending == len(rows)
         assert vectorized == 0  # старых reuse-векторов нет
 
-    def test_update_to_small_note_reuses_new_vector(self, service) -> None:
-        """Длинная → короткая: новый полный вектор переиспользуется чанком."""
+    def test_update_to_small_note_stores_pending_chunks(self, service) -> None:
+        """Длинная → короткая: новые чанки пишутся без векторов (Фаза 8);
+        reuse единичного чанка из notes_vec сделает чанковая очередь
+        воркера уже после догонки notes_vec."""
         svc, embedder = service
         note_id = svc.save(text_with_tokens(3000))["id"]
         new_text = "Обновлённая короткая заметка"
@@ -203,15 +214,16 @@ class TestUpdateChunking:
             chunk_vector = chunks.get_vector(conn, rows[0][0])
             pending = chunks.count_pending(conn)
         assert len(rows) == 1 and rows[0][2] == new_text
-        assert pending == 0
-        assert chunk_vector == pytest.approx(note_vector, abs=1e-7)
-        # кодировщик: полные тексты заметок — и никаких чанков
-        assert embedder.texts == [text_with_tokens(3000), new_text]
+        assert pending == 1  # чанк ждёт чанковую очередь воркера
+        assert note_vector is None  # ре-векторизация — фон (Фаза 8)
+        assert chunk_vector is None
+        assert embedder.texts == []  # update кодировщик не зовёт вовсе
 
-    def test_update_with_failing_vectorization_replaces_chunks(
+    def test_update_replaces_chunks_regardless_of_embedder(
         self, service
     ) -> None:
-        """Отказ ре-векторизации при update не откатывает замену чанков."""
+        """Состояние эмбеддера не влияет на update: замена чанков
+         проходит, вектора строит воркер (Фаза 8)."""
         svc, _embedder = service
         note_id = svc.save("маленькая, будет заменена большой")["id"]
         settings = get_settings()
@@ -247,15 +259,23 @@ class TestDeleteChunking:
         assert note[0] is not None
 
     def test_small_note_vector_survives_soft_delete(self, service) -> None:
+        """Фаза 8: вектор появляется через воркер (notes-очередь → reuse
+        чанковой очереди); soft delete вектора не трогает (trash)."""
         svc, _embedder = service
         text = "Маленькая заметка для удаления"
         note_id = svc.save(text)["id"]
+        embedder8 = HashEmbedder(get_settings().embedding_dim)
+        assert vectorize_notes(get_settings(), embedder8) == 1
+        chunk_worker = BackgroundWorker(get_settings(), embedder8)
+        assert asyncio.run(chunk_worker.process_pending_chunks()) == 1  # reuse
         svc.delete(note_id)
         with session(get_settings()) as conn:
             rows = chunks.get_note_chunks(conn, note_id)
             vectors_after = chunks.count_vectors(conn)
+            note_vector_alive = vectors.get_vector(conn, note_id) is not None
         assert len(rows) == 1  # чанк trash жив
         assert vectors_after == 1  # reuse-вектор жив (trash сохраняет вектора)
+        assert note_vector_alive  # полный вектор тоже пережил удаление
 
 
 def chunk_status(row) -> str:

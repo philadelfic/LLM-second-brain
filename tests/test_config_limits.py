@@ -17,6 +17,8 @@ REQUIRED_ENV: dict[str, str] = {
     "OLLAMA_BASE_URL": "http://192.168.3.113:11434",
     "SUMMARY_OLLAMA_BASE_URL": "http://192.168.3.112:11434",
     "SUMMARY_MODEL": "ornith-1.5:35b",
+    "DEDUP_JUDGE_OLLAMA_BASE_URL": "http://192.168.3.112:11434",
+    "DEDUP_JUDGE_MODEL": "ornith-1.5:35b",
     "MCP_AUTH_TOKEN": "test-secret-token",
 }
 
@@ -50,6 +52,9 @@ class TestIntLimits:
             ("EMBEDDING_DIM", "0"),
             ("SUMMARY_NUM_PREDICT", "0"),
             ("SUMMARY_TIMEOUT_SEC", "0"),
+            ("DEDUP_JUDGE_NUM_PREDICT", "0"),
+            ("DEDUP_JUDGE_TIMEOUT_SEC", "-30"),
+            ("DEDUP_CANDIDATE_TOP_N", "0"),
             ("BACKUP_INTERVAL_SEC", "0"),
             ("BACKUP_KEEP", "0"),
         ],
@@ -98,6 +103,39 @@ class TestRangeLimits:
         with pytest.raises(ConfigError, match="dedup_similarity"):
             load_env(monkeypatch, DEDUP_SIMILARITY="-0.1")
 
+    def test_dedup_candidate_range_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """DEDUP_CANDIDATE_SIMILARITY — в 0..1 (NFR-6, Фаза 8 Этап 2.1)."""
+        with pytest.raises(ConfigError, match="dedup_candidate_similarity"):
+            load_env(monkeypatch, DEDUP_CANDIDATE_SIMILARITY="1.5")
+        with pytest.raises(ConfigError, match="dedup_candidate_similarity"):
+            load_env(monkeypatch, DEDUP_CANDIDATE_SIMILARITY="-0.1")
+
+    def test_dedup_candidate_top_n_ceiling_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Топ-N кандидатов имеет потолок — защита brute-force KNN (NFR-5)."""
+        with pytest.raises(ConfigError, match="dedup_candidate_top_n"):
+            load_env(monkeypatch, DEDUP_CANDIDATE_TOP_N="51")
+        assert load_env(
+            monkeypatch, DEDUP_CANDIDATE_TOP_N="50"
+        ).dedup_candidate_top_n == 50
+
+    def test_candidate_similarity_above_dedup_similarity_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Реляционная проверка: кандидат-порог ≤ «дубль»-порога.
+
+        Иначе противоречивая конфигурация: кандидаты находятся, но ни один
+        не может быть признан дублем (кандидат-порог выше дубль-порога).
+        """
+        with pytest.raises(ConfigError, match="dedup_candidate_similarity"):
+            load_env(monkeypatch, DEDUP_CANDIDATE_SIMILARITY="0.95")
+        # Равенство порогов допустимо: кандидат = дубль без судьи.
+        settings = load_env(monkeypatch, DEDUP_CANDIDATE_SIMILARITY="0.92")
+        assert settings.dedup_candidate_similarity == settings.dedup_similarity
+
 
 class TestStringValidation:
     def test_log_level_is_normalized_and_case_insensitive(
@@ -115,6 +153,8 @@ class TestStringValidation:
             load_env(monkeypatch, OLLAMA_BASE_URL="192.168.3.113:11434")
         with pytest.raises(ConfigError, match="summary_ollama_base_url"):
             load_env(monkeypatch, SUMMARY_OLLAMA_BASE_URL="localhost:11434")
+        with pytest.raises(ConfigError, match="dedup_judge_ollama_base_url"):
+            load_env(monkeypatch, DEDUP_JUDGE_OLLAMA_BASE_URL="192.168.3.112:11434")
 
     def test_mcp_path_must_start_with_slash(
         self, monkeypatch: pytest.MonkeyPatch

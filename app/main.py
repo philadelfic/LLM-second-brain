@@ -53,7 +53,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     mcp = build_mcp(settings, services)
     # §3.4: две очереди — векторы (Фаза 3) и summary (Фаза 4, режим «Б»);
     # суммаризатор из DI — тот же экземпляр, что в /health.summarizer_ok.
-    worker = BackgroundWorker(settings, services.embedding, services.summary)
+    # Судья дедупа (Фаза 8, Этап 3.1) — тоже DI из services, один экземпляр
+    # на процесс (вердикты по кандидатам — Задача 3.2).
+    worker = BackgroundWorker(
+        settings,
+        services.embedding,
+        services.summary,
+        judge=services.dedup_judge,
+    )
+    # Суммаризация стартует сразу при save/update: NoteService сигналит
+    # воркеру, тот немедленно догоняет pending_summary (не ждёт back-off).
+    services.notes.set_summary_notifier(worker.notify_summary_pending)
     # Внутренний маршрут MCP-сервера — ровно MCP_PATH. host="0.0.0.0" — не
     # localhost, поэтому SDK не включает DNS-rebinding protection (сервис
     # живёт в LAN за Bearer-токеном; Open WebUI ходит с не-localhost Host).

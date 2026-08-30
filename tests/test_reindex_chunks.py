@@ -17,7 +17,7 @@ import asyncio
 import logging
 
 import pytest
-from fakes import HashEmbedder
+from fakes import HashEmbedder, vectorize_notes
 from test_notes_chunks import text_with_tokens
 
 from app.config import get_settings
@@ -73,6 +73,9 @@ def test_chunk_size_change_rechunks_all_notes(settings, monkeypatch, caplog) -> 
     short_id = notes.save(short_text)["id"]
     long_id = notes.save(long_text)["id"]
     trash_id = notes.save(trash_text)["id"]
+    # Фаза 8: полный вектор строит воркер — ДО удаления trash (очередь
+    # обслуживает только активные), чтобы у всех трёх был notes_vec.
+    assert vectorize_notes(settings, HashEmbedder(8)) == 3
     notes.delete(trash_id)
 
     caplog.clear()
@@ -183,6 +186,7 @@ def test_identity_restart_is_noop(settings, tmp_path, monkeypatch, caplog) -> No
     не пишет reindex-события, догонённые вектора не сбрасываются."""
     notes = make_notes(settings)
     note_id = notes.save(text_with_tokens(2500))["id"]
+    assert vectorize_notes(settings, HashEmbedder(8)) == 1  # notes_vec: воркер
     worker = BackgroundWorker(settings, HashEmbedder(8))
     assert asyncio.run(worker.process_pending_chunks()) == 3  # 2500 → 3 чанка
     with session(settings) as conn:

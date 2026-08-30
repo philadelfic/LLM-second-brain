@@ -1,7 +1,8 @@
 """Env-парсер — все переменные окружения из REQUIREMENTS §8.
 
 Обязательные переменные (`OLLAMA_BASE_URL`, `SUMMARY_OLLAMA_BASE_URL`,
-`SUMMARY_MODEL`, `MCP_AUTH_TOKEN`) умолчаний не имеют: отсутствие или пустое
+`SUMMARY_MODEL`, `DEDUP_JUDGE_OLLAMA_BASE_URL`, `DEDUP_JUDGE_MODEL`,
+`MCP_AUTH_TOKEN`) умолчаний не имеют: отсутствие или пустое
 значение — фатальная ошибка старта (NFR-2). Остальные имеют значения по
 умолчанию из таблицы REQUIREMENTS §8.
 
@@ -43,6 +44,8 @@ class Settings(BaseSettings):
     ollama_base_url: str = Field(...)  # Ollama векторизации
     summary_ollama_base_url: str = Field(...)  # Ollama суммаризации
     summary_model: str = Field(...)  # генеративная модель суммаризации
+    dedup_judge_ollama_base_url: str = Field(...)  # Ollama судьи дедупа (Фаза 8)
+    dedup_judge_model: str = Field(...)  # модель-судья дедупа (Фаза 8)
     mcp_auth_token: str = Field(...)  # Bearer-токен (NFR-2)
 
     # --- векторизация ---
@@ -79,6 +82,13 @@ class Settings(BaseSettings):
     default_list_limit: int = 20
     score_threshold: float = 0.35
     dedup_similarity: float = 0.92
+    # --- фоновый дедуп (Фаза 8, Этап 2.1): кандидат-предфильтр до сводки ---
+    dedup_candidate_top_n: int = 3  # топ-N кандидатов (проверит судья, Этап 3)
+    dedup_candidate_similarity: float = 0.80  # нижний порог кандидата-перефраза
+    # --- LLM-судья дедупа (Фаза 8, Этап 3.1): ornith-1.5:35b, think:false ---
+    dedup_judge_think: bool = False  # при false в вызов идёт "think": false
+    dedup_judge_num_predict: int = 256  # бюджет вердикта (судье хватает)
+    dedup_judge_timeout_sec: int = 30  # клиентский таймаут вызова судьи
     rrf_k: int = 60
 
     # --- лимиты (NFR-6: env-переопределяемы, валидируются; см. _validate_ranges) ---
@@ -101,6 +111,8 @@ class Settings(BaseSettings):
         "ollama_base_url",
         "summary_ollama_base_url",
         "summary_model",
+        "dedup_judge_ollama_base_url",
+        "dedup_judge_model",
         "mcp_auth_token",
     )
     @classmethod
@@ -147,7 +159,11 @@ class Settings(BaseSettings):
             errors.append("  - mcp_path: путь должен начинаться с «/»")
 
         # --- внешние Ollama: только http(s) ---
-        for field in ("ollama_base_url", "summary_ollama_base_url"):
+        for field in (
+            "ollama_base_url",
+            "summary_ollama_base_url",
+            "dedup_judge_ollama_base_url",
+        ):
             url = getattr(self, field)
             if not url.strip().startswith(("http://", "https://")):
                 errors.append(f"  - {field}: ожидается URL с http:// или https://")
@@ -164,12 +180,28 @@ class Settings(BaseSettings):
         # --- пороги и слияние ---
         need_range("score_threshold", self.score_threshold, 0.0, 1.0)
         need_range("dedup_similarity", self.dedup_similarity, 0.0, 1.0)
+        # Фоновый дедуп (Фаза 8, Этап 2.1): кандидат-порог обязан быть не выше
+        # дубль-порога — иначе кандидаты находятся, а дублем не признаются.
+        need_range(
+            "dedup_candidate_similarity", self.dedup_candidate_similarity, 0.0, 1.0
+        )
+        # Потолок 50 — защита brute-force KNN от безумного окна (NFR-5).
+        need_range("dedup_candidate_top_n", self.dedup_candidate_top_n, 1, 50)
+        if self.dedup_candidate_similarity > self.dedup_similarity:
+            errors.append(
+                "  - dedup_candidate_similarity: порог кандидата выше порога "
+                "«дубль» dedup_similarity — найденных кандидатов "
+                "нельзя будет признать дублем"
+            )
         need_low("rrf_k", self.rrf_k, 1)
 
         # --- векторизация / суммаризация ---
         need_low("embedding_dim", self.embedding_dim, 1)
         need_low("summary_num_predict", self.summary_num_predict, 1)
         need_low("summary_timeout_sec", self.summary_timeout_sec, 1)
+        # LLM-судья дедупа (Фаза 8, Этап 3.1): бюджет и таймаут ≥ 1 (NFR-6).
+        need_low("dedup_judge_num_predict", self.dedup_judge_num_predict, 1)
+        need_low("dedup_judge_timeout_sec", self.dedup_judge_timeout_sec, 1)
 
         # --- чанковая индексация (Фаза 7) ---
         if self.text_splitter.strip().lower() != "tiktoken":

@@ -1,8 +1,9 @@
-"""Тесты NoteService (Фаза 3, шаг 3.4): CRUD, дедуп, векторизация, soft delete.
+"""Тесты NoteService (Фаза 3/8): CRUD, дедуп, статусы записи, soft delete.
 
-REQUIREMENTS FR-2…FR-6. Векторизация/дедуп в save/update — через детерминированный
-HashEmbedder (успешный путь); режимы деградации и живой дедуп —
-tests/test_save_vectorize.py. Summary — fallback-усечение (Фаза 4).
+REQUIREMENTS FR-2…FR-6. С Фазы 8 (Этап 1) save/update не кодируют текст
+синхронно: строка пишется с vector_status='pending', вектора догоняет
+фоновый воркер (критерии догонки — tests/test_save_vectorize.py).
+Summary — fallback-усечение (Фаза 4).
 """
 
 from __future__ import annotations
@@ -64,16 +65,12 @@ class TestSave:
         service.save("Заметка о сервисе")
         with session(get_settings()) as conn:
             row = conn.execute("SELECT * FROM notes WHERE id = 1").fetchone()
-            # вектор записан в notes_vec и согласован с HashEmbedder
             stored_vector = vectors.get_vector(conn, 1)
-        assert row["summary"] == ""  # сгенерируется в Фазе 4
-        assert row["vector_status"] == "ok"  # синхронная векторизация удалась
+        assert row["summary"] == ""  # сгенерируется воркером (режим «Б»)
+        assert row["vector_status"] == "pending"  # Фаза 8: векторизация — фон
         assert row["summary_status"] == "pending"
         assert row["deleted_at"] is None
-        assert stored_vector == pytest.approx(
-            HashEmbedder(get_settings().embedding_dim).embed("Заметка о сервисе"),
-            abs=1e-6,
-        )
+        assert stored_vector is None  # notes_vec заполнит фоновый воркер
 
     def test_author_default_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """AUTHOR_DEFAULT из env (по умолчанию unknown) — автор, если харнес
@@ -298,17 +295,16 @@ class TestUpdate:
         with pytest.raises(NoteValidationError):
             service.update(1, long_text(2001))
 
-    def test_vector_status_reflects_revectorize(self, service: NoteService) -> None:
-        """Фаза 3: update ре-векторизует sync — 'ok' и вектор от нового текста."""
+    def test_update_marks_vector_pending(self, service: NoteService) -> None:
+        """Фаза 8: update не кодирует синхронно — pending, без вектора;
+        notes_vec догонит фоновый воркер (критерии — test_save_vectorize)."""
         service.save("Текст")
         service.update(1, "Другой текст")
         with session(get_settings()) as conn:
             row = conn.execute("SELECT vector_status FROM notes WHERE id=1").fetchone()
             stored_vector = vectors.get_vector(conn, 1)
-        assert row["vector_status"] == "ok"
-        assert stored_vector == pytest.approx(
-            HashEmbedder(get_settings().embedding_dim).embed("Другой текст"), abs=1e-6
-        )
+        assert row["vector_status"] == "pending"
+        assert stored_vector is None
 
 
 class TestDelete:

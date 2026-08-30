@@ -280,3 +280,90 @@ def test_empty_note_text_value_error(monkeypatch) -> None:
         with pytest.raises(ValueError, match="пустой"):
             service.summarize(text)
     assert recorder.calls == 0  # в сеть ни разу не пошли
+
+# --- merge: слияние дубликатов (Фаза 8, Этап 2.2) -----------------------------
+
+
+TEXT_A = "Купил молоко и хлеб по дороге домой."
+TEXT_B = "По пути домой зашёл в магазин — взял молоко и хлеб."
+
+
+def test_merge_returns_content(monkeypatch) -> None:
+    """Успешное слияние: content ответа возвращается как результат."""
+    settings = make_settings(monkeypatch)
+    service, _ = make_service(
+        settings,
+        [httpx.Response(200, json=ok_body("Молоко и хлеб куплены по дороге домой."))],
+    )
+    merged = service.merge(TEXT_A, TEXT_B)
+    assert merged == "Молоко и хлеб куплены по дороге домой."
+    assert service.last_attempt_ok is True
+    service.close()
+
+
+def test_merge_system_prompt_and_marked_texts(monkeypatch) -> None:
+    """Merge-промпт: объединение с сохранением фактов; оба текста в одном
+    user-сообщении, помечены и в порядке «ранняя → поздняя»."""
+    settings = make_settings(monkeypatch)
+    service, recorder = make_service(settings, [httpx.Response(200, json=ok_body())])
+    service.merge(TEXT_A, TEXT_B)
+    payload = last_payload(recorder)
+    messages = payload["messages"]
+    assert messages[0]["role"] == "system"
+    assert "объединяешь" in messages[0]["content"]
+    assert "сохрани ВСЕ факты, имена, числа и даты" in messages[0]["content"]
+    assert "2000" in messages[0]["content"]  # лимит = MAX_NOTE_CHARS
+    # оба текста в ОДНОМ user-сообщении: ранний — ТЕКСТ 1, поздний — ТЕКСТ 2
+    assert messages[1] == {
+        "role": "user",
+        "content": "ТЕКСТ 1:\n" + TEXT_A + "\n\nТЕКСТ 2:\n" + TEXT_B,
+    }
+    # остальное — как у summarize (та же модель и параметры, ARCH §4.7)
+    assert payload["model"] == settings.summary_model
+    assert payload["stream"] is False
+    assert payload["num_predict"] == settings.summary_num_predict
+    service.close()
+
+
+def test_merge_result_truncated_to_max_note_chars(monkeypatch) -> None:
+    """Страховка длины дедупа: результат — будущий ТЕКСТ заметки, лимит
+    MAX_NOTE_CHARS (не MAX_SUMMARY_CHARS) — не сломает memory_update."""
+    settings = make_settings(monkeypatch)
+    long_content = "ф" * (settings.max_note_chars + 70)
+    service, _ = make_service(settings, [httpx.Response(200, json=ok_body(long_content))])
+    merged = service.merge(TEXT_A, TEXT_B)
+    assert len(merged) == settings.max_note_chars == 2000
+    service.close()
+
+
+def test_merge_failures_raise_summary_error(monkeypatch) -> None:
+    """HTTP-отказ, не-JSON/пустой content — SummaryError; last_attempt_ok — False."""
+    settings = make_settings(monkeypatch)
+    service, recorder = make_service(settings, [httpx.Response(500, text="boom")])
+    with pytest.raises(SummaryError, match="HTTP 500"):
+        service.merge(TEXT_A, TEXT_B)
+    assert recorder.calls == 1
+    assert service.last_attempt_ok is False
+
+    service, _ = make_service(
+        make_settings(monkeypatch), [httpx.Response(200, json=ok_body(""))]
+    )
+    with pytest.raises(SummaryError, match="пустой content"):
+        service.merge(TEXT_A, TEXT_B)
+
+    service, _ = make_service(
+        make_settings(monkeypatch), [httpx.Response(200, text="<html/>")]
+    )
+    with pytest.raises(SummaryError, match="не-JSON"):
+        service.merge(TEXT_A, TEXT_B)
+
+
+def test_merge_empty_argument_value_error(monkeypatch) -> None:
+    """Пустой текст одной из заметок — ValueError до вызова Ollama."""
+    settings = make_settings(monkeypatch)
+    service, recorder = make_service(settings, [httpx.Response(200, json=ok_body())])
+    for pair in (("", TEXT_B), ("   ", TEXT_B), (TEXT_A, ""), (TEXT_A, "  ")):
+        with pytest.raises(ValueError, match="пустая"):
+            service.merge(*pair)
+    assert recorder.calls == 0  # в сеть ни разу не пошли
+    service.close()
