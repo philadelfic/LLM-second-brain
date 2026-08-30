@@ -122,7 +122,7 @@ class TestNotesCrud:
         )
         assert empty.status_code == 422
         long = client.post(
-            "/notes", json={"text": "х" * 2001},
+            "/notes", json={"text": "х" * 35001},
             headers={"Authorization": f"Bearer {token}"},
         )
         assert long.status_code == 422

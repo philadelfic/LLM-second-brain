@@ -364,13 +364,13 @@ def _chunks_note_text() -> str:
     )
     half = para * 30
     text = half + CHUNKS_FACT + half
-    assert 14000 <= len(text) <= 20000
+    assert 14000 <= len(text) <= 35000
     return text
 
 
 @pytest.fixture(scope="session")
 def live_chunks(tmp_path_factory) -> SimpleNamespace:
-    """Живой векторизатор + дефолты §8, MAX_NOTE_CHARS=20000.
+    """Живой векторизатор + дефолты §8, MAX_NOTE_CHARS=35000.
 
     Отдельная БД (tmp) — живые заметки фаз 3–4 не мешают ранжированию
     контрольного факта. Ollama недоступна — SKIP (skip расставит fixture).
@@ -389,7 +389,7 @@ def live_chunks(tmp_path_factory) -> SimpleNamespace:
         mcp_auth_token="live-chunk-token",
         db_path=str(tmp_path_factory.mktemp("live-chunks") / "notes.db"),
         embedding_dim=DIM,
-        max_note_chars=20000,
+        max_note_chars=35000,
     )
     init_db(settings)
     embedding = EmbeddingService(settings)

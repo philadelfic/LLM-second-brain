@@ -180,11 +180,11 @@ class TestToolsList:
 
     @pytest.mark.asyncio
     async def test_save_update_schema(self, server_url: str) -> None:
-        """Контракты FR-4/FR-5: text 1..2000 (MAX_NOTE_CHARS), id обязателен."""
+        """Контракты FR-4/FR-5: text 1..MAX_NOTE_CHARS (35000), id обязателен."""
         async with connect(server_url) as session:
             tools = {t.name: t for t in (await session.list_tools()).tools}
         save_text = tools["memory_save"].input_schema["properties"]["text"]
-        assert save_text["maxLength"] == 2000
+        assert save_text["maxLength"] == 35000
         assert tools["memory_save"].input_schema["required"] == ["text"]
         assert tools["memory_update"].input_schema["required"] == ["id", "text"]
 
@@ -201,7 +201,7 @@ class TestToolCalls:
     @pytest.mark.asyncio
     async def test_schema_rejects_too_long_note(self, server_url: str) -> None:
         async with connect(server_url) as session:
-            call = await session.call_tool("memory_save", {"text": "x" * 3000})
+            call = await session.call_tool("memory_save", {"text": "x" * 36000})
         assert call.is_error is True
         assert "string_too_long" in call.content[0].text
 

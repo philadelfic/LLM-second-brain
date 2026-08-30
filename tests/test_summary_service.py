@@ -133,14 +133,15 @@ def test_request_url_path_and_model(monkeypatch) -> None:
     assert payload["model"] == settings.summary_model
 
 
-def test_messages_system_prompt_contains_limit(monkeypatch) -> None:
+def test_messages_system_prompt_has_new_wording(monkeypatch) -> None:
     settings = make_settings(monkeypatch)
     service, recorder = make_service(settings, [httpx.Response(200, json=ok_body())])
     service.summarize(NOTE)
     payload = last_payload(recorder)
     messages = payload["messages"]
     assert messages[0]["role"] == "system"
-    assert "максимум 200 символов" in messages[0]["content"]
+    assert "1–2 коротких и ёмких предложениях" in messages[0]["content"]
+    assert "не длиннее 30 слов" in messages[0]["content"]
     assert "на языке заметки" in messages[0]["content"]
     assert messages[1] == {"role": "user", "content": NOTE}
 
@@ -152,7 +153,7 @@ def test_stream_disabled_and_generation_params(monkeypatch) -> None:
     payload = last_payload(recorder)
     assert payload["stream"] is False
     assert payload["num_predict"] == settings.summary_num_predict
-    assert payload["num_predict"] == 1500  # дефолт §8: щедрый общий бюджет
+    assert payload["num_predict"] == settings.summary_num_predict == 35000  # потолок после решения О. 2026-08-30
     assert payload["temperature"] == TEMPERATURE == 0.1
     assert payload["keep_alive"] == KEEP_ALIVE == "15m"
 
@@ -184,15 +185,16 @@ def test_read_timeout_from_env(monkeypatch) -> None:
     service.close()
 
 
-# --- обрезка до MAX_SUMMARY_CHARS (страховка ARCH §4.7) -----------------------
+# --- без среза: обрезка суммари отменена (решение О. 2026-08-30) --------------
 
 
-def test_long_content_truncated_to_limit(monkeypatch) -> None:
+def test_long_content_not_truncated(monkeypatch) -> None:
+    """Символьной обрезки суммари больше нет: content возвращается полностью,
+    длина контролируется самим промптом («до 30 слов»)."""
     settings = make_settings(monkeypatch)
     long_content = "д" * (settings.max_summary_chars + 50)
     service, _ = make_service(settings, [httpx.Response(200, json=ok_body(long_content))])
-    summary = service.summarize(NOTE)
-    assert len(summary) == settings.max_summary_chars == 200
+    assert service.summarize(NOTE) == long_content
     service.close()
 
 
@@ -310,9 +312,11 @@ def test_merge_system_prompt_and_marked_texts(monkeypatch) -> None:
     payload = last_payload(recorder)
     messages = payload["messages"]
     assert messages[0]["role"] == "system"
-    assert "объединяешь" in messages[0]["content"]
-    assert "сохрани ВСЕ факты, имена, числа и даты" in messages[0]["content"]
-    assert "2000" in messages[0]["content"]  # лимит = MAX_NOTE_CHARS
+    assert "две версии одной заметки" in messages[0]["content"]
+    assert "каждый факт скажи один раз" in messages[0]["content"]
+    assert "не добавляй от себя" in messages[0]["content"]
+    # числового лимита в промпте больше нет: потолок держит код, не модель
+    assert "35000" not in messages[0]["content"]
     # оба текста в ОДНОМ user-сообщении: ранний — ТЕКСТ 1, поздний — ТЕКСТ 2
     assert messages[1] == {
         "role": "user",
@@ -321,7 +325,10 @@ def test_merge_system_prompt_and_marked_texts(monkeypatch) -> None:
     # остальное — как у summarize (та же модель и параметры, ARCH §4.7)
     assert payload["model"] == settings.summary_model
     assert payload["stream"] is False
-    assert payload["num_predict"] == settings.summary_num_predict
+    # остальное — как у summarize, только num_predict свой (MERGE_NUM_PREDICT)
+    assert payload["model"] == settings.summary_model
+    assert payload["stream"] is False
+    assert payload["num_predict"] == settings.merge_num_predict == 35000
     service.close()
 
 
@@ -332,7 +339,7 @@ def test_merge_result_truncated_to_max_note_chars(monkeypatch) -> None:
     long_content = "ф" * (settings.max_note_chars + 70)
     service, _ = make_service(settings, [httpx.Response(200, json=ok_body(long_content))])
     merged = service.merge(TEXT_A, TEXT_B)
-    assert len(merged) == settings.max_note_chars == 2000
+    assert len(merged) == settings.max_note_chars == 35000
     service.close()
 
 

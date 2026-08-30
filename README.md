@@ -119,7 +119,7 @@ curl -s http://localhost:8080/mcp \
 | `DB_PATH` | `/data/notes.db` | файл SQLite (WAL) |
 | `BACKUP_DIR` / `BACKUP_INTERVAL_SEC` / `BACKUP_KEEP` | `/data/backups` / `86400` / `7` | снапшоты: каталог, интервал, ротация |
 | `LOG_LEVEL` | `INFO` | уровень JSON-логов stdout |
-| `MAX_NOTE_CHARS` / `MAX_QUERY_CHARS` | `2000` / `512` | лимиты ввода |
+| `MAX_NOTE_CHARS` / `MAX_QUERY_CHARS` | `35000` / `512` | лимиты ввода |
 | `TEXT_SPLITTER` | `tiktoken` | токен-сплиттер чанков (encoding `cl100k_base`, кэш в образе) |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` / `CHUNK_MIN_TARGET` | `1024` / `180` / `200` | окно чанка (токенов), перекрытие, минимальный хвост; смена любого — полная пере-чанковка при старте |
 | `EMBEDDING_BATCH_SIZE` / `EMBEDDING_CONCURRENT_REQUESTS` | `32` / `3` | воркер чанков: чанков в одном embed-запросе / параллельных запросов |
