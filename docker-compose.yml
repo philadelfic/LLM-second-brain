@@ -44,7 +44,7 @@ services:
       DEDUP_JUDGE_MODEL: "ornith-1.5:35b"                        # модель-судья дедупа
       DEDUP_JUDGE_THINK: "true"              # думающий судья: think:false давал ложные ДУБЛИ на длинных заметках (E2E); решение О. 2026-08-30
       DEDUP_JUDGE_NUM_PREDICT: "1024"        # бюджет thinking+вердикт (замер: ~1200 токенов, done_reason=stop)
-      DEDUP_JUDGE_TIMEOUT_SEC: "120"         # думающий судья: длинная пара 46 c + холодный старт ~17 c; решение О. «увеличим»
+      DEDUP_JUDGE_TIMEOUT_SEC: "300"         # думающий судья: длинная пара 46 c, худший живой вызов ~121 c (E2E) — 300 с с запасом; решение О. 2026-08-30
       # --- HTTP/MCP ---
       PORT: "8080"
       MCP_PATH: "/mcp"
