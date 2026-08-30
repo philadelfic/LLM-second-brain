@@ -20,3 +20,7 @@ data/
 
 # Локальные артефакты
 *.log
+
+# Не публикуем (решение О. 2026-08-31, репо на GitHub публичное)
+briefs/
+docker-compose.override.yml

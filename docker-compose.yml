@@ -2,7 +2,8 @@
 #
 # ПОЛНАЯ конфигурация запуска живёт здесь (решение О. 2026-08-29: без .env).
 # Перед первым запуском заполнить четыре обязательных значения ниже
-# (MCP_AUTH_TOKEN сгенерируй: openssl rand -hex 32) — пустой токен или
+# (MCP_AUTH_TOKEN сгенерируй: openssl rand -hex 32 и держи боевой в
+# docker-compose.override.yml — он gitignored; в git — CHANGE_ME) — пустой токен или
 # недоступная Ollama не пройдут стартовые проверки конфигурации.
 # Каталог данных: mkdir -p data.
 
@@ -19,7 +20,7 @@ services:
       OLLAMA_BASE_URL: "http://192.168.3.113:11434"        # Ollama векторизации (/api/embed)
       SUMMARY_OLLAMA_BASE_URL: "http://192.168.3.112:11434" # Ollama суммаризации (/api/chat)
       SUMMARY_MODEL: "ornith-1.5:35b"                       # генеративная модель суммаризации
-      MCP_AUTH_TOKEN: "b5e5085482a05119f193f4b064dd8e202dbd193056f14698241c4d4da6557f53"                  # Bearer-токен всех ручек, кроме /health
+      MCP_AUTH_TOKEN: "CHANGE_ME"                  # Bearer-токен всех ручек, кроме /health; боевой — в docker-compose.override.yml (gitignored, решение О. 2026-08-31)
       # --- векторизация: все параметры эмбеддинга ---
       EMBEDDING_MODEL: "qwen3-embedding:8b"  # смена → автоматическая реиндексация БД при старте
       EMBEDDING_DIM: "4096"                  # размерность; фиксируется в БД (meta), смена → реиндексация
