@@ -26,10 +26,12 @@ die()  { printf 'FATAL: %s\n' "$1" >&2; exit 1; }
 [ -f docker-compose.yml ] && [ -f app/main.py ] \
   || die "запускать из корня репо llm-second-brain (сейчас: $(pwd))"
 
-# Токен из compose (единственное место конфигурации, .env нет — решение Фазы 5)
-TOKEN="$(grep -E '^ *(- )?MCP_AUTH_TOKEN: *"' docker-compose.yml | head -n1 \
-          | sed -E 's/.*MCP_AUTH_TOKEN:[[:space:]]*"([^"]+)".*/\1/')"
-[ -n "$TOKEN" ] || die "не нашёл MCP_AUTH_TOKEN в docker-compose.yml"
+# Токен из merged-конфига compose (базовый файл + gitignored override с
+# боевым токеном — решение О. 2026-08-31; .env нет — решение Фазы 5)
+TOKEN="$(docker compose config 2>/dev/null | grep -E 'MCP_AUTH_TOKEN:' | head -n1 \
+          | sed -E 's/.*MCP_AUTH_TOKEN:[[:space:]]*"?([^"[:space:]]+)"?.*/\1/')"
+[ -n "$TOKEN" ] && [ "$TOKEN" != "CHANGE_ME" ] \
+  || die "не нашёл боевой MCP_AUTH_TOKEN (docker compose config: базовый + override)"
 
 # =====================================================================
 step 1 "PRECHECK: git чист, docker жив, контейнер работает"
