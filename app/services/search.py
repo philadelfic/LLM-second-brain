@@ -9,7 +9,8 @@
   summary на качество поиска не влияли раньше — не влияют и сейчас: векторам
   всё равно, а summary только в выдаче;
 - полнотекст: FTS5/BM25 топ-50 (trigram: русские словоформы, точные токены) —
-  ловит идентификаторы/даты; порогу не подлежит (REQUIREMENTS FR-1).
+  ловит идентификаторы/даты; порогу не подлежит (REQUIREMENTS FR-1). Слова
+  запроса — OR подстрок (BUG-001: AND терял заметку без одного из слов).
 - RRF устойчив к несопоставимым шкалам (косинус vs BM25): score(d) =
   Σ_sources 1/(RRF_K + rank_source), rank с 1. Векторная сторона после
   агрегации — один список, ранжирование как в Фазе 3.
@@ -29,6 +30,7 @@ MCP-слой срезает служебные поля — см. Фаза 9.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from typing import Any
 
@@ -44,6 +46,10 @@ MAX_TOP_K = 20
 
 # Кандидатов из каждого источника до слияния (ARCH §4.2, REQUIREMENTS §5.4).
 CANDIDATE_LIMIT = 50
+
+# Разбивка составных токенов запроса (BUG-001): «open-webui» → «open» +
+# «webui» — FTS ловит тексты, где написание отличается («Open WebUI»).
+_TOKEN_SPLIT_RE = re.compile(r"[^0-9A-Za-zА-Яа-яЁё]+")
 
 # Отказ кодирования запроса: поиск деградирует к FTS-only + warning (§5.3).
 WARNING_FTS_ONLY = (
@@ -331,12 +337,26 @@ class SearchService:
 
     @staticmethod
     def _match_expression(query: str) -> str | None:
-        """Слова ≥3 символов как цитированные подстроки через AND.
+        """Слова ≥3 символов (плюс ≥3-символьные части составных токенов)
+        как цитированные подстроки через OR.
 
+        OR, а не AND (BUG-001): AND выкидывал заметку целиком, если хотя бы
+        одно слово запроса не встречалось в её тексте («openwebui chat_id»
+        не находило заметку про chat_id без «openwebui»). При OR BM25
+        ранжирует по числу/редкости совпавших слов — заметка со всеми
+        словами выше; шум отсекается RRF-слиянием и top_k.
         None — нет ни одного слова, по которому trigram вообще может искать.
         """
-        words = (word for word in query.split() if len(word) >= 3)
-        unique = dict.fromkeys(words)
+        tokens: list[str] = []
+        for word in query.split():
+            if len(word) >= 3:
+                tokens.append(word)
+            for part in _TOKEN_SPLIT_RE.split(word):
+                if len(part) >= 3 and part != word:
+                    tokens.append(part)
+        unique = dict.fromkeys(tokens)
         if not unique:
             return None
-        return " AND ".join(f'"{word.replace(chr(34), chr(34) * 2)}"' for word in unique)
+        return " OR ".join(
+            f'"{token.replace(chr(34), chr(34) * 2)}"' for token in unique
+        )

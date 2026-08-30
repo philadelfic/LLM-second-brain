@@ -2,7 +2,8 @@
 
 База гибрида (векторная сторона — vec0 ортогональные критерии, деградация,
 RRF-слияние — tests/test_search_hybrid.py). Здесь trigram-контракт FTS:
-подстроки/словоформы, AND, кавычки, выдача без полного текста.
+подстроки/словоформы, OR-совпадение любого слова (BUG-001), кавычки, выдача
+без полного текста.
 """
 
 from __future__ import annotations
@@ -56,13 +57,31 @@ class TestMatching:
         # кейс-независимость токенизатора:
         assert searcher.search("TASKFLOW")["results"][0]["id"] == 1
 
-    def test_multi_word_is_and_of_substrings(self, service) -> None:
-        """Каждое слово ≥3 симв. должно присутствовать (AND)."""
+    def test_multi_word_is_or_of_substrings(self, service) -> None:
+        """BUG-001: слова ≥3 симв. — OR подстрок, не AND. Заметка со всеми
+        словами выше по BM25, но заметка с частью слов тоже находится:
+        AND терял релевантные заметки, если одно слово запроса нигде
+        не встречалось («openwebui chat_id» мимо заметки про chat_id)."""
         searcher, notes_service = service
-        notes_service.save("Сервис TaskFlow развёрнут на сервере")
-        notes_service.save("TaskFlow — это сервис задач")  # без сервера
+        notes_service.save("Сервис TaskFlow развёрнут на сервере")  # оба слова
+        notes_service.save("TaskFlow — это сервис задач")  # только TaskFlow
+        notes_service.save("Заметка про котиков")  # ни одного
+        notes_service.save("Рецепт борща на вечер")
+        notes_service.save("Прогулка по парку")
         hits = searcher.search("TaskFlow сервер")["results"]
-        assert [r["id"] for r in hits] == [1]
+        assert [r["id"] for r in hits] == [1, 2]  # оба слова — выше по BM25
+        # «deploy» не встречается нигде — релевантные всё равно найдены:
+        deployed = searcher.search("TaskFlow deploy")["results"]
+        assert {r["id"] for r in deployed} == {1, 2}
+
+    def test_compound_token_parts_searched(self, service) -> None:
+        """BUG-001: составной токен запроса ищется и по ≥3-символьным
+        частям: «open-webui» находит «Open WebUI» (написание в тексте
+        может отличаться от написания в запросе)."""
+        searcher, notes_service = service
+        notes_service.save("Контейнер Open WebUI слушает порт 3000")
+        result = searcher.search("open-webui контейнер")["results"]
+        assert [r["id"] for r in result] == [1]
 
     def test_short_words_dropped_from_expression(self, service) -> None:
         """Слова 1–2 символов отбрасываются (trigram их не видит вообще);
