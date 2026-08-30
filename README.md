@@ -1,5 +1,9 @@
 # LLM Second Brain
 
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)
+![Docker](https://img.shields.io/badge/Docker-ready-2496ed.svg)
+
 Self-hosted MCP-сервер «второго мозга» для LLM, крутящихся в харнесах
 (в первую очередь — Open WebUI). Модели получают через MCP доступ к общему
 банку заметок: могут искать по нему (гибридный векторный + полнотекстовый
@@ -209,72 +213,8 @@ FTS-синхронизация сверится и починится сама �
 воркер с back-off 30с→×2→15мин и деградация поиска до FTS-only).
 Подробности — [архитектура](ARCHITECTURE.md), потоки §4.
 
-## Статус
+## Лицензия
 
-- **Фаза 1 — каркас: ЗАВЕРШЕНА.** FastAPI + MCP Streamable HTTP (`/mcp`),
-  6 инструментов `memory_*`, Bearer-миддлварь, env-парсер, Docker (non-root),
-  healthcheck.
-- **Фаза 2 — хранилище: ЗАВЕРШЕНА.** SQLite (`notes` + FTS5 trigram,
-  триггеры синхронизации, WAL), CRUD всех 6 методов, soft delete, пагинация,
-  batch-get, FTS-only поиск (BM25), fallback-усечение вместо summary.
-- **Фаза 3 — векторизация и поиск: ЗАВЕРШЕНА.** Клиент Ollama `/api/embed`
-  (batch, таймауты, один ретрай); vec0 `notes_vec` (cosine, размерность
-  фиксируется при создании, гейт несовпадения при старте); гибридный поиск
-  vec0+FTS5 → RRF с отсечением по SCORE_THRESHOLD; дедуп в `memory_save`
-  (косинус ≥ DEDUP_SIMILARITY + FTS-фоллбек дословных дублей); фоновая
-  до-векторизация (back-off 30с→×2→15мин); скрипт переиндексации
-  `python -m scripts.reindex`; `embedding_ok` в `/health`.
-- **Фаза 4 — суммаризация (режим «Б»): ЗАВЕРШЕНА.** SummaryService — клиент
-  ко второй Ollama `POST /api/chat`: промпт одно предложение ≤
-  MAX_SUMMARY_CHARS, thinking не ограничивается (в БД не попадает), пустой
-  content = отказ, страховка-обрезка. Генерация — только фоновым воркером
-  (вторая очередь `pending_summary`, независимый back-off, догон при старте,
-  защита от гонки с `memory_update`); до готовности — fallback-усечение +
-  `summary_status=pending`; `/health.summarizer_ok`. Замеры:
-  `python -m scripts.benchmark_summary`.
-- **Фаза 5 — hardening и деплой: ЗАВЕРШЕНА.** Лимиты NFR-6 валидируются при
-  старте (диапазоны, потолки контрактов, сверка MAX_NOTE_CHARS со схемой БД);
-  JSON-логи stdout (NFR-4) — `tool_call` с латентностью/числом результатов,
-  запросы ≤80 симв., содержимое заметок не логируется; BackupService —
-  онлайн-снапшоты + ротация (`BACKUP_DIR`/`BACKUP_INTERVAL_SEC`/`BACKUP_KEEP`);
-  README с подключением Open WebUI; сборка образа и деплой (compose,
-  restart: unless-stopped, non-root, volume `/data`, healthcheck).
-- **Фаза 7 — чанк-индексация: ЗАВЕРШЕНА.**
-  токен-сплиттер tiktoken; чанковое хранилище `notes_chunks` +
-  `notes_chunks_vec` (pending по анти-джойну, без статус-колонки);
-  чанкование в save/update с reuse единственного чанка; поиск по лучшему
-  чанку (косинус и snippet из него) с fallback на вектор полного текста;
-  третья петля воркера (32×3, back-off, guard гонки с update);
-  автореиндексация чанк-параметров (пере-чанковка всех заметок);
-  живые проверки 15k-заметки на Ollama. Read-таймаут векторизации
-  поднят 20→720 с (CPU-инференс длинных текстов — решение 2026-08-30).
-- **Фаза 8 — асинхронный конвейер записи: ЗАВЕРШЕНА.** save/update
-  мгновенные — текст и чанки пишутся сразу (`vector_status=pending`),
-  векторизация и суммаризация — фоновые; фоновый дедуп с LLM-судьёй
-  (косинус-кандидаты → вердикт судьи `DEDUP_JUDGE_MODEL` → сведение
-  суммаризатором в раннюю заметку, поздняя — trash); очередь запросов
-  к Ollama (`ollama_slot` — один запрос к серверу в момент времени).
-- **Фаза 9 — компактные контракты MCP-выдач: ЗАВЕРШЕНА.** MCP-транспорт
-  отдаёт моделям компактную проекцию полных ответов сервисов по белым
-  спискам полей; REST сохраняет полные контракты; срезаны snippet,
-  rrf_score, cosine, summary_status, author, summary (в get), text дубля,
-  флаг duplicated, summary_pending (в update), warning.
-- **Далее:** Фаза 6 (опционально, не отменена) — Function-фильтр Open WebUI
-  для авто-подмешивания топ-K суммари к первому сообщению чата.
-
-## Разработка и тесты
-
-Запуск тестов: `pytest -m "not integration"` — слой без сети (фейк-эмбеддер
-и фиксированный суммаризатор); live-прогон `pytest -m integration` — живые
-Ollama: векторизатор (`LIVE_OLLAMA_URL`, дефолт 192.168.3.113:11434) и
-суммаризатор (`LIVE_SUMMARY_URL`, дефолт 192.168.3.112:11434,
-`LIVE_SUMMARY_MODEL` — ornith-1.5:35b); SKIP при недоступности серверов.
-Чанковая индексация проверяется живой моделью на заметке ~15k символов:
-pending-чанки → воркер → поиск по фрагменту из середины через лучший чанк
-(с ретро-замером против вектора полного текста — поведение Фазы 3).
-
-Структура: `app/transport` (MCP/REST/Bearer), `app/services` (notes, search,
-embedding, splitter, dedup, summary, worker, backup), `app/storage`
-(SQLite+FTS5+vec0+чанки),
-`app/observability` (JSON-логи), `scripts/` (reindex, benchmark). Ритм
-разработки и roadmap — REQUIREMENTS §10.
+Распространяется под лицензией [MIT](LICENSE).
+Разрешено свободное использование, изменение и распространение, в том
+числе в коммерческих целях.
