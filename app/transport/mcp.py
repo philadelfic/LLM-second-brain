@@ -13,6 +13,12 @@ InvalidSignature (см. журнал Фазы 1, подтверждено ещё
 Блокирующие вызовы SQLite — короткие (мс), но event loop не занимаем:
 каждый вызов сервиса уходит в `asyncio.to_thread`, а соединение с БД целиком
 живёт внутри рабочего потока.
+
+Фаза 9: MCP-выдачи — компактные проекции полных ответов сервисов по белым
+спискам полей (полный контракт остаётся в REST/логах; см.
+briefs/PHASE9_BRIEF.md). hint — только при fail; warning из MCP-ответов
+срезан (наблюдаемость деградации — REST /search, лог tool_call с fts_only,
+/health.embedding_ok).
 """
 
 import asyncio
@@ -48,7 +54,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "memory_search": (
         "Ищи в долговременной памяти ПЕРЕД ответом, если тема может там быть: "
         "прошлые решения, факты о системах, договорённости, конфиги. Возвращает "
-        "краткие содержания (summary) и фрагмент текста (snippet); если нужен "
+        "краткие содержания (summary) и метки времени заметок; если нужен "
         "точный текст — memory_get. Не выдумывай то, что могло быть сохранено — "
         "сначала поиск."
     ),
@@ -67,7 +73,8 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "Сохраняй атомарные устойчивые факты, полезные в будущем. Заметка "
         "самодостаточна: назови субъект явно, укажи детали и даты. Сначала "
         "memory_search: если похожее найдено — уточни его через memory_update, "
-        "а не создавай копию."
+        "а не создавай копию. Если вернулся stored=false — почти идентичная "
+        "заметка уже есть: бери id из ответа и уточняй её через memory_update."
     ),
     "memory_update": (
         "Перезаписывает заметку ЦЕЛИКОМ. Сначала memory_get, чтобы не потерять "
@@ -80,6 +87,57 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
 }
 
 TOOL_NAMES = frozenset(TOOL_DESCRIPTIONS)
+
+
+# Белые списки и мапперы компактных MCP-выдач (Фаза 9, бриф §1):
+# из полного ответа сервиса берём ТОЛЬКО разрешённые поля; рост сервисных
+# ответов в MCP не просачивается. hint — маркер мягкого отказа (только fail).
+_SEARCH_ITEM = ("id", "summary", "created_at", "updated_at")
+_LIST_ITEM = ("id", "summary", "created_at", "updated_at")
+_GET_NOTE = ("id", "text", "created_at", "updated_at")
+
+
+def _pick(source: dict, fields: tuple[str, ...]) -> dict[str, Any]:
+    """Взять ТОЛЬКО разрешённые поля (белый список): KeyError при
+    отсутствии поля — контракт изменился, пусть падает громко."""
+    return {name: source[name] for name in fields}
+
+
+def _with_hint(out: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
+    """hint — маркер fail в сервисных контрактах: копируем только если есть."""
+    if "hint" in source:
+        out["hint"] = source["hint"]
+    return out
+
+
+def _compact_search(result: dict[str, Any]) -> dict[str, Any]:
+    out = {"results": [_pick(r, _SEARCH_ITEM) for r in result["results"]]}
+    return _with_hint(out, result)  # warning не копируется никогда (и null тоже)
+
+
+def _compact_list(result: dict[str, Any]) -> dict[str, Any]:
+    out = {"items": [_pick(i, _LIST_ITEM) for i in result["items"]],
+           "total": result["total"]}
+    return _with_hint(out, result)
+
+
+def _compact_get(result: dict[str, Any]) -> dict[str, Any]:
+    out = {"notes": [_pick(n, _GET_NOTE) for n in result["notes"]]}
+    return _with_hint(out, result)
+
+
+def _compact_save(result: dict[str, Any]) -> dict[str, Any]:
+    if result.get("duplicated"):
+        return {"id": result["id"], "stored": False, "hint": result["hint"]}
+    return _pick(result, ("id", "stored", "summary_pending"))
+
+
+def _compact_update(result: dict[str, Any]) -> dict[str, Any]:
+    return _with_hint(_pick(result, ("id", "updated")), result)
+
+
+def _compact_delete(result: dict[str, Any]) -> dict[str, Any]:
+    return _with_hint(_pick(result, ("id", "deleted")), result)
 
 
 def build_mcp(settings: Settings, services: Services) -> MCPServer:
@@ -115,8 +173,9 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             results=len(result["results"]),
             top_k=top_k,
             query=preview(query),
+            fts_only=bool(result.get("warning")),
         )
-        return result
+        return _compact_search(result)
 
     @mcp.tool(name="memory_list", description=TOOL_DESCRIPTIONS["memory_list"])
     async def memory_list(
@@ -134,7 +193,7 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
         log_tool_call(
             "memory_list", started, results=len(result["items"]), limit=limit, offset=offset
         )
-        return result
+        return _compact_list(result)
 
     @mcp.tool(name="memory_get", description=TOOL_DESCRIPTIONS["memory_get"])
     async def memory_get(
@@ -161,7 +220,7 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
         log_tool_call(
             "memory_get", started, requested=len(ids), results=len(result["notes"])
         )
-        return result
+        return _compact_get(result)
 
     @mcp.tool(name="memory_save", description=TOOL_DESCRIPTIONS["memory_save"])
     async def memory_save(
@@ -184,7 +243,7 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             duplicated=bool(result.get("duplicated")),
             note_chars=len(text),
         )
-        return result
+        return _compact_save(result)
 
     @mcp.tool(name="memory_update", description=TOOL_DESCRIPTIONS["memory_update"])
     async def memory_update(
@@ -208,7 +267,7 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             updated=bool(result.get("updated")),
             note_chars=len(text),
         )
-        return result
+        return _compact_update(result)
 
     @mcp.tool(name="memory_delete", description=TOOL_DESCRIPTIONS["memory_delete"])
     async def memory_delete(
@@ -217,6 +276,6 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
         started = time.perf_counter()
         result = await asyncio.to_thread(services.notes.delete, id)
         log_tool_call("memory_delete", started, id=id, deleted=bool(result.get("deleted")))
-        return result
+        return _compact_delete(result)
 
     return mcp

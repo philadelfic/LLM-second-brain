@@ -24,6 +24,7 @@ from mcp.client.streamable_http import (
     streamable_http_client,
 )
 
+from app.services.dedup import DEDUP_HINT
 from app.transport.mcp import (
     SERVER_INSTRUCTIONS,
     SERVER_NAME,
@@ -302,11 +303,14 @@ class TestMemoryFlow:
             note_id = await self._saved_id(session, text)
             got = (await session.call_tool("memory_get", {"ids": [note_id]})).structured_content
         note = got["notes"][0]
+        assert note["id"] == note_id
         assert note["text"] == text
-        assert note["summary_status"] == "pending"
-        assert note["summary"] == text[:200]  # fallback-усечение (Фаза 2)
-        assert note["author"] == "unknown"  # AUTHOR_DEFAULT
         assert note["created_at"].endswith("Z") and note["updated_at"].endswith("Z")
+        # Компактный контракт Фазы 9: get — белый список из четырёх полей.
+        assert set(note) == {"id", "text", "created_at", "updated_at"}
+        assert "summary" not in note
+        assert "summary_status" not in note
+        assert "author" not in note
 
     @pytest.mark.asyncio
     async def test_single_id_alias(self, server_url: str) -> None:
@@ -318,21 +322,26 @@ class TestMemoryFlow:
 
     @pytest.mark.asyncio
     async def test_search_returns_no_full_text(self, server_url: str) -> None:
-        """FR-1: только summary + snippet; полный текст — memory_get."""
+        """FR-1 (Фаза 9): компактные хиты без snippet/оценок; warning срезан."""
         text = f"{self.marker}: квантовый кулер в стойке 192.168.7.7"
         async with connect(server_url) as session:
             await self._saved_id(session, text)
             found = (await session.call_tool(
                 "memory_search", {"query": "квантовый кулер"}
             )).structured_content
-        hit = next(r for r in found["results"] if r["snippet"].startswith(f"{self.marker}"))
-        assert set(hit) == {
-            "id", "summary", "snippet", "summary_status", "rrf_score",
-            "cosine", "created_at", "updated_at", "author",
-        }
-        assert hit["cosine"] is None
+        # Тестовая среда без семантики: fallback-усечение summary начинается
+        # с маркера — по нему и выбираем хит (ранее выбор шёл по snippet).
+        hit = next(
+            r for r in found["results"] if r["summary"].startswith(f"{self.marker}")
+        )
+        assert set(hit) == {"id", "summary", "created_at", "updated_at"}
+        assert "snippet" not in hit
+        assert "cosine" not in hit
+        assert "rrf_score" not in hit
+        assert "summary_status" not in hit
+        assert "author" not in hit
         assert "text" not in hit
-        assert found["warning"]  # Фаза 2: поиск без семантики
+        assert "warning" not in found  # warning срезан даже при деградации
 
     @pytest.mark.asyncio
     async def test_list_shows_summaries_only(self, server_url: str) -> None:
@@ -343,7 +352,10 @@ class TestMemoryFlow:
             )).structured_content
         assert listed["total"] >= 1
         assert listed["items"]  # среди первой страницы есть наша
-        assert all("text" not in item for item in listed["items"])
+        for item in listed["items"]:
+            assert set(item) == {"id", "summary", "created_at", "updated_at"}
+            assert "summary_status" not in item
+            assert "author" not in item
 
     @pytest.mark.asyncio
     async def test_update_full_rewrite(self, server_url: str) -> None:
@@ -354,7 +366,8 @@ class TestMemoryFlow:
             updated = (await session.call_tool("memory_update", {
                 "id": note_id, "text": f"{self.marker}: новый полный текст",
             })).structured_content
-            assert updated == {"id": note_id, "updated": True, "summary_pending": True}
+            assert updated == {"id": note_id, "updated": True}
+            assert "summary_pending" not in updated
             got = (await session.call_tool("memory_get", {"ids": [note_id]})).structured_content
         assert got["notes"][0]["text"] == f"{self.marker}: новый полный текст"
 
@@ -393,3 +406,51 @@ class TestMemoryFlow:
             )).structured_content
         assert found["results"] == []
         assert "переформулируй" in found["hint"]
+        assert "warning" not in found
+
+    @pytest.mark.asyncio
+    async def test_save_duplicate_compact_answer(self, server_url: str) -> None:
+        """Дубль через MCP: id существующей, stored=false, hint; text/duplicated срезаны."""
+        text = f"{self.marker}: дубль через повторный save"
+        async with connect(server_url) as session:
+            first = (await session.call_tool(
+                "memory_save", {"text": text}
+            )).structured_content
+            assert first["stored"] is True
+            second = (await session.call_tool(
+                "memory_save", {"text": text}
+            )).structured_content
+        assert second["id"] == first["id"]
+        assert second["stored"] is False
+        assert second["hint"] == DEDUP_HINT  # дословно — константа сервиса
+        assert "text" not in second
+        assert "duplicated" not in second
+
+    @pytest.mark.asyncio
+    async def test_list_beyond_total_gives_page_hint(self, server_url: str) -> None:
+        """offset >= total: пустая страница + каноничный hint сервиса."""
+        async with connect(server_url) as session:
+            listed = (await session.call_tool(
+                "memory_list", {"limit": 1, "offset": 10**9}
+            )).structured_content
+        assert set(listed) == {"items", "total", "hint"}
+        assert listed["items"] == []
+        assert listed["hint"] == (
+            "страница за пределом памяти: offset ≥ total; уменьши offset"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_partial_batch_keeps_request_order(self, server_url: str) -> None:
+        """Частичный batch: недостающий id молча выпадает, порядок — как в запросе."""
+        first_text = f"{self.marker}: batch первая заметка"
+        second_text = f"{self.marker}: batch вторая заметка"
+        async with connect(server_url) as session:
+            id1 = await self._saved_id(session, first_text)
+            id2 = await self._saved_id(session, second_text)
+            got = (await session.call_tool(
+                "memory_get", {"ids": [id1, 10**9, id2]}
+            )).structured_content
+        notes = got["notes"]
+        assert [note["id"] for note in notes] == [id1, id2]  # порядок запроса
+        assert [note["text"] for note in notes] == [first_text, second_text]
+        assert "hint" not in got  # успешный ответ — без hint (Фаза 9)
