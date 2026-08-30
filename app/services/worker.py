@@ -10,6 +10,21 @@ pending-статусов в БД (переживают рестарт, дого�
   вычитывающая партия режется на подъёмки EMBEDDING_BATCH_SIZE; в полёте —
   до EMBEDDING_CONCURRENT_REQUESTS подъёмок (Semaphore + asyncio.to_thread).
 
+Фаза 8, Этапы 2–3 (фоновый дедуп, вариант B): после довекторизации каждой
+заметки notes-очереди (`vector_status='ok'`) воркер ищет косинус-кандидатов
+против **ранних** активных заметок (`find_candidates`, DEDUP_CANDIDATE_* —
+только предфильтр) и сводит признанные дубли: приговор «дубль» принимает
+LLM-судья (JudgeService, Этап 3: вердикт «ДУБЛЬ»/«НЕ ДУБЛЬ» по паре текстов,
+`think:false`); без судьи (DI None, тестовый режим) — косинус-фоллбек
+Этапа 2.2 (топовый кандидат с cosine ≥ DEDUP_SIMILARITY). Слияние —
+суммаризатором (`Summarizer.merge`: оба текста в один) в **раннюю** заметку
+(меньший id; ре-векторизация/ре-суммаризация — штатно, через те же очереди),
+**поздняя** — soft delete.
+Отказ слияния (SummaryError, NFR-3) данные не портит: обе заметки остаются,
+свежая возвращается в pending_vector — повтор по штатному back-off
+notes-очереди (статус в БД — переживает рестарт); из «processed» такая
+заметка не считается, и интервал очереди не сбрасывается.
+
 Garanties:
 - отказ любого внешнего сервера не портит данные: статус остаётся pending
   (NFR-3); интервал опроса растёт по back-off: PENDING_RETRY_SEC (30 с) → ×2
@@ -55,9 +70,13 @@ Garanties:
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from app.config import Settings
+from app.services.dedup import DeduplicationService
 from app.services.embedding import Embedder, EmbeddingError
+from app.services.judge import Judge, JudgeError
+from app.services.notes import NoteService
 from app.services.summary import Summarizer, SummaryError
 from app.storage import chunks, vectors
 from app.storage.db import session, transaction
@@ -83,14 +102,36 @@ class BackgroundWorker:
         settings: Settings,
         embedding: Embedder,
         summarizer: Summarizer | None = None,
+        dedup: DeduplicationService | None = None,
+        judge: Judge | None = None,
     ) -> None:
         self._settings = settings
         self._embedding = embedding
         self._summarizer = summarizer
+        # LLM-судья дедупа (Фаза 8, Этап 3.1, DI из build_services — один
+        # экземпляр на процесс): вердикт «дубль/не дубль» по каждому
+        # косинус-кандидату (_merge_duplicates, Этап 3.2). None — тестовый
+        # режим: воркер сводит по косинус-фоллбеку Этапа 2.2.
+        self._judge = judge
+        # Фоновый дедуп (Фаза 8, Этап 2): после довекторизации заметки
+        # ищем косинус-кандидатов против ранних заметок. DI для тестов.
+        self._dedup = (
+            dedup if dedup is not None else DeduplicationService(settings)
+        )
+        # Сведение дублей (Этап 2.2) идёт штатной NOTE-логикой: update
+        # раннего (ре-векторизация/ре-суммаризация своими очередями) и
+        # soft delete позднего. Сервис собирается из тех же deps, что и
+        # воркер (embedding — DI-фейк в юнит-тестах); save-пути здесь не
+        # используются, notifier не нужен — после слияния воркер будит
+        # свою же суммаризационную петлю (notify_summary_pending).
+        self._notes = NoteService(settings, embedding=embedding)
         self._vector_interval = float(max(settings.pending_retry_sec, 0))
         self._summary_interval = float(max(settings.pending_retry_sec, 0))
         self._chunk_interval = float(max(settings.pending_retry_sec, 0))
         self._stopping = False
+        # Сигнал «появилась заметка с pending summary» — будит петлю
+        # суммаризации немедленно (save/update), минуя выросший back-off.
+        self._summary_event = asyncio.Event()
 
     @property
     def interval(self) -> float:
@@ -110,6 +151,15 @@ class BackgroundWorker:
     def stop(self) -> None:
         """Мягкая остановка: петли завершатся после разборки текущей итерации."""
         self._stopping = True
+
+    def notify_summary_pending(self) -> None:
+        """Разбудить петлю суммаризации: появилась заметка с pending summary.
+
+        Вызывается из save/update (поток `asyncio.to_thread`) —
+        `asyncio.Event.set()` потокобезопасен. Петля немедленно выходит из
+        ожидания и догоняет очередь, не дожидаясь выросшего back-off.
+        """
+        self._summary_event.set()
 
     async def run(self) -> None:
         """Все петли очередей (запускается asyncio-таской при старте).
@@ -143,10 +193,18 @@ class BackgroundWorker:
             if processed:
                 self._summary_interval = float(self._settings.pending_retry_sec)
                 continue
-            await asyncio.sleep(self._summary_interval)
-            self._summary_interval = next_interval(
-                self._summary_interval, self._settings.pending_retry_sec
-            )
+            # Пустой прогон: ждём сигнал «новая заметка» (save/update) или
+            # таймаут back-off. Сигнал будит петлю немедленно — суммаризация
+            # стартует сразу после записи, а не через выросший интервал.
+            self._summary_event.clear()
+            try:
+                await asyncio.wait_for(
+                    self._summary_event.wait(), timeout=self._summary_interval
+                )
+            except asyncio.TimeoutError:
+                self._summary_interval = next_interval(
+                    self._summary_interval, self._settings.pending_retry_sec
+                )
 
     async def _run_chunks(self) -> None:
         while not self._stopping:
@@ -165,6 +223,12 @@ class BackgroundWorker:
         """Векторизовать одну партию pending; возвращает число обработанных.
 
         Отказ кодирования — 0: статусы не тронуты, воркер выждет back-off.
+        После каждой довекторизации — шаг фонового дедупа (Фаза 8,
+        Этапы 2–3): косинус-кандидаты против ранних заметок и сведение
+        признанных дублей (_merge_duplicates); отказ векторизации до
+        дедупа не доходит (нечего сравнивать). Заметка, чьё сведение не
+        состоялось (отказ суммаризатора), в «processed» не считается —
+        очередь не сбрасывает back-off и повторит (NFR-3).
         """
         with session(self._settings) as conn:
             rows = conn.execute(
@@ -179,6 +243,7 @@ class BackgroundWorker:
             embeddings = self._embedding.embed_texts([row["text"] for row in rows])
         except EmbeddingError:
             return 0
+        processed = len(rows)
         for row, vector in zip(rows, embeddings):
             with session(self._settings) as conn, transaction(conn):
                 vectors.upsert(conn, row["id"], vector)
@@ -186,7 +251,242 @@ class BackgroundWorker:
                     "UPDATE notes SET vector_status = 'ok' WHERE id = ?",
                     (row["id"],),
                 )
-        return len(rows)
+            # Фоновый дедуп (Фаза 8, Этапы 2–3): вектор готов — кандидаты
+            # против ранних заметок (вне транзакции записи), затем
+            # приговор (LLM-судья, Этап 3.2; без судьи — косинус-фоллбек
+            # Этапа 2.2) и сведение.
+            older = self._find_dedup_candidates(int(row["id"]), vector)
+            if older and not self._merge_duplicates(int(row["id"]), older):
+                # Слияние не состоялось: обе заметки целы (NFR-3); свежая
+                # возвращается в pending — повтор по back-off очереди.
+                self._requeue_vectorization(int(row["id"]))
+                processed -= 1
+        return processed
+
+    # --- фоновый дедуп (Фаза 8, Этапы 2–3) ------------------------------------
+
+    def _find_dedup_candidates(
+        self, note_id: int, vector: list[float]
+    ) -> list[tuple[int, float]]:
+        """Косинус-кандидаты дедупа после довекторизации заметки.
+
+        Кандидаты ищутся только против **ранних** заметок (id меньше
+        текущей): пара «поздняя ↔ ранняя» обрабатывается один раз, из
+        стороны поздней — сведение (Этап 2.2) обновляет ранний дубль и
+        soft-delete поздний, а встречный прогон той же пары из стороны
+        ранней заметки зациклил бы обработку. Кандидаты логируются
+        (наблюдаемость); приговор «дубль» принимает _merge_duplicates:
+        каждый кандидат опрашивается судьёй (Этап 3.2, JudgeService —
+        косинус лишь предфильтр); без судьи — косинус-фоллбек
+        DEDUP_SIMILARITY (Этап 2.2).
+
+        Возвращает список [(candidate_id, cosine)] — вход сведение.
+        """
+        found = self._dedup.find_candidates(vector, exclude_id=note_id)
+        older = [pair for pair in found if pair[0] < note_id]
+        if older:
+            logging.getLogger("app").info(
+                "dedup: cosine candidates found for vectorized note",
+                extra={
+                    "event": "dedup_candidates",
+                    "note_id": note_id,
+                    "candidates": older,
+                },
+            )
+        return older
+
+    def _merge_duplicates(
+        self, note_id: int, candidates: list[tuple[int, float]]
+    ) -> bool:
+        """Приговор «дубль» — LLM-судья (Этап 3.2); сведение — Этап 2.2.
+
+        Косинус — лишь предфильтр: кандидатов (топ-N от find_candidates,
+        уже отрезанных к «ранним») опрашивает судья (JudgeService: вердикт
+        «ДУБЛЬ»/«НЕ ДУБЛЬ» по паре текстов, think:false); сводится первый
+        признанный — кандидаты идут по убыванию близости. Отказ судьи
+        (JudgeError) → False: обе заметки целы (NFR-3), свежая вернётся в
+        pending_vector и повторит по back-off — лучше несведённая пара,
+        чем ошибочное сведение. Без судьи (DI None, тестовый режим) —
+        фоллбек Этапа 2.2: топовый кандидат с cosine ≥ DEDUP_SIMILARITY.
+
+        Один мердж за прогон заметки: обновлённый ранний уходит в pending,
+        его ре-векторизация сама подхватит следующих кандидатов — каскад
+        без зацикливания.
+
+        Процедура (вариант B — решение Олега):
+        1) перечитать тексты свежей заметки и всех кандидатов (гонка с
+           memory_update/delete: протухшие кандидаты срезаются заранее —
+           о них не спрашивают ни судью, ни суммаризатор);
+        2) выбрать кандидата-дубля (_pick_duplicate: судья или фоллбек);
+        3) summarizer.merge(текст_ранней, текст_поздней) — объединить;
+        4) NoteService.update ранней (текст = объединённый; ре-векторизация
+           и ре-суммаризация — штатно, своими очередями);
+        5) NoteService.delete поздней (soft delete, trash).
+
+        Отказ слияния (SummaryError) → False: обе заметки целы (NFR-3),
+        свежая вернётся в pending_vector и повторит по back-off;
+        «processed» в process_pending её не учитывает. Окно креша между
+        update ранней и delete поздней оставляет ОБЕ живыми с актуальными
+        текстами — данные не теряются, пара разберётся при следующих
+        векторизациях. Прочие исключения — громко, как и всюду в воркере.
+
+        Возвращает True, если пару можно считать обработанной (сведена,
+        протухла, судья не признал), False — слияние повторить позже.
+        """
+        if self._summarizer is None:
+            # Тестовый режим Фазы 3 (суммаризатора нет): сведение
+            # невозможно в принципе — пара остаётся, заметка считается
+            # обработанной (иначе revert крутил бы холостой цикл
+            # пере-кодировок без суммаризатора).
+            return True
+        # Перечитать тексты свежей заметки и всех кандидатов (гонка с
+        # memory_update/delete — короткое чтение, без транзакции записи).
+        ids = [note_id] + [candidate_id for candidate_id, _ in candidates]
+        placeholders = ",".join("?" * len(ids))
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                f"SELECT id, text, deleted_at FROM notes WHERE id IN "
+                f"({placeholders})",
+                ids,
+            ).fetchall()
+        by_id = {row["id"]: row for row in rows}
+        newer = by_id.get(note_id)
+        if newer is None or newer["deleted_at"] is not None:
+            logging.getLogger("app").info(
+                "dedup: note vanished before merge — skipped",
+                extra={"event": "dedup_merge_skipped", "note_id": note_id},
+            )
+            return True  # повтор бессмыслен: свежая заметка протухла
+        alive = [
+            (candidate_id, cosine_value)
+            for candidate_id, cosine_value in candidates
+            if (row := by_id.get(candidate_id)) is not None
+            and row["deleted_at"] is None
+        ]
+        try:
+            best = self._pick_duplicate(note_id, alive, by_id)
+        except JudgeError:
+            logging.getLogger("app").warning(
+                "dedup: judge undecidable — both notes kept, retry queued",
+                extra={
+                    "event": "dedup_judge_failed",
+                    "note_id": note_id,
+                    "candidates": [candidate_id for candidate_id, _ in alive],
+                },
+            )
+            return False  # заметка вернётся в pending_vector (back-off)
+        if best is None:
+            return True  # судья (или фоллбек) не признал ни одного кандидата
+        older_id, cosine_value = best
+        older = by_id[older_id]
+        try:
+            merged = self._summarizer.merge(older["text"], newer["text"])
+            updated = self._notes.update(older_id, merged)
+            if not updated.get("updated"):
+                logging.getLogger("app").info(
+                    "dedup: merge target vanished during merge — pair skipped",
+                    extra={
+                        "event": "dedup_merge_skipped",
+                        "older_id": older_id,
+                        "note_id": note_id,
+                    },
+                )
+                return True
+            self._notes.delete(note_id)  # поздний дубль — в trash
+        except SummaryError:
+            logging.getLogger("app").warning(
+                "dedup: summarizer merge failed — both notes kept, retry queued",
+                extra={
+                    "event": "dedup_merge_failed",
+                    "older_id": older_id,
+                    "note_id": note_id,
+                },
+            )
+            return False  # заметка вернётся в pending_vector (back-off)
+        logging.getLogger("app").info(
+            "dedup: duplicate merged into earlier note",
+            extra={
+                "event": "dedup_merged",
+                "older_id": older_id,
+                "note_id": note_id,
+                "cosine": cosine_value,
+            },
+        )
+        # Ранняя заметка обновлена (summary pending) — будим свою же петлю
+        # суммаризации, не дожидаясь back-off.
+        self.notify_summary_pending()
+        return True
+
+    def _pick_duplicate(
+        self,
+        note_id: int,
+        candidates: list[tuple[int, float]],
+        by_id: dict,
+    ) -> tuple[int, float] | None:
+        """Выбрать кандидата для сведения: судья (Этап 3.2) или фоллбек.
+
+        Судья (Judge): опрашивается по каждому живому кандидату в порядке
+        убывания близости (порядок выдачи find_candidates); первый вердикт
+        «ДУБЛЬ» — приговор (candidate_id, cosine). «НЕ ДУБЛЬ» по всем —
+        None: слияния нет, заметка считается обработанной (повторять
+        вопрос по неизменному тексту незачем: дедуп ждёт следующую
+        векторизацию, а та случится только после изменения текста).
+        Каждая пара логируется (event=dedup_judge) — наблюдаемость
+        вердиктов предфильтра.
+
+        Фоллбек без судьи (DI None, тестовый режим Этапа 2.2): первый
+        кандидат с cosine ≥ DEDUP_SIMILARITY (выдача отсортирована).
+
+        JudgeError пробрасывается наружу — _merge_duplicates трактует
+        отказ судьи как отказ слияния (False → requeue по back-off,
+        NFR-3): неопределённость не превращаем в «не дубль».
+
+        by_id — свежепрочитанные строки notes (id → row): судья сравнивает
+        тексты пары (свежая, кандидат) — порядок аргументов фиксирует
+        JUDGE_USER_TEMPLATE (ТЕКСТ 1 — новая, ТЕКСТ 2 — кандидат).
+        """
+        if self._judge is None:
+            # Фоллбек Этапа 2.2 (тестовый режим): выдача отсортирована.
+            return next(
+                (
+                    pair
+                    for pair in candidates
+                    if pair[1] >= self._settings.dedup_similarity
+                ),
+                None,
+            )
+        for candidate_id, cosine_value in candidates:
+            verdict = self._judge.judge(
+                by_id[note_id]["text"], by_id[candidate_id]["text"]
+            )
+            logging.getLogger("app").info(
+                "dedup: judge verdict for cosine candidate",
+                extra={
+                    "event": "dedup_judge",
+                    "note_id": note_id,
+                    "candidate_id": candidate_id,
+                    "cosine": cosine_value,
+                    "verdict": verdict,
+                },
+            )
+            if verdict:
+                return (candidate_id, cosine_value)
+        return None
+
+    def _requeue_vectorization(self, note_id: int) -> None:
+        """Вернуть заметку в pending-очередь вектора (повтор слияния).
+
+        Вектор в notes_vec уже записан и остаётся до перезаписи; следующий
+        прогон очереди перекодирует текст и снова запустит дедуп. Состояние
+        — в БД: переживает рестарт (в отличие от in-memory попыток), темп
+        повторов держит штатный back-off notes-очереди.
+        """
+        with session(self._settings) as conn, transaction(conn):
+            conn.execute(
+                "UPDATE notes SET vector_status = 'pending' "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (note_id,),
+            )
 
     def process_summary_pending(self, limit: int = PENDING_BATCH) -> int:
         """Досуммировать одну партию pending; число до 'ok' доведённых.
@@ -214,6 +514,10 @@ class BackgroundWorker:
             try:
                 summary = self._summarizer.summarize(row["text"])
             except SummaryError:
+                logging.getLogger("app").warning(
+                    "summary: generation failed — kept pending, retry by back-off",
+                    extra={"event": "summary_failed", "note_id": row["id"]},
+                )
                 continue  # отказ: status pending остаётся, повтор по back-off
             with session(self._settings) as conn, transaction(conn):
                 cursor = conn.execute(

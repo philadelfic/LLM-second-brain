@@ -1,16 +1,22 @@
 """NoteService — CRUD заметок (REQUIREMENTS FR-2…FR-6, ARCHITECTURE §4.1–§4.6;
-Фаза 7: чанки в save/update).
+Фаза 8, Этап 1: save мгновенный — векторизация и суммаризация ушли в фон).
 
-Один код сервисов для MCP и REST (ARCH §1). С Фазы 3 — синхронное кодирование
-текста и дедуп в save/update (EmbeddingService + DeduplicationService иньектируются;
-отказ векторизации не ломает операцию — NFR-3): заметка сохраняется, дедуп
-деградирует к FTS, до-векторизация — фоновым воркером (§3.4). Суммаризации в
-синхронном пути нет (режим «Б», Фаза 4): summary всегда fallback-усечение.
+Один код сервисов для MCP и REST (ARCH §1). С Фазы 8 save/update НЕ кодируют
+текст синхронно: заметка записывается сразу с vector_status='pending' (текст +
+чанки одной транзакцией), вектора заметки и чанков догоняет фоновый воркер
+(§3.4). Косинус-дедуп в момент записи становится невозможен — он переезжает в
+фоновый дедуп (Этап 2), где признанные дубли сводятся (Этап 2.2): оба текста
+пару суммаризатор объединяет merge-промптом, ранний дубликат обновляется штатным
+update(), поздний уходит в trash (soft delete). В синхронном пути остаётся
+мгновенный дословный дедуп по тексту (SQL/FTS, без Ollama): перефразы он не
+ловит — это теперь зона фонового дедупа. Суммаризации в синхронном пути нет (режим «Б», Фаза 4):
+summary всегда fallback-усечение, генерация — фоновым воркером (notifier
+будит его сразу после записи).
 
 Контракты ответов (то, что уйдёт моделям через MCP-инструменты):
-- save (успех с вектором)  → {id, stored: True, summary_pending: True}
-- save (векторизация упала)→ + warning «дедуп только по тексту» (ARCH §4.1)
-- save (дубль)             → {duplicated: True, id, text, hint} (не создаётся)
+- save (успех)  → {id, stored: True, summary_pending: True} — **без** warning:
+  векторизация теперь всегда фоновая, а не «отложена из-за отказа» (Фаза 8)
+- save (дубль)  → {duplicated: True, id, text, hint} (не создаётся)
 - get    → {notes: [...]} (массив даже для одного id; отсутствующие/удалённые
            id пропускаются; пустой результат — мягкий ответ с hint)
 - list   → {items: [...], total} (без полных текстов) (+hint, если пусто)
@@ -18,47 +24,42 @@
 - delete → {id, deleted: True} | мягкий ответ deleted: False (soft delete)
 
 Про update **без warning**: контрактом FR-5 warning не предусмотрен — модель
-учится только по ответам save/search (§5.3), сам факт retry-векторизации
-ремонтируется воркером прозрачно.
+учится только по ответам save/search (§5.3), до-векторизация воркером
+прозрачна; то же справедливо для save (Фаза 8): pending — штатное состояние
+любой новой заметки, а не деградация.
 
 Пагинация/сортировка: `ORDER BY updated_at DESC, id DESC` — свежесть важнее
 возраста (FR-2); метки времени живут с точностью до секунды (DDL-формат
 ARCH §3.3), поэтому внутри одной секунды определения «свежее» даёт id
 (более поздняя запись больше) — детерминированный порядок без sleep'ов.
 
-Фаза 7 (шаг 3): заметка хранится целиком, а чанки — только для векторов.
+Чанки (Фаза 7): заметка хранится целиком, а чанки — только для векторов.
 В save/update чанки раскладываются чистым токен-сплиттером (без Ollama) и
-пишутся в notes_chunks той же транзакцией; вектора чанков строит фоновый
-воркер (шаг 5) — pending по анти-джойну. Исключение — reuse: единственный
-чанк ≤ CHUNK_SIZE переиспользует полный вектор заметки, не кодируя текст
-второй раз. Дедуп по-прежнему только по полному тексту (notes_vec) —
-чанк-вектора в дедупе не участвуют. Soft delete чанки не трогает (trash);
-физическая чистка чанков — замена при update, каскад + самолечение
-сирот при физическом удалении (шаг 2)."""
+пишутся в notes_chunks той же транзакцией **без векторов** (Фаза 8) — их
+строит фоновый воркер (pending выведен анти-джойном, шаг 5), включая reuse:
+вектор полного текста копируется в единственный чанк ≤ CHUNK_SIZE, если
+notes-очередь успела довекторизовать заметку раньше chunk-очереди. Дедуп —
+только по полному тексту (notes_vec): чанк-вектора в дедупе не участвуют.
+Soft delete чанки не трогает (trash); физическая чистка чанков — замена при
+update, каскад + самолечение сирот при физическом удалении (шаг 2)."""
 
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from typing import Any
 
 from app.config import Settings
 from app.services.dedup import DeduplicationService, duplicate_response
-from app.services.embedding import Embedder, EmbeddingError, EmbeddingService
+from app.services.embedding import Embedder, EmbeddingService
 from app.services.emit import summary_of
 from app.services.splitter import split_text
-from app.storage import chunks, vectors
+from app.storage import chunks
 from app.storage.db import session, transaction
 
 # Фиксированные верхние границы контрактов (REQUIREMENTS §5.1/NFR-6; env —
 # только для умолчаний: DEFAULT_LIST_LIMIT), поэтому не настраиваются.
 MAX_LIST_LIMIT = 50
-
-# Векторизация записи не удалась: если заметка сохранена — предупреждаем
-# модель честно, что семантический дедуп/поиск недоступны (ARCH §4.1, §5.3).
-WARNING_VECTOR_PENDING = (
-    "векторизация отложена: дедуп только по тексту (перефразы не ловятся), "
-    "поиск по этой заметке появится после до-векторизации фоновым воркером"
-)
 
 
 class NoteValidationError(ValueError):
@@ -70,54 +71,56 @@ class NoteValidationError(ValueError):
 
 
 class NoteService:
-    """CRUD банком заметок; save/update — векторизация, delete — soft."""
+    """CRUD банком заметок; save/update — мгновенная запись (Фаза 8),
+    векторизация/суммаризация — фоновые; delete — soft."""
 
     def __init__(
         self,
         settings: Settings,
         embedding: Embedder | None = None,
         dedup: DeduplicationService | None = None,
+        summary_notifier: Callable[[], None] | None = None,
     ) -> None:
         self._settings = settings
-        # DI для тестов: HashEmbedder/фейк вместо живого Ollama.
+        # DI для тестов: HashEmbedder/фейк вместо живого Ollama. С Фазы 8
+        # синхронный путь кодировщик не вызывает (вектора — фоновый воркер),
+        # сервис остаётся в конструкторе как точка сборки для search/health.
         self._embedding: Embedder = (
             embedding if embedding is not None else EmbeddingService(settings)
         )
         self._dedup = dedup if dedup is not None else DeduplicationService(settings)
+        # Сигнал воркеру суммаризации (main.py): будить петлю сразу при
+        # появлении pending summary, а не ждать выросший back-off.
+        self._summary_notifier = summary_notifier
+
+    def set_summary_notifier(self, notifier: Callable[[], None]) -> None:
+        """Подключить сигнал пробуждения воркера суммаризации (main.py)."""
+        self._summary_notifier = notifier
 
     # --- FR-4 memory_save (ARCH §4.1) --------------------------------------
 
     def save(self, text: str, author: str | None = None) -> dict[str, Any]:
-        """Валидация → кодирование → дедуп → INSERT (+вектор+чанки) транзакцией."""
-        self._validate_text(text)
-        vector = self._note_vector(text)
-        # Чанки считаем чистым сплиттером ДО записи (~миллисекунды) —
-        # транзакция остаётся короткой; Ollama для чанков не зовётся.
-        chunks_data = self._chunks_of(text)
-        if vector is not None:
-            duplicate = self._dedup.find_by_cosine(vector)
-            if duplicate is not None:
-                return duplicate_response(duplicate)
-            with session(self._settings) as conn, transaction(conn):
-                note_id = self._insert(conn, text, author, vector_status="ok")
-                vectors.upsert(conn, note_id, vector)
-                self._store_chunks(conn, note_id, chunks_data, vector)
-            return {"id": note_id, "stored": True, "summary_pending": True}
+        """Валидация → дословный дедуп → INSERT (текст + чанки) транзакцией.
 
-        # Отказ векторизации: заметка сохраняется, дедуп — по тексту (дословный),
-        # перефразы пропускаются (warning — канал обучения, §5.3).
+        Фаза 8 (Этап 1): Ollama в синхронном пути не вызывается — вектор
+        не строится, векторизация ушла в фон (pending-очередь воркера);
+        косинус-дедуп в момент записи невозможен, он переезжает в фоновый
+        дедуп (Этап 2). Синхронно отсекается только дословный дубль (SQL/FTS).
+        Ответ мгновенный и без warning: векторизация не «отложена из-за
+        отказа» — она всегда фоновая.
+        """
+        self._validate_text(text)
         duplicate = self._dedup.find_by_text(text)
         if duplicate is not None:
             return duplicate_response(duplicate)
+        # Чанки считаем чистым сплиттером (~миллисекунды, без Ollama) —
+        # транзакция остаётся короткой.
+        chunks_data = self._chunks_of(text)
         with session(self._settings) as conn, transaction(conn):
-            note_id = self._insert(conn, text, author)
+            note_id = self._insert(conn, text, author, vector_status="pending")
             self._store_chunks(conn, note_id, chunks_data, None)
-        return {
-            "id": note_id,
-            "stored": True,
-            "summary_pending": True,
-            "warning": WARNING_VECTOR_PENDING,
-        }
+        self._notify_summary_pending()
+        return {"id": note_id, "stored": True, "summary_pending": True}
 
     def _insert(
         self,
@@ -208,16 +211,19 @@ class NoteService:
             }
         return {"items": items, "total": total}
 
-    # --- FR-5 memory_update (перезапись целиком + ре-векторизация §4.5) ----
+    # --- FR-5 memory_update (перезапись целиком; векторизация — фон) -------
 
     def update(self, note_id: int, text: str) -> dict[str, Any]:
-        """UPDATE text целиком; summary reset; sync ре-векторизация.
+        """UPDATE text целиком; summary reset; ре-векторизация — фоном (Фаза 8).
 
-        Отказ ре-векторизации — рядовой pending (воркер догонит); warning
-        контрактом FR-5 не предусмотрен, ответ не меняется.
+        Заметка помечается vector_status='pending' — вектора заметки и чанков
+        строит фоновый воркер; warning контрактом FR-5 не предусмотрен, ответ
+        не меняется. С Фазы 8 Этапа 2.2 update() — штатный путь сведения
+        дублей: воркер объединяет пару merge-промптом суммаризатора и
+        обновляет раннюю заметку этим методом (поздняя — soft delete).
         """
         self._validate_text(text)
-        # Быстрая проверка до внешнего вызова: несуществующий id не кодируем.
+        # Быстрая проверка до записи: несуществующий id не трогаем.
         with session(self._settings) as conn:
             exists = conn.execute(
                 "SELECT 1 FROM notes WHERE id = ? AND deleted_at IS NULL",
@@ -225,28 +231,22 @@ class NoteService:
             ).fetchone()
         if exists is None:
             return self._not_found(note_id)
-        vector = self._note_vector(text)
         chunks_data = self._chunks_of(text)
         with session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
-                "UPDATE notes SET text = ?, vector_status = ?, "
+                "UPDATE notes SET text = ?, vector_status = 'pending', "
                 "summary = '', summary_status = 'pending', "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
                 "WHERE id = ? AND deleted_at IS NULL",
-                (
-                    text,
-                    "ok" if vector is not None else "pending",
-                    note_id,
-                ),
+                (text, note_id),
             )
             updated = cursor.rowcount  # 0 = нет такой активной заметки
-            if vector is not None:
-                vectors.upsert(conn, note_id, vector)
             # Фаза 7: старые чанки (и их вектора) заменяются новыми одной
-            # транзакцией — в том числе при отказе ре-векторизации.
-            self._store_chunks(conn, note_id, chunks_data, vector)
+            # транзакцией; Фаза 8: вектора строит фоновый воркер (pending).
+            self._store_chunks(conn, note_id, chunks_data, None)
         if not updated:
             return self._not_found(note_id)
+        self._notify_summary_pending()
         return {"id": note_id, "updated": True, "summary_pending": True}
 
     # --- FR-6 memory_delete (soft delete) ----------------------------------
@@ -276,7 +276,8 @@ class NoteService:
 
         trash не считается: фоновой догенерации для удалённых заметок нет
         (REQUIREMENTS FR-6), undo оператора возвращает заметку в активные —
-        и она снова считается pending до догенерации в Фазах 3–4.
+        и она снова считается pending до догенерации. С Фазы 8 pending
+        векторизации — штатное состояние каждой новой/обновлённой заметки.
         """
         with session(self._settings) as conn:
             row = conn.execute(
@@ -316,12 +317,10 @@ class NoteService:
         """Записать чанки заметки (в открытой транзакции); при update — полная
         замена: старые чанки и их вектора уходят вместе со строками.
 
-        Reuse (brief §6): единственный чанк размера ≤ CHUNK_SIZE при готовом
-        полном векторе получает вектор заметки без повторного кодирования —
-        текст такого чанка равен тексту заметки, схема вырождается в текущую
-        (заметки ≤3 000 симв. = 1 чанк). Иначе чанки остаются без векторов —
-        фоновый воркер до-кодирует (pending выведен анти-джойном, шаг 5);
-        вектор None (отказ Ollama) — тоже оставляет чанки в pending."""
+        Фаза 8: синхронный путь всегда передаёт note_vector=None — полного
+        вектора в момент записи больше нет, вектора чанков строит фоновый
+        воркер (включая reuse единственного чанка из notes_vec). Параметр
+        сохранён как точка расширения (например, для фоновых путей Фазы 8)."""
         chunk_ids = chunks.replace_note_chunks(conn, note_id, chunks_data)
         if (
             note_vector is not None
@@ -330,12 +329,10 @@ class NoteService:
         ):
             chunks.upsert_vector(conn, chunk_ids[0], note_vector)
 
-    def _note_vector(self, text: str) -> list[float] | None:
-        """Синхронное кодирование; отказ векторизации — None (не исключение)."""
-        try:
-            return self._embedding.embed(text)
-        except EmbeddingError:
-            return None
+    def _notify_summary_pending(self) -> None:
+        """Сигнал воркеру: появилась заметка с pending summary (будить сразу)."""
+        if self._summary_notifier is not None:
+            self._summary_notifier()
 
     @staticmethod
     def _not_found(note_id: int) -> dict[str, Any]:

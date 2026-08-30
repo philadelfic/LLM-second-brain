@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 import pytest
-from fakes import HashEmbedder, cosine
+from fakes import HashEmbedder, cosine, vectorize_notes
 
 from app.config import get_settings
 from app.services.notes import NoteService
@@ -191,7 +191,9 @@ class TestFallback:
         embedder = HashEmbedder(get_settings().embedding_dim)
         notes, searcher = _make_services(embedder)
         text = text_with_tokens(3000)
-        note_id = notes.save(text)["id"]  # чанки pending, полный вектор ok
+        note_id = notes.save(text)["id"]  # Фаза 8: чанки pending у воркера
+        # полный вектор достраивает воркер (notes-очередь) — догоняем:
+        assert vectorize_notes(get_settings(), embedder) == 1
         with session(get_settings()) as conn:
             assert chunks.count_pending(conn) == len(
                 token_windows(count_tokens(text), **DEFS)
@@ -211,6 +213,9 @@ class TestFallback:
         notes, searcher, _embedder = services
         text = "Единственная маленькая заметка про чанки"
         note_id = notes.save(text)["id"]
+        # Фаза 8: вектор появляется после догонки воркером (чанки pending →
+        # поиск идёт фоллбеком по notes_vec).
+        assert vectorize_notes(get_settings(), _embedder) == 1
         results = searcher.search(text, top_k=5)["results"]
         assert [r["id"] for r in results].count(note_id) == 1
         assert results[0]["cosine"] == pytest.approx(1.0, abs=1e-4)

@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import pytest
-from fakes import HashEmbedder
+from fakes import HashEmbedder, vectorize_notes
 
 from app.config import get_settings
 from app.services.notes import NoteService
@@ -19,7 +19,8 @@ from scripts.reindex import main
 
 @pytest.fixture
 def dim4(tmp_path, monkeypatch: pytest.MonkeyPatch):
-    """БД, созданная под старую размерность 4, с двумя векторизованными заметками."""
+    """БД под старой размерностью 4, с двумя векторизованными заметками
+    (вектора догнала очередь воркера — Фаза 8 save пишет только pending)."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     monkeypatch.setenv("EMBEDDING_DIM", "4")
     get_settings.cache_clear()
@@ -28,6 +29,8 @@ def dim4(tmp_path, monkeypatch: pytest.MonkeyPatch):
     notes = NoteService(settings, HashEmbedder(4))
     notes.save("заметка при старой размерности")
     notes.save("вторая заметка при старой размерности")
+    # Фаза 8: вектора строит воркер — доводим очередь до «2 векторизованных»
+    assert vectorize_notes(settings, HashEmbedder(4)) == 2
     return settings
 
 

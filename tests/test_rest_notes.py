@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from app.services.notes import WARNING_VECTOR_PENDING
-
 
 def unique(text: str) -> str:
     """Уникальный текст: дедуп Фазы 3 не примет нумерованные siblings за дубли."""
@@ -29,14 +27,9 @@ class TestNotesCrud:
 
     def test_create_returns_contract(self, client: TestClient, token: str) -> None:
         result = self._create(client, token, "Рест: заметка о деплое")
-        # Тестовая среда без Ollama → сохранение по FR-4 в режиме деградации:
-        # векторизация отложена, дедуп по тексту — обязательный warning.
-        assert result == {
-            "id": 1,
-            "stored": True,
-            "summary_pending": True,
-            "warning": WARNING_VECTOR_PENDING,
-        }
+        # Фаза 8: векторизация всегда фоновая — pending это штатное состояние
+        # новой заметки, а не деградация, поэтому warning в контракте нет.
+        assert result == {"id": 1, "stored": True, "summary_pending": True}
 
     def test_create_duplicate_rejected_by_text_fallback(
         self, client: TestClient, token: str
@@ -192,7 +185,7 @@ class TestHealthCounters:
         assert body["notes_count"] == 1
         assert body["pending_vector"] == 1  # Фаза 2 — все pending
         assert body["pending_summary"] == 1
-        assert body["embedding_ok"] is False  # попытка вектора была (offline)
+        assert body["embedding_ok"] is None  # Фаза 8: save кодировщик не зовёт
         assert body["summarizer_ok"] is None
         client.delete("/notes/1", headers={"Authorization": f"Bearer {token}"})
         assert health()["notes_count"] == 0

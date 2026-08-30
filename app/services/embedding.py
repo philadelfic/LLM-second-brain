@@ -36,6 +36,7 @@ from typing import Protocol
 import httpx
 
 from app.config import Settings
+from app.services.ollama_gate import ollama_slot
 
 # Одна повторная попытка в синхронном пути (ARCH §3.2).
 MAX_ATTEMPTS = 2
@@ -126,7 +127,10 @@ class EmbeddingService:
         for attempt in range(1, MAX_ATTEMPTS + 1):
             final = attempt == MAX_ATTEMPTS
             try:
-                response = self._client.post("/api/embed", json=payload)
+                # Очередь F1: один запрос к серверу в момент времени — слот
+                # держится на попытку (ретраи — та же задача кодирования).
+                with ollama_slot(self._settings.ollama_base_url):
+                    response = self._client.post("/api/embed", json=payload)
             except _RETRIABLE as exc:
                 if final:
                     raise EmbeddingError(
