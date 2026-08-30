@@ -39,7 +39,7 @@ services:
       SUMMARY_THINK: "true"                  # оставить размышления модели
       SUMMARY_NUM_PREDICT: "35000"           # потолок thinking+content выжимки (О. 2026-08-30: 1500→35000)
       MERGE_NUM_PREDICT: "35000"             # отдельный потолок слияния дублей (О. 2026-08-30)
-      SUMMARY_TIMEOUT_SEC: "600"             # 10 мин: merge длинной пары 372 c (замер E2E 2026-08-30), боевые суммари ~60 c
+      SUMMARY_TIMEOUT_SEC: "750"             # 12.5 мин (решение О. 2026-08-30: 600→750 под merge 35k-заметок); боевые суммари ~60 c
       # --- LLM-судья дедупа (Фаза 8, Этап 3, решение О. 2026-08-30: ornith-1.5:35b) ---
       DEDUP_JUDGE_OLLAMA_BASE_URL: "http://192.168.3.112:11434"  # Ollama судьи (/api/chat)
       DEDUP_JUDGE_MODEL: "ornith-1.5:35b"                        # модель-судья дедупа
