@@ -63,7 +63,8 @@ class Settings(BaseSettings):
     # --- суммаризация ---
     max_summary_chars: int = 200
     summary_think: bool = True  # при false в вызов идёт "think": false
-    summary_num_predict: int = 1500  # общий бюджет thinking+content
+    summary_num_predict: int = 35000  # потолок thinking+content выжимки (решение О. 2026-08-30: 1500→35000)
+    merge_num_predict: int = 35000  # отдельный потолок слияния дублей (решение О. 2026-08-30)
     summary_timeout_sec: int = 60  # клиентский таймаут вызова
 
     # --- выдача ---
@@ -92,7 +93,7 @@ class Settings(BaseSettings):
     rrf_k: int = 60
 
     # --- лимиты (NFR-6: env-переопределяемы, валидируются; см. _validate_ranges) ---
-    max_note_chars: int = 2000
+    max_note_chars: int = 35000  # 2000→20000 (Фаза 7) → 35000 (решение О. 2026-08-30)
     max_query_chars: int = 512
 
     # --- фоновые операции ---
@@ -198,6 +199,7 @@ class Settings(BaseSettings):
         # --- векторизация / суммаризация ---
         need_low("embedding_dim", self.embedding_dim, 1)
         need_low("summary_num_predict", self.summary_num_predict, 1)
+        need_low("merge_num_predict", self.merge_num_predict, 1)
         need_low("summary_timeout_sec", self.summary_timeout_sec, 1)
         # LLM-судья дедупа (Фаза 8, Этап 3.1): бюджет и таймаут ≥ 1 (NFR-6).
         need_low("dedup_judge_num_predict", self.dedup_judge_num_predict, 1)

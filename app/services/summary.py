@@ -2,8 +2,9 @@
 
 Второй внешний вызов системы: `POST /api/chat` на SUMMARY_OLLAMA_BASE_URL,
 модель SUMMARY_MODEL (`ornith-1.5:35b`). Генерирует краткое содержание
-заметки: одно предложение ≤ MAX_SUMMARY_CHARS, на языке заметки, с
-сохранением имён/чисел/дат (промпт — ARCH §4.7).
+заметки: 1–2 ёмких предложения, суммарно до 30 слов, на языке заметки
+(лимит держит сам промпт; символьной обрезки суммари нет — решение
+О. 2026-08-30; промпт — ARCH §4.7).
 
 Режим «Б»: вызов выполняется **только фоновым воркером** (поток
 pending_summary, а с Фазы 8 Этапа 2.2 — и петля слияния дублей), никогда из
@@ -31,17 +32,20 @@ MAX_NOTE_CHARS (не MAX_SUMMARY_CHARS), чтобы он всегда прохо
   `SUMMARY_THINK=true` (дефолт) поле `think` в запросе НЕ отправляется вовсе;
   при false — `"think": false`. Рассуждения приходят от Ollama отдельным
   полем `message.thinking` — **отбрасываются**, в БД попадает только
-  `message.content`. Бюджет num_predict общий на thinking+content, поэтому
-  он щедрый (SUMMARY_NUM_PREDICT=1500), контроль времени — клиентский
-  таймаут SUMMARY_TIMEOUT_SEC (дефолт 60 с; прод после E2E — 600 с: merge
+  `message.content`. Бюджет num_predict общий на thinking+content и теперь
+  раздельный (решение О. 2026-08-30): выжимка — SUMMARY_NUM_PREDICT
+  (35000), слияние дублей — свой MERGE_NUM_PREDICT (35000: merged-текст
+  может быть длинным). Контроль времени — клиентский таймаут
+  SUMMARY_TIMEOUT_SEC (дефолт 60 с; прод после E2E — 600 с: merge
   длинной пары 372 с, замер 2026-08-30): connect 2 с (LAN).
 - Ретраев нет — единственная повторная попытка это back-off воркера
   (PENDING_RETRY_SEC → ×2 → 15 мин); дублировать её здесь нечем управлять.
 - Проверки контракта жёсткие: HTTP 200, JSON-объект, `message.content` —
   непустая строка. **Пустой content → трактуется как отказ** (REQUIREMENTS
   §5.5) — «модель ответила, но не сказала ничего» не становится суммари.
-- Страховка длины: ответ обрезается до MAX_SUMMARY_CHARS символов по
-  строке (не байтам) — на случай невыполнения инструкции (ARCH §4.7).
+- Символьной обрезки суммари НЕТ (решение О. 2026-08-30): длину держит
+  промпт («до 30 слов»); страховка осталась только у merge — её результат
+  обязан пройти CHECK(MAX_NOTE_CHARS) при memory_update.
 - Отказ — `SummaryError`, и только она: воркер сам решает деградацию
   (fallback-усечение уже в выдачах, статус остаётся pending). Ни один отказ
   не ломает пользовательскую операцию (NFR-3).
@@ -74,23 +78,29 @@ KEEP_ALIVE = "15m"
 # Кусок тела ответа в тексте ошибки (логи не захламляем).
 _ERROR_BODY_CHARS = 120
 
+# Редакция О. 2026-08-30: сняты «одно предложение» и символьный лимит —
+# критерий промпта: предельно понятный пересказ главной мысли; длина в
+# словах (модели слова считают лучше символов, меньше срезов).
 SYSTEM_PROMPT = (
-    "Ты сжимаешь долговременную память. Резюмируй заметку ОДНИМ "
-    "предложением максимум {max_chars} символов. Сохраняй имена, "
-    "числа, даты и конкретику. Без вступлений, кавычек и пояснений. "
-    "Отвечай на языке заметки."
+    "Сделай краткий пересказ заметки в 1–2 коротких и ёмких "
+    "предложениях, суммарно не длиннее 30 слов. Передай главную мысль "
+    "так, чтобы по этому сокращению было предельно понятно, о чём текст. "
+    "Без вступлений, кавычек и пояснений. Отвечай на языке заметки."
 )
 
 # Объединение дубликатов (Фаза 8, Этап 2.2, решение Олега «вариант B»):
 # дубль не выбрасывается — пара текстов сливается в одну заметку. Тексты
 # приходят в user-сообщении помеченными (ТЕКСТ 1 — ранний, он остаётся;
 # ТЕКСТ 2 — поздний), чтобы модель не перепутала порядок.
+# Редакция О. 2026-08-30: без числового лимита в тексте промпта (модель
+# 35 тыс. символов не отмерит — потолок держит код) и с явным запретом
+# домысливать.
 MERGE_SYSTEM_PROMPT = (
-    "Ты объединяешь две заметки долговременной памяти в одну. Выдай "
-    "единый текст максимум {max_chars} символов: сохрани ВСЕ факты, "
-    "имена, числа и даты из обоих текстов; повторяющееся скажи один "
-    "раз. Без вступлений, заголовков, кавычек и пояснений. Отвечай "
-    "на языке заметок."
+    "У тебя две версии одной заметки. Сведи их в единый текст: объедини "
+    "всю информацию обеих — факты, имена, числа, даты, статусы, конфиги "
+    "и пути; каждый факт скажи один раз, повторяющееся опусти. Ничего "
+    "не выбрасывай и не добавляй от себя. Пиши связно, без заголовков, "
+    "вступлений, кавычек и пояснений. Отвечай на языке заметок."
 )
 MERGE_USER_TEMPLATE = "ТЕКСТ 1:\n{text_a}\n\nТЕКСТ 2:\n{text_b}"
 
@@ -148,10 +158,12 @@ class SummaryService:
         if not text or not text.strip():
             raise ValueError("summarize: пустой текст заметки")
         try:
+            # Обрезка суммари отменена (О. 2026-08-30): max_chars = None —
+            # content уходит в БД как есть, длина контролируется промптом.
             summary = self._chat(
-                SYSTEM_PROMPT.format(max_chars=self._settings.max_summary_chars),
+                SYSTEM_PROMPT,
                 text,
-                max_chars=self._settings.max_summary_chars,
+                max_chars=None,
             )
         except SummaryError:
             self.last_attempt_ok = False  # деградация станет видна в /health
@@ -173,9 +185,10 @@ class SummaryService:
             raise ValueError("merge: пустая заметка недопустима")
         try:
             merged = self._chat(
-                MERGE_SYSTEM_PROMPT.format(max_chars=self._settings.max_note_chars),
+                MERGE_SYSTEM_PROMPT,
                 MERGE_USER_TEMPLATE.format(text_a=text_a, text_b=text_b),
                 max_chars=self._settings.max_note_chars,
+                num_predict=self._settings.merge_num_predict,
             )
         except SummaryError:
             self.last_attempt_ok = False  # деградация станет видна в /health
@@ -189,9 +202,15 @@ class SummaryService:
 
     # --- внутреннее ---------------------------------------------------------
 
-    def _chat(self, system_prompt: str, user_text: str, max_chars: int) -> str:
+    def _chat(
+        self,
+        system_prompt: str,
+        user_text: str,
+        max_chars: int | None = None,
+        num_predict: int | None = None,
+    ) -> str:
         """Один вызов /api/chat + проверки контракта ответа (без ретраев)."""
-        payload = self._payload(system_prompt, user_text)
+        payload = self._payload(system_prompt, user_text, num_predict)
         try:
             # Очередь F1: один запрос к серверу в момент времени (summarize и
             # merge — один клиент и один base_url; судья — тот же сервер).
@@ -204,13 +223,16 @@ class SummaryService:
             ) from exc
         return self._parse(response, max_chars)
 
-    def _payload(self, system_prompt: str, user_text: str) -> dict[str, Any]:
+    def _payload(
+        self, system_prompt: str, user_text: str, num_predict: int | None
+    ) -> dict[str, Any]:
         """Тело вызова /api/chat (ARCH §4.7): режим «Б» — think по флагу.
 
-        system_prompt/user_text — единственные различия summarize/merge
-        (у merge — merge-промпт и два текста в одном user-сообщении);
-        модель, num_predict, temperature и think — общие (одна модель
-        суммаризации обслуживает и выжимку, и слияние дублей).
+        system_prompt/user_text — различия summarize/merge; num_predict —
+        раздельный потолок (решение О. 2026-08-30): выжимка —
+        SUMMARY_NUM_PREDICT, слияние дубов — MERGE_NUM_PREDICT (текст
+        может быть значительно длиннее выжимки). Модель, temperature,
+        keep_alive и think — общие (одна модель обслуживает и то, и то).
         """
         payload: dict[str, Any] = {
             "model": self._settings.summary_model,
@@ -219,7 +241,11 @@ class SummaryService:
                 {"role": "user", "content": user_text},
             ],
             "stream": False,
-            "num_predict": self._settings.summary_num_predict,
+            "num_predict": (
+                num_predict
+                if num_predict is not None
+                else self._settings.summary_num_predict
+            ),
             "temperature": TEMPERATURE,
             "keep_alive": KEEP_ALIVE,
         }
@@ -229,7 +255,12 @@ class SummaryService:
         return payload
 
     def _parse(self, response: httpx.Response, max_chars: int) -> str:
-        """Извлечь message.content; любые нарушения — SummaryError (§5.5)."""
+        """Извлечь message.content; любые нарушения — SummaryError (§5.5).
+
+        max_chars задаётся ТОЛЬКО merge (срез до MAX_NOTE_CHARS — результат
+        станет текстом заметки). Суммари идёт с max_chars=None: символьного
+        среза нет (решение О. 2026-08-30), длина контролируется промптом.
+        """
         if response.status_code != 200:
             body = " ".join(response.text[:_ERROR_BODY_CHARS].split())
             raise SummaryError(f"HTTP {response.status_code} от /api/chat: {body}")
@@ -246,6 +277,8 @@ class SummaryService:
             # (не суммари, а отказ) → fallback + summary_status=pending вверх.
             raise SummaryError("пустой content в ответе суммаризатора")
         # Поле `thinking` отбрасывается в принципе: читаем только content.
-        # Страховка длины — по назначению текста: суммари ≤ MAX_SUMMARY_CHARS
-        # (§4.7), объединённый текст дубликатов — до MAX_NOTE_CHARS.
-        return content.strip()[:max_chars]
+        # Символьная страховка осталась только у merge: её результат —
+        # будущий ТЕКСТ заметки, обязан проходить CHECK(MAX_NOTE_CHARS);
+        # суммари не обрезается вовсе (решение О. 2026-08-30).
+        summary = content.strip()
+        return summary if max_chars is None else summary[:max_chars]

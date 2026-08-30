@@ -21,7 +21,7 @@ from app.services.splitter import count_tokens, encoding, token_windows
 from app.storage import chunks, vectors
 from app.storage.db import init_db, session, transaction
 
-PROD_MAX_NOTE_CHARS = "20000"
+PROD_MAX_NOTE_CHARS = "35000"
 
 DEFS = {"chunk_size": 1024, "chunk_overlap": 180, "chunk_min_target": 200}
 
@@ -63,7 +63,7 @@ def long_note_with_fact() -> str:
 
 @pytest.fixture(autouse=True)
 def _prod_limits(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Боевые MAX_NOTE_CHARS (20000) — многочанковые заметки в тестах."""
+    """Боевые MAX_NOTE_CHARS (35000) — многочанковые заметки в тестах."""
     monkeypatch.setenv("MAX_NOTE_CHARS", PROD_MAX_NOTE_CHARS)
     get_settings.cache_clear()
     yield

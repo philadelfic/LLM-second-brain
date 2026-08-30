@@ -77,7 +77,7 @@ class TestSchemaCreated:
             with pytest.raises(sqlite3.IntegrityError):
                 conn.execute("INSERT INTO notes(text) VALUES ('')")
             with pytest.raises(sqlite3.IntegrityError):
-                conn.execute("INSERT INTO notes(text) VALUES (?)", ("x" * 2001,))
+                conn.execute("INSERT INTO notes(text) VALUES (?)", ("x" * 35001,))
 
     def test_env_limit_substituted_into_check(
         self, monkeypatch: pytest.MonkeyPatch

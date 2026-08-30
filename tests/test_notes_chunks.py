@@ -8,7 +8,7 @@ update, сохранение чанков trash при soft delete, неприк
 чанков при дедуп-отказе. Свечение текстов чанков против сплиттера — в тестах
 размерности/схемы (test_chunks_storage), здесь — доменные правила.
 
-MAX_NOTE_CHARS поднят до боевого значения compose (20000, решение О.
+MAX_NOTE_CHARS поднят до боевого значения compose (35000, решение О.
 2026-08-29) — иначе длинные (>1024 токенов) заметки не влезают в §8-дефолт
 2000 симв.; это же закрепляет production-профиль в тесте.
 """
@@ -29,7 +29,7 @@ from app.services.splitter import count_tokens, encoding, split_text, token_wind
 from app.storage import chunks, vectors
 from app.storage.db import init_db, session
 
-PROD_MAX_NOTE_CHARS = "20000"
+PROD_MAX_NOTE_CHARS = "35000"
 
 # Дефолты brief §4.
 DEFS = {"chunk_size": 1024, "chunk_overlap": 180, "chunk_min_target": 200}
@@ -72,7 +72,7 @@ class CountingHashEmbedder(HashEmbedder):
 
 @pytest.fixture(autouse=True)
 def _prod_note_limit(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """MAX_NOTE_CHARS=20000 (боевой compose): многочанковые заметки влезают."""
+    """MAX_NOTE_CHARS=35000 (боевой compose): многочанковые заметки влезают."""
     monkeypatch.setenv("MAX_NOTE_CHARS", PROD_MAX_NOTE_CHARS)
     get_settings.cache_clear()
     yield

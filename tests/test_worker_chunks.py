@@ -132,7 +132,7 @@ class MidFlightUpdateEmbedder(HashEmbedder):
 def set_env(monkeypatch: pytest.MonkeyPatch, tmp_path, **overrides: str) -> None:
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     monkeypatch.setenv("EMBEDDING_DIM", "8")
-    monkeypatch.setenv("MAX_NOTE_CHARS", "20000")
+    monkeypatch.setenv("MAX_NOTE_CHARS", "35000")
     for key, value in overrides.items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()

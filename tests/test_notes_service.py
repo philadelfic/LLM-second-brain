@@ -95,9 +95,9 @@ class TestSave:
 
     def test_too_long_text_rejected(self, service: NoteService) -> None:
         with pytest.raises(NoteValidationError):
-            service.save(long_text(2001))
+            service.save(long_text(35001))
 
-    @pytest.mark.parametrize("size", [1, 2000])
+    @pytest.mark.parametrize("size", [1, 35000])
     def test_boundary_lengths_ok(self, service: NoteService, size: int) -> None:
         assert service.save(long_text(size))["stored"] is True
 
@@ -293,7 +293,7 @@ class TestUpdate:
         with pytest.raises(NoteValidationError):
             service.update(1, "")
         with pytest.raises(NoteValidationError):
-            service.update(1, long_text(2001))
+            service.update(1, long_text(35001))
 
     def test_update_marks_vector_pending(self, service: NoteService) -> None:
         """Фаза 8: update не кодирует синхронно — pending, без вектора;
