@@ -19,7 +19,7 @@ services:
       # --- обязательные ---
       OLLAMA_BASE_URL: "http://192.168.3.113:11434"        # Ollama векторизации (/api/embed)
       SUMMARY_OLLAMA_BASE_URL: "http://192.168.3.112:11434" # Ollama суммаризации (/api/chat)
-      SUMMARY_MODEL: "ornith-1.5:35b"                       # генеративная модель суммаризации
+      SUMMARY_MODEL: "ornith:35b"                               # генеративная модель суммаризации (смена О. 2026-08-31: ornith-1.5 изредка проронял чужие токены)
       MCP_AUTH_TOKEN: "CHANGE_ME"                  # Bearer-токен всех ручек, кроме /health; боевой — в docker-compose.override.yml (gitignored, решение О. 2026-08-31)
       # --- векторизация: все параметры эмбеддинга ---
       EMBEDDING_MODEL: "qwen3-embedding:8b"  # смена → автоматическая реиндексация БД при старте
