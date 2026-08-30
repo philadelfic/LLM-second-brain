@@ -1,4 +1,4 @@
-"""Интеграционные тесты Фаз 3–4 — живые Ollama (@pytest.mark.integration).
+"""Интеграционные тесты Фаз 3–8 — живые Ollama (@pytest.mark.integration).
 
 Маркер `integration` (pyproject). Сервер векторизации берётся из env
 `LIVE_OLLAMA_URL` (дефолт — рабочий адрес REQUIREMENTS §4,
@@ -7,7 +7,9 @@ qwen3-embedding:8b, dim 4096); суммаризатор — из `LIVE_SUMMARY_U
 падение (ARCH §7). Проверяется: форматы живых векторов, качество на русских
 перефразах, дедуп-порог, догон pending фоновым воркером; суммаризация:
 реальная длина summary, язык, латентность, timeout, погонка фонового воркера
-(режим «Б»).
+(режим «Б»). Фаза 8: save мгновенный — вектора/дедуп догоняет фоновый
+воркер, поэтому перед проверками поиска и кандидатов гоняется
+notes-очередь (`process_pending`).
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import pytest
 from fakes import FailingEmbedder, cosine
 
 from app.config import Settings
+from app.services.dedup import DeduplicationService
 from app.services.embedding import EmbeddingError, EmbeddingService
 from app.services.notes import NoteService
 from app.services.search import SearchService
@@ -98,6 +101,9 @@ def test_hybrid_search_finds_russian_paraphrase(live) -> None:
         f"{unique}продакшен база PostgreSQL переехала на кластер pg15-prod",
     ):
         saved.append(live.notes.save(text)["id"])
+    # Фаза 8: save мгновенный — вектора создаёт фоновый воркер; перед
+    # поиском догоняем notes-очередь, иначе векторной половины гибрида нет.
+    BackgroundWorker(live.settings, live.embedding).process_pending()
     result = live.search.search(
         "команда собирается в июне на выездное мероприятие в Грузии"
     )
@@ -112,28 +118,48 @@ def test_hybrid_search_finds_russian_paraphrase(live) -> None:
 def test_dedup_catches_paraphrase(live) -> None:
     """Почти дословный перефраз ловится порогом 0.92 (REQUIREMENTS FR-4).
 
-    Замена пунктуации (запятая → тире) и регистра не меняет смысл — живая
-    модель должна дать близость ≥ 0.92; перефраз со словом «—» вместо «в»
-    дополнительно проходит по содержанию.
+    Фаза 8: косинус-дедуп фоновый (save ловит только дословные повторы),
+    поэтому проверяем живую близость на входе дедупа: замена «в» на «—»
+    (пунктуация) должна дать косинус-кандидата с cosine ≥ порога 0.92 —
+    такого кандидата судья (или фоллбек Этапа 2.2) сводит в фоне.
     """
     first = live.notes.save("Интеграция-дедуп: ретроспектива продукта в пятницу 14:00 в переговорной Браво")
     second = live.notes.save("Интеграция-дедуп: ретроспектива продукта — в пятницу 14:00 в переговорной Браво")
-    assert second.get("duplicated") is True
-    assert second["id"] == first["id"]
-
-
-def test_worker_catches_pending_queue(live) -> None:
-    """Воркер на живой машине дотягивает pending до ok (партия + вектор)."""
+    # Фаза 8: довекторизация обеих заметок notes-очередью воркера.
+    BackgroundWorker(live.settings, live.embedding).process_pending()
     with session(live.settings) as conn:
+        vector = vectors.get_vector(conn, second["id"])
+    assert vector is not None
+    candidates = DeduplicationService(live.settings).find_candidates(
+        vector, exclude_id=second["id"]
+    )
+    pair = {candidate_id: cosine_value for candidate_id, cosine_value in candidates}
+    assert pair[first["id"]] >= live.settings.dedup_similarity  # вход сведения
+    # NFR-3: без суммаризатора слияния нет — обе заметки целы (trash пуст).
+    with session(live.settings) as conn:
+        for note_id in (first["id"], second["id"]):
+            assert conn.execute(
+                "SELECT deleted_at FROM notes WHERE id = ?", (note_id,)
+            ).fetchone()[0] is None
+
+
+def test_worker_catches_pending_queue(live, tmp_path_factory) -> None:
+    """Воркер на живой машине дотягивает pending до ok (партия + вектор)."""
+    # Свежая БД: Фаза 8 делает save мгновенным, в общей сессионной БД
+    # копятся чужие pending — точность «== 1» держим на чистой базе.
+    db = tmp_path_factory.mktemp("live-worker") / "notes.db"
+    settings = live.settings.model_copy(update={"db_path": str(db)})
+    init_db(settings)
+    with session(settings) as conn:
         conn.execute(
             "INSERT INTO notes (text, author, vector_status, summary_status) "
             "VALUES ('Интеграция: отложенная заметка для живого воркера', "
             "'test', 'pending', 'pending')"
         )
         note_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    worker = BackgroundWorker(live.settings, live.embedding)
+    worker = BackgroundWorker(settings, live.embedding)
     assert worker.process_pending() == 1
-    with session(live.settings) as conn:
+    with session(settings) as conn:
         row = conn.execute(
             "SELECT vector_status FROM notes WHERE id = ?", (note_id,)
         ).fetchone()
@@ -142,7 +168,8 @@ def test_worker_catches_pending_queue(live) -> None:
 
 
 def test_offline_save_then_worker_repairs(live) -> None:
-    """Полный цикл деградации: сервер «вон» → pending + warning → воркер чинит."""
+    """Запись мгновенная (Фаза 8): заметка сразу с vector_status=pending;
+    живой воркер доводит до ok."""
     offline_settings = live.settings.model_copy(
         update={"ollama_base_url": "http://127.0.0.1:1"}
     )
@@ -150,7 +177,7 @@ def test_offline_save_then_worker_repairs(live) -> None:
     saved = notes_broken.save(
         "Деградационная заметка интеграции: сначала pending, потом ok"
     )
-    assert saved["warning"]
+    assert saved["stored"] is True
     with session(live.settings) as conn:
         assert conn.execute(
             "SELECT vector_status FROM notes WHERE id = ?", (saved["id"],)
@@ -294,6 +321,9 @@ def test_live_worker_backfills_summary_mode_b(live_summary, tmp_path_factory) ->
     t0 = time.monotonic()
     saved = notes.save(RU_NOTE)
     assert saved["summary_pending"] is True
+    # Фаза 8: векторизация — отдельная notes-очередь воркера (вектор по
+    # полному тексту, retrieval не ждёт суммари).
+    assert worker.process_pending() == 1
     assert worker.process_summary_pending() == 1
     elapsed = time.monotonic() - t0
     with session(settings) as conn:
