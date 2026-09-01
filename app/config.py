@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     # --- поиск ---
     default_top_k: int = 5
     default_list_limit: int = 20
-    score_threshold: float = 0.35
+    score_threshold: float = 0.50  # калибровка 2026-09-02: 0.35→0.50 (эксперимент на 82 реальных запросах, решение О.)
     dedup_similarity: float = 0.92
     # --- фоновый дедуп (Фаза 8, Этап 2.1): кандидат-предфильтр до сводки ---
     dedup_candidate_top_n: int = 3  # топ-N кандидатов (проверит судья, Этап 3)
