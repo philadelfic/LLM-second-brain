@@ -45,7 +45,7 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "DB_PATH": ("db_path", "/data/notes.db"),
     "DEFAULT_TOP_K": ("default_top_k", 5),
     "DEFAULT_LIST_LIMIT": ("default_list_limit", 20),
-    "SCORE_THRESHOLD": ("score_threshold", 0.35),
+    "SCORE_THRESHOLD": ("score_threshold", 0.50),
     "DEDUP_SIMILARITY": ("dedup_similarity", 0.92),
     # Фаза 8 (Этап 2.1): фоновый дедуп — косинус-кандидаты.
     "DEDUP_CANDIDATE_TOP_N": ("dedup_candidate_top_n", 3),
