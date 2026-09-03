@@ -201,7 +201,11 @@ def _compact_get(result: dict[str, Any]) -> dict[str, Any]:
 def _compact_save(result: dict[str, Any]) -> dict[str, Any]:
     if result.get("duplicated"):
         return {"id": result["id"], "stored": False, "hint": result["hint"]}
-    return _pick(result, ("id", "stored", "summary_pending"))
+    # Фаза 10 (Шаг 5, US-8): hint «похожее есть в <ns>» при записи в узел,
+    # где уже лежит дословный дубль (запись не блокирует — меж-узловые
+    # дубли легитимны). Копируется только если есть — белый список не
+    # растёт для обычного ответа.
+    return _with_hint(_pick(result, ("id", "stored", "summary_pending")), result)
 
 
 def _compact_update(result: dict[str, Any]) -> dict[str, Any]:
@@ -212,12 +216,20 @@ def _compact_delete(result: dict[str, Any]) -> dict[str, Any]:
     return _with_hint(_pick(result, ("id", "deleted")), result)
 
 
-def _compact_namespaces(result: dict[str, Any]) -> dict[str, Any]:
+def _compact_namespaces(result: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[str, Any]:
     out = {
         "namespaces": [_pick(node, _NS_ITEM) for node in result["namespaces"]],
-        # promotion_candidates заполняет триггер домена (Шаг 5); контракт
-        # стабилен с Шага 3 — поле присутствует всегда.
-        "promotion_candidates": [],
+        # Кандидаты на авто-создание узла (триггер Шага 5): растущие группы
+        # default-заметок с общим hint, ещё не прогнанные через судью
+        # структуры. Компактная проекция (domain, subdomain, count).
+        "promotion_candidates": [
+            {
+                "domain": candidate["domain"],
+                "subdomain": candidate["subdomain"],
+                "count": candidate["count"],
+            }
+            for candidate in candidates
+        ],
     }
     return out
 
@@ -435,7 +447,18 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
     async def memory_namespaces() -> dict[str, Any]:
         started = time.perf_counter()
         result = await asyncio.to_thread(services.namespaces.list_all)
-        log_tool_call("memory_namespaces", started, nodes=len(result["namespaces"]))
-        return _compact_namespaces(result)
+        try:
+            candidates = await asyncio.to_thread(services.promotion.candidates)
+        except Exception:
+            # Кандидаты — вспомогательное поле карты: сбой агрегации (БД
+            # ещё не инициализирована и т.п.) не ломает выдачу реестра.
+            candidates = []
+        log_tool_call(
+            "memory_namespaces",
+            started,
+            nodes=len(result["namespaces"]),
+            candidates=len(candidates),
+        )
+        return _compact_namespaces(result, candidates)
 
     return mcp

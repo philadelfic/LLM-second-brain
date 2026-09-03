@@ -178,7 +178,7 @@ class DeduplicationService:
             ns_params = []
         with session(self._settings) as conn:
             exact = conn.execute(
-                "SELECT id, text FROM notes "
+                "SELECT id, text, namespace FROM notes "
                 f"WHERE deleted_at IS NULL AND text = ?{ns_clause} ORDER BY id LIMIT 1",
                 (text, *ns_params),
             ).fetchone()
@@ -193,7 +193,7 @@ class DeduplicationService:
                 for word in dict.fromkeys(words)
             )
             candidates = conn.execute(
-                "SELECT n.id, n.text FROM notes_fts "
+                "SELECT n.id, n.text, n.namespace FROM notes_fts "
                 "JOIN notes n ON n.id = notes_fts.rowid "
                 f"WHERE notes_fts MATCH ? AND n.deleted_at IS NULL"
                 f"{ns_fts_clause} LIMIT ?",

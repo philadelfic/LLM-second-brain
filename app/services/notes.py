@@ -16,7 +16,10 @@ summary всегда fallback-усечение, генерация — фоно�
 Контракты ответов сервис-слоя (полные; REST отдаёт их как есть;
 MCP-слой срезает служебные поля — см. Фаза 9):
 - save (успех)  → {id, stored: True, summary_pending: True} — **без** warning:
-  векторизация теперь всегда фоновая, а не «отложена из-за отказа» (Фаза 8)
+  векторизация теперь всегда фоновая, а не «отложена из-за отказа» (Фаза 8);
+  Фаза 10 (Шаг 5, US-8): +опциональный hint «похожее есть в <ns>», если в
+  другом узле уже лежит дословный дубль (меж-узловые дубли легитимны —
+  запись не блокирует; hint — слой ориентирования, не деградация)
 - save (дубль)  → {duplicated: True, id, text, hint} (не создаётся)
 - get    → {notes: [...]} (массив даже для одного id; отсутствующие/удалённые
            id пропускаются; пустой результат — мягкий ответ с hint)
@@ -122,13 +125,25 @@ class NoteService:
         зарегистрированный; не указан — `default`); незарегистрированный
         узел — NamespaceError (транспорт Шага 3 обернёт в fail + hint).
         Дедуп при save — в пределах этого же неймспейса (меж-узловые
-        дубли легитимны).
+        дубли легитимны): дословный дубль в своём узле блокирует запись
+        (duplicated); дубль в ЧУЖОМ узле запись не блокирует — ответ
+        получает hint «похожее есть в <ns>» (US-8, слой ориентирования).
         """
         self._validate_text(text)
         ns = self._namespaces.validate_placement(namespace)
         duplicate = self._dedup.find_by_text(text, namespace=ns)
         if duplicate is not None:
             return duplicate_response(duplicate)
+        # Дедуп-хинт чужого узла (Фаза 10, US-8): близкий дубль в другом
+        # узле — легитимен (меж-узловые дубли не запрещены, §5.7), запись
+        # НЕ блокирует, но модель обучается ориентированию: hint в ответе.
+        foreign = self._dedup.find_by_text(text, namespace=None)
+        foreign_hint = (
+            f"похожее есть в «{foreign['namespace']}»; запись сюда не "
+            "блокирует — меж-узловые дубли легитимны"
+            if foreign is not None
+            else None
+        )
         # Чанки считаем чистым сплиттером (~миллисекунды, без Ollama) —
         # транзакция остаётся короткой.
         chunks_data = self._chunks_of(text)
@@ -138,7 +153,14 @@ class NoteService:
             )
             self._store_chunks(conn, note_id, chunks_data, None)
         self._notify_summary_pending()
-        return {"id": note_id, "stored": True, "summary_pending": True}
+        result: dict[str, Any] = {
+            "id": note_id,
+            "stored": True,
+            "summary_pending": True,
+        }
+        if foreign_hint is not None:
+            result["hint"] = foreign_hint  # слой ориентирования, не warning
+        return result
 
     def _insert(
         self,
