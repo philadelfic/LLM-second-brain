@@ -63,6 +63,14 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "BACKUP_DIR": ("backup_dir", "/data/backups"),
     "BACKUP_INTERVAL_SEC": ("backup_interval_sec", 86400),
     "BACKUP_KEEP": ("backup_keep", 7),
+    # Фаза 10: иерархические неймспейсы (§5.7).
+    "NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE": ("namespace_auto_move_min_confidence", 0.80),
+    "NAMESPACE_PROMOTION_THRESHOLD": ("namespace_promotion_threshold", 15),
+    "NAMESPACE_PROMOTION_MIN_CONFIDENCE": ("namespace_promotion_min_confidence", 0.60),
+    "NAMESPACE_SYNONYM_SIMILARITY": ("namespace_synonym_similarity", 0.85),
+    "NAMESPACE_AUTO_MAX_PER_DAY": ("namespace_auto_max_per_day", 3),
+    "NAMESPACE_MAX_LEAVES_PER_DOMAIN": ("namespace_max_leaves_per_domain", 12),
+    "NAMESPACE_GROOM_MIN_NOTES": ("namespace_groom_min_notes", 2),
 }
 
 
@@ -88,8 +96,9 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 41 поле: 6 обязательных + 35 с умолчаниями
-        (24 §8 + 6 чанковых Фазы 7 + 2 фонового дедупа + 3 судьи Фазы 8)."""
+        """В Settings — ровно 48 полей: 6 обязательных + 42 с умолчаниями
+        (24 §8 + 6 чанковых Фазы 7 + 2 фонового дедупа + 3 судьи Фазы 8
+        + 7 неймспейсов Фазы 10)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

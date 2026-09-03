@@ -108,6 +108,15 @@ class Settings(BaseSettings):
     backup_interval_sec: int = 86400  # сутки
     backup_keep: int = 7
 
+    # --- неймспейсы (Фаза 10, REQUIREMENTS §5.7/§8) ---
+    namespace_auto_move_min_confidence: float = 0.80  # авто-переезд default-заметки в существующий домен
+    namespace_promotion_threshold: int = 15  # счётчик default-заметок с одним hint → авто-создание листа
+    namespace_promotion_min_confidence: float = 0.60  # минимальный confidence разметки, учитываемый триггером
+    namespace_synonym_similarity: float = 0.85  # антисинонимия: косинус описаний — слияние вместо создания
+    namespace_auto_max_per_day: int = 3  # лимит авто-созданных узлов в сутки (защита от шторма)
+    namespace_max_leaves_per_domain: int = 12  # потолок листов в корне
+    namespace_groom_min_notes: int = 2  # груминг: узел с меньшим числом заметок — кандидат на слияние
+
     @field_validator(
         "ollama_base_url",
         "summary_ollama_base_url",
@@ -226,6 +235,29 @@ class Settings(BaseSettings):
             errors.append("  - backup_dir: путь не может быть пустым")
         if not self.db_path.strip():
             errors.append("  - db_path: путь не может быть пустым")
+
+        # --- неймспейсы (Фаза 10) ---
+        need_range(
+            "namespace_auto_move_min_confidence",
+            self.namespace_auto_move_min_confidence,
+            0.0,
+            1.0,
+        )
+        need_range(
+            "namespace_promotion_min_confidence",
+            self.namespace_promotion_min_confidence,
+            0.0,
+            1.0,
+        )
+        need_range(
+            "namespace_synonym_similarity", self.namespace_synonym_similarity, 0.0, 1.0
+        )
+        need_low("namespace_promotion_threshold", self.namespace_promotion_threshold, 1)
+        need_low("namespace_auto_max_per_day", self.namespace_auto_max_per_day, 1)
+        need_low(
+            "namespace_max_leaves_per_domain", self.namespace_max_leaves_per_domain, 1
+        )
+        need_low("namespace_groom_min_notes", self.namespace_groom_min_notes, 0)
 
         # --- прочее ---
         if not self.author_default.strip():
