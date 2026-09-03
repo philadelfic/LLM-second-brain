@@ -593,6 +593,22 @@ class TestNamespaceMCP:
         assert got["notes"][0]["namespace"] == "work"
 
     @pytest.mark.asyncio
+    async def test_save_foreign_duplicate_gives_hint(self, ns_url: str, ns_db: str) -> None:
+        """Дословный дубль в чужом узле: запись не блокирует, hint (US-8)."""
+        _register_namespace(ns_db, "work", "Рабочие заметки. Подпроекты — в листьях.")
+        text = f"{self.marker}: дубль между узлами"
+        async with connect(ns_url) as session:
+            first = (await session.call_tool(
+                "memory_save", {"text": text, "namespace": "work"}
+            )).structured_content
+            assert first["stored"] is True
+            second = (await session.call_tool(
+                "memory_save", {"text": text}
+            )).structured_content
+        assert second["stored"] is True
+        assert "work" in second["hint"]
+
+    @pytest.mark.asyncio
     async def test_memory_namespaces_registry(self, ns_url: str, ns_db: str) -> None:
         """memory_namespaces: компактный контракт (§5.7) + promotion_candidates."""
         _register_namespace(ns_db, "work", "Рабочие заметки. Подпроекты — в листьях.")
@@ -607,8 +623,29 @@ class TestNamespaceMCP:
         }
         assert nsmap["work"]["status"] == "confirmed"
         assert nsmap["work"]["description"] == "Рабочие заметки. Подпроекты — в листьях."
-        # promotion_candidates готовит триггер (Шаг 5); контракт стабилен.
-        assert registry["promotion_candidates"] == []
+        # promotion_candidates: растущие группы default-заметок с общим hint
+        # (Шаг 5): агрегация по живой БД, ещё не прогнанные через судью.
+        _seed_default_group(ns_db, "work", "subo", 15)
+        async with connect(ns_url) as session:
+            registry = (await session.call_tool("memory_namespaces", {})).structured_content
+        assert registry["promotion_candidates"] == [
+            {"domain": "work", "subdomain": "subo", "count": 15}
+        ]
+
+
+def _seed_default_group(
+    db_path: str, domain: str, slug: str, count: int
+) -> None:
+    """default-заметки с готовой разметкой (вход триггера — SQL-агрегация)."""
+    with sqlite3.connect(db_path) as conn:
+        for i in range(count):
+            conn.execute(
+                "INSERT INTO notes (text, summary, summary_status, namespace, "
+                "domain_hint, subdomain_hint, confidence, classified_at) "
+                "VALUES (?, ?, 'ok', 'default', ?, ?, 0.7, ?)",
+                (f"mcp seed {i} про {slug}", f"суммари {i}", domain, slug,
+                 "2026-09-03T00:00:00Z"),
+            )
 
 
 class TestInstructionsBudget:

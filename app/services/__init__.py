@@ -23,6 +23,7 @@ from app.services.embedding import EmbeddingService
 from app.services.judge import JudgeService
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
+from app.services.promotion import DescriptionService, PromotionService, StructureJudgeService
 from app.services.search import SearchService
 from app.services.summary import SummaryService
 
@@ -34,6 +35,7 @@ __all__ = [
     "JudgeService",
     "NamespaceService",
     "NoteService",
+    "PromotionService",
     "SearchService",
     "Services",
     "SummaryService",
@@ -54,6 +56,7 @@ class Services:
     backup: BackupService  # петля снапшотов — asyncio-таска в lifespan
     namespaces: NamespaceService  # реестр узлов (Фаза 10, memory_namespaces)
     classifier: ClassificationService  # причёска default-заметок (Фаза 10, Шаг 4)
+    promotion: PromotionService  # триггер домена (Фаза 10, Шаг 5, memory_namespaces + воркер)
 
 
 def build_services(
@@ -70,6 +73,14 @@ def build_services(
     """
     embedding = EmbeddingService(settings)
     dedup = DeduplicationService(settings)
+    namespaces = NamespaceService(settings)
+    promotion = PromotionService(
+        settings,
+        embedding=embedding,
+        describer=DescriptionService(settings),
+        judge=StructureJudgeService(settings),
+        namespaces=namespaces,
+    )
     return Services(
         notes=NoteService(settings, embedding, dedup),
         search=SearchService(settings, embedding),
@@ -78,6 +89,7 @@ def build_services(
         summary=summary if summary is not None else SummaryService(settings),
         dedup_judge=judge if judge is not None else JudgeService(settings),
         backup=BackupService(settings),
-        namespaces=NamespaceService(settings),
+        namespaces=namespaces,
         classifier=ClassificationService(settings),
+        promotion=promotion,
     )

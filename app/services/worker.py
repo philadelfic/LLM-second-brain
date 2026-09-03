@@ -79,6 +79,7 @@ from app.services.embedding import Embedder, EmbeddingError
 from app.services.judge import Judge, JudgeError
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
+from app.services.promotion import PromotionService
 from app.services.summary import Summarizer, SummaryError
 from app.storage import chunks, vectors
 from app.storage.db import session, transaction
@@ -107,6 +108,7 @@ class BackgroundWorker:
         dedup: DeduplicationService | None = None,
         judge: Judge | None = None,
         classifier: Classifier | None = None,
+        promoter: PromotionService | None = None,
     ) -> None:
         self._settings = settings
         self._embedding = embedding
@@ -134,6 +136,10 @@ class BackgroundWorker:
         # Реестр неймспейсов: известные узлы для классификатора и проверка
         # целевого узла авто-переезда.
         self._namespaces = NamespaceService(settings)
+        # Триггер домена (Фаза 10, Шаг 5): авто-создание листов из hint-групп
+        # после классификации; None — тестовый режим без триггера (в проде
+        # DI из build_services: describer + судья структуры).
+        self._promoter = promoter
         self._vector_interval = float(max(settings.pending_retry_sec, 0))
         self._summary_interval = float(max(settings.pending_retry_sec, 0))
         self._chunk_interval = float(max(settings.pending_retry_sec, 0))
@@ -607,6 +613,39 @@ class BackgroundWorker:
                     "namespace": target,
                     "confidence": result.confidence,
                 },
+            )
+        # Триггер домена (Фаза 10, Шаг 5): разметка могла докинуть hint-группу
+        # до порога — прогоняем конвейер промоции (авто-создание/слияние).
+        self._run_promotion()
+
+    def _run_promotion(self) -> None:
+        """Триггер домена (Шаг 5) после классификации default-заметки.
+
+        Сбои триггера не роняют воркер: это этап обогащения, а не конвейера
+        данных — суммаризация/векторизация важнее структурной автоматики.
+        Ожидаемые отказы describer/судьи обрабатываются внутри
+        PromotionService (кандидат остаётся без вердикта, NFR-3); здесь
+        ловится ВСЁ остальное (включая баги) — warning с traceback в логи,
+        петли очередей живут. Повтор — следующая классификация default-
+        заметки: группы не теряются, просто дотягивают до порога позже.
+        """
+        if self._promoter is None:
+            return  # тестовый режим без триггера
+        try:
+            report = self._promoter.run()
+        except Exception:
+            logging.getLogger("app").warning(
+                "promotion: run failed — trigger deferred to next classification",
+                extra={"event": "promotion_failed", "reason": "run"},
+                exc_info=True,
+            )
+            return
+        if any(report.values()):
+            # Сводка — одним ключом: 'created' конфликтует с атрибутом
+            # LogRecord (время создания) — extra его не принимает.
+            logging.getLogger("app").info(
+                "promotion: trigger run finished",
+                extra={"event": "promotion_run", "report": report},
             )
 
     def _auto_move_target(self, result) -> str | None:

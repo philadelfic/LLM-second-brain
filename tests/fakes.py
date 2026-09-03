@@ -48,6 +48,11 @@ import math
 from app.services.classifier import Classification, ClassificationError
 from app.services.embedding import EmbeddingError
 from app.services.judge import JudgeError
+from app.services.promotion import (
+    DescriberError,
+    StructureJudgeError,
+    Verdict,
+)
 from app.services.summary import SummaryError
 from app.services.worker import BackgroundWorker
 
@@ -280,6 +285,86 @@ class FixedClassifier:
         return self.result
 
     def close(self) -> None:  # интерфейс-совместимость с ClassificationService
+        return None
+
+
+class FixedDescriber:
+    """Фейк-генератор описаний узлов (Фаза 10, Шаг 5).
+
+    Интерфейс Describer (`describe`/`close`): возвращает заранее заданный
+    `description` (или отказ DescriberError при `fail=True` — деградация
+    триггера). Журнал `calls` — пары (summaries, slug, domain): тесты
+    проверяют, что описание строится по суммари группы.
+    """
+
+    def __init__(
+        self,
+        description: str = "Заметки по теме группы.",
+        fail: bool = False,
+    ) -> None:
+        self.description = description
+        self.fail = fail
+        self.calls: list[tuple[list[str], str, str]] = []
+        self.last_attempt_ok: bool | None = None
+
+    def describe(self, summaries: list[str], slug: str, domain: str) -> str:
+        self.calls.append((list(summaries), slug, domain))
+        if self.fail:
+            self.last_attempt_ok = False
+            raise DescriberError("генератор описаний недоступен")
+        self.last_attempt_ok = True
+        return self.description
+
+    def close(self) -> None:  # интерфейс-совместимость с DescriptionService
+        return None
+
+
+class ScriptedStructureJudge:
+    """Фейк-судья структуры (Фаза 10, Шаг 5): скриптованные вердикты.
+
+    `review()` вычерпывает `verdicts` по порядку (объекты Verdict);
+    исчерпанная очередь замещается `default`. `fail=True` —
+    StructureJudgeError при каждом вызове (деградация гейта: кандидат
+    остаётся без вердикта, повтор при следующем прогоне, NFR-3). Журнал
+    `review_calls` — аргументы вызова в порядке опроса: тесты проверяют,
+    что судьёй спрашивают именно готовых кандидатов с известными узлами.
+    """
+
+    def __init__(
+        self,
+        verdicts: list[Verdict] | None = None,
+        default: Verdict | None = None,
+        fail: bool = False,
+    ) -> None:
+        self.verdicts = list(verdicts or [])
+        self.default = default
+        self.fail = fail
+        self.review_calls: list[tuple[str, str, str, list, object, object]] = []
+        self.last_attempt_ok: bool | None = None
+
+    def review(
+        self,
+        description: str,
+        slug: str,
+        domain: str,
+        existing: list,
+        nearest_path: str | None,
+        nearest_cosine: float | None,
+    ) -> Verdict:
+        self.review_calls.append(
+            (description, slug, domain, list(existing), nearest_path, nearest_cosine)
+        )
+        if self.fail:
+            self.last_attempt_ok = False
+            raise StructureJudgeError("судья структуры недоступен")
+        self.last_attempt_ok = True
+        if self.verdicts:
+            return self.verdicts.pop(0)
+        if self.default is None:
+            raise StructureJudgeError("вердикт не скриптован")
+        return self.default
+
+    def close(self) -> None:  # интерфейс-совместимость с StructureJudgeService
         return None
 
 

@@ -112,6 +112,24 @@ CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
 )
 """
 
+# Вердикты судьи структуры (Фаза 10, Шаг 5): cooldown триггера. Группа
+# hint'ов, по которой судья вынес вердикт (слияние/отклонение), не
+# дёргает LLM повторно — иначе отклонённый кандидат зациклил бы вызовы
+# судьи при каждом прогоне (заметки с отклонённым hint'ом остаются в
+# default навсегда — честно-общие). Слияние хранит канонический узел;
+# сброс вердикта — оператор (REST, Шаг 6). Созданный узел записей не
+# требует: группа уходит из default ретро-перекладкой.
+_PROMOTIONS_DDL = """
+CREATE TABLE IF NOT EXISTS promotions (
+  domain         TEXT NOT NULL,
+  subdomain      TEXT NOT NULL,
+  status         TEXT NOT NULL CHECK(status IN ('merged', 'rejected')),
+  canonical_path TEXT NULL,
+  decided_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  PRIMARY KEY (domain, subdomain)
+)
+"""
+
 # Вектора (Фаза 3): физическая схема в `app.storage.vectors` (размерность и
 # cosine-метрика — там же); в init_db — создание/сверка при старте. Модель
 # эмбеддинга, на которой построен индекс, — в таблице meta (см. ниже):
@@ -274,6 +292,7 @@ def init_db(settings: Settings) -> None:
             conn.execute(_NAMESPACES_DDL)
             conn.execute(_INDEX_NAMESPACE_DDL)
             _ensure_default_namespace(conn)
+            conn.execute(_PROMOTIONS_DDL)
             # Партиция namespace (Фаза 10): vec-таблицы живых БД без `+ns`
             # пересоздаются с партицией, все заметки — в pending. ДО сверки
             # модели/чанков: обе ветки создают таблицы уже с партицией.
