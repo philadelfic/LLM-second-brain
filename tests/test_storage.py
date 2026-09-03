@@ -31,7 +31,8 @@ def _match(conn: sqlite3.Connection, needle: str) -> list[int]:
 
 class TestSchemaCreated:
     def test_notes_columns(self) -> None:
-        """Таблица notes — ровно 9 колонок из ARCHITECTURE §3.3."""
+        """Таблица notes — 11 колонок из ARCHITECTURE §3.3 (+Фаза 10 §5.7):
+        9 базовых + namespace/classified_at."""
         init_db(get_settings())
         with session(get_settings()) as conn:
             columns = {
@@ -40,6 +41,7 @@ class TestSchemaCreated:
         assert set(columns) == {
             "id", "text", "summary", "author", "vector_status",
             "summary_status", "created_at", "updated_at", "deleted_at",
+            "namespace", "classified_at",
         }
         # DDL-умолчания: summary пуст, статусы pending, author unknown.
         assert columns["summary"]["dflt_value"] == "''"
@@ -47,6 +49,8 @@ class TestSchemaCreated:
         assert columns["summary_status"]["dflt_value"] == "'pending'"
         assert columns["author"]["dflt_value"] == "'unknown'"
         assert columns["deleted_at"]["notnull"] == 0  # NULL = активна
+        assert columns["namespace"]["dflt_value"] == "'default'"  # Фаза 10
+        assert columns["classified_at"]["notnull"] == 0  # Фаза 10: NULL = не классифицирована
 
     def test_fts_external_content_trigram(self) -> None:
         """notes_fts — FTS5 внешний контент с trigram-токенизатором."""

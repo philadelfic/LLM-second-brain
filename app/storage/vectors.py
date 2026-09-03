@@ -21,10 +21,15 @@ from __future__ import annotations
 import re
 import sqlite3
 import struct
+from collections.abc import Sequence
 
 # В sqlite_master хранится исходный текст CREATE VIRTUAL TABLE — размерность
 # вынимаем оттуда (шедоу-таблицы vec0 считаются приватными деталями версии).
 _VEC_DIM_RE = re.compile(r"float\[(\d+)\]")
+
+# Партиция namespace (Фаза 10): колонка `+ns` в DDL — partition key sqlite-vec
+# 0.1.6: KNN с фильтром сканирует только свою партицию.
+_PARTITION_RE = re.compile(r"\+\s*ns\s+TEXT")
 
 VEC_TABLE = "notes_vec"
 
@@ -47,13 +52,28 @@ def existing_vec_dim(conn: sqlite3.Connection) -> int | None:
 
 
 def create_vec_table(conn: sqlite3.Connection, dim: int) -> None:
-    """Создать notes_vec с фиксированной размерностью (вызов один раз на БД)."""
+    """Создать notes_vec с фиксированной размерностью (вызов один раз на БД).
+
+    Фаза 10: колонка `+ns` — partition key по неймспейсу заметки (sqlite-vec
+    0.1.6): KNN с фильтром `+ns IN (...)` сканирует только партиции поддерева.
+    """
     conn.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS notes_vec USING vec0("
         "  note_id    INTEGER PRIMARY KEY,"
+        "  +ns        TEXT,"
         f"  embedding  float[{dim}] distance_metric=cosine"
         ")"
     )
+
+
+def has_partition(conn: sqlite3.Connection) -> bool:
+    """Есть ли партиция `+ns` в notes_vec (миграция Фазы 10); нет таблицы — False."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='notes_vec'"
+    ).fetchone()
+    if row is None:
+        return False
+    return _PARTITION_RE.search(row[0] or "") is not None
 
 
 def ensure_vec_table(conn: sqlite3.Connection, dim: int) -> None:
@@ -92,18 +112,25 @@ def unpack(blob: bytes) -> list[float]:
 # --- операции -----------------------------------------------------------
 
 
-def upsert(conn: sqlite3.Connection, note_id: int, vector: list[float]) -> None:
+def upsert(
+    conn: sqlite3.Connection,
+    note_id: int,
+    vector: list[float],
+    ns: str = "default",
+) -> None:
     """Записать/перезаписать вектор заметки (save/update/re-векторизация).
 
     DELETE + INSERT, а не INSERT OR REPLACE: vec0-виртуальная таблица
     не гарантирует поддержку REPLACE/ON CONFLICT — DELETE+INSERT идёт через
     публичный протокол xUpdate и устойчив к версии расширения. Ошибка
     размерности доходит наверх как sqlite3.Error (мешок session()).
+    Фаза 10: `ns` — партиция неймспейса заметки (дефолт — обратная
+    совместимость: тесты и legacy-пути пишут в default).
     """
     drop(conn, note_id)
     conn.execute(
-        "INSERT INTO notes_vec(note_id, embedding) VALUES (?, ?)",
-        (note_id, pack(vector)),
+        "INSERT INTO notes_vec(note_id, ns, embedding) VALUES (?, ?, ?)",
+        (note_id, ns, pack(vector)),
     )
 
 
@@ -126,19 +153,33 @@ def get_vector(conn: sqlite3.Connection, note_id: int) -> list[float] | None:
 
 
 def knn(
-    conn: sqlite3.Connection, query_vector: list[float], k: int
+    conn: sqlite3.Connection,
+    query_vector: list[float],
+    k: int,
+    ns_filter: Sequence[str] | None = None,
 ) -> list[tuple[int, float]]:
     """Топ-k заметок по косинусной близости к запросу (KNN brute-force vec0).
 
     Часть soft-deleted заметок (trash) вектора сохраняют (ARCH §3.3) —
     фильтрация удалённых — выше vec0, в SearchService (постовое отсечение).
+    Фаза 10: `ns_filter` — список путей узлов поддерева (KNN сканирует только
+    их партиции); None/пустой — глобальный поиск по всей таблице.
     Возвращает [(note_id, cosine)], по убыванию близости, cosine = 1 - distance.
     """
-    cursor = conn.execute(
-        "SELECT note_id, distance FROM notes_vec "
-        "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
-        (pack(query_vector), k),
-    )
+    if ns_filter:
+        placeholders = ",".join("?" * len(ns_filter))
+        cursor = conn.execute(
+            "SELECT note_id, distance FROM notes_vec "
+            f"WHERE +ns IN ({placeholders}) "
+            "AND embedding MATCH ? AND k = ? ORDER BY distance",
+            (*ns_filter, pack(query_vector), k),
+        )
+    else:
+        cursor = conn.execute(
+            "SELECT note_id, distance FROM notes_vec "
+            "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+            (pack(query_vector), k),
+        )
     return [(row[0], 1.0 - row[1]) for row in cursor]
 
 

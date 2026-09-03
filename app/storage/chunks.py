@@ -39,6 +39,9 @@ CHUNKS_VEC_TABLE = "notes_chunks_vec"
 # вынимаем оттуда (симметрично app.storage.vectors).
 _VEC_DIM_RE = re.compile(r"float\[(\d+)\]")
 
+# Партиция namespace (Фаза 10): колонка `+ns` — partition key sqlite-vec 0.1.6.
+_PARTITION_RE = re.compile(r"\+\s*ns\s+TEXT")
+
 
 class ChunkError(RuntimeError):
     """Ошибка чанкового слоя: схема сбита или вектор неподходящей размерности."""
@@ -64,13 +67,29 @@ def create_table(conn) -> None:
 
 
 def create_vec_table(conn, dim: int) -> None:
-    """Создать notes_chunks_vec с фиксированной размерностью (как notes_vec)."""
+    """Создать notes_chunks_vec с фиксированной размерностью (как notes_vec).
+
+    Фаза 10: колонка `+ns` — partition key по неймспейсу заметки-владельца:
+    KNN с фильтром поддерева сканирует только партиции поддерева. Значение
+    ns при вставке берётся из notes.namespace заметки-владельца (воркер).
+    """
     conn.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS notes_chunks_vec USING vec0("
         "  chunk_id   INTEGER PRIMARY KEY,"
+        "  +ns        TEXT,"
         f"  embedding  float[{dim}] distance_metric=cosine"
         ")"
     )
+
+
+def has_partition(conn) -> bool:
+    """Есть ли партиция `+ns` в notes_chunks_vec (миграция Фазы 10); нет таблицы — False."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='notes_chunks_vec'"
+    ).fetchone()
+    if row is None:
+        return False
+    return _PARTITION_RE.search(row[0] or "") is not None
 
 
 def existing_vec_dim(conn) -> int | None:
@@ -175,15 +194,17 @@ def pending_chunks(conn, limit: int) -> list[tuple[int, str]]:
 
 
 def pending_chunk_rows(conn, limit: int) -> list:
-    """Вычитка партии pending для воркера (шаг 5): id, text, tokens, note_id.
+    """Вычитка партии pending для воркера (шаг 5): id, text, tokens, note_id, ns.
 
     Расширенный вариант `pending_chunks` (тот же анти-джойн и порядок, ещё
-    две колонки): воркеру нужны note_id — для reuse единичного чанка сверяется
-    с заметкой — и text/tokens — защита записи от гонки с update (ARCH §4.5).
+    три колонки): воркеру нужны note_id — для reuse единичного чанка сверяется
+    с заметкой; text/tokens — защита записи от гонки с update (ARCH §4.5);
+    Фаза 10: ns — партиция неймспейса заметки-владельца для записи вектора.
     Прочим потребителям (скрипты, тесты шага 4) хватает (id, text).
     """
     return conn.execute(
-        f"SELECT c.id, c.text, c.tokens, c.note_id FROM {CHUNKS_TABLE} c "
+        f"SELECT c.id, c.text, c.tokens, c.note_id, n.namespace FROM {CHUNKS_TABLE} c "
+        "JOIN notes n ON n.id = c.note_id "
         f"LEFT JOIN {CHUNKS_VEC_TABLE} v ON v.chunk_id = c.id "
         "WHERE v.chunk_id IS NULL ORDER BY c.id LIMIT ?",
         (limit,),
@@ -204,17 +225,21 @@ def count_pending(conn) -> int:
 # --- вектора notes_chunks_vec ----------------------------------------------
 
 
-def upsert_vector(conn, chunk_id: int, vector: list[float]) -> None:
-    """Записать/перезаписать вектор чанка (DELETE+INSERT — как в vectors)."""
+def upsert_vector(conn, chunk_id: int, vector: list[float], ns: str = "default") -> None:
+    """Записать/перезаписать вектор чанка (DELETE+INSERT — как в vectors).
+
+    Фаза 10: `ns` — партиция неймспейса заметки-владельца (дефолт — обратная
+    совместимость: тесты и legacy-пути пишут в default).
+    """
     conn.execute(f"DELETE FROM {CHUNKS_VEC_TABLE} WHERE chunk_id = ?", (chunk_id,))
     conn.execute(
-        f"INSERT INTO {CHUNKS_VEC_TABLE} (chunk_id, embedding) VALUES (?, ?)",
-        (chunk_id, pack(vector)),
+        f"INSERT INTO {CHUNKS_VEC_TABLE} (chunk_id, ns, embedding) VALUES (?, ?, ?)",
+        (chunk_id, ns, pack(vector)),
     )
 
 
 def upsert_vector_if_exists(
-    conn, chunk_id: int, vector: list[float], text: str, tokens: int
+    conn, chunk_id: int, vector: list[float], text: str, tokens: int, ns: str = "default"
 ) -> bool:
     """Записать вектор чанка, только если чанк не менялся с момента вычитки.
 
@@ -224,13 +249,14 @@ def upsert_vector_if_exists(
     старого текста нельзя писать на новый чанк. Проверка (id, text, tokens);
     False — чанка уже нет/заменён: вектор не записан (не рождается сирота),
     актуальные чанки догонятся следующей партией очереди.
+    Фаза 10: `ns` — партиция неймспейса заметки-владельца.
     """
     conn.execute(f"DELETE FROM {CHUNKS_VEC_TABLE} WHERE chunk_id = ?", (chunk_id,))
     cursor = conn.execute(
-        f"INSERT INTO {CHUNKS_VEC_TABLE} (chunk_id, embedding) "
-        f"SELECT ?, ? WHERE EXISTS (SELECT 1 FROM {CHUNKS_TABLE} "
+        f"INSERT INTO {CHUNKS_VEC_TABLE} (chunk_id, ns, embedding) "
+        f"SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM {CHUNKS_TABLE} "
         "WHERE id = ? AND text = ? AND tokens = ?)",
-        (chunk_id, pack(vector), chunk_id, text, tokens),
+        (chunk_id, ns, pack(vector), chunk_id, text, tokens),
     )
     return cursor.rowcount > 0
 
@@ -253,16 +279,32 @@ def count_vectors(conn) -> int:
     return int(conn.execute(f"SELECT COUNT(*) FROM {CHUNKS_VEC_TABLE}").fetchone()[0])
 
 
-def knn(conn, query_vector: list[float], k: int) -> list[tuple[int, float]]:
+def knn(
+    conn,
+    query_vector: list[float],
+    k: int,
+    ns_filter: Sequence[str] | None = None,
+) -> list[tuple[int, float]]:
     """Топ-k чанков по косинусной близости (KNN brute-force vec0).
 
     Возвращает [(chunk_id, cosine)]. Фильтрация по активности заметки,
     агрегация до заметок и пороги — выше vec0, в SearchService (шаг 4):
-    vec0-таблица ничего не знает о notes (в т.ч. о trash).
+    vec0-таблица ничего не знает о notes (в т.ч. о trash). Фаза 10:
+    `ns_filter` — список путей узлов поддерева (KNN сканирует только их
+    партиции); None/пустой — глобальный поиск.
     """
-    cursor = conn.execute(
-        f"SELECT chunk_id, distance FROM {CHUNKS_VEC_TABLE} "
-        "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
-        (pack(query_vector), k),
-    )
+    if ns_filter:
+        placeholders = ",".join("?" * len(ns_filter))
+        cursor = conn.execute(
+            f"SELECT chunk_id, distance FROM {CHUNKS_VEC_TABLE} "
+            f"WHERE +ns IN ({placeholders}) "
+            "AND embedding MATCH ? AND k = ? ORDER BY distance",
+            (*ns_filter, pack(query_vector), k),
+        )
+    else:
+        cursor = conn.execute(
+            f"SELECT chunk_id, distance FROM {CHUNKS_VEC_TABLE} "
+            "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+            (pack(query_vector), k),
+        )
     return [(int(row[0]), 1.0 - row[1]) for row in cursor]

@@ -232,7 +232,7 @@ class BackgroundWorker:
         """
         with session(self._settings) as conn:
             rows = conn.execute(
-                "SELECT id, text FROM notes "
+                "SELECT id, text, namespace FROM notes "
                 "WHERE vector_status = 'pending' AND deleted_at IS NULL "
                 "ORDER BY id LIMIT ?",
                 (limit,),
@@ -246,7 +246,8 @@ class BackgroundWorker:
         processed = len(rows)
         for row, vector in zip(rows, embeddings):
             with session(self._settings) as conn, transaction(conn):
-                vectors.upsert(conn, row["id"], vector)
+                # Фаза 10: вектор пишется в партицию неймспейса заметки.
+                vectors.upsert(conn, row["id"], vector, row["namespace"])
                 conn.execute(
                     "UPDATE notes SET vector_status = 'ok' WHERE id = ?",
                     (row["id"],),
@@ -611,6 +612,7 @@ class BackgroundWorker:
                         full,
                         note_rows[0]["text"],
                         note_rows[0]["tokens"],
+                        ns=note_rows[0]["namespace"],
                     ):
                         reused.add(note_rows[0]["id"])
         return reused
@@ -643,7 +645,12 @@ class BackgroundWorker:
             with session(self._settings) as conn, transaction(conn):
                 for row, vector in zip(batch, result):
                     if chunks.upsert_vector_if_exists(
-                        conn, row["id"], vector, row["text"], row["tokens"]
+                        conn,
+                        row["id"],
+                        vector,
+                        row["text"],
+                        row["tokens"],
+                        ns=row["namespace"],
                     ):
                         written += 1
         return written

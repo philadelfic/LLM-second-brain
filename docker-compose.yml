@@ -67,6 +67,14 @@ services:
       BACKUP_DIR: "/data/backups"
       BACKUP_INTERVAL_SEC: "86400"
       BACKUP_KEEP: "7"
+      # --- неймспейсы (Фаза 10, §5.7) ---
+      NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE: "0.80"  # авто-переезд default-заметки в существующий домен при причёске
+      NAMESPACE_PROMOTION_THRESHOLD: "15"         # счётчик default-заметок с одним subdomain_hint → авто-создание листа (судья структуры)
+      NAMESPACE_PROMOTION_MIN_CONFIDENCE: "0.60"  # минимальный confidence разметки, учитываемый триггером
+      NAMESPACE_SYNONYM_SIMILARITY: "0.85"        # антисинонимия: косинус описаний — слияние вместо создания
+      NAMESPACE_AUTO_MAX_PER_DAY: "3"             # лимит авто-созданных узлов в сутки (защита от шторма)
+      NAMESPACE_MAX_LEAVES_PER_DOMAIN: "12"       # потолок листов в корне
+      NAMESPACE_GROOM_MIN_NOTES: "2"              # груминг: узел с меньшим числом заметок — кандидат на слияние
     volumes:
       - ./data:/data  # SQLite notes.db, снапшоты
     healthcheck:
