@@ -8,6 +8,7 @@ MCP_PATH. Сервер поднимается в subprocess на отдельн�
 from __future__ import annotations
 
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,7 @@ from tests.conftest import TEST_ENV
 TOKEN = TEST_ENV["MCP_AUTH_TOKEN"]
 SERVER_PORT = 18765
 CUSTOM_PORT = 18766
+NS_PORT = 18767
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -90,6 +92,28 @@ def custom_path_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     yield from _start_server(CUSTOM_PORT, {"MCP_PATH": "/memory", "DB_PATH": str(db)})
 
 
+@pytest.fixture(scope="session")
+def ns_db(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Отдельная БД для namespace-тестов (изоляция от общей памяти)."""
+    return str(tmp_path_factory.mktemp("mcp-ns") / "notes.db")
+
+
+@pytest.fixture(scope="session")
+def ns_url(ns_db: str) -> Iterator[str]:
+    """Сервер с дефолтным MCP_PATH=/mcp и своей (namespace-изолированной) БД."""
+    yield from _start_server(NS_PORT, {"DB_PATH": ns_db})
+
+
+def _register_namespace(db_path: str, path: str, description: str) -> None:
+    """Зарегистрировать узел прямо в БД namespace-сервера (операторская ручка
+    REST появится в Шаге 6; для MCP-теста реестр наполняем напрямую)."""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO namespaces (path, description) VALUES (?, ?)",
+            (path, description),
+        )
+
+
 @asynccontextmanager
 async def connect(base_url: str, path: str = "/mcp", token: str | None = TOKEN) -> AsyncIterator[ClientSession]:
     """Подключиться к MCP-эндпоинту и выполнить initialize."""
@@ -113,7 +137,11 @@ class TestHandshake:
         ) as streams, ClientSession(*streams) as session:
             result = await session.initialize()
         assert result.server_info.name == SERVER_NAME
-        assert result.instructions == SERVER_INSTRUCTIONS
+        # Фаза 10: инструкции = база + правило неймспейсов + карта реестра
+        # (§5.7, слой 1 ориентирования). База — префикс; карта зависит от
+        # реестра на момент сборки.
+        assert result.instructions.startswith(SERVER_INSTRUCTIONS)
+        assert "Карта узлов (path: description)" in result.instructions
         assert result.protocol_version  # версия согласована при handshake
 
     @pytest.mark.asyncio
@@ -126,9 +154,10 @@ class TestHandshake:
 
 class TestToolsList:
     @pytest.mark.asyncio
-    async def test_exactly_six_memory_tools(self, server_url: str) -> None:
+    async def test_exactly_seven_memory_tools(self, server_url: str) -> None:
         async with connect(server_url) as session:
             tools = await session.list_tools()
+        assert len(tools.tools) == 7
         assert {tool.name for tool in tools.tools} == TOOL_NAMES
 
     @pytest.mark.asyncio
@@ -187,6 +216,23 @@ class TestToolsList:
         assert save_text["maxLength"] == 35000
         assert tools["memory_save"].input_schema["required"] == ["text"]
         assert tools["memory_update"].input_schema["required"] == ["id", "text"]
+
+    @pytest.mark.asyncio
+    async def test_namespace_params_in_schemas(self, server_url: str) -> None:
+        """§5.7: namespace в save/update (save default), search/list +
+        namespace_exact; delete без namespace (по id)."""
+        async with connect(server_url) as session:
+            tools = {t.name: t for t in (await session.list_tools()).tools}
+        assert tools["memory_save"].input_schema["properties"]["namespace"]["default"] == "default"
+        assert tools["memory_update"].input_schema["properties"]["namespace"]["default"] is None
+        srch = tools["memory_search"].input_schema["properties"]
+        assert srch["namespace"]["default"] is None
+        assert srch["namespace_exact"]["default"] is False
+        lst = tools["memory_list"].input_schema["properties"]
+        assert lst["namespace"]["default"] is None
+        assert lst["namespace_exact"]["default"] is False
+        assert "namespace" not in tools["memory_delete"].input_schema["properties"]
+        assert "namespace" not in tools["memory_get"].input_schema["properties"]
 
 
 class TestToolCalls:
@@ -306,11 +352,9 @@ class TestMemoryFlow:
         assert note["id"] == note_id
         assert note["text"] == text
         assert note["created_at"].endswith("Z") and note["updated_at"].endswith("Z")
-        # Компактный контракт Фазы 9: get — белый список из четырёх полей.
-        assert set(note) == {"id", "text", "created_at", "updated_at"}
-        assert "summary" not in note
-        assert "summary_status" not in note
-        assert "author" not in note
+        # Компактный контракт Фазы 9: get — белый список из пяти полей (+namespace Фаза 10).
+        assert set(note) == {"id", "text", "created_at", "updated_at", "namespace"}
+        assert note["namespace"] == "default"  # save без узла → default (§5.7)
 
     @pytest.mark.asyncio
     async def test_single_id_alias(self, server_url: str) -> None:
@@ -334,7 +378,8 @@ class TestMemoryFlow:
         hit = next(
             r for r in found["results"] if r["summary"].startswith(f"{self.marker}")
         )
-        assert set(hit) == {"id", "summary", "created_at", "updated_at"}
+        assert set(hit) == {"id", "summary", "created_at", "updated_at", "namespace"}
+        assert hit["namespace"] == "default"
         assert "snippet" not in hit
         assert "cosine" not in hit
         assert "rrf_score" not in hit
@@ -353,7 +398,7 @@ class TestMemoryFlow:
         assert listed["total"] >= 1
         assert listed["items"]  # среди первой страницы есть наша
         for item in listed["items"]:
-            assert set(item) == {"id", "summary", "created_at", "updated_at"}
+            assert set(item) == {"id", "summary", "created_at", "updated_at", "namespace"}
             assert "summary_status" not in item
             assert "author" not in item
 
@@ -454,3 +499,140 @@ class TestMemoryFlow:
         assert [note["id"] for note in notes] == [id1, id2]  # порядок запроса
         assert [note["text"] for note in notes] == [first_text, second_text]
         assert "hint" not in got  # успешный ответ — без hint (Фаза 9)
+
+
+class TestNamespaceMCP:
+    """Фаза 10 (Шаг 3): namespace-параметры и memory_namespaces по живому серверу.
+    Изолированная БД (ns_url/ns_db) — общая память других тестов не трогается."""
+
+    marker = f"nsmarker-{uuid.uuid4().hex[:8]}"
+
+    @pytest.mark.asyncio
+    async def test_save_into_registered_namespace(self, ns_url: str, ns_db: str) -> None:
+        """save с зарегистрированным узлом: stored=True, метка в выдаче get (§5.7)."""
+        _register_namespace(ns_db, "work", "Рабочие заметки. Подпроекты — в листьях.")
+        text = f"{self.marker}: деплой в work-узел"
+        async with connect(ns_url) as session:
+            saved = (await session.call_tool(
+                "memory_save", {"text": text, "namespace": "work"}
+            )).structured_content
+            assert saved["stored"] is True
+            got = (await session.call_tool(
+                "memory_get", {"ids": [saved["id"]]}
+            )).structured_content
+        assert got["notes"][0]["namespace"] == "work"
+
+    @pytest.mark.asyncio
+    async def test_save_unregistered_namespace_fails_with_hint(
+        self, ns_url: str, ns_db: str
+    ) -> None:
+        """save в незарегистрированный узел → fail + hint (клиент не создаёт узлы)."""
+        async with connect(ns_url) as session:
+            saved = (await session.call_tool(
+                "memory_save", {"text": f"{self.marker}: в неизвестный узел",
+                                "namespace": "nope"}
+            )).structured_content
+        assert saved == {"stored": False, "hint": "неймспейс «nope» не зарегистрирован; актуальная карта — memory_namespaces"}
+
+    @pytest.mark.asyncio
+    async def test_search_unregistered_namespace_gives_hint(
+        self, ns_url: str, ns_db: str
+    ) -> None:
+        async with connect(ns_url) as session:
+            found = (await session.call_tool(
+                "memory_search", {"query": "что угодно", "namespace": "nope"}
+            )).structured_content
+        assert found["results"] == []
+        assert "nope" in found["hint"]
+
+    @pytest.mark.asyncio
+    async def test_list_namespace_filter(self, ns_url: str, ns_db: str) -> None:
+        _register_namespace(ns_db, "work", "Рабочие заметки. Подпроекты — в листьях.")
+        _register_namespace(ns_db, "projects", "Личные проекты. Сайт-резюме.")
+        async with connect(ns_url) as session:
+            await session.call_tool(
+                "memory_save", {"text": f"{self.marker}: в work", "namespace": "work"}
+            )
+            await session.call_tool(
+                "memory_save", {"text": f"{self.marker}: в projects", "namespace": "projects"}
+            )
+            work = (await session.call_tool(
+                "memory_list", {"namespace": "work", "limit": 5}
+            )).structured_content
+        assert all(item["namespace"] == "work" for item in work["items"])
+
+    @pytest.mark.asyncio
+    async def test_update_unregistered_namespace_fails(self, ns_url: str, ns_db: str) -> None:
+        _register_namespace(ns_db, "work", "Рабочие заметки.")
+        async with connect(ns_url) as session:
+            saved = (await session.call_tool(
+                "memory_save", {"text": f"{self.marker}: к перемещению"}
+            )).structured_content
+            upd = (await session.call_tool(
+                "memory_update", {"id": saved["id"],
+                                  "text": f"{self.marker}: новая", "namespace": "nope"}
+            )).structured_content
+        assert upd["updated"] is False
+        assert "nope" in upd["hint"]
+
+    @pytest.mark.asyncio
+    async def test_update_moves_namespace(self, ns_url: str, ns_db: str) -> None:
+        _register_namespace(ns_db, "work", "Рабочие заметки.")
+        async with connect(ns_url) as session:
+            saved = (await session.call_tool(
+                "memory_save", {"text": f"{self.marker}: в default"}
+            )).structured_content
+            upd = (await session.call_tool(
+                "memory_update", {"id": saved["id"],
+                                  "text": f"{self.marker}: переехала", "namespace": "work"}
+            )).structured_content
+            got = (await session.call_tool(
+                "memory_get", {"ids": [saved["id"]]}
+            )).structured_content
+        assert upd["updated"] is True
+        assert got["notes"][0]["namespace"] == "work"
+
+    @pytest.mark.asyncio
+    async def test_memory_namespaces_registry(self, ns_url: str, ns_db: str) -> None:
+        """memory_namespaces: компактный контракт (§5.7) + promotion_candidates."""
+        _register_namespace(ns_db, "work", "Рабочие заметки. Подпроекты — в листьях.")
+        async with connect(ns_url) as session:
+            registry = (await session.call_tool("memory_namespaces", {})).structured_content
+        paths = {node["path"] for node in registry["namespaces"]}
+        nsmap = {node["path"]: node for node in registry["namespaces"]}
+        assert "default" in paths and "work" in paths
+        assert set(nsmap["work"]) == {
+            "path", "description", "status", "notes_count",
+            "subtree_count", "updated_at",
+        }
+        assert nsmap["work"]["status"] == "confirmed"
+        assert nsmap["work"]["description"] == "Рабочие заметки. Подпроекты — в листьях."
+        # promotion_candidates готовит триггер (Шаг 5); контракт стабилен.
+        assert registry["promotion_candidates"] == []
+
+
+class TestInstructionsBudget:
+    """Замер бюджета §2: карта неймспейсов в инструкциях ≤ ~1300 токенов.
+    Строим полные инструкции на реальном реестре (юнит, без сети)."""
+
+    def test_map_in_instructions_within_budget(self, test_env: dict[str, str]) -> None:
+        from app.config import get_settings
+        from app.services import build_services
+        from app.services.namespaces import NamespaceService
+        from app.storage.db import init_db
+        from app.transport.mcp import build_instructions
+
+        settings = get_settings()
+        init_db(settings)
+        ns = NamespaceService(settings)
+        ns.create("work", "Рабочие заметки. Подпроекты — в листьях.")
+        ns.create("projects", "Личные проекты. Сайт-резюме.")
+        ns.create("work/sbos2020", "СУБО 2020: сервисы HR.")
+        instructions = build_instructions(build_services(settings))
+        assert SERVER_INSTRUCTIONS in instructions
+        assert "- work: Рабочие заметки. Подпроекты — в листьях." in instructions
+        assert "- projects: Личные проекты. Сайт-резюме." in instructions
+        assert "- work/sbos2020: СУБО 2020: сервисы HR." in instructions
+        # бюджет §2: грубая оценка токенов ≈ длина/4; ~10 узлов — далеко
+        # до ~1300 (база сама по себе ~300 токенов).
+        assert len(instructions.encode("utf-8")) / 4 <= 1300

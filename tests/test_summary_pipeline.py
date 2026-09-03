@@ -28,6 +28,7 @@ from app.main import create_app
 from app.services import (
     DeduplicationService,
     EmbeddingService,
+    NamespaceService,
     NoteService,
     SearchService,
     Services,
@@ -70,6 +71,7 @@ def _make_client(
             summary=summarizer,
             dedup_judge=JudgeService(settings),  # loopback:1: недоступен — Eтап 3.2
             backup=BackupService(settings),  # Фаза 5: петля снапшотов в lifespan
+            namespaces=NamespaceService(settings),  # Фаза 10: реестр неймспейсов
         )
 
     monkeypatch.setattr("app.main.build_services", builder)
