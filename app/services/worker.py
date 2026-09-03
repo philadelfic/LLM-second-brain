@@ -253,10 +253,13 @@ class BackgroundWorker:
                     (row["id"],),
                 )
             # Фоновый дедуп (Фаза 8, Этапы 2–3): вектор готов — кандидаты
-            # против ранних заметок (вне транзакции записи), затем
+            # против ранних заметок В ПРЕДЕЛАХ НЕЙМСПЕЙСА заметки (Фаза 10,
+            # §5.7: меж-узловые дубли легитимны — hint-механика Шага 5), затем
             # приговор (LLM-судья, Этап 3.2; без судьи — косинус-фоллбек
             # Этапа 2.2) и сведение.
-            older = self._find_dedup_candidates(int(row["id"]), vector)
+            older = self._find_dedup_candidates(
+                int(row["id"]), vector, row["namespace"]
+            )
             if older and not self._merge_duplicates(int(row["id"]), older):
                 # Слияние не состоялось: обе заметки целы (NFR-3); свежая
                 # возвращается в pending — повтор по back-off очереди.
@@ -267,7 +270,7 @@ class BackgroundWorker:
     # --- фоновый дедуп (Фаза 8, Этапы 2–3) ------------------------------------
 
     def _find_dedup_candidates(
-        self, note_id: int, vector: list[float]
+        self, note_id: int, vector: list[float], namespace: str = "default"
     ) -> list[tuple[int, float]]:
         """Косинус-кандидаты дедупа после довекторизации заметки.
 
@@ -275,7 +278,8 @@ class BackgroundWorker:
         текущей): пара «поздняя ↔ ранняя» обрабатывается один раз, из
         стороны поздней — сведение (Этап 2.2) обновляет ранний дубль и
         soft-delete поздний, а встречный прогон той же пары из стороны
-        ранней заметки зациклил бы обработку. Кандидаты логируются
+        ранней заметки зациклил бы обработку. Фаза 10 (§5.7): только в
+        пределах неймспейса заметки. Кандидаты логируются
         (наблюдаемость); приговор «дубль» принимает _merge_duplicates:
         каждый кандидат опрашивается судьёй (Этап 3.2, JudgeService —
         косинус лишь предфильтр); без судьи — косинус-фоллбек
@@ -283,7 +287,9 @@ class BackgroundWorker:
 
         Возвращает список [(candidate_id, cosine)] — вход сведение.
         """
-        found = self._dedup.find_candidates(vector, exclude_id=note_id)
+        found = self._dedup.find_candidates(
+            vector, exclude_id=note_id, namespace=namespace
+        )
         older = [pair for pair in found if pair[0] < note_id]
         if older:
             logging.getLogger("app").info(

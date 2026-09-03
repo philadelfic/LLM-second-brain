@@ -119,10 +119,11 @@ class TestGet:
         assert len(notes) == 1
         assert set(notes[0]) == {
             "id", "text", "summary", "summary_status",
-            "author", "created_at", "updated_at",
+            "author", "created_at", "updated_at", "namespace",  # Фаза 10
         }
         assert notes[0]["text"] == "Полный текст заметки"
         assert notes[0]["summary_status"] == "pending"
+        assert notes[0]["namespace"] == "default"  # save без namespace → default (Фаза 10)
 
     def test_batch_order_follows_request(self, service: NoteService) -> None:
         for i in range(1, 4):
@@ -199,9 +200,10 @@ class TestList:
         item = service.list()["items"][0]
         assert set(item) == {
             "id", "summary", "summary_status", "author",
-            "created_at", "updated_at",
+            "created_at", "updated_at", "namespace",  # Фаза 10
         }
         assert item["author"] == "model-x"
+        assert item["namespace"] == "default"  # Фаза 10
         assert item["summary"] == long_text(300)[:200]  # fallback-усечение
 
     def test_total_and_pagination(self, service: NoteService) -> None:

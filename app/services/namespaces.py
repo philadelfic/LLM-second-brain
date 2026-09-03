@@ -166,6 +166,23 @@ class NamespaceService:
                 )
             ]
 
+    def filter_nodes(self, namespace: str | None, exact: bool) -> list[str] | None:
+        """Узлы-партиции для фильтра выдачи (§5.7): None — глобально;
+        точный узел (`exact`) — только он; иначе — поддерево (узел + листья).
+        Незарегистрированный узел — NamespaceError (транспорт Шага 3 обернёт
+        в fail + hint). Общая точка для search и list."""
+        if namespace is None:
+            return None
+        normalized = self.validate_path(namespace)
+        if not self.exists(normalized):
+            raise NamespaceError(
+                f"неймспейс «{namespace}» не зарегистрирован; актуальная карта — "
+                "memory_namespaces"
+            )
+        if exact:
+            return [normalized]
+        return self.subtree_nodes(normalized)
+
     # --- запись ---------------------------------------------------------------
 
     def create(

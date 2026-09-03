@@ -54,6 +54,7 @@ from app.config import Settings
 from app.services.dedup import DeduplicationService, duplicate_response
 from app.services.embedding import Embedder, EmbeddingService
 from app.services.emit import summary_of
+from app.services.namespaces import NamespaceService
 from app.services.splitter import split_text
 from app.storage import chunks
 from app.storage.db import session, transaction
@@ -90,6 +91,8 @@ class NoteService:
             embedding if embedding is not None else EmbeddingService(settings)
         )
         self._dedup = dedup if dedup is not None else DeduplicationService(settings)
+        # Фаза 10: реестр неймспейсов (валидация узла, поддеревья для list).
+        self._namespaces = NamespaceService(settings)
         # Сигнал воркеру суммаризации (main.py): будить петлю сразу при
         # появлении pending summary, а не ждать выросший back-off.
         self._summary_notifier = summary_notifier
@@ -172,8 +175,18 @@ class NoteService:
 
     # --- FR-2 memory_list -------------------------------------------------
 
-    def list(self, limit: int | None = None, offset: int = 0) -> dict[str, Any]:
-        """Обзор памяти: краткие содержания по свежести + total (FR-2)."""
+    def list(
+        self,
+        limit: int | None = None,
+        offset: int = 0,
+        namespace: str | None = None,
+        namespace_exact: bool = False,
+    ) -> dict[str, Any]:
+        """Обзор памяти: краткие содержания по свежести + total (FR-2).
+
+        Фаза 10: namespace — фильтр узла/поддерева (None — глобально, как
+        раньше); каждый item несёт свой namespace.
+        """
         limit = self._settings.default_list_limit if limit is None else limit
         if not 1 <= limit <= MAX_LIST_LIMIT:
             raise NoteValidationError(
@@ -181,15 +194,26 @@ class NoteService:
             )
         if offset < 0:
             raise NoteValidationError(f"offset: ожидается ≥ 0, получено {offset}")
+        ns_nodes = self._namespaces.filter_nodes(namespace, namespace_exact)
+        if ns_nodes is not None:
+            ns_ph = ",".join("?" * len(ns_nodes))
+            ns_clause = f" AND namespace IN ({ns_ph})"
+            ns_params: list[object] = list(ns_nodes)
+        else:
+            ns_clause = ""
+            ns_params = []
         with session(self._settings) as conn:
             rows = conn.execute(
-                "SELECT id, summary, summary_status, author, created_at, updated_at, text "
-                "FROM notes WHERE deleted_at IS NULL "
+                "SELECT id, namespace, summary, summary_status, author, "
+                "created_at, updated_at, text "
+                "FROM notes WHERE deleted_at IS NULL"
+                f"{ns_clause} "
                 "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
-                (limit, offset),
+                [*ns_params, limit, offset],
             ).fetchall()
             total = conn.execute(
-                "SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL"
+                f"SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL{ns_clause}",
+                ns_params,
             ).fetchone()[0]
         items = [
             {
@@ -199,6 +223,7 @@ class NoteService:
                 "author": row["author"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
+                "namespace": row["namespace"],
             }
             for row in rows
         ]
@@ -352,7 +377,8 @@ class NoteService:
             )
 
     def _full_note(self, row: sqlite3.Row) -> dict[str, Any]:
-        """Формат выдачи memory_get (FR-3): полный текст + метаданные."""
+        """Формат выдачи memory_get (FR-3): полный текст + метаданные.
+        Фаза 10: +namespace (слой ориентирования: модель видит, где лежит)."""
         return {
             "id": row["id"],
             "text": row["text"],
@@ -361,4 +387,5 @@ class NoteService:
             "author": row["author"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "namespace": row["namespace"],
         }
