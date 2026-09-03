@@ -41,7 +41,7 @@ class NoDedup:
     def find_by_cosine(self, vector: list[float]):
         return None
 
-    def find_by_text(self, text: str):
+    def find_by_text(self, text: str, namespace: str | None = None):
         return None
 
 

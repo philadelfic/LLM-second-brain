@@ -129,6 +129,19 @@ class NamespaceService:
                 is not None
             )
 
+    def validate_placement(self, namespace: str) -> str:
+        """Целевой узел записи (save/update): нормализованный путь
+        зарегистрированного узла; незарегистрированный — NamespaceError
+        (транспорт Шага 3 обернёт в fail + hint). «default» существует
+        всегда, поэтому укладка без указания узла всегда проходит."""
+        normalized = self.validate_path(namespace)
+        if not self.exists(normalized):
+            raise NamespaceError(
+                f"неймспейс «{namespace}» не зарегистрирован; актуальная карта — "
+                "memory_namespaces"
+            )
+        return normalized
+
     def get(self, path: str) -> dict[str, Any] | None:
         """Узел реестра со счётчиками или None (нет узла)."""
         normalized = self.validate_path(path)

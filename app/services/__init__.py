@@ -5,6 +5,9 @@
 Фаза 3: EmbeddingService один на процесс — общий httpx-пул для гибридного
 поиска и дедупа записи; NoteService через DeduplicationService решает
 «дубликат / сохранить» (FR-4), SearchService — гибридный поиск (ARCH §4.2).
+Фаза 10: NamespaceService — реестр иерархических неймспейсов (карта для
+`memory_namespaces`; NoteService/SearchService держат собственный реестр
+для валидации записи и фильтров выдачи).
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from app.services.backup import BackupService
 from app.services.dedup import DeduplicationService
 from app.services.embedding import EmbeddingService
 from app.services.judge import JudgeService
+from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
 from app.services.search import SearchService
 from app.services.summary import SummaryService
@@ -25,6 +29,7 @@ __all__ = [
     "DeduplicationService",
     "EmbeddingService",
     "JudgeService",
+    "NamespaceService",
     "NoteService",
     "SearchService",
     "Services",
@@ -44,6 +49,7 @@ class Services:
     summary: SummaryService  # воркер — единственный потребитель (режим «Б»)
     dedup_judge: JudgeService  # судья дедупа — воркер, решение по кандидатам (Этап 3.2)
     backup: BackupService  # петля снапшотов — asyncio-таска в lifespan
+    namespaces: NamespaceService  # реестр узлов (Фаза 10, memory_namespaces)
 
 
 def build_services(
@@ -68,4 +74,5 @@ def build_services(
         summary=summary if summary is not None else SummaryService(settings),
         dedup_judge=judge if judge is not None else JudgeService(settings),
         backup=BackupService(settings),
+        namespaces=NamespaceService(settings),
     )
