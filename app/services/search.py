@@ -37,6 +37,7 @@ from typing import Any
 from app.config import Settings
 from app.services.embedding import Embedder, EmbeddingError, EmbeddingService
 from app.services.emit import snippet, summary_of
+from app.services.namespaces import NamespaceError, NamespaceService
 from app.storage import chunks, vectors
 from app.storage.db import session
 
@@ -81,9 +82,25 @@ class SearchService:
         self._settings = settings
         # DI для тестов: детерминированный HashEmbedder вместо сети.
         self._embedding: Embedder = embedding if embedding is not None else EmbeddingService(settings)
+        # Фаза 10: реестр неймспейсов (валидация узла, поддеревья).
+        self._namespaces = NamespaceService(settings)
 
-    def search(self, query: str, top_k: int | None = None) -> dict[str, Any]:
-        """Гибридный поиск (ARCH §4.2 + Фаза 7); выдача FR-1 без полного текста."""
+    def search(
+        self,
+        query: str,
+        top_k: int | None = None,
+        namespace: str | None = None,
+        namespace_exact: bool = False,
+    ) -> dict[str, Any]:
+        """Гибридный поиск (ARCH §4.2 + Фаза 7); выдача FR-1 без полного текста.
+
+        Фаза 10: `namespace` — узел иерархии; фильтр по его поддереву
+        (узел + зарегистрированные листья; `namespace_exact` — только сам
+        узел). None — глобальный поиск (RRF как раньше). Незарегистрированный
+        узел — NamespaceError (транспорт Шага 3 обернёт в fail + hint).
+        Каждый результат несёт свой `namespace` — модель видит, где нашлось
+        (слой ориентирования № 3).
+        """
         query = self._validate_query(query)
         top_k = self._default_top_k() if top_k is None else top_k
         if not 1 <= top_k <= MAX_TOP_K:
@@ -92,14 +109,17 @@ class SearchService:
             )
         query_vector = self._query_vector(query)
         expression = self._match_expression(query)
+        ns_nodes = self._namespaces.filter_nodes(namespace, namespace_exact)
 
         with session(self._settings) as conn:
             vector_hits = (
-                self._vector_candidates(conn, query_vector)
+                self._vector_candidates(conn, query_vector, ns_nodes)
                 if query_vector is not None
                 else []
             )
-            fts_rows = self._fts_candidates(conn, expression) if expression else []
+            fts_rows = (
+                self._fts_candidates(conn, expression, ns_nodes) if expression else []
+            )
 
             # --- слияние RRF: score(d) = Σ 1/(RRF_K + rank) -----------------
             # Векторный источник — уже агрегированный список заметок
@@ -132,21 +152,31 @@ class SearchService:
 
     # --- источники кандидатов ------------------------------------------------
 
+    def _namespace_filter(
+        self, namespace: str | None, namespace_exact: bool
+    ) -> list[str] | None:
+        """Узлы-партиции для фильтра — общая логика в реестре (filter_nodes)."""
+        return self._namespaces.filter_nodes(namespace, namespace_exact)
+
     def _vector_candidates(
-        self, conn: sqlite3.Connection, query_vector: list[float]
+        self,
+        conn: sqlite3.Connection,
+        query_vector: list[float],
+        ns_nodes: list[str] | None,
     ) -> list[tuple[int, float, str | None]]:
         """Векторные кандидаты: чанки → агрегация до заметок + fallback.
 
         Каждая заметка входит в источник ОДИН раз: близость задаёт её лучший
         чанк; заметки без готовых чанков (нет строк notes_chunks вообще или
         векторов у чанков) получают cosine полного вектора (notes_vec).
+        Фаза 10: поиск в партициях узлов поддерева (ns_nodes) — или глобально.
         Возврат уже отсортирован по cosine (для ранга в RRF) и отфильтрован
         по активности и порогу.
         """
-        by_chunk_source = self._chunk_candidates(conn, query_vector)
+        by_chunk_source = self._chunk_candidates(conn, query_vector, ns_nodes)
         # Fallback Фазы 7: заметки, у которых нет готовых чанк-векторов
         # (legacy/пending), ищутся по полному тексту, как в Фазе 3.
-        for note_id, cosine in self._full_text_candidates(conn, query_vector):
+        for note_id, cosine in self._full_text_candidates(conn, query_vector, ns_nodes):
             if note_id not in by_chunk_source:
                 by_chunk_source[note_id] = (cosine, None)
         ranked = sorted(
@@ -158,33 +188,47 @@ class SearchService:
         ]
 
     def _chunk_candidates(
-        self, conn: sqlite3.Connection, query_vector: list[float]
+        self,
+        conn: sqlite3.Connection,
+        query_vector: list[float],
+        ns_nodes: list[str] | None,
     ) -> dict[int, tuple[float, str]]:
         """KNN по notes_chunks_vec (топ-50) → одна запись на заметку.
 
         Первый чанк заметки в отсортированной по близости выдаче KNN — её
         лучший чанк: он задаёт cosine и текст для snippet. Порог сравнивается
         с cosine лучшего чанка (brief §6). Чанки trash-заметок отбрасываются
-        пост-фильтром (vec0 не знает о notes).
+        пост-фильтром (vec0 не знает о notes). Фаза 10: KNN сканирует партиции
+        узлов поддерева (ns_nodes) — или глобально; trash-окно считается
+        в тех же партициях.
         """
+        if ns_nodes:
+            ns_ph = ",".join("?" * len(ns_nodes))
+            ns_clause = f" AND n.namespace IN ({ns_ph})"
+            ns_params: list[object] = list(ns_nodes)
+        else:
+            ns_clause = ""
+            ns_params = []
         trash = conn.execute(
             "SELECT COUNT(*) FROM notes_chunks_vec WHERE chunk_id IN "
             "(SELECT c.id FROM notes_chunks c JOIN notes n ON n.id = c.note_id "
-            " WHERE n.deleted_at IS NOT NULL)"
+            f" WHERE n.deleted_at IS NOT NULL{ns_clause})",
+            ns_params,
         ).fetchone()[0]
-        hits = chunks.knn(conn, query_vector, CANDIDATE_LIMIT + trash)
+        hits = chunks.knn(conn, query_vector, CANDIDATE_LIMIT + trash, ns_filter=ns_nodes)
         hits = hits[:CANDIDATE_LIMIT]
         if not hits:
             return {}
         placeholders = ",".join("?" * len(hits))
-        # один заход: note_id и text чанка + активность заметки
+        # один заход: note_id и text чанка + активность заметки (в узлах)
         chunk_meta = {
             row["id"]: (row["note_id"], row["text"])
             for row in conn.execute(
                 "SELECT c.id, c.note_id, c.text FROM notes_chunks c "
                 "JOIN notes n ON n.id = c.note_id "
-                f"WHERE n.deleted_at IS NULL AND c.id IN ({placeholders})",
-                [chunk_id for chunk_id, _ in hits],
+                f"WHERE n.deleted_at IS NULL AND c.id IN ({placeholders})"
+                f"{ns_clause}",
+                [chunk_id for chunk_id, _ in hits] + ns_params,
             )
         }
         by_note: dict[int, tuple[float, str]] = {}
@@ -202,19 +246,32 @@ class SearchService:
         return by_note
 
     def _full_text_candidates(
-        self, conn: sqlite3.Connection, query_vector: list[float]
+        self,
+        conn: sqlite3.Connection,
+        query_vector: list[float],
+        ns_nodes: list[str] | None,
     ) -> list[tuple[int, float]]:
         """Топ-50 активных по косинусу полного текста + гейт порога (FR-1).
 
         Окно KNN расширяется на число trash-векторов, пост-фильтр оставляет
         только активные. Заметки, уже попавшие в чанк-агрегацию, здесь
-        отфильтруются наверху (они не fallback).
+        отфильтруются наверху (они не fallback). Фаза 10: KNN — в партициях
+        узлов поддерева, активные — только из тех же узлов.
         """
+        if ns_nodes:
+            ns_ph = ",".join("?" * len(ns_nodes))
+            ns_clause = f" AND namespace IN ({ns_ph})"
+            ns_params: list[object] = list(ns_nodes)
+        else:
+            ns_clause = ""
+            ns_params = []
         trash = conn.execute(
             "SELECT COUNT(*) FROM notes_vec WHERE note_id IN "
-            "(SELECT id FROM notes WHERE deleted_at IS NOT NULL)"
+            "(SELECT id FROM notes WHERE deleted_at IS NOT NULL"
+            f"{ns_clause})",
+            ns_params,
         ).fetchone()[0]
-        hits = vectors.knn(conn, query_vector, CANDIDATE_LIMIT + trash)
+        hits = vectors.knn(conn, query_vector, CANDIDATE_LIMIT + trash, ns_filter=ns_nodes)
         if not hits:
             return []
         placeholders = ",".join("?" * len(hits))
@@ -222,8 +279,8 @@ class SearchService:
             row[0]
             for row in conn.execute(
                 f"SELECT id FROM notes WHERE deleted_at IS NULL "
-                f"AND id IN ({placeholders})",
-                [note_id for note_id, _ in hits],
+                f"{ns_clause} AND id IN ({placeholders})",
+                ns_params + [note_id for note_id, _ in hits],
             )
         }
         threshold = self._settings.score_threshold
@@ -234,17 +291,29 @@ class SearchService:
         ]
 
     def _fts_candidates(
-        self, conn: sqlite3.Connection, expression: str
+        self,
+        conn: sqlite3.Connection,
+        expression: str,
+        ns_nodes: list[str] | None,
     ) -> list[sqlite3.Row]:
-        """Топ-50 FTS5/BM25 по активным заметкам; rank с 1 — для RRF."""
+        """Топ-50 FTS5/BM25 по активным заметкам в узлах поддерева; rank с 1 —
+        для RRF. Фаза 10: фильтр namespace — JOIN'ом на notes (FTS-индекс
+        не пересоздаётся, бриф Шаг 1)."""
+        if ns_nodes:
+            ns_ph = ",".join("?" * len(ns_nodes))
+            ns_clause = f" AND n.namespace IN ({ns_ph})"
+            params: list[object] = [expression, *ns_nodes]
+        else:
+            ns_clause = ""
+            params = [expression]
         return conn.execute(
             "SELECT n.id, n.text, n.summary, n.summary_status, n.author, "
-            "       n.created_at, n.updated_at, "
+            "       n.namespace, n.created_at, n.updated_at, "
             "       bm25(notes_fts) AS badness "
             "FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid "
-            "WHERE notes_fts MATCH ? AND n.deleted_at IS NULL "
+            f"WHERE notes_fts MATCH ?{ns_clause} AND n.deleted_at IS NULL "
             "ORDER BY badness, n.updated_at DESC, n.id DESC LIMIT ?",
-            (expression, CANDIDATE_LIMIT),
+            (*params, CANDIDATE_LIMIT),
         ).fetchall()
 
     # --- слияние и выдача ------------------------------------------------------
@@ -257,7 +326,7 @@ class SearchService:
             return {}
         placeholders = ",".join("?" * len(ids))
         rows = conn.execute(
-            f"SELECT id, text, summary, summary_status, author, "
+            f"SELECT id, namespace, text, summary, summary_status, author, "
             f"       created_at, updated_at "
             f"FROM notes WHERE deleted_at IS NULL AND id IN ({placeholders})",
             ids,
@@ -312,6 +381,7 @@ class SearchService:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "author": row["author"],
+            "namespace": row["namespace"],
         }
 
     # --- внутреннее ---------------------------------------------------------

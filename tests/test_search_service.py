@@ -135,9 +135,10 @@ class TestOutput:
         hit = self._first(searcher, 1)
         assert set(hit) == {
             "id", "summary", "snippet", "summary_status", "rrf_score",
-            "cosine", "created_at", "updated_at", "author",
+            "cosine", "created_at", "updated_at", "author", "namespace",  # Фаза 10
         }
         assert hit["author"] == "gpt"
+        assert hit["namespace"] == "default"  # Фаза 10: save без namespace → default
         assert hit["cosine"] is None  # Фаза 2 без векторов
         assert hit["summary_status"] == "pending"
 

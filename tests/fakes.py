@@ -204,12 +204,17 @@ class RecordingDedup:
 
     def __init__(self, candidates: list[tuple[int, float]] | None = None) -> None:
         self.candidates = list(candidates or [])
-        self.calls: list[tuple[int | None, list[float]]] = []
+        self.calls: list[tuple[int | None, list[float], str | None]] = []
 
     def find_candidates(
-        self, vector: list[float], exclude_id: int | None = None
+        self,
+        vector: list[float],
+        exclude_id: int | None = None,
+        namespace: str | None = None,
     ) -> list[tuple[int, float]]:
-        self.calls.append((exclude_id, list(vector)))
+        # Фаза 10: namespace — дедуп в пределах неймспейса (воркер передаёт
+        # namespace заметки-владельца); журнал расширен accordingly.
+        self.calls.append((exclude_id, list(vector), namespace))
         return list(self.candidates)
 
     def close(self) -> None:  # интерфейс-совместимость с DeduplicationService

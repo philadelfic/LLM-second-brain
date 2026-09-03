@@ -74,7 +74,7 @@ def test_process_pending_searches_candidates_for_each_note(dim8) -> None:
     worker = BackgroundWorker(dim8, HashEmbedder(8), dedup=dedup)
     assert worker.process_pending() == 2
     assert [call[0] for call in dedup.calls] == [1, 2]
-    for exclude_id, vector in dedup.calls:
+    for exclude_id, vector, _namespace in dedup.calls:
         expected = HashEmbedder(8).embed(texts[exclude_id - 1])
         assert vector == pytest.approx(expected, abs=1e-6)
 
