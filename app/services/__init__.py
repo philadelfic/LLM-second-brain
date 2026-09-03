@@ -7,7 +7,8 @@
 «дубликат / сохранить» (FR-4), SearchService — гибридный поиск (ARCH §4.2).
 Фаза 10: NamespaceService — реестр иерархических неймспейсов (карта для
 `memory_namespaces`; NoteService/SearchService держат собственный реестр
-для валидации записи и фильтров выдачи).
+для валидации записи и фильтров выдачи); ClassificationService — фоновая
+причёска default-заметок (Шаг 4).
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 
 from app.config import Settings
 from app.services.backup import BackupService
+from app.services.classifier import ClassificationService
 from app.services.dedup import DeduplicationService
 from app.services.embedding import EmbeddingService
 from app.services.judge import JudgeService
@@ -26,6 +28,7 @@ from app.services.summary import SummaryService
 
 __all__ = [
     "BackupService",
+    "ClassificationService",
     "DeduplicationService",
     "EmbeddingService",
     "JudgeService",
@@ -50,6 +53,7 @@ class Services:
     dedup_judge: JudgeService  # судья дедупа — воркер, решение по кандидатам (Этап 3.2)
     backup: BackupService  # петля снапшотов — asyncio-таска в lifespan
     namespaces: NamespaceService  # реестр узлов (Фаза 10, memory_namespaces)
+    classifier: ClassificationService  # причёска default-заметок (Фаза 10, Шаг 4)
 
 
 def build_services(
@@ -75,4 +79,5 @@ def build_services(
         dedup_judge=judge if judge is not None else JudgeService(settings),
         backup=BackupService(settings),
         namespaces=NamespaceService(settings),
+        classifier=ClassificationService(settings),
     )
