@@ -532,6 +532,7 @@ class PromotionService:
         if self._describer is None or self._judge is None:
             return report  # триггер отключён (тестовый режим)
         logger = logging.getLogger("app")
+        self._signal_root_orphans()
         day_limit = self._day_limit_reached()
         for candidate in self.candidates():
             domain, slug = candidate["domain"], candidate["subdomain"]
@@ -556,6 +557,39 @@ class PromotionService:
             if action == "created":
                 day_limit = self._day_limit_reached()
         return report
+
+    def _signal_root_orphans(self) -> None:
+        """Сигнал оператору: в default копится контент вне известных корней (§5.7).
+
+        Новые корни система сама не создаёт (границы автономии): если
+        разметка причёски стабильно указывает на незарегистрированный домен
+        и группа доросла до порога — оператор решает, быть ли такому корню
+        (REST Шаг 6). Сигнал — по порогу триггера (шум отсечён), в логах
+        (event=root_orphans); в memory_namespaces не выносим — структурная
+        сигнализация остаётся операторской.
+        """
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT n.domain_hint AS domain_hint, COUNT(*) AS cnt "
+                "FROM notes n WHERE n.namespace = 'default' AND n.deleted_at IS NULL "
+                "AND n.domain_hint IS NOT NULL "
+                "AND n.confidence >= ? "
+                "GROUP BY n.domain_hint HAVING COUNT(*) >= ?",
+                (
+                    self._settings.namespace_promotion_min_confidence,
+                    self._settings.namespace_promotion_threshold,
+                ),
+            ).fetchall()
+        orphans = [
+            {"domain": row["domain_hint"], "count": int(row["cnt"])}
+            for row in rows
+            if not self._namespaces.exists(normalize_slug(row["domain_hint"]) or "")
+        ]
+        if orphans:
+            logging.getLogger("app").warning(
+                "promotion: default accumulates content outside known roots",
+                extra={"event": "root_orphans", "orphans": orphans},
+            )
 
     def _promote_one(self, domain: str, slug: str) -> str | None:
         """Полный цикл одного кандидата: created|merged|rejected|None.

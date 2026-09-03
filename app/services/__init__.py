@@ -88,7 +88,7 @@ def build_services(
         dedup=dedup,
         summary=summary if summary is not None else SummaryService(settings),
         dedup_judge=judge if judge is not None else JudgeService(settings),
-        backup=BackupService(settings),
+        backup=BackupService(settings, namespaces=namespaces),
         namespaces=namespaces,
         classifier=ClassificationService(settings),
         promotion=promotion,

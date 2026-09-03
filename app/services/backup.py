@@ -29,8 +29,10 @@ import sqlite3
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from app.config import Settings
+from app.services.namespaces import NamespaceService
 
 # Коллекция снапшотов внутри BACKUP_DIR (имя = фиксированный префикс + UTC).
 IMAGE_PREFIX = "notes-"
@@ -41,10 +43,20 @@ _LATENCY = time.perf_counter
 
 
 class BackupService:
-    """Периодический снапшот + ротация; петля — asyncio-таска в lifespan."""
+    """Периодический снапшот + ротация; петля — asyncio-таска в lifespan.
 
-    def __init__(self, settings: Settings) -> None:
+    Фаза 10 (Шаг 6): после каждого снапшота — груминг реестра неймспейсов
+    (`NamespaceService.groom`): пустые provisional-листы чистятся, мелкие
+    и пустые confirmed — сигнал оператору в логах. Ритм — раз в сутки,
+    штатный интервал backup-петли (бриф Ф10 §3 «груминг в backup-цикл»);
+    отдельный сервис не нужен — структурная автоматика редка.
+    """
+
+    def __init__(self, settings: Settings, namespaces: NamespaceService | None = None) -> None:
         self._settings = settings
+        # Реестр неймспейсов для груминга (Фаза 10): общий экземпляр из
+        # build_services; None — создать свой (тесты/юниты).
+        self._namespaces = namespaces if namespaces is not None else NamespaceService(settings)
         self._stopping = False
 
     def stop(self) -> None:
@@ -108,10 +120,23 @@ class BackupService:
     def _backup_dir(self) -> Path:
         return Path(self._settings.backup_dir)
 
+    def groom(self) -> dict[str, Any]:
+        """Груминг реестра после снапшота (Фаза 10, Шаг 6): NamespaceService.
+
+        Отдельный метод — точка DI и теста: петля зовёт его после снапшота,
+        отказ пробрасывается (интерпретация — на стороне run).
+        """
+        return self._namespaces.groom()
+
     # --- Петля ---------------------------------------------------------------
 
     async def run(self) -> None:
-        """Снапшот сразу после старта, далее — раз в BACKUP_INTERVAL_SEC."""
+        """Снапшот сразу после старта, далее — раз в BACKUP_INTERVAL_SEC.
+
+        Фаза 10: после каждого снапшота — груминг реестра неймспейсов;
+        отказ груминга не убивает петлю (как отказ снапшота, NFR-3):
+        событие groom_failed в логе, повтор — следующий интервал.
+        """
         while not self._stopping:
             try:
                 await asyncio.to_thread(self.snapshot)
@@ -120,6 +145,17 @@ class BackupService:
                 # подробности — в JSON-лог, повтор по интервалу.
                 logging.getLogger("app").exception(
                     "backup snapshot failed", extra={"event": "backup_failed"}
+                )
+            try:
+                report = await asyncio.to_thread(self.groom)
+                if any(report.values()):
+                    logging.getLogger("app").info(
+                        "backup: namespace groom finished",
+                        extra={"event": "groom_run", "report": report},
+                    )
+            except Exception:
+                logging.getLogger("app").exception(
+                    "namespace groom failed", extra={"event": "groom_failed"}
                 )
             await asyncio.sleep(self._settings.backup_interval_sec)
 
