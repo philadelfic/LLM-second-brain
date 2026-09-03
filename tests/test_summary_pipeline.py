@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable, Iterator
 
 import pytest
-from fakes import FailingSummarizer, FixedSummarizer
+from fakes import FailingSummarizer, FixedClassifier, FixedSummarizer
 from fastapi.testclient import TestClient
 
 from app.config import get_settings
@@ -72,6 +72,7 @@ def _make_client(
             dedup_judge=JudgeService(settings),  # loopback:1: недоступен — Eтап 3.2
             backup=BackupService(settings),  # Фаза 5: петля снапшотов в lifespan
             namespaces=NamespaceService(settings),  # Фаза 10: реестр неймспейсов
+            classifier=FixedClassifier(),  # Фаза 10, Шаг 4: причёска (общая разметка)
         )
 
     monkeypatch.setattr("app.main.build_services", builder)

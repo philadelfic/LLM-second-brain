@@ -45,6 +45,7 @@ from __future__ import annotations
 import hashlib
 import math
 
+from app.services.classifier import Classification, ClassificationError
 from app.services.embedding import EmbeddingError
 from app.services.judge import JudgeError
 from app.services.summary import SummaryError
@@ -246,6 +247,40 @@ class MergeFailingSummarizer(FixedSummarizer):
             raise SummaryError("слияние недоступно")
         self.last_attempt_ok = True
         return self.merge_result
+
+
+class FixedClassifier:
+    """Фейк-классификатор (Фаза 10, Шаг 4): детерминированная разметка.
+
+    Интерфейс Classifier (`classify`/`close`); возвращает заранее заданный
+    `Classification` (или отказ при `fail=True` — ClassificationError,
+    деградация причёски). Журнал `calls` — пары (text, known_nodes) в порядке
+    опроса: тесты проверяют, что воркер классифицирует именно default-заметки
+    и передаёт известные узлы реестра.
+    """
+
+    def __init__(
+        self,
+        result: Classification | None = None,
+        fail: bool = False,
+    ) -> None:
+        self.result = result
+        self.fail = fail
+        self.calls: list[tuple[str, list]] = []
+        self.last_attempt_ok: bool | None = None
+
+    def classify(self, text: str, known_nodes: list) -> Classification:
+        self.calls.append((text, known_nodes))
+        if self.fail:
+            self.last_attempt_ok = False
+            raise ClassificationError("классификатор недоступен")
+        self.last_attempt_ok = True
+        if self.result is None:
+            return Classification(None, None, 0.0)
+        return self.result
+
+    def close(self) -> None:  # интерфейс-совместимость с ClassificationService
+        return None
 
 
 class ScriptedJudge:

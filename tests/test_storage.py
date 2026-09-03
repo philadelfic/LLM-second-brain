@@ -31,8 +31,9 @@ def _match(conn: sqlite3.Connection, needle: str) -> list[int]:
 
 class TestSchemaCreated:
     def test_notes_columns(self) -> None:
-        """Таблица notes — 11 колонок из ARCHITECTURE §3.3 (+Фаза 10 §5.7):
-        9 базовых + namespace/classified_at."""
+        """Таблица notes — 14 колонок из ARCHITECTURE §3.3 (+Фаза 10 §5.7):
+        9 базовых + namespace/classified_at + разметка причёски
+        domain_hint/subdomain_hint/confidence."""
         init_db(get_settings())
         with session(get_settings()) as conn:
             columns = {
@@ -41,7 +42,8 @@ class TestSchemaCreated:
         assert set(columns) == {
             "id", "text", "summary", "author", "vector_status",
             "summary_status", "created_at", "updated_at", "deleted_at",
-            "namespace", "classified_at",
+            "namespace", "classified_at", "domain_hint", "subdomain_hint",
+            "confidence",
         }
         # DDL-умолчания: summary пуст, статусы pending, author unknown.
         assert columns["summary"]["dflt_value"] == "''"

@@ -83,7 +83,10 @@ CREATE TABLE IF NOT EXISTS notes (
   updated_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   deleted_at     TEXT    NULL,
   namespace      TEXT    NOT NULL DEFAULT 'default',
-  classified_at  TEXT    NULL
+  classified_at  TEXT    NULL,
+  domain_hint    TEXT    NULL,
+  subdomain_hint TEXT    NULL,
+  confidence     REAL    NULL
 )
 """
 
@@ -267,6 +270,7 @@ def init_db(settings: Settings) -> None:
             _check_fts_integrity(conn)
             # Неймспейсы (Фаза 10): колонки notes + реестр + дефолт-узел.
             _migrate_namespace_columns(conn)
+            _migrate_classification_columns(conn)
             conn.execute(_NAMESPACES_DDL)
             conn.execute(_INDEX_NAMESPACE_DDL)
             _ensure_default_namespace(conn)
@@ -315,6 +319,21 @@ def _migrate_namespace_columns(conn: sqlite3.Connection) -> None:
         )
     if "classified_at" not in columns:
         conn.execute("ALTER TABLE notes ADD COLUMN classified_at TEXT")
+
+
+def _migrate_classification_columns(conn: sqlite3.Connection) -> None:
+    """Нулевая миграция Фазы 10 (Шаг 4): колонки разметки причёски
+    domain_hint/subdomain_hint/confidence. Свежие БД получают их из
+    _NOTES_DDL; унаследованные — ALTER TABLE ADD COLUMN (NULL — причёска
+    разберёт их позже). Параметры разметки — внутренние данные, НЕ в
+    MCP-контрактах (§5.7)."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
+    if "domain_hint" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN domain_hint TEXT")
+    if "subdomain_hint" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN subdomain_hint TEXT")
+    if "confidence" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN confidence REAL")
 
 
 def _ensure_default_namespace(conn: sqlite3.Connection) -> None:

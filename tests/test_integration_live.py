@@ -26,6 +26,7 @@ import pytest
 from fakes import FailingEmbedder, cosine
 
 from app.config import Settings
+from app.services.classifier import ClassificationService
 from app.services.dedup import DeduplicationService
 from app.services.embedding import EmbeddingError, EmbeddingService
 from app.services.notes import NoteService
@@ -281,6 +282,30 @@ def test_live_summary_latency_report(live_summary) -> None:
     print(f"\n[live-summary] латентность generate: {elapsed:.2f} с ({len(summary)} симв)")
     assert elapsed > 0
     assert len(summary) <= live_summary.settings.max_summary_chars
+
+
+def test_live_classifier_returns_valid_markup(live_summary) -> None:
+    """Живая классификация (Фаза 10, Шаг 4): валидная разметка §5.7.
+
+    Классификатор — та же модель, что суммаризация (SUMMARY_MODEL); проверяем
+    контракт выхода: три поля, confidence 0..1, слаги валидны. Латентность
+    печатается (бриф Ф10 п.4: фон — не влияет на save).
+    """
+    known = [
+        {"path": "work", "description": "Рабочие заметки. Подпроекты — в листьях."},
+        {"path": "projects", "description": "Личные проекты. Сайт-резюме."},
+    ]
+    service = ClassificationService(live_summary.settings)
+    t0 = time.monotonic()
+    try:
+        result = service.classify(RU_NOTE, known)
+    finally:
+        service.close()
+    elapsed = time.monotonic() - t0
+    print(f"\n[live-classify] латентность classify: {elapsed:.2f} с")
+    assert 0.0 <= result.confidence <= 1.0
+    assert result.domain_hint is None or isinstance(result.domain_hint, str)
+    assert result.subdomain_hint is None or isinstance(result.subdomain_hint, str)
 
 
 def test_live_summary_timeout_fails_fast(tmp_path_factory) -> None:

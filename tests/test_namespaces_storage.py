@@ -113,7 +113,8 @@ class TestFreshSchema:
         assert set(columns) == {
             "id", "text", "summary", "author", "vector_status",
             "summary_status", "created_at", "updated_at", "deleted_at",
-            "namespace", "classified_at",
+            "namespace", "classified_at", "domain_hint", "subdomain_hint",
+            "confidence",
         }
         assert columns["namespace"]["dflt_value"] == "'default'"
         assert columns["classified_at"]["notnull"] == 0

@@ -73,9 +73,11 @@ import asyncio
 import logging
 
 from app.config import Settings
+from app.services.classifier import ClassificationError, Classifier
 from app.services.dedup import DeduplicationService
 from app.services.embedding import Embedder, EmbeddingError
 from app.services.judge import Judge, JudgeError
+from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
 from app.services.summary import Summarizer, SummaryError
 from app.storage import chunks, vectors
@@ -104,6 +106,7 @@ class BackgroundWorker:
         summarizer: Summarizer | None = None,
         dedup: DeduplicationService | None = None,
         judge: Judge | None = None,
+        classifier: Classifier | None = None,
     ) -> None:
         self._settings = settings
         self._embedding = embedding
@@ -125,6 +128,12 @@ class BackgroundWorker:
         # используются, notifier не нужен — после слияния воркер будит
         # свою же суммаризационную петлю (notify_summary_pending).
         self._notes = NoteService(settings, embedding=embedding)
+        # Причёска (Фаза 10, Шаг 4): классификатор default-заметок после
+        # суммаризации; None — тестовый режим без классификации.
+        self._classifier = classifier
+        # Реестр неймспейсов: известные узлы для классификатора и проверка
+        # целевого узла авто-переезда.
+        self._namespaces = NamespaceService(settings)
         self._vector_interval = float(max(settings.pending_retry_sec, 0))
         self._summary_interval = float(max(settings.pending_retry_sec, 0))
         self._chunk_interval = float(max(settings.pending_retry_sec, 0))
@@ -511,7 +520,7 @@ class BackgroundWorker:
             return 0
         with session(self._settings) as conn:
             rows = conn.execute(
-                "SELECT id, text FROM notes "
+                "SELECT id, text, namespace, classified_at FROM notes "
                 "WHERE summary_status = 'pending' AND deleted_at IS NULL "
                 "ORDER BY id LIMIT ?",
                 (limit,),
@@ -534,7 +543,91 @@ class BackgroundWorker:
                 )
             if cursor.rowcount:
                 done += 1
+                # Причёска (Фаза 10, Шаг 4): после суммаризации default-заметки
+                # (ещё не классифицированной) — разметка и авто-переезд.
+                if row["namespace"] == "default" and row["classified_at"] is None:
+                    self._classify_default_note(int(row["id"]), row["text"])
         return done
+
+    # --- причёска (Фаза 10, Шаг 4) -------------------------------------------
+
+    def _classify_default_note(self, note_id: int, text: str) -> None:
+        """Разметить default-заметку после суммаризации; авто-переезд.
+
+        Только default-заметки (уложенные не перетряхиваются, §5.7) и только
+        один проход (classified_at — анти-зацикливание; повтор — после
+        memory_update, который сбрасывает summary в pending). Отказ
+        классификатора (ClassificationError) данные не портит: заметка
+        остаётся в default, classified_at не ставится — повтор при следующем
+        обновлении.
+
+        Авто-переезд в существующий узел — при confidence ≥
+        NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE: в существующий лист (если
+        subdomain_hint совпал с зарегистрированным), иначе в корень домена;
+        новый лист (subdomain_hint не зарегистрирован) остаётся в default —
+        его создаст триггер (Шаг 5) и переложит ретро-перекладкой. Переезд
+        ставит vector_status='pending' — воркер пере-кодирует вектор в
+        партицию нового неймспейса (старый вектор уходит DELETE+INSERT).
+        """
+        if self._classifier is None:
+            return  # тестовый режим без классификатора
+        known = self._namespaces.list_all()["namespaces"]
+        try:
+            result = self._classifier.classify(text, known)
+        except ClassificationError:
+            logging.getLogger("app").warning(
+                "classify: failed — note stays in default, retry on next update",
+                extra={"event": "classify_failed", "note_id": note_id},
+            )
+            return
+        with session(self._settings) as conn, transaction(conn):
+            conn.execute(
+                "UPDATE notes SET domain_hint = ?, subdomain_hint = ?, "
+                "confidence = ?, "
+                "classified_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (result.domain_hint, result.subdomain_hint, result.confidence, note_id),
+            )
+        target = self._auto_move_target(result)
+        if (
+            target is not None
+            and result.confidence >= self._settings.namespace_auto_move_min_confidence
+        ):
+            with session(self._settings) as conn, transaction(conn):
+                conn.execute(
+                    "UPDATE notes SET namespace = ?, vector_status = 'pending' "
+                    "WHERE id = ? AND deleted_at IS NULL",
+                    (target, note_id),
+                )
+            logging.getLogger("app").info(
+                "classify: default note auto-moved into existing node",
+                extra={
+                    "event": "classified_moved",
+                    "note_id": note_id,
+                    "namespace": target,
+                    "confidence": result.confidence,
+                },
+            )
+
+    def _auto_move_target(self, result) -> str | None:
+        """Целевой узел авто-переезда (только существующие узлы, §5.7).
+
+        domain_hint — корень из реестра; если он не зарегистрирован (модель
+        предложила новый корень — корни только оператор) — не двигаем.
+        subdomain_hint: зарегистрированный лист → в него; новый лист → None
+        (остаётся в default, триггер Шага 5 создаст и переложит); null →
+        в корень домена (общая для домена заметка).
+        """
+        if not result.domain_hint:
+            return None
+        if not self._namespaces.exists(result.domain_hint):
+            return None
+        if result.subdomain_hint:
+            leaf = f"{result.domain_hint}/{result.subdomain_hint}"
+            if self._namespaces.exists(leaf):
+                return leaf
+            return None  # новый лист — триггер (Шаг 5) создаст и переложит
+        return result.domain_hint
 
     # --- чанковая очередь (Фаза 7) ---------------------------------------------
 
