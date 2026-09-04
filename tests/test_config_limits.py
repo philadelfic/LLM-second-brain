@@ -14,11 +14,11 @@ import pytest
 from app.config import ConfigError, Settings, load_settings
 
 REQUIRED_ENV: dict[str, str] = {
-    "OLLAMA_BASE_URL": "http://192.168.3.113:11434",
-    "SUMMARY_OLLAMA_BASE_URL": "http://192.168.3.112:11434",
+    "EMBEDDING_BASE_URL": "http://192.168.3.113:11434",
+    "SUMMARY_BASE_URL": "http://192.168.3.112:11434",
     "SUMMARY_MODEL": "ornith-1.5:35b",
-    "DEDUP_JUDGE_OLLAMA_BASE_URL": "http://192.168.3.112:11434",
-    "DEDUP_JUDGE_MODEL": "ornith-1.5:35b",
+    "JUDGE_BASE_URL": "http://192.168.3.112:11434",
+    "JUDGE_MODEL": "ornith-1.5:35b",
     "MCP_AUTH_TOKEN": "test-secret-token",
 }
 
@@ -52,8 +52,8 @@ class TestIntLimits:
             ("EMBEDDING_DIM", "0"),
             ("SUMMARY_NUM_PREDICT", "0"),
             ("SUMMARY_TIMEOUT_SEC", "0"),
-            ("DEDUP_JUDGE_NUM_PREDICT", "0"),
-            ("DEDUP_JUDGE_TIMEOUT_SEC", "-30"),
+            ("JUDGE_NUM_PREDICT", "0"),
+            ("JUDGE_TIMEOUT_SEC", "-30"),
             ("DEDUP_CANDIDATE_TOP_N", "0"),
             ("BACKUP_INTERVAL_SEC", "0"),
             ("BACKUP_KEEP", "0"),
@@ -149,12 +149,12 @@ class TestStringValidation:
             load_env(monkeypatch, LOG_LEVEL="TRASH")
 
     def test_url_without_scheme_is_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        with pytest.raises(ConfigError, match="ollama_base_url"):
-            load_env(monkeypatch, OLLAMA_BASE_URL="192.168.3.113:11434")
-        with pytest.raises(ConfigError, match="summary_ollama_base_url"):
-            load_env(monkeypatch, SUMMARY_OLLAMA_BASE_URL="localhost:11434")
-        with pytest.raises(ConfigError, match="dedup_judge_ollama_base_url"):
-            load_env(monkeypatch, DEDUP_JUDGE_OLLAMA_BASE_URL="192.168.3.112:11434")
+        with pytest.raises(ConfigError, match="embedding_base_url"):
+            load_env(monkeypatch, EMBEDDING_BASE_URL="192.168.3.113:11434")
+        with pytest.raises(ConfigError, match="summary_base_url"):
+            load_env(monkeypatch, SUMMARY_BASE_URL="localhost:11434")
+        with pytest.raises(ConfigError, match="judge_base_url"):
+            load_env(monkeypatch, JUDGE_BASE_URL="192.168.3.112:11434")
 
     def test_mcp_path_must_start_with_slash(
         self, monkeypatch: pytest.MonkeyPatch

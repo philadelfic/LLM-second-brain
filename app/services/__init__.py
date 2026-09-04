@@ -52,7 +52,7 @@ class Services:
     embedding: EmbeddingService
     dedup: DeduplicationService
     summary: SummaryService  # воркер — единственный потребитель (режим «Б»)
-    dedup_judge: JudgeService  # судья дедупа — воркер, решение по кандидатам (Этап 3.2)
+    judge: JudgeService  # судья дедупа — воркер, решение по кандидатам (Этап 3.2)
     backup: BackupService  # петля снапшотов — asyncio-таска в lifespan
     namespaces: NamespaceService  # реестр узлов (Фаза 10, memory_namespaces)
     classifier: ClassificationService  # причёска default-заметок (Фаза 10, Шаг 4)
@@ -87,7 +87,7 @@ def build_services(
         embedding=embedding,
         dedup=dedup,
         summary=summary if summary is not None else SummaryService(settings),
-        dedup_judge=judge if judge is not None else JudgeService(settings),
+        judge=judge if judge is not None else JudgeService(settings),
         backup=BackupService(settings, namespaces=namespaces),
         namespaces=namespaces,
         classifier=ClassificationService(settings),

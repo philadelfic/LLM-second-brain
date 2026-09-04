@@ -71,7 +71,7 @@ def _make_client(
             embedding=embedding,
             dedup=dedup,
             summary=summarizer,
-            dedup_judge=JudgeService(settings),  # loopback:1: недоступен — Eтап 3.2
+            judge=JudgeService(settings),  # loopback:1: недоступен — Eтап 3.2
             backup=BackupService(settings),  # Фаза 5: петля снапшотов в lifespan
             namespaces=namespaces,
             classifier=FixedClassifier(),  # Фаза 10, Шаг 4: причёска (общая разметка)

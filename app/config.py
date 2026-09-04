@@ -1,7 +1,7 @@
 """Env-парсер — все переменные окружения из REQUIREMENTS §8.
 
-Обязательные переменные (`OLLAMA_BASE_URL`, `SUMMARY_OLLAMA_BASE_URL`,
-`SUMMARY_MODEL`, `DEDUP_JUDGE_OLLAMA_BASE_URL`, `DEDUP_JUDGE_MODEL`,
+Обязательные переменные (`EMBEDDING_BASE_URL`, `SUMMARY_BASE_URL`,
+`SUMMARY_MODEL`, `JUDGE_BASE_URL`, `JUDGE_MODEL`,
 `MCP_AUTH_TOKEN`) умолчаний не имеют: отсутствие или пустое
 значение — фатальная ошибка старта (NFR-2). Остальные имеют значения по
 умолчанию из таблицы REQUIREMENTS §8.
@@ -22,6 +22,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Допустимые уровни логирования (NFR-4: LOG_LEVEL); имя плывёт в std logging.
 LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
+# Допустимые провайдеры LLM-слотов (Фаза 11, решение №1): ollama — нативный
+# API, openai — OpenAI-совместимый (Bearer).
+LLM_PROVIDERS = frozenset({"ollama", "openai"})
+
+# Максимум слов в названии заметки (решение №9 брифа Фазы 11): зашитая
+# константа, НЕ env. Слова = len(title.split()).
+TITLE_MAX_WORDS = 5
+
 
 class ConfigError(RuntimeError):
     """Фатальная ошибка конфигурации: сервис обязан отказаться стартовать."""
@@ -41,12 +49,26 @@ class Settings(BaseSettings):
     )
 
     # --- обязательные (REQUIREMENTS §8: «обязательна», без умолчания) ---
-    ollama_base_url: str = Field(...)  # Ollama векторизации
-    summary_ollama_base_url: str = Field(...)  # Ollama суммаризации
+    embedding_base_url: str = Field(...)  # адрес API слота embedding (Фаза 11)
+    summary_base_url: str = Field(...)  # адрес API слота summary (Фаза 11)
     summary_model: str = Field(...)  # генеративная модель суммаризации
-    dedup_judge_ollama_base_url: str = Field(...)  # Ollama судьи дедупа (Фаза 8)
-    dedup_judge_model: str = Field(...)  # модель-судья дедупа (Фаза 8)
+    judge_base_url: str = Field(...)  # адрес API слота judge (Фаза 11)
+    judge_model: str = Field(...)  # модель-судья дедупа (Фаза 11)
     mcp_auth_token: str = Field(...)  # Bearer-токен (NFR-2)
+
+    # --- провайдеры per-slot (Фаза 11, решение №1): ollama — дефолт | openai ---
+    embedding_provider: str = "ollama"
+    summary_provider: str = "ollama"
+    judge_provider: str = "ollama"
+
+    # --- API-ключи per-slot (Фаза 11, решение №3): опциональны, default "" ---
+    embedding_api_key: str = ""
+    summary_api_key: str = ""
+    judge_api_key: str = ""
+
+    # --- каталог редактируемых промптов (Фаза 11, решение №7): не задан —
+    # файловая механика не активна, используются встроенные константы ---
+    prompts_dir: str | None = None
 
     # --- векторизация ---
     embedding_model: str = "qwen3-embedding:8b"
@@ -86,10 +108,11 @@ class Settings(BaseSettings):
     # --- фоновый дедуп (Фаза 8, Этап 2.1): кандидат-предфильтр до сводки ---
     dedup_candidate_top_n: int = 3  # топ-N кандидатов (проверит судья, Этап 3)
     dedup_candidate_similarity: float = 0.80  # нижний порог кандидата-перефраза
-    # --- LLM-судья дедупа (Фаза 8, Этап 3.1): ornith-1.5:35b, think:false ---
-    dedup_judge_think: bool = False  # при false в вызов идёт "think": false
-    dedup_judge_num_predict: int = 256  # бюджет вердикта (судье хватает)
-    dedup_judge_timeout_sec: int = 30  # клиентский таймаут вызова судьи
+    # --- LLM-судья дедупа (Фаза 8, Этап 3.1; Фаза 11 — блок переименован в judge_*):
+    # ornith-1.5:35b, think:false ---
+    judge_think: bool = False  # при false в вызов идёт "think": false
+    judge_num_predict: int = 256  # бюджет вердикта (судье хватает)
+    judge_timeout_sec: int = 30  # клиентский таймаут вызова судьи
     rrf_k: int = 60
 
     # --- лимиты (NFR-6: env-переопределяемы, валидируются; см. _validate_ranges) ---
@@ -119,15 +142,15 @@ class Settings(BaseSettings):
     # Судья структуры (Фаза 10): отдельный флаг think — дедуп-судья остаётся
     # думающим (решение Фазы 8), судья структуры бездумный (E2E Шага 7:
     # думающий «залипал» на парах-близнецах, голодая суммаризацию; вердикт
-    # — 10–50 токенов, рассуждения не нужны). None — наследует DEDUP_JUDGE_THINK.
+    # — 10–50 токенов, рассуждения не нужны). None — наследует JUDGE_THINK.
     namespace_judge_think: bool | None = None
 
     @field_validator(
-        "ollama_base_url",
-        "summary_ollama_base_url",
+        "embedding_base_url",
+        "summary_base_url",
         "summary_model",
-        "dedup_judge_ollama_base_url",
-        "dedup_judge_model",
+        "judge_base_url",
+        "judge_model",
         "mcp_auth_token",
     )
     @classmethod
@@ -136,6 +159,17 @@ class Settings(BaseSettings):
         if not value or not value.strip():
             raise ValueError("обязательная переменная пуста — задай значение")
         return value
+
+    @field_validator("embedding_provider", "summary_provider", "judge_provider")
+    @classmethod
+    def _validate_provider(cls, value: str) -> str:
+        """Провайдер слота — один из {ollama, openai} (Фаза 11, решение №1)."""
+        provider = value.strip().lower()
+        if provider not in LLM_PROVIDERS:
+            raise ValueError(
+                "провайдер — один из " + ", ".join(sorted(LLM_PROVIDERS))
+            )
+        return provider
 
     @field_validator("log_level")
     @classmethod
@@ -173,12 +207,8 @@ class Settings(BaseSettings):
         if not self.mcp_path.startswith("/"):
             errors.append("  - mcp_path: путь должен начинаться с «/»")
 
-        # --- внешние Ollama: только http(s) ---
-        for field in (
-            "ollama_base_url",
-            "summary_ollama_base_url",
-            "dedup_judge_ollama_base_url",
-        ):
+        # --- внешние API-слоты: только http(s) ---
+        for field in ("embedding_base_url", "summary_base_url", "judge_base_url"):
             url = getattr(self, field)
             if not url.strip().startswith(("http://", "https://")):
                 errors.append(f"  - {field}: ожидается URL с http:// или https://")
@@ -215,9 +245,10 @@ class Settings(BaseSettings):
         need_low("summary_num_predict", self.summary_num_predict, 1)
         need_low("merge_num_predict", self.merge_num_predict, 1)
         need_low("summary_timeout_sec", self.summary_timeout_sec, 1)
-        # LLM-судья дедупа (Фаза 8, Этап 3.1): бюджет и таймаут ≥ 1 (NFR-6).
-        need_low("dedup_judge_num_predict", self.dedup_judge_num_predict, 1)
-        need_low("dedup_judge_timeout_sec", self.dedup_judge_timeout_sec, 1)
+        # LLM-судья дедупа (Фаза 8, Этап 3.1; Фаза 11 — judge_*): бюджет и
+        # таймаут ≥ 1 (NFR-6).
+        need_low("judge_num_predict", self.judge_num_predict, 1)
+        need_low("judge_timeout_sec", self.judge_timeout_sec, 1)
 
         # --- чанковая индексация (Фаза 7) ---
         if self.text_splitter.strip().lower() != "tiktoken":

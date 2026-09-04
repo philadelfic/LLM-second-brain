@@ -109,9 +109,9 @@ class JudgeService:
         if transport is not None and not isinstance(transport, httpx.BaseTransport):
             transport = httpx.MockTransport(transport)
         self._client = httpx.Client(
-            base_url=settings.dedup_judge_ollama_base_url,
+            base_url=settings.judge_base_url,
             timeout=httpx.Timeout(
-                settings.dedup_judge_timeout_sec, connect=CONNECT_TIMEOUT_SEC
+                settings.judge_timeout_sec, connect=CONNECT_TIMEOUT_SEC
             ),
             transport=transport,
         )
@@ -145,7 +145,7 @@ class JudgeService:
     def _payload(self, text_new: str, text_candidate: str) -> dict[str, Any]:
         """Тело вызова /api/chat к судье (решения брифа Фазы 8)."""
         payload: dict[str, Any] = {
-            "model": self._settings.dedup_judge_model,
+            "model": self._settings.judge_model,
             "messages": [
                 {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
                 {
@@ -156,11 +156,11 @@ class JudgeService:
                 },
             ],
             "stream": False,
-            "num_predict": self._settings.dedup_judge_num_predict,
+            "num_predict": self._settings.judge_num_predict,
             "temperature": TEMPERATURE,
             "keep_alive": KEEP_ALIVE,
         }
-        if not self._settings.dedup_judge_think:
+        if not self._settings.judge_think:
             # Решение Олега (2026-08-30): судья не думает — быстрее.
             payload["think"] = False
         return payload
@@ -170,14 +170,14 @@ class JudgeService:
         try:
             # Очередь F1: один запрос к серверу в момент времени (тот же
             # base_url, что у суммаризатора, — слот общий на оба сервиса).
-            with ollama_slot(self._settings.dedup_judge_ollama_base_url):
+            with ollama_slot(self._settings.judge_base_url):
                 response = self._client.post(
                     "/api/chat", json=self._payload(text_new, text_candidate)
                 )
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise JudgeError(
                 "сервер судьи недоступен "
-                f"({self._settings.dedup_judge_ollama_base_url}): {exc}"
+                f"({self._settings.judge_base_url}): {exc}"
             ) from exc
         return self._parse(response)
 

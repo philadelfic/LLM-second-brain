@@ -128,7 +128,7 @@ def test_request_url_path_and_model(monkeypatch) -> None:
     service.summarize(NOTE)
     request = recorder.requests[0]
     assert request.url.path == "/api/chat"
-    assert str(request.url).startswith(settings.summary_ollama_base_url)
+    assert str(request.url).startswith(settings.summary_base_url)
     payload = last_payload(recorder)
     assert payload["model"] == settings.summary_model
 

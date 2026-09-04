@@ -72,8 +72,8 @@ def live(tmp_path_factory) -> SimpleNamespace:
         pytest.skip(f"живая Ollama недоступна: {url}")
     db_path = tmp_path_factory.mktemp("live") / "notes.db"
     settings = Settings(
-        ollama_base_url=url,
-        summary_ollama_base_url=url,  # в Фазе 3 суммаризация не вызывается
+        embedding_base_url=url,
+        summary_base_url=url,  # в Фазе 3 суммаризация не вызывается
         summary_model="unused-in-phase-3",
         mcp_auth_token="live-integration-token",
         db_path=str(db_path),
@@ -178,7 +178,7 @@ def test_offline_save_then_worker_repairs(live) -> None:
     """Запись мгновенная (Фаза 8): заметка сразу с vector_status=pending;
     живой воркер доводит до ok."""
     offline_settings = live.settings.model_copy(
-        update={"ollama_base_url": "http://127.0.0.1:1"}
+        update={"embedding_base_url": "http://127.0.0.1:1"}
     )
     notes_broken = NoteService(offline_settings, FailingEmbedder())
     saved = notes_broken.save(
@@ -231,8 +231,8 @@ def live_summary(tmp_path_factory) -> SimpleNamespace:
     if not _reachable(url):
         pytest.skip(f"живая Ollama суммаризации недоступна: {url}")
     settings = Settings(
-        ollama_base_url=os.environ.get("LIVE_OLLAMA_URL", LIVE_URL_DEFAULT),
-        summary_ollama_base_url=url,
+        embedding_base_url=os.environ.get("LIVE_OLLAMA_URL", LIVE_URL_DEFAULT),
+        summary_base_url=url,
         summary_model=model,
         mcp_auth_token="live-summary-token",
         db_path=str(tmp_path_factory.mktemp("live-summary") / "notes.db"),
@@ -331,13 +331,13 @@ def test_live_promotion_describes_judges_resolves(
     печатается (бриф Ф10: фон — не влияет на save).
     """
     db = tmp_path_factory.mktemp("live-promo") / "notes.db"
-    # Судья структуры — модель судьи дедупа (DEDUP_JUDGE_*): в проде это
+    # Судья структуры — модель судьи дедупа (JUDGE_*): в проде это
     # тот же стенд 112 с ornith-1.5:35b, что и суммаризация (§8).
     settings = live_summary.settings.model_copy(
         update={
             "db_path": str(db),
-            "dedup_judge_ollama_base_url": _live_summary_url(),
-            "dedup_judge_model": _live_summary_model(),
+            "judge_base_url": _live_summary_url(),
+            "judge_model": _live_summary_model(),
         }
     )
     init_db(settings)
@@ -413,8 +413,8 @@ def test_live_summary_timeout_fails_fast(tmp_path_factory) -> None:
     url = _live_summary_url()
     assert _reachable(url)  # скипнут на уровне fixture, если сервер «вон»
     short = Settings(
-        ollama_base_url=os.environ.get("LIVE_OLLAMA_URL", LIVE_URL_DEFAULT),
-        summary_ollama_base_url=url,
+        embedding_base_url=os.environ.get("LIVE_OLLAMA_URL", LIVE_URL_DEFAULT),
+        summary_base_url=url,
         summary_model=_live_summary_model(),
         mcp_auth_token="live-summary-token",
         summary_timeout_sec=1,  # read меньше любой генерации 35B-модели
@@ -508,8 +508,8 @@ def live_chunks(tmp_path_factory) -> SimpleNamespace:
     if not _reachable(url):
         pytest.skip(f"живая Ollama недоступна: {url}")
     settings = Settings(
-        ollama_base_url=url,
-        summary_ollama_base_url=url,
+        embedding_base_url=url,
+        summary_base_url=url,
         summary_model="unused-in-phase-7",
         mcp_auth_token="live-chunk-token",
         db_path=str(tmp_path_factory.mktemp("live-chunks") / "notes.db"),
@@ -543,7 +543,7 @@ def _embed_full_slow(settings: Settings, text: str) -> list[float]:
     детерминирована), есть httpx-вызов напрямую, ollama /api/embed.
     """
     response = httpx.post(
-        str(settings.ollama_base_url).rstrip("/") + "/api/embed",
+        str(settings.embedding_base_url).rstrip("/") + "/api/embed",
         json={"model": settings.embedding_model, "input": text},
         timeout=httpx.Timeout(2.0, read=300.0),
     )

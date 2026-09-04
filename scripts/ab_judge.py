@@ -64,14 +64,14 @@ def main() -> None:
     args = parser.parse_args()
 
     base_settings = {
-        "ollama_base_url": "http://192.168.3.113:11434",
-        "summary_ollama_base_url": "http://192.168.3.112:11434",
+        "embedding_base_url": "http://192.168.3.113:11434",
+        "summary_base_url": "http://192.168.3.112:11434",
         "summary_model": "unused-ab",
-        "dedup_judge_ollama_base_url": "http://192.168.3.112:11434",
-        "dedup_judge_model": "ornith:35b",
-        "dedup_judge_num_predict": 1024,
-        "dedup_judge_timeout_sec": 300,
-        "dedup_judge_think": True,  # дедум-конфиг (судья структуры переопределяет своим флагом)
+        "judge_base_url": "http://192.168.3.112:11434",
+        "judge_model": "ornith:35b",
+        "judge_num_predict": 1024,
+        "judge_timeout_sec": 300,
+        "judge_think": True,  # дедум-конфиг (судья структуры переопределяет своим флагом)
         "mcp_auth_token": "ab-token",
         "db_path": "/tmp/ab-judge-notes.db",  # судья БД не трогает — заглушка
     }

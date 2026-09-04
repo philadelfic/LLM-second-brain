@@ -111,7 +111,7 @@ class TestFreshSchema:
                 row["name"]: row for row in conn.execute("PRAGMA table_info(notes)")
             }
         assert set(columns) == {
-            "id", "text", "summary", "author", "vector_status",
+            "id", "text", "title", "summary", "author", "vector_status",
             "summary_status", "created_at", "updated_at", "deleted_at",
             "namespace", "classified_at", "domain_hint", "subdomain_hint",
             "confidence",

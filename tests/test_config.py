@@ -13,11 +13,11 @@ from app.config import ConfigError, Settings, get_settings, load_settings
 
 # Обязательные переменные (REQUIREMENTS §8 — «обязательна», без умолчания).
 REQUIRED_ENV: dict[str, str] = {
-    "OLLAMA_BASE_URL": "http://192.168.3.113:11434",
-    "SUMMARY_OLLAMA_BASE_URL": "http://192.168.3.112:11434",
+    "EMBEDDING_BASE_URL": "http://192.168.3.113:11434",
+    "SUMMARY_BASE_URL": "http://192.168.3.112:11434",
     "SUMMARY_MODEL": "ornith-1.5:35b",
-    "DEDUP_JUDGE_OLLAMA_BASE_URL": "http://192.168.3.112:11434",
-    "DEDUP_JUDGE_MODEL": "ornith-1.5:35b",
+    "JUDGE_BASE_URL": "http://192.168.3.112:11434",
+    "JUDGE_MODEL": "ornith-1.5:35b",
     "MCP_AUTH_TOKEN": "test-secret-token",
 }
 
@@ -26,6 +26,16 @@ REQUIRED_ENV: dict[str, str] = {
 OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "EMBEDDING_MODEL": ("embedding_model", "qwen3-embedding:8b"),
     "EMBEDDING_DIM": ("embedding_dim", 4096),
+    # Фаза 11: провайдеры per-slot (ollama — дефолт | openai).
+    "EMBEDDING_PROVIDER": ("embedding_provider", "ollama"),
+    "SUMMARY_PROVIDER": ("summary_provider", "ollama"),
+    "JUDGE_PROVIDER": ("judge_provider", "ollama"),
+    # Фаза 11: API-ключи per-slot (опциональны, default "").
+    "EMBEDDING_API_KEY": ("embedding_api_key", ""),
+    "SUMMARY_API_KEY": ("summary_api_key", ""),
+    "JUDGE_API_KEY": ("judge_api_key", ""),
+    # Фаза 11: каталог редактируемых промптов (опционален).
+    "PROMPTS_DIR": ("prompts_dir", None),
     # Фаза 7: чанковая индексация (bundle §4 brief — в compose как §8).
     "TEXT_SPLITTER": ("text_splitter", "tiktoken"),
     "CHUNK_SIZE": ("chunk_size", 1024),
@@ -51,9 +61,9 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "DEDUP_CANDIDATE_TOP_N": ("dedup_candidate_top_n", 3),
     "DEDUP_CANDIDATE_SIMILARITY": ("dedup_candidate_similarity", 0.80),
     # Фаза 8 (Этап 3.1): LLM-судья дедупа ornith-1.5:35b (think:false).
-    "DEDUP_JUDGE_THINK": ("dedup_judge_think", False),
-    "DEDUP_JUDGE_NUM_PREDICT": ("dedup_judge_num_predict", 256),
-    "DEDUP_JUDGE_TIMEOUT_SEC": ("dedup_judge_timeout_sec", 30),
+    "JUDGE_THINK": ("judge_think", False),
+    "JUDGE_NUM_PREDICT": ("judge_num_predict", 256),
+    "JUDGE_TIMEOUT_SEC": ("judge_timeout_sec", 30),
     "RRF_K": ("rrf_k", 60),
     "MAX_NOTE_CHARS": ("max_note_chars", 35000),
     "MAX_QUERY_CHARS": ("max_query_chars", 512),
@@ -72,7 +82,7 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "NAMESPACE_MAX_LEAVES_PER_DOMAIN": ("namespace_max_leaves_per_domain", 12),
     "NAMESPACE_GROOM_MIN_NOTES": ("namespace_groom_min_notes", 2),
     # Фаза 10.1: флаг think судьи структуры отделён от дедуп-судьи (A/B Шага 7);
-    # умолчание None = наследует DEDUP_JUDGE_THINK.
+    # умолчание None = наследует JUDGE_THINK.
     "NAMESPACE_JUDGE_THINK": ("namespace_judge_think", None),
 }
 
@@ -99,9 +109,10 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 49 полей: 6 обязательных + 43 с умолчаниями
+        """В Settings — ровно 57 полей: 6 обязательных + 51 с умолчаниями
         (25 §8 + 6 чанковых Фазы 7 + 2 фонового дедупа + 3 судьи Фазы 8
-        + 8 неймспейсов Фазы 10; NAMESPACE_JUDGE_THINK — умолчание None)."""
+        + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера + 3 ключа
+        + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected
@@ -158,11 +169,11 @@ class TestDefaults:
 
     def test_required_values_passed_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
         settings = load_env(monkeypatch)
-        assert settings.ollama_base_url == "http://192.168.3.113:11434"
-        assert settings.summary_ollama_base_url == "http://192.168.3.112:11434"
+        assert settings.embedding_base_url == "http://192.168.3.113:11434"
+        assert settings.summary_base_url == "http://192.168.3.112:11434"
         assert settings.summary_model == "ornith-1.5:35b"
-        assert settings.dedup_judge_ollama_base_url == "http://192.168.3.112:11434"
-        assert settings.dedup_judge_model == "ornith-1.5:35b"
+        assert settings.judge_base_url == "http://192.168.3.112:11434"
+        assert settings.judge_model == "ornith-1.5:35b"
         assert settings.mcp_auth_token == "test-secret-token"
 
 
@@ -187,13 +198,13 @@ class TestOverrides:
         for value in ("false", "0", "off"):
             assert load_env(monkeypatch, SUMMARY_THINK=value).summary_think is False
             assert load_env(
-                monkeypatch, DEDUP_JUDGE_THINK=value
-            ).dedup_judge_think is False
+                monkeypatch, JUDGE_THINK=value
+            ).judge_think is False
         for value in ("true", "1", "on"):
             assert load_env(monkeypatch, SUMMARY_THINK=value).summary_think is True
             assert load_env(
-                monkeypatch, DEDUP_JUDGE_THINK=value
-            ).dedup_judge_think is True
+                monkeypatch, JUDGE_THINK=value
+            ).judge_think is True
 
     def test_string_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         settings = load_env(monkeypatch, MCP_PATH="/memory", LOG_LEVEL="DEBUG")
@@ -207,6 +218,72 @@ class TestOverrides:
     def test_invalid_bool_is_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
         with pytest.raises(ConfigError):
             load_env(monkeypatch, SUMMARY_THINK="maybe")
+
+
+class TestProvidersAndKeys:
+    """Фаза 11: провайдеры per-slot ∈ {ollama, openai}, ключи опциональны."""
+
+    @pytest.mark.parametrize("env_name", ["EMBEDDING_PROVIDER", "SUMMARY_PROVIDER", "JUDGE_PROVIDER"])
+    def test_provider_outside_ollama_openai_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, env_name: str
+    ) -> None:
+        with pytest.raises(ConfigError, match="провайдер"):
+            load_env(monkeypatch, **{env_name: "anthropic"})
+
+    def test_provider_defaults_to_ollama(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        settings = load_env(monkeypatch)
+        assert settings.embedding_provider == "ollama"
+        assert settings.summary_provider == "ollama"
+        assert settings.judge_provider == "ollama"
+
+    def test_provider_openai_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        settings = load_env(
+            monkeypatch,
+            EMBEDDING_PROVIDER="openai",
+            SUMMARY_PROVIDER="openai",
+            JUDGE_PROVIDER="openai",
+        )
+        assert settings.embedding_provider == "openai"
+        assert settings.summary_provider == "openai"
+        assert settings.judge_provider == "openai"
+
+    def test_api_keys_optional_empty_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Ключи необязательны: пустые/отсутствующие — валидная конфигурация."""
+        settings = load_env(monkeypatch)
+        assert settings.embedding_api_key == ""
+        assert settings.summary_api_key == ""
+        assert settings.judge_api_key == ""
+
+    def test_api_keys_passed_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        settings = load_env(
+            monkeypatch,
+            EMBEDDING_API_KEY="emb-key",
+            SUMMARY_API_KEY="sum-key",
+            JUDGE_API_KEY="judge-key",
+        )
+        assert settings.embedding_api_key == "emb-key"
+        assert settings.summary_api_key == "sum-key"
+        assert settings.judge_api_key == "judge-key"
+
+    def test_prompts_dir_default_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert load_env(monkeypatch).prompts_dir is None
+        settings = load_env(monkeypatch, PROMPTS_DIR="/app/prompts")
+        assert settings.prompts_dir == "/app/prompts"
+
+    def test_base_url_must_be_http(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Три BASE_URL — только http(s) (Фаза 11, контракт)."""
+        with pytest.raises(ConfigError, match="embedding_base_url"):
+            load_env(monkeypatch, EMBEDDING_BASE_URL="192.168.3.113:11434")
+        with pytest.raises(ConfigError, match="summary_base_url"):
+            load_env(monkeypatch, SUMMARY_BASE_URL="localhost:11434")
+        with pytest.raises(ConfigError, match="judge_base_url"):
+            load_env(monkeypatch, JUDGE_BASE_URL="192.168.3.112:11434")
+
+    def test_title_max_words_constant(self) -> None:
+        """TITLE_MAX_WORDS = 5 — зашитая модульная константа (решение №9)."""
+        from app.config import TITLE_MAX_WORDS
+
+        assert TITLE_MAX_WORDS == 5
 
 
 class TestGetSettings:

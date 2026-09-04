@@ -126,14 +126,14 @@ def test_embed_texts_go_through_slot(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_chat_calls_share_slot(monkeypatch: pytest.MonkeyPatch) -> None:
     """Суммаризатор и судья на одном base_url: один /api/chat за раз (E2E-кейс).
 
-    В TEST_ENV SUMMARY_OLLAMA_BASE_URL == DEDUP_JUDGE_OLLAMA_BASE_URL —
+    В TEST_ENV SUMMARY_BASE_URL == JUDGE_BASE_URL —
     как в проде (192.168.3.112): merge (суммаризатор) и вердикт (судья)
     выстраиваются, а не конкурируют за единственный слот сервера.
     """
     settings = get_settings()
     assert (
-        settings.summary_ollama_base_url
-        == settings.dedup_judge_ollama_base_url
+        settings.summary_base_url
+        == settings.judge_base_url
     )
     body = {"message": {"role": "assistant", "content": "**НЕ ДУБЛЬ**"}}
     probe = _ConcurrencyProbe(body)
@@ -153,11 +153,11 @@ def test_servers_are_independent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Векторизация (.113) и суммаризация (.112) — разные серверы: параллельно."""
-    monkeypatch.setenv("OLLAMA_BASE_URL", "http://embed-server:11434")
-    monkeypatch.setenv("SUMMARY_OLLAMA_BASE_URL", "http://chat-server:11434")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "http://embed-server:11434")
+    monkeypatch.setenv("SUMMARY_BASE_URL", "http://chat-server:11434")
     get_settings.cache_clear()
     settings = get_settings()
-    assert settings.ollama_base_url != settings.summary_ollama_base_url
+    assert settings.embedding_base_url != settings.summary_base_url
 
     embed_probe = _ConcurrencyProbe({"embeddings": [[0.1] * settings.embedding_dim]})
     chat_probe = _ConcurrencyProbe(
