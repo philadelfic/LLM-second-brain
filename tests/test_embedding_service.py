@@ -1,6 +1,8 @@
-"""EmbeddingService (Фаза 3, шаг 3.2): контракт /api/embed, ретрай, деградации.
+"""EmbeddingService (Фаза 3, шаг 3.2; Фаза 11 — транспорт через LLMClient).
 
-Юнит-тесты через httpx.MockTransport — без сети; живой Ollama — шаг 3.6
+Контракт embed слота embedding: ollama — POST /api/embed (пейлоад прежний,
+байт-в-байт), openai — POST /v1/embeddings; ретрай, деградации. Юнит-тесты
+через httpx.MockTransport — без сети; живой Ollama — шаг 3.6
 (интеграционные `@pytest.mark.integration`).
 """
 
@@ -109,7 +111,9 @@ def test_wrong_dimension_raises(monkeypatch) -> None:
 def test_missing_embeddings_raises(monkeypatch) -> None:
     settings = make_settings(monkeypatch, dim=DIM)
     service, _ = make_service(settings, [httpx.Response(200, json={"error": "oops"})])
-    with pytest.raises(EmbeddingError, match="на 1 вход"):
+    # Формат ответа без списка векторов режектит клиент слота — контракт
+    # EmbeddingError сохранён (мусор не проходит как «валидные вектора»).
+    with pytest.raises(EmbeddingError, match="неожиданный формат"):
         service.embed("а")
 
 
@@ -180,6 +184,17 @@ def test_connection_refused_raises(monkeypatch) -> None:
     service, recorder = make_service(settings, [httpx.ConnectError("refused")])
     with pytest.raises(EmbeddingError):
         service.embed("а")
+    assert recorder.calls == MAX_ATTEMPTS
+
+
+def test_http_429_retried_once(monkeypatch) -> None:
+    """429 (перегрузка, решение №4) — транзиент: единственный ретрай спасает."""
+    settings = make_settings(monkeypatch, dim=DIM)
+    service, recorder = make_service(
+        settings,
+        [httpx.Response(429, text="busy"), httpx.Response(200, json=ok_body())],
+    )
+    assert len(service.embed("а")) == DIM
     assert recorder.calls == MAX_ATTEMPTS
 
 

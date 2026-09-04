@@ -1,6 +1,6 @@
-"""Замеры Фазы 4 (REQUIREMENTS §10, ARCHITECTURE §4.7): живая Ollama.
+"""Замеры Фазы 4 (REQUIREMENTS §10, ARCHITECTURE §4.7): живой слот summary.
 
-Замеряет на реальной суммаризирующей LLM (SUMMARY_OLLAMA_BASE_URL):
+Замеряет на реальной суммаризирующей LLM (SUMMARY_BASE_URL):
 1) латентность фоновой генерации (тёплые вызовы), отдельно — с reasoning
    (SUMMARY_THINK=true, режим по умолчанию: `think` не отправляется) и
    с `"think": false`;
@@ -90,7 +90,8 @@ def fail(msg: str) -> None:
 def warm_up(live_summary_url: str, live_summary_model: str) -> SummaryService:
     """Холодный старт (~22.6 ГБ) может превышать 60-с таймаут: греем терпеливо.
 
-    keep_alive="15m" — модель останется в памяти до конца прогонов.
+    Фаза 11 (решение №6): keep_alive клиент больше не отправляет — сколько
+    модель живёт в памяти, определяет сервер (OLLAMA_KEEP_ALIVE).
     """
     service = SummaryService(make_settings(True, live_summary_url, live_summary_model))
     text = (
@@ -103,7 +104,7 @@ def warm_up(live_summary_url: str, live_summary_model: str) -> SummaryService:
             service.summarize(text)
             print(
                 f"прогрев: попытка {attempt} — {time.monotonic() - t0:.1f} с; "
-                "модель загружена и остаётся в памяти (keep_alive=15m)"
+                "модель загружена (время жизни — OLLAMA_KEEP_ALIVE сервера)"
             )
             return service
         except Exception as exc:  # noqa: BLE001 — замерочный скрипт
@@ -206,7 +207,7 @@ def main() -> None:
     env = dict(os.environ)
     live_summary_url = env.get("LIVE_SUMMARY_URL", "http://192.168.3.112:11434")
     live_summary_model = env.get("LIVE_SUMMARY_MODEL", "ornith-1.5:35b")
-    vector_url = env.get("LIVE_OLLAMA_URL", "http://192.168.3.113:11434")
+    vector_url = env.get("LIVE_EMBEDDING_URL", "http://192.168.3.113:11434")
     if not reachable(live_summary_url):
         fail(f"Ollama суммаризации недоступна: {live_summary_url}")
     if not reachable(vector_url):
@@ -215,7 +216,10 @@ def main() -> None:
     service.close()
     bench_reasoning(live_summary_url, live_summary_model)
     bench_pipeline(live_summary_url, live_summary_model, vector_url)
-    print("\nГотово: keep_alive держал модель в памяти между замерами (15 м).")
+    print(
+        "\nГотово: время жизни модели на сервере регулируется OLLAMA_KEEP_ALIVE "
+        "(Фаза 11, решение №6 — клиент keep_alive не отправляет)."
+    )
 
 
 if __name__ == "__main__":

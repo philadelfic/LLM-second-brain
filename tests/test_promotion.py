@@ -11,6 +11,8 @@ ScriptedStructureJudge, HashEmbedder); живая модель — интегр�
 
 from __future__ import annotations
 
+import httpx
+import json
 import sqlite3
 
 import pytest
@@ -21,7 +23,6 @@ from app.services.namespaces import NamespaceService
 from app.services.promotion import (
     DescriptionService,
     DescriberError,
-    JUDGE_SYSTEM_PROMPT,
     PromotionService,
     StructureJudgeError,
     StructureJudgeService,
@@ -353,14 +354,25 @@ class TestVerdictParsing:
 class TestJudgeThinkFlag:
     """NAMESPACE_JUDGE_THINK: флаг think судьи структуры отделён от дедуп-судьи
     (E2E Шага 7: думающий вердикт ~40–60 с на вызов при 20 ток/с и «залипал»,
-    голодая суммаризацию; вердикт — 10–50 токенов)."""
+    голодая суммаризацию; вердикт — 10–50 токенов). Фаза 11: think собирается
+    на клиенте слота judge — проверяем фактическое тело chat-запроса."""
 
     def _payload(self, settings) -> dict:
-        judge = StructureJudgeService(settings)
+        """Тело chat-запроса судьи структуры (MockTransport, без сети)."""
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["payload"] = json.loads(request.read().decode())
+            return httpx.Response(
+                200, json={"message": {"role": "assistant", "content": "**СОЗДАТЬ**"}}
+            )
+
+        judge = StructureJudgeService(settings, transport=httpx.MockTransport(handler))
         try:
-            return judge._payload(JUDGE_SYSTEM_PROMPT, "x")
+            judge.review("описание кандидата", "slug", "work", [], None, None)
         finally:
             judge.close()
+        return captured["payload"]
 
     def test_namespace_judge_think_false_sends_think_false(self, settings, monkeypatch) -> None:
         monkeypatch.setenv("NAMESPACE_JUDGE_THINK", "false")

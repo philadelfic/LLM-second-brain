@@ -55,31 +55,23 @@ from typing import Any, Protocol
 import httpx
 
 from app.config import Settings
+from app.services.llm_client import LLMClient, LLMError, SlotSpec
 from app.services.namespaces import (
     NamespaceService,
     count_sentences,
     normalize_slug,
 )
-from app.services.ollama_gate import ollama_slot
+from app.services.prompts import PromptRegistry
 from app.storage.db import DEFAULT_NAMESPACE, session, transaction
 
 # Описания кандидата строятся по суммари: топ по confidence, детерминированно.
 SUMMARIES_PER_CANDIDATE = 3
 
-# Кусок тела ответа в тексте ошибки (логи не захламляем).
-_ERROR_BODY_CHARS = 120
-
-# Таймауты: connect 2 с (LAN), чтение 30 с — короткие ответы (как
-# классификатор Шага 4: маленький num_predict, reasoning не нужен).
-CONNECT_TIMEOUT_SEC = 2.0
-PROMOTION_TIMEOUT_SEC = 30
-
-# Параметры вызова, не настраиваемые env: маленькие бюджеты, нулевая
-# температура — детерминированные вердикты; keep_alive — модель живёт между
-# операциями (описания и вердикты редки).
+# Параметры вызова, не настраиваемые env: маленький бюджет описания
+# (think:false — короткий ответ). Таймауты/температура — уровень клиента
+# слота (LLMClient, Фаза 11): read-таймаут per-slot из Settings;
+# keep_alive не отправляется никому (решение №6 — моделью управляет сервер).
 DESCRIBE_NUM_PREDICT = 128
-TEMPERATURE = 0.1
-KEEP_ALIVE = "15m"
 
 
 class DescriberError(RuntimeError):
@@ -136,26 +128,15 @@ class StructureJudge(Protocol):
 
     # --- генератор описания (модель суммаризации, паттерн классификатора) ------
 
-DESCRIBE_SYSTEM_PROMPT = (
-    "Ты генератор описаний разделов иерархической памяти. По примерам "
-    "заметок напиши описание раздела: какие заметки в нём живут. Строго "
-    "1–2 коротких предложения, без списков и пояснений — только описание."
-)
-
-DESCRIBE_USER_TEMPLATE = (
-    "Новый подраздел: {domain}/{slug}\n\n"
-    "Примеры заметок раздела (краткие содержания):\n{summaries}"
-)
-
-
 class DescriptionService:
-    """Описание узла через Ollama `POST /api/chat` (модель суммаризации).
+    """Описание узла через chat слота summary (модель суммаризации).
 
     Отдельный маленький вызов (think:false, num_predict 128) — паттерн
-    классификатора Шага 4: та же модель, что суммаризация, слот общий
-    (ollama_gate сериализует вызовы к одному base_url). Слишком длинный
-    ответ обрезается до 2 предложений — контракт описаний (решение О.)
-    соблюдается механикой, а не надеждой на модель.
+    классификатора Шага 4: та же модель, что суммаризация, один клиент
+    слота (Фаза 11: LLMClient слота summary, оллама-вызвы сериализует
+    ollama_slot). Слишком длинный ответ обрезается до 2 предложений —
+    контракт описаний (решение О.) соблюдается механикой, а не надеждой
+    на модель.
     """
 
     def __init__(
@@ -164,14 +145,18 @@ class DescriptionService:
         transport: httpx.BaseTransport
         | Callable[[httpx.Request], httpx.Response]
         | None = None,
+        *,
+        llm: LLMClient | None = None,
+        registry: PromptRegistry | None = None,
     ) -> None:
         self._settings = settings
-        if transport is not None and not isinstance(transport, httpx.BaseTransport):
-            transport = httpx.MockTransport(transport)
-        self._client = httpx.Client(
-            base_url=settings.summary_base_url,
-            timeout=httpx.Timeout(PROMOTION_TIMEOUT_SEC, connect=CONNECT_TIMEOUT_SEC),
-            transport=transport,
+        self._prompts = registry if registry is not None else PromptRegistry()
+        # DI сборки (общий клиент слота summary) или свой клиент с
+        # transport-инъекцией для юнит-тестов (MockTransport).
+        self._llm = (
+            llm
+            if llm is not None
+            else LLMClient(SlotSpec.for_summary(settings), transport=transport)
         )
         # None — попыток не было (health не врёт до первых данных).
         self.last_attempt_ok: bool | None = None
@@ -181,64 +166,29 @@ class DescriptionService:
         if not summaries:
             raise ValueError("describe: ожидается непустой список суммари")
         try:
-            content = self._chat(
-                DESCRIBE_SYSTEM_PROMPT,
-                DESCRIBE_USER_TEMPLATE.format(
+            content = self._llm.chat(
+                self._prompts.describe_system,
+                self._prompts.describe_user.format(
                     domain=domain,
                     slug=slug,
                     summaries="\n".join(f"- {s}" for s in summaries),
                 ),
+                num_predict=DESCRIBE_NUM_PREDICT,
+                think=False,  # короткое описание без рассуждений
             )
-        except DescriberError:
+        except LLMError as exc:
+            # Текст клиента сохраняется: HTTP-статус, адрес слота, hint
+            # про {SLOT}_API_KEY у auth-отказа (решение №4).
             self.last_attempt_ok = False
-            raise
+            raise DescriberError(str(exc)) from exc
         self.last_attempt_ok = True
         return self._trim(content)
 
     def close(self) -> None:
         """Закрыть HTTP-пул (чистое завершение процесса)."""
-        self._client.close()
+        self._llm.close()
 
     # --- внутреннее ---------------------------------------------------------
-
-    def _chat(self, system_prompt: str, user_text: str) -> str:
-        """Один вызов /api/chat + проверки контракта ответа (без ретраев)."""
-        payload = {
-            "model": self._settings.summary_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            "stream": False,
-            "num_predict": DESCRIBE_NUM_PREDICT,
-            "temperature": TEMPERATURE,
-            "keep_alive": KEEP_ALIVE,
-            "think": False,  # короткое описание без рассуждений
-        }
-        try:
-            # Очередь F1: один запрос к серверу в момент времени (та же
-            # модель, что суммаризация — делим слот, не гоняем параллельно).
-            with ollama_slot(self._settings.summary_base_url):
-                response = self._client.post("/api/chat", json=payload)
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
-            raise DescriberError(
-                "сервер генерации описаний недоступен "
-                f"({self._settings.summary_base_url}): {exc}"
-            ) from exc
-        if response.status_code != 200:
-            body = " ".join(response.text[:_ERROR_BODY_CHARS].split())
-            raise DescriberError(f"HTTP {response.status_code} от /api/chat: {body}")
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise DescriberError(f"не-JSON ответ от /api/chat: {exc}") from exc
-        if not isinstance(data, dict):
-            raise DescriberError("неожиданный формат ответа /api/chat (не объект)")
-        message = data.get("message")
-        content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, str) or not content.strip():
-            raise DescriberError("пустой content в ответе генератора описаний")
-        return content.strip()
 
     @staticmethod
     def _trim(content: str) -> str:
@@ -267,26 +217,6 @@ class DescriptionService:
 
 # --- судья структуры (модель судьи дедупа, паттерн Фазы 8) -----------------
 
-JUDGE_SYSTEM_PROMPT = (
-    "Ты судья структуры иерархической памяти. Проверь кандидата на новый "
-    "подраздел. Правила: (1) если смысл кандидата совпадает с существующим "
-    "тематическим узлом (та же тема другими словами) — это слияние, а не "
-    "новый узел; (2) слаг и описание должны быть содержательными: "
-    "бессмысленный, мусорный или пустой по смыслу кандидат — отклонить. "
-    "Ответь строго одной отметкой без пояснений: СОЗДАТЬ — кандидат новый "
-    "и осмысленный; СЛИТЬ <path> — кандидат дублирует существующий узел, "
-    "в качестве path укажи ТОЛЬКО тематический путь из списка «Существующие "
-    "узлы» (никогда — путь кандидата; default — системный своп, слияние с "
-    "ним не бывает); ОТКЛОНИТЬ — кандидат бессмысленный."
-)
-
-JUDGE_USER_TEMPLATE = (
-    "Кандидат: {domain}/{slug} — {description}\n\n"
-    "Существующие узлы:\n{nodes}\n\n"
-    "Ближайший по векторному сходству: {nearest}"
-)
-
-
 # Путь-цель вердикта СЛИТЬ: слаги латиница/цифры/дефис, максимум 2 уровня.
 VERDICT_PATH_RE = re.compile(
     r"[a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(?:-[a-z0-9]+)*)?"
@@ -294,15 +224,17 @@ VERDICT_PATH_RE = re.compile(
 
 
 class StructureJudgeService:
-    """Вердикт судьи структуры через Ollama `POST /api/chat` (non-stream).
+    """Вердикт судьи структуры через chat слота judge (non-stream).
 
-    Модель судьи дедупа (DEDUP_JUDGE_MODEL, REQUIREMENTS §5.7 «та же модель
-    судьи дедупа, отдельный промпт»); параметры вызова — как у JudgeService
-    (Фаза 8): think из DEDUP_JUDGE_THINK, бюджет DEDUP_JUDGE_NUM_PREDICT.
-    Отказ судьи (транспорт) — StructureJudgeError: кандидат остаётся без
-    вердикта и повторяется при следующем прогоне (NFR-3). Плохой вердикт
-    (СЛИТЬ без узла) — тоже StructureJudgeError: недоопределённое решение
-    не превращаем в создание.
+    Модель судьи дедупа (JUDGE_MODEL, REQUIREMENTS §5.7 «та же модель
+    судьи дедупа, отдельный промпт»); Фаза 11: транспорт — общий клиент
+    слота judge (LLMClient), параметры вызова — как у JudgeService
+    (Фаза 8): think из NAMESPACE_JUDGE_THINK (None — наследует
+    JUDGE_THINK), бюджет JUDGE_NUM_PREDICT; keep_alive не отправляется
+    (решение №6). Отказ судьи (транспорт) — StructureJudgeError: кандидат
+    остаётся без вердикта и повторяется при следующем прогоне (NFR-3).
+    Плохой вердикт (СЛИТЬ без узла) — тоже StructureJudgeError:
+    недоопределённое решение не превращаем в создание.
     """
 
     def __init__(
@@ -311,16 +243,18 @@ class StructureJudgeService:
         transport: httpx.BaseTransport
         | Callable[[httpx.Request], httpx.Response]
         | None = None,
+        *,
+        llm: LLMClient | None = None,
+        registry: PromptRegistry | None = None,
     ) -> None:
         self._settings = settings
-        if transport is not None and not isinstance(transport, httpx.BaseTransport):
-            transport = httpx.MockTransport(transport)
-        self._client = httpx.Client(
-            base_url=settings.judge_base_url,
-            timeout=httpx.Timeout(
-                settings.judge_timeout_sec, connect=CONNECT_TIMEOUT_SEC
-            ),
-            transport=transport,
+        self._prompts = registry if registry is not None else PromptRegistry()
+        # DI сборки (общий клиент слота judge) или свой клиент с
+        # transport-инъекцией для юнит-тестов (MockTransport).
+        self._llm = (
+            llm
+            if llm is not None
+            else LLMClient(SlotSpec.for_judge(settings), transport=transport)
         )
         self.last_attempt_ok: bool | None = None
 
@@ -335,9 +269,9 @@ class StructureJudgeService:
     ) -> Verdict:
         """Вердикт по кандидату; любой отказ — StructureJudgeError."""
         try:
-            content = self._chat(
-                JUDGE_SYSTEM_PROMPT,
-                JUDGE_USER_TEMPLATE.format(
+            content = self._llm.chat(
+                self._prompts.structure_judge_system,
+                self._prompts.structure_judge_user.format(
                     domain=domain,
                     slug=slug,
                     description=description,
@@ -352,74 +286,37 @@ class StructureJudgeService:
                         else "нет близких узлов"
                     ),
                 ),
+                num_predict=self._settings.judge_num_predict,
+                think=self._think(),
             )
-        except StructureJudgeError:
+        except LLMError as exc:
+            # Текст клиента сохраняется: HTTP-статус, адрес слота, hint
+            # про {SLOT}_API_KEY у auth-отказа (решение №4).
             self.last_attempt_ok = False
+            raise StructureJudgeError(str(exc)) from exc
+        try:
+            verdict = self._parse(content)
+        except StructureJudgeError:
+            self.last_attempt_ok = False  # нераспознанный вердикт — тоже отказ
             raise
         self.last_attempt_ok = True
-        return self._parse(content)
+        return verdict
 
     def close(self) -> None:
         """Закрыть HTTP-пул (чистое завершение процесса)."""
-        self._client.close()
+        self._llm.close()
 
     # --- внутреннее ---------------------------------------------------------
 
-    def _payload(self, system_prompt: str, user_text: str) -> dict[str, Any]:
-        """Тело вызова /api/chat. Параметры — как у судьи дедупа (Фаза 8),
-        кроме think: флаг отдельный (NAMESPACE_JUDGE_THINK, E2E Шага 7 —
-        думающий судья структуры «залипал» на парах-близнецах при 20 ток/с,
-        голодая суммаризацию на общем слоте; бездумный вердикт — 10–50
-        токенов). None — наследует DEDUP_JUDGE_THINK (дедум-конфиг).
+    def _think(self) -> bool | None:
+        """Флаг think судьи структуры: NAMESPACE_JUDGE_THINK, None —
+        наследует JUDGE_THINK (дедум-конфиг). Флаг отделён от дедуп-судьи
+        (E2E Шага 7 — думающий судья структуры «залипал» на парах-
+        близнецах при 20 ток/с, голодая суммаризацию на общем слоте;
+        бездумный вердикт — 10–50 токенов).
         """
-        payload: dict[str, Any] = {
-            "model": self._settings.judge_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            "stream": False,
-            "num_predict": self._settings.judge_num_predict,
-            "temperature": TEMPERATURE,
-            "keep_alive": KEEP_ALIVE,
-        }
         think = self._settings.namespace_judge_think
-        if think is None:
-            think = self._settings.judge_think
-        if not think:
-            payload["think"] = False
-        return payload
-
-    def _chat(self, system_prompt: str, user_text: str) -> str:
-        """Один вызов /api/chat + проверки контракта ответа (без ретраев)."""
-        try:
-            # Слот общий с судьёй дедупа (тот же base_url) — не гоняем
-            # параллельные вызовы на один Ollama-сервер.
-            with ollama_slot(self._settings.judge_base_url):
-                response = self._client.post(
-                    "/api/chat", json=self._payload(system_prompt, user_text)
-                )
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
-            raise StructureJudgeError(
-                "сервер судьи структуры недоступен "
-                f"({self._settings.judge_base_url}): {exc}"
-            ) from exc
-        if response.status_code != 200:
-            body = " ".join(response.text[:_ERROR_BODY_CHARS].split())
-            raise StructureJudgeError(
-                f"HTTP {response.status_code} от /api/chat: {body}"
-            )
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise StructureJudgeError(f"не-JSON ответ от /api/chat: {exc}") from exc
-        if not isinstance(data, dict):
-            raise StructureJudgeError("неожиданный формат ответа /api/chat (не объект)")
-        message = data.get("message")
-        content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, str) or not content.strip():
-            raise StructureJudgeError("пустой content в ответе судьи структуры")
-        return content.strip()
+        return think if think is not None else self._settings.judge_think
 
     @staticmethod
     def _parse(content: str) -> Verdict:

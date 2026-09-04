@@ -95,6 +95,7 @@ class HealthResponse(BaseModel):
     status: str
     embedding_ok: bool | None  # Фаза 3
     summarizer_ok: bool | None  # Фаза 4
+    judge_ok: bool | None  # Фаза 11: судья дедупа/структуры (слот judge)
     notes_count: int
     pending_vector: int
     pending_summary: int
@@ -126,7 +127,9 @@ def build_rest_router(settings: Settings) -> APIRouter:
         `embedding_ok` — исход последней попытки векторизации (None — попыток
         не было; обновляет EmbeddingService — единая точка всех кодирований);
         `summarizer_ok` — исход последней генерации суммари (None — попыток не
-        было; обновляет SummaryService — все генерации идут из воркера).
+        было; обновляет SummaryService — все генерации идут из воркера);
+        `judge_ok` — исход последнего вызова судьи (Фаза 11: инициализируется
+        стартовой проверкой — ok → True, unreachable → False).
         Счётчики — из БД: активные заметки (trash не обслуживается).
         """
         services = _services(request)
@@ -135,6 +138,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
             status="ok",
             embedding_ok=services.embedding.last_attempt_ok,
             summarizer_ok=services.summary.last_attempt_ok,
+            judge_ok=services.judge.last_attempt_ok,
             notes_count=counts["notes_count"],
             pending_vector=counts["pending_vector"],
             pending_summary=counts["pending_summary"],

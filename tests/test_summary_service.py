@@ -1,9 +1,11 @@
-"""SummaryService (Фаза 4, шаг 1): контракт /api/chat, режим «Б».
+"""SummaryService (Фаза 4, шаг 1; Фаза 11 — транспорт через LLMClient).
 
-Юнит-тесты через httpx.MockTransport — без сети; живая Ollama суммаризации
-(192.168.3.112, ornith-1.5:35b) — шаг 4 фазы (интеграционные, маркер
-`integration`). Контракты: ARCH §4.7 (промпт/параметры), REQUIREMENTS §5.5
-(thinking не ограничивается; пустой content = отказ).
+Контракт chat слота summary: ollama — POST /api/chat (пейлоад прежний
+МИНУС keep_alive — байт-в-байт), openai — /v1/chat/completions; режим «Б».
+Юнит-тесты через httpx.MockTransport — без сети; живой слот summary —
+интеграционные (маркер `integration`). Контракты: ARCH §4.7
+(промпт/параметры), REQUIREMENTS §5.5 (thinking не ограничивается; пустой
+content = отказ), промпты — из реестра (решение №7).
 """
 
 from __future__ import annotations
@@ -14,13 +16,9 @@ import httpx
 import pytest
 
 from app.config import get_settings
-from app.services.summary import (
-    CONNECT_TIMEOUT_SEC,
-    KEEP_ALIVE,
-    TEMPERATURE,
-    SummaryError,
-    SummaryService,
-)
+from app.services.llm_client import CONNECT_TIMEOUT_SEC_OLLAMA
+from app.services.prompts import PromptRegistry
+from app.services.summary import SummaryError, SummaryService
 
 
 def make_settings(monkeypatch: pytest.MonkeyPatch, **env: str):
@@ -66,9 +64,13 @@ class Recorder:
         return len(self.requests)
 
 
-def make_service(settings, actions: list) -> tuple[SummaryService, Recorder]:
+def make_service(settings, actions: list, registry=None) -> tuple[SummaryService, Recorder]:
     recorder = Recorder(actions)
-    service = SummaryService(settings, transport=httpx.MockTransport(recorder.handler))
+    service = SummaryService(
+        settings,
+        transport=httpx.MockTransport(recorder.handler),
+        registry=registry,
+    )
     return service, recorder
 
 
@@ -154,8 +156,72 @@ def test_stream_disabled_and_generation_params(monkeypatch) -> None:
     assert payload["stream"] is False
     assert payload["num_predict"] == settings.summary_num_predict
     assert payload["num_predict"] == settings.summary_num_predict == 35000  # потолок после решения О. 2026-08-30
-    assert payload["temperature"] == TEMPERATURE == 0.1
-    assert payload["keep_alive"] == KEEP_ALIVE == "15m"
+    assert payload["temperature"] == 0.1
+    assert "keep_alive" not in payload  # решение №6: моделью управляет сервер
+
+
+def test_ollama_payload_bytes_minus_keep_alive(monkeypatch) -> None:
+    """Ollama-пейлоад прежний МИНУС keep_alive — байт-в-байт (решение №6).
+
+    Ключи и их порядок ровно как в v2.0 (model, messages, stream,
+    num_predict, temperature), поле keep_alive снято; think при дефолтном
+    SUMMARY_THINK=true не отправляется.
+    """
+    settings = make_settings(monkeypatch)
+    service, recorder = make_service(settings, [httpx.Response(200, json=ok_body())])
+    service.summarize(NOTE)
+    expected = {
+        "model": settings.summary_model,
+        "messages": [
+            {"role": "system", "content": PromptRegistry().summary_system},
+            {"role": "user", "content": NOTE},
+        ],
+        "stream": False,
+        "num_predict": settings.summary_num_predict,
+        "temperature": 0.1,
+    }
+    assert recorder.requests[0].read() == json.dumps(
+        expected, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def test_think_false_payload_bytes_minus_keep_alive(monkeypatch) -> None:
+    """SUMMARY_THINK=false: прежний пейлоад с "think": false в конце
+    (минус keep_alive) — байт-в-байт (решение №6)."""
+    settings = make_settings(monkeypatch, SUMMARY_THINK="false")
+    service, recorder = make_service(settings, [httpx.Response(200, json=ok_body())])
+    assert settings.summary_think is False
+    service.summarize(NOTE)
+    expected = {
+        "model": settings.summary_model,
+        "messages": [
+            {"role": "system", "content": PromptRegistry().summary_system},
+            {"role": "user", "content": NOTE},
+        ],
+        "stream": False,
+        "num_predict": settings.summary_num_predict,
+        "temperature": 0.1,
+        "think": False,
+    }
+    assert recorder.requests[0].read() == json.dumps(
+        expected, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def test_system_prompt_taken_from_registry(tmp_path, monkeypatch) -> None:
+    """Промпт — из реестра (решение №7): непустой файл побеждает встроенный
+    и уходит в запрос (user-шаблоны — зашитые константы реестра)."""
+    custom = "Кастомный промпт пересказа: одна ёмкая фраза."
+    (tmp_path / "summary_system.txt").write_text(custom, encoding="utf-8")
+    settings = make_settings(monkeypatch)
+    service, recorder = make_service(
+        settings,
+        [httpx.Response(200, json=ok_body())],
+        registry=PromptRegistry(tmp_path),
+    )
+    service.summarize(NOTE)
+    assert last_payload(recorder)["messages"][0]["content"] == custom
+    service.close()
 
 
 def test_think_absent_by_default(monkeypatch) -> None:
@@ -177,11 +243,11 @@ def test_think_false_explicit_when_disabled(monkeypatch) -> None:
 
 
 def test_read_timeout_from_env(monkeypatch) -> None:
-    """SUMMARY_TIMEOUT_SEC задаёт клиентский read-таймаут (§8)."""
+    """SUMMARY_TIMEOUT_SEC задаёт клиентский read-таймаут слота (§8)."""
     settings = make_settings(monkeypatch, SUMMARY_TIMEOUT_SEC="7")
     service, _ = make_service(settings, [httpx.Response(200, json=ok_body())])
-    assert service._client.timeout.read == 7.0
-    assert service._client.timeout.connect == CONNECT_TIMEOUT_SEC
+    assert service._llm.spec.read_timeout == 7.0
+    assert service._llm._client.timeout.connect == CONNECT_TIMEOUT_SEC_OLLAMA == 2.0
     service.close()
 
 
@@ -219,9 +285,11 @@ def test_non_json_response_raises(monkeypatch) -> None:
 
 
 def test_non_object_json_raises(monkeypatch) -> None:
+    """Малформация ответа (не объект) — отказ клиента слота (§5.5):
+    content из такого ответа не извлечь — отказ, не суммари."""
     settings = make_settings(monkeypatch)
     service, _ = make_service(settings, [httpx.Response(200, json=[1, 2])])
-    with pytest.raises(SummaryError, match="не объект"):
+    with pytest.raises(SummaryError, match="пустой content"):
         service.summarize(NOTE)
 
 

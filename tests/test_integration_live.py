@@ -1,7 +1,7 @@
 """Интеграционные тесты Фаз 3–8 — живые Ollama (@pytest.mark.integration).
 
 Маркер `integration` (pyproject). Сервер векторизации берётся из env
-`LIVE_OLLAMA_URL` (дефолт — рабочий адрес REQUIREMENTS §4,
+`LIVE_EMBEDDING_URL` (дефолт — рабочий адрес REQUIREMENTS §4,
 qwen3-embedding:8b, dim 4096); суммаризатор — из `LIVE_SUMMARY_URL`
 (дефолт 192.168.3.112, ornith-1.5:35b). При недоступности — SKIP, а не
 падение (ARCH §7). Проверяется: форматы живых векторов, качество на русских
@@ -67,7 +67,7 @@ def _reachable(url: str, timeout: float = 2.0) -> bool:
 @pytest.fixture(scope="session")
 def live(tmp_path_factory) -> SimpleNamespace:
     """Живой набор сервисов на доступной Ollama; иначе — SKIP."""
-    url = os.environ.get("LIVE_OLLAMA_URL", LIVE_URL_DEFAULT)
+    url = os.environ.get("LIVE_EMBEDDING_URL", LIVE_URL_DEFAULT)
     if not _reachable(url):
         pytest.skip(f"живая Ollama недоступна: {url}")
     db_path = tmp_path_factory.mktemp("live") / "notes.db"
@@ -231,7 +231,7 @@ def live_summary(tmp_path_factory) -> SimpleNamespace:
     if not _reachable(url):
         pytest.skip(f"живая Ollama суммаризации недоступна: {url}")
     settings = Settings(
-        embedding_base_url=os.environ.get("LIVE_OLLAMA_URL", LIVE_URL_DEFAULT),
+        embedding_base_url=os.environ.get("LIVE_EMBEDDING_URL", LIVE_URL_DEFAULT),
         summary_base_url=url,
         summary_model=model,
         mcp_auth_token="live-summary-token",
@@ -413,7 +413,7 @@ def test_live_summary_timeout_fails_fast(tmp_path_factory) -> None:
     url = _live_summary_url()
     assert _reachable(url)  # скипнут на уровне fixture, если сервер «вон»
     short = Settings(
-        embedding_base_url=os.environ.get("LIVE_OLLAMA_URL", LIVE_URL_DEFAULT),
+        embedding_base_url=os.environ.get("LIVE_EMBEDDING_URL", LIVE_URL_DEFAULT),
         summary_base_url=url,
         summary_model=_live_summary_model(),
         mcp_auth_token="live-summary-token",
@@ -504,7 +504,7 @@ def live_chunks(tmp_path_factory) -> SimpleNamespace:
     read-таймаутом 720 с (решение О. 2026-08-30) дефолты §8 (32×3)
     влезают, подъёмки идут по канону как в проде.
     """
-    url = os.environ.get("LIVE_OLLAMA_URL", LIVE_URL_DEFAULT)
+    url = os.environ.get("LIVE_EMBEDDING_URL", LIVE_URL_DEFAULT)
     if not _reachable(url):
         pytest.skip(f"живая Ollama недоступна: {url}")
     settings = Settings(

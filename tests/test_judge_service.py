@@ -1,12 +1,13 @@
-"""JudgeService (Фаза 8, Этап 3.1): контракты /api/chat LLM-судьи дедупа.
+"""JudgeService (Фаза 8, Этап 3.1; Фаза 11 — транспорт через LLMClient).
 
-Юнит-тесты через httpx.MockTransport — без сети; живая Ollama судьи
-(192.168.3.112, ornith-1.5:35b, think:false) — по решению Олега проверена
-до старта Этапа 3 (бриф Фазы 8), интеграционный шаг не требует отдельного
-жизненного цикла в юнитах. Контракты брифа: вердикт `**ДУБЛЬ**` / `**НЕ
-ДУБЛЬ**` в message.content (markdown-жирный стрипается), `think: false` в
-запросе, поле `thinking` игнорируется, пустой content/нераспознанный
-вердикт/не-200/не-JSON — отказ (JudgeError).
+Контракт chat слота judge: ollama — POST /api/chat (пейлоад прежний МИНУС
+keep_alive — байт-в-байт), openai — /v1/chat/completions. Юнит-тесты через
+httpx.MockTransport — без сети; живой слот судьи — интеграционные.
+Контракты брифа: вердикт `**ДУБЛЬ**` / `**НЕ ДУБЛЬ**` в message.content
+(markdown-жирный стрипается), `think: false` в запросе (дефолт
+JUDGE_THINK=false), поле `thinking` игнорируется, пустой
+content/нераспознанный вердикт/не-200/не-JSON — отказ (JudgeError); промпты
+— из реестра (решение №7).
 """
 
 from __future__ import annotations
@@ -18,13 +19,9 @@ import pytest
 
 from app.config import get_settings
 from app.services import build_services
-from app.services.judge import (
-    CONNECT_TIMEOUT_SEC,
-    KEEP_ALIVE,
-    TEMPERATURE,
-    JudgeError,
-    JudgeService,
-)
+from app.services.judge import JudgeError, JudgeService
+from app.services.llm_client import CONNECT_TIMEOUT_SEC_OLLAMA
+from app.services.prompts import PromptRegistry
 
 
 def make_settings(monkeypatch: pytest.MonkeyPatch, **env: str):
@@ -191,8 +188,36 @@ def test_stream_disabled_and_generation_params(monkeypatch) -> None:
     payload = last_payload(recorder)
     assert payload["stream"] is False
     assert payload["num_predict"] == settings.judge_num_predict == 256
-    assert payload["temperature"] == TEMPERATURE == 0.1
-    assert payload["keep_alive"] == KEEP_ALIVE == "15m"
+    assert payload["temperature"] == 0.1
+    assert "keep_alive" not in payload  # решение №6: моделью управляет сервер
+
+
+def test_ollama_payload_bytes_minus_keep_alive(monkeypatch) -> None:
+    """Ollama-пейлоад прежний МИНУС keep_alive (решение №6): ключи и их
+    порядок как в v2.0 (model, messages, stream, num_predict, temperature)
+    плюс "think": false в конце (дефолт JUDGE_THINK=false)."""
+    settings = make_settings(monkeypatch)
+    service, recorder = make_service(settings, [httpx.Response(200, json=ok_body())])
+    service.judge(TEXT_NEW, TEXT_CANDIDATE)
+    expected = {
+        "model": settings.judge_model,
+        "messages": [
+            {"role": "system", "content": PromptRegistry().judge_system},
+            {
+                "role": "user",
+                "content": PromptRegistry().judge_user.format(
+                    text_new=TEXT_NEW, text_candidate=TEXT_CANDIDATE
+                ),
+            },
+        ],
+        "stream": False,
+        "num_predict": settings.judge_num_predict,
+        "temperature": 0.1,
+        "think": False,
+    }
+    assert recorder.requests[0].read() == json.dumps(
+        expected, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
 
 
 def test_num_predict_from_env(monkeypatch) -> None:
@@ -203,11 +228,11 @@ def test_num_predict_from_env(monkeypatch) -> None:
 
 
 def test_read_timeout_from_env(monkeypatch) -> None:
-    """JUDGE_TIMEOUT_SEC задаёт клиентский read-таймаут (§8)."""
+    """JUDGE_TIMEOUT_SEC задаёт клиентский read-таймаут слота (§8)."""
     settings = make_settings(monkeypatch, JUDGE_TIMEOUT_SEC="7")
     service, _ = make_service(settings, [httpx.Response(200, json=ok_body())])
-    assert service._client.timeout.read == 7.0
-    assert service._client.timeout.connect == CONNECT_TIMEOUT_SEC
+    assert service._llm.spec.read_timeout == 7.0
+    assert service._llm._client.timeout.connect == CONNECT_TIMEOUT_SEC_OLLAMA == 2.0
     service.close()
 
 
@@ -232,9 +257,11 @@ def test_non_json_response_raises(monkeypatch) -> None:
 
 
 def test_non_object_json_raises(monkeypatch) -> None:
+    """Малформация ответа (не объект) — отказ клиента слота: content не
+    извлечь — отказ, не вердикт."""
     settings = make_settings(monkeypatch)
     service, _ = make_service(settings, [httpx.Response(200, json=[1, 2])])
-    with pytest.raises(JudgeError, match="не объект"):
+    with pytest.raises(JudgeError, match="пустой content"):
         service.judge(TEXT_NEW, TEXT_CANDIDATE)
 
 
