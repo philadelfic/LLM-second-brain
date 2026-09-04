@@ -20,6 +20,8 @@
 зависимости. Кандидаты с лучшим векторным hit ниже порога вылетают до слияния.
 
 Выдача FR-1: summary/snippet, без полного текста (memory_get адресно).
+Фаза 11 (решение №9): +title — реальное значение notes.title (None остаётся
+только у миграционных заметок без названия).
 Snippet — из ЛУЧШЕГО чанка (первые SNIPPET_CHARS символов чанка): модель видит
 релевантный фрагмент длинной заметки, а не её начало; у fallback-кандидатов —
 из полного текста, как в Фазе 3. Ties (равный rrf_score) — по updated_at DESC,
@@ -326,7 +328,7 @@ class SearchService:
             return {}
         placeholders = ",".join("?" * len(ids))
         rows = conn.execute(
-            f"SELECT id, namespace, text, summary, summary_status, author, "
+            f"SELECT id, title, namespace, text, summary, summary_status, author, "
             f"       created_at, updated_at "
             f"FROM notes WHERE deleted_at IS NULL AND id IN ({placeholders})",
             ids,
@@ -370,9 +372,15 @@ class SearchService:
         cosine: float | None,
         snippet_source: str | None,
     ) -> dict[str, Any]:
-        """Формат элемента FR-1: без текста заметки (memory_get адресно)."""
+        """Формат элемента FR-1: без текста заметки (memory_get адресно).
+
+        Фаза 11 (решение №9, follow-up 5b): +title — реальное значение
+        notes.title (None только у миграционных заметок без названия);
+        REST /search отдаёт выдачу как есть, MCP-слой берёт то же поле.
+        """
         return {
             "id": row["id"],
+            "title": row["title"],
             "summary": summary_of(row, self._settings),
             "snippet": snippet(snippet_source or row["text"], self._settings),
             "summary_status": row["summary_status"],

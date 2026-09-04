@@ -192,7 +192,9 @@ def test_save_makes_no_embedding_attempt(client, token) -> None:
     (попыток кодирования не было), заметка стоит в очереди pending_vector."""
     client.post(
         "/notes",
-        json={"text": "заметка до health-опроса"},
+        # Фаза 11, follow-up 5b: REST strict — POST без title → 422;
+        # по клиентскому контракту передаём валидный title (≤5 слов).
+        json={"text": "заметка до health-опроса", "title": "Заметка health"},
         headers={"Authorization": f"Bearer {token}"},
     )
     body = client.get("/health").json()
