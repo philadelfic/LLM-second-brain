@@ -71,6 +71,9 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "NAMESPACE_AUTO_MAX_PER_DAY": ("namespace_auto_max_per_day", 3),
     "NAMESPACE_MAX_LEAVES_PER_DOMAIN": ("namespace_max_leaves_per_domain", 12),
     "NAMESPACE_GROOM_MIN_NOTES": ("namespace_groom_min_notes", 2),
+    # Фаза 10.1: флаг think судьи структуры отделён от дедуп-судьи (A/B Шага 7);
+    # умолчание None = наследует DEDUP_JUDGE_THINK.
+    "NAMESPACE_JUDGE_THINK": ("namespace_judge_think", None),
 }
 
 
@@ -96,9 +99,9 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 48 полей: 6 обязательных + 42 с умолчаниями
-        (24 §8 + 6 чанковых Фазы 7 + 2 фонового дедупа + 3 судьи Фазы 8
-        + 7 неймспейсов Фазы 10)."""
+        """В Settings — ровно 49 полей: 6 обязательных + 43 с умолчаниями
+        (25 §8 + 6 чанковых Фазы 7 + 2 фонового дедупа + 3 судьи Фазы 8
+        + 8 неймспейсов Фазы 10; NAMESPACE_JUDGE_THINK — умолчание None)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

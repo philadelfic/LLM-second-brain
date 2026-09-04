@@ -366,7 +366,12 @@ class StructureJudgeService:
     # --- внутреннее ---------------------------------------------------------
 
     def _payload(self, system_prompt: str, user_text: str) -> dict[str, Any]:
-        """Тело вызова /api/chat (параметры — как у судьи дедупа, Фаза 8)."""
+        """Тело вызова /api/chat. Параметры — как у судьи дедупа (Фаза 8),
+        кроме think: флаг отдельный (NAMESPACE_JUDGE_THINK, E2E Шага 7 —
+        думающий судья структуры «залипал» на парах-близнецах при 20 ток/с,
+        голодая суммаризацию на общем слоте; бездумный вердикт — 10–50
+        токенов). None — наследует DEDUP_JUDGE_THINK (дедум-конфиг).
+        """
         payload: dict[str, Any] = {
             "model": self._settings.dedup_judge_model,
             "messages": [
@@ -378,7 +383,10 @@ class StructureJudgeService:
             "temperature": TEMPERATURE,
             "keep_alive": KEEP_ALIVE,
         }
-        if not self._settings.dedup_judge_think:
+        think = self._settings.namespace_judge_think
+        if think is None:
+            think = self._settings.dedup_judge_think
+        if not think:
             payload["think"] = False
         return payload
 

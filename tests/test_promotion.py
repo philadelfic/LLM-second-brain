@@ -21,6 +21,7 @@ from app.services.namespaces import NamespaceService
 from app.services.promotion import (
     DescriptionService,
     DescriberError,
+    JUDGE_SYSTEM_PROMPT,
     PromotionService,
     StructureJudgeError,
     StructureJudgeService,
@@ -347,6 +348,39 @@ class TestVerdictParsing:
     def test_merge_without_target_fails(self) -> None:
         with pytest.raises(StructureJudgeError):
             StructureJudgeService._parse("СЛИТЬ")  # type: ignore[arg-type]
+
+
+class TestJudgeThinkFlag:
+    """NAMESPACE_JUDGE_THINK: флаг think судьи структуры отделён от дедуп-судьи
+    (E2E Шага 7: думающий вердикт ~40–60 с на вызов при 20 ток/с и «залипал»,
+    голодая суммаризацию; вердикт — 10–50 токенов)."""
+
+    def _payload(self, settings) -> dict:
+        judge = StructureJudgeService(settings)
+        try:
+            return judge._payload(JUDGE_SYSTEM_PROMPT, "x")
+        finally:
+            judge.close()
+
+    def test_namespace_judge_think_false_sends_think_false(self, settings, monkeypatch) -> None:
+        monkeypatch.setenv("NAMESPACE_JUDGE_THINK", "false")
+        get_settings.cache_clear()
+        settings = get_settings()
+        assert self._payload(settings).get("think") is False
+
+    def test_none_inherits_dedup_judge_think(self, settings, monkeypatch) -> None:
+        """Флаг не задан → наследует DEDUP_JUDGE_THINK (думающий дедум-конфиг:
+        поле think в payload НЕ отправляется — модель думает по умолчанию)."""
+        monkeypatch.setenv("DEDUP_JUDGE_THINK", "true")
+        monkeypatch.delenv("NAMESPACE_JUDGE_THINK", raising=False)
+        get_settings.cache_clear()
+        payload = self._payload(get_settings())
+        assert "think" not in payload
+
+    def test_namespace_judge_think_true_inherits(self, settings, monkeypatch) -> None:
+        monkeypatch.setenv("NAMESPACE_JUDGE_THINK", "true")
+        get_settings.cache_clear()
+        assert "think" not in self._payload(get_settings())
 
 
 class TestDescriptionTrim:
