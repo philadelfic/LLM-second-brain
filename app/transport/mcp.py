@@ -34,8 +34,7 @@ NamespaceValidationError, транспорт обернёт в fail + hint (мя
 title ≤5 слов») и memory_update (опционален — передан и валиден → перезапись,
 не передан → прежний). `title` добавлен в белые списки выдач search/list;
 в get названия НЕТ (экономия контекста — там полный текст). SearchService
-(app/services/search.py — вне белого списка пула 5) пока не отдаёт title:
-выдача memory_search резервирует ключ под контракт (None до правки search.py).
+отдаёт title в выдаче поиска (follow-up пула 5b, Фаза 11).
 """
 
 import asyncio
@@ -179,7 +178,7 @@ TOOL_NAMES = frozenset(TOOL_DESCRIPTIONS)
 # ответов в MCP не просачивается. hint — маркер мягкого отказа (только fail).
 # Фаза 10: +namespace в search/list/get (слой ориентирования 3, §5.7).
 # Фаза 11 (решение №9): +title в list (сервис notes отдаёт) и в search
-# (ключ резервируется — search.py вне белого списка пула 5, см. _search_hit);
+# (SearchService отдаёт — follow-up пула 5b, см. _search_hit);
 # в get названия НЕТ — там полный текст (экономия контекста).
 _SEARCH_ITEM = ("id", "summary", "created_at", "updated_at", "namespace")
 _LIST_ITEM = ("id", "title", "summary", "created_at", "updated_at", "namespace")
@@ -196,10 +195,8 @@ def _pick(source: dict, fields: tuple[str, ...]) -> dict[str, Any]:
 def _search_hit(row: dict[str, Any]) -> dict[str, Any]:
     """Компактный хит memory_search: белый список Фазы 9 + `title` (решение №9).
 
-    SearchService (app/services/search.py) — вне белого списка пула 5 Фазы 11
-    и пока не отдаёт title в результатах: ключ резервируется под контракт
-    (None до правки search.py — тогда значение подхватится без изменений
-    MCP-слоя). Остальные поля — громкий белый список: их отсутствие — сломанный
+    SearchService — отдает title в результатах (follow-up пула 5b, Фаза 11);
+    остальные поля — громкий белый список: их отсутствие — сломанный
     контракт, пусть падает громко.
     """
     hit: dict[str, Any] = {name: row[name] for name in _SEARCH_ITEM}

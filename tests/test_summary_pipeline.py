@@ -118,8 +118,11 @@ def dead_app(monkeypatch) -> Iterator[TestClient]:
 
 
 def _create(client: TestClient, token: str, text: str) -> dict:
+    """Создание заметки через REST по клиентскому контракту (решение №9,
+    follow-up 5b): title обязателен (≤5 слов) — иначе 422."""
     response = client.post(
-        "/notes", json={"text": text}, headers={"Authorization": f"Bearer {token}"}
+        "/notes", json={"text": text, "title": "Ретроспектива офиса"},
+        headers={"Authorization": f"Bearer {token}"},
     )
     assert response.status_code == 201, response.text
     return response.json()

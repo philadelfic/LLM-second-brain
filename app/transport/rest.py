@@ -12,12 +12,13 @@
 422 — валидация пути/описания, 404 — узел не найден, 409 — защита/конфликт
 (default, merge в себя, корень с детьми, занятый путь).
 
-Фаза 11 (решение №9): `title` в теле POST/PUT /notes (оператор может назвать
-заметку; передан — валидируется сервисом, невалидный → 422 «задай title
-≤5 слов»; в PUT не передан — прежний остаётся) и в выдачах get/list
-(оператору; null — заметка без названия, догенерирует воркер). REST —
-операторская поверхность: POST без title — легаси-путь (легитимен, как у
-миграции); контракт «новые всегда с title» с fail+hint — MCP memory_save.
+Фаза 11 (решение №9, follow-up 5b): `title` в теле POST/PUT /notes (передан —
+валидируется сервисом, невалидный → 422 «задай title ≤5 слов»; в PUT
+не передан — прежний остаётся) и в выдачах get/search/list (оператору;
+null — миграционная заметка без названия). Контракт «новые всегда с
+title» един на обеих поверхностях: POST /notes без title или с невалидным
+→ 422 fail+hint, заметка НЕ создаётся. Сентинел-легаси NoteService.save(text)
+без title — путь миграции/скриптов на сервис-слое, транспортам недоступен.
 """
 
 from __future__ import annotations
@@ -37,9 +38,10 @@ from app.services.search import SearchValidationError
 class NoteCreate(BaseModel):
     """Тело POST /notes. Автор — если оператор знает модель-источник.
 
-    Фаза 11 (решение №9): `title` опционален — передан, валидируется сервисом
-    (пустой/длиннее 5 слов → 422 «задай title ≤5 слов»); не передан —
-    легаси-путь: заметка без названия (догенерирует воркер).
+    Фаза 11 (решение №9, follow-up 5b): `title` обязателен — отсутствующий
+    (не передан) или невалидный (пустой/длиннее TITLE_MAX_WORDS слов) →
+    422 «задай title ≤5 слов», заметка НЕ создаётся; контракт един
+    с MCP memory_save (сентинел-легаси save(text) — только сервис-слой).
     """
 
     text: str
@@ -142,17 +144,14 @@ def build_rest_router(settings: Settings) -> APIRouter:
     async def create_note(payload: NoteCreate, request: Request) -> dict:
         """Создать заметку (memory_save FR-4: векторизация + дедуп).
 
-        Среда без Ollama → деградация (pending + warning, дедуп по тексту)."""
+        Среда без Ollama → деградация (pending + warning, дедуп по тексту).
+        Решение №9 (follow-up 5b): title обязателен — без него/невалидный →
+        TitleValidationError → 422 fail+hint (контракт един с MCP).
+        """
         try:
-            if payload.title is None:
-                # REST — операторская поверхность: заметка без названия
-                # легитимна (легаси-путь сервиса, догенерация воркером);
-                # контракт «новые всегда с title» (fail+hint) — MCP.
-                return await asyncio.to_thread(
-                    _services(request).notes.save,
-                    payload.text,
-                    author=payload.author,
-                )
+            # title=None от транспорта («клиент не назвал заметку») — отказ
+            # сервиса (TitleValidationError); сентинел-легаси через REST
+            # недостижим: title всегда передаётся явно.
             return await asyncio.to_thread(
                 _services(request).notes.save,
                 payload.text,

@@ -138,26 +138,33 @@ class TestNotesCrud:
 
 
 class TestTitleRest:
-    """Фаза 11 (решение №9): title в REST — валидация переданного названия
-    (422 «задай title ≤5 слов»), перезапись/сохранение в PUT, выдачи get/list.
-
-    REST — операторская поверхность: POST без title — легаси-путь (заметка
-    без названия, догенерирует воркером), как у миграции/скриптов. Контракт
-    «новые всегда с title» (fail+hint) — MCP memory_save.
+    """Фаза 11 (решение №9, follow-up 5b): title в REST — валидация переданного
+    названия (422 «задай title ≤5 слов»), перезапись/сохранение в PUT, выдачи
+    get/list/search. Контракт «новые всегда с title» един на обеих
+    поверхностях (MCP memory_save и REST /notes): POST без title — 422,
+    заметка НЕ создаётся. Сентинел-легаси save(text) — сервисный путь
+    миграции/скриптов, через REST недостижим.
     """
 
-    def test_create_without_title_is_legacy(self, client: TestClient, token: str) -> None:
-        """POST без title — легаси-путь: заметка создана с title = null
-        (догенерирует воркер); контракт «новые всегда с title» — MCP."""
+    def test_create_without_title_422(self, client: TestClient, token: str) -> None:
+        """POST без title → 422 fail+hint «задай title ≤5 слов», заметка НЕ
+        создаётся (легаси-201 отменён follow-up 5b: контракт един с MCP
+        memory_save); пустой title — тоже невалидный → 422."""
         created = client.post(
             "/notes", json={"text": "Рест: без названия"},
             headers={"Authorization": f"Bearer {token}"},
         )
-        assert created.status_code == 201
-        note = client.get(
-            "/notes/1", headers={"Authorization": f"Bearer {token}"}
-        ).json()
-        assert note["title"] is None
+        assert created.status_code == 422
+        assert created.json()["detail"] == "задай title ≤5 слов"
+        empty = client.post(
+            "/notes", json={"text": "Рест: пустое название", "title": ""},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert empty.status_code == 422
+        assert empty.json()["detail"] == "задай title ≤5 слов"
+        assert client.get(
+            "/notes", headers={"Authorization": f"Bearer {token}"}
+        ).json()["total"] == 0  # ни одна не создана
 
     def test_create_six_word_title_422(self, client: TestClient, token: str) -> None:
         response = client.post(
@@ -245,6 +252,7 @@ class TestSearch:
         body = response.json()
         (hit,) = body["results"]
         assert hit["snippet"].startswith("Сервис скоринга")
+        assert hit["title"] == "Сервис скоринга"  # Фаза 11 (решение №9): реальный title
         assert "text" not in hit
         assert hit["cosine"] is None
 
