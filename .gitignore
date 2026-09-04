@@ -23,6 +23,11 @@ data/
 prompts/
 prompts-test/
 
+# Инженерные доки — внутренние (не публикуются в GitHub; остаются в
+# рабочей копии рядом с кодом)
+REQUIREMENTS.md
+ARCHITECTURE.md
+
 # Локальные артефакты
 *.log
 
