@@ -4,274 +4,78 @@
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)
 ![Docker](https://img.shields.io/badge/Docker-ready-2496ed.svg)
 
-Self-hosted MCP-сервер «второго мозга» для LLM, крутящихся в харнесах
-(в первую очередь — Open WebUI). Модели получают через MCP доступ к общему
-банку заметок: могут искать по нему (гибридный векторный + полнотекстовый
-поиск), просматривать, записывать, обновлять и удалять заметки.
+A self-hosted **long-term memory server** for LLMs running in harnesses
+(primarily Open WebUI). Models get MCP access to a shared note store: they can
+search it (hybrid vector + full-text), read, write, update and delete notes.
 
-## Зачем
+## What it is
 
-1. **Распределённые знания с быстрым доступом.** Знания живут не в системном
-   промпте и не в истории чатов, а в отдельном хранилище; модель получает
-   только релевантное, по запросу.
-2. **Экономия токенов.** Вместо монолитного контекста — фиксированный
-   небольшой overhead на спецификацию инструментов (~1200 токенов) и
-   адресная выдача **кратких содержаний** заметок, а не целых текстов.
+- **One Docker container**, self-hosted, non-root.
+- **MCP Streamable HTTP** (`/mcp`, natively supported by Open WebUI) with a
+  Bearer token.
+- **7 tools** prefixed `memory_*`: search, list, get, save, update, delete,
+  namespaces (map of sections).
+- **Storage**: SQLite + `sqlite-vec` (vector search) + FTS5 (full-text),
+  merged via Reciprocal Rank Fusion.
+- **Vectorization & summarization** are external LLM calls. Each of the three
+  slots (embedding / summary / judge) is configured independently with its own
+  provider (`ollama` or an OpenAI-compatible API), base URL, model and optional
+  API key.
+- **Hierarchical namespaces**: the store is split into large sections; the map
+  is exposed to models via MCP instructions and `memory_namespaces`.
+- **Background worker**: pending vectors, summaries, dedup, classification and
+  title generation are processed asynchronously; failures never break CRUD
+  (pending states + back-off retry).
+- **Backups**: periodic online SQLite snapshots with rotation.
 
-## Ключевые свойства
+## Why
 
-- Один контейнер Docker, self-host, non-root.
-- MCP Streamable HTTP (`/mcp`, нативно поддерживается Open WebUI) + Bearer-токен.
-- 7 инструментов с префиксом `memory_*`: search, list, get, save, update,
-  delete, namespaces (карта разделов).
-- Хранилище: SQLite + `sqlite-vec` (векторный поиск) + FTS5 (полнотекстовый),
-  слияние через Reciprocal Rank Fusion.
-- Векторизация: внешний Ollama (embedding-модель и адрес — в env); вектора
-  строятся по чанкам текста (сама заметка хранится целиком) — поиск по факту
-  из середины длинной заметки не «размазывается» (см. «Чанковая индексация»).
-- Суммаризация: отдельная внешняя LLM (адрес и модель — в env) строит короткое
-  `summary` каждой заметки; модели через MCP получают компактные выдачи
-  (`id`, `summary`, метки времени), полный контракт поиска — у REST
-  (`GET /search`): `snippet` (фрагмент лучшего чанка), `cosine`,
-  `rrf_score`, `author`. Генерация — фоновая, не блокирует запись;
-  рассуждения модели не сохраняются.
-- Иерархические неймспейсы: база делится на крупные разделы, карта —
-  в MCP-инструкциях и `memory_namespaces`; разделы растут системой сами
-  (судья структуры создаёт `provisional`-узлы), структурные ручки —
-  у оператора через REST (см. «Неймспейсы»).
-- Резервное копирование: периодический онлайн-снапшот БД в `BACKUP_DIR`
-  (SQLite `backup` API), ротация по `BACKUP_KEEP`; после снапшота —
-  груминг реестра неймспейсов.
-- Логи — одна JSON-строка на событие в stdout (вызовы инструментов с
-  латентностью и числом результатов; тексты запросов — первые 80 символов;
-  содержимое заметок в логи не пишется).
-- Пользовательского интерфейса нет — пишут и читают только модели;
-  оператор имеет доступ к файлу БД напрямую.
+1. **Distributed knowledge with fast access.** Knowledge lives in a separate
+   store, not in the system prompt or chat history; the model fetches only what
+   is relevant, on demand.
+2. **Token economy.** Instead of a monolithic context — a fixed small overhead
+   for the tool spec (~1200 tokens) and targeted retrieval of **short
+   summaries**, not full texts.
 
-## Документация
-
-- [Требования](REQUIREMENTS.md) — цели, функциональные и нефункциональные
-  требования, контракты всех инструментов, конфигурация (§8), риски.
-- [Архитектура](ARCHITECTURE.md) — компоненты, схема данных, потоки,
-  интеграция с Open WebUI, подход к «обучению» моделей, тестирование, деплой.
-
-## Быстрый старт (docker compose)
+## Quick start
 
 ```bash
 git clone <repo> llm-second-brain && cd llm-second-brain
-# Вся конфигурация — в docker-compose.yml (без .env).
-# Обязательное там же:
-#   OLLAMA_BASE_URL, SUMMARY_OLLAMA_BASE_URL, SUMMARY_MODEL,
-#   MCP_AUTH_TOKEN  (сгенерируй: openssl rand -hex 32)
-# Дефолты всех прочих переменных — канонические из REQUIREMENTS §8, видно
-# рядом с каждой; фактические значения переопределяются там же, в compose.
-mkdir -p data          # каталог volume: notes.db + backups (uid/gid 1000)
+mkdir -p data prompts
+# Edit docker-compose.yml: set MCP_AUTH_TOKEN (openssl rand -hex 32) and the
+# three LLM slot addresses/models. Full reference: docs/CONFIG.md.
 docker compose up -d --build
 curl -s http://localhost:8080/health | python -m json.tool
 ```
 
-`/health` отвечает без токена:
+`/health` answers without a token. See [Installation](docs/INSTALL.md) for the
+first-run walkthrough (compose, token, Open WebUI, `/health`).
 
-```json
-{"status":"ok","embedding_ok":null,"summarizer_ok":null,
- "notes_count":0,"pending_vector":0,"pending_summary":0}
-```
+## Documentation
 
-`embedding_ok`/`summarizer_ok` — исход последних попыток (`null` — попыток
-ещё не было; обеих Ollama может не быть на старте — сервис поднимется
-штатно, записи уйдут в pending и догонятся фоновым воркером, NFR-3).
+- [Installation](docs/INSTALL.md) — setup, first run, Open WebUI, `/health`.
+- [Configuration](docs/CONFIG.md) — every environment variable (v2.1), the
+  prompt files, and the `OLLAMA_KEEP_ALIVE` note.
+- [Changelog](CHANGELOG.md) — release history (Keep a Changelog).
+- Engineering docs (in Russian, in this repo): [Requirements](REQUIREMENTS.md)
+  and [Architecture](ARCHITECTURE.md) — goals, contracts, data model, flows,
+  testing, deployment.
 
-## Подключение Open WebUI
+## Operational notes
 
-Требуется Open WebUI **v0.6.31+** — с этой версии поддерживается MCP
-Streamable HTTP нативно.
+- **`keep_alive` is not sent by the client** (since v2.1). Model residency is
+  managed by the server: set `OLLAMA_KEEP_ALIVE` on the Ollama side if you want
+  models to stay loaded. With the server default (5 min) models are unloaded
+  more often, and a cold start (~22.6 GB for the summarizer) returns to
+  latency.
+- **Changing `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` / `EMBEDDING_DIM`**
+  triggers an automatic full reindex on startup: all notes go to `pending` and
+  the worker re-encodes them. Search/dedup thresholds are calibrated for
+  `qwen3-embedding:8b` — recalibrate after changing the model.
+- **Privacy**: an `openai` provider sends note texts to an external API (the
+  dedup judge and classifier see full texts). Choose providers per slot
+  deliberately.
 
-1. Открой **Admin Panel → Settings → Integrations** → блок «External Tool
-   Servers» → **«+ Add Connection»** (в старых версиях пункт называется
-   «Tools → Add Connection»).
-2. Заполни поля диалога:
-   - **Type**: `MCP Streamable HTTP`;
-   - **URL**: `http://<хост-сервиса>:8080/mcp` — путь `MCP_PATH`, по
-     умолчанию `/mcp`. Если Open WebUI в другом контейнере того же
-     docker-хоста → `http://<ip-хоста>:8080/mcp` (или имя сети compose);
-   - **Auth**: `Bearer`; **token** — значение `MCP_AUTH_TOKEN` из `docker-compose.yml`.
-3. Сохрани. В списке появятся 7 инструментов `memory_*` — они доступны всем
-   моделям, достаточно включить у модели «вызов инструментов».
-4. Проверка в чате: «найди в памяти …» → модель вызывает `memory_search`.
+## License
 
-Дополнительные MCP-клиенты подключаются так же: URL `http://<host>:8080/mcp`,
-заголовок `Authorization: Bearer <MCP_AUTH_TOKEN>`. Handshake curl'ом:
-
-```bash
-curl -s http://localhost:8080/mcp \
-  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
-```
-
-## Конфигурация
-
-Вся конфигурация — в `docker-compose.yml`, блок `environment` (все 49
-переменных §8 с дефолтами; фактические значения правятся там же, `.env` нет).
-Обязательные — `OLLAMA_BASE_URL`, `SUMMARY_OLLAMA_BASE_URL`,
-`SUMMARY_MODEL`, `MCP_AUTH_TOKEN` (пустой токен — фатальная ошибка старта).
-Канонические дефолты снять из REQUIREMENTS §8, ключевые:
-
-| Переменная | Умолчание | Смысл |
-|---|---|---|
-| `MCP_AUTH_TOKEN` | — (обязателен) | Bearer-токен всех ручек, кроме `/health` |
-| `OLLAMA_BASE_URL` | — (обязателен) | Ollama векторизации (`/api/embed`) |
-| `SUMMARY_OLLAMA_BASE_URL` | — (обязателен) | Ollama суммаризации (`/api/chat`) |
-| `SUMMARY_MODEL` | — (обязателен) | модель суммаризации, напр. `ornith-1.5:35b` |
-| `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `qwen3-embedding:8b` / `4096` | embedding; смена модели/размерности — автоматическая реиндексация при старте (все заметки уходят в pending, воркер пере-кодирует) |
-| `PORT` / `MCP_PATH` | `8080` / `/mcp` | HTTP и путь MCP |
-| `DB_PATH` | `/data/notes.db` | файл SQLite (WAL) |
-| `BACKUP_DIR` / `BACKUP_INTERVAL_SEC` / `BACKUP_KEEP` | `/data/backups` / `86400` / `7` | снапшоты: каталог, интервал, ротация |
-| `LOG_LEVEL` | `INFO` | уровень JSON-логов stdout |
-| `MAX_NOTE_CHARS` / `MAX_QUERY_CHARS` | `35000` / `512` | лимиты ввода |
-| `TEXT_SPLITTER` | `tiktoken` | токен-сплиттер чанков (encoding `cl100k_base`, кэш в образе) |
-| `CHUNK_SIZE` / `CHUNK_OVERLAP` / `CHUNK_MIN_TARGET` | `1024` / `180` / `200` | окно чанка (токенов), перекрытие, минимальный хвост; смена любого — полная пере-чанковка при старте |
-| `EMBEDDING_BATCH_SIZE` / `EMBEDDING_CONCURRENT_REQUESTS` | `32` / `3` | воркер чанков: чанков в одном embed-запросе / параллельных запросов |
-| `NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE` | `0.80` | причёска: авто-переезд default-заметки в существующий узел |
-| `NAMESPACE_PROMOTION_THRESHOLD` / `NAMESPACE_PROMOTION_MIN_CONFIDENCE` | `15` / `0.60` | триггер домена: счётчик default-заметок с общим hint / минимальная уверенность разметки |
-| `NAMESPACE_SYNONYM_SIMILARITY` | `0.85` | антисинонимия: косинус описаний — слияние вместо создания |
-| `NAMESPACE_AUTO_MAX_PER_DAY` / `NAMESPACE_MAX_LEAVES_PER_DOMAIN` | `3` / `12` | лимиты авто-создания узлов (защита от шторма) |
-| `NAMESPACE_GROOM_MIN_NOTES` | `2` | груминг: узел с меньшим числом заметок — кандидат на слияние |
-
-Все лимиты валидируются при старте: некорректное значение (вне диапазона,
-мусор) — фатальная ошибка конфигурации с перечнем всех нарушений сразу.
-Смена `MAX_NOTE_CHARS` поверх существующей БД запрещена (лимит «запечён»
-в CHECK-схеме) — верни прежнее значение или пересоздай БД.
-
-## Неймспейсы (Фаза 10)
-
-## Неймспейсы (Фаза 10)
-
-Одна общая база делится на крупные разделы-«папки» — **иерархические
-неймспейсы** (максимум 2 уровня: `domain`, `domain/subdomain`; их мало
-3–7, выбор однозначен). Это не теги: узлы крупные, дисциплина почти
-бесплатная, риск «шума из соседних доменов» снимается.
-
-- **Два канала укладки**: клиент при `memory_save` кладёт заметку сам, если
-  знает карту (`namespace` — только существующий узел; не указан —
-  `default`); не знает — в `default`, и фоновая причёска разбирает её:
-  классификатор размечает заметку (`domain_hint`/`subdomain_hint`/
-  `confidence`) и при высокой уверенности переезжает в существующий узел.
-- **Структура растёт сама**: когда в `default` копится масса заметок с
-  общим подразделом (порог и минимальная уверенность — env), система сама
-  создаёт лист (`provisional`, описание генерирует LLM по суммари группы),
-  прогнав кандидата через **судью структуры** (антисинонимия — близкого
-  кандидата система сливает с существующим узлом вместо создания; осмыс-
-  ленность слага/описания). `provisional` участвует в поиске наравне с
-  `confirmed`; оператор при желании подтверждает — это аудит, не обязатель-
-  ный шаг.
-- **Ориентирование моделей** (3 слоя): карта узлов в MCP-инструкциях;
-  `memory_namespaces` — актуальный реестр по запросу (включая
-  `promotion_candidates` — растущие темы, для которых узел скоро появится);
-  метки `namespace` в выдачах. Правило: уверен в области — ищи с
-  `namespace` (узел = его поддерево), не уверен — ищи глобально (промах
-  ничего не теряет).
-- **Структурные ручки — только оператору** (REST, НЕ через MCP:
-  клиент-модели рулят содержимым, не структурой): `GET/POST /namespaces`,
-  `PATCH /namespaces/{path}` (описание/статус/переименование),
-  `POST /namespaces/{path}/merge`, `DELETE /namespaces/{path}` — все с
-  перекладкой заметок (ничего не теряется). Стартовый набор узлов
-  инсталляции регистрируется через POST — это данные инсталляции, в код
-  не зашиваются.
-- **Груминг**: пустые временные узлы чистятся автоматически; узлы ниже
-  минимума — сигнал оператору в логах. Все структурные события идут в
-  JSON-логи отдельными типами — аудит автономии.
-- **env**: `NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE` (0.80),
-  `NAMESPACE_PROMOTION_THRESHOLD` (15), `NAMESPACE_PROMOTION_MIN_CONFIDENCE`
-  (0.60), `NAMESPACE_SYNONYM_SIMILARITY` (0.85), `NAMESPACE_AUTO_MAX_PER_DAY`
-  (3), `NAMESPACE_MAX_LEAVES_PER_DOMAIN` (12), `NAMESPACE_GROOM_MIN_NOTES` (2).
-
-## Чанковая индексация
-
-Вектора строятся не «один на заметку», а по чанкам: заметка хранится и
-отдаётся **целиком**, но для векторизации текст режется сплиттером
-(tiktoken, encoding `cl100k_base`) на окна `CHUNK_SIZE` токенов с
-перекрытием `CHUNK_OVERLAP`; хвостовой чанк меньше `CHUNK_MIN_TARGET`
-сливается с предыдущим. Заметка ~20 000 символов ≈ 7 500 токенов ≈ ≤9
-чанков; типичная короткая заметка — один чанк, схема вырождается в
-прежнюю. Зачем: вектор полного текста «размазывает» семантику — поиск
-по конкретному факту из середины длинной заметки проседает; чанк же
-несёт смысл своего участка, а лучший чанк заметки задаёт и её косинус
-релевантности, и snippet.
-
-Как это устроено:
-
-- **Хранение**: тексты чанков — `notes_chunks` (FK на заметку, cascade при
-  физическом удалении; soft delete чанки сохраняет — trash ищется как
-  раньше), вектора чанков — `notes_chunks_vec` (vec0, cosine, та же модель
-  и размерность, что у заметок).
-- **Reuse**: уместилась в один чанк ≤ `CHUNK_SIZE` — вектор чанка копируется
-  из готового полного вектора, Ollama вызывается один раз.
-- **Pending без статус-колонки**: «вектор чанка готов» = есть строка в
-  `notes_chunks_vec` (анти-джойн). Отказ векторизации или новый текст при
-  update оставляют чанки pending — докодирует воркер.
-- **Воркер**: третья фоновая петля (рядом с до-векторизацией заметок и
-  суммаризацией): вычитывает партию `EMBEDDING_BATCH_SIZE` ×
-  `EMBEDDING_CONCURRENT_REQUESTS` чанков (32 × 3), режет на подъёмки по 32,
-  кодирует не более 3 запросов одновременно; отказ подъёмки не портит
-  остальных (успешные записываются, отказавшие ждут back-off 30 с → ×2 →
-  15 мин). Гонка с `memory_update` закрыта: вектор пишется только на
-  неизменённый с вычитки чанк.
-- **Поиск**: KNN по чанкам (топ-50) → агрегация до заметок: лучший чанк
-  задаёт `cosine` и `snippet` (первые `SNIPPET_CHARS` символов чанка; поля
-  полной сервисной/REST-выдачи — MCP их не отдаёт);
-  заметки без готовых чанк-векторов (легаси, pending) ищутся по полному
-  вектору, как раньше. FTS-плечо и RRF не менялись.
-- **Пере-чанковка**: смена `CHUNK_SIZE`/`CHUNK_OVERLAP`/`CHUNK_MIN_TARGET`
-  (или модели/размерности) фиксируется meta-таблицей при старте: при
-  смене чанковых параметров полного вектора это не касается (дропается
-  только `notes_chunks_vec`), но **все** заметки (включая корзину)
-  пере-чанковываются заново — короткие получают reuse сразу, остальные
-  остаются pending до догонки воркером.
-
-Read-таймаут векторизации — константа 720 с (решение 2026-08-30):
-8B-модель на CPU-хосте кодирует полный 15k-текст ~2 мин, длинные тексты
-должны дорабатываться, а не рваться в retry (короткие — миллисекунды).
-Живая проверка механики — `tests/test_integration_live.py` (15k-заметка,
-работает живой Ollama, скип при её недоступности).
-
-## Эксплуатация
-
-**Логи.** Весь stdout — JSON (`docker compose logs -f second-brain`):
-`tool_call`-события по всем 7 инструментам (`tool`, `latency_ms`, число
-результатов; поисковый запрос — первые 80 символов; тексты заметок в логи
-не пишутся), `startup`, `backup_created`/`backup_failed`, структурные
-события автономии неймспейсов (`classified_moved`, `node_created`,
-`node_merged`, `node_deleted`, `groom_*`, `root_orphans`), access/error
-uvicorn. Уровень — `LOG_LEVEL`.
-
-**Backup.** Файлы `notes-<UTC>.db` в `BACKUP_DIR` (по умолчанию
-`/data/backups`, внутри volume `./data`); первый — сразу после старта, далее
-раз в сутки; каталог держит `BACKUP_KEEP` свежайших. Восстановление —
-останови сервис, замени `notes.db` снапшотом (рядом `-wal`/`-shm` исходной
-БД тоже убери/учти), запусти снова. Копии читаются обычным `sqlite3`.
-
-**Прямой доступ оператора к БД** (REQUIREMENTS §3): `sqlite3 data/notes.db`.
-Undo soft-delete — снять метку: `UPDATE notes SET deleted_at = NULL WHERE id = ?;`
-FTS-синхронизация сверится и починится сама на следующем старте.
-
-**Проверка MCP:** `curl`-handshake из раздела о подключении; `tools/list`
-возвращает ровно 7 инструментов `memory_*`; без/с неверным токеном — 401.
-
-## Архитектура в двух словах
-
-Один FastAPI-процесс: REST (`/health`, `/notes`, `/search`, `/namespaces`
-— для оператора) + MCP Streamable HTTP (`/mcp`) над одним service-слоем.
-SQLite (WAL): `notes` + реестр неймспейсов + FTS5 trigram + vec0
-(вектор полного текста + вектора чанков, партиции по `namespace`).
-Векторизация и суммаризация —
-внешние Ollama; отказ любой не ломает CRUD (pending-статусы + фоновый
-воркер с back-off 30с→×2→15мин и деградация поиска до FTS-only).
-Подробности — [архитектура](ARCHITECTURE.md), потоки §4.
-
-## Лицензия
-
-Распространяется под лицензией [MIT](LICENSE).
-Разрешено свободное использование, изменение и распространение, в том
-числе в коммерческих целях.
+Distributed under the [MIT](LICENSE) license.

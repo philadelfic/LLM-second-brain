@@ -47,24 +47,6 @@
     инсталляции: живёт в реестре (данные БД), в код и публичные доки не
     зашивается; в документации — обезличенные примеры (`default`, `domain`,
     `domain/project-a`).
-
-- **Вынос LLM-промптов в env** (идея ассистента, 2026-08-31). Сейчас системные
-  промпты суммаризации, слияния дублей и судьи дедупа захардкожены как модульные
-  константы в `app/services/summary.py` (`SYSTEM_PROMPT`, `MERGE_SYSTEM_PROMPT`,
-  `MERGE_USER_TEMPLATE`) и `app/services/judge.py` (`JUDGE_SYSTEM_PROMPT`,
-  `JUDGE_USER_TEMPLATE`). Вынести в переменные окружения с дефолтами = текущие
-  тексты, чтобы менять формулировки без пересборки/передеплоя:
-  `SUMMARY_SYSTEM_PROMPT`, `MERGE_SYSTEM_PROMPT`, `MERGE_USER_TEMPLATE`,
-  `DEDUP_JUDGE_SYSTEM_PROMPT`, `DEDUP_JUDGE_USER_TEMPLATE`. Вопросы к будущему
-  проектированию (пока не решения): выносить ли user-шаблоны — это format-строки
-  с плейсхолдерами (`{text_a}`/`{text_b}`/`{text_new}`/`{text_candidate}`),
-  которые пользователь env обязан сохранить; многострочность значений в
-  docker-compose (block scalar `|`). Реализация = поля `Settings` с валидацией
-  непустоты + правки `_payload`/`_chat` в обоих сервисах + `OPTIONAL_ENV` в
-  `tests/test_config.py` (completeness-тест сверяет `Settings.model_fields`
-  ровно с `OPTIONAL_ENV + REQUIRED_ENV`) + docker-compose + документация
-  (§8, ARCHITECTURE §4.7, README).
-
 ---
 
 ## Отклонено
