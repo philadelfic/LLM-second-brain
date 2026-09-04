@@ -93,7 +93,10 @@ class DeduplicationService:
     # --- фоновый дедуп: кандидаты (Фаза 8, Этап 2.1) -------------------------
 
     def find_candidates(
-        self, vector: list[float], exclude_id: int | None = None
+        self,
+        vector: list[float],
+        exclude_id: int | None = None,
+        namespace: str | None = None,
     ) -> list[tuple[int, float]]:
         """Топ-N активных кандидатов по косинусу (кандидат-предфильтр Этапа 2).
 
@@ -110,17 +113,35 @@ class DeduplicationService:
         и без исключения занял бы слот топ-N с cosine 1.0. Trash не кандидат:
         окно KNN расширяется на число trash-векторов, пост-фильтр оставляет
         только активные (как в SearchService — vec0 не знает о notes).
+        Фаза 10 (§5.7): `namespace` — дедуп в пределах неймспейса (KNN
+        сканирует партицию узла); None — глобально (legacy-совместимость).
+        Меж-неймспейсовый близкий контент — не дубль: заметки в разных
+        узлах легитимны (хинт ориентирования — Шаг 5).
         Возврат — [(note_id, cosine)] по убыванию близости, не более топ-N.
         """
         top_n = self._settings.dedup_candidate_top_n
         threshold = self._settings.dedup_candidate_similarity
         with session(self._settings) as conn:
+            if namespace:
+                ns_ph = ",".join("?" * 1)
+                ns_clause = " AND namespace = ?"
+                ns_params: list[object] = [namespace]
+            else:
+                ns_clause = ""
+                ns_params = []
             trash = conn.execute(
                 "SELECT COUNT(*) FROM notes_vec WHERE note_id IN "
-                "(SELECT id FROM notes WHERE deleted_at IS NOT NULL)"
+                "(SELECT id FROM notes WHERE deleted_at IS NOT NULL"
+                f"{ns_clause})",
+                ns_params,
             ).fetchone()[0]
             window = top_n + trash + (1 if exclude_id is not None else 0)
-            hits = vectors.knn(conn, vector, window)
+            hits = vectors.knn(
+                conn,
+                vector,
+                window,
+                ns_filter=[namespace] if namespace else None,
+            )
             if not hits:
                 return []
             placeholders = ",".join("?" * len(hits))
@@ -128,8 +149,8 @@ class DeduplicationService:
                 row[0]
                 for row in conn.execute(
                     f"SELECT id FROM notes WHERE deleted_at IS NULL "
-                    f"AND id IN ({placeholders})",
-                    [note_id for note_id, _ in hits],
+                    f"{ns_clause} AND id IN ({placeholders})",
+                    ns_params + [note_id for note_id, _ in hits],
                 )
             }
             result: list[tuple[int, float]] = []
@@ -145,21 +166,21 @@ class DeduplicationService:
 
     # --- фоллбек --------------------------------------------------------
 
-    def find_by_text(self, text: str) -> sqlite3.Row | None:
-        """Дословный дубль без векторизации (ARCH §4.1 «дедуп по FTS»).
-
-    1) SQL-равенство сырого текста — работает и для короче 3 символов,
-           где trigram слеп;
-        2) FTS5 по словам нормализованного текста (регистр/пробелы не влияют),
-           среди кандидатов ищем тот, чья нормализованная строка полностью
-           совпала. Фразовый MATCH здесь не подходит: колебания пробелов в
-           исходнике меняют триграммную последовательность фразы.
-        """
+    def find_by_text(self, text: str, namespace: str | None = None) -> sqlite3.Row | None:
+        """Дословный дубль без векторизации (ARCH §4.1 «дедуп по FTS»)."""
+        if namespace:
+            ns_clause = " AND namespace = ?"
+            ns_fts_clause = " AND n.namespace = ?"
+            ns_params: list[object] = [namespace]
+        else:
+            ns_clause = ""
+            ns_fts_clause = ""
+            ns_params = []
         with session(self._settings) as conn:
             exact = conn.execute(
-                "SELECT id, text FROM notes "
-                "WHERE deleted_at IS NULL AND text = ? ORDER BY id LIMIT 1",
-                (text,),
+                "SELECT id, text, namespace FROM notes "
+                f"WHERE deleted_at IS NULL AND text = ?{ns_clause} ORDER BY id LIMIT 1",
+                (text, *ns_params),
             ).fetchone()
             if exact is not None:
                 return exact
@@ -172,10 +193,11 @@ class DeduplicationService:
                 for word in dict.fromkeys(words)
             )
             candidates = conn.execute(
-                "SELECT n.id, n.text FROM notes_fts "
+                "SELECT n.id, n.text, n.namespace FROM notes_fts "
                 "JOIN notes n ON n.id = notes_fts.rowid "
-                "WHERE notes_fts MATCH ? AND n.deleted_at IS NULL LIMIT ?",
-                (expression, FALLBACK_SCAN),
+                f"WHERE notes_fts MATCH ? AND n.deleted_at IS NULL"
+                f"{ns_fts_clause} LIMIT ?",
+                (expression, *ns_params, FALLBACK_SCAN),
             ).fetchall()
             for candidate in candidates:
                 if normalize_text(candidate["text"]) == norm:

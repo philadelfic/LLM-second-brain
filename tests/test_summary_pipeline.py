@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable, Iterator
 
 import pytest
-from fakes import FailingSummarizer, FixedSummarizer
+from fakes import FailingSummarizer, FixedClassifier, FixedSummarizer
 from fastapi.testclient import TestClient
 
 from app.config import get_settings
@@ -28,7 +28,9 @@ from app.main import create_app
 from app.services import (
     DeduplicationService,
     EmbeddingService,
+    NamespaceService,
     NoteService,
+    PromotionService,
     SearchService,
     Services,
 )
@@ -62,6 +64,7 @@ def _make_client(
     def builder(settings) -> Services:
         embedding = EmbeddingService(settings)  # loopback:1 → offline (штатно)
         dedup = DeduplicationService(settings)
+        namespaces = NamespaceService(settings)  # Фаза 10: реестр неймспейсов
         return Services(
             notes=NoteService(settings, embedding, dedup),
             search=SearchService(settings, embedding),
@@ -70,6 +73,14 @@ def _make_client(
             summary=summarizer,
             dedup_judge=JudgeService(settings),  # loopback:1: недоступен — Eтап 3.2
             backup=BackupService(settings),  # Фаза 5: петля снапшотов в lifespan
+            namespaces=namespaces,
+            classifier=FixedClassifier(),  # Фаза 10, Шаг 4: причёска (общая разметка)
+            # Фаза 10, Шаг 5: триггер без describer/судьи — не запускается
+            # (контейнер обязан быть полным; разметка FixedClassifier — общая,
+            # hint-групп до порога не вырастает).
+            promotion=PromotionService(
+                settings, embedding=embedding, namespaces=namespaces
+            ),
         )
 
     monkeypatch.setattr("app.main.build_services", builder)

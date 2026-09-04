@@ -45,8 +45,14 @@ from __future__ import annotations
 import hashlib
 import math
 
+from app.services.classifier import Classification, ClassificationError
 from app.services.embedding import EmbeddingError
 from app.services.judge import JudgeError
+from app.services.promotion import (
+    DescriberError,
+    StructureJudgeError,
+    Verdict,
+)
 from app.services.summary import SummaryError
 from app.services.worker import BackgroundWorker
 
@@ -204,12 +210,17 @@ class RecordingDedup:
 
     def __init__(self, candidates: list[tuple[int, float]] | None = None) -> None:
         self.candidates = list(candidates or [])
-        self.calls: list[tuple[int | None, list[float]]] = []
+        self.calls: list[tuple[int | None, list[float], str | None]] = []
 
     def find_candidates(
-        self, vector: list[float], exclude_id: int | None = None
+        self,
+        vector: list[float],
+        exclude_id: int | None = None,
+        namespace: str | None = None,
     ) -> list[tuple[int, float]]:
-        self.calls.append((exclude_id, list(vector)))
+        # Фаза 10: namespace — дедуп в пределах неймспейса (воркер передаёт
+        # namespace заметки-владельца); журнал расширен accordingly.
+        self.calls.append((exclude_id, list(vector), namespace))
         return list(self.candidates)
 
     def close(self) -> None:  # интерфейс-совместимость с DeduplicationService
@@ -241,6 +252,120 @@ class MergeFailingSummarizer(FixedSummarizer):
             raise SummaryError("слияние недоступно")
         self.last_attempt_ok = True
         return self.merge_result
+
+
+class FixedClassifier:
+    """Фейк-классификатор (Фаза 10, Шаг 4): детерминированная разметка.
+
+    Интерфейс Classifier (`classify`/`close`); возвращает заранее заданный
+    `Classification` (или отказ при `fail=True` — ClassificationError,
+    деградация причёски). Журнал `calls` — пары (text, known_nodes) в порядке
+    опроса: тесты проверяют, что воркер классифицирует именно default-заметки
+    и передаёт известные узлы реестра.
+    """
+
+    def __init__(
+        self,
+        result: Classification | None = None,
+        fail: bool = False,
+    ) -> None:
+        self.result = result
+        self.fail = fail
+        self.calls: list[tuple[str, list]] = []
+        self.last_attempt_ok: bool | None = None
+
+    def classify(self, text: str, known_nodes: list) -> Classification:
+        self.calls.append((text, known_nodes))
+        if self.fail:
+            self.last_attempt_ok = False
+            raise ClassificationError("классификатор недоступен")
+        self.last_attempt_ok = True
+        if self.result is None:
+            return Classification(None, None, 0.0)
+        return self.result
+
+    def close(self) -> None:  # интерфейс-совместимость с ClassificationService
+        return None
+
+
+class FixedDescriber:
+    """Фейк-генератор описаний узлов (Фаза 10, Шаг 5).
+
+    Интерфейс Describer (`describe`/`close`): возвращает заранее заданный
+    `description` (или отказ DescriberError при `fail=True` — деградация
+    триггера). Журнал `calls` — пары (summaries, slug, domain): тесты
+    проверяют, что описание строится по суммари группы.
+    """
+
+    def __init__(
+        self,
+        description: str = "Заметки по теме группы.",
+        fail: bool = False,
+    ) -> None:
+        self.description = description
+        self.fail = fail
+        self.calls: list[tuple[list[str], str, str]] = []
+        self.last_attempt_ok: bool | None = None
+
+    def describe(self, summaries: list[str], slug: str, domain: str) -> str:
+        self.calls.append((list(summaries), slug, domain))
+        if self.fail:
+            self.last_attempt_ok = False
+            raise DescriberError("генератор описаний недоступен")
+        self.last_attempt_ok = True
+        return self.description
+
+    def close(self) -> None:  # интерфейс-совместимость с DescriptionService
+        return None
+
+
+class ScriptedStructureJudge:
+    """Фейк-судья структуры (Фаза 10, Шаг 5): скриптованные вердикты.
+
+    `review()` вычерпывает `verdicts` по порядку (объекты Verdict);
+    исчерпанная очередь замещается `default`. `fail=True` —
+    StructureJudgeError при каждом вызове (деградация гейта: кандидат
+    остаётся без вердикта, повтор при следующем прогоне, NFR-3). Журнал
+    `review_calls` — аргументы вызова в порядке опроса: тесты проверяют,
+    что судьёй спрашивают именно готовых кандидатов с известными узлами.
+    """
+
+    def __init__(
+        self,
+        verdicts: list[Verdict] | None = None,
+        default: Verdict | None = None,
+        fail: bool = False,
+    ) -> None:
+        self.verdicts = list(verdicts or [])
+        self.default = default
+        self.fail = fail
+        self.review_calls: list[tuple[str, str, str, list, object, object]] = []
+        self.last_attempt_ok: bool | None = None
+
+    def review(
+        self,
+        description: str,
+        slug: str,
+        domain: str,
+        existing: list,
+        nearest_path: str | None,
+        nearest_cosine: float | None,
+    ) -> Verdict:
+        self.review_calls.append(
+            (description, slug, domain, list(existing), nearest_path, nearest_cosine)
+        )
+        if self.fail:
+            self.last_attempt_ok = False
+            raise StructureJudgeError("судья структуры недоступен")
+        self.last_attempt_ok = True
+        if self.verdicts:
+            return self.verdicts.pop(0)
+        if self.default is None:
+            raise StructureJudgeError("вердикт не скриптован")
+        return self.default
+
+    def close(self) -> None:  # интерфейс-совместимость с StructureJudgeService
+        return None
 
 
 class ScriptedJudge:

@@ -16,7 +16,10 @@ summary всегда fallback-усечение, генерация — фоно�
 Контракты ответов сервис-слоя (полные; REST отдаёт их как есть;
 MCP-слой срезает служебные поля — см. Фаза 9):
 - save (успех)  → {id, stored: True, summary_pending: True} — **без** warning:
-  векторизация теперь всегда фоновая, а не «отложена из-за отказа» (Фаза 8)
+  векторизация теперь всегда фоновая, а не «отложена из-за отказа» (Фаза 8);
+  Фаза 10 (Шаг 5, US-8): +опциональный hint «похожее есть в <ns>», если в
+  другом узле уже лежит дословный дубль (меж-узловые дубли легитимны —
+  запись не блокирует; hint — слой ориентирования, не деградация)
 - save (дубль)  → {duplicated: True, id, text, hint} (не создаётся)
 - get    → {notes: [...]} (массив даже для одного id; отсутствующие/удалённые
            id пропускаются; пустой результат — мягкий ответ с hint)
@@ -54,6 +57,7 @@ from app.config import Settings
 from app.services.dedup import DeduplicationService, duplicate_response
 from app.services.embedding import Embedder, EmbeddingService
 from app.services.emit import summary_of
+from app.services.namespaces import NamespaceService
 from app.services.splitter import split_text
 from app.storage import chunks
 from app.storage.db import session, transaction
@@ -90,6 +94,8 @@ class NoteService:
             embedding if embedding is not None else EmbeddingService(settings)
         )
         self._dedup = dedup if dedup is not None else DeduplicationService(settings)
+        # Фаза 10: реестр неймспейсов (валидация узла, поддеревья для list).
+        self._namespaces = NamespaceService(settings)
         # Сигнал воркеру суммаризации (main.py): будить петлю сразу при
         # появлении pending summary, а не ждать выросший back-off.
         self._summary_notifier = summary_notifier
@@ -100,7 +106,12 @@ class NoteService:
 
     # --- FR-4 memory_save (ARCH §4.1) --------------------------------------
 
-    def save(self, text: str, author: str | None = None) -> dict[str, Any]:
+    def save(
+        self,
+        text: str,
+        author: str | None = None,
+        namespace: str = "default",
+    ) -> dict[str, Any]:
         """Валидация → дословный дедуп → INSERT (текст + чанки) транзакцией.
 
         Фаза 8 (Этап 1): Ollama в синхронном пути не вызывается — вектор
@@ -109,19 +120,47 @@ class NoteService:
         дедуп (Этап 2). Синхронно отсекается только дословный дубль (SQL/FTS).
         Ответ мгновенный и без warning: векторизация не «отложена из-за
         отказа» — она всегда фоновая.
+
+        Фаза 10 (§5.7): `namespace` — целевой узел записи (только
+        зарегистрированный; не указан — `default`); незарегистрированный
+        узел — NamespaceError (транспорт Шага 3 обернёт в fail + hint).
+        Дедуп при save — в пределах этого же неймспейса (меж-узловые
+        дубли легитимны): дословный дубль в своём узле блокирует запись
+        (duplicated); дубль в ЧУЖОМ узле запись не блокирует — ответ
+        получает hint «похожее есть в <ns>» (US-8, слой ориентирования).
         """
         self._validate_text(text)
-        duplicate = self._dedup.find_by_text(text)
+        ns = self._namespaces.validate_placement(namespace)
+        duplicate = self._dedup.find_by_text(text, namespace=ns)
         if duplicate is not None:
             return duplicate_response(duplicate)
+        # Дедуп-хинт чужого узла (Фаза 10, US-8): близкий дубль в другом
+        # узле — легитимен (меж-узловые дубли не запрещены, §5.7), запись
+        # НЕ блокирует, но модель обучается ориентированию: hint в ответе.
+        foreign = self._dedup.find_by_text(text, namespace=None)
+        foreign_hint = (
+            f"похожее есть в «{foreign['namespace']}»; запись сюда не "
+            "блокирует — меж-узловые дубли легитимны"
+            if foreign is not None
+            else None
+        )
         # Чанки считаем чистым сплиттером (~миллисекунды, без Ollama) —
         # транзакция остаётся короткой.
         chunks_data = self._chunks_of(text)
         with session(self._settings) as conn, transaction(conn):
-            note_id = self._insert(conn, text, author, vector_status="pending")
+            note_id = self._insert(
+                conn, text, author, vector_status="pending", namespace=ns
+            )
             self._store_chunks(conn, note_id, chunks_data, None)
         self._notify_summary_pending()
-        return {"id": note_id, "stored": True, "summary_pending": True}
+        result: dict[str, Any] = {
+            "id": note_id,
+            "stored": True,
+            "summary_pending": True,
+        }
+        if foreign_hint is not None:
+            result["hint"] = foreign_hint  # слой ориентирования, не warning
+        return result
 
     def _insert(
         self,
@@ -129,11 +168,18 @@ class NoteService:
         text: str,
         author: str | None,
         vector_status: str = "pending",
+        namespace: str = "default",
     ) -> int:
         """INSERT строки заметки (внутри открытой транзакции)."""
         cursor = conn.execute(
-            "INSERT INTO notes (text, author, vector_status) VALUES (?, ?, ?)",
-            (text, author if author else self._settings.author_default, vector_status),
+            "INSERT INTO notes (text, author, vector_status, namespace) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                text,
+                author if author else self._settings.author_default,
+                vector_status,
+                namespace,
+            ),
         )
         return int(cursor.lastrowid or 0)
 
@@ -172,8 +218,18 @@ class NoteService:
 
     # --- FR-2 memory_list -------------------------------------------------
 
-    def list(self, limit: int | None = None, offset: int = 0) -> dict[str, Any]:
-        """Обзор памяти: краткие содержания по свежести + total (FR-2)."""
+    def list(
+        self,
+        limit: int | None = None,
+        offset: int = 0,
+        namespace: str | None = None,
+        namespace_exact: bool = False,
+    ) -> dict[str, Any]:
+        """Обзор памяти: краткие содержания по свежести + total (FR-2).
+
+        Фаза 10: namespace — фильтр узла/поддерева (None — глобально, как
+        раньше); каждый item несёт свой namespace.
+        """
         limit = self._settings.default_list_limit if limit is None else limit
         if not 1 <= limit <= MAX_LIST_LIMIT:
             raise NoteValidationError(
@@ -181,15 +237,26 @@ class NoteService:
             )
         if offset < 0:
             raise NoteValidationError(f"offset: ожидается ≥ 0, получено {offset}")
+        ns_nodes = self._namespaces.filter_nodes(namespace, namespace_exact)
+        if ns_nodes is not None:
+            ns_ph = ",".join("?" * len(ns_nodes))
+            ns_clause = f" AND namespace IN ({ns_ph})"
+            ns_params: list[object] = list(ns_nodes)
+        else:
+            ns_clause = ""
+            ns_params = []
         with session(self._settings) as conn:
             rows = conn.execute(
-                "SELECT id, summary, summary_status, author, created_at, updated_at, text "
-                "FROM notes WHERE deleted_at IS NULL "
+                "SELECT id, namespace, summary, summary_status, author, "
+                "created_at, updated_at, text "
+                "FROM notes WHERE deleted_at IS NULL"
+                f"{ns_clause} "
                 "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
-                (limit, offset),
+                [*ns_params, limit, offset],
             ).fetchall()
             total = conn.execute(
-                "SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL"
+                f"SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL{ns_clause}",
+                ns_params,
             ).fetchone()[0]
         items = [
             {
@@ -199,6 +266,7 @@ class NoteService:
                 "author": row["author"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
+                "namespace": row["namespace"],
             }
             for row in rows
         ]
@@ -214,7 +282,9 @@ class NoteService:
 
     # --- FR-5 memory_update (перезапись целиком; векторизация — фон) -------
 
-    def update(self, note_id: int, text: str) -> dict[str, Any]:
+    def update(
+        self, note_id: int, text: str, namespace: str | None = None
+    ) -> dict[str, Any]:
         """UPDATE text целиком; summary reset; ре-векторизация — фоном (Фаза 8).
 
         Заметка помечается vector_status='pending' — вектора заметки и чанков
@@ -222,24 +292,33 @@ class NoteService:
         не меняется. С Фазы 8 Этапа 2.2 update() — штатный путь сведения
         дублей: воркер объединяет пару merge-промптом суммаризатора и
         обновляет раннюю заметку этим методом (поздняя — soft delete).
+
+        Фаза 10 (§5.7): `namespace` — опциональный целевой узел переезда;
+        не указан — заметка остаётся в своём namespace (перемещение
+        уложенной заметки назад в default не требуется). Зарегистрирован ли
+        узел — проверяется той же точкой, что и save (NamespaceError →
+        транспорт Шага 3 обернёт в fail + hint).
         """
         self._validate_text(text)
         # Быстрая проверка до записи: несуществующий id не трогаем.
         with session(self._settings) as conn:
-            exists = conn.execute(
-                "SELECT 1 FROM notes WHERE id = ? AND deleted_at IS NULL",
+            row = conn.execute(
+                "SELECT id, namespace FROM notes "
+                "WHERE id = ? AND deleted_at IS NULL",
                 (note_id,),
             ).fetchone()
-        if exists is None:
+        if row is None:
             return self._not_found(note_id)
+        ns = self._namespaces.validate_placement(namespace) if namespace is not None \
+            else row["namespace"]
         chunks_data = self._chunks_of(text)
         with session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
-                "UPDATE notes SET text = ?, vector_status = 'pending', "
+                "UPDATE notes SET text = ?, namespace = ?, vector_status = 'pending', "
                 "summary = '', summary_status = 'pending', "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
                 "WHERE id = ? AND deleted_at IS NULL",
-                (text, note_id),
+                (text, ns, note_id),
             )
             updated = cursor.rowcount  # 0 = нет такой активной заметки
             # Фаза 7: старые чанки (и их вектора) заменяются новыми одной
@@ -352,7 +431,8 @@ class NoteService:
             )
 
     def _full_note(self, row: sqlite3.Row) -> dict[str, Any]:
-        """Формат выдачи memory_get (FR-3): полный текст + метаданные."""
+        """Формат выдачи memory_get (FR-3): полный текст + метаданные.
+        Фаза 10: +namespace (слой ориентирования: модель видит, где лежит)."""
         return {
             "id": row["id"],
             "text": row["text"],
@@ -361,4 +441,5 @@ class NoteService:
             "author": row["author"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "namespace": row["namespace"],
         }

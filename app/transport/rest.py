@@ -6,6 +6,11 @@
 пагинации — фиксированные контракты FR (limit 1..50, offset ≥ 0).
 
 Фаза 2: /notes CRUD + /search + счётчики /health из БД (NFR-4).
+Фаза 10 (Шаг 6): операторские ручки структуры — GET/POST/PATCH/DELETE
+/namespaces + merge (все с перекладкой заметок, ничего не теряется, §5.7);
+структурные ручки — НЕ в MCP (клиент-модели не рулят структурой). Ошибки:
+422 — валидация пути/описания, 404 — узел не найден, 409 — защита/конфликт
+(default, merge в себя, корень с детьми, занятый путь).
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ from pydantic import BaseModel
 
 from app.config import Settings
 from app.services import Services
+from app.services.namespaces import NamespaceError, NamespaceValidationError
 from app.services.notes import NoteValidationError
 from app.services.search import SearchValidationError
 
@@ -26,6 +32,35 @@ class NoteCreate(BaseModel):
 
     text: str
     author: str | None = None
+
+
+class NamespaceCreate(BaseModel):
+    """Тело POST /namespaces: оператор создаёт confirmed-узел (Шаг 6).
+
+    Автоматика создаёт provisional сама (триггер Шага 5); ручка — только
+    для стартового набора и корней (авто-корней не бывает, §5.7).
+    """
+
+    path: str
+    description: str
+
+
+class NamespacePatch(BaseModel):
+    """Тело PATCH /namespaces/{path}: описание, статус и/или переименование.
+
+    `path` в теле — новый путь узла (rename с перекладкой заметок, §5.7);
+    опущен — узел остаётся на месте.
+    """
+
+    path: str | None = None
+    description: str | None = None
+    status: str | None = None
+
+
+class NamespaceMerge(BaseModel):
+    """Тело POST /namespaces/{path}/merge: целевой канонический узел."""
+
+    into: str
 
 
 class NoteUpdate(BaseModel):
@@ -52,6 +87,12 @@ def _services(request: Request) -> Services:
 def _unprocessable(exc: ValueError) -> HTTPException:
     """Доменные нарушения → 422 с текстом сервиса (без внутренностей)."""
     return HTTPException(status_code=422, detail=str(exc))
+
+
+def _conflict(exc: NamespaceError) -> HTTPException:
+    """Конфликт структурных ручек (Шаг 6): защита default, дубль пути,
+    merge в себя — 409 с текстом сервиса (не найден — проверяется заранее)."""
+    return HTTPException(status_code=409, detail=str(exc))
 
 
 def build_rest_router(settings: Settings) -> APIRouter:
@@ -158,5 +199,103 @@ def build_rest_router(settings: Settings) -> APIRouter:
             )
         except SearchValidationError as exc:
             raise _unprocessable(exc) from exc
+
+    # --- неймспейсы: операторские ручки структуры (Фаза 10, Шаг 6) ----------
+    # §5.7: структурные ручки — REST оператора, НЕ в MCP (клиент-модели не
+    # рулят структурой). Один код сервисов; существующие REST-контракты
+    # нетронуты (прецедент Фазы 9 — новые маршруты не меняют старые).
+
+    @rest_router.get("/namespaces")
+    async def list_namespaces(request: Request) -> dict:
+        """Реестр узлов со счётчиками + promotion_candidates (US-9).
+
+        candidates — живая SQL-агрегация триггера (растущие hint-группы
+        default-заметок, ещё не прогнанные через судью структуры).
+        """
+        services = _services(request)
+        result = await asyncio.to_thread(services.namespaces.list_all)
+        try:
+            candidates = await asyncio.to_thread(services.promotion.candidates)
+        except Exception:
+            # Кандидаты — вспомогательный слой: сбой агрегации не ломает
+            # реестр (деградация, как в MCP memory_namespaces).
+            candidates = []
+        return {
+            "namespaces": result["namespaces"],
+            "promotion_candidates": candidates,
+        }
+
+    @rest_router.post("/namespaces", status_code=201)
+    async def create_namespace(payload: NamespaceCreate, request: Request) -> dict:
+        """Зарегистрировать узел (confirmed): стартовый набор/новые корни/листья."""
+        try:
+            return await asyncio.to_thread(
+                _services(request).namespaces.create, payload.path, payload.description
+            )
+        except NamespaceValidationError as exc:
+            raise _unprocessable(exc) from exc
+        except NamespaceError as exc:
+            raise _conflict(exc) from exc
+
+    @rest_router.patch("/namespaces/{path:path}")
+    async def patch_namespace(path: str, payload: NamespacePatch, request: Request) -> dict:
+        """Правка узла: описание, статус (confirm) и/или переименование.
+
+        Rename — перекладка заметок/разметки/вердиктов (§5.7: ничего не
+        теряется); статус — аудит provisional → confirmed (и назад, если
+        оператор передумал). Служебные поля не переданы — узел без изменений.
+        """
+        services = _services(request)
+        node = await asyncio.to_thread(services.namespaces.get, path)
+        if node is None:
+            raise HTTPException(status_code=404, detail=f"узел «{path}» не зарегистрирован")
+        try:
+            if payload.path is not None:
+                node = await asyncio.to_thread(
+                    services.namespaces.rename, node["path"], payload.path
+                )
+            if payload.description is not None:
+                node = await asyncio.to_thread(
+                    services.namespaces.update_description, node["path"], payload.description
+                )
+            if payload.status is not None:
+                node = await asyncio.to_thread(
+                    services.namespaces.set_status, node["path"], payload.status
+                )
+        except NamespaceValidationError as exc:
+            raise _unprocessable(exc) from exc
+        except NamespaceError as exc:
+            raise _conflict(exc) from exc
+        return node
+
+    @rest_router.post("/namespaces/{path:path}/merge")
+    async def merge_namespace(path: str, payload: NamespaceMerge, request: Request) -> dict:
+        """Слить лист с каноническим узлом: заметки переехали, узел исчез (US-11)."""
+        services = _services(request)
+        node = await asyncio.to_thread(services.namespaces.get, path)
+        if node is None:
+            raise HTTPException(status_code=404, detail=f"узел «{path}» не зарегистрирован")
+        try:
+            return await asyncio.to_thread(
+                services.namespaces.merge_node, node["path"], payload.into
+            )
+        except NamespaceValidationError as exc:
+            raise _unprocessable(exc) from exc
+        except NamespaceError as exc:
+            raise _conflict(exc) from exc
+
+    @rest_router.delete("/namespaces/{path:path}")
+    async def delete_namespace(path: str, request: Request) -> dict:
+        """Удалить узел с перекладкой заметок (§5.7: ничего не теряется)."""
+        services = _services(request)
+        node = await asyncio.to_thread(services.namespaces.get, path)
+        if node is None:
+            raise HTTPException(status_code=404, detail=f"узел «{path}» не зарегистрирован")
+        try:
+            return await asyncio.to_thread(services.namespaces.delete_node, node["path"])
+        except NamespaceValidationError as exc:
+            raise _unprocessable(exc) from exc
+        except NamespaceError as exc:
+            raise _conflict(exc) from exc
 
     return rest_router

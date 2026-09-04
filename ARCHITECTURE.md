@@ -152,19 +152,52 @@ services:
 - **DedupService** — дословный дедуп (SQL/FTS, синхронно в save) и
   косинус-кандидаты фонового дедупа (топ-N ≥
   `DEDUP_CANDIDATE_SIMILARITY`); `find_by_cosine` — проверочное API
-  (косинус-фоллбек `DEDUP_SIMILARITY`, Этап 2.2).
+  (косинус-фоллбек `DEDUP_SIMILARITY`, Этап 2.2). Фаза 10: дедуп — в
+  пределах неймспейса заметки (меж-узловые дубли легитимны); дословный
+  дубль в чужом узле при save — запись не блокирует, в ответе hint
+  «похожее есть в <ns>» (слой ориентирования).
 - **JudgeService** — судья дедупа (Ollama `/api/chat`, `DEDUP_JUDGE_*`):
   вердикт «ДУБЛЬ/НЕ ДУБЛЬ» по паре текстов; думающий судья
   (think:true — решение 2026-08-30 после E2E); вызывается фоновым
   дедупом воркера, через слот очереди ollama_slot (тот же base_url,
   что у суммаризатора).
+- **NamespaceService** (Фаза 10, §5.7) — реестр иерархических неймспейсов:
+  валидация слаг-путей (глубина ≤2, «СУБО 2020» → `subo-2020`), контракт
+  описаний (≤2 предложений — единая точка валидации), CRUD, счётчики
+  `notes_count`/`subtree_count`, узлы поддерева для фильтров поиска;
+  операторские перекладки (§5.7 — всё с перекладкой заметок, ничего не
+  теряется): rename (узел + дети), merge листа (hint канонизируется),
+  delete (лист → заметки в родительский корень); груминг (пустые
+  provisional-листы чистятся автоматом, пустые confirmed и листья
+  < `NAMESPACE_GROOM_MIN_NOTES` — сигнал оператору).
+- **ClassificationService** (Фаза 10, Шаг 4) — причёска default-заметок:
+  та же модель, что суммаризация, отдельный промпт, JSON-выход
+  (`domain_hint`/`subdomain_hint`/`confidence`, think:false, маленький
+  num_predict); известные узлы передаются в user-сообщении. Вызывается
+  воркером после суммаризации; `classified_at` — анти-зацикливание.
+- **PromotionService** (Фаза 10, Шаг 5) — триггер домена и авто-создание
+  листа: SQL-агрегация hint-групп среди default-заметок (порог
+  `NAMESPACE_PROMOTION_THRESHOLD` / `NAMESPACE_PROMOTION_MIN_CONFIDENCE`)
+  → генератор описания по 2–3 суммари группы (модель суммаризации,
+  think:false; обрезка до 2 предложений) → косинус-предфильтр
+  антисинонимии (≥ `NAMESPACE_SYNONYM_SIMILARITY` — слияние без LLM) →
+  судья структуры (`StructureJudgeService` — модель судьи дедупа,
+  отдельный промпт: СОЗДАТЬ/СЛИТЬ <path>/ОТКЛОНИТЬ) → provisional-лист +
+  ретро-перекладка одним UPDATE (hint канонизируется, вектора — pending).
+  Cooldown: таблица `promotions` (вердикты merged/rejected), существование
+  узла, лимиты `NAMESPACE_AUTO_MAX_PER_DAY`/`NAMESPACE_MAX_LEAVES_PER_DOMAIN`.
+  Параметры разметки — внутренние данные, НЕ в MCP-контрактах (§5.7).
 - **BackgroundWorker** — единственный asyncio-воркер, три независимые
   петли: до-векторизация заметок (`vector_status=pending`),
   до-суммаризация (`summary_status=pending`) и до-векторизация чанков
   (анти-джойн `notes_chunks`/`notes_chunks_vec`); раздельные back-off
-  очереди (§3.4).
+  очереди (§3.4). После суммаризации default-заметки — причёска:
+  классификация (Шаг 4) и триггер домена (Шаг 5); сбои триггера не
+  роняют петли (обогащение, не конвейер данных).
 - **BackupService** — периодический снапшот БД через SQLite `backup` API
-  (онлайн, без остановки) в `BACKUP_DIR`, ротация по `BACKUP_KEEP`.
+  (онлайн, без остановки) в `BACKUP_DIR`, ротация по `BACKUP_KEEP`; после
+  каждого снапшота — груминг реестра неймспейсов (Фаза 10: ритм раз в
+  сутки, отдельная петля не нужна).
 
 ### 3.3 Storage
 
@@ -181,7 +214,38 @@ CREATE TABLE notes (
   summary_status TEXT    NOT NULL DEFAULT 'pending', -- ok | pending
   created_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   updated_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-  deleted_at     TEXT    NULL      -- NULL = активна; soft delete ставит метку
+  deleted_at     TEXT    NULL,      -- NULL = активна; soft delete ставит метку
+  -- Фаза 10 (§5.7): укладка в узел иерархии + внутренняя разметка причёски
+  -- (domain_hint/subdomain_hint/confidence — НЕ в MCP-контрактах):
+  namespace      TEXT    NOT NULL DEFAULT 'default',
+  classified_at  TEXT    NULL,      -- анти-зацикливание причёски
+  domain_hint    TEXT    NULL,      -- корень из реестра (классификатор)
+  subdomain_hint TEXT    NULL,      -- слаг листа или NULL (общая)
+  confidence     REAL    NULL       -- 0..1
+);
+CREATE INDEX idx_notes_namespace ON notes(namespace, deleted_at);
+
+-- Реестр узлов иерархии (Фаза 10): path — слэш-путь (max 2 уровня),
+-- description — обязательное (≤2 предложений), status — confirmed | provisional
+-- (авто-созданные узлы судьи структуры). default создаётся при init_db всегда.
+CREATE TABLE namespaces (
+  path        TEXT PRIMARY KEY,
+  description TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'confirmed'
+              CHECK(status IN ('confirmed', 'provisional')),
+  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+-- Вердикты судьи структуры (Шаг 5): cooldown триггера — группа с вынесенным
+-- вердиктом не дёргает describer/судью повторно; сброс — оператор (REST).
+CREATE TABLE promotions (
+  domain         TEXT NOT NULL,
+  subdomain      TEXT NOT NULL,
+  status         TEXT NOT NULL CHECK(status IN ('merged', 'rejected')),
+  canonical_path TEXT NULL,
+  decided_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  PRIMARY KEY (domain, subdomain)
 );
 
 CREATE VIRTUAL TABLE notes_fts USING fts5(
@@ -192,6 +256,7 @@ CREATE VIRTUAL TABLE notes_fts USING fts5(
 
 CREATE VIRTUAL TABLE notes_vec USING vec0(
   note_id    INTEGER PRIMARY KEY,
+  +ns        TEXT PARTITION KEY,  -- Фаза 10: партиция = namespace заметки
   embedding  float[4096]      -- размерность фиксируется при создании БД
 );
 
@@ -206,6 +271,7 @@ CREATE TABLE notes_chunks (
 
 CREATE VIRTUAL TABLE notes_chunks_vec USING vec0(
   chunk_id   INTEGER PRIMARY KEY,
+  +ns        TEXT PARTITION KEY,  -- Фаза 10: партиция = namespace заметки
   embedding  float[4096] distance_metric=cosine
 );
 ```
@@ -218,6 +284,15 @@ CREATE VIRTUAL TABLE notes_chunks_vec USING vec0(
 - `summary_status=pending` → в выдачах используется fallback (усечение
   текста), воркер догенерирует `summary`.
 - `summary` не векторизуется и не индексируется FTS.
+- **Неймспейсы (Фаза 10, §5.7)**: vec0-таблицы с partition key `+ns` —
+  вектор заметки живёт в партиции его узла; поиск по узлу = поддерево
+  (список узлов IN-фильтром), лист покрывает только себя, без namespace —
+  глобальный RRF; FTS-филиал фильтруется JOIN'ом (индекс не пересоздаётся).
+  Переезд заметки (причёска/оператор) ставит `vector_status='pending'` —
+  воркер пере-кодирует вектор в партицию нового узла. БД до Фазы 10
+  мигрируются нулевой миграцией при старте (существующие заметки →
+  `default`; vec-индексы без `+ns` пересоздаются с партицией, полная
+  переиндексация штатными pending-очередями).
 - Автореиндексация при старте (таблица `meta`, механика b972386): env
   сверяется с meta (`embedding_model`, `embedding_dim`, `chunk_size`,
   `chunk_overlap`, `chunk_min_target`). Смена модели/размерности → дропаются
@@ -251,6 +326,21 @@ CREATE VIRTUAL TABLE notes_chunks_vec USING vec0(
   `upsert_vector_if_exists` (SQLite переиспользует rowid после
   DELETE+INSERT).
 - back-off: 30s → ×2 → max 15 мин, независимо по каждой из трёх очередей.
+- Причёска и триггер домена (Фаза 10, §5.7): после успешной суммаризации
+  default-заметки (ещё не классифицированной) воркер размечает её
+  (`ClassificationService`: domain_hint/subdomain_hint/confidence,
+  `classified_at` — анти-зацикливание, повтор после `memory_update`) и
+  при confidence ≥ `NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE` переезжает в
+  существующий узел (вектор — pending в новую партицию). Новый лист
+  (subdomain_hint не зарегистрирован) остаётся в default — его создаст
+  триггер: после классификации воркер гонит `PromotionService.run`
+  (SQL-агрегация → describer → косинус-предфильтр → судья структуры →
+  provisional-лист + ретро-перекладка). Сбой триггера не роняет петли
+  (обогащение): ожидаемые отказы LLM оставляют кандидата без вердикта
+  (повтор при следующей классификации), остальное — warning с traceback.
+  Суммаризация/классификация/судья/описания — через общий слот
+  ollama_gate (сервер суммаризации 112): строго последовательно.
+
 
 ## 4. Потоки
 
@@ -503,6 +593,43 @@ top_k=5 ~2 КБ → ≤1.2 КБ; дубль `memory_save` ~2.2 КБ → ≤0.2 �
 Нормативные контракты — REQUIREMENTS §5.6; канонические тексты
 инструментов — §5.2 этого документа.
 
+### 5.7 Фаза 10: неймспейсы — карта и ориентирование (модель для моделей)
+
+Иерархические неймспейсы (§5.7 REQUIREMENTS, максимум 2 уровня: `domain`,
+`domain/subdomain`) делят одну общую базу на крупные разделы, снимая риск
+«шума из соседних доменов». Два канала укладки: клиент при `save` кладёт
+сам (знает карту) или — не знает — в `default`; фоновая причёска разбирает
+default. Структура (листья) растёт системой автоматически (`provisional` —
+наравне с `confirmed` в поиске и перекладке), корни и структурные ручки
+(confirm/rename/merge/delete — REST, все с перекладкой) — только оператор;
+**MCP-ручек структуры нет**: клиент-модели влияют на структуру данными
+(hint'ы), не ручками.
+
+Три слоя ориентирования (§5.7):
+
+1. Карта узлов с описаниями в серверных `instructions` (статична до
+   reconnect — ок при нашем ритме изменений; бюджет §2 ≤ ~1300 токенов);
+2. `memory_namespaces` (7-й инструмент) — актуальный реестр (path,
+   description, status, notes_count, subtree_count, updated_at) +
+   `promotion_candidates` (растущие hint-группы default-заметок, ещё не
+   прогнанные через судью структуры) — живая карта для моделей;
+3. метки `namespace` в выдачах search/list/get — модель учится на лету.
+
+Правило для моделей (вшито в инструкции): «уверен в области — ищи с
+`namespace` (узел = его поддерево); не уверен — ищи глобально и сужай по
+результатам: промах ничего не теряет». `namespace_exact` — точный узел
+без листьев. save с незарегистрированным узлом → fail + hint (клиенты не
+создают узлы); параметры разметки (domain_hint/subdomain_hint/confidence)
+— внутренние данные, не в контрактах. Дедуп — в пределах неймспейса;
+близкий дубль в чужом узле даёт hint «похожее есть в `<ns>`» (запись не
+блокирует). Автономная эволюция структуры (§1: человек — архитектор
+инвариантов и аудитор): триггер домена → судья структуры → provisional;
+груминг чистит пустое; структурные события (`classified_moved`,
+`node_created`, `node_merged`, `node_deleted`, `groom_*`, `root_orphans`)
+— в JSON-логи отдельными типами — аудит автономии.
+
+Нормативные контракты — REQUIREMENTS §5.7; env — §8 (`NAMESPACE_*`).
+
 ## 6. Безопасность
 
 - Единственный механизм — статический Bearer-токен (env). Предполагается
@@ -529,16 +656,30 @@ top_k=5 ~2 КБ → ≤1.2 КБ; дубль `memory_save` ~2.2 КБ → ≤0.2 �
   чанку (ретро-замер против вектора полного текста — поведение Фазы 3).
   Скип при недоступности серверов.
 - **MCP-поверхность**: handshake (в т.ч. поле `instructions`), `tools/list`
-  → все 6, вызовы mcp-клиентом, негативы токена (нет/неверный → 401);
+  → все 7, вызовы mcp-клиентом, негативы токена (нет/неверный → 401);
   Фаза 9 — белые списки полей компактных выдач (срезанные поля
-  «не присутствуют в ответе»).
+  «не присутствуют в ответе»); Фаза 10 — `memory_namespaces`,
+  namespace-параметры 4 инструментов, карта в инструкциях (бюджет §2).
 - **Отказы внешних серверов**: падение embedding → pending + деградация
   поиска; падение суммаризатора → fallback + pending. Юнит-тесты с
   «выключенными» фейками.
+- **Неймспейсы (Фаза 10)**: миграция живой БД (US-12), семантика
+  поддерева/листа/exact, дедуп в пределах узла и hint чужого, причёска
+  (авто-переезд/общая/новый лист), триггер домена (агрегация →
+  косинус-предфильтр → судья структуры → provisional + ретро-перекладка,
+  cooldown, лимиты), груминг, REST-ручки оператора (rename/merge/delete
+  с перекладкой). Интеграционные — на живой Ollama (классификатор,
+  генератор описаний, судья структуры). E2E Фазы 10 —
+  `scripts/e2e_phase10.py`: US-1…US-12 на тест-контейнере со снапшотом
+  боевой notes.db (миграция, карта, поиск, причёска, триггер,
+  обратимость) + замеры §4.
 
 ## 8. Развитие после v1 (сознательно не сейчас)
 
-- Теги/неймспейсы, фильтры поиска по ним.
+- ~~Теги/неймспейсы, фильтры поиска по ним~~ — неймспейсы реализованы
+  (Фаза 10, §5.7, ветка v2.0-dev; теги отклонены — §5.2 REQUIREMENTS):
+  этап 2 фазы (авто-роутинг search по описаниям узлов, батч-ревизия
+  первичной укладки, кластеризация эмбеддингов) — опционально позже.
 - `memory_restore` (undo для моделей) и физическая чистка trash.
 - Компрессия: авто-слияние почти-дубликатов, чистка старья.
 - Function-фильтр авто-подгрузки (Фаза 6).
