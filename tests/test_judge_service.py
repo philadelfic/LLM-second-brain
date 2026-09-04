@@ -145,9 +145,9 @@ def test_request_url_path_and_model(monkeypatch) -> None:
     service.judge(TEXT_NEW, TEXT_CANDIDATE)
     request = recorder.requests[0]
     assert request.url.path == "/api/chat"
-    assert str(request.url).startswith(settings.dedup_judge_ollama_base_url)
+    assert str(request.url).startswith(settings.judge_base_url)
     payload = last_payload(recorder)
-    assert payload["model"] == settings.dedup_judge_model
+    assert payload["model"] == settings.judge_model
 
 
 def test_messages_system_prompt_and_marked_texts(monkeypatch) -> None:
@@ -167,19 +167,19 @@ def test_messages_system_prompt_and_marked_texts(monkeypatch) -> None:
 
 
 def test_think_false_in_request_body_by_default(monkeypatch) -> None:
-    """DEDUP_JUDGE_THINK=false (дефолт): в теле запроса \"think\": false."""
+    """JUDGE_THINK=false (дефолт): в теле запроса \"think\": false."""
     settings = make_settings(monkeypatch)
-    assert settings.dedup_judge_think is False
+    assert settings.judge_think is False
     service, recorder = make_service(settings, [httpx.Response(200, json=ok_body())])
     service.judge(TEXT_NEW, TEXT_CANDIDATE)
     assert last_payload(recorder)["think"] is False
 
 
 def test_think_field_absent_when_enabled(monkeypatch) -> None:
-    """DEDUP_JUDGE_THINK=true: поля think нет (thinking ограничиваем не)."""
-    settings = make_settings(monkeypatch, DEDUP_JUDGE_THINK="true")
+    """JUDGE_THINK=true: поля think нет (thinking ограничиваем не)."""
+    settings = make_settings(monkeypatch, JUDGE_THINK="true")
     service, recorder = make_service(settings, [httpx.Response(200, json=ok_body())])
-    assert settings.dedup_judge_think is True
+    assert settings.judge_think is True
     service.judge(TEXT_NEW, TEXT_CANDIDATE)
     assert "think" not in last_payload(recorder)
 
@@ -190,21 +190,21 @@ def test_stream_disabled_and_generation_params(monkeypatch) -> None:
     service.judge(TEXT_NEW, TEXT_CANDIDATE)
     payload = last_payload(recorder)
     assert payload["stream"] is False
-    assert payload["num_predict"] == settings.dedup_judge_num_predict == 256
+    assert payload["num_predict"] == settings.judge_num_predict == 256
     assert payload["temperature"] == TEMPERATURE == 0.1
     assert payload["keep_alive"] == KEEP_ALIVE == "15m"
 
 
 def test_num_predict_from_env(monkeypatch) -> None:
-    settings = make_settings(monkeypatch, DEDUP_JUDGE_NUM_PREDICT="16")
+    settings = make_settings(monkeypatch, JUDGE_NUM_PREDICT="16")
     service, recorder = make_service(settings, [httpx.Response(200, json=ok_body())])
     service.judge(TEXT_NEW, TEXT_CANDIDATE)
     assert last_payload(recorder)["num_predict"] == 16
 
 
 def test_read_timeout_from_env(monkeypatch) -> None:
-    """DEDUP_JUDGE_TIMEOUT_SEC задаёт клиентский read-таймаут (§8)."""
-    settings = make_settings(monkeypatch, DEDUP_JUDGE_TIMEOUT_SEC="7")
+    """JUDGE_TIMEOUT_SEC задаёт клиентский read-таймаут (§8)."""
+    settings = make_settings(monkeypatch, JUDGE_TIMEOUT_SEC="7")
     service, _ = make_service(settings, [httpx.Response(200, json=ok_body())])
     assert service._client.timeout.read == 7.0
     assert service._client.timeout.connect == CONNECT_TIMEOUT_SEC
@@ -313,9 +313,9 @@ def test_empty_texts_value_error(monkeypatch) -> None:
 
 
 def test_build_services_wires_judge(monkeypatch) -> None:
-    """`build_services` собирает JudgeService на DEDUP_JUDGE_* (DI как summary)."""
+    """`build_services` собирает JudgeService на JUDGE_* (DI как summary)."""
     settings = make_settings(monkeypatch)
     services = build_services(settings)
-    assert services.dedup_judge is not None
-    assert type(services.dedup_judge).__name__ == "JudgeService"
-    services.dedup_judge.close()
+    assert services.judge is not None
+    assert type(services.judge).__name__ == "JudgeService"
+    services.judge.close()

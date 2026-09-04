@@ -108,7 +108,7 @@ class ClassificationService:
         if transport is not None and not isinstance(transport, httpx.BaseTransport):
             transport = httpx.MockTransport(transport)
         self._client = httpx.Client(
-            base_url=settings.summary_ollama_base_url,
+            base_url=settings.summary_base_url,
             timeout=httpx.Timeout(
                 CLASSIFIER_TIMEOUT_SEC, connect=CONNECT_TIMEOUT_SEC
             ),
@@ -172,12 +172,12 @@ class ClassificationService:
         try:
             # Очередь F1: один запрос к серверу в момент времени (та же
             # модель, что суммаризация — делим слот, не гоняем параллельно).
-            with ollama_slot(self._settings.summary_ollama_base_url):
+            with ollama_slot(self._settings.summary_base_url):
                 response = self._client.post("/api/chat", json=payload)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise ClassificationError(
                 "сервер классификации недоступен "
-                f"({self._settings.summary_ollama_base_url}): {exc}"
+                f"({self._settings.summary_base_url}): {exc}"
             ) from exc
         if response.status_code != 200:
             body = " ".join(response.text[:_ERROR_BODY_CHARS].split())

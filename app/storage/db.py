@@ -75,6 +75,7 @@ _NOTES_DDL = """
 CREATE TABLE IF NOT EXISTS notes (
   id             INTEGER PRIMARY KEY,
   text           TEXT    NOT NULL CHECK(length(text) BETWEEN 1 AND {max_note_chars}),
+  title          TEXT    NULL,
   summary        TEXT    NOT NULL DEFAULT '',
   author         TEXT    NOT NULL DEFAULT 'unknown',
   vector_status  TEXT    NOT NULL DEFAULT 'pending',
@@ -286,6 +287,8 @@ def init_db(settings: Settings) -> None:
             for trigger in _TRIGGERS:
                 conn.execute(trigger)
             _check_fts_integrity(conn)
+            # Названия заметок (Фаза 11, решение №9): notes.title TEXT (nullable).
+            _migrate_title_column(conn)
             # Неймспейсы (Фаза 10): колонки notes + реестр + дефолт-узел.
             _migrate_namespace_columns(conn)
             _migrate_classification_columns(conn)
@@ -316,6 +319,19 @@ def init_db(settings: Settings) -> None:
 
 DEFAULT_NAMESPACE = "default"
 DEFAULT_NAMESPACE_DESCRIPTION = "общие заметки, не привязанные к доменам"
+
+
+def _migrate_title_column(conn: sqlite3.Connection) -> None:
+    """Нулевая миграция Фазы 11 (решение №9): notes.title TEXT (nullable).
+
+    Свежие БД получают колонку из _NOTES_DDL; унаследованные — ALTER TABLE
+    ADD COLUMN (старые заметки остаются без названия — только они могут им
+    быть; новые всегда с title, контракт валидируется сервисом).
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
+    if "title" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN title TEXT")
+
 
 _INDEX_NAMESPACE_DDL = (
     "CREATE INDEX IF NOT EXISTS idx_notes_namespace "
@@ -465,9 +481,10 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
     автореиндексация при старте.
 
     Две разные причины, одна механика (b972386, решение О. 2026-08-29):
-    - смена модели/размерности (env vs meta embedding_model/embedding_dim):
-      ОБА векторных индекса пересоздаются под текущую размерность, все заметки
-      (включая trash — их вектора тоже невалидны) уходят в pending, воркер
+    - смена модели/размерности/провайдера (env vs meta embedding_model/
+      embedding_dim/embedding_provider, Фаза 11 — провайдер): ОБА векторных
+      индекса пересоздаются под текущую размерность, все заметки (включая
+      trash — их вектора тоже невалидны) уходят в pending, воркер
       пере-кодирует полные вектора;
     - смена чанк-параметров (env vs meta chunk_*, Фаза 7, brief §6): вектора
       полного текста остаются валидными (текст не менялся) — дропается только
@@ -487,6 +504,10 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
     были построены той же моделью (иначе оператор потратил бы reindex.py).
     Чанк-параметры в meta пишутся аналогично — только отсутствующие ключи
     (отсутствие = «не менялись», сравнение с env только по существующим).
+    Провайдер эмбеддинга (Фаза 11) — тот же паттерн: у БД без ключа
+    embedding_provider (до Фазы 11) запись из env без реиндексации; смена
+    провайдера при том же имени модели — тоже реиндекс (вектора другой
+    провайдерской модели несовместимы).
     """
     conn.execute(_META_DDL)
     stored = _get_meta(conn, "embedding_model")
@@ -500,10 +521,19 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
         _set_chunk_meta_defaults(conn, settings)
         _set_meta(conn, "embedding_model", settings.embedding_model)
         _set_meta(conn, "embedding_dim", str(settings.embedding_dim))
+        _set_meta(conn, "embedding_provider", settings.embedding_provider)
         return
     stored_dim = int(stored_dim_raw)
+    # Провайдер эмбеддинга (Фаза 11): у БД без ключа (до Фазы 11) — нулевая
+    # миграция по паттерну chunk-ключей: запись из env БЕЗ реиндексации.
+    stored_provider = _get_meta(conn, "embedding_provider")
+    if stored_provider is None:
+        _set_meta(conn, "embedding_provider", settings.embedding_provider)
+        stored_provider = settings.embedding_provider
     model_changed = (
-        stored != settings.embedding_model or stored_dim != settings.embedding_dim
+        stored != settings.embedding_model
+        or stored_dim != settings.embedding_dim
+        or stored_provider != settings.embedding_provider
     )
     # Чанк-параметры: сравниваем ТОЛЬКО зафиксированные ранее ключи
     # (отсутствующий ключ — нулевая миграция, «не менялись», пишется ниже).
@@ -528,12 +558,14 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
     }
     message = "chunk parameters changed: re-chunking all notes"
     if model_changed:
-        message = "embedding model/dim changed: rebuilding vector index"
+        message = "embedding provider/model/dim changed: rebuilding vector index"
         started_extra.update(
             from_model=stored,
             to_model=settings.embedding_model,
             from_dim=stored_dim,
             to_dim=settings.embedding_dim,
+            from_provider=stored_provider,
+            to_provider=settings.embedding_provider,
         )
     for key, (old_value, new_value) in chunk_changes.items():
         started_extra[f"from_{key}"] = old_value
@@ -557,6 +589,7 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
         if model_changed:
             _set_meta(conn, "embedding_model", settings.embedding_model)
             _set_meta(conn, "embedding_dim", str(settings.embedding_dim))
+            _set_meta(conn, "embedding_provider", settings.embedding_provider)
         for key in _CHUNK_META_KEYS:
             _set_meta(conn, key, str(getattr(settings, key)))
     pending_chunks = int(chunks.count_pending(conn))

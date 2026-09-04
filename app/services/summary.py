@@ -145,7 +145,7 @@ class SummaryService:
         if transport is not None and not isinstance(transport, httpx.BaseTransport):
             transport = httpx.MockTransport(transport)
         self._client = httpx.Client(
-            base_url=settings.summary_ollama_base_url,
+            base_url=settings.summary_base_url,
             timeout=httpx.Timeout(
                 settings.summary_timeout_sec, connect=CONNECT_TIMEOUT_SEC
             ),
@@ -215,12 +215,12 @@ class SummaryService:
         try:
             # Очередь F1: один запрос к серверу в момент времени (summarize и
             # merge — один клиент и один base_url; судья — тот же сервер).
-            with ollama_slot(self._settings.summary_ollama_base_url):
+            with ollama_slot(self._settings.summary_base_url):
                 response = self._client.post("/api/chat", json=payload)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise SummaryError(
                 "сервер суммаризации недоступен "
-                f"({self._settings.summary_ollama_base_url}): {exc}"
+                f"({self._settings.summary_base_url}): {exc}"
             ) from exc
         return self._parse(response, max_chars)
 

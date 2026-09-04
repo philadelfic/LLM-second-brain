@@ -169,7 +169,7 @@ class DescriptionService:
         if transport is not None and not isinstance(transport, httpx.BaseTransport):
             transport = httpx.MockTransport(transport)
         self._client = httpx.Client(
-            base_url=settings.summary_ollama_base_url,
+            base_url=settings.summary_base_url,
             timeout=httpx.Timeout(PROMOTION_TIMEOUT_SEC, connect=CONNECT_TIMEOUT_SEC),
             transport=transport,
         )
@@ -218,12 +218,12 @@ class DescriptionService:
         try:
             # Очередь F1: один запрос к серверу в момент времени (та же
             # модель, что суммаризация — делим слот, не гоняем параллельно).
-            with ollama_slot(self._settings.summary_ollama_base_url):
+            with ollama_slot(self._settings.summary_base_url):
                 response = self._client.post("/api/chat", json=payload)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise DescriberError(
                 "сервер генерации описаний недоступен "
-                f"({self._settings.summary_ollama_base_url}): {exc}"
+                f"({self._settings.summary_base_url}): {exc}"
             ) from exc
         if response.status_code != 200:
             body = " ".join(response.text[:_ERROR_BODY_CHARS].split())
@@ -316,9 +316,9 @@ class StructureJudgeService:
         if transport is not None and not isinstance(transport, httpx.BaseTransport):
             transport = httpx.MockTransport(transport)
         self._client = httpx.Client(
-            base_url=settings.dedup_judge_ollama_base_url,
+            base_url=settings.judge_base_url,
             timeout=httpx.Timeout(
-                settings.dedup_judge_timeout_sec, connect=CONNECT_TIMEOUT_SEC
+                settings.judge_timeout_sec, connect=CONNECT_TIMEOUT_SEC
             ),
             transport=transport,
         )
@@ -373,19 +373,19 @@ class StructureJudgeService:
         токенов). None — наследует DEDUP_JUDGE_THINK (дедум-конфиг).
         """
         payload: dict[str, Any] = {
-            "model": self._settings.dedup_judge_model,
+            "model": self._settings.judge_model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text},
             ],
             "stream": False,
-            "num_predict": self._settings.dedup_judge_num_predict,
+            "num_predict": self._settings.judge_num_predict,
             "temperature": TEMPERATURE,
             "keep_alive": KEEP_ALIVE,
         }
         think = self._settings.namespace_judge_think
         if think is None:
-            think = self._settings.dedup_judge_think
+            think = self._settings.judge_think
         if not think:
             payload["think"] = False
         return payload
@@ -395,14 +395,14 @@ class StructureJudgeService:
         try:
             # Слот общий с судьёй дедупа (тот же base_url) — не гоняем
             # параллельные вызовы на один Ollama-сервер.
-            with ollama_slot(self._settings.dedup_judge_ollama_base_url):
+            with ollama_slot(self._settings.judge_base_url):
                 response = self._client.post(
                     "/api/chat", json=self._payload(system_prompt, user_text)
                 )
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise StructureJudgeError(
                 "сервер судьи структуры недоступен "
-                f"({self._settings.dedup_judge_ollama_base_url}): {exc}"
+                f"({self._settings.judge_base_url}): {exc}"
             ) from exc
         if response.status_code != 200:
             body = " ".join(response.text[:_ERROR_BODY_CHARS].split())

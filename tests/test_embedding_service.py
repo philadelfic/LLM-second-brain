@@ -84,7 +84,7 @@ def test_request_has_model_and_url(monkeypatch) -> None:
     service.embed("текст")
     request = recorder.requests[0]
     assert request.url.path == "/api/embed"
-    assert str(request.url).startswith(settings.ollama_base_url)
+    assert str(request.url).startswith(settings.embedding_base_url)
     assert '"model":"' + settings.embedding_model + '"' in request.read().decode()
 
 

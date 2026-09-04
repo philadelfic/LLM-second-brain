@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from app.config import get_settings
@@ -150,6 +152,96 @@ def test_meta_initialized_on_legacy_db_without_reindex(tmp_path, monkeypatch) ->
         assert conn.execute(
             "SELECT value FROM meta WHERE key = 'embedding_model'"
         ).fetchone()[0] == get_settings().embedding_model
+
+
+def test_provider_change_reindexes_same_model(tmp_path, monkeypatch) -> None:
+    """Смена EMBEDDING_PROVIDER при том же имени модели — автореиндексация:
+    вектора другого провайдера несовместимы даже при равной модели/размерности
+    (Фаза 11, решение №4)."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
+    make_settings(monkeypatch, dim=4)
+    settings = get_settings()
+    init_db(settings)
+    _insert_note_with_vector(settings, 1, [1.0, 0.0, 0.0, 0.0])
+
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "openai")
+    get_settings.cache_clear()
+    init_db(get_settings())
+    with session(get_settings()) as conn:
+        assert vectors.count(conn) == 0  # старые вектора невалидны — сброшены
+        assert conn.execute(
+            "SELECT vector_status FROM notes WHERE id = 1"
+        ).fetchone()[0] == "pending"
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key = 'embedding_provider'"
+        ).fetchone()[0] == "openai"
+
+
+def test_provider_zero_migration_without_meta_key(tmp_path, monkeypatch) -> None:
+    """У БД без meta-ключа embedding_provider (до Фазы 11) — нулевая миграция:
+    запись из env БЕЗ реиндексации (вектора целы, паттерн chunk-ключей)."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
+    settings = make_settings(monkeypatch, dim=4)
+    init_db(settings)
+    _insert_note_with_vector(settings, 1, [1.0, 0.0, 0.0, 0.0])
+    # убрать ключ провайдера — имитация БД до Фазы 11
+    with session(settings) as conn:
+        conn.execute("DELETE FROM meta WHERE key = 'embedding_provider'")
+    init_db(settings)
+    with session(settings) as conn:
+        assert vectors.count(conn) == 1  # вектора целы — без реиндексации
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key = 'embedding_provider'"
+        ).fetchone()[0] == get_settings().embedding_provider
+
+
+def test_reindex_logs_from_to_for_all_three_fields(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """reindex_started логирует from/to по провайдеру, модели и размерности
+    (критерий приёмки пула 1)."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
+    make_settings(monkeypatch, dim=4)
+    settings = get_settings()
+    init_db(settings)
+    _insert_note_with_vector(settings, 1, [1.0, 0.0, 0.0, 0.0])
+
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "openai")
+    monkeypatch.setenv("EMBEDDING_MODEL", "bge-m3:other")
+    monkeypatch.setenv("EMBEDDING_DIM", "8")
+    get_settings.cache_clear()
+    with caplog.at_level(logging.WARNING, logger="app"):
+        init_db(get_settings())
+    record = next(r for r in caplog.records if r.event == "reindex_started")
+    assert record.from_provider == "ollama"
+    assert record.to_provider == "openai"
+    assert record.from_model == "qwen3-embedding:8b"
+    assert record.to_model == "bge-m3:other"
+    assert record.from_dim == 4
+    assert record.to_dim == 8
+
+
+def test_notes_title_column_in_ddl(tmp_path, monkeypatch) -> None:
+    """Фаза 11 (решение №9): notes.title TEXT (nullable) в схеме."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
+    settings = make_settings(monkeypatch, dim=4)
+    init_db(settings)
+    with session(settings) as conn:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
+    assert "title" in cols
+
+
+def test_notes_title_migrated_on_legacy_db(tmp_path, monkeypatch) -> None:
+    """Унаследованная БД без колонки title — нулевая миграция ALTER TABLE."""
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
+    settings = make_settings(monkeypatch, dim=4)
+    init_db(settings)
+    with session(settings) as conn:
+        conn.execute("ALTER TABLE notes DROP COLUMN title")
+    init_db(settings)
+    with session(settings) as conn:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
+    assert "title" in cols
 
 
 def test_init_db_idempotent_keeps_vectors(tmp_path, monkeypatch) -> None:

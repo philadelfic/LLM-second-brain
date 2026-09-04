@@ -59,7 +59,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings,
         services.embedding,
         services.summary,
-        judge=services.dedup_judge,
+        judge=services.judge,
         classifier=services.classifier,
         promoter=services.promotion,
     )

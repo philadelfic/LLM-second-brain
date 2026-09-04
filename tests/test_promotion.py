@@ -368,10 +368,10 @@ class TestJudgeThinkFlag:
         settings = get_settings()
         assert self._payload(settings).get("think") is False
 
-    def test_none_inherits_dedup_judge_think(self, settings, monkeypatch) -> None:
-        """Флаг не задан → наследует DEDUP_JUDGE_THINK (думающий дедум-конфиг:
+    def test_none_inherits_judge_think(self, settings, monkeypatch) -> None:
+        """Флаг не задан → наследует JUDGE_THINK (думающий дедум-конфиг:
         поле think в payload НЕ отправляется — модель думает по умолчанию)."""
-        monkeypatch.setenv("DEDUP_JUDGE_THINK", "true")
+        monkeypatch.setenv("JUDGE_THINK", "true")
         monkeypatch.delenv("NAMESPACE_JUDGE_THINK", raising=False)
         get_settings.cache_clear()
         payload = self._payload(get_settings())

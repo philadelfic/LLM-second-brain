@@ -21,12 +21,13 @@ from fastapi.testclient import TestClient
 # живая Ollama — integration-тесты с отдельным маркером (шаг 3.6),
 # успешный же путь тестируется через детерминированный HashEmbedder.
 TEST_ENV: dict[str, str] = {
-    "OLLAMA_BASE_URL": "http://127.0.0.1:1",
-    "SUMMARY_OLLAMA_BASE_URL": "http://127.0.0.1:1",
+    "EMBEDDING_BASE_URL": "http://127.0.0.1:1",
+    "SUMMARY_BASE_URL": "http://127.0.0.1:1",
     "SUMMARY_MODEL": "test-summary-model",
-    # LLM-судья дедупа (Фаза 8, Этап 3.1): обязательные как у суммаризатора.
-    "DEDUP_JUDGE_OLLAMA_BASE_URL": "http://127.0.0.1:1",
-    "DEDUP_JUDGE_MODEL": "test-judge-model",
+    # LLM-судья дедупа (Фаза 8, Этап 3.1; Фаза 11 — блок judge_*):
+    # обязательные как у суммаризатора.
+    "JUDGE_BASE_URL": "http://127.0.0.1:1",
+    "JUDGE_MODEL": "test-judge-model",
     "MCP_AUTH_TOKEN": "test-secret-token",
 }
 

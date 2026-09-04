@@ -73,8 +73,8 @@ def reachable(url: str, timeout: float = 3.0) -> bool:
 
 def make_settings(think: bool, live_summary_url: str, live_summary_model: str) -> Settings:
     base = Settings(
-        ollama_base_url=live_summary_url,  # не используется в замере 1–2
-        summary_ollama_base_url=live_summary_url,
+        embedding_base_url=live_summary_url,  # не используется в замере 1–2
+        summary_base_url=live_summary_url,
         summary_model=live_summary_model,
         mcp_auth_token="benchmark-not-a-secret",
         db_path="/tmp/unused.db",
@@ -160,8 +160,8 @@ def bench_pipeline(
 
     with tempfile.TemporaryDirectory(prefix="bench-summary-") as tmp:
         settings = Settings(
-            ollama_base_url=vector_url,
-            summary_ollama_base_url=live_summary_url,
+            embedding_base_url=vector_url,
+            summary_base_url=live_summary_url,
             summary_model=live_summary_model,
             mcp_auth_token="benchmark-not-a-secret",
             db_path=os.path.join(tmp, "notes.db"),

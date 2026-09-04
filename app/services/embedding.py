@@ -98,7 +98,7 @@ class EmbeddingService:
         if transport is not None and not isinstance(transport, httpx.BaseTransport):
             transport = httpx.MockTransport(transport)
         self._client = httpx.Client(
-            base_url=settings.ollama_base_url,
+            base_url=settings.embedding_base_url,
             timeout=httpx.Timeout(READ_TIMEOUT_SEC, connect=CONNECT_TIMEOUT_SEC),
             transport=transport,
         )
@@ -129,13 +129,13 @@ class EmbeddingService:
             try:
                 # Очередь F1: один запрос к серверу в момент времени — слот
                 # держится на попытку (ретраи — та же задача кодирования).
-                with ollama_slot(self._settings.ollama_base_url):
+                with ollama_slot(self._settings.embedding_base_url):
                     response = self._client.post("/api/embed", json=payload)
             except _RETRIABLE as exc:
                 if final:
                     raise EmbeddingError(
                         "сервер векторизации недоступен "
-                        f"({self._settings.ollama_base_url}): {exc}"
+                        f"({self._settings.embedding_base_url}): {exc}"
                     ) from exc
                 continue  # единственный ретрай (ARCH §3.2)
             if response.status_code in _RETRY_STATUS and not final:
