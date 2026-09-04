@@ -26,14 +26,21 @@ import pytest
 from fakes import FailingEmbedder, cosine
 
 from app.config import Settings
+from app.services.classifier import ClassificationService
 from app.services.dedup import DeduplicationService
 from app.services.embedding import EmbeddingError, EmbeddingService
+from app.services.namespaces import NamespaceService, count_sentences
 from app.services.notes import NoteService
+from app.services.promotion import (
+    DescriptionService,
+    PromotionService,
+    StructureJudgeService,
+)
 from app.services.search import SearchService
 from app.services.summary import SummaryError, SummaryService
 from app.services.worker import BackgroundWorker
 from app.storage import chunks, vectors
-from app.storage.db import init_db, session
+from app.storage.db import init_db, session, transaction
 
 # Дефолт из REQUIREMENTS §4 (операторский адрес); перебить env при другом.
 LIVE_URL_DEFAULT = "http://192.168.3.113:11434"
@@ -281,6 +288,124 @@ def test_live_summary_latency_report(live_summary) -> None:
     print(f"\n[live-summary] латентность generate: {elapsed:.2f} с ({len(summary)} симв)")
     assert elapsed > 0
     assert len(summary) <= live_summary.settings.max_summary_chars
+
+
+def test_live_classifier_returns_valid_markup(live_summary) -> None:
+    """Живая классификация (Фаза 10, Шаг 4): валидная разметка §5.7.
+
+    Классификатор — та же модель, что суммаризация (SUMMARY_MODEL); проверяем
+    контракт выхода: три поля, confidence 0..1, слаги валидны. Латентность
+    печатается (бриф Ф10 п.4: фон — не влияет на save).
+    """
+    known = [
+        {"path": "work", "description": "Рабочие заметки. Подпроекты — в листьях."},
+        {"path": "projects", "description": "Личные проекты. Сайт-резюме."},
+    ]
+    service = ClassificationService(live_summary.settings)
+    t0 = time.monotonic()
+    try:
+        result = service.classify(RU_NOTE, known)
+    finally:
+        service.close()
+    elapsed = time.monotonic() - t0
+    print(f"\n[live-classify] латентность classify: {elapsed:.2f} с")
+    assert 0.0 <= result.confidence <= 1.0
+    assert result.domain_hint is None or isinstance(result.domain_hint, str)
+    assert result.subdomain_hint is None or isinstance(result.subdomain_hint, str)
+
+
+def test_live_promotion_describes_judges_resolves(
+    live_summary, tmp_path_factory
+) -> None:
+    """Живой конвейер Шага 5: описание + судья структуры + вердикт.
+
+    Группа seeded-разметки (причёска — живой путь Шага 4, здесь не дублируем
+    флаке-классификацию): describer (модель суммаризации, think:false) пишет
+    описание по суммари группы, судья структуры (модель дедупа, §5.7 «та же
+    модель судьи дедупа, отдельный промпт») гейтит решение, косинус-предфильтр
+    кодирует живым векторизатором. Живой судья недетерминирован
+    (temperature 0.1) — тест проверяет КОНТРАКТ любого из трёх вердиктов:
+    СОЗДАТЬ (provisional-лист + полная ретро-перекладка + описание ≤2
+    предложений), СЛИТЬ (перекладка в существующий узел с канонизацией
+    hint), ОТКЛОНИТЬ (запись в promotions, заметки на месте). Латентность
+    печатается (бриф Ф10: фон — не влияет на save).
+    """
+    db = tmp_path_factory.mktemp("live-promo") / "notes.db"
+    # Судья структуры — модель судьи дедупа (DEDUP_JUDGE_*): в проде это
+    # тот же стенд 112 с ornith-1.5:35b, что и суммаризация (§8).
+    settings = live_summary.settings.model_copy(
+        update={
+            "db_path": str(db),
+            "dedup_judge_ollama_base_url": _live_summary_url(),
+            "dedup_judge_model": _live_summary_model(),
+        }
+    )
+    init_db(settings)
+    embedding = EmbeddingService(settings)
+    namespaces = NamespaceService(settings)
+    namespaces.create("work", "Рабочие заметки. Подпроекты — в листьях.")
+    # Посев группы: 15 default-заметок с готовой разметкой
+    # (confidence ≥ 0.60 — триггерная группа, §5.7).
+    with session(settings) as conn, transaction(conn):
+        for i in range(15):
+            conn.execute(
+                "INSERT INTO notes (text, summary, summary_status, namespace, "
+                "domain_hint, subdomain_hint, confidence, classified_at) "
+                "VALUES (?, ?, 'ok', 'default', 'work', 'subo', 0.8, ?)",
+                (
+                    f"live-promo заметка {i}: СУБО 2020, сервисы HR, деплой "
+                    f"реестра зарплат, итерация {i}",
+                    f"СУБО 2020: сервисы HR, заметка {i} о деплое реестра",
+                    "2026-09-03T00:00:00Z",
+                ),
+            )
+    promotion = PromotionService(
+        settings,
+        embedding=embedding,
+        describer=DescriptionService(settings),
+        judge=StructureJudgeService(settings),
+        namespaces=namespaces,
+    )
+    # Кандидаты видны и до прогона (memory_namespaces.promotion_candidates).
+    assert promotion.candidates() == [
+        {"domain": "work", "subdomain": "subo", "count": 15,
+         "avg_confidence": 0.8}
+    ]
+    t0 = time.monotonic()
+    report = promotion.run()
+    elapsed = time.monotonic() - t0
+    decided = report["created"] + report["merged"] + report["rejected"]
+    assert decided == ["work/subo"], report  # группа решена ровно одним вердиктом
+    assert promotion.candidates() == []  # cooldown: решённая группа не возвращается
+    with session(settings) as conn:
+        in_default = conn.execute(
+            "SELECT COUNT(*) FROM notes WHERE namespace = 'default' "
+            "AND deleted_at IS NULL"
+        ).fetchone()[0]
+        verdicts = conn.execute(
+            "SELECT status, canonical_path FROM promotions"
+        ).fetchall()
+    if report["created"]:
+        node = namespaces.get("work/subo")
+        assert node is not None and node["status"] == "provisional"
+        assert 1 <= count_sentences(node["description"]) <= 2  # контракт описаний
+        assert in_default == 0  # ретро-перекладка полная
+    elif report["merged"]:
+        canonical = verdicts[0]["canonical_path"]
+        assert namespaces.get(canonical) is not None
+        assert in_default == 0  # все заметки переехали в канонический узел
+    else:
+        assert report["rejected"] == ["work/subo"]
+        assert verdicts[0]["status"] == "rejected"
+        assert in_default == 15  # отклонённая группа остаётся в default
+    print(
+        f"\n[live-promotion] вердикт судьи: "
+        f"{'СОЗДАТЬ' if report['created'] else ('СЛИТЬ' if report['merged'] else 'ОТКЛОНИТЬ')}",
+        f"за {elapsed:.1f} с",
+    )
+    embedding.close()
+    DescriptionService(settings).close()
+    StructureJudgeService(settings).close()
 
 
 def test_live_summary_timeout_fails_fast(tmp_path_factory) -> None:

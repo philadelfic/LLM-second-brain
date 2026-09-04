@@ -12,6 +12,7 @@ import pytest
 from fakes import HashEmbedder
 
 from app.config import get_settings
+from app.services.namespaces import NamespaceError, NamespaceService
 from app.services.notes import MAX_LIST_LIMIT, NoteService, NoteValidationError
 from app.storage import vectors
 from app.storage.db import init_db, session
@@ -119,10 +120,11 @@ class TestGet:
         assert len(notes) == 1
         assert set(notes[0]) == {
             "id", "text", "summary", "summary_status",
-            "author", "created_at", "updated_at",
+            "author", "created_at", "updated_at", "namespace",  # Фаза 10
         }
         assert notes[0]["text"] == "Полный текст заметки"
         assert notes[0]["summary_status"] == "pending"
+        assert notes[0]["namespace"] == "default"  # save без namespace → default (Фаза 10)
 
     def test_batch_order_follows_request(self, service: NoteService) -> None:
         for i in range(1, 4):
@@ -199,9 +201,10 @@ class TestList:
         item = service.list()["items"][0]
         assert set(item) == {
             "id", "summary", "summary_status", "author",
-            "created_at", "updated_at",
+            "created_at", "updated_at", "namespace",  # Фаза 10
         }
         assert item["author"] == "model-x"
+        assert item["namespace"] == "default"  # Фаза 10
         assert item["summary"] == long_text(300)[:200]  # fallback-усечение
 
     def test_total_and_pagination(self, service: NoteService) -> None:
@@ -369,3 +372,42 @@ class TestSettingsSnapshot:
         service.save(long_text(50))
         get_settings.cache_clear()
         assert len(service.get([1])["notes"][0]["summary"]) == 10
+
+
+class TestSaveUpdateNamespace:
+    """Фаза 10 (§5.7): namespace в save/update — целевой узел записи;
+    незарегистрированный узел → NamespaceError (транспорт обернёт fail+hint)."""
+
+    def _register(self, path: str, description: str) -> None:
+        NamespaceService(get_settings()).create(path, description)
+
+    def test_save_default_by_default(self, service: NoteService) -> None:
+        saved = service.save("заметка без узла")
+        assert service.get([saved["id"]])["notes"][0]["namespace"] == "default"
+
+    def test_save_into_registered_namespace(self, service: NoteService) -> None:
+        self._register("work", "Рабочие заметки. Подпроекты — в листьях.")
+        saved = service.save("в work", namespace="work")
+        assert saved["stored"] is True
+        assert service.get([saved["id"]])["notes"][0]["namespace"] == "work"
+
+    def test_save_unknown_namespace_raises(self, service: NoteService) -> None:
+        with pytest.raises(NamespaceError):
+            service.save("в никуда", namespace="nope")
+
+    def test_update_moves_namespace(self, service: NoteService) -> None:
+        self._register("work", "Рабочие заметки. Подпроекты — в листьях.")
+        nid = service.save("первоначально в default")["id"]
+        service.update(nid, "переезжает в work", namespace="work")
+        assert service.get([nid])["notes"][0]["namespace"] == "work"
+
+    def test_update_without_namespace_keeps_place(self, service: NoteService) -> None:
+        self._register("work", "Рабочие заметки. Подпроекты — в листьях.")
+        nid = service.save("в work сразу", namespace="work")["id"]
+        service.update(nid, "обновлено, остаётся в work")
+        assert service.get([nid])["notes"][0]["namespace"] == "work"
+
+    def test_update_unknown_namespace_raises(self, service: NoteService) -> None:
+        nid = service.save("есть в default")["id"]
+        with pytest.raises(NamespaceError):
+            service.update(nid, "куда-то не туда", namespace="nope")

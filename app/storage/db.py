@@ -81,13 +81,52 @@ CREATE TABLE IF NOT EXISTS notes (
   summary_status TEXT    NOT NULL DEFAULT 'pending',
   created_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   updated_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-  deleted_at     TEXT    NULL
+  deleted_at     TEXT    NULL,
+  namespace      TEXT    NOT NULL DEFAULT 'default',
+  classified_at  TEXT    NULL,
+  domain_hint    TEXT    NULL,
+  subdomain_hint TEXT    NULL,
+  confidence     REAL    NULL
+)
+"""
+
+# Реестр неймспейсов (Фаза 10, REQUIREMENTS §5.7): узлы иерархии (path —
+# слэш-путь, максимум 2 уровня), description — обязательное (контракт
+# ≤2 предложений валидируется сервисом), status — confirmed | provisional
+# (авто-созданные узлы судьи структуры). Существующие заметки при миграции
+# уходят в 'default' (дефолт колонки + INSERT узла ниже).
+_NAMESPACES_DDL = """
+CREATE TABLE IF NOT EXISTS namespaces (
+  path        TEXT PRIMARY KEY,
+  description TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'confirmed'
+              CHECK(status IN ('confirmed', 'provisional')),
+  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 )
 """
 
 _FTS_DDL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
   text, content='notes', content_rowid='id', tokenize='trigram'
+)
+"""
+
+# Вердикты судьи структуры (Фаза 10, Шаг 5): cooldown триггера. Группа
+# hint'ов, по которой судья вынес вердикт (слияние/отклонение), не
+# дёргает LLM повторно — иначе отклонённый кандидат зациклил бы вызовы
+# судьи при каждом прогоне (заметки с отклонённым hint'ом остаются в
+# default навсегда — честно-общие). Слияние хранит канонический узел;
+# сброс вердикта — оператор (REST, Шаг 6). Созданный узел записей не
+# требует: группа уходит из default ретро-перекладкой.
+_PROMOTIONS_DDL = """
+CREATE TABLE IF NOT EXISTS promotions (
+  domain         TEXT NOT NULL,
+  subdomain      TEXT NOT NULL,
+  status         TEXT NOT NULL CHECK(status IN ('merged', 'rejected')),
+  canonical_path TEXT NULL,
+  decided_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  PRIMARY KEY (domain, subdomain)
 )
 """
 
@@ -247,6 +286,17 @@ def init_db(settings: Settings) -> None:
             for trigger in _TRIGGERS:
                 conn.execute(trigger)
             _check_fts_integrity(conn)
+            # Неймспейсы (Фаза 10): колонки notes + реестр + дефолт-узел.
+            _migrate_namespace_columns(conn)
+            _migrate_classification_columns(conn)
+            conn.execute(_NAMESPACES_DDL)
+            conn.execute(_INDEX_NAMESPACE_DDL)
+            _ensure_default_namespace(conn)
+            conn.execute(_PROMOTIONS_DDL)
+            # Партиция namespace (Фаза 10): vec-таблицы живых БД без `+ns`
+            # пересоздаются с партицией, все заметки — в pending. ДО сверки
+            # модели/чанков: обе ветки создают таблицы уже с партицией.
+            _sync_namespace_partition(conn, settings)
             # Чанки (Фаза 7): таблица текстов чанков — до векторной сверки,
             # при несовпадении конфигурации дропается и notes_chunks_vec.
             chunks.create_table(conn)
@@ -260,6 +310,101 @@ def init_db(settings: Settings) -> None:
         raise StorageError(
             f"не удалось инициализировать БД {settings.db_path}: {exc}"
         ) from exc
+
+
+# --- неймспейсы (Фаза 10) --------------------------------------------------
+
+DEFAULT_NAMESPACE = "default"
+DEFAULT_NAMESPACE_DESCRIPTION = "общие заметки, не привязанные к доменам"
+
+_INDEX_NAMESPACE_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_notes_namespace "
+    "ON notes(namespace, deleted_at)"
+)
+
+
+def _migrate_namespace_columns(conn: sqlite3.Connection) -> None:
+    """Нулевая миграция Фазы 10 поверх живых БД: колонки notes.namespace и
+    notes.classified_at. Свежие БД получают их из _NOTES_DDL; унаследованные —
+    ALTER TABLE ADD COLUMN (все существующие заметки → 'default',
+    classified_at NULL — причёска разберёт их позже, бриф Фазы 10, US-12).
+    SQLite допускает ADD COLUMN NOT NULL только с константным DEFAULT —
+    'default' им и является.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
+    if "namespace" not in columns:
+        conn.execute(
+            "ALTER TABLE notes ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default'"
+        )
+    if "classified_at" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN classified_at TEXT")
+
+
+def _migrate_classification_columns(conn: sqlite3.Connection) -> None:
+    """Нулевая миграция Фазы 10 (Шаг 4): колонки разметки причёски
+    domain_hint/subdomain_hint/confidence. Свежие БД получают их из
+    _NOTES_DDL; унаследованные — ALTER TABLE ADD COLUMN (NULL — причёска
+    разберёт их позже). Параметры разметки — внутренние данные, НЕ в
+    MCP-контрактах (§5.7)."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
+    if "domain_hint" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN domain_hint TEXT")
+    if "subdomain_hint" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN subdomain_hint TEXT")
+    if "confidence" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN confidence REAL")
+
+
+def _ensure_default_namespace(conn: sqlite3.Connection) -> None:
+    """Узел 'default' существует всегда (идемпотентно): описание — дефолт,
+    оператор может править его через REST (Шаг 6)."""
+    conn.execute(
+        "INSERT INTO namespaces (path, description, status) VALUES (?, ?, 'confirmed') "
+        "ON CONFLICT(path) DO NOTHING",
+        (DEFAULT_NAMESPACE, DEFAULT_NAMESPACE_DESCRIPTION),
+    )
+
+
+def _sync_namespace_partition(conn: sqlite3.Connection, settings: Settings) -> None:
+    """Миграция vec-индексов под партицию namespace (Фаза 10).
+
+    У БД, созданных до Фазы 10, notes_vec/notes_chunks_vec без колонки `+ns`:
+    ОБЕ таблицы дропаются и пересоздаются с partition key, все заметки
+    (включая trash) уходят в vector_status='pending' — фоновый воркер
+    пере-кодирует (NFR-3: данные не теряются, поиск деградирует к FTS).
+    Свежие БД пропускаются: их таблицы создаются в _sync_embedding_meta уже
+    с партицией. Вызывается ДО _sync_embedding_meta (см. init_db).
+    """
+    if vectors.has_partition(conn) and chunks.has_partition(conn):
+        return
+    has_tables = (
+        vectors.existing_vec_dim(conn) is not None
+        or chunks.existing_vec_dim(conn) is not None
+    )
+    if not has_tables:
+        return  # свежая БД — таблицы создадутся ниже уже с партицией
+    notes_count = int(conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0])
+    logging.getLogger("app").warning(
+        "namespace partition introduced: rebuilding vector indexes",
+        extra={
+            "event": "reindex_started",
+            "notes": notes_count,
+            "reason": "namespace_partition",
+        },
+    )
+    conn.execute("DROP TABLE IF EXISTS notes_vec")
+    conn.execute("DROP TABLE IF EXISTS notes_chunks_vec")
+    vectors.create_vec_table(conn, settings.embedding_dim)
+    chunks.create_vec_table(conn, settings.embedding_dim)
+    conn.execute("UPDATE notes SET vector_status = 'pending'")
+    logging.getLogger("app").info(
+        "vector indexes rebuilt with namespace partition",
+        extra={
+            "event": "reindex_done",
+            "notes_pending": notes_count,
+            "reason": "namespace_partition",
+        },
+    )
 
 
 def _get_meta(conn: sqlite3.Connection, key: str) -> str | None:

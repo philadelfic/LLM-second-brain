@@ -73,10 +73,13 @@ import asyncio
 import logging
 
 from app.config import Settings
+from app.services.classifier import ClassificationError, Classifier
 from app.services.dedup import DeduplicationService
 from app.services.embedding import Embedder, EmbeddingError
 from app.services.judge import Judge, JudgeError
+from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
+from app.services.promotion import PromotionService
 from app.services.summary import Summarizer, SummaryError
 from app.storage import chunks, vectors
 from app.storage.db import session, transaction
@@ -104,6 +107,8 @@ class BackgroundWorker:
         summarizer: Summarizer | None = None,
         dedup: DeduplicationService | None = None,
         judge: Judge | None = None,
+        classifier: Classifier | None = None,
+        promoter: PromotionService | None = None,
     ) -> None:
         self._settings = settings
         self._embedding = embedding
@@ -125,6 +130,16 @@ class BackgroundWorker:
         # используются, notifier не нужен — после слияния воркер будит
         # свою же суммаризационную петлю (notify_summary_pending).
         self._notes = NoteService(settings, embedding=embedding)
+        # Причёска (Фаза 10, Шаг 4): классификатор default-заметок после
+        # суммаризации; None — тестовый режим без классификации.
+        self._classifier = classifier
+        # Реестр неймспейсов: известные узлы для классификатора и проверка
+        # целевого узла авто-переезда.
+        self._namespaces = NamespaceService(settings)
+        # Триггер домена (Фаза 10, Шаг 5): авто-создание листов из hint-групп
+        # после классификации; None — тестовый режим без триггера (в проде
+        # DI из build_services: describer + судья структуры).
+        self._promoter = promoter
         self._vector_interval = float(max(settings.pending_retry_sec, 0))
         self._summary_interval = float(max(settings.pending_retry_sec, 0))
         self._chunk_interval = float(max(settings.pending_retry_sec, 0))
@@ -232,7 +247,7 @@ class BackgroundWorker:
         """
         with session(self._settings) as conn:
             rows = conn.execute(
-                "SELECT id, text FROM notes "
+                "SELECT id, text, namespace FROM notes "
                 "WHERE vector_status = 'pending' AND deleted_at IS NULL "
                 "ORDER BY id LIMIT ?",
                 (limit,),
@@ -246,16 +261,20 @@ class BackgroundWorker:
         processed = len(rows)
         for row, vector in zip(rows, embeddings):
             with session(self._settings) as conn, transaction(conn):
-                vectors.upsert(conn, row["id"], vector)
+                # Фаза 10: вектор пишется в партицию неймспейса заметки.
+                vectors.upsert(conn, row["id"], vector, row["namespace"])
                 conn.execute(
                     "UPDATE notes SET vector_status = 'ok' WHERE id = ?",
                     (row["id"],),
                 )
             # Фоновый дедуп (Фаза 8, Этапы 2–3): вектор готов — кандидаты
-            # против ранних заметок (вне транзакции записи), затем
+            # против ранних заметок В ПРЕДЕЛАХ НЕЙМСПЕЙСА заметки (Фаза 10,
+            # §5.7: меж-узловые дубли легитимны — hint-механика Шага 5), затем
             # приговор (LLM-судья, Этап 3.2; без судьи — косинус-фоллбек
             # Этапа 2.2) и сведение.
-            older = self._find_dedup_candidates(int(row["id"]), vector)
+            older = self._find_dedup_candidates(
+                int(row["id"]), vector, row["namespace"]
+            )
             if older and not self._merge_duplicates(int(row["id"]), older):
                 # Слияние не состоялось: обе заметки целы (NFR-3); свежая
                 # возвращается в pending — повтор по back-off очереди.
@@ -266,7 +285,7 @@ class BackgroundWorker:
     # --- фоновый дедуп (Фаза 8, Этапы 2–3) ------------------------------------
 
     def _find_dedup_candidates(
-        self, note_id: int, vector: list[float]
+        self, note_id: int, vector: list[float], namespace: str = "default"
     ) -> list[tuple[int, float]]:
         """Косинус-кандидаты дедупа после довекторизации заметки.
 
@@ -274,7 +293,8 @@ class BackgroundWorker:
         текущей): пара «поздняя ↔ ранняя» обрабатывается один раз, из
         стороны поздней — сведение (Этап 2.2) обновляет ранний дубль и
         soft-delete поздний, а встречный прогон той же пары из стороны
-        ранней заметки зациклил бы обработку. Кандидаты логируются
+        ранней заметки зациклил бы обработку. Фаза 10 (§5.7): только в
+        пределах неймспейса заметки. Кандидаты логируются
         (наблюдаемость); приговор «дубль» принимает _merge_duplicates:
         каждый кандидат опрашивается судьёй (Этап 3.2, JudgeService —
         косинус лишь предфильтр); без судьи — косинус-фоллбек
@@ -282,7 +302,9 @@ class BackgroundWorker:
 
         Возвращает список [(candidate_id, cosine)] — вход сведение.
         """
-        found = self._dedup.find_candidates(vector, exclude_id=note_id)
+        found = self._dedup.find_candidates(
+            vector, exclude_id=note_id, namespace=namespace
+        )
         older = [pair for pair in found if pair[0] < note_id]
         if older:
             logging.getLogger("app").info(
@@ -504,7 +526,7 @@ class BackgroundWorker:
             return 0
         with session(self._settings) as conn:
             rows = conn.execute(
-                "SELECT id, text FROM notes "
+                "SELECT id, text, namespace, classified_at FROM notes "
                 "WHERE summary_status = 'pending' AND deleted_at IS NULL "
                 "ORDER BY id LIMIT ?",
                 (limit,),
@@ -527,7 +549,124 @@ class BackgroundWorker:
                 )
             if cursor.rowcount:
                 done += 1
+                # Причёска (Фаза 10, Шаг 4): после суммаризации default-заметки
+                # (ещё не классифицированной) — разметка и авто-переезд.
+                if row["namespace"] == "default" and row["classified_at"] is None:
+                    self._classify_default_note(int(row["id"]), row["text"])
         return done
+
+    # --- причёска (Фаза 10, Шаг 4) -------------------------------------------
+
+    def _classify_default_note(self, note_id: int, text: str) -> None:
+        """Разметить default-заметку после суммаризации; авто-переезд.
+
+        Только default-заметки (уложенные не перетряхиваются, §5.7) и только
+        один проход (classified_at — анти-зацикливание; повтор — после
+        memory_update, который сбрасывает summary в pending). Отказ
+        классификатора (ClassificationError) данные не портит: заметка
+        остаётся в default, classified_at не ставится — повтор при следующем
+        обновлении.
+
+        Авто-переезд в существующий узел — при confidence ≥
+        NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE: в существующий лист (если
+        subdomain_hint совпал с зарегистрированным), иначе в корень домена;
+        новый лист (subdomain_hint не зарегистрирован) остаётся в default —
+        его создаст триггер (Шаг 5) и переложит ретро-перекладкой. Переезд
+        ставит vector_status='pending' — воркер пере-кодирует вектор в
+        партицию нового неймспейса (старый вектор уходит DELETE+INSERT).
+        """
+        if self._classifier is None:
+            return  # тестовый режим без классификатора
+        known = self._namespaces.list_all()["namespaces"]
+        try:
+            result = self._classifier.classify(text, known)
+        except ClassificationError:
+            logging.getLogger("app").warning(
+                "classify: failed — note stays in default, retry on next update",
+                extra={"event": "classify_failed", "note_id": note_id},
+            )
+            return
+        with session(self._settings) as conn, transaction(conn):
+            conn.execute(
+                "UPDATE notes SET domain_hint = ?, subdomain_hint = ?, "
+                "confidence = ?, "
+                "classified_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (result.domain_hint, result.subdomain_hint, result.confidence, note_id),
+            )
+        target = self._auto_move_target(result)
+        if (
+            target is not None
+            and result.confidence >= self._settings.namespace_auto_move_min_confidence
+        ):
+            with session(self._settings) as conn, transaction(conn):
+                conn.execute(
+                    "UPDATE notes SET namespace = ?, vector_status = 'pending' "
+                    "WHERE id = ? AND deleted_at IS NULL",
+                    (target, note_id),
+                )
+            logging.getLogger("app").info(
+                "classify: default note auto-moved into existing node",
+                extra={
+                    "event": "classified_moved",
+                    "note_id": note_id,
+                    "namespace": target,
+                    "confidence": result.confidence,
+                },
+            )
+        # Триггер домена (Фаза 10, Шаг 5): разметка могла докинуть hint-группу
+        # до порога — прогоняем конвейер промоции (авто-создание/слияние).
+        self._run_promotion()
+
+    def _run_promotion(self) -> None:
+        """Триггер домена (Шаг 5) после классификации default-заметки.
+
+        Сбои триггера не роняют воркер: это этап обогащения, а не конвейера
+        данных — суммаризация/векторизация важнее структурной автоматики.
+        Ожидаемые отказы describer/судьи обрабатываются внутри
+        PromotionService (кандидат остаётся без вердикта, NFR-3); здесь
+        ловится ВСЁ остальное (включая баги) — warning с traceback в логи,
+        петли очередей живут. Повтор — следующая классификация default-
+        заметки: группы не теряются, просто дотягивают до порога позже.
+        """
+        if self._promoter is None:
+            return  # тестовый режим без триггера
+        try:
+            report = self._promoter.run()
+        except Exception:
+            logging.getLogger("app").warning(
+                "promotion: run failed — trigger deferred to next classification",
+                extra={"event": "promotion_failed", "reason": "run"},
+                exc_info=True,
+            )
+            return
+        if any(report.values()):
+            # Сводка — одним ключом: 'created' конфликтует с атрибутом
+            # LogRecord (время создания) — extra его не принимает.
+            logging.getLogger("app").info(
+                "promotion: trigger run finished",
+                extra={"event": "promotion_run", "report": report},
+            )
+
+    def _auto_move_target(self, result) -> str | None:
+        """Целевой узел авто-переезда (только существующие узлы, §5.7).
+
+        domain_hint — корень из реестра; если он не зарегистрирован (модель
+        предложила новый корень — корни только оператор) — не двигаем.
+        subdomain_hint: зарегистрированный лист → в него; новый лист → None
+        (остаётся в default, триггер Шага 5 создаст и переложит); null →
+        в корень домена (общая для домена заметка).
+        """
+        if not result.domain_hint:
+            return None
+        if not self._namespaces.exists(result.domain_hint):
+            return None
+        if result.subdomain_hint:
+            leaf = f"{result.domain_hint}/{result.subdomain_hint}"
+            if self._namespaces.exists(leaf):
+                return leaf
+            return None  # новый лист — триггер (Шаг 5) создаст и переложит
+        return result.domain_hint
 
     # --- чанковая очередь (Фаза 7) ---------------------------------------------
 
@@ -611,6 +750,7 @@ class BackgroundWorker:
                         full,
                         note_rows[0]["text"],
                         note_rows[0]["tokens"],
+                        ns=note_rows[0]["namespace"],
                     ):
                         reused.add(note_rows[0]["id"])
         return reused
@@ -643,7 +783,12 @@ class BackgroundWorker:
             with session(self._settings) as conn, transaction(conn):
                 for row, vector in zip(batch, result):
                     if chunks.upsert_vector_if_exists(
-                        conn, row["id"], vector, row["text"], row["tokens"]
+                        conn,
+                        row["id"],
+                        vector,
+                        row["text"],
+                        row["tokens"],
+                        ns=row["namespace"],
                     ):
                         written += 1
         return written

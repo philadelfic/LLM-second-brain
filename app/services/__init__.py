@@ -5,6 +5,10 @@
 Фаза 3: EmbeddingService один на процесс — общий httpx-пул для гибридного
 поиска и дедупа записи; NoteService через DeduplicationService решает
 «дубликат / сохранить» (FR-4), SearchService — гибридный поиск (ARCH §4.2).
+Фаза 10: NamespaceService — реестр иерархических неймспейсов (карта для
+`memory_namespaces`; NoteService/SearchService держат собственный реестр
+для валидации записи и фильтров выдачи); ClassificationService — фоновая
+причёска default-заметок (Шаг 4).
 """
 
 from __future__ import annotations
@@ -13,19 +17,25 @@ from dataclasses import dataclass
 
 from app.config import Settings
 from app.services.backup import BackupService
+from app.services.classifier import ClassificationService
 from app.services.dedup import DeduplicationService
 from app.services.embedding import EmbeddingService
 from app.services.judge import JudgeService
+from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
+from app.services.promotion import DescriptionService, PromotionService, StructureJudgeService
 from app.services.search import SearchService
 from app.services.summary import SummaryService
 
 __all__ = [
     "BackupService",
+    "ClassificationService",
     "DeduplicationService",
     "EmbeddingService",
     "JudgeService",
+    "NamespaceService",
     "NoteService",
+    "PromotionService",
     "SearchService",
     "Services",
     "SummaryService",
@@ -44,6 +54,9 @@ class Services:
     summary: SummaryService  # воркер — единственный потребитель (режим «Б»)
     dedup_judge: JudgeService  # судья дедупа — воркер, решение по кандидатам (Этап 3.2)
     backup: BackupService  # петля снапшотов — asyncio-таска в lifespan
+    namespaces: NamespaceService  # реестр узлов (Фаза 10, memory_namespaces)
+    classifier: ClassificationService  # причёска default-заметок (Фаза 10, Шаг 4)
+    promotion: PromotionService  # триггер домена (Фаза 10, Шаг 5, memory_namespaces + воркер)
 
 
 def build_services(
@@ -60,6 +73,14 @@ def build_services(
     """
     embedding = EmbeddingService(settings)
     dedup = DeduplicationService(settings)
+    namespaces = NamespaceService(settings)
+    promotion = PromotionService(
+        settings,
+        embedding=embedding,
+        describer=DescriptionService(settings),
+        judge=StructureJudgeService(settings),
+        namespaces=namespaces,
+    )
     return Services(
         notes=NoteService(settings, embedding, dedup),
         search=SearchService(settings, embedding),
@@ -67,5 +88,8 @@ def build_services(
         dedup=dedup,
         summary=summary if summary is not None else SummaryService(settings),
         dedup_judge=judge if judge is not None else JudgeService(settings),
-        backup=BackupService(settings),
+        backup=BackupService(settings, namespaces=namespaces),
+        namespaces=namespaces,
+        classifier=ClassificationService(settings),
+        promotion=promotion,
     )
