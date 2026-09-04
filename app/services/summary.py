@@ -87,6 +87,15 @@ class SummaryError(RuntimeError):
     """Суммаризация не выполнена: сервер недоступен или ответ некорректен."""
 
 
+# Промпт title-догенерации (Фаза 11, решение №9): зашит — нужен только для
+# миграционных заметок (title IS NULL), файлом не создаётся. Думающий вызов
+# слота summary (как суммаризация), обрезку до TITLE_MAX_WORDS делает воркер.
+TITLE_PROMPT = (
+    "Сформулируй короткое название заметки: 1–5 слов, по сути текста, "
+    "без кавычек и точки в конце."
+)
+
+
 class Summarizer(Protocol):
     """Контракт суммаризатора: природы реализации он не знает.
 
@@ -96,6 +105,12 @@ class Summarizer(Protocol):
 
     def summarize(self, text: str) -> str:
         """Сгенерировать краткое содержание одного текста."""
+        ...
+
+    def title(self, text: str) -> str:
+        """Название заметки ≤5 слов (Фаза 11, решение №9: title-доген
+        миграционных заметок; думающий вызов слота summary, промпт зашит
+        TITLE_PROMPT, обрезку делает воркер)."""
         ...
 
     def merge(self, text_a: str, text_b: str) -> str:
@@ -145,6 +160,22 @@ class SummaryService:
             raise
         self.last_attempt_ok = True
         return summary
+
+    def title(self, text: str) -> str:
+        """Название заметки ≤5 слов (Фаза 11, решение №9: title-доген
+        миграционных заметок — единственный потребитель, воркер). Думающий
+        вызов слота summary с зашитым TITLE_PROMPT; обрезку до TITLE_MAX_WORDS
+        делает воркер механикой. Любой отказ — SummaryError.
+        """
+        if not text or not text.strip():
+            raise ValueError("title: пустой текст заметки")
+        try:
+            name = self._chat(TITLE_PROMPT, text)
+        except SummaryError:
+            self.last_attempt_ok = False  # деградация станет видна в /health
+            raise
+        self.last_attempt_ok = True
+        return name
 
     def merge(self, text_a: str, text_b: str) -> str:
         """Слить два текста-дубликата в один; любой отказ — SummaryError.
