@@ -59,23 +59,27 @@ class E2E:
         response = self.client.request(method, path, **kwargs)
         return response
 
-    def save(self, text: str, namespace: str | None = None) -> dict:
-        """save без namespace — REST POST /notes (контракт прежний).
+    def save(self, text: str, namespace: str | None = None, title: str | None = None) -> dict:
+        """save без namespace — REST POST /notes; с namespace — MCP memory_save.
 
-        save С namespace — только MCP (REST POST /notes не расширялся:
-        контракты прежних фаз байт-в-байт; namespace — параметр MCP).
+        Фаза 11 (решение №9): title обязателен на обеих поверхностях —
+        новые заметки без title (или длиннее 5 слов) не создаются;
+        REST после follow-up пула 5b строгий по title (422), MCP даёт
+        fail+hint (stored=false). Заглушка-дефолт — валидный короткий
+        заголовок с маркером прогона; осмысленный title передают вызовы.
         """
         if namespace:
-            return self.mcp_save(text, namespace)
-        response = self.rest("POST", "/notes", json={"text": text})
+            return self.mcp_save(text, namespace, title)
+        response = self.rest("POST", "/notes", json={"text": text, "title": title or f"{MARK} заметка"})
         assert response.status_code == 201, response.text
         return response.json()
 
-    def mcp_save(self, text: str, namespace: str) -> dict:
-        """memory_save с namespace через MCP."""
+    def mcp_save(self, text: str, namespace: str, title: str | None = None) -> dict:
+        """memory_save с namespace и title (≤5 слов) через MCP."""
         data = asyncio.run(
             _mcp_call(self.base_url, self.token, "memory_save",
-                      {"text": text, "namespace": namespace})
+                      {"text": text, "title": title or f"{MARK} заметка",
+                       "namespace": namespace})
         )
         result = data["result"]
         assert result.get("stored") is True, f"save в {namespace} не удался: {result}"
@@ -203,8 +207,10 @@ def register_bootstrap(e: E2E) -> None:
 
 def us1_save_with_and_without_namespace(e: E2E) -> dict:
     """US-1: save с/без namespace; метка namespace в выдаче get."""
-    plain = e.save(f"{MARK}: заметка без узла — общая для проверки")
-    placed = e.save(f"{MARK}: заметка в work", namespace="work")
+    plain = e.save(f"{MARK}: заметка без узла — общая для проверки",
+                   title=f"{MARK} общая без узла")
+    placed = e.save(f"{MARK}: заметка в work", namespace="work",
+                    title=f"{MARK} рабочая заметка")
     assert plain["stored"] and placed["stored"]
     assert e.get_note(plain["id"])["namespace"] == "default"
     assert e.get_note(placed["id"])["namespace"] == "work"
@@ -237,7 +243,7 @@ def us3_memory_namespaces(e: E2E, token: str) -> None:
 def us4_subtree_exact(e: E2E) -> None:
     """US-4: search по корню покрывает поддерево; exact — только узел; лист — себя."""
     leaf_note = e.save(f"{MARK} US4: СУБО 2020 реестр зарплат и деплой отчётов",
-                       namespace="work/sbos2020")
+                       namespace="work/sbos2020", title=f"{MARK} US4 реестр зарплат")
     assert e.wait_vector_ok(leaf_note["id"]), "вектор листа не готов"
     query = f"{MARK} US4 реестр зарплат"
     subtree = e.search(query, namespace="work")
@@ -258,7 +264,8 @@ def us4_subtree_exact(e: E2E) -> None:
 def us5_miss_extends(e: E2E) -> None:
     """US-5: промах по узлу ничего не теряет — глобальный поиск находит."""
     note = e.save(f"{MARK} US5: сайт-резюме переехал на новый хостинг",
-                  namespace="projects/llmsecondbrain")
+                  namespace="projects/llmsecondbrain",
+                  title=f"{MARK} US5 переезд сайта")
     assert e.wait_vector_ok(note["id"]), "вектор не готов"
     missed = e.search(f"{MARK} US5 хостинг сайта", namespace="work")
     global_found = e.search_global(f"{MARK} US5 хостинг сайта резюме")
@@ -275,7 +282,7 @@ def us67_grooming(e: E2E, token: str) -> None:
         f"{MARK} US6: СУБО 2020, деплой реестра зарплат: релиз 2026-09-03, "
         "чек-лист миграции pg15-prod выполнен, владелец тест-прогон."
     )
-    saved = e.save(text)
+    saved = e.save(text, title=f"{MARK} US6 деплой реестра")
     # Ожидаем суммаризацию (метрика §4 — ЛАТЕНТНОСТЬ КЛАССИФИКАЦИИ, не генерации:
     # «default-заметка после суммаризации классифицируется за ≤60 c», бриф §4).
     deadline = time.monotonic() + 1800
@@ -302,7 +309,8 @@ def us67_grooming(e: E2E, token: str) -> None:
           latency <= 60, f"→ {ns} за {latency:.1f} c после суммаризации (цель ≤60 c)")
     # US-7: общая заметка остаётся в default (честно-общая).
     general = e.save(
-        f"{MARK} US7: общий конспект без привязки к домену — заметки о погоде и рецептах."
+        f"{MARK} US7: общий конспект без привязки к домену — заметки о погоде и рецептах.",
+        title=f"{MARK} US7 общий конспект",
     )
     deadline = time.monotonic() + 1800
     row = None
@@ -324,8 +332,8 @@ def us67_grooming(e: E2E, token: str) -> None:
 def us8_foreign_duplicate_hint(e: E2E) -> None:
     """US-8: дословный дубль в чужом узле — запись не блокирует, hint указывает узел."""
     text = f"{MARK} US8: регламент ночных выгрузок отчётов, окно 02:00 UTC"
-    first = e.save(text, namespace="work/sbos2020")
-    second = e.save(text, namespace="work/is1777")
+    first = e.save(text, namespace="work/sbos2020", title=f"{MARK} US8 регламент выгрузок")
+    second = e.save(text, namespace="work/is1777", title=f"{MARK} US8 регламент выгрузок")
     assert second["stored"] is True and second["id"] != first["id"]
     assert "work/sbos2020" in second["hint"]
     check("US-8", "дедуп-хинт чужого узла (запись не блокирует)", True)
@@ -356,7 +364,8 @@ def us10_auto_create_and_retrofit(e: E2E) -> None:
         e.save(
             f"{MARK} US10: заметка для домена work, подраздел e2e10-quant-sensors: "
             f"калибровка квантовых сенсоров, серия {i}, температура {200 + i} K, "
-            f"дрейф {i * 0.1} ппм/ч, отчёт за смену."
+            f"дрейф {i * 0.1} ппм/ч, отчёт за смену.",
+            title=f"{MARK} US10 калибровка серия {i}",
         )
     print("  [..] US10: 15 заметок в очереди суммаризации/классификации — ждём триггер")
     deadline = time.monotonic() + 40 * 60  # 15×(суммаризация ~60 c + разметка)
@@ -386,13 +395,15 @@ def us10_auto_create_and_retrofit(e: E2E) -> None:
 def us11_merge_delete_reversible(e: E2E) -> None:
     """US-11: обратимость — merge/delete с перекладкой (ничего не теряется)."""
     e.ensure_node("work/e2e-tmp", f"{MARK}: временный лист для слияния.")
-    tmp_note = e.save(f"{MARK} US11: заметка во временном листе", namespace="work/e2e-tmp")
+    tmp_note = e.save(f"{MARK} US11: заметка во временном листе",
+                      namespace="work/e2e-tmp", title=f"{MARK} US11 временная заметка")
     merged = e.rest("POST", "/namespaces/work/e2e-tmp/merge", json={"into": "work/sbos2020"}).json()
     assert merged["moved"] == 1
     assert e.get_note(tmp_note["id"])["namespace"] == "work/sbos2020"
     assert e.node("work/e2e-tmp") is None
     e.ensure_node("work/e2e-del", f"{MARK}: временный лист на удаление.")
-    del_note = e.save(f"{MARK} US11: заметка на удаление узла", namespace="work/e2e-del")
+    del_note = e.save(f"{MARK} US11: заметка на удаление узла",
+                      namespace="work/e2e-del", title=f"{MARK} US11 узел на удаление")
     deleted = e.rest("DELETE", "/namespaces/work/e2e-del")
     assert deleted.status_code == 200 and deleted.json()["moved"] == 1
     assert e.get_note(deleted["id"])["namespace"] == "work"
@@ -430,7 +441,10 @@ def save_latency(e: E2E) -> None:
     samples = []
     for i in range(3):
         t0 = time.monotonic()
-        e.save(f"{MARK} замер save-латентности №{i}: заметка об измерении времени записи")
+        e.save(
+            f"{MARK} замер save-латентности №{i}: заметка об измерении времени записи",
+            title=f"{MARK} замер латентности номер {i}",
+        )
         samples.append((time.monotonic() - t0) * 1000)
     METRICS["save_latency_ms_avg"] = round(sum(samples) / len(samples), 1)
     check("§4", "save-латентность (мгновенный, фон)", True,

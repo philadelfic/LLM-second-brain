@@ -1,7 +1,7 @@
 """PromptRegistry (Фаза 11, пул 3; решение №7 брифа): реестр промптов.
 
-Контракты пула: встроенные константы всех 10 промптов (тексты 1-в-1 с
-app/services/{summary,judge,classifier,promotion}.py); файловая механика
+Тексты промптов живут в реестре (follow-up координатора: алиасы сервисов
+удалены, сверка 1-в-1 со старыми константами снята); файловая механика
 трёх редактируемых при заданном prompts_dir: seed-if-missing идемпотентен,
 существующие файлы НЕ перезаписываются, пустой файл = встроенный дефолт,
 непустой файл побеждает, зашитые 7 файлами не создаются; judge_system из
@@ -19,20 +19,13 @@ import pathlib
 import pytest
 
 from app.config import ConfigError
-from app.services import (
-    classifier,
-    judge,
-    promotion,
-    prompts as prompts_mod,
-    summary,
-)
+from app.services import prompts as prompts_mod
 from app.services.prompts import (
-    BUILTIN_PROMPTS,
     EDITABLE_PROMPTS,
     PromptRegistry,
 )
 
-# Имена промптов в контракте реестра (ключи BUILTIN_PROMPTS).
+# Имена промптов в контракте реестра (10 имён — контракт пула 3).
 PROMPT_NAMES: tuple[str, ...] = (
     "summary_system",
     "summary_merge_system",
@@ -47,51 +40,35 @@ PROMPT_NAMES: tuple[str, ...] = (
 )
 
 
-# --- встроенные тексты 1-в-1 ------------------------------------------------
-
-
-class TestBuiltinTexts:
-    def test_summary_system_matches_service(self) -> None:
-        assert PromptRegistry().summary_system == summary.SYSTEM_PROMPT
-
-    def test_summary_merge_system_matches_service(self) -> None:
-        assert PromptRegistry().summary_merge_system == summary.MERGE_SYSTEM_PROMPT
-
-    def test_summary_merge_user_matches_service(self) -> None:
-        assert PromptRegistry().merge_user == summary.MERGE_USER_TEMPLATE
-
-    def test_judge_system_matches_service(self) -> None:
-        assert PromptRegistry().judge_system == judge.JUDGE_SYSTEM_PROMPT
-
-    def test_judge_user_matches_service(self) -> None:
-        assert PromptRegistry().judge_user == judge.JUDGE_USER_TEMPLATE
-
-    def test_classifier_system_matches_service(self) -> None:
-        assert PromptRegistry().classifier_system == classifier.CLASSIFY_SYSTEM_PROMPT
-
-    def test_describe_prompts_match_service(self) -> None:
-        registry = PromptRegistry()
-        assert registry.describe_system == promotion.DESCRIBE_SYSTEM_PROMPT
-        assert registry.describe_user == promotion.DESCRIBE_USER_TEMPLATE
-
-    def test_structure_judge_prompts_match_service(self) -> None:
-        registry = PromptRegistry()
-        assert registry.structure_judge_system == promotion.JUDGE_SYSTEM_PROMPT
-        assert registry.structure_judge_user == promotion.JUDGE_USER_TEMPLATE
-
-
 # --- API реестра (свойства + get) -------------------------------------------
 
 
 class TestRegistryApi:
     def test_ten_builtin_prompts_registered(self) -> None:
         """Ровно 10 промптов, имена — контракт пула 3."""
-        assert set(BUILTIN_PROMPTS) == set(PROMPT_NAMES)
+        assert len(PROMPT_NAMES) == 10
+        assert set(PROMPT_NAMES) == {
+            "summary_system",
+            "summary_merge_system",
+            "judge_system",
+            "merge_user",
+            "judge_user",
+            "classifier_system",
+            "describe_system",
+            "describe_user",
+            "structure_judge_system",
+            "structure_judge_user",
+        }
 
     def test_all_names_resolvable_via_get(self) -> None:
-        registry = PromptRegistry()
+        """Все имена разрешаются непустым стабильным текстом (follow-up:
+        сверка 1-в-1 с алиасами сервисов убрана — тексты живут в реестре)."""
+        first = PromptRegistry()
+        second = PromptRegistry()
         for name in PROMPT_NAMES:
-            assert registry.get(name) == BUILTIN_PROMPTS[name]
+            text = first.get(name)
+            assert isinstance(text, str) and text.strip()
+            assert second.get(name) == text
 
     def test_properties_match_get(self) -> None:
         registry = PromptRegistry()
@@ -129,7 +106,7 @@ class TestNoPromptsDir:
         registry = PromptRegistry()
         assert registry.prompts_dir is None
         for name in PROMPT_NAMES:
-            assert registry.get(name) == BUILTIN_PROMPTS[name]
+            assert registry.get(name).strip()
 
     def test_seed_not_written_without_prompts_dir(self) -> None:
         """Без каталога seed-файлы не создаются (некуда и незачем)."""
@@ -198,8 +175,10 @@ class TestFileMechanics:
             "   \n\t  ", encoding="utf-8"
         )  # пробельный = пустой
         registry = PromptRegistry(prompts_dir=tmp_path)
-        assert registry.summary_system == summary.SYSTEM_PROMPT
-        assert registry.summary_merge_system == summary.MERGE_SYSTEM_PROMPT
+        assert registry.summary_system == PromptRegistry().get("summary_system")
+        assert registry.summary_merge_system == PromptRegistry().get(
+            "summary_merge_system"
+        )
 
     def test_judge_file_wins_over_builtin(self, tmp_path: pathlib.Path) -> None:
         """Судья дедупа читается из файла (с маркерами) — поверх встроенного."""
@@ -207,7 +186,7 @@ class TestFileMechanics:
         (tmp_path / "judge_system.txt").write_text(custom, encoding="utf-8")
         registry = PromptRegistry(prompts_dir=tmp_path)
         assert registry.judge_system == custom
-        assert registry.judge_system != judge.JUDGE_SYSTEM_PROMPT
+        assert registry.judge_system != PromptRegistry().judge_system
 
     def test_seed_only_for_editable_names(
         self, tmp_path: pathlib.Path

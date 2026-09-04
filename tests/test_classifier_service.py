@@ -1,10 +1,12 @@
-"""ClassificationService (Фаза 10, Шаг 4): контракт /api/chat, JSON-разметка.
+"""ClassificationService (Фаза 10, Шаг 4; Фаза 11 — клиент слота summary).
 
-Юнит-тесты через httpx.MockTransport — без сети; живая Ollama классификации
-(та же модель, что суммаризация) — интеграционные, маркер `integration`.
-Контракты: REQUIREMENTS §5.7 (три поля разметки, маленький num_predict,
-think:false, известные узлы в user-сообщении; параметры разметки — внутренние
-данные, не в MCP).
+Контракт chat слота summary для классификатора (ollama — POST /api/chat,
+openai — /v1/chat/completions), JSON-разметка. Юнит-тесты через
+httpx.MockTransport — без сети; живой слот классификации (та же модель,
+что суммаризация) — интеграционные, маркер `integration`. Контракты:
+REQUIREMENTS §5.7 (три поля разметки, маленький num_predict, think:false,
+известные узлы в user-сообщении; параметры разметки — внутренние данные,
+не в MCP), промпт — из реестра (решение №7).
 """
 
 from __future__ import annotations
@@ -123,6 +125,10 @@ def test_payload_small_num_predict_and_think_false(monkeypatch) -> None:
     assert payload["num_predict"] == CLASSIFIER_NUM_PREDICT
     assert payload["think"] is False
     assert payload["model"] == settings.summary_model  # та же модель, что суммаризация
+    # Фаза 11: температура — уровень клиента слота (0.1, как у суммаризации;
+    # отдельная нулевая у классификатора осталась в v2.0).
+    assert payload["temperature"] == 0.1
+    assert "keep_alive" not in payload  # решение №6
     service.close()
 
 

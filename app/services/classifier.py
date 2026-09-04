@@ -1,14 +1,26 @@
 """ClassificationService — фоновая причёска (Фаза 10, Шаг 4; REQUIREMENTS §5.7).
 
-Классификатор default-заметок: та же модель, что суммаризация
-(SUMMARY_MODEL / SUMMARY_OLLAMA_BASE_URL), отдельный промпт, JSON-вывод,
-маленький `num_predict`. Выход — три поля разметки: `domain_hint` (корень из
-реестра), `subdomain_hint` (слаг листа или null = общая), `confidence` (0–1).
-Параметры разметки — внутренние данные, НЕ в MCP-контрактах (не теги-2.0):
-клиент-модель видит только узлы реестра.
+Классификатор default-заметок: слот summary — та же модель, что
+суммаризация (SUMMARY_MODEL / SUMMARY_BASE_URL), отдельный промпт,
+JSON-вывод, маленький `num_predict`. Выход — три поля разметки:
+`domain_hint` (корень из реестра), `subdomain_hint` (слаг листа или
+null = общая), `confidence` (0–1). Параметры разметки — внутренние данные,
+НЕ в MCP-контрактах (не теги-2.0): клиент-модель видит только узлы реестра.
+
+Фаза 11: HTTP-транспорт вынесен в `LLMClient` (app/services/llm_client.py)
+— классификатор делит клиент слота summary (провайдер `ollama` | `openai`,
+решение №1: классификация живёт в одном слоте с суммаризацией). Сервис
+больше не держит httpx и не собирает пейлоады сам: system+user, non-stream,
+маленький `num_predict` и явный `think: false` уходят через
+`LLMClient.chat`; очередь F1 (ollama_slot — только ollama-провайдер),
+Bearer при заданном ключе и разбор ответа (`message.content`, reasoning-
+поля отбрасываются) — внутри клиента. keep_alive не отправляется никому
+(решение №6: моделью управляет сервер, OLLAMA_KEEP_ALIVE). Read-таймаут —
+таймаут слота summary (SUMMARY_TIMEOUT_SEC): с v2.1 клиент один на слот,
+отдельный CLASSIFIER_TIMEOUT_SEC больше не задаётся.
 
 Вызывается только фоновым воркером после суммаризации default-заметки
-(последовательно, не параллельно — `ollama_slot` сериализует вызовы к одному
+(последовательно, не параллельно — ollama_slot сериализует вызовы к одному
 base_url). Отказ — `ClassificationError`: заметка остаётся в default,
 `classified_at` не ставится, повтор — после `memory_update` (анти-зацикливание
 §5.7). `last_attempt_ok` — как у суммаризатора (NFR-4, /health).
@@ -16,10 +28,11 @@ base_url). Отказ — `ClassificationError`: заметка остаётся
 Промпт: в user-сообщение передаются известные узлы (path: description) —
 «подходит существующий — используй; специфична и не подходит — новый слаг
 (латиница-цифры-дефис); общая — null». Консистентность слагов растёт вместе
-со списком известных узлов.
+со списком известных узлов. Текст — из реестра промптов (Фаза 11, решение
+№7): `classifier_system` — зашитая константа, файлами не создаётся никогда.
 
 Юнит-тестам — транспорт без сети: `transport` принимает httpx.MockTransport
-или handler (как SummaryService).
+или handler (пробрасывается в LLMClient слота).
 """
 
 from __future__ import annotations
@@ -32,37 +45,13 @@ from typing import Any, Protocol
 import httpx
 
 from app.config import Settings
+from app.services.llm_client import LLMClient, LLMError, SlotSpec
 from app.services.namespaces import normalize_slug
-from app.services.ollama_gate import ollama_slot
+from app.services.prompts import PromptRegistry
 
-# Таймауты: connect 2 с (LAN), чтение — CLASSIFIER_TIMEOUT_SEC (маленький
-# JSON-ответ, reasoning не нужен — think:false).
-CONNECT_TIMEOUT_SEC = 2.0
-CLASSIFIER_TIMEOUT_SEC = 30
-
-# Параметры вызова, не настраиваемые env (как TEMPERATURE/KEEP_ALIVE в
-# summary.py): маленький бюджет JSON-разметки, нулевая температура —
-# детерминированный выбор узла, keep_alive≈15m — модель не выгружается.
+# Параметры вызова, не настраиваемые env (ARCH §4.7): маленький бюджет
+# JSON-разметки; think:false — явный запрет рассуждений (быстрее).
 CLASSIFIER_NUM_PREDICT = 64
-TEMPERATURE = 0.0
-KEEP_ALIVE = "15m"
-
-# Кусок тела ответа в тексте ошибки (логи не захламляем).
-_ERROR_BODY_CHARS = 120
-
-# Промпт классификатора (§5.7): известные узлы — в user-сообщении; ответ —
-# строго JSON-объект без пояснений.
-CLASSIFY_SYSTEM_PROMPT = (
-    "Ты классификатор заметок для иерархической памяти. Определи, к какому "
-    "разделу относится заметка. Известные узлы перечислены в запросе. "
-    "Правила: если заметка относится к существующему домену — верни его путь "
-    "как domain_hint; если к конкретному подразделу — верни слаг листа как "
-    "subdomain_hint (латиница-цифры-дефис), иначе null; если заметка общая и "
-    "не привязана к домену — верни null для обоих. Ответь строго одним "
-    "JSON-объектом без пояснений: {\"domain_hint\": \"...\", "
-    "\"subdomain_hint\": \"...\", \"confidence\": 0.0} — confidence от 0 до 1, "
-    "насколько уверен в выборе."
-)
 
 
 class ClassificationError(RuntimeError):
@@ -81,7 +70,7 @@ class Classification:
 class Classifier(Protocol):
     """Контракт классификатора: природы реализации он не знает.
 
-    Реализации: ClassificationService (живая Ollama /api/chat) и тестовый
+    Реализации: ClassificationService (живой слот summary) и тестовый
     фейк (tests/fakes.py) — воркер зависит от протокола, а не от класса.
     """
 
@@ -95,7 +84,7 @@ class Classifier(Protocol):
 
 
 class ClassificationService:
-    """Разметка default-заметки через Ollama `POST /api/chat` (non-stream)."""
+    """Разметка default-заметки через chat слота summary (non-stream)."""
 
     def __init__(
         self,
@@ -103,16 +92,18 @@ class ClassificationService:
         transport: httpx.BaseTransport
         | Callable[[httpx.Request], httpx.Response]
         | None = None,
+        *,
+        llm: LLMClient | None = None,
+        registry: PromptRegistry | None = None,
     ) -> None:
         self._settings = settings
-        if transport is not None and not isinstance(transport, httpx.BaseTransport):
-            transport = httpx.MockTransport(transport)
-        self._client = httpx.Client(
-            base_url=settings.summary_base_url,
-            timeout=httpx.Timeout(
-                CLASSIFIER_TIMEOUT_SEC, connect=CONNECT_TIMEOUT_SEC
-            ),
-            transport=transport,
+        self._prompts = registry if registry is not None else PromptRegistry()
+        # DI сборки (общий клиент слота summary) или свой клиент с
+        # transport-инъекцией для юнит-тестов (MockTransport).
+        self._llm = (
+            llm
+            if llm is not None
+            else LLMClient(SlotSpec.for_summary(settings), transport=transport)
         )
         # None — попыток не было (health не врёт до первых данных).
         self.last_attempt_ok: bool | None = None
@@ -124,13 +115,16 @@ class ClassificationService:
         if not text or not text.strip():
             raise ValueError("classify: пустой текст заметки")
         try:
-            content = self._chat(
-                CLASSIFY_SYSTEM_PROMPT,
+            content = self._llm.chat(
+                self._prompts.classifier_system,
                 self._user_message(text, known_nodes),
+                num_predict=CLASSIFIER_NUM_PREDICT,
+                think=False,  # JSON-разметка без рассуждений (быстрее)
             )
-        except ClassificationError:
+        except LLMError as exc:
+            # Текст клиента сохраняется (HTTP-статус/hint ключа, решение №4).
             self.last_attempt_ok = False  # деградация станет видна в /health
-            raise
+            raise ClassificationError(str(exc)) from exc
         try:
             result = self._parse(content)
         except ClassificationError:
@@ -141,7 +135,7 @@ class ClassificationService:
 
     def close(self) -> None:
         """Закрыть HTTP-пул (чистое завершение процесса)."""
-        self._client.close()
+        self._llm.close()
 
     # --- внутреннее ---------------------------------------------------------
 
@@ -154,49 +148,6 @@ class ClassificationService:
         if not nodes:
             nodes = "(нет известных узлов)"
         return f"Заметка:\n{text}\n\nИзвестные узлы:\n{nodes}"
-
-    def _chat(self, system_prompt: str, user_text: str) -> str:
-        """Один вызов /api/chat + проверки контракта ответа (без ретраев)."""
-        payload = {
-            "model": self._settings.summary_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            "stream": False,
-            "num_predict": CLASSIFIER_NUM_PREDICT,
-            "temperature": TEMPERATURE,
-            "keep_alive": KEEP_ALIVE,
-            "think": False,  # JSON-разметка без рассуждений (быстрее)
-        }
-        try:
-            # Очередь F1: один запрос к серверу в момент времени (та же
-            # модель, что суммаризация — делим слот, не гоняем параллельно).
-            with ollama_slot(self._settings.summary_base_url):
-                response = self._client.post("/api/chat", json=payload)
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
-            raise ClassificationError(
-                "сервер классификации недоступен "
-                f"({self._settings.summary_base_url}): {exc}"
-            ) from exc
-        if response.status_code != 200:
-            body = " ".join(response.text[:_ERROR_BODY_CHARS].split())
-            raise ClassificationError(
-                f"HTTP {response.status_code} от /api/chat: {body}"
-            )
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise ClassificationError(f"не-JSON ответ от /api/chat: {exc}") from exc
-        if not isinstance(data, dict):
-            raise ClassificationError(
-                "неожиданный формат ответа /api/chat (не объект)"
-            )
-        message = data.get("message")
-        content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, str) or not content.strip():
-            raise ClassificationError("пустой content в ответе классификатора")
-        return content.strip()
 
     def _parse(self, content: str) -> Classification:
         """Извлечь и провалидировать JSON-разметку; нарушения — ClassificationError."""
