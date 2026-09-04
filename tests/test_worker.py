@@ -11,12 +11,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 import time
 
 import pytest
-from fakes import FailingEmbedder, FailingSummarizer, FixedSummarizer, HashEmbedder
+from fakes import (
+    FailingEmbedder,
+    FailingSummarizer,
+    FixedClassifier,
+    FixedSummarizer,
+    HashEmbedder,
+    RecordingDedup,
+)
 
 from app.config import get_settings
+from app.services.classifier import Classification
+from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
 from app.services.worker import MAX_INTERVAL_SEC, BackgroundWorker, next_interval
 from app.storage import vectors
@@ -389,3 +399,200 @@ async def test_backoff_independent_per_queue(slow) -> None:
     # успех сбросил только интервального счётчика своей очереди
     assert worker.summary_interval == float(slow.pending_retry_sec)
     assert worker.interval > float(slow.pending_retry_sec)  # векторный всё ещё растёт
+
+
+# --- Фаза 11 (решение №10): петли по слотам, title-доген, зависимости ---------
+
+
+class BlockingEmbedder(HashEmbedder):
+    """Кодировщик, блокирующий embedding-петлю (проверка параллельности петель)."""
+
+    def __init__(self, dim: int, delay: float = 0.5) -> None:
+        super().__init__(dim)
+        self.delay = delay
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        time.sleep(self.delay)
+        return super().embed_texts(texts)
+
+
+class ConcurrentTrackingSummarizer(FixedSummarizer):
+    """Суммаризатор, трекающий максимальную одновременность вызовов.
+
+    summary-петля обрабатывает заметки последовательно (одна задача за раз на
+    эндпоинт слота) — max_active обязан остаться 1.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.active = 0
+        self.max_active = 0
+        self._lock = threading.Lock()
+
+    def summarize(self, text: str) -> str:
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            return super().summarize(text)
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
+def test_judge_interval_starts_at_configured(settings) -> None:
+    """Своя независимая петля = свой счётчик back-off (решение №10)."""
+    worker = make_worker(settings, HashEmbedder(8))
+    assert worker.judge_interval == float(settings.pending_retry_sec)
+
+
+def test_title_dogen_generates_and_truncates(settings) -> None:
+    """Title-догенерация (решение №9): миграционная заметка (title IS NULL) →
+    думающий вызов слота summary → результат обрезан до TITLE_MAX_WORDS слов,
+    запись title."""
+    notes = NoteService(settings, FailingEmbedder())
+    saved = notes.save("заметка без названия")  # легаси-путь → title=NULL
+    worker = make_worker(
+        settings,
+        HashEmbedder(8),
+        FixedSummarizer("один два три четыре пять шесть семь"),
+    )
+    assert worker.process_title_pending() == 1
+    with session(settings) as conn:
+        row = conn.execute(
+            "SELECT title FROM notes WHERE id = ?", (saved["id"],)
+        ).fetchone()
+    assert row["title"] == "один два три четыре пять"  # ≤5 слов
+    assert len(row["title"].split()) == 5
+
+
+def test_title_dogen_skips_notes_with_title(settings) -> None:
+    """Новые заметки всегда с title — догенерация их не трогает (только NULL)."""
+    notes = NoteService(settings, FailingEmbedder())
+    notes.save("заметка с названием", title="Есть название")
+    worker = make_worker(settings, HashEmbedder(8), FixedSummarizer("генерация"))
+    assert worker.process_title_pending() == 0
+    with session(settings) as conn:
+        row = conn.execute("SELECT title FROM notes WHERE id = 1").fetchone()
+    assert row["title"] == "Есть название"
+
+
+def test_title_dogen_failure_keeps_null(settings) -> None:
+    """Отказ генерации (NFR-3): title остаётся NULL, повтор по back-off."""
+    notes = NoteService(settings, FailingEmbedder())
+    saved = notes.save("заметка без названия")
+    worker = make_worker(settings, HashEmbedder(8), FailingSummarizer())
+    assert worker.process_title_pending() == 0
+    with session(settings) as conn:
+        row = conn.execute(
+            "SELECT title FROM notes WHERE id = ?", (saved["id"],)
+        ).fetchone()
+    assert row["title"] is None
+
+
+def test_judge_job_created_after_vector(settings) -> None:
+    """Диспетчер зависимостей (решение №10): judge-работа появляется ТОЛЬКО
+    после готовности вектора заметки (embedding-петля)."""
+    notes = NoteService(settings, FailingEmbedder())
+    notes.save("заметка для проверки зависимости")
+    worker = make_worker(settings, HashEmbedder(8))
+    # до векторизации judge-работ нет
+    assert worker.process_judge_pending() == 0
+    worker.process_pending()  # векторизация → judge-работа
+    assert worker.process_judge_pending() == 1  # judge-работа появилась
+
+
+def test_merge_job_created_after_judge_verdict(settings) -> None:
+    """Диспетчер зависимостей (решение №10): merge-работа создаётся ТОЛЬКО
+    после вердикта судьи (judge-петля) и ходит в summary-слот."""
+    notes = NoteService(settings, FailingEmbedder())
+    notes.save("ранняя заметка про бэкапы")
+    notes.save("поздняя заметка про деплои")
+    worker = BackgroundWorker(
+        settings,
+        HashEmbedder(8),
+        FixedSummarizer(merged="слитый текст"),
+        RecordingDedup(candidates=[(1, 0.95)]),
+    )
+    worker.process_pending()
+    # до вердикта судьи merge-работ нет
+    assert worker.process_merge_pending() == 0
+    worker.process_judge_pending()  # вердикт → merge-работа
+    assert worker.process_merge_pending() == 1
+
+
+def test_merge_preserves_earlier_title(settings) -> None:
+    """Merge сохраняет title ранней (решение №9): update без title не затирает
+    название ранней заметки."""
+    notes = NoteService(settings, FailingEmbedder())
+    first = notes.save("ранняя заметка про бэкапы", title="Ранняя заметка")
+    notes.save("поздняя заметка про деплои", title="Поздняя заметка")
+    worker = BackgroundWorker(
+        settings,
+        HashEmbedder(8),
+        FixedSummarizer(merged="слитый текст"),
+        RecordingDedup(candidates=[(first["id"], 0.95)]),
+    )
+    worker.process_pending()
+    worker.process_judge_pending()
+    worker.process_merge_pending()
+    with session(settings) as conn:
+        row = conn.execute(
+            "SELECT title, text FROM notes WHERE id = ?", (first["id"],)
+        ).fetchone()
+    assert row["title"] == "Ранняя заметка"  # title ранней сохранён
+    assert row["text"] == "слитый текст"
+
+
+def test_summary_loop_serializes_jobs(settings) -> None:
+    """Сериализация работ одного слота: summary-петля обрабатывает заметки
+    по одной (одна задача за раз на эндпоинт слота)."""
+    notes = NoteService(settings, FailingEmbedder())
+    for number in range(3):
+        notes.save(f"заметка суммаризации {number}, тема отдельная")
+    summarizer = ConcurrentTrackingSummarizer()
+    worker = make_worker(settings, FailingEmbedder(), summarizer)
+    assert worker.process_summary_pending() == 3
+    assert summarizer.max_active == 1  # никогда не больше одной задачи
+
+
+@pytest.mark.asyncio
+async def test_embedding_loop_does_not_block_summary(fast) -> None:
+    """Параллельность разных эндпоинтов: embedding-петля (заблокирована) не
+    ждёт summary-петлю — суммаризация догоняется независимо."""
+    notes = NoteService(fast, FailingEmbedder())
+    notes.save("заметка для параллельности петель")
+    worker = make_worker(
+        fast, BlockingEmbedder(8, delay=0.5), FixedSummarizer("Суммари параллельно.")
+    )
+    task = asyncio.create_task(worker.run())
+    status = None
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        with session(fast) as conn:
+            status = conn.execute(
+                "SELECT summary_status FROM notes WHERE id = 1"
+            ).fetchone()[0]
+        if status == "ok":
+            break
+        await asyncio.sleep(0.01)
+    worker.stop()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert status == "ok"  # summary-петля не ждала embedding-петлю
+
+
+def test_classification_after_summarization(settings) -> None:
+    """Диспетчер зависимостей (решение №10): классификация — только после
+    суммаризации той же заметки (summary-петля)."""
+    NamespaceService(settings).create("work", "Рабочие заметки.")
+    notes = NoteService(settings, FailingEmbedder())
+    notes.save("заметка про рабочие процессы")
+    classifier = FixedClassifier(Classification("work", None, 0.95))
+    worker = BackgroundWorker(
+        settings, HashEmbedder(8), FixedSummarizer(), classifier=classifier
+    )
+    assert classifier.calls == []  # до суммаризации классификации нет
+    worker.process_summary_pending()  # суммаризация → классификация
+    assert len(classifier.calls) == 1

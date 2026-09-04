@@ -1,36 +1,41 @@
 """Фоновый воркер (ARCHITECTURE §3.4): до-векторизация + до-суммаризация.
 
-Единственный воркер на процесс, **три независимые очереди** — состояния
-pending-статусов в БД (переживают рестарт, догоняются при старте сервиса):
-- `pending_vector`  → batch `embed_texts` (один вызов на партию) → вектора в
-  notes_vec, vector_status='ok';
-- `pending_summary` → по заметке `summarizer.summarize(text)` (режим «Б» —
-  единственный путь генерации summary, §5.5) → summary + summary_status='ok';
-- pending-чанки (Фаза 7, анти-джойн «нет строки в notes_chunks_vec») →
-  вычитывающая партия режется на подъёмки EMBEDDING_BATCH_SIZE; в полёте —
-  до EMBEDDING_CONCURRENT_REQUESTS подъёмок (Semaphore + asyncio.to_thread).
+Единственный воркер на процесс, **три независимые петли по СЛОТАМ** (Фаза 11,
+решение №10) — состояния pending-статусов в БД (переживают рестарт, догоняются
+при старте сервиса):
 
-Фаза 8, Этапы 2–3 (фоновый дедуп, вариант B): после довекторизации каждой
-заметки notes-очереди (`vector_status='ok'`) воркер ищет косинус-кандидатов
-против **ранних** активных заметок (`find_candidates`, DEDUP_CANDIDATE_* —
-только предфильтр) и сводит признанные дубли: приговор «дубль» принимает
-LLM-судья (JudgeService, Этап 3: вердикт «ДУБЛЬ»/«НЕ ДУБЛЬ» по паре текстов,
-`think:false`); без судьи (DI None, тестовый режим) — косинус-фоллбек
-Этапа 2.2 (топовый кандидат с cosine ≥ DEDUP_SIMILARITY). Слияние —
-суммаризатором (`Summarizer.merge`: оба текста в один) в **раннюю** заметку
-(меньший id; ре-векторизация/ре-суммаризация — штатно, через те же очереди),
-**поздняя** — soft delete.
-Отказ слияния (SummaryError, NFR-3) данные не портит: обе заметки остаются,
-свежая возвращается в pending_vector — повтор по штатному back-off
-notes-очереди (статус в БД — переживает рестарт); из «processed» такая
-заметка не считается, и интервал очереди не сбрасывается.
+- **embedding-петля** (`_run_embedding`): вектора заметок (`pending_vector` →
+  batch `embed_texts` → notes_vec, vector_status='ok') + чанковая очередь
+  (Фаза 7, анти-джоин «нет строки в notes_chunks_vec»). Объединены в одну
+  петлю; Semaphore EMBEDDING_CONCURRENT_REQUESTS остаётся. После готовности
+  вектора каждой заметки создаётся judge-работа (дедуп) — диспетчер
+  зависимостей (решение №10): судья опрашивается только по довекторизованной
+  заметке.
+- **summary-петля** (`_run_summary`): title-догенерация (миграция, title IS
+  NULL) → summarize → merge (слияние дублей) → классификация → описание узла.
+  notify будит эту петлю (save/update).
+- **judge-петля** (`_run_judge`): судья дедупа (по judge-работам, созданным
+  embedding-петлёй) + судья структуры (внутри PromotionService, триггер после
+  классификации).
+
+Job-очереди в БД по слотам (`worker_jobs`): judge-работа (kind='dedup')
+создаётся ТОЛЬКО после готовности вектора заметки; merge-работа (kind='merge')
+создаётся после вердикта судьи и ходит в summary-слот. Порядок заметок в
+очереди — по id. Back-off раздельный по петлям (30 с → ×2 → 15 мин, как
+сейчас); notify будит summary-петлю; save векторизует синхронно — вне очередей.
+
+Title-догенерация (решение №9): заметки с `title IS NULL` (только миграционные
+— новые всегда с title) → думающий вызов слота summary (think по флагу, как
+суммаризация), результат обрезается до TITLE_MAX_WORDS механикой, запись title;
+очередь наполняется только миграцией и после прогонки опустеет. Промпт
+догенерации — зашит в воркере (TITLE_PROMPT), файлом не создаётся.
 
 Garanties:
 - отказ любого внешнего сервера не портит данные: статус остаётся pending
   (NFR-3); интервал опроса растёт по back-off: PENDING_RETRY_SEC (30 с) → ×2
-  → max 15 минут (REQUIREMENTS §5.3) — **независимо по каждой очереди**
+  → max 15 минут (REQUIREMENTS §5.3) — **независимо по каждой петле**
   (ARCH §3.4): недоступный векторизатор не останавливает суммаризацию и
-  наоборот; успех в очереди сбрасывает только её интервал и продолжает
+  наоборот; успех в петле сбрасывает только её интервал и продолжает
   выгребать её немедленно.
 - конкурентный доступ — через busy_timeout/WAL (§3.3); каждая партия —
   короткие транзакции, параллель с запросами безопасна.
@@ -70,9 +75,10 @@ Garanties:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
-from app.config import Settings
+from app.config import TITLE_MAX_WORDS, Settings
 from app.services.classifier import ClassificationError, Classifier
 from app.services.dedup import DeduplicationService
 from app.services.embedding import Embedder, EmbeddingError
@@ -91,6 +97,11 @@ PENDING_BATCH = 50
 # Потолок back-off (REQUIREMENTS §5.3 «max 15 мин»), env не настраивается.
 MAX_INTERVAL_SEC = 15 * 60
 
+# Промпт догенерации названия (решение №9): ЗАШИТ в SummaryService.title
+# (follow-up 6b — протокол Summarizer получил метод title; здесь раньше был
+# мёртвый дубль константы, генерация шла с промптом суммаризации).
+# Думающий вызов слота summary, обрезка до TITLE_MAX_WORDS — механика воркера.
+
 
 def next_interval(current: float, start: int) -> float:
     """Шаг back-off: интервал удваивается, потолок — 15 минут (§3.4)."""
@@ -98,7 +109,7 @@ def next_interval(current: float, start: int) -> float:
 
 
 class BackgroundWorker:
-    """Единственный фоновый воркер; очереди — pending-статусы в БД."""
+    """Единственный фоновый воркер; очереди — pending-статусы в БД + worker_jobs."""
 
     def __init__(
         self,
@@ -115,11 +126,11 @@ class BackgroundWorker:
         self._summarizer = summarizer
         # LLM-судья дедупа (Фаза 8, Этап 3.1, DI из build_services — один
         # экземпляр на процесс): вердикт «дубль/не дубль» по каждому
-        # косинус-кандидату (_merge_duplicates, Этап 3.2). None — тестовый
-        # режим: воркер сводит по косинус-фоллбеку Этапа 2.2.
+        # косинус-кандидату (judge-петля, Этап 3.2). None — тестовый режим:
+        # воркер сводит по косинус-фоллбеку Этапа 2.2.
         self._judge = judge
-        # Фоновый дедуп (Фаза 8, Этап 2): после довекторизации заметки
-        # ищем косинус-кандидатов против ранних заметок. DI для тестов.
+        # Фоновый дедуп (Фаза 8, Этап 2): поиск косинус-кандидатов против
+        # ранних заметок. DI для тестов.
         self._dedup = (
             dedup if dedup is not None else DeduplicationService(settings)
         )
@@ -142,26 +153,42 @@ class BackgroundWorker:
         self._promoter = promoter
         self._vector_interval = float(max(settings.pending_retry_sec, 0))
         self._summary_interval = float(max(settings.pending_retry_sec, 0))
-        self._chunk_interval = float(max(settings.pending_retry_sec, 0))
+        self._judge_interval = float(max(settings.pending_retry_sec, 0))
         self._stopping = False
         # Сигнал «появилась заметка с pending summary» — будит петлю
         # суммаризации немедленно (save/update), минуя выросший back-off.
         self._summary_event = asyncio.Event()
+        # Сигнал «появилась judge-работа» — будит judge-петлю (embedding-петля
+        # создала дедуп-работу после довекторизации).
+        self._judge_event = asyncio.Event()
+        # Job-очереди по слотам (Фаза 11, решение №10): таблица создаётся
+        # воркером лениво при первом обращении к очередям (схема — зона
+        # воркера, не db.py). В __init__ не создаём: воркер собирается в
+        # create_app() на импорте, когда БД ещё не инициализирована.
 
     @property
     def interval(self) -> float:
-        """Текущий интервал векторной очереди (диагностика, тесты)."""
+        """Текущий интервал embedding-петли (диагностика, тесты)."""
         return self._vector_interval
 
     @property
     def summary_interval(self) -> float:
-        """Текущий интервал суммаризационной очереди (диагностика, тесты)."""
+        """Текущий интервал суммаризационной петли (диагностика, тесты)."""
         return self._summary_interval
 
     @property
     def chunk_interval(self) -> float:
-        """Текущий интервал чанковой очереди (диагностика, тесты, Фаза 7)."""
-        return self._chunk_interval
+        """Интервал чанковой очереди (диагностика, тесты, Фаза 7).
+
+        Чанковая очередь объединена с векторной в embedding-петлю (решение
+        №10) — интервал общий с `interval`.
+        """
+        return self._vector_interval
+
+    @property
+    def judge_interval(self) -> float:
+        """Текущий интервал judge-петли (диагностика, тесты, Фаза 11)."""
+        return self._judge_interval
 
     def stop(self) -> None:
         """Мягкая остановка: петли завершатся после разборки текущей итерации."""
@@ -176,20 +203,30 @@ class BackgroundWorker:
         """
         self._summary_event.set()
 
+    def notify_judge_pending(self) -> None:
+        """Разбудить judge-петлю: появилась judge-работа (дедуп).
+
+        Вызывается из embedding-петли после создания дедуп-работы —
+        `asyncio.Event.set()` потокобезопасен.
+        """
+        self._judge_event.set()
+
     async def run(self) -> None:
         """Все петли очередей (запускается asyncio-таской при старте).
 
         Обработанные партии идут одна за другой (очередь выгребаем сразу);
-        пустой прогон — пауза на текущий интервал очереди с удвоением.
+        пустой прогон — пауза на текущий интервал петли с удвоением.
         Петли независимы: back-off и выгребание — раздельные.
         """
         await asyncio.gather(
-            self._run_vector(), self._run_summary(), self._run_chunks()
+            self._run_embedding(), self._run_summary(), self._run_judge()
         )
 
-    async def _run_vector(self) -> None:
+    async def _run_embedding(self) -> None:
         while not self._stopping:
-            processed = await asyncio.to_thread(self.process_pending)
+            processed = 0
+            processed += await asyncio.to_thread(self.process_pending)
+            processed += await self.process_pending_chunks()
             if processed:
                 self._vector_interval = float(
                     self._settings.pending_retry_sec
@@ -204,7 +241,10 @@ class BackgroundWorker:
         if self._summarizer is None:
             return  # тестовый режим без суммаризатора: петля не нужна
         while not self._stopping:
-            processed = await asyncio.to_thread(self.process_summary_pending)
+            processed = 0
+            processed += await asyncio.to_thread(self.process_title_pending)
+            processed += await asyncio.to_thread(self.process_summary_pending)
+            processed += await asyncio.to_thread(self.process_merge_pending)
             if processed:
                 self._summary_interval = float(self._settings.pending_retry_sec)
                 continue
@@ -221,15 +261,82 @@ class BackgroundWorker:
                     self._summary_interval, self._settings.pending_retry_sec
                 )
 
-    async def _run_chunks(self) -> None:
+    async def _run_judge(self) -> None:
         while not self._stopping:
-            processed = await self.process_pending_chunks()
+            processed = await asyncio.to_thread(self.process_judge_pending)
             if processed:
-                self._chunk_interval = float(self._settings.pending_retry_sec)
+                self._judge_interval = float(self._settings.pending_retry_sec)
                 continue
-            await asyncio.sleep(self._chunk_interval)
-            self._chunk_interval = next_interval(
-                self._chunk_interval, self._settings.pending_retry_sec
+            # Пустой прогон: ждём сигнал «появилась judge-работа» или таймаут
+            # back-off. Сигнал будит петлю немедленно после довекторизации.
+            self._judge_event.clear()
+            try:
+                await asyncio.wait_for(
+                    self._judge_event.wait(), timeout=self._judge_interval
+                )
+            except asyncio.TimeoutError:
+                self._judge_interval = next_interval(
+                    self._judge_interval, self._settings.pending_retry_sec
+                )
+
+    # --- job-очереди по слотам (Фаза 11, решение №10) -------------------------
+
+    def _ensure_job_table(self) -> None:
+        """Создать таблицу job-очередей (идемпотентно).
+
+        Схема — зона воркера (не db.py): job-очереди по слотам — внутренняя
+        механика фонового конвейера, диспетчер зависимостей между петлями.
+        """
+        with session(self._settings) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS worker_jobs ("
+                "  id         INTEGER PRIMARY KEY,"
+                "  slot       TEXT NOT NULL,"
+                "  kind       TEXT NOT NULL,"
+                "  note_id    INTEGER NOT NULL,"
+                "  payload    TEXT,"
+                "  status     TEXT NOT NULL DEFAULT 'pending',"
+                "  created_at TEXT NOT NULL DEFAULT "
+                "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
+                "  updated_at TEXT NOT NULL DEFAULT "
+                "    (strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+                ")"
+            )
+
+    def _create_job(
+        self, slot: str, kind: str, note_id: int, payload: str | None = None
+    ) -> None:
+        """Поставить работу в очередь слота (диспетчер зависимостей)."""
+        self._ensure_job_table()
+        with session(self._settings) as conn, transaction(conn):
+            conn.execute(
+                "INSERT INTO worker_jobs (slot, kind, note_id, payload) "
+                "VALUES (?, ?, ?, ?)",
+                (slot, kind, note_id, payload),
+            )
+
+    def _pending_jobs(
+        self, slot: str, kind: str, limit: int
+    ) -> list:
+        """Вычитать pending-работы слота (порядок по id)."""
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            return conn.execute(
+                "SELECT id, note_id, payload FROM worker_jobs "
+                "WHERE slot = ? AND kind = ? AND status = 'pending' "
+                "ORDER BY id LIMIT ?",
+                (slot, kind, limit),
+            ).fetchall()
+
+    def _mark_job_done(self, job_id: int) -> None:
+        """Пометить работу выполненной (снята с очереди)."""
+        self._ensure_job_table()
+        with session(self._settings) as conn, transaction(conn):
+            conn.execute(
+                "UPDATE worker_jobs SET status = 'done', "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                "WHERE id = ?",
+                (job_id,),
             )
 
     # --- синхронная работа (выполняется в to_thread) --------------------------
@@ -238,12 +345,11 @@ class BackgroundWorker:
         """Векторизовать одну партию pending; возвращает число обработанных.
 
         Отказ кодирования — 0: статусы не тронуты, воркер выждет back-off.
-        После каждой довекторизации — шаг фонового дедупа (Фаза 8,
-        Этапы 2–3): косинус-кандидаты против ранних заметок и сведение
-        признанных дублей (_merge_duplicates); отказ векторизации до
-        дедупа не доходит (нечего сравнивать). Заметка, чьё сведение не
-        состоялось (отказ суммаризатора), в «processed» не считается —
-        очередь не сбрасывает back-off и повторит (NFR-3).
+        После каждой довекторизации создаётся judge-работа (дедуп) в очередь
+        слота judge (решение №10): судья опрашивается только по готовому
+        вектору — диспетчер зависимостей. Само сведение дублей — в
+        judge-петле (process_judge_pending) и summary-петле
+        (process_merge_pending).
         """
         with session(self._settings) as conn:
             rows = conn.execute(
@@ -267,20 +373,189 @@ class BackgroundWorker:
                     "UPDATE notes SET vector_status = 'ok' WHERE id = ?",
                     (row["id"],),
                 )
-            # Фоновый дедуп (Фаза 8, Этапы 2–3): вектор готов — кандидаты
-            # против ранних заметок В ПРЕДЕЛАХ НЕЙМСПЕЙСА заметки (Фаза 10,
-            # §5.7: меж-узловые дубли легитимны — hint-механика Шага 5), затем
-            # приговор (LLM-судья, Этап 3.2; без судьи — косинус-фоллбек
-            # Этапа 2.2) и сведение.
-            older = self._find_dedup_candidates(
-                int(row["id"]), vector, row["namespace"]
-            )
-            if older and not self._merge_duplicates(int(row["id"]), older):
-                # Слияние не состоялось: обе заметки целы (NFR-3); свежая
-                # возвращается в pending — повтор по back-off очереди.
-                self._requeue_vectorization(int(row["id"]))
-                processed -= 1
+            # Фаза 11 (решение №10): вектор готов — judge-работа (дедуп)
+            # в очередь слота judge; диспетчер зависимостей.
+            self._create_job("judge", "dedup", int(row["id"]))
+        self.notify_judge_pending()
         return processed
+
+    # --- judge-петля: судья дедупа (Фаза 8, Этап 3.2; Фаза 11, решение №10) ---
+
+    def process_judge_pending(self, limit: int = PENDING_BATCH) -> int:
+        """Обработать партию judge-работ (дедуп); число обработанных.
+
+        По каждой judge-работе (создана после довекторизации заметки):
+        косинус-кандидаты против ранних заметок (_find_dedup_candidates,
+        DEDUP_CANDIDATE_* — только предфильтр) и приговор «дубль» — LLM-судья
+        (Этап 3.2, JudgeService; без судьи — косинус-фоллбек Этапа 2.2).
+        Признанный дубль → merge-работа в очередь слота summary (решение
+        №10: merge ходит в summary-слот). Отказ судьи (JudgeError) — работа
+        остаётся pending, повтор по back-off judge-петли (NFR-3: обе заметки
+        целы). Протухшая заметка (удалена/вектор не готов) — работа снимается.
+        """
+        jobs = self._pending_jobs("judge", "dedup", limit)
+        if not jobs:
+            return 0
+        done = 0
+        for job in jobs:
+            note_id = int(job["note_id"])
+            with session(self._settings) as conn:
+                row = conn.execute(
+                    "SELECT id, text, namespace, vector_status, deleted_at "
+                    "FROM notes WHERE id = ?",
+                    (note_id,),
+                ).fetchone()
+                vector = vectors.get_vector(conn, note_id) if row is not None else None
+            if (
+                row is None
+                or row["deleted_at"] is not None
+                or row["vector_status"] != "ok"
+                or vector is None
+            ):
+                self._mark_job_done(job["id"])
+                done += 1
+                continue
+            older = self._find_dedup_candidates(
+                note_id, vector, row["namespace"]
+            )
+            if older:
+                # Перечитать тексты свежей заметки и всех кандидатов (гонка с
+                # memory_update/delete: протухшие кандидаты срезаются заранее —
+                # о них не спрашивают ни судью, ни суммаризатор).
+                ids = [note_id] + [candidate_id for candidate_id, _ in older]
+                placeholders = ",".join("?" * len(ids))
+                with session(self._settings) as conn:
+                    rows = conn.execute(
+                        f"SELECT id, text, deleted_at FROM notes WHERE id IN "
+                        f"({placeholders})",
+                        ids,
+                    ).fetchall()
+                by_id = {r["id"]: r for r in rows}
+                newer = by_id.get(note_id)
+                if newer is None or newer["deleted_at"] is not None:
+                    self._mark_job_done(job["id"])
+                    done += 1
+                    continue
+                alive = [
+                    (candidate_id, cosine_value)
+                    for candidate_id, cosine_value in older
+                    if (r := by_id.get(candidate_id)) is not None
+                    and r["deleted_at"] is None
+                ]
+                try:
+                    best = self._pick_duplicate(note_id, alive, by_id)
+                except JudgeError:
+                    logging.getLogger("app").warning(
+                        "dedup: judge undecidable — both notes kept, retry queued",
+                        extra={
+                            "event": "dedup_judge_failed",
+                            "note_id": note_id,
+                            "candidates": [
+                                candidate_id for candidate_id, _ in alive
+                            ],
+                        },
+                    )
+                    continue  # работа остаётся pending — повтор по back-off
+                if best is not None:
+                    older_id, cosine_value = best
+                    # Merge-работа в очередь слота summary (решение №10).
+                    self._create_job(
+                        "summary",
+                        "merge",
+                        note_id,
+                        payload=json.dumps(
+                            {"older_id": older_id, "cosine": cosine_value}
+                        ),
+                    )
+            self._mark_job_done(job["id"])
+            done += 1
+        return done
+
+    # --- summary-петля: merge-работа (слияние дублей, Этап 2.2) --------------
+
+    def process_merge_pending(self, limit: int = PENDING_BATCH) -> int:
+        """Обработать партию merge-работ (слияние дублей); число обработанных.
+
+        Merge-работа создана judge-петлёй после вердикта судьи (решение №10:
+        merge ходит в summary-слот). Процедура (вариант B — решение Олега):
+        1) перечитать тексты ранней и поздней заметок (гонка с
+           memory_update/delete: протухшая пара срезается);
+        2) summarizer.merge(текст_ранней, текст_поздней) — объединить;
+        3) NoteService.update ранней (текст = объединённый; ре-векторизация
+           и ре-суммаризация — штатно, своими очередями; title ранней
+           сохраняется — update без title, решение №9);
+        4) NoteService.delete поздней (soft delete, trash).
+
+        Отказ слияния (SummaryError, NFR-3) данные не портит: обе заметки
+        остаются, работа остаётся pending — повтор по back-off summary-петли.
+        """
+        if self._summarizer is None:
+            return 0  # тестовый режим без суммаризатора: слияние невозможно
+        jobs = self._pending_jobs("summary", "merge", limit)
+        if not jobs:
+            return 0
+        done = 0
+        for job in jobs:
+            note_id = int(job["note_id"])
+            try:
+                payload = json.loads(job["payload"] or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            older_id = payload.get("older_id")
+            if older_id is None:
+                self._mark_job_done(job["id"])
+                done += 1
+                continue
+            with session(self._settings) as conn:
+                rows = conn.execute(
+                    "SELECT id, text, deleted_at FROM notes WHERE id IN (?, ?)",
+                    (older_id, note_id),
+                ).fetchall()
+            by_id = {r["id"]: r for r in rows}
+            older = by_id.get(older_id)
+            newer = by_id.get(note_id)
+            if (
+                older is None
+                or newer is None
+                or older["deleted_at"] is not None
+                or newer["deleted_at"] is not None
+            ):
+                self._mark_job_done(job["id"])
+                done += 1
+                continue
+            try:
+                merged = self._summarizer.merge(older["text"], newer["text"])
+                updated = self._notes.update(older_id, merged)
+                if not updated.get("updated"):
+                    self._mark_job_done(job["id"])
+                    done += 1
+                    continue
+                self._notes.delete(note_id)  # поздний дубль — в trash
+            except SummaryError:
+                logging.getLogger("app").warning(
+                    "dedup: summarizer merge failed — both notes kept, retry queued",
+                    extra={
+                        "event": "dedup_merge_failed",
+                        "older_id": older_id,
+                        "note_id": note_id,
+                    },
+                )
+                continue  # работа остаётся pending — повтор по back-off
+            logging.getLogger("app").info(
+                "dedup: duplicate merged into earlier note",
+                extra={
+                    "event": "dedup_merged",
+                    "older_id": older_id,
+                    "note_id": note_id,
+                    "cosine": payload.get("cosine"),
+                },
+            )
+            self._mark_job_done(job["id"])
+            done += 1
+            # Ранняя заметка обновлена (summary pending) — будим свою же петлю
+            # суммаризации, не дожидаясь back-off.
+            self.notify_summary_pending()
+        return done
 
     # --- фоновый дедуп (Фаза 8, Этапы 2–3) ------------------------------------
 
@@ -295,7 +570,7 @@ class BackgroundWorker:
         soft-delete поздний, а встречный прогон той же пары из стороны
         ранней заметки зациклил бы обработку. Фаза 10 (§5.7): только в
         пределах неймспейса заметки. Кандидаты логируются
-        (наблюдаемость); приговор «дубль» принимает _merge_duplicates:
+        (наблюдаемость); приговор «дубль» принимает process_judge_pending:
         каждый кандидат опрашивается судьёй (Этап 3.2, JudgeService —
         косинус лишь предфильтр); без судьи — косинус-фоллбек
         DEDUP_SIMILARITY (Этап 2.2).
@@ -317,128 +592,6 @@ class BackgroundWorker:
             )
         return older
 
-    def _merge_duplicates(
-        self, note_id: int, candidates: list[tuple[int, float]]
-    ) -> bool:
-        """Приговор «дубль» — LLM-судья (Этап 3.2); сведение — Этап 2.2.
-
-        Косинус — лишь предфильтр: кандидатов (топ-N от find_candidates,
-        уже отрезанных к «ранним») опрашивает судья (JudgeService: вердикт
-        «ДУБЛЬ»/«НЕ ДУБЛЬ» по паре текстов, think:false); сводится первый
-        признанный — кандидаты идут по убыванию близости. Отказ судьи
-        (JudgeError) → False: обе заметки целы (NFR-3), свежая вернётся в
-        pending_vector и повторит по back-off — лучше несведённая пара,
-        чем ошибочное сведение. Без судьи (DI None, тестовый режим) —
-        фоллбек Этапа 2.2: топовый кандидат с cosine ≥ DEDUP_SIMILARITY.
-
-        Один мердж за прогон заметки: обновлённый ранний уходит в pending,
-        его ре-векторизация сама подхватит следующих кандидатов — каскад
-        без зацикливания.
-
-        Процедура (вариант B — решение Олега):
-        1) перечитать тексты свежей заметки и всех кандидатов (гонка с
-           memory_update/delete: протухшие кандидаты срезаются заранее —
-           о них не спрашивают ни судью, ни суммаризатор);
-        2) выбрать кандидата-дубля (_pick_duplicate: судья или фоллбек);
-        3) summarizer.merge(текст_ранней, текст_поздней) — объединить;
-        4) NoteService.update ранней (текст = объединённый; ре-векторизация
-           и ре-суммаризация — штатно, своими очередями);
-        5) NoteService.delete поздней (soft delete, trash).
-
-        Отказ слияния (SummaryError) → False: обе заметки целы (NFR-3),
-        свежая вернётся в pending_vector и повторит по back-off;
-        «processed» в process_pending её не учитывает. Окно креша между
-        update ранней и delete поздней оставляет ОБЕ живыми с актуальными
-        текстами — данные не теряются, пара разберётся при следующих
-        векторизациях. Прочие исключения — громко, как и всюду в воркере.
-
-        Возвращает True, если пару можно считать обработанной (сведена,
-        протухла, судья не признал), False — слияние повторить позже.
-        """
-        if self._summarizer is None:
-            # Тестовый режим Фазы 3 (суммаризатора нет): сведение
-            # невозможно в принципе — пара остаётся, заметка считается
-            # обработанной (иначе revert крутил бы холостой цикл
-            # пере-кодировок без суммаризатора).
-            return True
-        # Перечитать тексты свежей заметки и всех кандидатов (гонка с
-        # memory_update/delete — короткое чтение, без транзакции записи).
-        ids = [note_id] + [candidate_id for candidate_id, _ in candidates]
-        placeholders = ",".join("?" * len(ids))
-        with session(self._settings) as conn:
-            rows = conn.execute(
-                f"SELECT id, text, deleted_at FROM notes WHERE id IN "
-                f"({placeholders})",
-                ids,
-            ).fetchall()
-        by_id = {row["id"]: row for row in rows}
-        newer = by_id.get(note_id)
-        if newer is None or newer["deleted_at"] is not None:
-            logging.getLogger("app").info(
-                "dedup: note vanished before merge — skipped",
-                extra={"event": "dedup_merge_skipped", "note_id": note_id},
-            )
-            return True  # повтор бессмыслен: свежая заметка протухла
-        alive = [
-            (candidate_id, cosine_value)
-            for candidate_id, cosine_value in candidates
-            if (row := by_id.get(candidate_id)) is not None
-            and row["deleted_at"] is None
-        ]
-        try:
-            best = self._pick_duplicate(note_id, alive, by_id)
-        except JudgeError:
-            logging.getLogger("app").warning(
-                "dedup: judge undecidable — both notes kept, retry queued",
-                extra={
-                    "event": "dedup_judge_failed",
-                    "note_id": note_id,
-                    "candidates": [candidate_id for candidate_id, _ in alive],
-                },
-            )
-            return False  # заметка вернётся в pending_vector (back-off)
-        if best is None:
-            return True  # судья (или фоллбек) не признал ни одного кандидата
-        older_id, cosine_value = best
-        older = by_id[older_id]
-        try:
-            merged = self._summarizer.merge(older["text"], newer["text"])
-            updated = self._notes.update(older_id, merged)
-            if not updated.get("updated"):
-                logging.getLogger("app").info(
-                    "dedup: merge target vanished during merge — pair skipped",
-                    extra={
-                        "event": "dedup_merge_skipped",
-                        "older_id": older_id,
-                        "note_id": note_id,
-                    },
-                )
-                return True
-            self._notes.delete(note_id)  # поздний дубль — в trash
-        except SummaryError:
-            logging.getLogger("app").warning(
-                "dedup: summarizer merge failed — both notes kept, retry queued",
-                extra={
-                    "event": "dedup_merge_failed",
-                    "older_id": older_id,
-                    "note_id": note_id,
-                },
-            )
-            return False  # заметка вернётся в pending_vector (back-off)
-        logging.getLogger("app").info(
-            "dedup: duplicate merged into earlier note",
-            extra={
-                "event": "dedup_merged",
-                "older_id": older_id,
-                "note_id": note_id,
-                "cosine": cosine_value,
-            },
-        )
-        # Ранняя заметка обновлена (summary pending) — будим свою же петлю
-        # суммаризации, не дожидаясь back-off.
-        self.notify_summary_pending()
-        return True
-
     def _pick_duplicate(
         self,
         note_id: int,
@@ -459,9 +612,9 @@ class BackgroundWorker:
         Фоллбек без судьи (DI None, тестовый режим Этапа 2.2): первый
         кандидат с cosine ≥ DEDUP_SIMILARITY (выдача отсортирована).
 
-        JudgeError пробрасывается наружу — _merge_duplicates трактует
-        отказ судьи как отказ слияния (False → requeue по back-off,
-        NFR-3): неопределённость не превращаем в «не дубль».
+        JudgeError пробрасывается наружу — process_judge_pending трактует
+        отказ судьи как отказ слияния (работа остаётся pending, повтор по
+        back-off, NFR-3): неопределённость не превращаем в «не дубль».
 
         by_id — свежепрочитанные строки notes (id → row): судья сравнивает
         тексты пары (свежая, кандидат) — порядок аргументов фиксирует
@@ -495,20 +648,63 @@ class BackgroundWorker:
                 return (candidate_id, cosine_value)
         return None
 
-    def _requeue_vectorization(self, note_id: int) -> None:
-        """Вернуть заметку в pending-очередь вектора (повтор слияния).
+    # --- summary-петля: title-догенерация (решение №9) -----------------------
 
-        Вектор в notes_vec уже записан и остаётся до перезаписи; следующий
-        прогон очереди перекодирует текст и снова запустит дедуп. Состояние
-        — в БД: переживает рестарт (в отличие от in-memory попыток), темп
-        повторов держит штатный back-off notes-очереди.
+    def process_title_pending(self, limit: int = PENDING_BATCH) -> int:
+        """Догенерировать названия миграционных заметок (title IS NULL).
+
+        Только миграционные заметки (новые всегда с title — контракт решения
+        №9); очередь наполняется только миграцией и после прогонки опустеет.
+        Думающий вызов слота summary (SummaryService.title — промпт зашит
+        TITLE_PROMPT, Фаза 11), результат обрезается до TITLE_MAX_WORDS слов
+        механикой, запись title. Отказ генерации
+        (SummaryError) — заметка остаётся без названия, повтор по back-off
+        (NFR-3). Возвращает число записанных названий.
         """
-        with session(self._settings) as conn, transaction(conn):
-            conn.execute(
-                "UPDATE notes SET vector_status = 'pending' "
-                "WHERE id = ? AND deleted_at IS NULL",
-                (note_id,),
-            )
+        if self._summarizer is None:
+            return 0
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT id, text FROM notes "
+                "WHERE title IS NULL AND deleted_at IS NULL "
+                "ORDER BY id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        done = 0
+        for row in rows:
+            try:
+                generated = self._summarizer.title(row["text"])
+            except SummaryError:
+                logging.getLogger("app").warning(
+                    "title: generation failed — kept null, retry by back-off",
+                    extra={"event": "title_failed", "note_id": row["id"]},
+                )
+                continue  # отказ: title остаётся NULL, повтор по back-off
+            title = self._truncate_title(generated)
+            if not title:
+                continue
+            with session(self._settings) as conn, transaction(conn):
+                cursor = conn.execute(
+                    "UPDATE notes SET title = ? "
+                    "WHERE id = ? AND title IS NULL AND deleted_at IS NULL",
+                    (title, row["id"]),
+                )
+            if cursor.rowcount:
+                done += 1
+                logging.getLogger("app").info(
+                    "title: generated for migration note",
+                    extra={"event": "title_generated", "note_id": row["id"]},
+                )
+        return done
+
+    @staticmethod
+    def _truncate_title(text: str) -> str:
+        """Обрезать сгенерированное название до TITLE_MAX_WORDS слов (решение №9).
+
+        Слова = len(title.split()) — как в контракте валидации (notes.py).
+        """
+        words = text.split()
+        return " ".join(words[:TITLE_MAX_WORDS])
 
     def process_summary_pending(self, limit: int = PENDING_BATCH) -> int:
         """Досуммировать одну партию pending; число до 'ok' доведённых.

@@ -1,25 +1,29 @@
-"""Фоновый дедуп в воркере (Фаза 8, Этап 2.1): кандидаты после векторизации.
+"""Фоновый дедуп в воркере (Фаза 8, Этап 2.1; Фаза 11, решение №10).
 
-process_pending после довекторизации каждой заметки ищет косинус-кандидатов
-(find_candidates) против ранних активных заметок — точка подключения сведения
-(Этап 2.2) и судьи-LLM (Этап 3). Здесь проверяем: факт вызова для каждой
-довекторизованной (RecordingDedup), фильтр «только id < note_id» (пара
-обрабатывается единожды — защита от зацикливания), пропуск дедупа при отказе
-векторизации и связку с реальным DeduplicationService (критерий приёмки
-Этапа 2.1: после довекторизации перефраз дал кандидата).
+С Фазы 11 (решение №10) воркер — три петли по слотам: embedding-петля
+векторизует заметки и создаёт judge-работы (дедуп) в очередь слота judge;
+judge-петля (process_judge_pending) ищет косинус-кандидатов и принимает
+приговор (LLM-судья или косинус-фоллбек), при признанном дубле создаёт
+merge-работу в очередь слота summary; summary-петля (process_merge_pending)
+выполняет слияние (merge суммаризатором, ранний обновляется, поздний — trash).
 
-Этап 2.2 (фоллбек без судьи): приговор «дубль» по косинусу
-DEDUP_SIMILARITY — merge-промпт суммаризатором (FixedSummarizer/
-MergeFailingSummarizer), ранний дубликат обновляется объединённым текстом
-(ре-векторизация/ре-суммаризация штатно), поздний — soft delete; отказ
-слияния оставляет обе заметки, свежая возвращается в pending_vector
-(NFR-3).
+Здесь проверяем: факт вызова поиска кандидатов для каждой довекторизованной
+заметки (RecordingDedup), фильтр «только id < note_id» (пара обрабатывается
+единожды — защита от зацикливания), пропуск дедупа при отказе векторизации и
+связку с реальным DeduplicationService (критерий приёмки Этапа 2.1: после
+довекторизации перефраз дал кандидата).
+
+Этап 2.2 (фоллбек без судьи): приговор «дубль» по косинусу DEDUP_SIMILARITY —
+merge-промпт суммаризатором (FixedSummarizer/MergeFailingSummarizer), ранний
+дубликат обновляется объединённым текстом (ре-векторизация/ре-суммаризация
+штатно), поздний — soft delete; отказ слияния оставляет обе заметки, merge-
+работа остаётся pending (NFR-3).
 
 Этап 3.2 (судья): косинус — лишь предфильтр, финальный вердикт — за
 JudgeService (ScriptedJudge): каждого живого кандидата спрашивают про пару
 текстов (text_new = свежая, text_candidate = ранняя), сводится первый
-признанный «ДУБЛЬ»; «НЕ ДУБЛЬ» всем — обе живы; отказ судьи (JudgeError)
-— requeue свежей в pending_vector, повтор по back-off (NFR-3).
+признанный «ДУБЛЬ»; «НЕ ДУБЛЬ» всем — обе живы; отказ судьи (JudgeError) —
+judge-работа остаётся pending, повтор по back-off (NFR-3).
 """
 
 from __future__ import annotations
@@ -56,7 +60,7 @@ def dim8(tmp_path, monkeypatch: pytest.MonkeyPatch):
 
 
 def _dedup_records(caplog) -> list:
-    """Лог-записи с event=dedup_candidates (поиск кандидатов в process_pending)."""
+    """Лог-записи с event=dedup_candidates (поиск кандидатов в judge-петле)."""
     return [
         record
         for record in caplog.records
@@ -72,7 +76,8 @@ def test_process_pending_searches_candidates_for_each_note(dim8) -> None:
         notes.save(text)
     dedup = RecordingDedup()  # кандидатов не даёт — проверяем только вызовы
     worker = BackgroundWorker(dim8, HashEmbedder(8), dedup=dedup)
-    assert worker.process_pending() == 2
+    assert worker.process_pending() == 2  # embedding-петля: вектора + judge-работы
+    assert worker.process_judge_pending() == 2  # judge-петля: поиск кандидатов
     assert [call[0] for call in dedup.calls] == [1, 2]
     for exclude_id, vector, _namespace in dedup.calls:
         expected = HashEmbedder(8).embed(texts[exclude_id - 1])
@@ -94,6 +99,7 @@ def test_process_pending_keeps_only_older_candidates(dim8, caplog) -> None:
     worker = BackgroundWorker(dim8, HashEmbedder(8), dedup=dedup)
     with caplog.at_level(logging.INFO, logger="app"):
         assert worker.process_pending() == 2
+        assert worker.process_judge_pending() == 2
     records = _dedup_records(caplog)
     assert len(records) == 1
     assert records[0].note_id == 2
@@ -101,12 +107,13 @@ def test_process_pending_keeps_only_older_candidates(dim8, caplog) -> None:
 
 
 def test_embedding_failure_skips_dedup(dim8) -> None:
-    """Отказ кодирования — 0 векторов, до дедупа не доходим (нечего сравнивать)."""
+    """Отказ кодирования — 0 векторов, judge-работ нет, до дедупа не доходим."""
     notes = NoteService(dim8, FailingEmbedder())
     notes.save("заметка без векторизатора")
     dedup = RecordingDedup(candidates=[(0, 0.95)])
     worker = BackgroundWorker(dim8, FailingEmbedder(), dedup=dedup)
     assert worker.process_pending() == 0
+    assert worker.process_judge_pending() == 0
     assert dedup.calls == []
 
 
@@ -136,6 +143,7 @@ def test_vectorized_paraphrase_yields_candidates(dim8, caplog) -> None:
     worker = BackgroundWorker(dim8, embedder)
     with caplog.at_level(logging.INFO, logger="app"):
         assert worker.process_pending() == 2
+        assert worker.process_judge_pending() == 2
     records = _dedup_records(caplog)
     assert len(records) == 1
     assert records[0].note_id == second["id"]
@@ -160,7 +168,9 @@ def test_merge_updates_earlier_and_soft_deletes_later(dim8, caplog) -> None:
     summarizer = FixedSummarizer("Фикс-суммари.", merged=merged_text)
     worker = BackgroundWorker(dim8, HashEmbedder(8), summarizer)
     with caplog.at_level(logging.INFO, logger="app"):
-        assert worker.process_pending() == 2  # обе довекторизованы, сведение
+        assert worker.process_pending() == 2  # embedding: вектора + judge-работы
+        assert worker.process_judge_pending() == 2  # judge: вердикт → merge-работа
+        assert worker.process_merge_pending() == 1  # summary: слияние
     # merge вызван ровно один раз, порядок аргументов: (ранняя, поздняя)
     assert summarizer.merge_calls == [(texts[0], texts[1])]
     merged_log = [
@@ -182,6 +192,7 @@ def test_merge_updates_earlier_and_soft_deletes_later(dim8, caplog) -> None:
     assert rows[1]["deleted_at"] is not None  # поздняя — soft delete
     # воркер догоняет обновлённую раннюю, второй пары нет (нет зацикливания)
     assert worker.process_pending() == 1
+    assert worker.process_judge_pending() == 1  # дедуп-работа ранней: кандидатов нет
     assert worker.process_summary_pending() == 1
     with session(dim8) as conn:
         row = conn.execute(
@@ -195,9 +206,9 @@ def test_merge_updates_earlier_and_soft_deletes_later(dim8, caplog) -> None:
 
 
 def test_merge_failure_keeps_both_and_retries(dim8, caplog) -> None:
-    """Отказ слияния (NFR-3): обе заметки живы, свежая вернулась в
-    pending_vector (не «processed» — back-off очереди держится); после
-    восстановления суммаризатора повтор завершает сведение."""
+    """Отказ слияния (NFR-3): обе заметки живы, merge-работа остаётся pending
+    (back-off очереди держится); после восстановления суммаризатора повтор
+    завершает сведение."""
     texts = ["первая отложенная заметка", "вторая отложенная заметка"]
     notes = NoteService(dim8, FailingEmbedder())
     notes.save(texts[0])
@@ -205,7 +216,9 @@ def test_merge_failure_keeps_both_and_retries(dim8, caplog) -> None:
     summarizer = MergeFailingSummarizer()  # merge отказывает, пока fail
     worker = BackgroundWorker(dim8, HashEmbedder(8), summarizer)
     with caplog.at_level(logging.WARNING, logger="app"):
-        assert worker.process_pending() == 1  # id=2 довекторизована без учёта
+        assert worker.process_pending() == 2
+        assert worker.process_judge_pending() == 2  # вердикт → merge-работа
+        assert worker.process_merge_pending() == 0  # слияние отказало
     assert len(summarizer.merge_calls) == 1  # попытка слияния была
     warnings = [
         record
@@ -218,11 +231,11 @@ def test_merge_failure_keeps_both_and_retries(dim8, caplog) -> None:
             "SELECT id, text, vector_status, deleted_at FROM notes ORDER BY id"
         ).fetchall()
     assert rows[0]["vector_status"] == "ok"  # ранняя не тронута
-    assert rows[1]["vector_status"] == "pending"  # свежая — на повтор
+    assert rows[1]["vector_status"] == "ok"  # свежая тоже (merge-работа pending)
     assert all(row["deleted_at"] is None for row in rows)  # обе живы (NFR-3)
     # «чиним» суммаризатор — повтор из очереди доводит сведение до конца
     summarizer.fail = False
-    assert worker.process_pending() == 1
+    assert worker.process_merge_pending() == 1
     with session(dim8) as conn:
         rows = conn.execute(
             "SELECT id, text, vector_status, deleted_at FROM notes ORDER BY id"
@@ -246,6 +259,7 @@ def test_candidate_below_fallback_threshold_keeps_pair(dim8) -> None:
         dim8, HashEmbedder(8), summarizer, RecordingDedup(candidates=[(1, 0.85)])
     )
     assert worker.process_pending() == 2
+    assert worker.process_judge_pending() == 2
     assert summarizer.merge_calls == []  # 0.80 ≤ 0.85 < 0.92 — не дубль
     with session(dim8) as conn:
         rows = conn.execute(
@@ -278,6 +292,7 @@ def test_merge_verdict_uses_dedup_similarity_env(tmp_path, monkeypatch) -> None:
         settings, HashEmbedder(8), summarizer, RecordingDedup(candidates=[(1, 0.95)])
     )
     assert worker.process_pending() == 2
+    assert worker.process_judge_pending() == 2
     assert summarizer.merge_calls == []  # 0.92 < 0.95 < 0.99 — зона суда
     get_settings.cache_clear()
 
@@ -294,6 +309,7 @@ def test_merge_skips_when_candidate_vanishes(dim8) -> None:
         dim8, HashEmbedder(8), summarizer, RecordingDedup(candidates=[(1, 0.95)])
     )
     assert worker.process_pending() == 1  # trash не векторизуется
+    assert worker.process_judge_pending() == 1  # кандидат протух — сведение нет
     assert summarizer.merge_calls == []  # сведение отменено
     with session(dim8) as conn:
         row = conn.execute(
@@ -304,8 +320,7 @@ def test_merge_skips_when_candidate_vanishes(dim8) -> None:
 
 def test_candidates_without_summarizer_stay_unmerged(dim8) -> None:
     """Без суммаризатора (тестовый режим Фазы 3) сведение невозможно:
-    пара остаётся, заметка считается обработанной — без холостого requeue
-    (иначе цикл пере-кодировок без суммаризатора не завершится)."""
+    merge-работа остаётся pending, обе заметки живы со статусом ok."""
     texts = ["первая отложенная заметка", "вторая отложенная заметка"]
     notes = NoteService(dim8, FailingEmbedder())
     notes.save(texts[0])
@@ -313,7 +328,9 @@ def test_candidates_without_summarizer_stay_unmerged(dim8) -> None:
     worker = BackgroundWorker(
         dim8, HashEmbedder(8), None, RecordingDedup(candidates=[(1, 0.95)])
     )
-    assert worker.process_pending() == 2  # processed не режется: requeue нет
+    assert worker.process_pending() == 2
+    assert worker.process_judge_pending() == 2  # вердикт → merge-работа
+    assert worker.process_merge_pending() == 0  # без суммаризатора слияния нет
     with session(dim8) as conn:
         rows = conn.execute(
             "SELECT id, vector_status, deleted_at FROM notes ORDER BY id"
@@ -347,6 +364,8 @@ def test_judge_merges_paraphrase_below_cosine_threshold(dim8, caplog) -> None:
     )
     with caplog.at_level(logging.INFO, logger="app"):
         assert worker.process_pending() == 2
+        assert worker.process_judge_pending() == 2
+        assert worker.process_merge_pending() == 1
     # Судья опрошен парой текстов: text_new = свежая, text_candidate = ранняя.
     assert judge.judge_calls == [(texts[1], texts[0])]
     verdict_log = [
@@ -397,6 +416,7 @@ def test_judge_verdict_keeps_distinct_notes(dim8) -> None:
         judge=judge,
     )
     assert worker.process_pending() == 2
+    assert worker.process_judge_pending() == 2
     assert judge.judge_calls == [(texts[1], texts[0])]
     assert summarizer.merge_calls == []  # вердикт «НЕ ДУБЛЬ» — сведение нет
     with session(dim8) as conn:
@@ -410,9 +430,9 @@ def test_judge_verdict_keeps_distinct_notes(dim8) -> None:
 
 
 def test_judge_failure_keeps_both_and_retries(dim8, caplog) -> None:
-    """Отказ судьи (JudgeError, NFR-3): обе заметки живы, свежая вернулась
-    в pending_vector (не «processed» — back-off очереди держится); после
-    восстановления судьи повтор из очереди завершает сведение."""
+    """Отказ судьи (JudgeError, NFR-3): обе заметки живы, judge-работа
+    остаётся pending (back-off очереди держится); после восстановления судьи
+    повтор из очереди завершает сведение."""
     texts = ["первая отложенная заметка", "вторая отложенная заметка"]
     notes = NoteService(dim8, FailingEmbedder())
     notes.save(texts[0])
@@ -427,7 +447,8 @@ def test_judge_failure_keeps_both_and_retries(dim8, caplog) -> None:
         judge=judge,
     )
     with caplog.at_level(logging.WARNING, logger="app"):
-        assert worker.process_pending() == 1  # id=2 довекторизована, но requeue
+        assert worker.process_pending() == 2
+        assert worker.process_judge_pending() == 1  # id=2 работа остаётся pending
     assert len(judge.judge_calls) == 1  # вопрос был задан до отказа
     warnings = [
         record
@@ -441,11 +462,12 @@ def test_judge_failure_keeps_both_and_retries(dim8, caplog) -> None:
             "SELECT id, text, vector_status, deleted_at FROM notes ORDER BY id"
         ).fetchall()
     assert rows[0]["vector_status"] == "ok"  # ранняя не тронута
-    assert rows[1]["vector_status"] == "pending"  # свежая — на повтор
+    assert rows[1]["vector_status"] == "ok"  # свежая тоже (работа pending)
     assert all(row["deleted_at"] is None for row in rows)  # обе живы (NFR-3)
     # «Чиним» судью — повтор из очереди доводит дедуп до сведения.
     judge.fail = False
-    assert worker.process_pending() == 1
+    assert worker.process_judge_pending() == 1  # повтор pending-работы
+    assert worker.process_merge_pending() == 1
     with session(dim8) as conn:
         rows = conn.execute(
             "SELECT id, text, vector_status, deleted_at FROM notes ORDER BY id"
@@ -479,6 +501,8 @@ def test_judge_picks_second_candidate_after_first_rejects(dim8) -> None:
         judge=judge,
     )
     assert worker.process_pending() == 3
+    assert worker.process_judge_pending() == 3
+    assert worker.process_merge_pending() == 1
     assert judge.judge_calls == [
         (texts[1], texts[0]),  # id=2 против id=1: «НЕ ДУБЛЬ»
         (texts[2], texts[0]),  # id=3 против id=1: «НЕ ДУБЛЬ»

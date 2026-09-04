@@ -161,6 +161,13 @@ class FixedSummarizer:
         self.last_attempt_ok = True
         return self.summary
 
+    def title(self, text: str) -> str:
+        """Title-доген (Фаза 11, решение №9): тот же фиксированный текст;
+        обрезку до 5 слов делает воркер."""
+        self.calls.append(text)
+        self.last_attempt_ok = True
+        return self.summary
+
     def merge(self, text_a: str, text_b: str) -> str:
         """Слияние дубликатов (Этап 2.2): фиксированный ответ, журнал пар."""
         self.merge_calls.append((text_a, text_b))
@@ -184,6 +191,12 @@ class FailingSummarizer:
         self.last_attempt_ok: bool | None = None  # для /health.summarizer_ok
 
     def summarize(self, text: str) -> str:
+        self.calls.append(text)
+        self.last_attempt_ok = False
+        raise SummaryError(self.message)
+
+    def title(self, text: str) -> str:
+        """Title-доген всегда отказывает (как summarize)."""
         self.calls.append(text)
         self.last_attempt_ok = False
         raise SummaryError(self.message)
