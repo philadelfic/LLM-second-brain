@@ -1,11 +1,21 @@
 # LLM Second Brain — self-hosted MCP-сервер долговременной памяти (NFR-1).
 #
 # ПОЛНАЯ конфигурация запуска живёт здесь (решение О. 2026-08-29: без .env).
-# Перед первым запуском заполнить четыре обязательных значения ниже
+# Перед первым запуском заполнить обязательные значения ниже
 # (MCP_AUTH_TOKEN сгенерируй: openssl rand -hex 32 и держи боевой в
-# docker-compose.override.yml — он gitignored; в git — CHANGE_ME) — пустой токен или
-# недоступная Ollama не пройдут стартовые проверки конфигурации.
+# docker-compose.override.yml — он gitignored; в git — CHANGE_ME) — пустой токен
+# или недоступные LLM-слоты не пройдут стартовые проверки конфигурации.
 # Каталог данных: mkdir -p data.
+#
+# Фаза 11 (v2.1): три LLM-слота (embedding / summary / judge) настраиваются
+# независимо — провайдер, адрес API, модель и (опционально) ключ per-slot.
+# Провайдер: ollama (нативный API, дефолт) | openai (OpenAI-совместимый, Bearer).
+#
+# ВАЖНО (решение О. 2026-09-04): смена EMBEDDING_PROVIDER / EMBEDDING_MODEL /
+# EMBEDDING_DIM → автоматическая ПОЛНАЯ переиндексация при старте: оба
+# векторных индекса пересоздаются, ВСЕ заметки (включая корзину) уходят в
+# pending, фоновый воркер пере-кодирует их заново. Пороги поиска/дедупа
+# откалиброваны под qwen3-embedding:8b — после смены модели калибровать заново.
 
 services:
   second-brain:
@@ -17,13 +27,33 @@ services:
       - "8080:8080"  # host:container
     environment:
       # --- обязательные ---
-      OLLAMA_BASE_URL: "http://192.168.3.113:11434"        # Ollama векторизации (/api/embed)
-      SUMMARY_OLLAMA_BASE_URL: "http://192.168.3.112:11434" # Ollama суммаризации (/api/chat)
-      SUMMARY_MODEL: "ornith:35b"                               # генеративная модель суммаризации (смена О. 2026-08-31: ornith-1.5 изредка проронял чужие токены)
       MCP_AUTH_TOKEN: "CHANGE_ME"                  # Bearer-токен всех ручек, кроме /health; боевой — в docker-compose.override.yml (gitignored, решение О. 2026-08-31)
-      # --- векторизация: все параметры эмбеддинга ---
+      # --- слот embedding (векторизация) ---
+      EMBEDDING_PROVIDER: "ollama"                 # ollama (дефолт) | openai
+      EMBEDDING_BASE_URL: "http://192.168.3.113:11434"  # ollama: /api/embed; openai: /v1/embeddings
+      EMBEDDING_API_KEY: "CHANGE_ME"               # опционально; openai-провайдеру обязателен (иначе 401/403-hint на вызове)
       EMBEDDING_MODEL: "qwen3-embedding:8b"  # смена → автоматическая реиндексация БД при старте
       EMBEDDING_DIM: "4096"                  # размерность; фиксируется в БД (meta), смена → реиндексация
+      # --- слот summary (суммаризация + merge + классификация + описание узла) ---
+      SUMMARY_PROVIDER: "ollama"                 # ollama (дефолт) | openai
+      SUMMARY_BASE_URL: "http://192.168.3.112:11434"  # ollama: /api/chat; openai: /v1/chat/completions
+      SUMMARY_API_KEY: "CHANGE_ME"               # опционально; openai-провайдеру обязателен
+      SUMMARY_MODEL: "ornith:35b"                               # генеративная модель суммаризации (смена О. 2026-08-31: ornith-1.5 изредка проронял чужие токены)
+      # --- слот judge (судья дедупа + судья структуры) ---
+      JUDGE_PROVIDER: "ollama"                 # ollama (дефолт) | openai
+      JUDGE_BASE_URL: "http://192.168.3.112:11434"  # ollama: /api/chat; openai: /v1/chat/completions
+      JUDGE_API_KEY: "CHANGE_ME"               # опционально; openai-провайдеру обязателен
+      JUDGE_MODEL: "ornith:35b"                        # модель-судья дедупа
+      JUDGE_THINK: "true"              # думающий судья: think:false давал ложные ДУБЛИ на длинных заметках (E2E); решение О. 2026-08-30; действует только для ollama-провайдера
+      JUDGE_NUM_PREDICT: "1024"        # бюджет thinking+вердикт (замер: ~1200 токенов, done_reason=stop)
+      JUDGE_TIMEOUT_SEC: "300"         # думающий судья: длинная пара 46 c, худший живой вызов ~121 c (E2E) — 300 с с запасом; решение О. 2026-08-30
+      # --- редактируемые промпты (Фаза 11, решение №7): каталог монтируется
+      #     в ./prompts:/app/prompts; при заданном PROMPTS_DIR создаются 3
+      #     файла (summary_system, summary_merge_system, judge_system), если
+      #     отсутствуют; существующие не перезаписываются; пустой файл =
+      #     встроенный дефолт; judge_system обязан содержать маркеры
+      #     «ДУБЛЬ»/«НЕ ДУБЛЬ» (иначе фатальный отказ старта) ---
+      PROMPTS_DIR: "/app/prompts"
       # --- чанковая индексация (Фаза 7): вектора заметки — по чанкам ---
       TEXT_SPLITTER: "tiktoken"              # токен-сплиттер; encoding фикс: cl100k_base (кэш в образе)
       CHUNK_SIZE: "1024"                     # окно чанка, токенов; смена → пере-чанковка всех заметок
@@ -37,16 +67,10 @@ services:
       DEDUP_CANDIDATE_SIMILARITY: "0.80"     # нижний порог кандидата-перефраза (≤ DEDUP_SIMILARITY)
       # --- суммаризация (режим «Б»: режимы think не ограничиваются) ---
       MAX_SUMMARY_CHARS: "200"
-      SUMMARY_THINK: "true"                  # оставить размышления модели
+      SUMMARY_THINK: "true"                  # оставить размышления модели; действует только для ollama-провайдера
       SUMMARY_NUM_PREDICT: "35000"           # потолок thinking+content выжимки (О. 2026-08-30: 1500→35000)
       MERGE_NUM_PREDICT: "35000"             # отдельный потолок слияния дублей (О. 2026-08-30)
       SUMMARY_TIMEOUT_SEC: "750"             # 12.5 мин (решение О. 2026-08-30: 600→750 под merge 35k-заметок); боевые суммари ~60 c
-      # --- LLM-судья дедупа (Фаза 8, Этап 3; модель сменена О. 2026-08-31: ornith:35b) ---
-      DEDUP_JUDGE_OLLAMA_BASE_URL: "http://192.168.3.112:11434"  # Ollama судьи (/api/chat)
-      DEDUP_JUDGE_MODEL: "ornith:35b"                        # модель-судья дедупа
-      DEDUP_JUDGE_THINK: "true"              # думающий судья: think:false давал ложные ДУБЛИ на длинных заметках (E2E); решение О. 2026-08-30
-      DEDUP_JUDGE_NUM_PREDICT: "1024"        # бюджет thinking+вердикт (замер: ~1200 токенов, done_reason=stop)
-      DEDUP_JUDGE_TIMEOUT_SEC: "300"         # думающий судья: длинная пара 46 c, худший живой вызов ~121 c (E2E) — 300 с с запасом; решение О. 2026-08-30
       # --- HTTP/MCP ---
       PORT: "8080"
       MCP_PATH: "/mcp"
@@ -75,7 +99,7 @@ services:
       NAMESPACE_AUTO_MAX_PER_DAY: "3"             # лимит авто-созданных узлов в сутки (защита от шторма)
       NAMESPACE_MAX_LEAVES_PER_DOMAIN: "12"       # потолок листов в корне
       NAMESPACE_GROOM_MIN_NOTES: "2"              # груминг: узел с меньшим числом заметок — кандидат на слияние
-      # NAMESPACE_JUDGE_THINK не задан: судья структуры наследует DEDUP_JUDGE_THINK
+      # NAMESPACE_JUDGE_THINK не задан: судья структуры наследует JUDGE_THINK
       # (думающий). A/B судьи структуры (scripts/ab_judge.py, 2026-09-04):
       # бездумный вердикт в 40-80 раз быстрее (0.6-1.0 с vs 30-60 с), но на
       # пограничных кандидатах нестабилен (60% согласованности — необратимые
@@ -83,6 +107,7 @@ services:
       # Задать "false" — осознанно, после нового A/B.
     volumes:
       - ./data:/data  # SQLite notes.db, снапшоты
+      - ./prompts:/app/prompts  # редактируемые промпты (Фаза 11, решение №7)
     healthcheck:
       # python:3.12-slim не содержит curl — проверяем штатным python (NFR-4: /health без токена).
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"]
