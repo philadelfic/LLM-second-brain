@@ -11,6 +11,13 @@
 структурные ручки — НЕ в MCP (клиент-модели не рулят структурой). Ошибки:
 422 — валидация пути/описания, 404 — узел не найден, 409 — защита/конфликт
 (default, merge в себя, корень с детьми, занятый путь).
+
+Фаза 11 (решение №9): `title` в теле POST/PUT /notes (оператор может назвать
+заметку; передан — валидируется сервисом, невалидный → 422 «задай title
+≤5 слов»; в PUT не передан — прежний остаётся) и в выдачах get/list
+(оператору; null — заметка без названия, догенерирует воркер). REST —
+операторская поверхность: POST без title — легаси-путь (легитимен, как у
+миграции); контракт «новые всегда с title» с fail+hint — MCP memory_save.
 """
 
 from __future__ import annotations
@@ -28,9 +35,15 @@ from app.services.search import SearchValidationError
 
 
 class NoteCreate(BaseModel):
-    """Тело POST /notes. Автор — если оператор знает модель-источник."""
+    """Тело POST /notes. Автор — если оператор знает модель-источник.
+
+    Фаза 11 (решение №9): `title` опционален — передан, валидируется сервисом
+    (пустой/длиннее 5 слов → 422 «задай title ≤5 слов»); не передан —
+    легаси-путь: заметка без названия (догенерирует воркер).
+    """
 
     text: str
+    title: str | None = None
     author: str | None = None
 
 
@@ -64,9 +77,14 @@ class NamespaceMerge(BaseModel):
 
 
 class NoteUpdate(BaseModel):
-    """Тело PUT /notes/{id}: перезапись целой заметки (FR-5)."""
+    """Тело PUT /notes/{id}: перезапись целой заметки (FR-5).
+
+    Фаза 11 (решение №9): `title` опционален — передан и валиден →
+    перезапись, не передан → прежний остаётся (merge-путь не затирает).
+    """
 
     text: str
+    title: str | None = None
 
 
 class HealthResponse(BaseModel):
@@ -126,8 +144,20 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
         Среда без Ollama → деградация (pending + warning, дедуп по тексту)."""
         try:
+            if payload.title is None:
+                # REST — операторская поверхность: заметка без названия
+                # легитимна (легаси-путь сервиса, догенерация воркером);
+                # контракт «новые всегда с title» (fail+hint) — MCP.
+                return await asyncio.to_thread(
+                    _services(request).notes.save,
+                    payload.text,
+                    author=payload.author,
+                )
             return await asyncio.to_thread(
-                _services(request).notes.save, payload.text, payload.author
+                _services(request).notes.save,
+                payload.text,
+                payload.author,
+                title=payload.title,
             )
         except NoteValidationError as exc:
             raise _unprocessable(exc) from exc
@@ -164,7 +194,10 @@ def build_rest_router(settings: Settings) -> APIRouter:
         """Перезаписать заметку целиком (FR-5)."""
         try:
             result = await asyncio.to_thread(
-                _services(request).notes.update, note_id, payload.text
+                _services(request).notes.update,
+                note_id,
+                payload.text,
+                title=payload.title,
             )
         except NoteValidationError as exc:
             raise _unprocessable(exc) from exc

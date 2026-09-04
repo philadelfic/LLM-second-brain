@@ -260,7 +260,11 @@ class TestToolCallLogs:
             f"Для теста приватности логов: {secret}. Заметка содержит секрет."
         )
         async with mcp_session(base_url) as session:
-            saved = await session.call_tool("memory_save", {"text": note_text})
+            # Фаза 11 (решение №9): новые заметки создаются только с title
+            # (≤5 слов) — fail+hint иначе; title не содержит секрет из text.
+            saved = await session.call_tool(
+                "memory_save", {"text": note_text, "title": "Тест приватности логов"}
+            )
             assert not saved.is_error
             await session.call_tool(
                 "memory_update", {"id": saved.structured_content["id"], "text": note_text}

@@ -11,9 +11,15 @@ from __future__ import annotations
 import pytest
 from fakes import HashEmbedder
 
-from app.config import get_settings
+from app.config import TITLE_MAX_WORDS, get_settings
 from app.services.namespaces import NamespaceError, NamespaceService
-from app.services.notes import MAX_LIST_LIMIT, NoteService, NoteValidationError
+from app.services.notes import (
+    MAX_LIST_LIMIT,
+    TITLE_HINT,
+    NoteService,
+    NoteValidationError,
+    TitleValidationError,
+)
 from app.storage import vectors
 from app.storage.db import init_db, session
 
@@ -119,12 +125,13 @@ class TestGet:
         notes = service.get([1])["notes"]
         assert len(notes) == 1
         assert set(notes[0]) == {
-            "id", "text", "summary", "summary_status",
-            "author", "created_at", "updated_at", "namespace",  # Фаза 10
+            "id", "title", "text", "summary", "summary_status",
+            "author", "created_at", "updated_at", "namespace",  # Фаза 10 + title (Фаза 11)
         }
         assert notes[0]["text"] == "Полный текст заметки"
         assert notes[0]["summary_status"] == "pending"
         assert notes[0]["namespace"] == "default"  # save без namespace → default (Фаза 10)
+        assert notes[0]["title"] is None  # легаси-путь save без title (решение №9)
 
     def test_batch_order_follows_request(self, service: NoteService) -> None:
         for i in range(1, 4):
@@ -200,11 +207,12 @@ class TestList:
         service.save(long_text(300), author="model-x")
         item = service.list()["items"][0]
         assert set(item) == {
-            "id", "summary", "summary_status", "author",
-            "created_at", "updated_at", "namespace",  # Фаза 10
+            "id", "title", "summary", "summary_status", "author",
+            "created_at", "updated_at", "namespace",  # Фаза 10 + title (Фаза 11)
         }
         assert item["author"] == "model-x"
         assert item["namespace"] == "default"  # Фаза 10
+        assert item["title"] is None  # легаси-путь save без title (решение №9)
         assert item["summary"] == long_text(300)[:200]  # fallback-усечение
 
     def test_total_and_pagination(self, service: NoteService) -> None:
@@ -411,3 +419,142 @@ class TestSaveUpdateNamespace:
         nid = service.save("есть в default")["id"]
         with pytest.raises(NamespaceError):
             service.update(nid, "куда-то не туда", namespace="nope")
+
+
+class TestSaveTitle:
+    """Фаза 11 (решение №9): title — обязательное название новой заметки.
+
+    Транспортный контракт: клиент-модель называет заметку при записи.
+    Отсутствующий у клиента title транспорт передаёт как None → отказ;
+    невалидный (пустой/длиннее TITLE_MAX_WORDS = 5 слов) → отказ; заметка
+    НЕ создаётся. Прямой вызов сервиса без title (сентинел) — легаси-путь
+    миграции/скриптов: заметка пишется с title=NULL, название догенерирует
+    воркер.
+    """
+
+    def test_valid_title_stored(self, service: NoteService) -> None:
+        saved = service.save(
+            "Текст про деплой TaskFlow", title="Деплой TaskFlow прошёл"
+        )
+        assert saved["stored"] is True
+        with session(get_settings()) as conn:
+            row = conn.execute("SELECT title FROM notes WHERE id = 1").fetchone()
+        assert row["title"] == "Деплой TaskFlow прошёл"
+
+    def test_five_words_boundary_ok(self, service: NoteService) -> None:
+        """Граница TITLE_MAX_WORDS: ровно 5 слов — валидно."""
+        assert TITLE_MAX_WORDS == 5
+        saved = service.save("текст границы", title="раз два три четыре пять")
+        assert saved["stored"] is True
+
+    def test_six_words_rejected_with_hint(self, service: NoteService) -> None:
+        with pytest.raises(NoteValidationError, match="задай title ≤5 слов"):
+            service.save("текст", title="раз два три четыре пять шесть")
+        with session(get_settings()) as conn:  # заметка НЕ создана
+            assert conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 0
+
+    def test_transport_none_title_rejected(self, service: NoteService) -> None:
+        """Транспорт передал None (клиент не назвал заметку) → отказ."""
+        with pytest.raises(NoteValidationError, match="задай title ≤5 слов"):
+            service.save("текст", title=None)
+        with session(get_settings()) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 0
+
+    @pytest.mark.parametrize("bad", ["", "   "])
+    def test_empty_title_rejected(
+        self, service: NoteService, bad: str
+    ) -> None:
+        with pytest.raises(NoteValidationError):
+            service.save("текст", title=bad)
+
+    def test_hint_is_canonical(self, service: NoteService) -> None:
+        """Отказ несёт канонический hint (TITLE_HINT) — транспорт отдаёт его
+        клиенту-модели как есть (§5.3)."""
+        with pytest.raises(TitleValidationError) as exc_info:
+            service.save("текст", title="раз два три четыре пять шесть")
+        assert str(exc_info.value) == TITLE_HINT == "задай title ≤5 слов"
+
+    def test_direct_call_without_title_is_legacy(self, service: NoteService) -> None:
+        """Прямой вызов save без title (сентинел) — легаси-путь миграции:
+        заметка создаётся с title=NULL (название догенерирует воркер)."""
+        saved = service.save("легаси-заметка без названия")
+        assert saved["stored"] is True
+        with session(get_settings()) as conn:
+            row = conn.execute("SELECT title FROM notes WHERE id = 1").fetchone()
+        assert row["title"] is None
+
+    def test_title_whitespace_stripped(self, service: NoteService) -> None:
+        service.save("текст", title="  Короткое название  ")
+        with session(get_settings()) as conn:
+            row = conn.execute("SELECT title FROM notes WHERE id = 1").fetchone()
+        assert row["title"] == "Короткое название"
+
+    def test_invalid_title_checked_before_namespace(
+        self, service: NoteService
+    ) -> None:
+        """Порядок проверок: невалидный title отказывает раньше namespace."""
+        with pytest.raises(NoteValidationError, match="задай title ≤5 слов"):
+            service.save(
+                "текст", title="раз два три четыре пять шесть", namespace="nope"
+            )
+
+
+class TestUpdateTitle:
+    """Фаза 11 (решение №9): update — title опционален.
+
+    Передан и валиден → перезапись; не передан (None) → прежний остаётся:
+    merge-путь воркера вызывает update без title — название ранней заметки
+    не затирается. Сбросить название нельзя (новые — всегда с названием).
+    """
+
+    def test_update_overwrites_valid_title(self, service: NoteService) -> None:
+        service.save("старый текст", title="Старое название")
+        assert service.update(1, "новый текст", title="Новое название")["updated"] is True
+        with session(get_settings()) as conn:
+            row = conn.execute("SELECT title, text FROM notes WHERE id=1").fetchone()
+        assert row["title"] == "Новое название"
+        assert row["text"] == "новый текст"
+
+    def test_update_without_title_keeps_previous(self, service: NoteService) -> None:
+        """Не передан (None) → прежний остаётся (merge-путь воркера)."""
+        service.save("первый текст", title="Название ранней")
+        assert service.update(1, "обновлённый текст")["updated"] is True
+        with session(get_settings()) as conn:
+            row = conn.execute("SELECT title, text FROM notes WHERE id=1").fetchone()
+        assert row["title"] == "Название ранней"
+        assert row["text"] == "обновлённый текст"
+
+    def test_update_invalid_title_rejected(self, service: NoteService) -> None:
+        service.save("текст", title="Название")
+        with pytest.raises(NoteValidationError, match="задай title ≤5 слов"):
+            service.update(1, "новый текст", title="раз два три четыре пять шесть")
+        with session(get_settings()) as conn:  # заметка не тронута
+            row = conn.execute("SELECT title, text FROM notes WHERE id=1").fetchone()
+        assert row["title"] == "Название"
+        assert row["text"] == "текст"
+
+    def test_untitled_note_updated_keeps_null(self, service: NoteService) -> None:
+        """Легаси-заметка без названия: update без title не создаёт название."""
+        service.save("легаси без названия")
+        assert service.update(1, "обновлённый текст")["updated"] is True
+        with session(get_settings()) as conn:
+            row = conn.execute("SELECT title FROM notes WHERE id=1").fetchone()
+        assert row["title"] is None
+
+
+class TestTitleInOutputs:
+    """Фаза 11 (решение №9): title в выдачах list/get — REST отдаёт как есть
+    (MCP memory_get срезает белым списком: там полный текст).
+    """
+
+    def test_list_items_carry_title(self, service: NoteService) -> None:
+        service.save("с названием", title="Осмысленное название")
+        service.save("легаси без названия")
+        by_id = {item["id"]: item for item in service.list()["items"]}
+        assert by_id[1]["title"] == "Осмысленное название"
+        assert by_id[2]["title"] is None  # миграционная (легаси-путь)
+
+    def test_get_carries_title(self, service: NoteService) -> None:
+        service.save("с названием", title="Осмысленное название")
+        note = service.get([1])["notes"][0]
+        assert note["title"] == "Осмысленное название"

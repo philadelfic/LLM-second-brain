@@ -209,13 +209,18 @@ class TestToolsList:
 
     @pytest.mark.asyncio
     async def test_save_update_schema(self, server_url: str) -> None:
-        """Контракты FR-4/FR-5: text 1..MAX_NOTE_CHARS (35000), id обязателен."""
+        """Контракты FR-4/FR-5: text 1..MAX_NOTE_CHARS (35000), id обязателен;
+        title (Фаза 11, решение №9) — опционален в схеме: отказ за сервисом
+        (fail+hint «задай title ≤5 слов»), не схемой.
+        """
         async with connect(server_url) as session:
             tools = {t.name: t for t in (await session.list_tools()).tools}
         save_text = tools["memory_save"].input_schema["properties"]["text"]
         assert save_text["maxLength"] == 35000
         assert tools["memory_save"].input_schema["required"] == ["text"]
         assert tools["memory_update"].input_schema["required"] == ["id", "text"]
+        assert tools["memory_save"].input_schema["properties"]["title"]["default"] is None
+        assert tools["memory_update"].input_schema["properties"]["title"]["default"] is None
 
     @pytest.mark.asyncio
     async def test_namespace_params_in_schemas(self, server_url: str) -> None:
@@ -329,24 +334,28 @@ def _has_mcp_error(exc: BaseException) -> bool:
         return any(_has_mcp_error(sub) for sub in subs)
     return False
 
+async def _saved_id(
+    session: ClientSession, text: str, title: str = "Тестовая заметка"
+) -> int:
+    """helper E2E: сохранить заметку с валидным title (решение №9) и вернуть id."""
+    call = await session.call_tool("memory_save", {"text": text, "title": title})
+    assert call.is_error is False, call.content
+    content = call.structured_content
+    assert content["stored"] is True
+    assert content["summary_pending"] is True  # режим суммаризации
+    return content["id"]
+
+
 class TestMemoryFlow:
     """E2E по живому серверу: полный CRUD + поиск через MCP-клиента."""
 
     marker = f"genmarker-{uuid.uuid4().hex[:8]}"
 
-    async def _saved_id(self, session: ClientSession, text: str) -> int:
-        call = await session.call_tool("memory_save", {"text": text})
-        assert call.is_error is False, call.content
-        content = call.structured_content
-        assert content["stored"] is True
-        assert content["summary_pending"] is True  # режим суммаризации
-        return content["id"]
-
     @pytest.mark.asyncio
     async def test_save_get_roundtrip(self, server_url: str) -> None:
         text = f"{self.marker}: деплой TaskFlow прошёл 2026-08-29"
         async with connect(server_url) as session:
-            note_id = await self._saved_id(session, text)
+            note_id = await _saved_id(session, text)
             got = (await session.call_tool("memory_get", {"ids": [note_id]})).structured_content
         note = got["notes"][0]
         assert note["id"] == note_id
@@ -355,12 +364,13 @@ class TestMemoryFlow:
         # Компактный контракт Фазы 9: get — белый список из пяти полей (+namespace Фаза 10).
         assert set(note) == {"id", "text", "created_at", "updated_at", "namespace"}
         assert note["namespace"] == "default"  # save без узла → default (§5.7)
+        assert "title" not in note  # Фаза 11: get без названия (там полный текст)
 
     @pytest.mark.asyncio
     async def test_single_id_alias(self, server_url: str) -> None:
         text = f"{self.marker}: алиас одиночного id"
         async with connect(server_url) as session:
-            note_id = await self._saved_id(session, text)
+            note_id = await _saved_id(session, text)
             got = (await session.call_tool("memory_get", {"id": note_id})).structured_content
         assert got["notes"][0]["id"] == note_id
 
@@ -369,7 +379,7 @@ class TestMemoryFlow:
         """FR-1 (Фаза 9): компактные хиты без snippet/оценок; warning срезан."""
         text = f"{self.marker}: квантовый кулер в стойке 192.168.7.7"
         async with connect(server_url) as session:
-            await self._saved_id(session, text)
+            await _saved_id(session, text)
             found = (await session.call_tool(
                 "memory_search", {"query": "квантовый кулер"}
             )).structured_content
@@ -378,7 +388,9 @@ class TestMemoryFlow:
         hit = next(
             r for r in found["results"] if r["summary"].startswith(f"{self.marker}")
         )
-        assert set(hit) == {"id", "summary", "created_at", "updated_at", "namespace"}
+        assert set(hit) == {
+            "id", "summary", "created_at", "updated_at", "namespace", "title",
+        }  # Фаза 11 (решение №9): +title (ключ резервируется — search.py вне пула 5)
         assert hit["namespace"] == "default"
         assert "snippet" not in hit
         assert "cosine" not in hit
@@ -391,21 +403,23 @@ class TestMemoryFlow:
     @pytest.mark.asyncio
     async def test_list_shows_summaries_only(self, server_url: str) -> None:
         async with connect(server_url) as session:
-            await self._saved_id(session, f"{self.marker}: для списка")
+            await _saved_id(session, f"{self.marker}: для списка")
             listed = (await session.call_tool(
                 "memory_list", {"limit": 5}
             )).structured_content
         assert listed["total"] >= 1
         assert listed["items"]  # среди первой страницы есть наша
         for item in listed["items"]:
-            assert set(item) == {"id", "summary", "created_at", "updated_at", "namespace"}
+            assert set(item) == {
+                "id", "summary", "created_at", "updated_at", "namespace", "title",
+            }  # Фаза 11 (решение №9): +title
             assert "summary_status" not in item
             assert "author" not in item
 
     @pytest.mark.asyncio
     async def test_update_full_rewrite(self, server_url: str) -> None:
         async with connect(server_url) as session:
-            note_id = await self._saved_id(
+            note_id = await _saved_id(
                 session, f"{self.marker}: старый текст для апдейта"
             )
             updated = (await session.call_tool("memory_update", {
@@ -419,7 +433,7 @@ class TestMemoryFlow:
     @pytest.mark.asyncio
     async def test_delete_is_soft(self, server_url: str) -> None:
         async with connect(server_url) as session:
-            note_id = await self._saved_id(session, f"{self.marker}: на удаление")
+            note_id = await _saved_id(session, f"{self.marker}: на удаление")
             deleted = (await session.call_tool("memory_delete", {"id": note_id})).structured_content
             assert deleted == {"id": note_id, "deleted": True}
             got = (await session.call_tool("memory_get", {"ids": [note_id]})).structured_content
@@ -459,11 +473,11 @@ class TestMemoryFlow:
         text = f"{self.marker}: дубль через повторный save"
         async with connect(server_url) as session:
             first = (await session.call_tool(
-                "memory_save", {"text": text}
+                "memory_save", {"text": text, "title": "Дубль тест"}
             )).structured_content
             assert first["stored"] is True
             second = (await session.call_tool(
-                "memory_save", {"text": text}
+                "memory_save", {"text": text, "title": "Дубль тест"}
             )).structured_content
         assert second["id"] == first["id"]
         assert second["stored"] is False
@@ -490,8 +504,8 @@ class TestMemoryFlow:
         first_text = f"{self.marker}: batch первая заметка"
         second_text = f"{self.marker}: batch вторая заметка"
         async with connect(server_url) as session:
-            id1 = await self._saved_id(session, first_text)
-            id2 = await self._saved_id(session, second_text)
+            id1 = await _saved_id(session, first_text)
+            id2 = await _saved_id(session, second_text)
             got = (await session.call_tool(
                 "memory_get", {"ids": [id1, 10**9, id2]}
             )).structured_content
@@ -499,6 +513,119 @@ class TestMemoryFlow:
         assert [note["id"] for note in notes] == [id1, id2]  # порядок запроса
         assert [note["text"] for note in notes] == [first_text, second_text]
         assert "hint" not in got  # успешный ответ — без hint (Фаза 9)
+
+
+class TestTitleMCP:
+    """Фаза 11 (решение №9): title в save/update и выдачах — по живому серверу.
+
+    Отказ save без title / с длиннее 5 слов — fail+hint «задай title ≤5 слов»,
+    заметка не создаётся; title в search/list; в get — НЕТ; update —
+    перезапись валидного, сохранение при отсутствии.
+    """
+
+    marker = f"titlemarker-{uuid.uuid4().hex[:8]}"
+
+    @pytest.mark.asyncio
+    async def test_save_without_title_fails_with_hint(self, server_url: str) -> None:
+        """save без title → fail+hint, заметка НЕ создаётся."""
+        async with connect(server_url) as session:
+            before = (await session.call_tool(
+                "memory_list", {"limit": 1}
+            )).structured_content
+            saved = (await session.call_tool(
+                "memory_save", {"text": f"{self.marker}: заметка без названия"}
+            )).structured_content
+            after = (await session.call_tool(
+                "memory_list", {"limit": 1}
+            )).structured_content
+        assert saved == {"stored": False, "hint": "задай title ≤5 слов"}
+        assert after["total"] == before["total"]  # заметка не создана
+
+    @pytest.mark.asyncio
+    async def test_save_too_long_title_fails_with_hint(self, server_url: str) -> None:
+        """6 слов (> TITLE_MAX_WORDS) → fail+hint, заметка НЕ создаётся."""
+        async with connect(server_url) as session:
+            saved = (await session.call_tool(
+                "memory_save", {"text": f"{self.marker}: длинное название",
+                                "title": "раз два три четыре пять шесть"}
+            )).structured_content
+        assert saved == {"stored": False, "hint": "задай title ≤5 слов"}
+
+    @pytest.mark.asyncio
+    async def test_save_five_word_title_stored_and_visible(self, server_url: str) -> None:
+        """5 слов — граница валидности: сохранено, title виден в list."""
+        text = f"{self.marker}: пять слов в названии"
+        async with connect(server_url) as session:
+            saved = (await session.call_tool(
+                "memory_save", {"text": text, "title": "раз два три четыре пять"}
+            )).structured_content
+            assert saved["stored"] is True
+            listed = (await session.call_tool(
+                "memory_list", {"limit": 20}
+            )).structured_content
+        item = next(i for i in listed["items"] if i["id"] == saved["id"])
+        assert item["title"] == "раз два три четыре пять"
+
+    @pytest.mark.asyncio
+    async def test_update_title_overwrite_and_keep(self, server_url: str) -> None:
+        """update: title перезаписывает; без title — прежний остаётся."""
+        async with connect(server_url) as session:
+            note_id = await _saved_id(
+                session, f"{self.marker}: апдейт названия", title="Первое название"
+            )
+            upd = (await session.call_tool(
+                "memory_update", {"id": note_id,
+                                  "text": f"{self.marker}: апдейт с названием",
+                                  "title": "Второе название"}
+            )).structured_content
+            assert upd == {"id": note_id, "updated": True}
+            listed = (await session.call_tool(
+                "memory_list", {"limit": 20}
+            )).structured_content
+            upd2 = (await session.call_tool(
+                "memory_update", {"id": note_id,
+                                  "text": f"{self.marker}: апдейт без названия"}
+            )).structured_content
+            assert upd2 == {"id": note_id, "updated": True}
+            listed2 = (await session.call_tool(
+                "memory_list", {"limit": 20}
+            )).structured_content
+        item = next(i for i in listed["items"] if i["id"] == note_id)
+        assert item["title"] == "Второе название"  # перезапись
+        item2 = next(i for i in listed2["items"] if i["id"] == note_id)
+        assert item2["title"] == "Второе название"  # не передан — прежний
+
+    @pytest.mark.asyncio
+    async def test_update_too_long_title_fails(self, server_url: str) -> None:
+        """update с невалидным title → мягкий отказ + hint; заметка не тронута."""
+        async with connect(server_url) as session:
+            note_id = await _saved_id(
+                session, f"{self.marker}: апдейт плохого названия"
+            )
+            upd = (await session.call_tool(
+                "memory_update", {"id": note_id,
+                                  "text": f"{self.marker}: не должно записаться",
+                                  "title": "раз два три четыре пять шесть"}
+            )).structured_content
+            listed = (await session.call_tool(
+                "memory_list", {"limit": 20}
+            )).structured_content
+        assert upd["updated"] is False
+        assert upd["hint"] == "задай title ≤5 слов"
+        item = next(i for i in listed["items"] if i["id"] == note_id)
+        assert item["summary"].startswith(f"{self.marker}: апдейт плохого названия")
+
+    @pytest.mark.asyncio
+    async def test_get_note_has_no_title(self, server_url: str) -> None:
+        """memory_get — БЕЗ title (экономия контекста: там полный текст)."""
+        async with connect(server_url) as session:
+            note_id = await _saved_id(
+                session, f"{self.marker}: get без названия"
+            )
+            got = (await session.call_tool(
+                "memory_get", {"ids": [note_id]}
+            )).structured_content
+        assert "title" not in got["notes"][0]
 
 
 class TestNamespaceMCP:
@@ -514,7 +641,7 @@ class TestNamespaceMCP:
         text = f"{self.marker}: деплой в work-узел"
         async with connect(ns_url) as session:
             saved = (await session.call_tool(
-                "memory_save", {"text": text, "namespace": "work"}
+                "memory_save", {"text": text, "title": "Деплой в work", "namespace": "work"}
             )).structured_content
             assert saved["stored"] is True
             got = (await session.call_tool(
@@ -530,6 +657,7 @@ class TestNamespaceMCP:
         async with connect(ns_url) as session:
             saved = (await session.call_tool(
                 "memory_save", {"text": f"{self.marker}: в неизвестный узел",
+                                "title": "В неизвестный узел",
                                 "namespace": "nope"}
             )).structured_content
         assert saved == {"stored": False, "hint": "неймспейс «nope» не зарегистрирован; актуальная карта — memory_namespaces"}
@@ -551,10 +679,12 @@ class TestNamespaceMCP:
         _register_namespace(ns_db, "projects", "Личные проекты. Сайт-резюме.")
         async with connect(ns_url) as session:
             await session.call_tool(
-                "memory_save", {"text": f"{self.marker}: в work", "namespace": "work"}
+                "memory_save", {"text": f"{self.marker}: в work",
+                                "title": "В work", "namespace": "work"}
             )
             await session.call_tool(
-                "memory_save", {"text": f"{self.marker}: в projects", "namespace": "projects"}
+                "memory_save", {"text": f"{self.marker}: в projects",
+                                "title": "В projects", "namespace": "projects"}
             )
             work = (await session.call_tool(
                 "memory_list", {"namespace": "work", "limit": 5}
@@ -566,7 +696,8 @@ class TestNamespaceMCP:
         _register_namespace(ns_db, "work", "Рабочие заметки.")
         async with connect(ns_url) as session:
             saved = (await session.call_tool(
-                "memory_save", {"text": f"{self.marker}: к перемещению"}
+                "memory_save", {"text": f"{self.marker}: к перемещению",
+                                "title": "К перемещению"}
             )).structured_content
             upd = (await session.call_tool(
                 "memory_update", {"id": saved["id"],
@@ -580,7 +711,8 @@ class TestNamespaceMCP:
         _register_namespace(ns_db, "work", "Рабочие заметки.")
         async with connect(ns_url) as session:
             saved = (await session.call_tool(
-                "memory_save", {"text": f"{self.marker}: в default"}
+                "memory_save", {"text": f"{self.marker}: в default",
+                                "title": "В default"}
             )).structured_content
             upd = (await session.call_tool(
                 "memory_update", {"id": saved["id"],
@@ -599,11 +731,12 @@ class TestNamespaceMCP:
         text = f"{self.marker}: дубль между узлами"
         async with connect(ns_url) as session:
             first = (await session.call_tool(
-                "memory_save", {"text": text, "namespace": "work"}
+                "memory_save", {"text": text, "title": "Межузловой дубль",
+                                "namespace": "work"}
             )).structured_content
             assert first["stored"] is True
             second = (await session.call_tool(
-                "memory_save", {"text": text}
+                "memory_save", {"text": text, "title": "Межузловой дубль"}
             )).structured_content
         assert second["stored"] is True
         assert "work" in second["hint"]
@@ -667,6 +800,9 @@ class TestInstructionsBudget:
         ns.create("work/sbos2020", "СУБО 2020: сервисы HR.")
         instructions = build_instructions(build_services(settings))
         assert SERVER_INSTRUCTIONS in instructions
+        # Фаза 11 (решение №9): правило названий вшито в базу инструкций.
+        assert "title" in SERVER_INSTRUCTIONS
+        assert "≤5 слов" in SERVER_INSTRUCTIONS
         assert "- work: Рабочие заметки. Подпроекты — в листьях." in instructions
         assert "- projects: Личные проекты. Сайт-резюме." in instructions
         assert "- work/sbos2020: СУБО 2020: сервисы HR." in instructions
