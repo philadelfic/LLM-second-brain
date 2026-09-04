@@ -116,6 +116,11 @@ class Settings(BaseSettings):
     namespace_auto_max_per_day: int = 3  # лимит авто-созданных узлов в сутки (защита от шторма)
     namespace_max_leaves_per_domain: int = 12  # потолок листов в корне
     namespace_groom_min_notes: int = 2  # груминг: узел с меньшим числом заметок — кандидат на слияние
+    # Судья структуры (Фаза 10): отдельный флаг think — дедуп-судья остаётся
+    # думающим (решение Фазы 8), судья структуры бездумный (E2E Шага 7:
+    # думающий «залипал» на парах-близнецах, голодая суммаризацию; вердикт
+    # — 10–50 токенов, рассуждения не нужны). None — наследует DEDUP_JUDGE_THINK.
+    namespace_judge_think: bool | None = None
 
     @field_validator(
         "ollama_base_url",
