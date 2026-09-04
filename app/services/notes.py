@@ -21,9 +21,16 @@ MCP-слой срезает служебные поля — см. Фаза 9):
   другом узле уже лежит дословный дубль (меж-узловые дубли легитимны —
   запись не блокирует; hint — слой ориентирования, не деградация)
 - save (дубль)  → {duplicated: True, id, text, hint} (не создаётся)
+- save (отказ title) → TitleValidationError (решение №9): новые заметки без
+           названия или с длиннее TITLE_MAX_WORDS слов не создаются —
+           транспорт даёт клиенту fail+hint (MCP {stored: False, hint},
+           REST 422); без названия остаются только миграционные заметки
+           (прямой вызов save без title — легаси-путь, догенерация воркером)
 - get    → {notes: [...]} (массив даже для одного id; отсутствующие/удалённые
-           id пропускаются; пустой результат — мягкий ответ с hint)
-- list   → {items: [...], total} (без полных текстов) (+hint, если пусто)
+           id пропускаются; пустой результат — мягкий ответ с hint; каждая
+           заметка несёт title, Фаза 11 — MCP memory_get его срезает)
+- list   → {items: [...], total} (без полных текстов; каждый item несёт
+           title, Фаза 11) (+hint, если пусто)
 - update → {id, updated: True, summary_pending: True} | мягкий ответ updated: False
 - delete → {id, deleted: True} | мягкий ответ deleted: False (soft delete)
 
@@ -31,6 +38,15 @@ MCP-слой срезает служебные поля — см. Фаза 9):
 учится только по ответам save/search (§5.3), до-векторизация воркером
 прозрачна; то же справедливо для save (Фаза 8): pending — штатное состояние
 любой новой заметки, а не деградация.
+
+Названия заметок (Фаза 11, решение №9): заметку называет клиент-модель при
+записи. save — `title` обязателен: отсутствующий (транспорт передал None),
+пустой или длиннее TITLE_MAX_WORDS слов → TitleValidationError, заметка НЕ
+создаётся (транспорт даёт fail+hint «задай title ≤5 слов»). Прямой вызов
+save без title (сентинел _UNSET_TITLE) — легаси-путь миграции/скриптов:
+заметка пишется с title=NULL. update — `title` опционален: передан и валиден
+→ перезапись, не передан → прежний остаётся; merge-путь воркера вызывает
+update без title — название ранней заметки не затирается.
 
 Пагинация/сортировка: `ORDER BY updated_at DESC, id DESC` — свежесть важнее
 возраста (FR-2); метки времени живут с точностью до секунды (DDL-формат
@@ -53,7 +69,7 @@ import sqlite3
 from collections.abc import Callable
 from typing import Any
 
-from app.config import Settings
+from app.config import TITLE_MAX_WORDS, Settings
 from app.services.dedup import DeduplicationService, duplicate_response
 from app.services.embedding import Embedder, EmbeddingService
 from app.services.emit import summary_of
@@ -66,12 +82,45 @@ from app.storage.db import session, transaction
 # только для умолчаний: DEFAULT_LIST_LIMIT), поэтому не настраиваются.
 MAX_LIST_LIMIT = 50
 
+# Название заметки (Фаза 11, решение №9): клиент-модель называет заметку при
+# записи; отсутствие/невалидность — отказ записи с этим hint (§5.3).
+TITLE_HINT = "задай title ≤5 слов"
+
+# Сентинел «title не передан»: прямой вызов NoteService.save без транспорта
+# (миграция, скрипты, тесты) — легаси-путь, заметка пишется с title=NULL
+# (без названия остаются только миграционные заметки, название догенерирует
+# воркер). Транспорты (MCP/REST) всегда передают title явно — в том числе
+# None, когда клиент-модель не назвала заметку: это отказ (fail+hint).
+_UNSET_TITLE: Any = object()
+
+
+def is_valid_title(title: str | None) -> bool:
+    """Валидный title (решение №9): непустой и ≤ TITLE_MAX_WORDS слов.
+
+    Слова = len(title.split()): пробельные колебания по краям и внутри не
+    считаются словами; «пустой» — пустая или пробельная строка.
+    """
+    if title is None:
+        return False
+    return bool(title.strip()) and len(title.split()) <= TITLE_MAX_WORDS
+
 
 class NoteValidationError(ValueError):
     """Нарушение доменных ограничений (длина текста, размер batch, пагинация).
 
     Бекстоп за pydantic-схемой транспорта: MCP-клиент, приславший мусор,
     отсеется ещё схемой инструмента, но сервис защищает себя сам.
+    """
+
+
+class TitleValidationError(NoteValidationError):
+    """Нарушение контракта названия (Фаза 11, решение №9): title отсутствует,
+    пустой или длиннее TITLE_MAX_WORDS слов.
+
+    Штатный механизм отказа save (как NamespaceError при незарегистрированном
+    узле): REST ловит родительский NoteValidationError → 422, MCP-транспорт
+    ловит TitleValidationError → fail + hint с TITLE_HINT. Заметка НЕ
+    создаётся.
     """
 
 
@@ -111,8 +160,9 @@ class NoteService:
         text: str,
         author: str | None = None,
         namespace: str = "default",
+        title: str | None = _UNSET_TITLE,
     ) -> dict[str, Any]:
-        """Валидация → дословный дедуп → INSERT (текст + чанки) транзакцией.
+        """Валидация (текст, title) → дословный дедуп → INSERT транзакцией.
 
         Фаза 8 (Этап 1): Ollama в синхронном пути не вызывается — вектор
         не строится, векторизация ушла в фон (pending-очередь воркера);
@@ -120,6 +170,15 @@ class NoteService:
         дедуп (Этап 2). Синхронно отсекается только дословный дубль (SQL/FTS).
         Ответ мгновенный и без warning: векторизация не «отложена из-за
         отказа» — она всегда фоновая.
+
+        Фаза 11 (решение №9): `title` — обязательное название новой заметки
+        (осмысленное, ≤ TITLE_MAX_WORDS слов): отсутствующий у клиента-модели
+        (транспорт передал None) или невалидный → TitleValidationError —
+        заметка НЕ создаётся (транспорт даёт fail+hint). Прямой вызов без
+        title (сентинел _UNSET_TITLE) — легаси-путь миграции/скриптов:
+        заметка пишется с title=NULL, название догенерирует воркер.
+        Параметр добавлен ПОСЛЕДНИМ: прежние позиционные вызовы
+        (save(text, author), save(text, None, ns)) сохраняют смысл.
 
         Фаза 10 (§5.7): `namespace` — целевой узел записи (только
         зарегистрированный; не указан — `default`); незарегистрированный
@@ -130,6 +189,7 @@ class NoteService:
         получает hint «похожее есть в <ns>» (US-8, слой ориентирования).
         """
         self._validate_text(text)
+        note_title = self._validated_save_title(title)
         ns = self._namespaces.validate_placement(namespace)
         duplicate = self._dedup.find_by_text(text, namespace=ns)
         if duplicate is not None:
@@ -149,7 +209,8 @@ class NoteService:
         chunks_data = self._chunks_of(text)
         with session(self._settings) as conn, transaction(conn):
             note_id = self._insert(
-                conn, text, author, vector_status="pending", namespace=ns
+                conn, text, author, vector_status="pending", namespace=ns,
+                title=note_title,
             )
             self._store_chunks(conn, note_id, chunks_data, None)
         self._notify_summary_pending()
@@ -169,13 +230,18 @@ class NoteService:
         author: str | None,
         vector_status: str = "pending",
         namespace: str = "default",
+        title: str | None = None,
     ) -> int:
-        """INSERT строки заметки (внутри открытой транзакции)."""
+        """INSERT строки заметки (внутри открытой транзакции).
+
+        title (решение №9) — проверен/нормализован вызывающим (_validated_save_title);
+        None — легаси-путь миграции (название догенерирует воркер)."""
         cursor = conn.execute(
-            "INSERT INTO notes (text, author, vector_status, namespace) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO notes (text, title, author, vector_status, namespace) "
+            "VALUES (?, ?, ?, ?, ?)",
             (
                 text,
+                title,
                 author if author else self._settings.author_default,
                 vector_status,
                 namespace,
@@ -247,7 +313,7 @@ class NoteService:
             ns_params = []
         with session(self._settings) as conn:
             rows = conn.execute(
-                "SELECT id, namespace, summary, summary_status, author, "
+                "SELECT id, title, namespace, summary, summary_status, author, "
                 "created_at, updated_at, text "
                 "FROM notes WHERE deleted_at IS NULL"
                 f"{ns_clause} "
@@ -261,6 +327,7 @@ class NoteService:
         items = [
             {
                 "id": row["id"],
+                "title": row["title"],  # Фаза 11 (решение №9): может быть None (миграция)
                 "summary": summary_of(row, self._settings),
                 "summary_status": row["summary_status"],
                 "author": row["author"],
@@ -283,7 +350,11 @@ class NoteService:
     # --- FR-5 memory_update (перезапись целиком; векторизация — фон) -------
 
     def update(
-        self, note_id: int, text: str, namespace: str | None = None
+        self,
+        note_id: int,
+        text: str,
+        namespace: str | None = None,
+        title: str | None = None,
     ) -> dict[str, Any]:
         """UPDATE text целиком; summary reset; ре-векторизация — фоном (Фаза 8).
 
@@ -298,8 +369,15 @@ class NoteService:
         уложенной заметки назад в default не требуется). Зарегистрирован ли
         узел — проверяется той же точкой, что и save (NamespaceError →
         транспорт Шага 3 обернёт в fail + hint).
+
+        Фаза 11 (решение №9): `title` опционален — передан и валиден →
+        перезапись, не передан (None) → прежний остаётся: merge-путь воркера
+        вызывает update без title и название ранней заметки не затирается.
+        Невалидный title → TitleValidationError; сбросить название нельзя
+        (новые — всегда с названием, без него остаются только миграционные).
         """
         self._validate_text(text)
+        note_title = None if title is None else self._checked_title(title)
         # Быстрая проверка до записи: несуществующий id не трогаем.
         with session(self._settings) as conn:
             row = conn.execute(
@@ -313,13 +391,24 @@ class NoteService:
             else row["namespace"]
         chunks_data = self._chunks_of(text)
         with session(self._settings) as conn, transaction(conn):
-            cursor = conn.execute(
-                "UPDATE notes SET text = ?, namespace = ?, vector_status = 'pending', "
-                "summary = '', summary_status = 'pending', "
-                "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
-                "WHERE id = ? AND deleted_at IS NULL",
-                (text, ns, note_id),
-            )
+            if note_title is None:  # title не передан — прежний остаётся (решение №9)
+                cursor = conn.execute(
+                    "UPDATE notes SET text = ?, namespace = ?, "
+                    "vector_status = 'pending', "
+                    "summary = '', summary_status = 'pending', "
+                    "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                    "WHERE id = ? AND deleted_at IS NULL",
+                    (text, ns, note_id),
+                )
+            else:  # валидный title передан — перезапись
+                cursor = conn.execute(
+                    "UPDATE notes SET text = ?, title = ?, namespace = ?, "
+                    "vector_status = 'pending', "
+                    "summary = '', summary_status = 'pending', "
+                    "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                    "WHERE id = ? AND deleted_at IS NULL",
+                    (text, note_title, ns, note_id),
+                )
             updated = cursor.rowcount  # 0 = нет такой активной заметки
             # Фаза 7: старые чанки (и их вектора) заменяются новыми одной
             # транзакцией; Фаза 8: вектора строит фоновый воркер (pending).
@@ -422,6 +511,25 @@ class NoteService:
             "hint": "заметка не найдена (возможно, удалена)",
         }
 
+    def _validated_save_title(self, title: str | None) -> str | None:
+        """title для save (решение №9): сентинел → None (легаси-путь прямого
+        вызова без транспорта); передан (в т.ч. None от транспорта — клиент
+        не назвал заметку) → обязан быть валидным, иначе TitleValidationError.
+        Возврат — нормализованный title (без краевых пробелов)."""
+        if title is _UNSET_TITLE:
+            return None
+        return self._checked_title(title)
+
+    @staticmethod
+    def _checked_title(title: str | None) -> str:
+        """Валидный title обязателен (решение №9): пустой/длиннее
+        TITLE_MAX_WORDS слов → TitleValidationError (транспорт даёт fail+hint).
+        Возврат — нормализованный title (без краевых пробелов)."""
+        if not is_valid_title(title):
+            raise TitleValidationError(TITLE_HINT)
+        assert title is not None  # is_valid_title отсёк None — для типизации
+        return title.strip()
+
     def _validate_text(self, text: str) -> None:
         """1..MAX_NOTE_CHARS — доменное правило REQUIREMENTS FR-4/FR-5."""
         if not 1 <= len(text) <= self._settings.max_note_chars:
@@ -432,9 +540,12 @@ class NoteService:
 
     def _full_note(self, row: sqlite3.Row) -> dict[str, Any]:
         """Формат выдачи memory_get (FR-3): полный текст + метаданные.
-        Фаза 10: +namespace (слой ориентирования: модель видит, где лежит)."""
+        Фаза 10: +namespace (слой ориентирования: модель видит, где лежит).
+        Фаза 11 (решение №9): +title (REST-выдача оператору; MCP memory_get
+        срезает белым списком — экономия контекста, там полный текст)."""
         return {
             "id": row["id"],
+            "title": row["title"],
             "text": row["text"],
             "summary": summary_of(row, self._settings),
             "summary_status": row["summary_status"],
