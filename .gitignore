@@ -24,16 +24,15 @@ prompts/
 prompts-test/
 
 # Инженерные доки — внутренние (не публикуются в GitHub; остаются в
-# рабочей копии рядом с кодом)
-REQUIREMENTS.md
-ARCHITECTURE.md
+# рабочей копии рядом с кодом). С 2026-09-05 собраны в engineering/:
+# REQUIREMENTS.md, ARCHITECTURE.md, briefs/ (постановки фаз), v2.1/.
+engineering/
 
 # Локальные артефакты
 *.log
 
 # Не публикуем (решение О. 2026-08-31, репо на GitHub публичное;
 # BUGS.md — решение О. 2026-09-03: баги не публикуем)
-briefs/
 docker-compose.override.yml
 BUGS.md
 
