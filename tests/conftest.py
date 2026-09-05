@@ -47,7 +47,14 @@ def test_env(
     """Чистый кэш настроек, валидное окружение и БД во временной папке."""
     db_path = tmp_path / "notes.db"
     monkeypatch.setenv("DB_PATH", str(db_path))
-    env = {**TEST_ENV, "DB_PATH": str(db_path)}
+    # BACKUP_DIR — во временную папку: дефолт /data/backups тестовому процессу
+    # недоступен (root-owned /data) — backup-петля ловит PermissionError на
+    # каждый старт приложения (шум backup_failed + редкий флейк наблюдений;
+    # фаза 2, аппрув пула 7). Тесты test_backup.py переопределяют своим
+    # monkeypatch.setenv — их значение применяется позже и побеждает.
+    backup_dir = tmp_path / "backups"
+    monkeypatch.setenv("BACKUP_DIR", str(backup_dir))
+    env = {**TEST_ENV, "DB_PATH": str(db_path), "BACKUP_DIR": str(backup_dir)}
     get_settings.cache_clear()
     yield env
     get_settings.cache_clear()
