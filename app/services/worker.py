@@ -227,57 +227,104 @@ class BackgroundWorker:
 
     async def _run_embedding(self) -> None:
         while not self._stopping:
-            processed = 0
-            processed += await asyncio.to_thread(self.process_pending)
-            processed += await self.process_pending_chunks()
-            if processed:
-                self._vector_interval = float(
-                    self._settings.pending_retry_sec
-                )  # успех — сброс
-                continue
-            await asyncio.sleep(self._vector_interval)
-            self._vector_interval = next_interval(
-                self._vector_interval, self._settings.pending_retry_sec
-            )
+            try:
+                processed = 0
+                processed += await asyncio.to_thread(self.process_pending)
+                processed += await self.process_pending_chunks()
+                if processed:
+                    self._vector_interval = float(
+                        self._settings.pending_retry_sec
+                    )  # успех — сброс
+                    continue
+                await asyncio.sleep(self._vector_interval)
+                self._vector_interval = next_interval(
+                    self._vector_interval, self._settings.pending_retry_sec
+                )
+            except asyncio.CancelledError:
+                raise  # отмена петли (graceful stop) — не глотать
+            except Exception:
+                # Супервизор петли (пул 4): НЕПРЕДВИДЕННЫЙ сбой итерации
+                # (StorageError при исчерпании busy_timeout, дефект кода,
+                # «громкий» re-raise из _store_chunk_vectors) не убивает
+                # корутину — warning с traceback, пауза и повтор по back-off.
+                logging.getLogger("app").warning(
+                    "worker loop iteration failed — loop continues",
+                    extra={"event": "loop_iteration_failed", "loop": "embedding"},
+                    exc_info=True,
+                )
+                await asyncio.sleep(self._vector_interval)
+                self._vector_interval = next_interval(
+                    self._vector_interval, self._settings.pending_retry_sec
+                )
 
     async def _run_summary(self) -> None:
         if self._summarizer is None:
             return  # тестовый режим без суммаризатора: петля не нужна
         while not self._stopping:
-            processed = 0
-            processed += await asyncio.to_thread(self.process_title_pending)
-            processed += await asyncio.to_thread(self.process_summary_pending)
-            processed += await asyncio.to_thread(self.process_merge_pending)
-            if processed:
-                self._summary_interval = float(self._settings.pending_retry_sec)
-                continue
-            # Пустой прогон: ждём сигнал «новая заметка» (save/update) или
-            # таймаут back-off. Сигнал будит петлю немедленно — суммаризация
-            # стартует сразу после записи, а не через выросший интервал.
-            self._summary_event.clear()
             try:
-                await asyncio.wait_for(
-                    self._summary_event.wait(), timeout=self._summary_interval
+                processed = 0
+                processed += await asyncio.to_thread(self.process_title_pending)
+                processed += await asyncio.to_thread(self.process_summary_pending)
+                processed += await asyncio.to_thread(self.process_merge_pending)
+                if processed:
+                    self._summary_interval = float(self._settings.pending_retry_sec)
+                    continue
+                # Пустой прогон: ждём сигнал «новая заметка» (save/update) или
+                # таймаут back-off. Сигнал будит петлю немедленно — суммаризация
+                # стартует сразу после записи, а не через выросший интервал.
+                self._summary_event.clear()
+                try:
+                    await asyncio.wait_for(
+                        self._summary_event.wait(), timeout=self._summary_interval
+                    )
+                except asyncio.TimeoutError:
+                    self._summary_interval = next_interval(
+                        self._summary_interval, self._settings.pending_retry_sec
+                    )
+            except asyncio.CancelledError:
+                raise  # отмена петли (graceful stop) — не глотать
+            except Exception:
+                # Супервизор петли (пул 4): непредвиденный сбой итерации не
+                # убивает summary-петлю — warning с traceback, пауза, повтор.
+                logging.getLogger("app").warning(
+                    "worker loop iteration failed — loop continues",
+                    extra={"event": "loop_iteration_failed", "loop": "summary"},
+                    exc_info=True,
                 )
-            except asyncio.TimeoutError:
+                await asyncio.sleep(self._summary_interval)
                 self._summary_interval = next_interval(
                     self._summary_interval, self._settings.pending_retry_sec
                 )
 
     async def _run_judge(self) -> None:
         while not self._stopping:
-            processed = await asyncio.to_thread(self.process_judge_pending)
-            if processed:
-                self._judge_interval = float(self._settings.pending_retry_sec)
-                continue
-            # Пустой прогон: ждём сигнал «появилась judge-работа» или таймаут
-            # back-off. Сигнал будит петлю немедленно после довекторизации.
-            self._judge_event.clear()
             try:
-                await asyncio.wait_for(
-                    self._judge_event.wait(), timeout=self._judge_interval
+                processed = await asyncio.to_thread(self.process_judge_pending)
+                if processed:
+                    self._judge_interval = float(self._settings.pending_retry_sec)
+                    continue
+                # Пустой прогон: ждём сигнал «появилась judge-работа» или таймаут
+                # back-off. Сигнал будит петлю немедленно после довекторизации.
+                self._judge_event.clear()
+                try:
+                    await asyncio.wait_for(
+                        self._judge_event.wait(), timeout=self._judge_interval
+                    )
+                except asyncio.TimeoutError:
+                    self._judge_interval = next_interval(
+                        self._judge_interval, self._settings.pending_retry_sec
+                    )
+            except asyncio.CancelledError:
+                raise  # отмена петли (graceful stop) — не глотать
+            except Exception:
+                # Супервизор петли (пул 4): непредвиденный сбой итерации не
+                # убивает judge-петлю — warning с traceback, пауза, повтор.
+                logging.getLogger("app").warning(
+                    "worker loop iteration failed — loop continues",
+                    extra={"event": "loop_iteration_failed", "loop": "judge"},
+                    exc_info=True,
                 )
-            except asyncio.TimeoutError:
+                await asyncio.sleep(self._judge_interval)
                 self._judge_interval = next_interval(
                     self._judge_interval, self._settings.pending_retry_sec
                 )

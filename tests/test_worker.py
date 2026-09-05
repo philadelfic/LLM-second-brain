@@ -713,3 +713,113 @@ def test_classification_after_summarization(settings) -> None:
     assert classifier.calls == []  # до суммаризации классификации нет
     worker.process_summary_pending()  # суммаризация → классификация
     assert len(classifier.calls) == 1
+
+
+# --- супервизор петель (пул 4) ----------------------------------------------
+
+
+class FlakyEmbedder(HashEmbedder):
+    """Кодировщик: первые два вызова — НЕПРЕДВИДЕННЫЙ RuntimeError, дальше
+    работает.
+
+    Пул 4: проверка супервизора петли — RuntimeError (не EmbeddingError,
+    «громкий» сбой) в итерации embedding-петли не убивает корутину. Два
+    отказа подряд дают устойчивое окно наблюдения выросшего back-off-интервала
+    (после одного отказа интервал успевает сброситься успешным повтором).
+    """
+
+    def __init__(self, dim: int) -> None:
+        super().__init__(dim)
+        self.calls = 0
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
+        if self.calls <= 2:
+            raise RuntimeError("непредвиденный сбой кодирования")
+        return super().embed_texts(texts)
+
+
+@pytest.mark.asyncio
+async def test_embedding_loop_survives_unexpected_failure(slow) -> None:
+    """Пул 4: RuntimeError в итерации embedding-петли не убивает петлю —
+    warning, пауза по back-off (интервал вырос), повторный вызов эмбеддера,
+    заметка в итоге довекторизована; stop() завершает петлю."""
+    notes = NoteService(slow, FailingEmbedder())
+    notes.save("заметка для проверки супервизора embedding-петли")
+    embedder = FlakyEmbedder(8)
+    worker = make_worker(slow, embedder)
+    task = asyncio.create_task(worker.run())
+    deadline = time.monotonic() + 6.0
+    # первые вызовы упали RuntimeError → петля в back-off, интервал вырос
+    while time.monotonic() < deadline and embedder.calls < 2:
+        await asyncio.sleep(0.01)
+    assert embedder.calls >= 2
+    while (
+        time.monotonic() < deadline
+        and worker.interval <= float(slow.pending_retry_sec)
+    ):
+        await asyncio.sleep(0.01)
+    assert worker.interval > float(slow.pending_retry_sec)  # интервал вырос
+    # петля выжила: заметка в итоге довекторизована
+    status = None
+    while time.monotonic() < deadline:
+        with session(slow) as conn:
+            status = conn.execute(
+                "SELECT vector_status FROM notes WHERE id = 1"
+            ).fetchone()[0]
+        if status == "ok":
+            break
+        await asyncio.sleep(0.01)
+    assert status == "ok"
+    worker.stop()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+class FlakySummarizer(FixedSummarizer):
+    """Суммаризатор: первый вызов — НЕПРЕДВИДЕННЫЙ RuntimeError, дальше работает.
+
+    Пул 4: проверка супервизора summary-петли. Счётчик — `attempts` (не
+    `calls`): `calls` у FixedSummarizer — журнал текстов, его не затираем.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    def summarize(self, text: str) -> str:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise RuntimeError("непредвиденный сбой суммаризации")
+        return super().summarize(text)
+
+
+@pytest.mark.asyncio
+async def test_summary_loop_survives_unexpected_failure(fast) -> None:
+    """Пул 4: RuntimeError в итерации summary-петли не убивает петлю —
+    warning, повторный вызов суммаризатора, заметка в итоге суммаризована;
+    stop() завершает петлю."""
+    notes = NoteService(fast, FailingEmbedder())
+    notes.save("заметка для проверки супервизора summary-петли", title="Заметка")
+    summarizer = FlakySummarizer()
+    worker = make_worker(fast, FailingEmbedder(), summarizer)
+    task = asyncio.create_task(worker.run())
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and summarizer.attempts < 2:
+        await asyncio.sleep(0.01)
+    assert summarizer.attempts >= 2  # петля выжила после сбоя
+    status = None
+    while time.monotonic() < deadline:
+        with session(fast) as conn:
+            status = conn.execute(
+                "SELECT summary_status FROM notes WHERE id = 1"
+            ).fetchone()[0]
+        if status == "ok":
+            break
+        await asyncio.sleep(0.01)
+    assert status == "ok"  # повторная итерация довела суммаризацию
+    worker.stop()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
