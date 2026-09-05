@@ -166,8 +166,21 @@ class DeduplicationService:
 
     # --- фоллбек --------------------------------------------------------
 
-    def find_by_text(self, text: str, namespace: str | None = None) -> sqlite3.Row | None:
-        """Дословный дубль без векторизации (ARCH §4.1 «дедуп по FTS»)."""
+    def find_by_text(
+        self,
+        text: str,
+        namespace: str | None = None,
+        conn: sqlite3.Connection | None = None,
+    ) -> sqlite3.Row | None:
+        """Дословный дубль без векторизации (ARCH §4.1 «дедуп по FTS»).
+
+        Опциональный `conn` — работать на ПЕРЕДАННОМ соединении (без своего
+        `session()`): save выполняет проверку и INSERT одной BEGIN IMMEDIATE-
+        транзакцией, что исключает TOCTOU-гонку двух конкурентных save одного
+        текста (писатели сериализуются busy_timeout, второй видит уже
+        вставленную строку — дословный дубль невозможен). Без `conn` — как
+        раньше: собственный `session()` (обратная совместимость).
+        """
         if namespace:
             ns_clause = " AND namespace = ?"
             ns_fts_clause = " AND n.namespace = ?"
@@ -176,30 +189,47 @@ class DeduplicationService:
             ns_clause = ""
             ns_fts_clause = ""
             ns_params = []
-        with session(self._settings) as conn:
-            exact = conn.execute(
-                "SELECT id, text, namespace FROM notes "
-                f"WHERE deleted_at IS NULL AND text = ?{ns_clause} ORDER BY id LIMIT 1",
-                (text, *ns_params),
-            ).fetchone()
-            if exact is not None:
-                return exact
-            norm = normalize_text(text)
-            words = [word for word in norm.split() if len(word) >= 3]
-            if not words:  # только слова короче 3 символов — trigram слеп
-                return None
-            expression = " AND ".join(
-                f'"{word.replace(chr(34), chr(34) * 2)}"'
-                for word in dict.fromkeys(words)
+        if conn is not None:
+            return self._literal_duplicate(
+                conn, text, ns_clause, ns_fts_clause, ns_params
             )
-            candidates = conn.execute(
-                "SELECT n.id, n.text, n.namespace FROM notes_fts "
-                "JOIN notes n ON n.id = notes_fts.rowid "
-                f"WHERE notes_fts MATCH ? AND n.deleted_at IS NULL"
-                f"{ns_fts_clause} LIMIT ?",
-                (expression, *ns_params, FALLBACK_SCAN),
-            ).fetchall()
-            for candidate in candidates:
-                if normalize_text(candidate["text"]) == norm:
-                    return candidate
+        with session(self._settings) as own_conn:
+            return self._literal_duplicate(
+                own_conn, text, ns_clause, ns_fts_clause, ns_params
+            )
+
+    def _literal_duplicate(
+        self,
+        conn: sqlite3.Connection,
+        text: str,
+        ns_clause: str,
+        ns_fts_clause: str,
+        ns_params: list[object],
+    ) -> sqlite3.Row | None:
+        """Тело дословного дедупа на открытом соединении (SQL + FTS-фоллбек)."""
+        exact = conn.execute(
+            "SELECT id, text, namespace FROM notes "
+            f"WHERE deleted_at IS NULL AND text = ?{ns_clause} ORDER BY id LIMIT 1",
+            (text, *ns_params),
+        ).fetchone()
+        if exact is not None:
+            return exact
+        norm = normalize_text(text)
+        words = [word for word in norm.split() if len(word) >= 3]
+        if not words:  # только слова короче 3 символов — trigram слеп
             return None
+        expression = " AND ".join(
+            f'"{word.replace(chr(34), chr(34) * 2)}"'
+            for word in dict.fromkeys(words)
+        )
+        candidates = conn.execute(
+            "SELECT n.id, n.text, n.namespace FROM notes_fts "
+            "JOIN notes n ON n.id = notes_fts.rowid "
+            f"WHERE notes_fts MATCH ? AND n.deleted_at IS NULL"
+            f"{ns_fts_clause} LIMIT ?",
+            (expression, *ns_params, FALLBACK_SCAN),
+        ).fetchall()
+        for candidate in candidates:
+            if normalize_text(candidate["text"]) == norm:
+                return candidate
+        return None

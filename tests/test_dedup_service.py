@@ -129,6 +129,23 @@ def test_find_by_text_no_match(dim8, notes) -> None:
     assert DeduplicationService(dim8).find_by_text("совсем другая формулировка") is None
 
 
+def test_find_by_text_with_explicit_conn(dim8, notes) -> None:
+    """Пул 3: find_by_text умеет работать на ПЕРЕДАННОМ соединении (save внутри
+    транзакции) — результат тот же, что и с собственным session(); без своего
+    соединения метод не открывает (инструмент атомарности записи)."""
+    notes.save("Текст для явного conn")
+    with session(dim8) as conn:
+        found = DeduplicationService(dim8).find_by_text(
+            "Текст для явного conn", conn=conn
+        )
+    assert found is not None and found["id"] == 1
+    with session(dim8) as conn:  # и по namespace-фильтру на чужом conn
+        no_hit = DeduplicationService(dim8).find_by_text(
+            "Текст для явного conn", namespace="work", conn=conn
+        )
+    assert no_hit is None  # в своём узле текст не лежит
+
+
 # --- интеграция с save (успешный путь) ---------------------------------------
 
 

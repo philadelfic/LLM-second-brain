@@ -76,6 +76,7 @@ from app.services.emit import summary_of
 from app.services.namespaces import NamespaceService
 from app.services.splitter import split_text
 from app.storage import chunks
+from app.storage import vectors
 from app.storage.db import session, transaction
 
 # Фиксированные верхние границы контрактов (REQUIREMENTS §5.1/NFR-6; env —
@@ -191,28 +192,38 @@ class NoteService:
         self._validate_text(text)
         note_title = self._validated_save_title(title)
         ns = self._namespaces.validate_placement(namespace)
-        duplicate = self._dedup.find_by_text(text, namespace=ns)
+        # Чанки считаем чистым сплиттером (~миллисекунды, без Ollama) ДО
+        # транзакции — сама транзакция остаётся короткой.
+        chunks_data = self._chunks_of(text)
+        # Дословный дедуп (свой ns) и foreign-hint скан (чужой ns) — ВНУТРИ
+        # BEGIN IMMEDIATE, ДО INSERT: проверка и запись одной транзакцией
+        # исключают TOCTOU-гонку двух конкурентных save одного текста (второй
+        # писатель ждёт COMMIT первого через busy_timeout и видит уже
+        # вставленную строку — дословный дубль невозможен). Признанный
+        # дубль: вставки нет, транзакция коммитится пустой (допустимо),
+        # ответ duplicate_response после её закрытия.
+        duplicate = None
+        foreign_hint = None
+        with session(self._settings) as conn, transaction(conn):
+            duplicate = self._dedup.find_by_text(text, namespace=ns, conn=conn)
+            if duplicate is None:
+                # Дедуп-хинт чужого узла (Фаза 10, US-8): близкий дубль в
+                # другом узле — легитимен (меж-узловые дубли не запрещены,
+                # §5.7), запись НЕ блокирует, но модель обучается
+                # ориентированию: hint в ответе.
+                foreign = self._dedup.find_by_text(text, namespace=None, conn=conn)
+                if foreign is not None:
+                    foreign_hint = (
+                        f"похожее есть в «{foreign['namespace']}»; запись сюда не "
+                        "блокирует — меж-узловые дубли легитимны"
+                    )
+                note_id = self._insert(
+                    conn, text, author, vector_status="pending", namespace=ns,
+                    title=note_title,
+                )
+                self._store_chunks(conn, note_id, chunks_data, None)
         if duplicate is not None:
             return duplicate_response(duplicate)
-        # Дедуп-хинт чужого узла (Фаза 10, US-8): близкий дубль в другом
-        # узле — легитимен (меж-узловые дубли не запрещены, §5.7), запись
-        # НЕ блокирует, но модель обучается ориентированию: hint в ответе.
-        foreign = self._dedup.find_by_text(text, namespace=None)
-        foreign_hint = (
-            f"похожее есть в «{foreign['namespace']}»; запись сюда не "
-            "блокирует — меж-узловые дубли легитимны"
-            if foreign is not None
-            else None
-        )
-        # Чанки считаем чистым сплиттером (~миллисекунды, без Ollama) —
-        # транзакция остаётся короткой.
-        chunks_data = self._chunks_of(text)
-        with session(self._settings) as conn, transaction(conn):
-            note_id = self._insert(
-                conn, text, author, vector_status="pending", namespace=ns,
-                title=note_title,
-            )
-            self._store_chunks(conn, note_id, chunks_data, None)
         self._notify_summary_pending()
         result: dict[str, Any] = {
             "id": note_id,
@@ -425,6 +436,11 @@ class NoteService:
             # Фаза 7: старые чанки (и их вектора) заменяются новыми одной
             # транзакцией; Фаза 8: вектора строит фоновый воркер (pending).
             self._store_chunks(conn, note_id, chunks_data, None)
+            # v2.1.1 (пул 3): сбросить и ПРОТУХШИЙ полный вектор заметки —
+            # notes_vec пуст до догонки воркером: в окне pending заметка
+            # участвует только в FTS-поиске (ARCH §3.3), старый вектор по
+            # прежнему тексту не кормит ни векторный поиск, ни косинус-дедуп.
+            vectors.drop(conn, note_id)
         if not updated:
             return self._not_found(note_id)
         self._notify_summary_pending()

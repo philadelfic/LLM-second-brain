@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 import time
 
 import pytest
@@ -235,4 +236,76 @@ async def test_run_vectorizes_saved_note(fast_dim8) -> None:
     with contextlib.suppress(asyncio.CancelledError):
         await task
     assert status == "ok"
+
+
+# --- пул 3: атомарность записи (TOCTOU-дословный дедуп + сброс вектора) ---
+
+
+def test_concurrent_save_same_text_single_stored(dim8) -> None:
+    """Пул 3: TOCTOU-гонка мёртва — два параллельных save одного текста
+    дают ровно один stored и один duplicated; в БД одна активная строка.
+
+    Раньше find_by_text был ВНЕ транзакции INSERT: оба потока могли пройти
+    проверку и INSERT'нуться. Теперь дедуп и запись — один BEGIN IMMEDIATE
+    (писатели сериализуются busy_timeout): второй видит уже вставленную
+    строку и отвечает duplicated — дословный дубль невозможен.
+    """
+    notes = notes_with(dim8, HashEmbedder(8))
+    text = "единственный конкурентный дословный текст для гонки"
+    barrier = threading.Barrier(2)  # оба стартуют одновременно
+    results: list[dict] = []
+
+    def _save() -> None:
+        barrier.wait()
+        results.append(notes.save(text))
+
+    threads = [threading.Thread(target=_save) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    stored = [r for r in results if r.get("stored") is True]
+    duplicated = [r for r in results if r.get("duplicated") is True]
+    assert len(stored) == 1 and len(duplicated) == 1
+    with session(dim8) as conn:
+        active = conn.execute(
+            "SELECT COUNT(*) FROM notes "
+            "WHERE deleted_at IS NULL AND text = ?",
+            (text,),
+        ).fetchone()[0]
+    assert active == 1
+
+
+def test_update_drops_stale_full_vector(dim8) -> None:
+    """Пул 3: update сбрасывает и ПОЛНЫЙ вектор (notes_vec) — в окне pending
+    заметка участвует только в FTS-поиске (ARCH §3.3), протухший вектор по
+    старому тексту не кормит ни поиск, ни косинус-дедуп; догонка воркером
+    возвращает вектор нового текста со статусом ok.
+    """
+    notes = notes_with(dim8, HashEmbedder(8))
+    old = "первый текст уникальный единственный до правки"
+    new = "полностью новый текст после апдейта заметки"
+    notes.save(old)
+    assert vectorize_notes(dim8, HashEmbedder(8)) == 1  # вектор есть
+    with session(dim8) as conn:
+        assert vectors.get_vector(conn, 1) == pytest.approx(
+            HashEmbedder(8).embed(old), abs=1e-6
+        )
+    assert notes.update(1, new)["updated"] is True
+    with session(dim8) as conn:
+        row = conn.execute(
+            "SELECT vector_status FROM notes WHERE id = 1"
+        ).fetchone()
+        assert row["vector_status"] == "pending"
+        assert vectors.get_vector(conn, 1) is None  # полный вектор сброшен
+        assert vectors.count(conn) == 0  # в notes_vec 0 строк для этого id
+    assert vectorize_notes(dim8, HashEmbedder(8)) == 1  # догонка воркером
+    with session(dim8) as conn:
+        row = conn.execute(
+            "SELECT vector_status FROM notes WHERE id = 1"
+        ).fetchone()
+        assert row["vector_status"] == "ok"
+        assert vectors.get_vector(conn, 1) == pytest.approx(
+            HashEmbedder(8).embed(new), abs=1e-6
+        )
 
