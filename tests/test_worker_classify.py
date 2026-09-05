@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from fakes import FailingEmbedder, FixedClassifier, FixedSummarizer, HashEmbedder
 
@@ -49,6 +51,21 @@ def _worker(settings, classifier) -> BackgroundWorker:
     return BackgroundWorker(
         settings, HashEmbedder(8), FixedSummarizer(), classifier=classifier
     )
+
+
+class MidMoveClassifier(FixedClassifier):
+    """Фейк-гонка причёски (пул 6): пока идёт классификация, оператор
+    перекладывает заметку в узел (update с namespace='work') — фон не должен
+    перебить операторский переезд (guard `namespace='default'` в WHERE)."""
+
+    def __init__(self, notes: NoteService, note_id: int) -> None:
+        super().__init__(Classification("work", None, 0.95))
+        self._notes = notes
+        self._note_id = note_id
+
+    def classify(self, text: str, known_nodes: list) -> Classification:
+        self._notes.update(self._note_id, text, namespace="work")
+        return super().classify(text, known_nodes)
 
 
 class TestClassifyDefault:
@@ -163,6 +180,68 @@ class TestClassifyDefault:
         # Повторный прогон: summary уже ok, классификация не повторяется.
         assert worker.process_summary_pending() == 0
         assert len(classifier.calls) == 1
+
+
+class TestGroomingAtomicityP6:
+    """Пул 6: причёска — один UPDATE (разметка + авто-переезд), guard
+    namespace='default', цель до транзакции, лог только при реальном переезде."""
+
+    def test_operator_move_not_overwritten_by_worker(
+        self, settings, caplog
+    ) -> None:
+        """Оператор, уложивший default-заметку (namespace='work') в окне причёски,
+        фоном не перекладывается (guard `namespace='default'` → rowcount 0) — и
+        лог classified_moved не пишется (только при реальном переезде)."""
+        NamespaceService(settings).create("work", "Рабочие заметки.")
+        nid = _save_default(settings, "заметка, которую оператор уложил в полёте")
+        notes = NoteService(settings, FailingEmbedder())
+        classifier = MidMoveClassifier(notes, nid)
+        worker = _worker(settings, classifier)
+        with caplog.at_level(logging.INFO, logger="app"):
+            worker.process_summary_pending()
+        row = _row(settings, nid)
+        assert row["namespace"] == "work"  # фон не перебил операторский переезд
+        moved = [
+            r
+            for r in caplog.records
+            if getattr(r, "event", None) == "classified_moved"
+        ]
+        assert moved == []  # переезда фона не было (rowcount 0) — и лога нет
+
+    def test_target_failure_writes_no_markup(self, settings) -> None:
+        """Сбой вычисления цели авто-переезда (не-слаг domain_hint →
+        NamespaceValidationError из _auto_move_target) НЕ пишет в БД ни разметку,
+        ни classified_at — целевой узел считается ДО транзакции («отказ
+        классификации = не размечено», Уточнения пула 2/6)."""
+        nid = _save_default(settings, "заметка с мусорной разметкой классификатора")
+        classifier = FixedClassifier(Classification("Работа", None, 0.9))
+        worker = _worker(settings, classifier)
+        worker.process_summary_pending()
+        row = _row(settings, nid)
+        assert row["namespace"] == "default"
+        assert row["classified_at"] is None
+        assert row["domain_hint"] is None and row["subdomain_hint"] is None
+        assert row["confidence"] is None
+
+    def test_classified_moved_logged_once_on_real_move(self, settings, caplog) -> None:
+        """Лог classified_moved — ровно один, только при фактическом переезде;
+        разметка и namespace/vector_status пишутся одним UPDATE."""
+        NamespaceService(settings).create("work", "Рабочие заметки.")
+        nid = _save_default(settings, "заметка для проверки лога переезда")
+        classifier = FixedClassifier(Classification("work", None, 0.95))
+        worker = _worker(settings, classifier)
+        with caplog.at_level(logging.INFO, logger="app"):
+            assert worker.process_summary_pending() == 1
+        moved = [
+            r
+            for r in caplog.records
+            if getattr(r, "event", None) == "classified_moved"
+        ]
+        assert len(moved) == 1
+        assert moved[0].note_id == nid and moved[0].namespace == "work"
+        row = _row(settings, nid)
+        assert row["namespace"] == "work"
+        assert row["vector_status"] == "pending"  # пере-кодировка в новую партицию
 
 
 class TestRepeatAfterUpdate:

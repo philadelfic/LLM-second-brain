@@ -281,6 +281,12 @@ class BackgroundWorker:
                 # Пустой прогон: ждём сигнал «новая заметка» (save/update) или
                 # таймаут back-off. Сигнал будит петлю немедленно — суммаризация
                 # стартует сразу после записи, а не через выросший интервал.
+                # Пул 6 (lost wakeup): notify мог прийти ВО ВРЕМЯ выгребания
+                # партии, и `event.clear()` ниже стёр бы сигнал — дёшево
+                # перепроверяем саму очередь перед сном; непустая → сразу в
+                # следующую итерацию, без ожидания интервала.
+                if not await asyncio.to_thread(self._summary_queue_empty):
+                    continue
                 self._summary_event.clear()
                 try:
                     await asyncio.wait_for(
@@ -314,6 +320,11 @@ class BackgroundWorker:
                     continue
                 # Пустой прогон: ждём сигнал «появилась judge-работа» или таймаут
                 # back-off. Сигнал будит петлю немедленно после довекторизации.
+                # Пул 6 (lost wakeup): notify мог прийти, пока выгребали партию,
+                # и `event.clear()` ниже стёр бы его — перепроверяем очередь
+                # перед сном; непустая → сразу в следующую итерацию.
+                if not await asyncio.to_thread(self._judge_queue_empty):
+                    continue
                 self._judge_event.clear()
                 try:
                     await asyncio.wait_for(
@@ -438,6 +449,41 @@ class BackgroundWorker:
                 "WHERE id = ?",
                 (job_id,),
             )
+
+    # --- потерянный будильник: дешёвая перепроверка очереди перед сном (пул 6)
+
+    def _summary_queue_empty(self) -> bool:
+        """Пуста ли summary-очередь (дешёвый SELECT, пул 6, lost wakeup).
+
+        Петля перед `clear()+wait` перепроверяет саму очередь, а не только
+        event: notify мог прийти во время выгребания партии, и `clear()`
+        после него стёр бы сигнал (пауза до интервала на непустой очереди).
+        Очередь пуста — только если нет title-догена (title IS NULL),
+        pending суммаризации и pending merge-работ (все в summary-слоте).
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT (SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL "
+                "  AND (title IS NULL OR summary_status = 'pending')) "
+                "+ (SELECT COUNT(*) FROM worker_jobs "
+                "  WHERE slot = 'summary' AND status = 'pending') AS c"
+            ).fetchone()
+        return int(row["c"]) == 0
+
+    def _judge_queue_empty(self) -> bool:
+        """Пуста ли judge-очередь (дешёвый SELECT, пул 6, lost wakeup).
+
+        Считает pending dedup-работы judge-слота — ту же очередь, что
+        выгребает process_judge_pending в этой петле.
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM worker_jobs "
+                "WHERE slot = 'judge' AND kind = 'dedup' AND status = 'pending'"
+            ).fetchone()
+        return int(row[0]) == 0
 
     # --- синхронная работа (выполняется в to_thread) --------------------------
 
@@ -606,10 +652,11 @@ class BackgroundWorker:
         1) перечитать тексты ранней и поздней заметок (гонка с
            memory_update/delete: протухшая пара срезается);
         2) summarizer.merge(текст_ранней, текст_поздней) — объединить;
-        3) NoteService.update ранней (текст = объединённый; ре-векторизация
-           и ре-суммаризация — штатно, своими очередями; title ранней
-           сохраняется — update без title, решение №9);
-        4) NoteService.delete поздней (soft delete, trash).
+        3) NoteService.merge_pair — ОДНОЙ транзакцией обновить раннюю заметку
+           (текст = объединённый; ре-векторизация и ре-суммаризация — штатно,
+           своими очередями; title ранней не трогается) и soft-delete поздней
+           (trash). Пул 6: единая транзакция исключает полусостояние
+           «обновлена ранняя, поздняя жива» при отказе между операциями.
 
         Отказ слияния (SummaryError, NFR-3) данные не портит: обе заметки
         остаются, работа остаётся pending — повтор по back-off summary-петли.
@@ -654,12 +701,15 @@ class BackgroundWorker:
                 continue
             try:
                 merged = self._summarizer.merge(older["text"], newer["text"])
-                updated = self._notes.update(older_id, merged)
-                if not updated.get("updated"):
+                outcome = self._notes.merge_pair(older_id, merged, note_id)
+                if not outcome["merged"]:
+                    # Ранняя исчезла (оператор удалил) между вычиткой и
+                    # сведением — слияние не состоялось, работа снимается;
+                    # поздняя при этом не трогается (merge_pair ничего не
+                    # пишет, если ранней активной заметки нет).
                     self._mark_job_done(job["id"])
                     done += 1
                     continue
-                self._notes.delete(note_id)  # поздний дубль — в trash
             except SummaryError:
                 logging.getLogger("app").warning(
                     "dedup: summarizer merge failed — both notes kept, retry queued",
@@ -917,6 +967,14 @@ class BackgroundWorker:
         его создаст триггер (Шаг 5) и переложит ретро-перекладкой. Переезд
         ставит vector_status='pending' — воркер пере-кодирует вектор в
         партицию нового неймспейса (старый вектор уходит DELETE+INSERT).
+
+        Пул 6: разметка и переезд — ОДНА транзакция (один UPDATE, guard
+        `namespace='default'`): гонка с клиентским memory_update больше не
+        оставляет полусостояния «разметка записана, переезд по старой оценке»;
+        операторский переезд в полёте фоном не перебивается (rowcount). Цель
+        авто-переезда считаем до транзакции — отказ _auto_move_target (в т.ч.
+        NamespaceValidationError на мусорном hint) ничего не пишет в БД
+        (строгая семантика «отказ классификации = не размечено»).
         """
         if self._classifier is None:
             return  # тестовый режим без классификатора
@@ -929,25 +987,41 @@ class BackgroundWorker:
                 extra={"event": "classify_failed", "note_id": note_id},
             )
             return
-        with session(self._settings) as conn, transaction(conn):
-            conn.execute(
-                "UPDATE notes SET domain_hint = ?, subdomain_hint = ?, "
-                "confidence = ?, "
-                "classified_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
-                "WHERE id = ? AND deleted_at IS NULL",
-                (result.domain_hint, result.subdomain_hint, result.confidence, note_id),
-            )
+        # Пул 6: целевой узел авто-переезда ДО транзакции — если он падает
+        # (в т.ч. NamespaceValidationError), БД не пишем вовсе.
         target = self._auto_move_target(result)
-        if (
+        move = (
             target is not None
             and result.confidence >= self._settings.namespace_auto_move_min_confidence
-        ):
-            with session(self._settings) as conn, transaction(conn):
-                conn.execute(
-                    "UPDATE notes SET namespace = ?, vector_status = 'pending' "
-                    "WHERE id = ? AND deleted_at IS NULL",
-                    (target, note_id),
-                )
+        )
+        with session(self._settings) as conn, transaction(conn):
+            # Один UPDATE: разметка + (при переезде) namespace/vector_status.
+            # Guard `namespace = 'default'`: оператор, уложивший заметку в полёте,
+            # фоном не перекладывается (rowcount 0 — переезда не было, нет и
+            # лога classified_moved).
+            columns = [
+                "domain_hint = ?",
+                "subdomain_hint = ?",
+                "confidence = ?",
+                "classified_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+            ]
+            params: list[object] = [
+                result.domain_hint,
+                result.subdomain_hint,
+                result.confidence,
+            ]
+            if move:
+                columns.append("namespace = ?")
+                columns.append("vector_status = 'pending'")
+                params.append(target)
+            cursor = conn.execute(
+                "UPDATE notes SET "
+                + ", ".join(columns)
+                + " WHERE id = ? AND namespace = 'default' AND deleted_at IS NULL",
+                (*params, note_id),
+            )
+        # Лог — только при ФАКТИЧЕСКОМ переезде (rowcount+condition).
+        if move and cursor.rowcount:
             logging.getLogger("app").info(
                 "classify: default note auto-moved into existing node",
                 extra={

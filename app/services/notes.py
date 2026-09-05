@@ -466,6 +466,70 @@ class NoteService:
             }
         return {"id": note_id, "deleted": True}
 
+    def merge_pair(
+        self,
+        older_id: int,
+        merged_text: str,
+        newer_id: int,
+    ) -> dict[str, Any]:
+        """Слить дубликаты ОДНОЙ транзакцией (пул 6): обновить раннюю заметку
+        и soft-delete позднюю.
+
+        До пула 6 воркер звал update(ранней) и delete(поздней) раздельно —
+        отказ между ними (ошибка БД) оставлял job pending → repeat снова
+        сливал бы уже обновлённую раннюю. Здесь — единая транзакция: либо
+        обе операции, либо ни одной (rollback), полусостояние исключено.
+
+        Штатный набор update-сбросов (как в update без title): текст, замена
+        чанков, vector_status='pending', сброс summary и разметки причёски,
+        updated_at; **title не трогается** (решение №9), namespace сохраняется
+        (ранняя остаётся в своём узле). Guard `deleted_at IS NULL` на обеих
+        заметках: операторский soft delete не перебивается.
+
+        Возврат — ``{"older_id", "merged", "newer_id", "deleted"}``:
+        ``merged=False``, если активной ранней заметки нет (UPDATE не
+        сматчился) — тогда ничего не пишется и поздняя НЕ удаляется.
+        Notify после транзакции. Метод внутренний (merge-путь воркера) —
+        контракты REST/MCP не меняются.
+        """
+        self._validate_text(merged_text)
+        chunks_data = self._chunks_of(merged_text)
+        with session(self._settings) as conn, transaction(conn):
+            # Ранняя: полный штатный набор update (title не трогаем, namespace
+            # сохраняется). Guard deleted_at IS NULL — операторский delete.
+            cursor = conn.execute(
+                "UPDATE notes SET text = ?, "
+                "vector_status = 'pending', "
+                "summary = '', summary_status = 'pending', "
+                "classified_at = NULL, domain_hint = NULL, "
+                "subdomain_hint = NULL, confidence = NULL, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (merged_text, older_id),
+            )
+            merged = cursor.rowcount > 0
+            deleted = False
+            if merged:
+                # Только если ранняя жива: заменяем её чанки и роняем протухший
+                # полный вектор (как update) — и лишь затем soft-delete поздней.
+                self._store_chunks(conn, older_id, chunks_data, None)
+                vectors.drop(conn, older_id)
+                cursor = conn.execute(
+                    "UPDATE notes SET deleted_at = "
+                    "strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                    "WHERE id = ? AND deleted_at IS NULL",
+                    (newer_id,),
+                )
+                deleted = cursor.rowcount > 0
+        if merged:
+            self._notify_summary_pending()
+        return {
+            "older_id": older_id,
+            "merged": merged,
+            "newer_id": newer_id,
+            "deleted": deleted,
+        }
+
     # --- NFR-4 /health ------------------------------------------------------
 
     def health_counts(self) -> dict[str, int]:

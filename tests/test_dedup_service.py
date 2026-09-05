@@ -22,6 +22,7 @@ from app.services.dedup import (
     duplicate_response,
     normalize_text,
 )
+from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
 from app.storage import vectors
 from app.storage.db import init_db, session, transaction
@@ -278,3 +279,94 @@ def test_find_candidates_trash_does_not_consume_top_n(dim8, notes) -> None:
 def test_find_candidates_empty_bank(dim8) -> None:
     """Банк векторов пуст — кандидатов нет."""
     assert DeduplicationService(dim8).find_candidates(E1) == []
+
+
+# --- атомарное сведение: NoteService.merge_pair (пул 6) -----------------------
+
+
+def test_merge_pair_updates_earlier_deletes_later_atomically(dim8, notes) -> None:
+    """Пул 6: merge_pair ОДНОЙ транзакцией пишет обновление ранней и soft delete
+    поздней; штатный набор сбросов; namespace/title ранней сохраняются."""
+    first = notes.save("первая заметка пары")
+    second = notes.save("вторая заметка пары")
+    outcome = notes.merge_pair(
+        first["id"], "Объединённый текст пары.", second["id"]
+    )
+    assert outcome == {
+        "older_id": first["id"],
+        "merged": True,
+        "newer_id": second["id"],
+        "deleted": True,
+    }
+    with session(dim8) as conn:
+        rows = conn.execute(
+            "SELECT id, text, vector_status, summary_status, deleted_at, title "
+            "FROM notes ORDER BY id"
+        ).fetchall()
+    assert rows[0]["text"] == "Объединённый текст пары."
+    assert rows[0]["vector_status"] == "pending"  # ре-векторизация фоном
+    assert rows[0]["summary_status"] == "pending"  # ре-суммаризация фоном
+    assert rows[0]["deleted_at"] is None  # ранняя жива, title не тронут
+    assert rows[1]["deleted_at"] is not None  # поздняя в trash
+    assert rows[1]["id"] == second["id"]
+
+
+def test_merge_pair_preserves_namespace(dim8, notes) -> None:
+    """Пул 6: namespace ранней сохраняется (merge_pair не трогает узел)."""
+    NamespaceService(dim8).create("work", "Рабочие заметки.")
+    first = notes.save("первая в узле work", namespace="work")
+    second = notes.save("вторая в default")
+    outcome = notes.merge_pair(first["id"], "Слитый текст в узле work.", second["id"])
+    assert outcome["merged"] is True and outcome["deleted"] is True
+    with session(dim8) as conn:
+        rows = conn.execute(
+            "SELECT id, namespace, deleted_at FROM notes ORDER BY id"
+        ).fetchall()
+    assert rows[0]["namespace"] == "work"  # namespace ранней сохраняется
+    assert rows[0]["deleted_at"] is None
+    assert rows[1]["deleted_at"] is not None
+
+
+def test_merge_pair_injection_failure_rolls_back(dim8, notes, monkeypatch) -> None:
+    """Пул 6: отказ внутри транзакции (monkeypatch _store_chunks → raise) →
+    rollback: текст ранней НЕ изменился И поздняя НЕ удалена — полусостояние
+    сведения исключено."""
+    first_text = "первая заметка пары"
+    first = notes.save(first_text)
+    second = notes.save("вторая заметка пары")
+
+    def boom(conn, note_id, chunks_data, note_vector):
+        raise RuntimeError("инжектированный отказ записи чанков")
+
+    monkeypatch.setattr(notes, "_store_chunks", boom)
+    with pytest.raises(RuntimeError):
+        notes.merge_pair(
+            first["id"], "СЛИТЫЙ ТЕКСТ, НЕ ДОЛЖЕН СОХРАНИТЬСЯ", second["id"]
+        )
+    with session(dim8) as conn:
+        rows = conn.execute(
+            "SELECT id, text, deleted_at FROM notes ORDER BY id"
+        ).fetchall()
+    assert rows[0]["text"] == first_text  # ранняя не изменилась (rollback)
+    assert rows[0]["deleted_at"] is None
+    assert rows[1]["deleted_at"] is None  # поздняя не удалена (rollback)
+
+
+def test_merge_pair_missing_older_is_noop(dim8, notes) -> None:
+    """Пул 6: ранней активной заметки нет → merged=False, ничего не пишется,
+    поздняя НЕ удаляется (воркер снимает работу после этого)."""
+    second = notes.save("вторая заметка пары без первой")
+    outcome = notes.merge_pair(9999, "текст слияния", second["id"])
+    assert outcome == {
+        "older_id": 9999,
+        "merged": False,
+        "newer_id": second["id"],
+        "deleted": False,
+    }
+    with session(dim8) as conn:
+        row = conn.execute(
+            "SELECT text, deleted_at FROM notes WHERE id = ?",
+            (second["id"],),
+        ).fetchone()
+    assert row["text"] == "вторая заметка пары без первой"
+    assert row["deleted_at"] is None

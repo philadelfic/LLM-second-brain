@@ -937,3 +937,110 @@ def test_process_pending_respects_embedding_batch_size(
     assert embedder.batch_sizes == [3]
     assert worker.process_pending() == 2  # остаток — следующая подъёмка
     assert embedder.batch_sizes == [3, 2]
+
+
+# --- пул 6: потерянный будильник (lost wakeup) --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_summary_loop_rechecks_queue_before_sleep(slow) -> None:
+    """Пул 6 (lost wakeup): notify, пришедший ВО ВРЕМЯ обработки партии, не
+    теряется — перед `clear()+wait` петля перепроверяет очередь
+    (_summary_queue_empty) и продолжает без ожидания интервала."""
+    worker = make_worker(slow, FailingEmbedder(), FixedSummarizer("Суммари цикла."))
+    real_batch = worker.process_summary_pending
+    inserted = False
+
+    def racy_batch(limit=None):
+        nonlocal inserted
+        result = real_batch(limit)
+        if not inserted:
+            inserted = True
+            # «notify пришёл во время выгребания»: очередь на момент чтения была
+            # пуста (вернёт 0), но в процессе добавилась заметка + сигнал.
+            NoteService(slow, FailingEmbedder()).save(
+                "заметка, добавленная прямо во время обработки партии",
+                title="Новая заметка",
+            )
+            worker.notify_summary_pending()
+        return result
+
+    worker.process_summary_pending = racy_batch
+    orig_wait_for = asyncio.wait_for
+
+    def spy_wait_for(coro, timeout=None, *args, **kwargs):
+        # Петля не должна спать, пока в очереди есть необработанная работа.
+        with session(slow) as conn:
+            pending = conn.execute(
+                "SELECT 1 FROM notes WHERE id = 1 AND "
+                "(title IS NULL OR summary_status = 'pending')"
+            ).fetchone()
+        if pending:
+            raise AssertionError("summary loop slept with pending work (lost wakeup)")
+        return orig_wait_for(coro, timeout, *args, **kwargs)
+
+    asyncio.wait_for = spy_wait_for
+    try:
+        task = asyncio.create_task(worker._run_summary())
+        status = None
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with session(slow) as conn:
+                row = conn.execute(
+                    "SELECT summary_status FROM notes WHERE id = 1"
+                ).fetchone()
+            if row is not None and row["summary_status"] == "ok":
+                status = row["summary_status"]
+                break
+            await asyncio.sleep(0.01)
+        worker.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert status == "ok"  # догонка без сна; иначе AssertionError в spy
+    finally:
+        asyncio.wait_for = orig_wait_for
+
+
+@pytest.mark.asyncio
+async def test_judge_loop_rechecks_queue_before_sleep(slow) -> None:
+    """Пул 6 (lost wakeup) для judge-петли: notify во время обработки партии
+    не теряется — перед сном перепроверка очереди (_judge_queue_empty)."""
+    worker = make_worker(slow, HashEmbedder(8))
+    calls = {"n": 0}
+
+    def racy_batch(limit=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # notify пришёл, пока петля выгребала (очередь на чтении пуста, 0),
+            # — добавляем judge-работу + сигнал.
+            worker._create_job("judge", "dedup", 999)
+            worker.notify_judge_pending()
+        return 0
+
+    worker.process_judge_pending = racy_batch
+    orig_wait_for = asyncio.wait_for
+
+    def spy_wait_for(coro, timeout=None, *args, **kwargs):
+        with session(slow) as conn:
+            pending_jobs = conn.execute(
+                "SELECT COUNT(*) FROM worker_jobs WHERE "
+                "slot = 'judge' AND kind = 'dedup' AND status = 'pending'"
+            ).fetchone()[0]
+        if pending_jobs:
+            raise AssertionError("judge loop slept with pending work (lost wakeup)")
+        return orig_wait_for(coro, timeout, *args, **kwargs)
+
+    asyncio.wait_for = spy_wait_for
+    try:
+        task = asyncio.create_task(worker._run_judge())
+        # петля продолжила БЕЗ сна: повторная итерация наступает сразу.
+        while calls["n"] < 3:
+            await asyncio.sleep(0.01)
+        worker.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert calls["n"] >= 3
+    finally:
+        asyncio.wait_for = orig_wait_for
