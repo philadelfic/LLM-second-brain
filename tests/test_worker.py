@@ -131,6 +131,77 @@ def test_process_respects_limit(settings) -> None:
     assert worker.process_pending() == 0
 
 
+class MidFlightUpdateEmbedder(HashEmbedder):
+    """Фейк-гонка: пока воркер кодирует партию, одна заметка обновляется
+    (пул 1, аналог MidFlightUpdateSummarizer для embedding-петли)."""
+
+    def __init__(self, dim: int, notes_service, note_id: int, new_text: str) -> None:
+        super().__init__(dim)
+        self._notes = notes_service
+        self._note_id = note_id
+        self._new_text = new_text
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        result = super().embed_texts(texts)
+        self._notes.update(self._note_id, self._new_text)  # текст меняется здесь
+        return result
+
+
+def test_process_pending_race_with_update(settings) -> None:
+    """Гонка с memory_update: протухший вектор не пишется, judge-работа не
+    создаётся; остальные заметки партии довекторизованы штатно (пул 1)."""
+    notes = NoteService(settings, FailingEmbedder())
+    notes.save("старый текст, который изменят во время кодирования")
+    notes.save("вторая заметка партии, не тронутая гонкой")
+    racy = MidFlightUpdateEmbedder(
+        8, notes, 1, "новый текст, записанный прямо во время кодирования"
+    )
+    worker = make_worker(settings, racy)
+    assert worker.process_pending() == 1  # только вторая фактически довекторизована
+    with session(settings) as conn:
+        row1 = conn.execute("SELECT * FROM notes WHERE id = 1").fetchone()
+        assert row1["vector_status"] == "pending"  # гонка: осталась pending
+        assert vectors.get_vector(conn, 1) is None  # протухшего вектора нет
+        row2 = conn.execute("SELECT * FROM notes WHERE id = 2").fetchone()
+        assert row2["vector_status"] == "ok"
+        assert vectors.get_vector(conn, 2) is not None
+        # judge-работа только для фактически довекторизованной (id=2)
+        jobs = conn.execute(
+            "SELECT note_id FROM worker_jobs "
+            "WHERE slot='judge' AND kind='dedup' ORDER BY note_id"
+        ).fetchall()
+        assert [j["note_id"] for j in jobs] == [2]
+
+
+def test_process_pending_race_retry_vectorizes_new_text(settings) -> None:
+    """Повтор: следующая партия кодирует новый текст → ok, вектор нового
+    текста, judge-работа создана (пул 1)."""
+    notes = NoteService(settings, FailingEmbedder())
+    notes.save("старый текст, который изменят во время кодирования")
+    notes.save("вторая заметка партии, не тронутая гонкой")
+    racy = MidFlightUpdateEmbedder(
+        8, notes, 1, "новый текст, записанный прямо во время кодирования"
+    )
+    worker = make_worker(settings, racy)
+    worker.process_pending()  # первая гонка: id=1 осталась pending
+    # повтор: id=1 кодируется уже по новому тексту
+    assert worker.process_pending() == 1
+    with session(settings) as conn:
+        row = conn.execute("SELECT * FROM notes WHERE id = 1").fetchone()
+        assert row["vector_status"] == "ok"
+        assert vectors.get_vector(conn, 1) == pytest.approx(
+            HashEmbedder(8).embed(
+                "новый текст, записанный прямо во время кодирования"
+            ),
+            abs=1e-6,
+        )
+        jobs = conn.execute(
+            "SELECT note_id FROM worker_jobs "
+            "WHERE slot='judge' AND kind='dedup' ORDER BY note_id"
+        ).fetchall()
+        assert [j["note_id"] for j in jobs] == [1, 2]
+
+
 # --- back-off ----------------------------------------------------------------
 
 

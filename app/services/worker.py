@@ -49,9 +49,11 @@ Garanties:
 Запись суммари защищена от гонки с memory_update: между вычиткой текста и
 записью воркер мог получить обновлённый текст — UPDATE ограничен условием
 `AND text = ?` (тот же текст; иначе суммари протухшего текста затёрло бы
-свежий). В векторизации (Фаза 3) ре-векторизация синхронна в update —
-вектор пишется по актуальному на момент записи тексту; расхождение «текст
-менялся между вычиткой и записью» чинится следующей партией.
+свежий). Векторизация защищена так же (пул 1): notes-петля пишет вектор
+только при неизменных с вычитки (id, text, namespace, vector_status) —
+guard-UPDATE в той же транзакции; протухшая партия не пишется, повтор —
+следующей партией (аналог `AND text = ?` у суммари и
+`upsert_vector_if_exists` у чанков).
 
 Чанковая очередь (Фаза 7) закрывает обе проблемы:
 - reuse единичного чанка (brief §6): у заметки с ровно одним чанком
@@ -346,11 +348,15 @@ class BackgroundWorker:
         """Векторизовать одну партию pending; возвращает число обработанных.
 
         Отказ кодирования — 0: статусы не тронуты, воркер выждет back-off.
-        После каждой довекторизации создаётся judge-работа (дедуп) в очередь
-        слота judge (решение №10): судья опрашивается только по готовому
-        вектору — диспетчер зависимостей. Само сведение дублей — в
-        judge-петле (process_judge_pending) и summary-петле
-        (process_merge_pending).
+        Guard (пул 1): вектор пишется только при неизменных с вычитки
+        (id, text, namespace, vector_status='pending') — иначе
+        memory_update/переезд в полёте оставил бы протухший вектор со
+        статусом 'ok'. Промахнувшиеся остаются pending → следующая партия
+        перекодирует новый текст. После каждой фактической довекторизации
+        создаётся judge-работа (дедуп) в очередь слота judge (решение №10):
+        судья опрашивается только по готовому вектору — диспетчер
+        зависимостей. Само сведение дублей — в judge-петле
+        (process_judge_pending) и summary-петле (process_merge_pending).
         """
         with session(self._settings) as conn:
             rows = conn.execute(
@@ -365,15 +371,25 @@ class BackgroundWorker:
             embeddings = self._embedding.embed_texts([row["text"] for row in rows])
         except EmbeddingError:
             return 0
-        processed = len(rows)
+        processed = 0
         for row, vector in zip(rows, embeddings):
             with session(self._settings) as conn, transaction(conn):
+                # Guard (пул 1): вектор — только если заметка не менялась с
+                # вычитки (id, text, namespace, vector_status='pending') —
+                # иначе memory_update/переезд в полёте оставил бы протухший
+                # вектор со статусом 'ok'. Промахнувшиеся остаются pending →
+                # следующая партия перекодирует новый текст.
+                cursor = conn.execute(
+                    "UPDATE notes SET vector_status = 'ok' "
+                    "WHERE id = ? AND text = ? AND namespace = ? "
+                    "AND vector_status = 'pending'",
+                    (row["id"], row["text"], row["namespace"]),
+                )
+                if not cursor.rowcount:
+                    continue
                 # Фаза 10: вектор пишется в партицию неймспейса заметки.
                 vectors.upsert(conn, row["id"], vector, row["namespace"])
-                conn.execute(
-                    "UPDATE notes SET vector_status = 'ok' WHERE id = ?",
-                    (row["id"],),
-                )
+                processed += 1
             # Фаза 11 (решение №10): вектор готов — judge-работа (дедуп)
             # в очередь слота judge; диспетчер зависимостей.
             self._create_job("judge", "dedup", int(row["id"]))
