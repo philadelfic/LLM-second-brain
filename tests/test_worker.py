@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fakes import (
@@ -30,7 +32,7 @@ from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
 from app.services.worker import MAX_INTERVAL_SEC, BackgroundWorker, next_interval
 from app.storage import vectors
-from app.storage.db import init_db, session
+from app.storage.db import init_db, session, transaction
 
 
 @pytest.fixture
@@ -823,3 +825,115 @@ async def test_summary_loop_survives_unexpected_failure(fast) -> None:
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
+
+
+# --- пул 5: гигиена worker_jobs (индекс, ретеншн, единократное DDL) ----------
+
+
+def _jobs_ts(days_ago: float) -> str:
+    """Timestamp в формате worker_jobs.updated_at, сдвинутый на days_ago суток."""
+    moment = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _seed_worker_job(
+    settings, note_id: int, status: str, updated_at: str, kind: str = "merge"
+) -> None:
+    """Вставить строку worker_jobs с явным status/updated_at."""
+    with session(settings) as conn, transaction(conn):
+        conn.execute(
+            "INSERT INTO worker_jobs (slot, kind, note_id, status, updated_at) "
+            "VALUES ('summary', ?, ?, ?, ?)",
+            (kind, note_id, status, updated_at),
+        )
+
+
+def test_ensure_job_table_creates_queue_index_once(settings) -> None:
+    """Пул 5: после _ensure_job_table индекс worker_jobs присутствует
+    в sqlite_master; повторный вызов не создаёт дублей."""
+    worker = make_worker(settings, HashEmbedder(8))
+    worker._ensure_job_table()
+    with session(settings) as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_worker_jobs_queue'"
+        ).fetchall()
+        assert [row["name"] for row in rows] == ["idx_worker_jobs_queue"]
+    worker._ensure_job_table()  # повторный вызов — IF NOT EXISTS, дублей нет
+    with session(settings) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_worker_jobs_queue'"
+        ).fetchone()[0]
+        assert count == 1
+
+
+def test_purge_done_jobs_removes_only_stale_done(settings, caplog) -> None:
+    """Пул 5: ретеншн — очищаются только done-работы старше 7 суток;
+    свежие done и pending не трогаются; событие jobs_purged в логе."""
+    worker = make_worker(settings, HashEmbedder(8))
+    worker._ensure_job_table()
+    _seed_worker_job(settings, 1, "done", _jobs_ts(8))      # старая done → удалить
+    _seed_worker_job(settings, 2, "done", _jobs_ts(0))      # свежая done → оставить
+    _seed_worker_job(settings, 3, "pending", _jobs_ts(8))   # старый pending → оставить
+    with caplog.at_level(logging.INFO, logger="app"):
+        worker._purge_done_jobs()
+    with session(settings) as conn:
+        remaining = conn.execute(
+            "SELECT note_id, status FROM worker_jobs ORDER BY note_id"
+        ).fetchall()
+    assert [(row["note_id"], row["status"]) for row in remaining] == [
+        (2, "done"),
+        (3, "pending"),
+    ]
+    purged = [
+        r for r in caplog.records if getattr(r, "event", None) == "jobs_purged"
+    ]
+    assert purged and purged[-1].count == 1  # удалена ровно одна (старая done)
+
+
+def test_purge_done_jobs_noop_when_nothing_stale(settings, caplog) -> None:
+    """Пул 5: нет старых done — jobs_purged не логируется, строки целы."""
+    worker = make_worker(settings, HashEmbedder(8))
+    worker._ensure_job_table()
+    _seed_worker_job(settings, 1, "done", _jobs_ts(0))
+    with caplog.at_level(logging.INFO, logger="app"):
+        worker._purge_done_jobs()
+    with session(settings) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM worker_jobs"
+        ).fetchone()[0] == 1
+    assert not [
+        r for r in caplog.records if getattr(r, "event", None) == "jobs_purged"
+    ]
+
+
+class BatchRecordEmbedder(HashEmbedder):
+    """Хэш-кодировщик, фиксирующий размеры подъёмок embed_texts."""
+
+    def __init__(self, dim: int = 8) -> None:
+        super().__init__(dim)
+        self.batch_sizes: list[int] = []
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        self.batch_sizes.append(len(texts))
+        return super().embed_texts(texts)
+
+
+def test_process_pending_respects_embedding_batch_size(
+    settings, monkeypatch
+) -> None:
+    """Пул 5: notes-петля без явного limit режется по EMBEDDING_BATCH_SIZE
+    (а не фиксированной константой): подъёмки ровно по настроенному batch."""
+    monkeypatch.setenv("EMBEDDING_BATCH_SIZE", "3")
+    get_settings.cache_clear()
+    small = get_settings()  # тот же DB_PATH, batch=3
+    notes = NoteService(small, FailingEmbedder())
+    for number in range(5):
+        notes.save(f"заметка {number} для batch notes-петли")
+    embedder = BatchRecordEmbedder(8)
+    worker = make_worker(small, embedder)
+    assert worker.process_pending() == 3  # первая подъёмка ровно по batch
+    assert embedder.batch_sizes == [3]
+    assert worker.process_pending() == 2  # остаток — следующая подъёмка
+    assert embedder.batch_sizes == [3, 2]

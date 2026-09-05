@@ -93,9 +93,10 @@ from app.services.summary import Summarizer, SummaryError
 from app.storage import chunks, vectors
 from app.storage.db import session, transaction
 
-# Заметок за один прогон (embed_texts — batch; summary — по одной, модель
-# суммаризации тяжёлая): очередь выгребается последовательными партиями.
-PENDING_BATCH = 50
+# Сколько хранить выполненные done-работы в worker_jobs (retention). Не env —
+# по паттерну TITLE_MAX_WORDS: после этого срока работы вычищаются idle-веткой
+# embedding-петли (_purge_done_jobs), очередь не растёт безгранично.
+WORKER_JOBS_RETENTION_DAYS = 7
 
 # Потолок back-off (REQUIREMENTS §5.3 «max 15 мин»), env не настраивается.
 MAX_INTERVAL_SEC = 15 * 60
@@ -164,6 +165,11 @@ class BackgroundWorker:
         # Сигнал «появилась judge-работа» — будит judge-петлю (embedding-петля
         # создала дедуп-работу после довекторизации).
         self._judge_event = asyncio.Event()
+        # Мемоизация создания таблицы job-очередей (пул 5): DDL исполняется
+        # один раз на экземпляр воркера, а не при каждом обращении к очередям
+        # (_create_job/_pending_jobs/_mark_job_done звали _ensure_job_table
+        # на каждый вызов — 3 раза на работу).
+        self._jobs_table_ready = False
         # Job-очереди по слотам (Фаза 11, решение №10): таблица создаётся
         # воркером лениво при первом обращении к очередям (схема — зона
         # воркера, не db.py). В __init__ не создаём: воркер собирается в
@@ -236,6 +242,9 @@ class BackgroundWorker:
                         self._settings.pending_retry_sec
                     )  # успех — сброс
                     continue
+                # Idle-ветка (пул 5): работ нет — гигиена worker_jobs
+                # (done-старше retention вычищаются) перед сном.
+                await asyncio.to_thread(self._purge_done_jobs)
                 await asyncio.sleep(self._vector_interval)
                 self._vector_interval = next_interval(
                     self._vector_interval, self._settings.pending_retry_sec
@@ -332,11 +341,20 @@ class BackgroundWorker:
     # --- job-очереди по слотам (Фаза 11, решение №10) -------------------------
 
     def _ensure_job_table(self) -> None:
-        """Создать таблицу job-очередей (идемпотентно).
+        """Создать таблицу + индекс job-очередей (идемпотентно, один раз).
 
         Схема — зона воркера (не db.py): job-очереди по слотам — внутренняя
         механика фонового конвейера, диспетчер зависимостей между петлями.
+
+        Пул 5, единократное создание: полный DDL исполняется только при
+        первом обращении на экземпляр воркера (мемоизация на флаге
+        `_jobs_table_ready`); повторные вызовы (3 штуки на каждую работу:
+        `_create_job`, `_pending_jobs`, `_mark_job_done`) возвращаются сразу.
+        Индекс `idx_worker_jobs_queue` на (slot, kind, status, id): выборка
+        pending-очереди слота — по индексу, а не полным сканом таблицы.
         """
+        if self._jobs_table_ready:
+            return
         with session(self._settings) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS worker_jobs ("
@@ -351,6 +369,38 @@ class BackgroundWorker:
                 "  updated_at TEXT NOT NULL DEFAULT "
                 "    (strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
                 ")"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_worker_jobs_queue "
+                "ON worker_jobs(slot, kind, status, id)"
+            )
+        self._jobs_table_ready = True
+
+    def _purge_done_jobs(self) -> None:
+        """Вычистить done-работы старше retention-окна (пул 5, гигиена).
+
+        worker_jobs копит ≥1 строку на каждую заметку (при пере-векторизациях
+        после update — больше); без чистки таблица и полные сканы очереди
+        росли бы безгранично. DELETE ограничен `status = 'done'` и
+        `updated_at` старше WORKER_JOBS_RETENTION_DAYS — pending-работы не
+        трогаются. Вызывается в idle-ветке embedding-петли (когда работ нет,
+        перед сном). Удалено > 0 → info-лог event `jobs_purged`.
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn, transaction(conn):
+            cursor = conn.execute(
+                "DELETE FROM worker_jobs WHERE status = 'done' AND updated_at < "
+                "strftime('%Y-%m-%dT%H:%M:%SZ','now',"
+                f"'-{WORKER_JOBS_RETENTION_DAYS} days')"
+            )
+        if cursor.rowcount > 0:
+            logging.getLogger("app").info(
+                "worker_jobs: purged done jobs older than retention window",
+                extra={
+                    "event": "jobs_purged",
+                    "count": cursor.rowcount,
+                    "retention_days": WORKER_JOBS_RETENTION_DAYS,
+                },
             )
 
     def _create_job(
@@ -391,8 +441,12 @@ class BackgroundWorker:
 
     # --- синхронная работа (выполняется в to_thread) --------------------------
 
-    def process_pending(self, limit: int = PENDING_BATCH) -> int:
+    def process_pending(self, limit: int | None = None) -> int:
         """Векторизовать одну партию pending; возвращает число обработанных.
+
+        Размер партии по умолчанию — settings.embedding_batch_size (пул 5:
+        notes-петля режется по EMBEDDING_BATCH_SIZE, как и чанковая
+        process_pending_chunks); явный `limit` переопределяет.
 
         Отказ кодирования — 0: статусы не тронуты, воркер выждет back-off.
         Guard (пул 1): вектор пишется только при неизменных с вычитки
@@ -405,12 +459,15 @@ class BackgroundWorker:
         зависимостей. Само сведение дублей — в judge-петле
         (process_judge_pending) и summary-петле (process_merge_pending).
         """
+        batch = (
+            limit if limit is not None else self._settings.embedding_batch_size
+        )
         with session(self._settings) as conn:
             rows = conn.execute(
                 "SELECT id, text, namespace FROM notes "
                 "WHERE vector_status = 'pending' AND deleted_at IS NULL "
                 "ORDER BY id LIMIT ?",
-                (limit,),
+                (batch,),
             ).fetchall()
         if not rows:
             return 0
@@ -445,7 +502,7 @@ class BackgroundWorker:
 
     # --- judge-петля: судья дедупа (Фаза 8, Этап 3.2; Фаза 11, решение №10) ---
 
-    def process_judge_pending(self, limit: int = PENDING_BATCH) -> int:
+    def process_judge_pending(self, limit: int | None = None) -> int:
         """Обработать партию judge-работ (дедуп); число обработанных.
 
         По каждой judge-работе (создана после довекторизации заметки):
@@ -457,7 +514,11 @@ class BackgroundWorker:
         остаётся pending, повтор по back-off judge-петли (NFR-3: обе заметки
         целы). Протухшая заметка (удалена/вектор не готов) — работа снимается.
         """
-        jobs = self._pending_jobs("judge", "dedup", limit)
+        jobs = self._pending_jobs(
+            "judge",
+            "dedup",
+            limit if limit is not None else self._settings.embedding_batch_size,
+        )
         if not jobs:
             return 0
         done = 0
@@ -537,7 +598,7 @@ class BackgroundWorker:
 
     # --- summary-петля: merge-работа (слияние дублей, Этап 2.2) --------------
 
-    def process_merge_pending(self, limit: int = PENDING_BATCH) -> int:
+    def process_merge_pending(self, limit: int | None = None) -> int:
         """Обработать партию merge-работ (слияние дублей); число обработанных.
 
         Merge-работа создана judge-петлёй после вердикта судьи (решение №10:
@@ -555,7 +616,11 @@ class BackgroundWorker:
         """
         if self._summarizer is None:
             return 0  # тестовый режим без суммаризатора: слияние невозможно
-        jobs = self._pending_jobs("summary", "merge", limit)
+        jobs = self._pending_jobs(
+            "summary",
+            "merge",
+            limit if limit is not None else self._settings.embedding_batch_size,
+        )
         if not jobs:
             return 0
         done = 0
@@ -714,7 +779,7 @@ class BackgroundWorker:
 
     # --- summary-петля: title-догенерация (решение №9) -----------------------
 
-    def process_title_pending(self, limit: int = PENDING_BATCH) -> int:
+    def process_title_pending(self, limit: int | None = None) -> int:
         """Догенерировать названия миграционных заметок (title IS NULL).
 
         Только миграционные заметки (новые всегда с title — контракт решения
@@ -727,12 +792,15 @@ class BackgroundWorker:
         """
         if self._summarizer is None:
             return 0
+        batch = (
+            limit if limit is not None else self._settings.embedding_batch_size
+        )
         with session(self._settings) as conn:
             rows = conn.execute(
                 "SELECT id, text FROM notes "
                 "WHERE title IS NULL AND deleted_at IS NULL "
                 "ORDER BY id LIMIT ?",
-                (limit,),
+                (batch,),
             ).fetchall()
         done = 0
         for row in rows:
@@ -770,7 +838,7 @@ class BackgroundWorker:
         words = text.split()
         return " ".join(words[:TITLE_MAX_WORDS])
 
-    def process_summary_pending(self, limit: int = PENDING_BATCH) -> int:
+    def process_summary_pending(self, limit: int | None = None) -> int:
         """Досуммировать одну партию pending; число до 'ok' доведённых.
 
         Режим «Б» (§5.5): генерация — только здесь, по заметкам из очереди.
@@ -784,12 +852,15 @@ class BackgroundWorker:
         """
         if self._summarizer is None:
             return 0
+        batch = (
+            limit if limit is not None else self._settings.embedding_batch_size
+        )
         with session(self._settings) as conn:
             rows = conn.execute(
                 "SELECT id, text, namespace, classified_at FROM notes "
                 "WHERE summary_status = 'pending' AND deleted_at IS NULL "
                 "ORDER BY id LIMIT ?",
-                (limit,),
+                (batch,),
             ).fetchall()
         done = 0
         for row in rows:
