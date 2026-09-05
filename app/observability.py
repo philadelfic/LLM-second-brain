@@ -15,7 +15,9 @@
 - **Приватность (NFR-4)**: содержимое заметок в логи НЕ пишется —
   `log_tool_call` принимает только агрегаты (число результатов, длину
   текста `note_chars`, id, флаги); поисковые запросы — обрезка `preview`
-  до 80 символов (это запрос, а не заметка).
+  до 80 символов (это запрос, а не заметка). uvicorn access-лог — второй
+  канал: `AccessQueryTruncate` режет query-часть full_path до тех же 80
+  символов, чтобы полный query string не попадал в JSON-лог.
 
 `latency_ms` — `perf_counter()` (монотонные часы, не wall time).
 """
@@ -46,6 +48,30 @@ _RESERVED_FIELDS = frozenset(
         "color_message",
     }
 )
+
+
+class AccessQueryTruncate(logging.Filter):
+    """Обрезает query-часть full_path в uvicorn.access до QUERY_PREVIEW_CHARS.
+
+    uvicorn.access кладёт в record.args кортеж
+    `(client_addr, method, full_path, http_version, status)`; full_path может
+    содержать полный query string. NFR-4 требует превью запросов ≤80 символов
+    — режем только query, путь сохраняем. Записи без query (или не-доступа)
+    не меняются.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not isinstance(args, tuple) or len(args) < 3:
+            return True
+        full_path = args[2]
+        if not isinstance(full_path, str) or "?" not in full_path:
+            return True
+        path, _, query = full_path.partition("?")
+        if len(query) <= QUERY_PREVIEW_CHARS:
+            return True
+        record.args = args[:2] + (f"{path}?{query[:QUERY_PREVIEW_CHARS]}",) + args[3:]
+        return True
 
 
 class JsonFormatter(logging.Formatter):
@@ -101,10 +127,14 @@ def uvicorn_log_config(level: str) -> dict[str, object]:
         "formatters": {
             "json": {"()": f"{__name__}.JsonFormatter"},
         },
+        "filters": {
+            "access_query_truncate": {"()": f"{__name__}.AccessQueryTruncate"},
+        },
         "handlers": {
             "stdout": {
                 "class": "logging.StreamHandler",
                 "formatter": "json",
+                "filters": ["access_query_truncate"],
                 "stream": "ext://sys.stdout",
             },
         },

@@ -33,6 +33,7 @@ from mcp.client.streamable_http import (
 
 from app.observability import (
     QUERY_PREVIEW_CHARS,
+    AccessQueryTruncate,
     JsonFormatter,
     log_tool_call,
     preview,
@@ -104,6 +105,48 @@ class TestPreview:
 
     def test_short_query_untouched(self) -> None:
         assert preview("короткий запрос") == "короткий запрос"
+
+
+class TestAccessQueryTruncate:
+    """Фильтр uvicorn.access: query-часть full_path режется до 80 символов."""
+
+    def _access_record(self, full_path: str) -> logging.LogRecord:
+        record = make_record('%s - "%s %s HTTP/%s" %d')
+        record.args = ("127.0.0.1", "GET", full_path, "1.1", 200)
+        return record
+
+    def test_long_query_truncated_in_formatted_json(self) -> None:
+        record = self._access_record(f"/search?q={'ф' * 200}")
+        AccessQueryTruncate().filter(record)
+        payload = json.loads(JsonFormatter().format(record))
+        message = payload["message"]
+        assert "/search?q=" in message
+        logged_query = message.split("/search?", 1)[1].split(" HTTP/", 1)[0]
+        assert len(logged_query) == QUERY_PREVIEW_CHARS == 80
+
+    def test_path_preserved_when_query_truncated(self) -> None:
+        record = self._access_record(f"/search?q={'ф' * 200}")
+        AccessQueryTruncate().filter(record)
+        assert record.args[2].startswith("/search?q=")
+        assert len(record.args[2].split("?", 1)[1]) == QUERY_PREVIEW_CHARS
+
+    def test_no_query_unchanged(self) -> None:
+        record = self._access_record("/health")
+        AccessQueryTruncate().filter(record)
+        assert record.args[2] == "/health"
+
+    def test_short_query_unchanged(self) -> None:
+        record = self._access_record("/search?q=short")
+        AccessQueryTruncate().filter(record)
+        assert record.args[2] == "/search?q=short"
+
+    def test_other_fields_preserved(self) -> None:
+        record = self._access_record(f"/search?q={'ф' * 200}")
+        AccessQueryTruncate().filter(record)
+        assert record.args[0] == "127.0.0.1"
+        assert record.args[1] == "GET"
+        assert record.args[3] == "1.1"
+        assert record.args[4] == 200
 
 
 class TestLogToolCall:

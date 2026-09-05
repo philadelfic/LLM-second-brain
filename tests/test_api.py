@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.config import get_settings
 from app.main import create_app
+from app.transport.auth import BearerAuthMiddleware
 
 
 class TestHealth:
@@ -109,3 +110,61 @@ class TestStartup:
         stderr = capsys.readouterr().err
         assert "FATAL" in stderr
         assert "mcp_auth_token" in stderr  # сообщение называет переменную
+
+
+class TestNonAsciiBearerMiddleware:
+    """Не-ASCII значение в Bearer — 401, не 500 (прямой вызов ASGI-миддлвари).
+
+    TestClient/httpx не даёт отправить не-ASCII заголовок (кодирует в ASCII),
+    поэтому проверяем миддлварь напрямую через ASGI-scope с байтовыми
+    заголовками — как её видит реальный сервер.
+    """
+
+    @staticmethod
+    def _scope(headers: list[tuple[bytes, bytes]]) -> dict:
+        return {
+            "type": "http",
+            "path": "/notes",
+            "method": "GET",
+            "headers": headers,
+            "query_string": b"",
+            "scheme": "http",
+            "server": ("test", 80),
+            "client": ("test", 123),
+        }
+
+    @staticmethod
+    async def _app(scope: dict, receive: object, send: object) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def _status(self, middleware: BearerAuthMiddleware, scope: dict) -> int:
+        status: dict[str, int] = {}
+
+        async def send(message: dict) -> None:
+            if message["type"] == "http.response.start":
+                status["code"] = message["status"]
+
+        async def receive() -> dict:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        await middleware(scope, receive, send)
+        return status["code"]
+
+    @pytest.mark.asyncio
+    async def test_non_ascii_bearer_401(self) -> None:
+        middleware = BearerAuthMiddleware(self._app, "correct-token", frozenset())
+        scope = self._scope([(b"authorization", "Bearer ñ".encode("utf-8"))])
+        assert await self._status(middleware, scope) == 401
+
+    @pytest.mark.asyncio
+    async def test_correct_ascii_token_200(self) -> None:
+        middleware = BearerAuthMiddleware(self._app, "correct-token", frozenset())
+        scope = self._scope([(b"authorization", b"Bearer correct-token")])
+        assert await self._status(middleware, scope) == 200
+
+    @pytest.mark.asyncio
+    async def test_empty_bearer_401(self) -> None:
+        middleware = BearerAuthMiddleware(self._app, "correct-token", frozenset())
+        scope = self._scope([(b"authorization", b"Bearer")])
+        assert await self._status(middleware, scope) == 401

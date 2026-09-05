@@ -5,7 +5,9 @@
 
 Реализация — чистый ASGI-миддлварь (без BaseHTTPMiddleware): не вмешивается
 в стриминг ответов, что критично для MCP Streamable HTTP (SSE-потоки).
-Сравнение токена — `secrets.compare_digest` (timing-safe).
+Сравнение токена — `secrets.compare_digest` (timing-safe) по байтам: так
+не-ASCII значение в заголовке (например, `Bearer ñ`) обрабатывается штатно
+(несовпадение → 401), а не роняет миддлварь TypeError-ом.
 """
 
 from __future__ import annotations
@@ -41,7 +43,9 @@ class BearerAuthMiddleware:
         authorization = Headers(scope=scope).get("Authorization", "")
         scheme, _, value = authorization.partition(" ")
         # Схема нечувствительна к регистру (RFC 7235); значение — чувствительно.
-        if scheme.lower() != "bearer" or not secrets.compare_digest(value, self.token):
+        if scheme.lower() != "bearer" or not secrets.compare_digest(
+            value.encode("utf-8"), self.token.encode("utf-8")
+        ):
             await self._unauthorized(scope, receive, send)
             return
 
