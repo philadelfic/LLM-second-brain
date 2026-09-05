@@ -440,6 +440,52 @@ async def test_run_catches_pending_summary(fast) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_summary_survives_non_slug_domain_hint(fast) -> None:
+    """Пул 2: мусорный вывод классификатора (не-слаг domain_hint →
+    NamespaceValidationError из _auto_move_target) не убивает summary-петлю:
+    петля продолжает работать, последующие заметки суммаризуются штатно."""
+    notes = NoteService(fast, FailingEmbedder())
+    notes.save("заметка с мусорной разметкой классификатора")
+    classifier = FixedClassifier(Classification("Работа", None, 0.9))
+    worker = BackgroundWorker(
+        fast, FailingEmbedder(), FixedSummarizer("Суммари цикла."), classifier=classifier
+    )
+    task = asyncio.create_task(worker.run())
+    # первая заметка: суммаризация доведена, классификация упала (сдержана)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        with session(fast) as conn:
+            status = conn.execute(
+                "SELECT summary_status FROM notes WHERE id = 1"
+            ).fetchone()[0]
+        if status == "ok":
+            break
+        await asyncio.sleep(0.01)
+    assert status == "ok"
+    with session(fast) as conn:
+        row = conn.execute(
+            "SELECT namespace FROM notes WHERE id = 1"
+        ).fetchone()
+        assert row["namespace"] == "default"  # переезд не произошёл
+    # петля жива: вторая заметка тоже суммаризуется
+    notes.save("вторая заметка после сбоя классификатора")
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        with session(fast) as conn:
+            status2 = conn.execute(
+                "SELECT summary_status FROM notes WHERE id = 2"
+            ).fetchone()[0]
+        if status2 == "ok":
+            break
+        await asyncio.sleep(0.01)
+    worker.stop()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert status2 == "ok"
+
+
+@pytest.mark.asyncio
 async def test_backoff_independent_per_queue(slow) -> None:
     """ARCH §3.4: back-off независим — отказ векторизации не мешает суммаризации."""
     notes = NoteService(slow, FailingEmbedder())

@@ -25,6 +25,11 @@ base_url). Отказ — `ClassificationError`: заметка остаётся
 `classified_at` не ставится, повтор — после `memory_update` (анти-зацикливание
 §5.7). `last_attempt_ok` — как у суммаризатора (NFR-4, /health).
 
+Оба hint-слага (`domain_hint` и `subdomain_hint`) нормализуются через
+`normalize_slug` (регистр/дефисы), как это делает `validate_path` для узлов
+реестра; не-слаг (не латиница-цифры-дефис) — некорректная разметка →
+`ClassificationError`, заметка остаётся в default (повтор после update).
+
 Промпт: в user-сообщение передаются известные узлы (path: description) —
 «подходит существующий — используй; специфична и не подходит — новый слаг
 (латиница-цифры-дефис); общая — null». Консистентность слагов растёт вместе
@@ -170,6 +175,13 @@ class ClassificationService:
                     f"subdomain_hint «{subdomain}» не слаг (латиница-цифры-дефис)"
                 )
             subdomain = slug
+        if domain is not None:
+            slug = normalize_slug(domain)
+            if slug is None:
+                raise ClassificationError(
+                    f"domain_hint «{domain}» не слаг (латиница-цифры-дефис)"
+                )
+            domain = slug
         return Classification(
             domain_hint=domain,
             subdomain_hint=subdomain,

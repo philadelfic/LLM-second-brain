@@ -137,6 +137,21 @@ class TestClassifyDefault:
         assert row["classified_at"] is None
         assert row["domain_hint"] is None
 
+    def test_classifier_failure_does_not_break_batch(self, settings) -> None:
+        """Отказ классификатора (ClassificationError) не ломает партию: суммари
+        всех заметок доведены до 'ok', классификация отложена (пул 2)."""
+        NamespaceService(settings).create("work", "Рабочие заметки.")
+        nid1 = _save_default(settings, "первая заметка партии")
+        nid2 = _save_default(settings, "вторая заметка партии")
+        classifier = FixedClassifier(fail=True)
+        worker = _worker(settings, classifier)
+        assert worker.process_summary_pending() == 2  # обе суммаризованы
+        for nid in (nid1, nid2):
+            row = _row(settings, nid)
+            assert row["summary_status"] == "ok"
+            assert row["classified_at"] is None  # классификация отложена
+            assert row["namespace"] == "default"
+
     def test_classified_note_not_reclassified(self, settings) -> None:
         """classified_at — анти-зацикливание: повторный прогон не трогает."""
         NamespaceService(settings).create("work", "Рабочие заметки.")

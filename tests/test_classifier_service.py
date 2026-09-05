@@ -142,6 +142,16 @@ def test_subdomain_slug_normalized(monkeypatch) -> None:
     service.close()
 
 
+def test_domain_slug_normalized(monkeypatch) -> None:
+    """Слаг корня нормализуется (регистр/дефисы), как у узлов реестра."""
+    settings = make_settings(monkeypatch)
+    body = ok_body('{"domain_hint": "Work", "subdomain_hint": null, "confidence": 0.9}')
+    service, _ = make_service(settings, [httpx.Response(200, json=body)])
+    result = service.classify(NOTE, KNOWN)
+    assert result.domain_hint == "work"
+    service.close()
+
+
 def test_code_fence_stripped(monkeypatch) -> None:
     """Модель может обернуть JSON в код-фенс — вынимаем объект."""
     settings = make_settings(monkeypatch)
@@ -170,6 +180,19 @@ def test_invalid_subdomain_slug_raises(monkeypatch) -> None:
     service, _ = make_service(settings, [httpx.Response(200, json=body)])
     with pytest.raises(ClassificationError):
         service.classify(NOTE, KNOWN)
+    service.close()
+
+
+def test_invalid_domain_slug_raises(monkeypatch) -> None:
+    """Не-слаг domain_hint — некорректная разметка → ClassificationError,
+    last_attempt_ok=False (пул 2: иначе NamespaceValidationError убивал
+    summary-петлю через _auto_move_target)."""
+    settings = make_settings(monkeypatch)
+    body = ok_body('{"domain_hint": "Работа", "subdomain_hint": null, "confidence": 0.9}')
+    service, _ = make_service(settings, [httpx.Response(200, json=body)])
+    with pytest.raises(ClassificationError):
+        service.classify(NOTE, KNOWN)
+    assert service.last_attempt_ok is False
     service.close()
 
 

@@ -765,7 +765,19 @@ class BackgroundWorker:
                 # Причёска (Фаза 10, Шаг 4): после суммаризации default-заметки
                 # (ещё не классифицированной) — разметка и авто-переезд.
                 if row["namespace"] == "default" and row["classified_at"] is None:
-                    self._classify_default_note(int(row["id"]), row["text"])
+                    try:
+                        self._classify_default_note(int(row["id"]), row["text"])
+                    except asyncio.CancelledError:
+                        raise  # отмена петли — не глотать
+                    except Exception:
+                        # Непредвиденный сбой причёски (в т.ч. баг) не роняет
+                        # summary-петлю: остальные заметки партии обрабатываются
+                        # дальше, классификация этой — после следующего update.
+                        logging.getLogger("app").warning(
+                            "classify: internal error — enrichment deferred",
+                            extra={"event": "classify_crashed", "note_id": row["id"]},
+                            exc_info=True,
+                        )
         return done
 
     # --- причёска (Фаза 10, Шаг 4) -------------------------------------------
