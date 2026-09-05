@@ -16,10 +16,11 @@ import json
 import sqlite3
 
 import pytest
-from fakes import FixedDescriber, HashEmbedder, ScriptedStructureJudge
+from fakes import FailingEmbedder, FixedDescriber, HashEmbedder, ScriptedStructureJudge
 
 from app.config import get_settings
 from app.services.namespaces import NamespaceService
+from app.services.notes import NoteService
 from app.services.promotion import (
     DescriptionService,
     DescriberError,
@@ -115,6 +116,25 @@ class TestCandidates:
         NamespaceService(settings).create("work", "Рабочие заметки.")
         _seed_group(settings, "work", "subo", THRESHOLD - 1)
         promoter = _promoter(settings, FixedDescriber(), ScriptedStructureJudge())
+        assert promoter.candidates() == []
+
+    def test_update_clears_stale_hints_from_trigger(self, settings) -> None:
+        """v2.1.1: memory_update сбрасывает разметку — заметка с изменённым
+        текстом выпадает из hint-группы до новой классификации: протухшие
+        hints не кормят триггер (аудит 2026-09-05)."""
+        NamespaceService(settings).create("work", "Рабочие заметки.")
+        _seed_group(settings, "work", "subo", THRESHOLD)
+        promoter = _promoter(settings, FixedDescriber(), ScriptedStructureJudge())
+        assert len(promoter.candidates()) == 1  # группа на пороге
+
+        # обновили одну заметку группы — hints сброшены, счётчик упал
+        with session(settings) as conn:
+            note_id = conn.execute(
+                "SELECT id FROM notes WHERE domain_hint = 'work' AND "
+                "subdomain_hint = 'subo' LIMIT 1"
+            ).fetchone()[0]
+        NoteService(settings, FailingEmbedder()).update(note_id, "обновлённый текст")
+        # 14 < порога; сброшенный hint не в счёте
         assert promoter.candidates() == []
 
     def test_low_confidence_notes_not_counted(self, settings) -> None:

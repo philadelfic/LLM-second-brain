@@ -375,6 +375,14 @@ class NoteService:
         вызывает update без title и название ранней заметки не затирается.
         Невалидный title → TitleValidationError; сбросить название нельзя
         (новые — всегда с названием, без него остаются только миграционные).
+
+        v2.1.1 (аудит 2026-09-05): update сбрасывает и разметку причёски —
+        `classified_at = NULL` + `domain_hint`/`subdomain_hint`/`confidence`
+        = NULL: повтор классификации после обновления текста (§5.7 —
+        «повтор только после memory_update»), протухшие hints не участвуют
+        в агрегации триггера до новой разметки. Повтор пройдёт только у
+        default-заметок (воркер классифицирует только их); merge-путь тоже
+        проходит здесь — слитая заметка переоценивается по новому тексту.
         """
         self._validate_text(text)
         note_title = None if title is None else self._checked_title(title)
@@ -396,6 +404,8 @@ class NoteService:
                     "UPDATE notes SET text = ?, namespace = ?, "
                     "vector_status = 'pending', "
                     "summary = '', summary_status = 'pending', "
+                    "classified_at = NULL, domain_hint = NULL, "
+                    "subdomain_hint = NULL, confidence = NULL, "
                     "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
                     "WHERE id = ? AND deleted_at IS NULL",
                     (text, ns, note_id),
@@ -405,6 +415,8 @@ class NoteService:
                     "UPDATE notes SET text = ?, title = ?, namespace = ?, "
                     "vector_status = 'pending', "
                     "summary = '', summary_status = 'pending', "
+                    "classified_at = NULL, domain_hint = NULL, "
+                    "subdomain_hint = NULL, confidence = NULL, "
                     "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
                     "WHERE id = ? AND deleted_at IS NULL",
                     (text, note_title, ns, note_id),

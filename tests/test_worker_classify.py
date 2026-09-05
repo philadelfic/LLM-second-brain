@@ -3,7 +3,8 @@
 После суммаризации default-заметки (ещё не классифицированной) воркер
 размечает её (domain_hint/subdomain_hint/confidence + classified_at) и при
 высоком confidence авто-переезжает в существующий узел. Только default,
-один проход (classified_at), отказ классификатора данные не портит.
+один проход (classified_at; повтор — после memory_update, v2.1.1),
+отказ классификатора данные не портит.
 """
 
 from __future__ import annotations
@@ -38,7 +39,8 @@ def _row(settings, note_id: int):
     with session(settings) as conn:
         return conn.execute(
             "SELECT namespace, domain_hint, subdomain_hint, confidence, "
-            "classified_at, vector_status FROM notes WHERE id = ?",
+            "classified_at, vector_status, summary_status FROM notes "
+            "WHERE id = ?",
             (note_id,),
         ).fetchone()
 
@@ -146,3 +148,55 @@ class TestClassifyDefault:
         # Повторный прогон: summary уже ok, классификация не повторяется.
         assert worker.process_summary_pending() == 0
         assert len(classifier.calls) == 1
+
+
+class TestRepeatAfterUpdate:
+    """v2.1.1: memory_update перезапускает фоновую цепочку заметки целиком —
+    включая повторную классификацию default-заметок (§5.7: «повтор только
+    после memory_update»; до v2.1.1 classified_at не сбрасывался, повтор
+    был возможен только после отказа классификатора)."""
+
+    def test_update_resets_classification_marks(self, settings) -> None:
+        """update сбрасывает classified_at и hints одним UPDATE — вместе с
+        summary/vector (вся цепочка перезапускается)."""
+        NamespaceService(settings).create("work", "Рабочие заметки.")
+        nid = _save_default(settings, "заметка про рабочие процессы")
+        worker = _worker(settings, FixedClassifier(Classification("work", None, 0.5)))
+        worker.process_summary_pending()
+        assert _row(settings, nid)["classified_at"] is not None  # была разметка
+
+        notes = NoteService(settings, FailingEmbedder())
+        notes.update(nid, "обновлённый текст заметки")
+        row = _row(settings, nid)
+        assert row["classified_at"] is None
+        assert row["domain_hint"] is None and row["subdomain_hint"] is None
+        assert row["confidence"] is None
+        assert row["vector_status"] == "pending"   # ре-векторизация (Фаза 8)
+        assert row["summary_status"] == "pending"  # пересуммаризация (режим «Б»)
+
+    def test_update_repeats_classification_and_move(self, settings) -> None:
+        """Полный повтор после update: пересуммаризация → классификация →
+        авто-переезд по НОВОЙ разметке; анти-зацикливание сохраняется
+        (без нового update повторного прохода нет)."""
+        NamespaceService(settings).create("work", "Рабочие заметки.")
+        nid = _save_default(settings, "общая заметка без домена")
+        first = FixedClassifier(Classification(None, None, 0.1))
+        worker = _worker(settings, first)
+        worker.process_summary_pending()
+        row = _row(settings, nid)
+        assert row["classified_at"] is not None and row["namespace"] == "default"
+
+        # текст стал доменным — оператор обновил заметку
+        NoteService(settings, FailingEmbedder()).update(
+            nid, "заметка теперь про рабочие процессы"
+        )
+        second = FixedClassifier(Classification("work", None, 0.95))
+        worker2 = _worker(settings, second)
+        assert worker2.process_summary_pending() == 1  # пересуммаризация
+        assert len(second.calls) == 1                  # повторная классификация
+        row = _row(settings, nid)
+        assert row["namespace"] == "work"             # новый авто-переезд
+        assert row["classified_at"] is not None
+        # анти-зацикливание: без нового update классификация не повторяется
+        assert worker2.process_summary_pending() == 0
+        assert len(second.calls) == 1

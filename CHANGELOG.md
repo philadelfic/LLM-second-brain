@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.1] - 2026-09-05
+
+### Fixed
+
+- **The background pipeline now fully restarts after `memory_update`**
+  (requirements-vs-code audit, 2026-09-05): `NoteService.update()` also
+  resets the classification marks (`classified_at`, `domain_hint`,
+  `subdomain_hint`, `confidence`) in the same UPDATE. A rewritten default
+  note is re-classified by the groomer (and can auto-move into an existing
+  domain again), and stale hints no longer feed the namespace promotion
+  trigger until a fresh classification arrives. Re-vectorization and
+  re-summarization after an update were already in place; new tests lock
+  the entire chain.
+- **Docs**: the `/health` docstring in `rest.py` now matches the actual
+  `judge_ok` semantics (an unreachable judge stays `null` until the first
+  real call fails).
+
 ## [2.1.0] - 2026-09-05
 
 ### Added
