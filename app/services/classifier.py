@@ -51,7 +51,7 @@ from app.services.prompts import PromptRegistry
 
 # Параметры вызова, не настраиваемые env (ARCH §4.7): маленький бюджет
 # JSON-разметки; think:false — явный запрет рассуждений (быстрее).
-CLASSIFIER_NUM_PREDICT = 64
+CLASSIFIER_NUM_PREDICT = 768
 
 
 class ClassificationError(RuntimeError):
