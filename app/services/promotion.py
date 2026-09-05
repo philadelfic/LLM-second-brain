@@ -71,7 +71,7 @@ SUMMARIES_PER_CANDIDATE = 3
 # (think:false — короткий ответ). Таймауты/температура — уровень клиента
 # слота (LLMClient, Фаза 11): read-таймаут per-slot из Settings;
 # keep_alive не отправляется никому (решение №6 — моделью управляет сервер).
-DESCRIBE_NUM_PREDICT = 128
+DESCRIBE_NUM_PREDICT = 512
 
 
 class DescriberError(RuntimeError):
