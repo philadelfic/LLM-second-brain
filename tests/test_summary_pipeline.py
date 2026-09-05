@@ -170,6 +170,11 @@ def test_notifier_wakes_worker_without_blocking_save(monkeypatch, token) -> None
         monkeypatch, FixedSummarizer("Ретроспектива 12 сентября в 14:00."), "30",
         notify=True,
     ) as test_client:
+        # Осадка: даём summary-петле дойти до wait(). Save, случись В ПЕРВОЙ
+        # итерации петли (до clear()), теряет notify — петля уходит в 30-с
+        # back-off и тест «мгновенной догонки» флейкает под нагрузкой полного
+        # прогона (фаза 2, аппрув пула 3; структурный фикс lost-wakeup — пул 6).
+        time.sleep(0.5)
         result = _create(test_client, token, NOTE_TEXT)
         assert result["summary_pending"] is True  # save не ждал суммаризацию
         # воркер догоняет сразу (notifier), не дожидаясь 30с back-off
@@ -177,7 +182,8 @@ def test_notifier_wakes_worker_without_blocking_save(monkeypatch, token) -> None
             lambda: test_client.get(
                 "/notes/1", headers={"Authorization": f"Bearer {token}"}
             ).json()["summary_status"] == "ok",
-            timeout=3.0,
+            # 10 с с запасом; суть теста — «не дожидаясь 30с back-off» — сохранена.
+            timeout=10.0,
         )
 
 
