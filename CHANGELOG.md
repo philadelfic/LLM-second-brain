@@ -21,6 +21,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Docs**: the `/health` docstring in `rest.py` now matches the actual
   `judge_ok` semantics (an unreachable judge stays `null` until the first
   real call fails).
+- **Phase-2 refactor** (code audit, 2026-09-05/06; 13 pools, 828 tests):
+  - **Worker notes-queue vector guard**: the embedding loop writes the
+    full-text vector and flips `vector_status` to `ok` only if the note is
+    unchanged since it was read (verified in the same transaction) — a
+    mid-flight `memory_update` can no longer leave a stale vector marked
+    as fresh.
+  - **Classifier robustness**: a non-slug `domain_hint` is rejected as an
+    invalid classification, and an unexpected classifier failure is
+    contained with a warning instead of killing the summary loop.
+  - **Atomic write paths**: the literal-dedup check runs inside the save
+    transaction (no TOCTOU duplicate); `update()` drops the stale
+    full-text vector (pending notes search FTS-only, as documented);
+    grooming/move is a single UPDATE guarded by `namespace = 'default'`;
+    duplicate merge (earlier update + later delete) is one transaction.
+  - **Worker loop supervisor**: an unexpected error in a loop iteration is
+    logged with a traceback and the loop continues instead of dying until
+    restart; queue re-checks after `clear()` remove lost wakeups.
+  - **worker_jobs hygiene**: queue index, 7-day retention for done jobs,
+    one-time DDL; background party sizes follow `EMBEDDING_BATCH_SIZE`.
+  - **Security/robustness smalls**: Bearer compared on bytes (a non-ASCII
+    header yields 401, not 500), query strings truncated to 80 chars in
+    the access log, a namespace rename race maps to 409, L2-normalized
+    embeddings in the synonym prefilter, failed MCP tool calls logged
+    (`failed=true` + latency), ambiguous `memory_get` rejected loudly,
+    partial backup snapshot removed on copy failure.
+  - **Performance: dedup query plans under a namespace filter**
+    (`NOT INDEXED` + `CROSS JOIN`): at 50k notes a save into a large
+    namespace took 4–12+ s (the planner drove both dedup queries through
+    the low-selectivity namespace index), now save p95 ≈ 0.34 s
+    (bench, 2026-09-06).
+  - **Dead legacy code removed** in dedup/search/storage; failed MCP tool
+    calls are visible in the JSON logs.
+  - Tests: two timing-sensitive tests stabilized, `BACKUP_DIR` points to a
+    tmp dir in the test env, a dedup plan-hint regression test added;
+    full suite: 828 passed.
 
 ## [2.1.0] - 2026-09-05
 
