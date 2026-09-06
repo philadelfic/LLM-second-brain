@@ -411,7 +411,10 @@ def test_live_promotion_describes_judges_resolves(
 def test_live_summary_timeout_fails_fast(tmp_path_factory) -> None:
     """Клиентский таймаут SUMMARY_TIMEOUT_SEC: отказ влезает в бюджет."""
     url = _live_summary_url()
-    assert _reachable(url)  # скипнут на уровне fixture, если сервер «вон»
+    if not _reachable(url):
+        # После чистки истории (пул 13/фаза 2) дефолтный URL — localhost:
+        # без живого слота тест скипается, как остальные live-тесты.
+        pytest.skip(f"живая Ollama суммаризации недоступна: {url}")
     short = Settings(
         embedding_base_url=os.environ.get("LIVE_EMBEDDING_URL", LIVE_URL_DEFAULT),
         summary_base_url=url,
