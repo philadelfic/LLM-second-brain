@@ -94,7 +94,6 @@ class DeduplicationService:
         threshold = self._settings.dedup_candidate_similarity
         with session(self._settings) as conn:
             if namespace:
-                ns_ph = "?"
                 ns_clause = " AND namespace = ?"
                 ns_params: list[object] = [namespace]
             else:
