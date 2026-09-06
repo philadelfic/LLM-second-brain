@@ -431,3 +431,112 @@ class TestDescriptionTrim:
     def test_empty_description_fails(self) -> None:
         with pytest.raises(DescriberError):
             DescriptionService._trim("   ")  # type: ignore[arg-type]
+
+
+class ScaleEmbedder:
+    """Фейк-эмбеддер: HashEmbedder × коэффициент по индексу (детерминирован).
+
+    Направления векторов те же, что у HashEmbedder; каждый i-й текст в батче
+    умножается на (i + 1). Коэффициенты растущие (1, 2, 3, ...) — тест
+    проверяет, что масштаб не влияет на выбор ближайшего узла (L2-нормализация
+    в _nearest_node обнуляет разницу)."""
+
+    def __init__(self, dim: int = 8) -> None:
+        self._base = HashEmbedder(dim)
+        self.dim = dim
+
+    def embed(self, text: str) -> list[float]:
+        self._base.embed(text)
+        return self.embed_texts([text])[0]
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        base = self._base.embed_texts(texts)
+        return [
+            [v * (i + 1) for v in vec] for i, vec in enumerate(base)
+        ]
+
+    def close(self) -> None:
+        return None
+
+
+class ZeroEmbedder:
+    """Фейк-эмбеддер: всегда нулевые векторы (тест нуль-обработки)."""
+
+    def __init__(self, dim: int = 8) -> None:
+        self.dim = dim
+
+    def embed(self, text: str) -> list[float]:
+        return [0.0] * self.dim
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        return [[0.0] * self.dim for _ in texts]
+
+    def close(self) -> None:
+        return None
+
+
+class TestCosineScaleInvariance:
+    """Предфильтр не зависит от масштаба векторов провайдера (пул 8)."""
+
+    def test_scaled_vectors_give_same_nearest_node(self, settings) -> None:
+        """ScaleEmbedder × коэффициент = тот же ближайший узел, что HashEmbedder."""
+        NamespaceService(settings).create("work", "Рабочие заметки.")
+        NamespaceService(settings).create("work/hr", "Сервисы HR: зарплаты.")
+        NamespaceService(settings).create("work/dev", "Разработка: фичи.")
+        _seed_group(settings, "work", "subo", THRESHOLD)
+        describer = FixedDescriber("Сервисы HR: зарплаты.")
+        # HashEmbedder: L2-нормировка внутри → честный косинус.
+        promoter_base = _promoter(settings, describer, ScriptedStructureJudge())
+        path_base, cosine_base = promoter_base._nearest_node(
+            "Сервисы HR: зарплаты."
+        )
+        # ScaleEmbedder: вектора × (i+1), но L2-нормализация в _nearest_node
+        # обнуляет масштаб → тот же path, тот же cosine.
+        promoter_scaled = PromotionService(
+            settings,
+            embedding=ScaleEmbedder(8),
+            describer=describer,
+            judge=ScriptedStructureJudge(),
+            namespaces=NamespaceService(settings),
+        )
+        path_scaled, cosine_scaled = promoter_scaled._nearest_node(
+            "Сервисы HR: зарплаты."
+        )
+        assert path_base == path_scaled == "work/hr"
+        assert abs(cosine_base - cosine_scaled) < 1e-9
+
+    def test_zero_vector_skips_prefilter(self, settings) -> None:
+        """Нулевой вектор кандидата → предфильтр None, гейт судье."""
+        NamespaceService(settings).create("work", "Рабочие заметки.")
+        NamespaceService(settings).create("work/hr", "Сервисы HR: зарплаты.")
+        _seed_group(settings, "work", "subo", THRESHOLD)
+        describer = FixedDescriber("Сервисы HR: зарплаты.")
+        judge = ScriptedStructureJudge(verdicts=[Verdict("СОЗДАТЬ")])
+        promoter = PromotionService(
+            settings,
+            embedding=ZeroEmbedder(8),
+            describer=describer,
+            judge=judge,
+            namespaces=NamespaceService(settings),
+        )
+        # Прямой вызов _nearest_node: нулевой вектор → (None, None).
+        path, cosine = promoter._nearest_node("Сервисы HR: зарплаты.")
+        assert path is None
+        assert cosine is None
+        # Через run(): предфильтр None → гейт судье, вердикт СОЗДАТЬ.
+        report = promoter.run()
+        assert "created" in report
+        # Судья вызван с nearest_path=None, nearest_cosine=None (предфильтр
+        # не нашёл ближайшего из-за нулевого вектора).
+        assert len(judge.review_calls) == 1
+        call = judge.review_calls[0]
+        assert call[0] == "Сервисы HR: зарплаты."  # description
+        assert call[1] == "subo"  # slug
+        assert call[2] == "work"  # domain
+        assert call[4] is None  # nearest_path
+        assert call[5] is None  # nearest_cosine
+        # Узел создан provisional.
+        ns = NamespaceService(settings)
+        leaf = ns.get("work/subo")
+        assert leaf is not None
+        assert leaf["status"] == "provisional"

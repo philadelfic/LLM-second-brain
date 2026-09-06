@@ -48,6 +48,7 @@ hint переезжают в узел штатной причёской Шага
 from __future__ import annotations
 
 import logging
+import math
 import re
 from collections.abc import Callable
 from typing import Any, Protocol
@@ -72,6 +73,11 @@ SUMMARIES_PER_CANDIDATE = 3
 # слота (LLMClient, Фаза 11): read-таймаут per-slot из Settings;
 # keep_alive не отправляется никому (решение №6 — моделью управляет сервер).
 DESCRIBE_NUM_PREDICT = 512
+
+
+def _l2_norm(vec: list[float]) -> float:
+    """Евклидова норма вектора (L2)."""
+    return math.sqrt(sum(v * v for v in vec))
 
 
 class DescriberError(RuntimeError):
@@ -690,7 +696,12 @@ class PromotionService:
         эмбеддинг отказал. Отказ кодирования (EmbeddingError) — предфильтр
         просто не находит ближайшего: гейт остаётся судье (деградация, не
         отказ конвейера).
-        """
+
+        Косинус считается по L2-нормированным векторам: dot product по
+        нормированным = честный cosine, нечувствительный к масштабу
+        провайдера (симметрично `vectors.py`, где косинус не зависит от
+        нормы). Если норма вектора 0 — пара даёт cosine 0.0 (слияния не
+        будет — безопасное направление)."""
         nodes = self._thematic_nodes()
         if not nodes:
             return None, None
@@ -705,14 +716,29 @@ class PromotionService:
             )
             return None, None
         candidate_vec, node_vecs = vectors[0], vectors[1:]
-        best_index = max(
-            range(len(node_vecs)),
-            key=lambda i: sum(a * b for a, b in zip(candidate_vec, node_vecs[i])),
-        )
-        cosine = sum(
-            a * b for a, b in zip(candidate_vec, node_vecs[best_index])
-        )
-        return nodes[best_index]["path"], cosine
+        # L2-нормализация: dot product по нормированным = честный cosine,
+        # не зависит от масштаба провайдера.
+        candidate_norm = _l2_norm(candidate_vec)
+        if candidate_norm == 0.0:
+            return None, None
+        candidate_normed = [v / candidate_norm for v in candidate_vec]
+        best_index = 0
+        best_cosine = -1.0
+        for i, node_vec in enumerate(node_vecs):
+            node_norm = _l2_norm(node_vec)
+            if node_norm == 0.0:
+                continue
+            node_normed = [v / node_norm for v in node_vec]
+            cos = sum(
+                a * b for a, b in zip(candidate_normed, node_normed)
+            )
+            if cos > best_cosine:
+                best_cosine = cos
+                best_index = i
+        if best_cosine == -1.0:
+            # Все узлы нулевые — гейт остаётся судье.
+            return None, None
+        return nodes[best_index]["path"], best_cosine
 
     def _day_limit_reached(self) -> bool:
         """NAMESPACE_AUTO_MAX_PER_DAY: provisional-узлы, созданные сегодня (UTC)."""
