@@ -176,9 +176,20 @@ class DeduplicationService:
         ns_fts_clause: str,
         ns_params: list[object],
     ) -> sqlite3.Row | None:
-        """Тело дословного дедупа на открытом соединении (SQL + FTS-фоллбек)."""
+        """Тело дословного дедупа на открытом соединении (SQL + FTS-фоллбек).
+
+        План-хинты (пул 13, бенч 50k: find_by_text с ns-фильтром — 132 с):
+        - `NOT INDEXED` на exact-scan: без него с `AND namespace = ?`
+          планировщик берёт idx_notes_namespace (низкоселективный — все строки
+          узла) как внешний цикл и fetch'ит текст построчно (случайные
+          страницы вместо 18-мс последовательного скана);
+        - `CROSS JOIN` в FTS-запросе: forcing notes_fts внешним циклом —
+          без него тот же индекс ставил notes первым и дёргал MATCH на
+          каждую строку узла. `CROSS JOIN` в SQLite запрещает
+          перестановку таблиц оптимизатором.
+        """
         exact = conn.execute(
-            "SELECT id, text, namespace FROM notes "
+            "SELECT id, text, namespace FROM notes NOT INDEXED "
             f"WHERE deleted_at IS NULL AND text = ?{ns_clause} ORDER BY id LIMIT 1",
             (text, *ns_params),
         ).fetchone()
@@ -194,7 +205,7 @@ class DeduplicationService:
         )
         candidates = conn.execute(
             "SELECT n.id, n.text, n.namespace FROM notes_fts "
-            "JOIN notes n ON n.id = notes_fts.rowid "
+            "CROSS JOIN notes n ON n.id = notes_fts.rowid "
             f"WHERE notes_fts MATCH ? AND n.deleted_at IS NULL"
             f"{ns_fts_clause} LIMIT ?",
             (expression, *ns_params, FALLBACK_SCAN),

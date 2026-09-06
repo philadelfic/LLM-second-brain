@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import math
+import sqlite3
 
 import pytest
 from fakes import HashEmbedder, vectorize_notes
@@ -347,3 +348,38 @@ def test_merge_pair_missing_older_is_noop(dim8, notes) -> None:
         ).fetchone()
     assert row["text"] == "вторая заметка пары без первой"
     assert row["deleted_at"] is None
+
+
+# --- план-хинты дедупа (пул 13) ------------------------------------------------
+
+
+class _RecordingConn:
+    """Обёртка над соединением: записывает SQL, исполнение делегирует."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self.executed: list[str] = []
+
+    def execute(self, sql: str, params: tuple = ()) -> object:
+        self.executed.append(sql)
+        return self._conn.execute(sql, params)
+
+
+def test_find_by_text_plan_hints(dim8, notes) -> None:
+    """Пул 13: план-хинты в SQL дедупа — `NOT INDEXED` на exact-scan и
+    `CROSS JOIN` (FTS-first) в фоллбеке. Без хинтов планировщик на большой БД
+    берёт idx_notes_namespace как внешний цикл (бенч 50k: find_by_text с
+    ns-фильтром — ~132 с, с хинтами — 21 мс)."""
+    text = "текст для проверки план-хинтов дедупа"
+    notes.save(text)
+    # Регистровый вариант того же текста: точный скан ПРОМАХНЁТСЯ (регистр),
+    # нормализованный сравнением совпадёт — исполнится именно FTS-фоллбек.
+    variant = "ТЕКСТ  ДЛЯ ПРОВЕРКИ  ПЛАН-ХИНТОВ ДЕДУПА"
+    with session(dim8) as conn:
+        spy = _RecordingConn(conn)
+        found = DeduplicationService(dim8).find_by_text(
+            variant, namespace="default", conn=spy
+        )
+    assert found is not None  # нормализованный дубль найден фоллбеком
+    assert "NOT INDEXED" in spy.executed[0]  # exact-scan: план-хинт
+    assert "CROSS JOIN" in spy.executed[1]   # FTS-фоллбек: FTS-first
