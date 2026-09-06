@@ -179,3 +179,21 @@ class TestMutations:
         service.create("work", "Рабочие заметки.")
         with pytest.raises(NamespaceValidationError):
             service.set_status("work", "draft")
+
+    def test_rename_race_maps_pk_conflict_to_namespace_error(
+        self, service: NamespaceService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Гонка: цель жива в БД, но проверки видят её как свободную (§5.9 → 409)."""
+        service.create("work", "Рабочие заметки.")
+        service.create("projects", "Личные проекты.")
+        real_exists = service.exists
+
+        def fake_exists(path: str) -> bool:
+            if path == "projects":
+                return False  # устаревший read: цель «ещё не зарегистрирована»
+            return real_exists(path)
+
+        monkeypatch.setattr(service, "exists", fake_exists)
+        # PK-конфликт внутри транзакции → NamespaceError, не голый IntegrityError.
+        with pytest.raises(NamespaceError):
+            service.rename("work", "projects")

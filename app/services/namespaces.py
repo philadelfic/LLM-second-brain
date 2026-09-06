@@ -369,57 +369,63 @@ class NamespaceService:
             old_domain, old_slug = old_path, None
         new_domain = new_path.split("/", 1)[0]
         new_slug = new_path.split("/", 1)[1] if "/" in new_path else None
-        with session(self._settings) as conn, transaction(conn):
-            # Реестр: путь узла и всех его детей (узлов мало — по одному).
-            for node_path in old_nodes:
-                conn.execute(
-                    "UPDATE namespaces SET path = ?, "
-                    "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE path = ?",
-                    (new_path + node_path[len(old_path):], node_path),
-                )
-            # Заметки поддерева: namespace + пере-кодировка в новую партицию.
-            for node_path in old_nodes:
-                conn.execute(
-                    "UPDATE notes SET namespace = ?, vector_status = 'pending' "
-                    "WHERE namespace = ? AND deleted_at IS NULL",
-                    (new_path + node_path[len(old_path):], node_path),
-                )
-            # Разметка default-заметок (причёска ссылается на старые пути).
-            if is_root:
-                conn.execute(
-                    "UPDATE notes SET domain_hint = ? "
-                    "WHERE namespace = 'default' AND domain_hint = ?",
-                    (new_domain, old_domain),
-                )
-            else:
-                conn.execute(
-                    "UPDATE notes SET subdomain_hint = ? "
-                    "WHERE namespace = 'default' AND domain_hint = ? "
-                    "AND subdomain_hint = ?",
-                    (new_slug, old_domain, old_slug),
-                )
-            # Вердикты триггера: домен/слаг листа/канонические пути. Слаги
-            # листов не меняются при переименовании КОРНЯ — там только домен.
-            if is_root:
-                conn.execute(
-                    "UPDATE promotions SET domain = ? WHERE domain = ?",
-                    (new_domain, old_domain),
-                )
-            else:
-                conn.execute(
-                    "UPDATE promotions SET subdomain = ? "
-                    "WHERE domain = ? AND subdomain = ?",
-                    (new_slug, old_domain, old_slug),
-                )
-            conn.execute(
-                "UPDATE promotions SET canonical_path = ? WHERE canonical_path = ?",
-                (new_path, old_path),
-            )
-            conn.execute(
-                "UPDATE promotions SET canonical_path = ? || substr(canonical_path, ?) "
-                "WHERE canonical_path LIKE ? || '/%'",
-                (new_path, len(old_path) + 1, old_path),
-            )
+        with session(self._settings) as conn:
+            try:
+                with transaction(conn):
+                    # Реестр: путь узла и всех его детей (узлов мало — по одному).
+                    for node_path in old_nodes:
+                        conn.execute(
+                            "UPDATE namespaces SET path = ?, "
+                            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE path = ?",
+                            (new_path + node_path[len(old_path):], node_path),
+                        )
+                    # Заметки поддерева: namespace + пере-кодировка в новую партицию.
+                    for node_path in old_nodes:
+                        conn.execute(
+                            "UPDATE notes SET namespace = ?, vector_status = 'pending' "
+                            "WHERE namespace = ? AND deleted_at IS NULL",
+                            (new_path + node_path[len(old_path):], node_path),
+                        )
+                    # Разметка default-заметок (причёска ссылается на старые пути).
+                    if is_root:
+                        conn.execute(
+                            "UPDATE notes SET domain_hint = ? "
+                            "WHERE namespace = 'default' AND domain_hint = ?",
+                            (new_domain, old_domain),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE notes SET subdomain_hint = ? "
+                            "WHERE namespace = 'default' AND domain_hint = ? "
+                            "AND subdomain_hint = ?",
+                            (new_slug, old_domain, old_slug),
+                        )
+                    # Вердикты триггера: домен/слаг листа/канонические пути. Слаги
+                    # листов не меняются при переименовании КОРНЯ — там только домен.
+                    if is_root:
+                        conn.execute(
+                            "UPDATE promotions SET domain = ? WHERE domain = ?",
+                            (new_domain, old_domain),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE promotions SET subdomain = ? "
+                            "WHERE domain = ? AND subdomain = ?",
+                            (new_slug, old_domain, old_slug),
+                        )
+                    conn.execute(
+                        "UPDATE promotions SET canonical_path = ? WHERE canonical_path = ?",
+                        (new_path, old_path),
+                    )
+                    conn.execute(
+                        "UPDATE promotions SET canonical_path = ? || substr(canonical_path, ?) "
+                        "WHERE canonical_path LIKE ? || '/%'",
+                        (new_path, len(old_path) + 1, old_path),
+                    )
+            except sqlite3.IntegrityError as exc:
+                raise NamespaceError(
+                    f"узел «{new_path}» уже зарегистрирован"
+                ) from exc
         logging.getLogger("app").info(
             "namespace renamed",
             extra={
@@ -526,7 +532,6 @@ class NamespaceService:
         )
         return {"path": normalized, "moved": moved}
 
-    # --- внутренне ------------------------------------------------------------
     # --- внутренне ------------------------------------------------------------
 
     @staticmethod
