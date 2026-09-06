@@ -68,6 +68,9 @@ class BackupService:
     def snapshot(self) -> Path:
         """Онлайн-снапшот БД (SQLite backup API) + ротация; путь нового файла.
 
+        При отказе копирования частичный target-файл убирается — в ротации
+        остаются только целые снапшоты (битый файл не занимает слот).
+
         Raises:
             sqlite3.Error / OSError: пробрасываются — интерпретация и лог
             на стороне петли (`run`) или теста.
@@ -76,7 +79,11 @@ class BackupService:
         backup_dir = Path(self._settings.backup_dir)
         backup_dir.mkdir(parents=True, exist_ok=True)
         target = backup_dir / _snapshot_name()
-        self._copy(self._settings.db_path, target)
+        try:
+            self._copy(self._settings.db_path, target)
+        except (sqlite3.Error, OSError):
+            target.unlink(missing_ok=True)
+            raise
         size = target.stat().st_size
         removed = self.rotate()
         logging.getLogger("app").info(

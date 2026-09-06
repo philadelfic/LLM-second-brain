@@ -129,6 +129,55 @@ class TestSnapshot:
         assert record.latency_ms >= 0  # type: ignore[attr-defined]
         assert record.removed >= 0  # type: ignore[attr-defined]
 
+    @pytest.mark.asyncio
+    async def test_copy_failure_leaves_no_partial_file(
+        self,
+        backup_service: tuple[BackupService, Path],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Отказ копирования: частичный target убирается, старые снапшоты целы.
+
+        Петля ловит отказ (событие `backup_failed`); частичный файл не
+        остаётся в каталоге, ранее созданный снапшот на месте, ротация
+        ничего лишнего не удалила.
+        """
+        service, backup_dir = backup_service
+        # Ранее созданный валидный снапшот — должен пережить отказ.
+        previous = service.snapshot()
+        assert previous.exists()
+        # Имена снапшотов — с точностью до секунды: ждём смены секунды, чтобы
+        # снапшоты петли не перезаписали `previous` (тот же таймстамп в имени).
+        time.sleep(1.1)
+
+        def _boom(source_path: str, target_path: Path) -> None:
+            # Имитируем частичную запись: файл создан, но копия не завершилась.
+            target_path.write_bytes(b"partial")
+            raise OSError("disk full")
+
+        monkeypatch.setattr(service, "_copy", _boom)
+        patched = service._settings.model_copy(update={"backup_interval_sec": 0.05})
+        monkeypatch.setattr(service, "_settings", patched)
+        with caplog.at_level(logging.INFO, logger="app"):
+            task = asyncio.create_task(service.run())
+            try:
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    if _with_event(caplog, "backup_failed"):
+                        break
+                    await asyncio.sleep(0.05)
+            finally:
+                service.stop()
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        # Частичного файла нет; старый снапшот на месте; ротация ничего не тронула.
+        snapshots = list(backup_dir.glob(f"{IMAGE_PREFIX}*{IMAGE_SUFFIX}"))
+        assert snapshots == [previous]
+        assert previous.exists()
+        assert _with_event(caplog, "backup_failed")
+
 
 class TestRotation:
     def test_keeps_backup_keep_newest(
