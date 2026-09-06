@@ -307,6 +307,16 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
                 services.search.search, query, top_k, namespace, namespace_exact
             )
         except (NamespaceError, NamespaceValidationError) as exc:
+            # NFR-4: отказ инструмента наблюдаем — failed + латентность;
+            # текст исключения безопасен (имя узла, не содержимое заметок).
+            log_tool_call(
+                "memory_search",
+                started,
+                failed=True,
+                reason=str(exc),
+                namespace=namespace,
+                query=preview(query),
+            )
             return {"results": [], "hint": str(exc)}
         # NFR-4: вызов инструмента с латентностью и числом результатов;
         # текст запроса — превью (первые 80 симв.); заметки не логируются.
@@ -349,6 +359,13 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
                 services.notes.list, limit, offset, namespace, namespace_exact
             )
         except (NamespaceError, NamespaceValidationError) as exc:
+            log_tool_call(
+                "memory_list",
+                started,
+                failed=True,
+                reason=str(exc),
+                namespace=namespace,
+            )
             return {"items": [], "total": 0, "hint": str(exc)}
         log_tool_call(
             "memory_list",
@@ -376,6 +393,10 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
         ] = None,
     ) -> dict[str, Any]:
         # FR-3: id (int) — алиас одного id (оборачивается в список).
+        # Неоднозначный ввод (оба параметра) отклоняется громко — модель
+        # учится по ошибкам (§5.3), а не молчаливому приоритету списка.
+        if ids is not None and id is not None:
+            raise ValueError("передай либо ids (список), либо одиночный id — не оба")
         if ids is None:
             if id is None:
                 raise ValueError("передай ids (список) или одиночный id")
@@ -421,7 +442,16 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             # Отказ записи: title отсутствует/невалиден (решение №9) или узел
             # не зарегистрирован — fail + hint (клиент-модель учится по hint,
             # §5.3; узлы клиент не создаёт — актуальная карта
-            # memory_namespaces).
+            # memory_namespaces). NFR-4: отказ наблюдаем — failed + латентность;
+            # текст исключения безопасен (фиксированный hint / имя узла).
+            log_tool_call(
+                "memory_save",
+                started,
+                failed=True,
+                reason=str(exc),
+                namespace=namespace,
+                note_chars=len(text),
+            )
             return {"stored": False, "hint": str(exc)}
         # Приватность (NFR-4): сам текст не пишется — только длина и флаги.
         log_tool_call(
@@ -467,7 +497,16 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             )
         except (TitleValidationError, NamespaceError, NamespaceValidationError) as exc:
             # title невалиден (решение №9) или узел не зарегистрирован —
-            # мягкий отказ + hint.
+            # мягкий отказ + hint. NFR-4: отказ наблюдаем — failed + латентность.
+            log_tool_call(
+                "memory_update",
+                started,
+                failed=True,
+                reason=str(exc),
+                id=id,
+                namespace=namespace,
+                note_chars=len(text),
+            )
             return {"id": id, "updated": False, "hint": str(exc)}
         log_tool_call(
             # Приватность (NFR-4): текст не пишется — только длина.

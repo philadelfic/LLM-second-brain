@@ -7,6 +7,7 @@ MCP_PATH. Сервер поднимается в subprocess на отдельн�
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import subprocess
@@ -779,6 +780,100 @@ def _seed_default_group(
                 (f"mcp seed {i} про {slug}", f"суммари {i}", domain, slug,
                  "2026-09-03T00:00:00Z"),
             )
+
+
+class TestFailLogging:
+    """Пул 11: отказы инструментов наблюдаемы в логах (NFR-4) + строгий memory_get.
+
+    Юнит-слой против in-process MCP-сервера: caplog ловит app-логи в том же
+    процессе (e2e-серверы — subprocess, их stdout в caplog не попадает).
+    """
+
+    @pytest.fixture
+    def mcp_inproc(self, test_env: dict[str, str]):
+        """In-process MCP-сервер над тестовой БД (caplog видит его логи)."""
+        from app.config import get_settings
+        from app.services import build_services
+        from app.storage.db import init_db
+        from app.transport.mcp import build_mcp
+
+        settings = get_settings()
+        init_db(settings)
+        services = build_services(settings)
+        return build_mcp(settings, services)
+
+    @pytest.mark.asyncio
+    async def test_memory_get_rejects_ambiguous_input(self, mcp_inproc) -> None:
+        """Оба параметра (ids + id) → громкая ошибка вызова, не молчаливый приоритет."""
+        with pytest.raises(Exception) as exc_info:
+            await mcp_inproc.call_tool("memory_get", {"ids": [1], "id": 1})
+        # SDK оборачивает ValueError в UnexpectedToolError; причина — наш ValueError.
+        assert isinstance(exc_info.value.__cause__, ValueError)
+
+    @pytest.mark.asyncio
+    async def test_save_invalid_title_fail_logged(self, mcp_inproc, caplog) -> None:
+        """save с невалидным title: fail-лог (failed=True, tool, latency), ответ не меняется."""
+        with caplog.at_level(logging.INFO, logger="app"):
+            result = await mcp_inproc.call_tool(
+                "memory_save", {"text": "x", "title": "раз два три четыре пять шесть"}
+            )
+        assert result.structured_content == {
+            "stored": False, "hint": "задай title ≤5 слов",
+        }
+        fail = _tool_fail_records(caplog, "memory_save")
+        assert fail
+        assert fail[-1].reason == "задай title ≤5 слов"
+        assert fail[-1].latency_ms >= 0
+
+    @pytest.mark.asyncio
+    async def test_save_unregistered_namespace_fail_logged(self, mcp_inproc, caplog) -> None:
+        """save в незарегистрированный узел: fail-лог с именем узла, ответ не меняется."""
+        with caplog.at_level(logging.INFO, logger="app"):
+            result = await mcp_inproc.call_tool(
+                "memory_save", {"text": "x", "title": "В неизвестный узел",
+                                "namespace": "nope"}
+            )
+        assert result.structured_content["stored"] is False
+        assert "nope" in result.structured_content["hint"]
+        fail = _tool_fail_records(caplog, "memory_save")
+        assert fail
+        assert "nope" in fail[-1].reason
+
+    @pytest.mark.asyncio
+    async def test_search_fail_logged(self, mcp_inproc, caplog) -> None:
+        """search в незарегистрированный узел: fail-лог (failed=True, tool, latency)."""
+        with caplog.at_level(logging.INFO, logger="app"):
+            result = await mcp_inproc.call_tool(
+                "memory_search", {"query": "что угодно", "namespace": "nope"}
+            )
+        assert result.structured_content["results"] == []
+        assert "nope" in result.structured_content["hint"]
+        fail = _tool_fail_records(caplog, "memory_search")
+        assert fail
+        assert "nope" in fail[-1].reason
+        assert fail[-1].latency_ms >= 0
+
+    @pytest.mark.asyncio
+    async def test_list_fail_logged(self, mcp_inproc, caplog) -> None:
+        """list в незарегистрированный узел: fail-лог (failed=True, tool, latency)."""
+        with caplog.at_level(logging.INFO, logger="app"):
+            result = await mcp_inproc.call_tool("memory_list", {"namespace": "nope"})
+        assert result.structured_content["items"] == []
+        assert "nope" in result.structured_content["hint"]
+        fail = _tool_fail_records(caplog, "memory_list")
+        assert fail
+        assert "nope" in fail[-1].reason
+        assert fail[-1].latency_ms >= 0
+
+
+def _tool_fail_records(caplog, tool: str) -> list:
+    """Записи caplog: tool_call для данного инструмента с failed=True."""
+    return [
+        r for r in caplog.records
+        if getattr(r, "event", None) == "tool_call"
+        and getattr(r, "tool", None) == tool
+        and getattr(r, "failed", None) is True
+    ]
 
 
 class TestInstructionsBudget:
