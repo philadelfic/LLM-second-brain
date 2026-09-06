@@ -293,7 +293,11 @@ def init_db(settings: Settings) -> None:
             _migrate_namespace_columns(conn)
             _migrate_classification_columns(conn)
             conn.execute(_NAMESPACES_DDL)
-            conn.execute(_INDEX_NAMESPACE_DDL)
+            # List-индексы (пул 15): старый idx_notes_namespace заменён
+            # (prefix namespace, deleted_at покрыт новым ns-индексом).
+            conn.execute("DROP INDEX IF EXISTS idx_notes_namespace")
+            conn.execute(_INDEX_DELETED_UPDATED_DDL)
+            conn.execute(_INDEX_NS_DELETED_UPDATED_DDL)
             _ensure_default_namespace(conn)
             conn.execute(_PROMOTIONS_DDL)
             # Партиция namespace (Фаза 10): vec-таблицы живых БД без `+ns`
@@ -333,9 +337,19 @@ def _migrate_title_column(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE notes ADD COLUMN title TEXT")
 
 
-_INDEX_NAMESPACE_DDL = (
-    "CREATE INDEX IF NOT EXISTS idx_notes_namespace "
-    "ON notes(namespace, deleted_at)"
+# Индексы list-выдач (фаза 2, пул 15; замер 50k: LIST p95 204 мс):
+# покрывают ORDER BY updated_at DESC, id DESC — SQLite идёт по индексу
+# (COVERING, уже отсортирован) и останавливается после LIMIT, без полного
+# скана и сортировки. idx_notes_ns_deleted_updated заменяет собой
+# idx_notes_namespace (prefix namespace, deleted_at — те же lookup'ы дедупа
+# и счётчиков), старый индекс сносится при старте.
+_INDEX_DELETED_UPDATED_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_notes_deleted_updated "
+    "ON notes(deleted_at, updated_at DESC, id DESC)"
+)
+_INDEX_NS_DELETED_UPDATED_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_notes_ns_deleted_updated "
+    "ON notes(namespace, deleted_at, updated_at DESC, id DESC)"
 )
 
 

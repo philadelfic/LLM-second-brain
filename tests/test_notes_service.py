@@ -558,3 +558,52 @@ class TestTitleInOutputs:
         service.save("с названием", title="Осмысленное название")
         note = service.get([1])["notes"][0]
         assert note["title"] == "Осмысленное название"
+
+
+class TestListIndexes:
+    """Пул 15 (list-индексы): планы list-запросов идут по индексам — без
+    полного скана и сортировки (бенч 50k: LIST p95 204 мс → единицы мс)."""
+
+    def test_indexes_exist(self) -> None:
+        init_db(get_settings())
+        with session(get_settings()) as conn:
+            names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' "
+                    "AND tbl_name = 'notes'"
+                )
+            }
+        assert "idx_notes_deleted_updated" in names
+        assert "idx_notes_ns_deleted_updated" in names
+        assert "idx_notes_namespace" not in names  # заменён (prefix покрыт)
+
+    def test_global_list_plan_uses_index(self) -> None:
+        init_db(get_settings())
+        with session(get_settings()) as conn:
+            plan = " | ".join(
+                row[3]
+                for row in conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT id FROM notes "
+                    "WHERE deleted_at IS NULL "
+                    "ORDER BY updated_at DESC, id DESC LIMIT 20"
+                )
+            )
+        assert "idx_notes_deleted_updated" in plan
+        assert "SCAN notes" not in plan
+        assert "TEMP B-TREE" not in plan
+
+    def test_ns_list_plan_uses_index(self) -> None:
+        init_db(get_settings())
+        with session(get_settings()) as conn:
+            plan = " | ".join(
+                row[3]
+                for row in conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT id FROM notes "
+                    "WHERE namespace = 'work' AND deleted_at IS NULL "
+                    "ORDER BY updated_at DESC, id DESC LIMIT 20"
+                )
+            )
+        assert "idx_notes_ns_deleted_updated" in plan
+        assert "SCAN notes" not in plan
+        assert "TEMP B-TREE" not in plan
