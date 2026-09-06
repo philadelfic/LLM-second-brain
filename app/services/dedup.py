@@ -16,10 +16,6 @@
   лишь предфильтр; без судьи (DI None, тестовый режим) воркер сводит по
   косинусу ≥ DEDUP_SIMILARITY (фоллбек Этапа 2.2).
 
-`find_by_cosine` (топ-1 по DEDUP_SIMILARITY) — прежний синхронный путь Фаз
-3–7: прод-код его с Этапа 1 не вызывает (сведение живёт в воркере — Этап
-2.2), оставлен как проверочное API (вопрос об удалении — по ходу Этапа 3).
-
 Trash (soft delete) не участвует ни в одном пути: удалённая заметка — не
 кандидат в дубликаты (undo оператора вернёт её как отдельную заметку,
 REQUIREMENTS FR-6); вектора trash живы (ARCH §3.3), дедуп читает только
@@ -65,31 +61,6 @@ class DeduplicationService:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    # --- основной путь ------------------------------------------------------
-
-    def find_by_cosine(self, vector: list[float]) -> sqlite3.Row | None:
-        """Топ-1 активная заметка с cosine ≥ DEDUP_SIMILARITY (иначе None).
-
-        С Фазы 8 прод-код метод не вызывает (синхронной векторизации больше
-        нет — Этап 1; вердикт фонового дедупа принял судья — Этап 3.2):
-        оставлен как проверочное API (решение об удалении — открытое,
-        за ответом к Олегу). Хит на удалённую (trash) заметку — не
-        дубликат: вектора trash живы для поиска-восстановления, но дедуп
-        читает только активные.
-        """
-        with session(self._settings) as conn:
-            hits = vectors.knn(conn, vector, 1)
-            if not hits:
-                return None
-            note_id, cosine = hits[0]
-            if cosine < self._settings.dedup_similarity:
-                return None
-            return conn.execute(
-                "SELECT id, text FROM notes "
-                "WHERE id = ? AND deleted_at IS NULL",
-                (note_id,),
-            ).fetchone()
-
     # --- фоновый дедуп: кандидаты (Фаза 8, Этап 2.1) -------------------------
 
     def find_candidates(
@@ -123,7 +94,7 @@ class DeduplicationService:
         threshold = self._settings.dedup_candidate_similarity
         with session(self._settings) as conn:
             if namespace:
-                ns_ph = ",".join("?" * 1)
+                ns_ph = "?"
                 ns_clause = " AND namespace = ?"
                 ns_params: list[object] = [namespace]
             else:

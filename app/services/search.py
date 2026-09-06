@@ -154,12 +154,6 @@ class SearchService:
 
     # --- источники кандидатов ------------------------------------------------
 
-    def _namespace_filter(
-        self, namespace: str | None, namespace_exact: bool
-    ) -> list[str] | None:
-        """Узлы-партиции для фильтра — общая логика в реестре (filter_nodes)."""
-        return self._namespaces.filter_nodes(namespace, namespace_exact)
-
     def _vector_candidates(
         self,
         conn: sqlite3.Connection,

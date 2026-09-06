@@ -34,9 +34,6 @@ class NoDedup:
     """Отключённый дедуп: длинные тексты-фикстуры почти идентичны (дедуп
     реализуется и проверяется в шаге 3, воркеру/миграции он шумит)."""
 
-    def find_by_cosine(self, vector: list[float]):
-        return None
-
     def find_by_text(
         self,
         text: str,

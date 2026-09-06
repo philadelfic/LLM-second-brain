@@ -38,9 +38,6 @@ DEFS = {"chunk_size": 1024, "chunk_overlap": 180, "chunk_min_target": 200}
 class NoDedup:
     """Отключённый дедуп: тесты воркера не про дубликаты (шаг 3)."""
 
-    def find_by_cosine(self, vector: list[float]):
-        return None
-
     def find_by_text(
         self,
         text: str,

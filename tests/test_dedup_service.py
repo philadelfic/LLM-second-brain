@@ -1,11 +1,9 @@
-"""DeduplicationService (Фаза 3/8): косинусный порог, FTS-фоллбек, trash.
+"""DeduplicationService (Фаза 3/8): FTS-фоллбек, косинус-кандидаты, trash.
 
-Метод find_by_cosine (топ-1, порог DEDUP_SIMILARITY) с Этапа 1 вызывается
-только фоновой обработкой (вектора строит воркер — тесты догоняют очередь
-через vectorize_notes); в синхронном save остался дословный дедуп по тексту.
-Перефразы ниже порога сохраняются — их ловит фоновый дедуп: Этап 2.1
-находит косинус-кандидатов (find_candidates, порог DEDUP_CANDIDATE_*),
-Этап 2.2 сводит дубли, Этап 3 добавит судью-LLM.
+В синхронном save живёт дословный дедуп по тексту. Перефразы ниже порога
+сохраняются — их ловит фоновый дедуп: Этап 2.1 находит косинус-кандидатов
+(find_candidates, порог DEDUP_CANDIDATE_*), Этап 2.2 сводит дубли,
+Этап 3 добавит судью-LLM.
 """
 
 from __future__ import annotations
@@ -28,7 +26,6 @@ from app.storage import vectors
 from app.storage.db import init_db, session, transaction
 
 E1 = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-E2 = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 
 @pytest.fixture
@@ -70,26 +67,6 @@ def test_duplicate_response_shape() -> None:
 # --- косинусный дедуп --------------------------------------------------------
 
 
-def test_find_by_cosine_above_threshold(dim8, notes) -> None:
-    notes.save("приветственная заметка про деплой", author="m1")
-    # Фаза 8: вектор строит воркер — для косинус-поиска догоняем очередь.
-    assert vectorize_notes(dim8, HashEmbedder(8)) == 1
-    dedup = DeduplicationService(dim8)
-    found = dedup.find_by_cosine(HashEmbedder(8).embed("приветственная заметка про деплой"))
-    assert found is not None
-    assert found["id"] == 1
-
-
-def test_find_by_cosine_orthogonal_is_not_dup(dim8, notes) -> None:
-    notes.save("заметка совсем другого смысла")
-    dedup = DeduplicationService(dim8)
-    assert dedup.find_by_cosine(E2) is None  # ортогональный вектор далеко
-
-
-def test_find_by_cosine_empty_bank(dim8) -> None:
-    assert DeduplicationService(dim8).find_by_cosine(E1) is None
-
-
 def test_trash_hit_is_not_duplicate(dim8, notes) -> None:
     """Вектор в trash жив (ARCH §3.3), но дедуп читает только активные."""
     notes.save("уникальная заметка для удаления")
@@ -97,7 +74,7 @@ def test_trash_hit_is_not_duplicate(dim8, notes) -> None:
     notes.delete(1)
     dedup = DeduplicationService(dim8)
     query = HashEmbedder(8).embed("уникальная заметка для удаления")
-    assert dedup.find_by_cosine(query) is None
+    assert dedup.find_candidates(query) == []  # trash — не кандидат
     # а FTS-фоллбек тоже не ловит удалённый текст
     assert dedup.find_by_text("уникальная заметка для удаления") is None
 

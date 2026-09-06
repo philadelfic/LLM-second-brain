@@ -76,25 +76,6 @@ def has_partition(conn: sqlite3.Connection) -> bool:
     return _PARTITION_RE.search(row[0] or "") is not None
 
 
-def ensure_vec_table(conn: sqlite3.Connection, dim: int) -> None:
-    """Гейт старта: размерность БД обязана совпадать с конфигом.
-
-    Несовпадение (сменили EMBEDDING_DIM после создания БД) — понятный отказ
-    запуска вместо молчаливо невалидного индекса (REQUIREMENTS §8);
-    лечение — переиндексация скриптом scripts/reindex.py.
-    """
-    existing = existing_vec_dim(conn)
-    if existing is None:
-        create_vec_table(conn, dim)
-        return
-    if existing != dim:
-        raise VectorError(
-            f"размерность векторов в БД ({existing}) не совпадает с "
-            f"EMBEDDING_DIM ({dim}); смена размерности требует переиндексации: "
-            "python scripts/reindex.py (REQUIREMENTS §8)"
-        )
-
-
 # --- сериализация ---------------------------------------------------------
 
 
@@ -137,11 +118,6 @@ def upsert(
 def drop(conn: sqlite3.Connection, note_id: int) -> None:
     """Жёстко убрать вектор (reindex, физическая чистка trash — не soft delete)."""
     conn.execute("DELETE FROM notes_vec WHERE note_id = ?", (note_id,))
-
-
-def clear_all(conn: sqlite3.Connection) -> None:
-    """Сбросить ВСЕ вектора (reindex при смене размерности/модели)."""
-    conn.execute("DELETE FROM notes_vec")
 
 
 def get_vector(conn: sqlite3.Connection, note_id: int) -> list[float] | None:

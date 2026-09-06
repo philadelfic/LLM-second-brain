@@ -86,9 +86,9 @@ def services() -> tuple[NoteService, SearchService, HashEmbedder]:
 def _vectorize_pending_chunks(embedder: HashEmbedder) -> int:
     """Довекторизовать pending-чанки (как это сделает воркер, шаг 5)."""
     with session(get_settings()) as conn, transaction(conn):
-        pending = chunks.pending_chunks(conn, 10_000)
-        for chunk_id, chunk_text in pending:
-            chunks.upsert_vector(conn, chunk_id, embedder.embed(chunk_text))
+        pending = chunks.pending_chunk_rows(conn, 10_000)
+        for row in pending:
+            chunks.upsert_vector(conn, row[0], embedder.embed(row[1]))
     return len(pending)
 
 

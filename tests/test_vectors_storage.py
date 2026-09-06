@@ -363,13 +363,3 @@ def test_trash_keeps_vector_row(dim4) -> None:
     with session(dim4) as conn:
         assert vectors.get_vector(conn, 7) is not None
         assert vectors.count(conn) == 1
-
-
-def test_clear_all(dim4) -> None:
-    with session(dim4) as conn, transaction(conn):
-        for note_id in (1, 2, 3):
-            vectors.upsert(conn, note_id, [1.0, 0.0, 0.0, 0.0])
-    with session(dim4) as conn:
-        vectors.clear_all(conn)
-    with session(dim4) as conn:
-        assert vectors.count(conn) == 0

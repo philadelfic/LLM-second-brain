@@ -133,7 +133,7 @@ def test_dim_change_rechunks_notes_and_drops_chunk_vectors(
         assert chunks.count_vectors(conn) == 0  # вектора сброшены дропом
         # пере-чанковка (brief §6): текст чанка пересчитан от текста заметки,
         # рукотворный «текст чанка» заменён честным сплиттер-выходом
-        assert chunks.pending_chunks(conn, limit=10)[0][1] == "текст заметки"
+        assert chunks.pending_chunk_rows(conn, 10)[0][1] == "текст заметки"
     init_db(new_settings)  # повторный старт ничего не портит
     with session(new_settings) as conn:
         assert chunks.count_chunks(conn) == 1
@@ -273,7 +273,7 @@ def test_drop_note_chunks_clears_vectors(dim4) -> None:
         assert chunks.count_vectors(conn) == 0
 
 
-def test_pending_chunks_oldest_first_and_limited(dim4) -> None:
+def test_pending_chunk_rows_oldest_first_and_limited(dim4) -> None:
     _insert_note(dim4, 1)
     _insert_note(dim4, 2)
     with session(dim4) as conn, transaction(conn):
@@ -281,9 +281,9 @@ def test_pending_chunks_oldest_first_and_limited(dim4) -> None:
         ids2 = chunks.replace_note_chunks(conn, 2, [("второй", 1), ("ещё", 1)])
         chunks.upsert_vector(conn, ids1[0], [1.0, 0.0, 0.0, 0.0])
     with session(dim4) as conn:
-        pending = chunks.pending_chunks(conn, limit=10)
-        assert [chunk_id for chunk_id, _ in pending] == ids2  # по id, старые first
-        assert chunks.pending_chunks(conn, limit=1)[0][1] == "второй"
+        pending = chunks.pending_chunk_rows(conn, 10)
+        assert [row[0] for row in pending] == ids2  # по id, старые first
+        assert chunks.pending_chunk_rows(conn, 1)[0][1] == "второй"
 
 
 # --- вектора чанков ---------------------------------------------------------

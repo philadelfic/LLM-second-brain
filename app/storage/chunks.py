@@ -176,31 +176,13 @@ def count_chunks(conn) -> int:
 # --- очередь pending-чанков -----------------------------------------------
 
 
-def pending_chunks(conn, limit: int) -> list[tuple[int, str]]:
-    """Чанки без вектора, по возрастанию id (старые записи — первыми).
-
-    Статус pending выводится анти-джойном (см. решение в шапке модуля).
-    Воркер (шаг 5) берёт уроками по `limit` партий.
-    """
-    return [
-        (int(row[0]), str(row[1]))
-        for row in conn.execute(
-            f"SELECT c.id, c.text FROM {CHUNKS_TABLE} c "
-            f"LEFT JOIN {CHUNKS_VEC_TABLE} v ON v.chunk_id = c.id "
-            "WHERE v.chunk_id IS NULL ORDER BY c.id LIMIT ?",
-            (limit,),
-        )
-    ]
-
-
 def pending_chunk_rows(conn, limit: int) -> list:
     """Вычитка партии pending для воркера (шаг 5): id, text, tokens, note_id, ns.
 
-    Расширенный вариант `pending_chunks` (тот же анти-джойн и порядок, ещё
-    три колонки): воркеру нужны note_id — для reuse единичного чанка сверяется
-    с заметкой; text/tokens — защита записи от гонки с update (ARCH §4.5);
+    Анти-джойн, порядок «старые первыми» и `limit`; три дополнительные колонки
+    к (id, text): воркеру нужны note_id — для reuse единичного чанка (сверяется
+    с заметкой); text/tokens — защита записи от гонки с update (ARCH §4.5);
     Фаза 10: ns — партиция неймспейса заметки-владельца для записи вектора.
-    Прочим потребителям (скрипты, тесты шага 4) хватает (id, text).
     """
     return conn.execute(
         f"SELECT c.id, c.text, c.tokens, c.note_id, n.namespace FROM {CHUNKS_TABLE} c "
