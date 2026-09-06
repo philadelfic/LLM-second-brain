@@ -107,6 +107,12 @@ def paused_app(monkeypatch) -> Iterator[TestClient]:
         monkeypatch, FixedSummarizer("Ретроспектива 12 сентября в 14:00."), "30",
         notify=False,
     ) as test_client:
+        # Осадка: даём петлям дойти до сна (back-off 30 с). Save, случись
+        # В ПЕРВОЙ итерации summary-петли (до того, как она уснёт),
+        # обрабатывается немедленно — и «пауза» флейкает под нагрузкой:
+        # заметка оказывается 'ok' вместо pending (фаза 2, аппрув пула 8;
+        # тот же класс гонки, что и notifier-флейк — аппрув пула 3).
+        time.sleep(0.5)
         yield test_client
 
 
