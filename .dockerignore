@@ -6,6 +6,8 @@
 .env
 .env.example
 data/
+data-test/
+prompts-test/
 tests/
 briefs/
 *.md
