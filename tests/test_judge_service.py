@@ -38,7 +38,7 @@ def ok_body(content: str = "**ДУБЛЬ**\n\nОбе заметки про по�
     """Штатный ответ судьи /api/chat (поле thinking присутствует — пустое или
     нет, не читаем; при think:false Ollama его вообще не возвращает)."""
     return {
-        "model": "ornith-1.5:35b",
+        "model": "lfm2.5:latest",
         "created_at": "2026-08-30T12:00:00Z",
         "message": {
             "role": "assistant",

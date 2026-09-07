@@ -547,9 +547,9 @@ class TestEmbed:
 
 class TestCheck:
     def test_ollama_ok_when_model_listed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        settings = make_settings(monkeypatch, JUDGE_MODEL="ornith-1.5:35b")
+        settings = make_settings(monkeypatch, JUDGE_MODEL="lfm2.5:latest")
         client, recorder = make_client(
-            SlotSpec.for_judge(settings), [tags_body("ornith-1.5:35b", "qwen3:32b")]
+            SlotSpec.for_judge(settings), [tags_body("lfm2.5:latest", "qwen3:32b")]
         )
         assert client.check() == CHECK_OK
         request = recorder.requests[0]
@@ -559,7 +559,7 @@ class TestCheck:
 
     def test_ollama_model_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Модели слота нет в /api/tags → model_missing."""
-        settings = make_settings(monkeypatch, JUDGE_MODEL="ornith-1.5:35b")
+        settings = make_settings(monkeypatch, JUDGE_MODEL="lfm2.5:latest")
         client, _ = make_client(
             SlotSpec.for_judge(settings), [tags_body("qwen3:32b", "llama3:8b")]
         )

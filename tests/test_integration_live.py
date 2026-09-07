@@ -3,7 +3,7 @@
 Маркер `integration` (pyproject). Сервер векторизации берётся из env
 `LIVE_EMBEDDING_URL` (дефолт — рабочий адрес REQUIREMENTS §4,
 qwen3-embedding:8b, dim 4096); суммаризатор — из `LIVE_SUMMARY_URL`
-(дефолт localhost, ornith-1.5:35b). При недоступности — SKIP, а не
+(дефолт localhost, lfm2.5:latest). При недоступности — SKIP, а не
 падение (ARCH §7). Проверяется: форматы живых векторов, качество на русских
 перефразах, дедуп-порог, догон pending фоновым воркером; суммаризация:
 реальная длина summary, язык, латентность, timeout, погонка фонового воркера
@@ -48,7 +48,7 @@ DIM = 4096  # qwen3-embedding:8b — REQUIREMENTS §8
 
 # Живой суммаризатор — Фаза 4 (REQUIREMENTS §4/§5.5).
 LIVE_SUMMARY_URL_DEFAULT = "http://localhost:11434"
-LIVE_SUMMARY_MODEL_DEFAULT = "ornith-1.5:35b"
+LIVE_SUMMARY_MODEL_DEFAULT = "lfm2.5:latest"
 
 pytestmark = pytest.mark.integration
 
@@ -332,7 +332,7 @@ def test_live_promotion_describes_judges_resolves(
     """
     db = tmp_path_factory.mktemp("live-promo") / "notes.db"
     # Судья структуры — модель судьи дедупа (JUDGE_*): в проде это
-    # тот же стенд 112 с ornith-1.5:35b, что и суммаризация (§8).
+    # тот же стенд 112 с lfm2.5:latest, что и суммаризация (§8).
     settings = live_summary.settings.model_copy(
         update={
             "db_path": str(db),

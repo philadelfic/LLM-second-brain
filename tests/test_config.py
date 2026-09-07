@@ -15,9 +15,9 @@ from app.config import ConfigError, Settings, get_settings, load_settings
 REQUIRED_ENV: dict[str, str] = {
     "EMBEDDING_BASE_URL": "http://localhost:11434",
     "SUMMARY_BASE_URL": "http://localhost:11434",
-    "SUMMARY_MODEL": "ornith-1.5:35b",
+    "SUMMARY_MODEL": "lfm2.5:latest",
     "JUDGE_BASE_URL": "http://localhost:11434",
-    "JUDGE_MODEL": "ornith-1.5:35b",
+    "JUDGE_MODEL": "lfm2.5:latest",
     "MCP_AUTH_TOKEN": "test-secret-token",
 }
 
@@ -60,7 +60,7 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     # Фаза 8 (Этап 2.1): фоновый дедуп — косинус-кандидаты.
     "DEDUP_CANDIDATE_TOP_N": ("dedup_candidate_top_n", 3),
     "DEDUP_CANDIDATE_SIMILARITY": ("dedup_candidate_similarity", 0.80),
-    # Фаза 8 (Этап 3.1): LLM-судья дедупа ornith-1.5:35b (think:false).
+    # Фаза 8 (Этап 3.1): LLM-судья дедупа lfm2.5:latest (think:false).
     "JUDGE_THINK": ("judge_think", False),
     "JUDGE_NUM_PREDICT": ("judge_num_predict", 256),
     "JUDGE_TIMEOUT_SEC": ("judge_timeout_sec", 30),
@@ -173,9 +173,9 @@ class TestDefaults:
         settings = load_env(monkeypatch)
         assert settings.embedding_base_url == "http://localhost:11434"
         assert settings.summary_base_url == "http://localhost:11434"
-        assert settings.summary_model == "ornith-1.5:35b"
+        assert settings.summary_model == "lfm2.5:latest"
         assert settings.judge_base_url == "http://localhost:11434"
-        assert settings.judge_model == "ornith-1.5:35b"
+        assert settings.judge_model == "lfm2.5:latest"
         assert settings.mcp_auth_token == "test-secret-token"
 
 

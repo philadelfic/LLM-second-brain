@@ -16,9 +16,9 @@ from app.config import ConfigError, Settings, load_settings
 REQUIRED_ENV: dict[str, str] = {
     "EMBEDDING_BASE_URL": "http://localhost:11434",
     "SUMMARY_BASE_URL": "http://localhost:11434",
-    "SUMMARY_MODEL": "ornith-1.5:35b",
+    "SUMMARY_MODEL": "lfm2.5:latest",
     "JUDGE_BASE_URL": "http://localhost:11434",
-    "JUDGE_MODEL": "ornith-1.5:35b",
+    "JUDGE_MODEL": "lfm2.5:latest",
     "MCP_AUTH_TOKEN": "test-secret-token",
 }
 

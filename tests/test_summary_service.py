@@ -34,7 +34,7 @@ def make_settings(monkeypatch: pytest.MonkeyPatch, **env: str):
 def ok_body(content: str = "Краткое содержание одним предложением.") -> dict:
     """Штатный ответ /api/chat (поле thinking присутствует — отбрасывается)."""
     return {
-        "model": "ornith-1.5:35b",
+        "model": "lfm2.5:latest",
         "created_at": "2026-08-29T12:00:00Z",
         "message": {
             "role": "assistant",
