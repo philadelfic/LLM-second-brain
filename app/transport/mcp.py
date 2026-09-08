@@ -125,12 +125,16 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "краткие содержания (summary) и метки времени заметок; если нужен "
         "точный текст — memory_get. Не выдумывай то, что могло быть сохранено — "
         "сначала поиск. Если уверен в области — укажи `namespace` (узел или "
-        "его поддерево по карте); не уверен — ищи глобально и сужай."
+        "его поддерево по карте); не уверен — ищи глобально и сужай. Режим "
+        "поиска — параметр `mode`: `semantic` (по умолчанию, по смыслу) или "
+        "`title` (по подстроке названия)."
     ),
     "memory_list": (
         "Обзор памяти: заметки (краткие содержания, по свежести), с пагинацией "
         "offset. Используй для ориентировки в темах; не читает все заметки "
-        "целиком. Укажи `namespace`, чтобы ограничить обзор узлом/поддеревом."
+        "целиком. Укажи `namespace`, чтобы ограничить обзор узлом/поддеревом. "
+        "Форма выдачи — параметр `detail`: `summaries` (по умолчанию, с краткими "
+        "содержаниями) или `titles` (компактно: id, title, namespace)."
     ),
     "memory_get": (
         "Полный текст одной или нескольких заметок (передай список ids — читай "
@@ -222,6 +226,40 @@ def _compact_list(result: dict[str, Any]) -> dict[str, Any]:
     return _with_hint(out, result)
 
 
+# lsb-0001-02 (FR-3.4/FR-4.1): title-режим поиска и titles-деталь листинга —
+# отдельные компактные контракты. Белые списки semantic-поиска и summaries-
+# листинга (_SEARCH_ITEM/_LIST_ITEM) НЕ меняются — обратная совместимость
+# v2.1.1 (FR-3.3, FR-4.2). title-выдача поиска несёт score вместо
+# created_at/updated_at (контракт FR-2.2 постановки 01); titles-листинг —
+# только id/title/namespace.
+_TITLE_SEARCH_ITEM = ("id", "title", "namespace", "summary", "score")
+_TITLE_LIST_ITEM = ("id", "title", "namespace")
+
+# Допустимые значения новых опциональных параметров (FR-3.1, FR-4.1).
+SEARCH_MODES = ("semantic", "title")
+LIST_DETAILS = ("summaries", "titles")
+
+# Мягкие отказы (FR-3.4, §5.3 fail + hint): хинт перечисляет доступные
+# значения — модель сама выбирает корректное.
+HINT_INVALID_MODE = (
+    "неизвестный режим поиска; доступные: semantic (по умолчанию), title"
+)
+HINT_INVALID_DETAIL = (
+    "неизвестная форма листинга; доступные: summaries (по умолчанию), titles"
+)
+
+
+def _compact_title_search(result: dict[str, Any]) -> dict[str, Any]:
+    out = {"results": [_pick(r, _TITLE_SEARCH_ITEM) for r in result["results"]]}
+    return _with_hint(out, result)
+
+
+def _compact_list_titles(result: dict[str, Any]) -> dict[str, Any]:
+    out = {"items": [_pick(i, _TITLE_LIST_ITEM) for i in result["items"]],
+           "total": result["total"]}
+    return _with_hint(out, result)
+
+
 def _compact_get(result: dict[str, Any]) -> dict[str, Any]:
     out = {"notes": [_pick(n, _GET_NOTE) for n in result["notes"]]}
     return _with_hint(out, result)
@@ -300,12 +338,42 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             bool,
             Field(description="Только сам узел, без листьев под ним"),
         ] = False,
+        mode: Annotated[
+            str,
+            Field(
+                description="Режим поиска: semantic (по умолчанию, по смыслу) "
+                "или title (по подстроке названия)",
+            ),
+        ] = "semantic",
     ) -> dict[str, Any]:
         started = time.perf_counter()
-        try:
-            result = await asyncio.to_thread(
-                services.search.search, query, top_k, namespace, namespace_exact
+        if mode not in SEARCH_MODES:
+            # FR-3.4: неизвестный mode — мягкий отказ с хинтом доступных
+            # режимов (fail + hint), не жёсткая ошибка.
+            log_tool_call(
+                "memory_search",
+                started,
+                failed=True,
+                reason="invalid mode",
+                namespace=namespace,
+                query=preview(query),
             )
+            return {"results": [], "hint": HINT_INVALID_MODE}
+        try:
+            if mode == "title":
+                # lsb-0001-02: title-режим поверх SearchService.search_title
+                # (постановка 01) — строгий поиск по подстроке названия.
+                result = await asyncio.to_thread(
+                    services.search.search_title,
+                    query,
+                    top_k,
+                    namespace,
+                    namespace_exact,
+                )
+            else:
+                result = await asyncio.to_thread(
+                    services.search.search, query, top_k, namespace, namespace_exact
+                )
         except (NamespaceError, NamespaceValidationError) as exc:
             # NFR-4: отказ инструмента наблюдаем — failed + латентность;
             # текст исключения безопасен (имя узла, не содержимое заметок).
@@ -329,6 +397,8 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             query=preview(query),
             fts_only=bool(result.get("warning")),
         )
+        if mode == "title":
+            return _compact_title_search(result)
         return _compact_search(result)
 
     @mcp.tool(name="memory_list", description=TOOL_DESCRIPTIONS["memory_list"])
@@ -352,8 +422,26 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             bool,
             Field(description="Только сам узел, без листьев под ним"),
         ] = False,
+        detail: Annotated[
+            str,
+            Field(
+                description="Форма выдачи: summaries (по умолчанию, с краткими "
+                "содержаниями) или titles (компактно: id, title, namespace)",
+            ),
+        ] = "summaries",
     ) -> dict[str, Any]:
         started = time.perf_counter()
+        if detail not in LIST_DETAILS:
+            # FR-4.1: неизвестный detail — мягкий отказ с хинтом доступных
+            # форм (fail + hint), симметрично mode.
+            log_tool_call(
+                "memory_list",
+                started,
+                failed=True,
+                reason="invalid detail",
+                namespace=namespace,
+            )
+            return {"items": [], "total": 0, "hint": HINT_INVALID_DETAIL}
         try:
             result = await asyncio.to_thread(
                 services.notes.list, limit, offset, namespace, namespace_exact
@@ -375,6 +463,8 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             offset=offset,
             namespace=namespace,
         )
+        if detail == "titles":
+            return _compact_list_titles(result)
         return _compact_list(result)
 
     @mcp.tool(name="memory_get", description=TOOL_DESCRIPTIONS["memory_get"])

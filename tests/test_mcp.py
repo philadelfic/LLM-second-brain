@@ -240,6 +240,23 @@ class TestToolsList:
         assert "namespace" not in tools["memory_delete"].input_schema["properties"]
         assert "namespace" not in tools["memory_get"].input_schema["properties"]
 
+    @pytest.mark.asyncio
+    async def test_search_schema_mode(self, server_url: str) -> None:
+        """FR-3.1: mode в схеме memory_search, дефолт 'semantic', опционален."""
+        async with connect(server_url) as session:
+            tools = {t.name: t for t in (await session.list_tools()).tools}
+        schema = tools["memory_search"].input_schema
+        assert schema["required"] == ["query"]  # mode не обязателен
+        assert schema["properties"]["mode"]["default"] == "semantic"
+
+    @pytest.mark.asyncio
+    async def test_list_schema_detail(self, server_url: str) -> None:
+        """FR-4.1: detail в схеме memory_list, дефолт 'summaries'."""
+        async with connect(server_url) as session:
+            tools = {t.name: t for t in (await session.list_tools()).tools}
+        props = tools["memory_list"].input_schema["properties"]
+        assert props["detail"]["default"] == "summaries"
+
 
 class TestToolCalls:
     @pytest.mark.asyncio
@@ -416,6 +433,88 @@ class TestMemoryFlow:
             }  # Фаза 11 (решение №9): +title
             assert "summary_status" not in item
             assert "author" not in item
+
+    @pytest.mark.asyncio
+    async def test_search_title_mode_finds_by_title(self, server_url: str) -> None:
+        """FR-3.1/FR-2.1: mode='title' находит по подстроке названия (компактно)."""
+        title = f"Квантовый кулер {self.marker}"
+        async with connect(server_url) as session:
+            note_id = await _saved_id(session, f"{self.marker}: текст для title-поиска", title=title)
+            found = (await session.call_tool(
+                "memory_search", {"query": "квантовый", "mode": "title"}
+            )).structured_content
+        hit = next(r for r in found["results"] if r["id"] == note_id)
+        # title-контракт FR-2.2: score вместо created_at/updated_at.
+        assert set(hit) == {"id", "title", "namespace", "summary", "score"}
+        assert hit["title"] == title
+        assert hit["namespace"] == "default"
+        assert "created_at" not in hit
+
+    @pytest.mark.asyncio
+    async def test_search_semantic_mode_unchanged(self, server_url: str) -> None:
+        """FR-3.2: mode='semantic' — как раньше (компактный контракт semantic)."""
+        text = f"{self.marker}: семантический режим явно"
+        async with connect(server_url) as session:
+            await _saved_id(session, text)
+            found = (await session.call_tool(
+                "memory_search", {"query": "семантический режим", "mode": "semantic"}
+            )).structured_content
+        hit = next(
+            r for r in found["results"] if r["summary"].startswith(f"{self.marker}")
+        )
+        assert set(hit) == {
+            "id", "summary", "created_at", "updated_at", "namespace", "title",
+        }
+        assert "score" not in hit
+
+    @pytest.mark.asyncio
+    async def test_search_invalid_mode_soft_fail(self, server_url: str) -> None:
+        """FR-3.4: неизвестный mode — мягкий отказ с хинтом доступных режимов."""
+        async with connect(server_url) as session:
+            found = (await session.call_tool(
+                "memory_search", {"query": "что-то", "mode": "hybrid"}
+            )).structured_content
+        assert found["results"] == []
+        assert "semantic" in found["hint"] and "title" in found["hint"]
+
+    @pytest.mark.asyncio
+    async def test_list_titles_detail_compact(self, server_url: str) -> None:
+        """FR-4.1: detail='titles' — компактно (id, title, namespace), без summary."""
+        async with connect(server_url) as session:
+            await _saved_id(session, f"{self.marker}: для titles-листинга")
+            listed = (await session.call_tool(
+                "memory_list", {"limit": 5, "detail": "titles"}
+            )).structured_content
+        assert listed["total"] >= 1
+        assert listed["items"]
+        for item in listed["items"]:
+            assert set(item) == {"id", "title", "namespace"}
+            assert "summary" not in item
+            assert "created_at" not in item
+
+    @pytest.mark.asyncio
+    async def test_list_summaries_detail_unchanged(self, server_url: str) -> None:
+        """FR-4.2: detail='summaries' — как сейчас (полный компактный контракт)."""
+        async with connect(server_url) as session:
+            await _saved_id(session, f"{self.marker}: для summaries-листинга")
+            listed = (await session.call_tool(
+                "memory_list", {"limit": 5, "detail": "summaries"}
+            )).structured_content
+        assert listed["total"] >= 1
+        for item in listed["items"]:
+            assert set(item) == {
+                "id", "summary", "created_at", "updated_at", "namespace", "title",
+            }
+
+    @pytest.mark.asyncio
+    async def test_list_invalid_detail_soft_fail(self, server_url: str) -> None:
+        """FR-4.1: неизвестный detail — мягкий отказ с хинтом доступных форм."""
+        async with connect(server_url) as session:
+            listed = (await session.call_tool(
+                "memory_list", {"limit": 5, "detail": "full"}
+            )).structured_content
+        assert listed["items"] == [] and listed["total"] == 0
+        assert "summaries" in listed["hint"] and "titles" in listed["hint"]
 
     @pytest.mark.asyncio
     async def test_update_full_rewrite(self, server_url: str) -> None:
