@@ -39,3 +39,6 @@ BUGS.md
 # Тестовая копия (решение О. 2026-09-03): токен и база тест-контейнера
 .env.test
 data-test/
+# test-environment secrets (not for GitHub)
+docker-compose.test.yml
+.secrets/
