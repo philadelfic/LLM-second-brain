@@ -28,6 +28,13 @@ Snippet — из ЛУЧШЕГО чанка (первые SNIPPET_CHARS симв�
 id DESC: свежее полезнее (в духе FR-2), детерминированно без случайности.
 Выдача — полный контракт сервис-слоя (REST отдаёт как есть);
 MCP-слой срезает служебные поля — см. Фаза 9.
+
+lsb-0001-01 (Шаг 3): FTS-сторона гибрида — с весами bm25: совпадение
+подстроки в title ранжируется выше той же подстроки в text (FR-1.2;
+вес TITLE_FTS_WEIGHT — решение гейта R3). Плюс отдельный title-режим
+SearchService.search_title: строгий поиск по названиям (решение D3 —
+вхождение в text не матчится), компактная выдача и ступеньки score
+(решение D2 — FR-2.1/FR-2.2).
 """
 
 from __future__ import annotations
@@ -68,6 +75,19 @@ HINT_NO_RESULTS = (
 HINT_SHORT_QUERY = (
     "каждое слово запроса короче 3 символов — trigram по ним не ищет; "
     "добавь осмысленные слова"
+)
+
+# Вес bm25 title-колонки notes_fts (lsb-0001-01, FR-1.2): совпадение
+# подстроки в названии даёт более НИЗКУЮ badness → выше в ORDER BY badness,
+# чем то же совпадение в тексте (колонки notes_fts: title, text; вес text —
+# 1.0). Значение подбирается тестами (решение гейта R3); env-переменной нет.
+TITLE_FTS_WEIGHT = 2.0
+
+# Пустой title-режим (FR-2.2): компактная выдача, обычный semantic-поиск
+# ищет шире — hint обучает модель выбрать нужный инструмент.
+HINT_NO_RESULTS_TITLE = (
+    "по названию ничего не найдено; проверь подстроку названия или сделай "
+    "обзор через memory_list; обычный semantic-поиск ищет и по тексту"
 )
 
 
@@ -151,6 +171,94 @@ class SearchService:
             )
             return {"results": [], "warning": warning, "hint": hint}
         return {"results": results, "warning": warning}
+
+    def search_title(
+        self,
+        query: str,
+        top_k: int | None = None,
+        namespace: str | None = None,
+        namespace_exact: bool = False,
+    ) -> dict[str, Any]:
+        """Title-поиск memory_search (lsb-0001-01): FR-2.1/FR-2.2 + решения
+        D2/D3 владельца.
+
+        D3 — строго по названиям: подстрока совпадает ТОЛЬКО с title;
+        вхождение в текст здесь не матчится (такой текст находит обычный
+        гибридный search). Сопоставление — на стороне Python
+        (`needle in title.lower()`), а не LIKE/FTS: lower() в SQLite
+        регистронезависим только для ASCII, кириллица не покрывается (и
+        trigram-FTS её не ищет). Масштаб — тот же аргумент, что у
+        brute-force vec0 (NFR-5): до 50 000 заметок — одна вычитка и
+        линейный скан только заголовков.
+
+        Ранжирование (D2, ступеньки): 1.0 — запрос совпал с названием
+        ЦЕЛИКОМ (регистронезависимо), 0.5 — подстрока. Порядок: точные
+        выше; среди частичных — вхождение ближе к началу названия выше;
+        tie — updated_at DESC, затем id DESC (в духе _merge). Выдача
+        компактная (FR-2.2): id, title, namespace, summary, score — без
+        snippet/rrf_score/полного текста (summary — через summary_of:
+        pending → fallback-усечение §5.5, готовое — как есть).
+
+        Валидации как у semantic: длина запроса 1..max_query_chars, top_k
+        1..MAX_TOP_K (умолчание — default_top_k). Trigram-правило «слова
+        ≥3 симв.» здесь НЕ применяется — это не FTS. `namespace` — узел
+        иерархии: поддерево (`namespace_exact` — только сам узел), как в
+        search(); незарегистрированный узел — NamespaceError, пробрасывается
+        как есть (MCP-транспорт подключит на шаге 03 релиза 2.2 и обернёт
+        в fail + hint, как у search). warning в этом режиме не бывает —
+        эмбеддинг не используется.
+        """
+        query = self._validate_query(query)
+        top_k = self._default_top_k() if top_k is None else top_k
+        if not 1 <= top_k <= MAX_TOP_K:
+            raise SearchValidationError(
+                f"top_k: ожидается 1..{MAX_TOP_K}, получено {top_k}"
+            )
+        ns_nodes = self._namespaces.filter_nodes(namespace, namespace_exact)
+        ns_clause = ""
+        ns_params: list[object] = []
+        if ns_nodes:
+            ns_clause = " AND namespace IN (" + ",".join("?" * len(ns_nodes)) + ")"
+            ns_params = list(ns_nodes)
+        with session(self._settings) as conn:
+            # text — только вход summary_of (pending-fallback §5.5); в выдачу
+            # полный текст не идёт (компактный контракт FR-2.2).
+            rows = conn.execute(
+                "SELECT id, title, namespace, text, summary, summary_status, "
+                "       created_at, updated_at "
+                "FROM notes WHERE deleted_at IS NULL AND title IS NOT NULL"
+                f"{ns_clause}",
+                ns_params,
+            ).fetchall()
+        needle = query.lower()
+        ranked: list[tuple[float, int, sqlite3.Row]] = []
+        for row in rows:
+            lowered = row["title"].lower()
+            if needle not in lowered:
+                continue
+            ranked.append(
+                (1.0 if lowered == needle else 0.5, lowered.find(needle), row)
+            )
+        # Порядок (решение D2): score DESC → позиция вхождения ASC →
+        # updated_at DESC → id DESC. Стабильные проходы: последний ключ —
+        # главный; updated_at/id не отрицаются — DESC проходом reverse=True.
+        ranked.sort(key=lambda hit: hit[2]["id"], reverse=True)
+        ranked.sort(key=lambda hit: hit[2]["updated_at"], reverse=True)
+        ranked.sort(key=lambda hit: hit[1])
+        ranked.sort(key=lambda hit: hit[0], reverse=True)
+        results = [
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "namespace": row["namespace"],
+                "summary": summary_of(row, self._settings),
+                "score": score,
+            }
+            for score, _position, row in ranked[:top_k]
+        ]
+        if not results:
+            return {"results": [], "hint": HINT_NO_RESULTS_TITLE}
+        return {"results": results}
 
     # --- источники кандидатов ------------------------------------------------
 
@@ -294,18 +402,22 @@ class SearchService:
     ) -> list[sqlite3.Row]:
         """Топ-50 FTS5/BM25 по активным заметкам в узлах поддерева; rank с 1 —
         для RRF. Фаза 10: фильтр namespace — JOIN'ом на notes (FTS-индекс
-        не пересоздаётся, бриф Шаг 1)."""
+        не пересоздаётся, бриф Шаг 1). lsb-0001-01 (FR-1.2): веса bm25
+        (TITLE_FTS_WEIGHT, 1.0) — совпадение в title выше совпадения в text.
+        """
         if ns_nodes:
             ns_ph = ",".join("?" * len(ns_nodes))
             ns_clause = f" AND n.namespace IN ({ns_ph})"
-            params: list[object] = [expression, *ns_nodes]
+            # Весовые параметры bm25 идут ПЕРЕД остальными: порядок вызова
+            # аргументов — как в SQL (SELECT bm25(..., ?, ?) раньше WHERE ?).
+            params: list[object] = [TITLE_FTS_WEIGHT, 1.0, expression, *ns_nodes]
         else:
             ns_clause = ""
-            params = [expression]
+            params = [TITLE_FTS_WEIGHT, 1.0, expression]
         return conn.execute(
             "SELECT n.id, n.text, n.summary, n.summary_status, n.author, "
             "       n.namespace, n.created_at, n.updated_at, "
-            "       bm25(notes_fts) AS badness "
+            "       bm25(notes_fts, ?, ?) AS badness "
             "FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid "
             f"WHERE notes_fts MATCH ?{ns_clause} AND n.deleted_at IS NULL "
             "ORDER BY badness, n.updated_at DESC, n.id DESC LIMIT ?",
