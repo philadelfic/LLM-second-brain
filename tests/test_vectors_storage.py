@@ -237,6 +237,12 @@ def test_notes_title_migrated_on_legacy_db(tmp_path, monkeypatch) -> None:
     settings = make_settings(monkeypatch, dim=4)
     init_db(settings)
     with session(settings) as conn:
+        # lsb-0001-01: триггеры notes_fts_* читают new.title, а SQLite
+        # запрещает DROP COLUMN, на которую ссылается триггер. У настоящей
+        # легаси-БД (до Фазы 11) триггеры text-only — эмуляция начинается
+        # со снятия текущих триггеров.
+        conn.execute("DROP TRIGGER IF EXISTS notes_fts_ai")
+        conn.execute("DROP TRIGGER IF EXISTS notes_fts_au")
         conn.execute("ALTER TABLE notes DROP COLUMN title")
     init_db(settings)
     with session(settings) as conn:
