@@ -235,6 +235,7 @@ def live_summary(tmp_path_factory) -> SimpleNamespace:
         summary_base_url=url,
         summary_model=model,
         mcp_auth_token="live-summary-token",
+        summary_timeout_sec=300,  # ornith:35b генерирует дольше дефолта 60 с
         db_path=str(tmp_path_factory.mktemp("live-summary") / "notes.db"),
     )
     init_db(settings)
