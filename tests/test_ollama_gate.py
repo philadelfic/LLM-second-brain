@@ -165,6 +165,7 @@ def test_servers_are_independent(
     )
     shared = {"active": 0, "max": 0}
     lock = threading.Lock()
+    overlap = threading.Barrier(2)  # оба потока гарантированно в активной зоне
 
     class _Shared:
         def __init__(self, inner: _ConcurrencyProbe) -> None:
@@ -174,6 +175,7 @@ def test_servers_are_independent(
             with lock:
                 shared["active"] += 1
                 shared["max"] = max(shared["max"], shared["active"])
+            overlap.wait()  # детерминизм: оба вызова перекрываются
             try:
                 return self._inner(request)
             finally:

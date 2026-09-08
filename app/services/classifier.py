@@ -190,7 +190,12 @@ class ClassificationService:
 
     @staticmethod
     def _extract_json(content: str) -> Any:
-        """Вынуть JSON-объект из ответа (устойчиво к код-фенсам и обвязке)."""
+        """Вынуть JSON-объект из ответа (устойчиво к код-фенсам и обвязке).
+
+        Срезается обвязка thinking/response (модель ornith:35b оборачивает
+        JSON в теги thinking/response, где рассуждения могут содержать
+        фигурные скобки) — до попытки json.loads.
+        """
         text = content.strip()
         if text.startswith("```"):
             lines = text.splitlines()
@@ -199,6 +204,7 @@ class ClassificationService:
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             text = "\n".join(lines).strip()
+        text = ClassificationService._strip_reasoning_wrapper(text)
         try:
             return json.loads(text)
         except ValueError:
@@ -211,3 +217,23 @@ class ClassificationService:
             except ValueError:
                 pass
         raise ClassificationError("не удалось извлечь JSON из ответа классификатора")
+
+    @staticmethod
+    def _strip_reasoning_wrapper(text: str) -> str:
+        """Срезать обвязку thinking/response, если модель её добавила.
+
+        Идём с конца: если есть строка-маркер `response` (последняя из
+        {response, <response>, </response>}) — возвращаем всё, что после неё.
+        Иначе убираем строки-маркеры {thinking, <thinking>, </thinking>,
+        response, <response>, </response>}. Если ничего не срезалось —
+        возвращаем исходный текст.
+        """
+        lines = text.splitlines()
+        response_markers = {"response", "<response>", "</response>"}
+        all_markers = response_markers | {"thinking", "<thinking>", "</thinking>"}
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].strip().lower() in response_markers:
+                return "\n".join(lines[i + 1 :]).strip()
+        stripped = [ln for ln in lines if ln.strip().lower() not in all_markers]
+        result = "\n".join(stripped).strip()
+        return result if result != text.strip() else text

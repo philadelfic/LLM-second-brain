@@ -162,6 +162,20 @@ def test_code_fence_stripped(monkeypatch) -> None:
     service.close()
 
 
+def test_thinking_response_wrapper_stripped(monkeypatch) -> None:
+    """Обвязка thinking/response (ornith:35b) срезается до разбора JSON."""
+    settings = make_settings(monkeypatch)
+    content = (
+        ' thinking\nThe user asks: "You are a tag classifier..." '
+        '"confidence": 0.0}. Ensure no extra text.\n response\n'
+        '{"domain_hint": "work", "subdomain_hint": null, "confidence": 0.7}'
+    )
+    service, _ = make_service(settings, [httpx.Response(200, json=ok_body(content))])
+    result = service.classify(NOTE, KNOWN)
+    assert result == Classification("work", None, 0.7)
+    service.close()
+
+
 # --- негативы ---------------------------------------------------------------
 
 def test_invalid_confidence_raises(monkeypatch) -> None:
