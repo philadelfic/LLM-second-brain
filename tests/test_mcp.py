@@ -198,11 +198,12 @@ class TestToolsList:
 
     @pytest.mark.asyncio
     async def test_get_schema_batch(self, server_url: str) -> None:
-        """Контракт FR-3: ids — список 1..20 (MAX_GET_BATCH), id — алиас."""
+        """Контракт FR-3 (lsb-0003): ids — список 1..20 (MAX_GET_BATCH),
+        id — алиас; query/chunk/limit — чтение чанка, все опциональны."""
         async with connect(server_url) as session:
             tools = {t.name: t for t in (await session.list_tools()).tools}
         schema = tools["memory_get"].input_schema
-        assert set(schema["properties"]) == {"ids", "id"}
+        assert set(schema["properties"]) == {"ids", "id", "query", "chunk", "limit"}
         assert schema.get("required") is None
         ids = schema["properties"]["ids"]["anyOf"][0]
         assert ids["maxItems"] == 20  # MAX_GET_BATCH
@@ -391,6 +392,63 @@ class TestMemoryFlow:
             note_id = await _saved_id(session, text)
             got = (await session.call_tool("memory_get", {"id": note_id})).structured_content
         assert got["notes"][0]["id"] == note_id
+
+    @pytest.mark.asyncio
+    async def test_chunk_read_by_index(self, server_url: str) -> None:
+        """lsb-0003: memory_get с chunk=N возвращает чанки заметки (списком)."""
+        text = f"{self.marker}: " + ("длинный текст заметки для нескольких чанков " * 60)
+        async with connect(server_url) as session:
+            note_id = await _saved_id(session, text, title="Чанк чтение")
+            got = (
+                await session.call_tool("memory_get", {"id": note_id, "chunk": 0})
+            ).structured_content
+        assert got["chunks"]
+        assert got["chunks"][0]["chunk_index"] == 0
+        assert got["total_chunks"] >= 1
+        assert "chars" in got
+
+    @pytest.mark.asyncio
+    async def test_get_without_chunk_stays_full_note(self, server_url: str) -> None:
+        """Обратная совместимость (FR-1): без query/chunk — заметка целиком."""
+        text = f"{self.marker}: по-прежнему целиком"
+        async with connect(server_url) as session:
+            note_id = await _saved_id(session, text)
+            got = (
+                await session.call_tool("memory_get", {"ids": [note_id]})
+            ).structured_content
+        assert got["notes"][0]["id"] == note_id
+
+    @pytest.mark.asyncio
+    async def test_chunk_read_multi_id_refused(self, server_url: str) -> None:
+        """Чтение чанком по нескольким id — мягкий отказ (ids+чанки)."""
+        async with connect(server_url) as session:
+            got = (
+                await session.call_tool("memory_get", {"ids": [1, 2], "chunk": 0})
+            ).structured_content
+        assert got["chunks"] == []
+        assert "по одному id" in got["hint"]
+
+    @pytest.mark.asyncio
+    async def test_limit_without_query_refused(self, server_url: str) -> None:
+        """limit без query/chunk — мягкий отказ."""
+        async with connect(server_url) as session:
+            got = (
+                await session.call_tool("memory_get", {"id": 1, "limit": 3})
+            ).structured_content
+        assert got["chunks"] == []
+        assert "limit" in got["hint"]
+
+    @pytest.mark.asyncio
+    async def test_query_and_chunk_refused(self, server_url: str) -> None:
+        """query + chunk вместе — мягкий отказ (hint)."""
+        async with connect(server_url) as session:
+            got = (
+                await session.call_tool(
+                    "memory_get", {"id": 1, "query": "x", "chunk": 0}
+                )
+            ).structured_content
+        assert got["chunks"] == []
+        assert "не оба" in got["hint"]
 
     @pytest.mark.asyncio
     async def test_search_returns_no_full_text(self, server_url: str) -> None:

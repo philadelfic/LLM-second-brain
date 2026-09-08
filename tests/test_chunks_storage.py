@@ -344,3 +344,32 @@ def test_chunk_knn_scale_invariant(dim4) -> None:
     with session(dim4) as conn:
         (_, cosine) = chunks.knn(conn, [1.0, 0.0, 0.0, 0.0], k=1)[0]
     assert cosine == pytest.approx(1.0)
+
+
+def test_rank_chunks_skips_pending_and_orders_by_relevance(dim4) -> None:
+    """lsb-0003: ранг чанков заметки по близости к вектору запроса;
+    чанки без вектора (pending) пропускаются; порядок — по убыванию близости."""
+    _insert_note(dim4, 1)
+    with session(dim4) as conn, transaction(conn):
+        ids = chunks.replace_note_chunks(conn, 1, [("аааа", 1), ("бббб", 2), ("вввв", 3)])
+        chunks.upsert_vector(conn, ids[0], [1.0, 0.0, 0.0, 0.0])  # idx 0
+        chunks.upsert_vector(conn, ids[1], [0.0, 1.0, 0.0, 0.0])  # idx 1
+        # idx 2 — без вектора (pending)
+    with session(dim4) as conn:
+        ranked = chunks.rank_chunks(conn, 1, [0.9, 0.1, 0.0, 0.0], limit=3)
+    # самый близкий — idx 0, затем idx 1; pending idx 2 пропущен.
+    assert ranked == [0, 1]
+
+
+def test_rank_chunks_respects_limit(dim4) -> None:
+    _insert_note(dim4, 1)
+    with session(dim4) as conn, transaction(conn):
+        ids = chunks.replace_note_chunks(conn, 1, [("а", 1), ("б", 1), ("в", 1)])
+        chunks.upsert_vector(conn, ids[0], [1.0, 0.0, 0.0, 0.0])
+        chunks.upsert_vector(conn, ids[1], [0.5, 0.5, 0.0, 0.0])
+        chunks.upsert_vector(conn, ids[2], [0.0, 1.0, 0.0, 0.0])
+    with session(dim4) as conn:
+        top1 = chunks.rank_chunks(conn, 1, [1.0, 0.0, 0.0, 0.0], limit=1)
+        top2 = chunks.rank_chunks(conn, 1, [1.0, 0.0, 0.0, 0.0], limit=2)
+    assert top1 == [0]
+    assert top2 == [0, 1]

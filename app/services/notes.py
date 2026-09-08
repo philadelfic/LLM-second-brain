@@ -82,6 +82,7 @@ from app.storage.db import session, transaction
 # Фиксированные верхние границы контрактов (REQUIREMENTS §5.1/NFR-6; env —
 # только для умолчаний: DEFAULT_LIST_LIMIT), поэтому не настраиваются.
 MAX_LIST_LIMIT = 50
+MAX_READ_CHUNKS = 3  # lsb-0003: максимум чанков за один memory_get (решение О. 2026-09-08)
 
 # Название заметки (Фаза 11, решение №9): клиент-модель называет заметку при
 # записи; отсутствие/невалидность — отказ записи с этим hint (§5.3).
@@ -292,6 +293,88 @@ class NoteService:
                 "(возможно, удалены); обзор — memory_list",
             }
         return {"notes": notes}
+
+    def get_chunk(
+        self,
+        note_id: int,
+        query: str | None = None,
+        chunk: int | None = None,
+        limit: int = 1,
+    ) -> dict[str, Any]:
+        """Чтение заметки чанком (lsb-0003, №16): по смыслу (`query`) или по
+        номеру (`chunk`) с пагинацией (`limit`), максимум 3 чанка подряд.
+
+        Мягкие отказы (hint — модель сама корректирует): недопустимый
+        `limit`; `query`+`chunk` вместе; `chunk` вне [0, total_chunks);
+        заметка не найдена; при `query` нет ни одного довекторизованного
+        чанка. Ответ — `chunks`-список (не склейка): перекрытие (overlap)
+        соседних чанков не дублируется. Гарантия total_chunks >= 1 (FR-6):
+        если чанков нет — весь текст как чанк 0.
+        """
+        if not 1 <= limit <= MAX_READ_CHUNKS:
+            raise NoteValidationError(
+                f"limit: ожидается 1..{MAX_READ_CHUNKS}, получено {limit}"
+            )
+        if query is not None and chunk is not None:
+            raise NoteValidationError(
+                "передай либо query (по смыслу), либо chunk (по номеру) — не оба"
+            )
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT * FROM notes WHERE deleted_at IS NULL AND id = ?",
+                (note_id,),
+            ).fetchone()
+        if row is None:
+            return {
+                "chunks": [],
+                "hint": "заметка не найдена (возможно, удалена); обзор — memory_list",
+            }
+        text = row["text"]
+        with session(self._settings) as conn:
+            chunk_rows = chunks.get_note_chunks(conn, note_id)
+        # (idx, text) в порядке текста; total_chunks >= 1 (гарантия FR-6).
+        ordered = [(idx, ctext) for _cid, idx, ctext, _tok in chunk_rows]
+        if not ordered:
+            ordered = [(0, text)]
+        total_chunks = len(ordered)
+        text_by_idx = dict(ordered)
+
+        if query is not None:
+            qv = self._embedding.embed(query)
+            with session(self._settings) as conn:
+                ranked = chunks.rank_chunks(conn, note_id, qv, limit)
+            if not ranked:
+                return {
+                    "chunks": [],
+                    "total_chunks": total_chunks,
+                    "hint": "нет довекторизованных чанков — попробуй позже "
+                    "или прочитай заметку целиком (без query/chunk)",
+                }
+            items = [
+                {"chunk_index": idx, "text": text_by_idx[idx]} for idx in ranked
+            ]
+        else:  # chunk-режим (chunk не None: query+chunk уже отброшены)
+            assert chunk is not None
+            if not 0 <= chunk < total_chunks:
+                return {
+                    "chunks": [],
+                    "total_chunks": total_chunks,
+                    "hint": f"chunk вне диапазона: 0..{total_chunks - 1}; "
+                    "для чтения дальше используй следующий номер чанка",
+                }
+            selected = sorted(
+                idx for idx in range(chunk, min(chunk + limit, total_chunks))
+            )
+            items = [
+                {"chunk_index": idx, "text": text_by_idx[idx]} for idx in selected
+            ]
+        chars = sum(len(item["text"]) for item in items)
+        return {
+            "chunks": items,
+            "total_chunks": total_chunks,
+            "chars": chars,
+            "hint": "",
+        }
 
     # --- FR-2 memory_list -------------------------------------------------
 

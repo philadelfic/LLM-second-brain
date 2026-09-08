@@ -290,3 +290,33 @@ def knn(
             (pack(query_vector), k),
         )
     return [(int(row[0]), 1.0 - row[1]) for row in cursor]
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Косинусная близость двух векторов (нечувствительна к норме)."""
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def rank_chunks(
+    conn, note_id: int, query_vector: list[float], limit: int
+) -> list[int]:
+    """Индексы (idx) чанков одной заметки по косинусной близости к запросу.
+
+    lsb-0003: чтение заметки чанком по смысловому запросу. Пропускает чанки
+    без вектора (pending — их не догнали) и возвращает до `limit` индексов
+    в порядке убывания близости (самый релевантный — первым).
+    """
+    rows = get_note_chunks(conn, note_id)  # (chunk_id, idx, text, tokens)
+    scored: list[tuple[int, float]] = []
+    for chunk_id, idx, _text, _tokens in rows:
+        vec = get_vector(conn, chunk_id)
+        if vec is None:
+            continue  # pending — не ранжируем
+        scored.append((idx, _cosine(query_vector, vec)))
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return [idx for idx, _score in scored[:limit]]

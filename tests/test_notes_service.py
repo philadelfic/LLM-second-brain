@@ -20,7 +20,7 @@ from app.services.notes import (
     NoteValidationError,
     TitleValidationError,
 )
-from app.storage import vectors
+from app.storage import chunks, vectors
 from app.storage.db import init_db, session
 
 
@@ -607,3 +607,87 @@ class TestListIndexes:
         assert "idx_notes_ns_deleted_updated" in plan
         assert "SCAN notes" not in plan
         assert "TEMP B-TREE" not in plan
+
+
+class TestGetChunk:
+    """lsb-0003, №16: чтение заметки чанком (memory_get с query/chunk/limit)."""
+
+    @staticmethod
+    def _vectorize(note_id: int) -> None:
+        """Довекторизовать чанки заметки детерминированным HashEmbedder."""
+        embedder = HashEmbedder(get_settings().embedding_dim)
+        with session(get_settings()) as conn:
+            for _cid, _idx, ctext, _tok in chunks.get_note_chunks(conn, note_id):
+                chunks.upsert_vector(conn, _cid, embedder.embed(ctext))
+
+    def test_missing_note_is_soft(self, service: NoteService) -> None:
+        res = service.get_chunk(999999, chunk=0)
+        assert res["chunks"] == []
+        assert "не найдена" in res["hint"]
+
+    def test_short_note_has_one_chunk(self, service: NoteService) -> None:
+        """FR-6: total_chunks >= 1 даже для однострочной заметки."""
+        note_id = service.save(text="однострочная заметка", title="короткая")["id"]
+        res = service.get_chunk(note_id, chunk=0)
+        assert res["total_chunks"] == 1
+        assert len(res["chunks"]) == 1
+        assert res["chunks"][0]["chunk_index"] == 0
+        assert res["chars"] > 0
+        assert res["hint"] == ""
+
+    def test_chunk_zero_returns_first_of_many(self, service: NoteService) -> None:
+        note_id = service.save(text=long_text(9000), title="большая заметка")["id"]
+        res = service.get_chunk(note_id, chunk=0)
+        assert res["total_chunks"] >= 2
+        assert res["chunks"][0]["chunk_index"] == 0
+        assert res["chunks"][0]["text"]
+        assert res["chars"] > 0
+
+    def test_limit_returns_up_to_three_in_text_order(self, service: NoteService) -> None:
+        note_id = service.save(text=long_text(9000), title="большая")["id"]
+        res = service.get_chunk(note_id, chunk=0, limit=3)
+        indices = [c["chunk_index"] for c in res["chunks"]]
+        assert indices == sorted(indices)  # порядок текста
+        assert len(res["chunks"]) <= 3
+
+    def test_chunk_out_of_range_is_soft(self, service: NoteService) -> None:
+        note_id = service.save(text="короткая заметка", title="короткая")["id"]
+        res = service.get_chunk(note_id, chunk=5)
+        assert res["chunks"] == []
+        assert res["total_chunks"] == 1
+        assert "chunk вне диапазона" in res["hint"]
+
+    def test_limit_too_large_rejected(self, service: NoteService) -> None:
+        note_id = service.save(text="текст", title="т")["id"]
+        with pytest.raises(NoteValidationError):
+            service.get_chunk(note_id, chunk=0, limit=4)
+        with pytest.raises(NoteValidationError):
+            service.get_chunk(note_id, chunk=0, limit=0)
+
+    def test_query_and_chunk_rejected(self, service: NoteService) -> None:
+        note_id = service.save(text="текст", title="т")["id"]
+        with pytest.raises(NoteValidationError):
+            service.get_chunk(note_id, query="любой", chunk=0)
+
+    def test_query_no_vectorized_chunks_is_soft(self, service: NoteService) -> None:
+        # чанки не довекторизованы (Фаза 8: синхронный save вектора не пишет)
+        note_id = service.save(text=long_text(9000), title="свежая")["id"]
+        res = service.get_chunk(note_id, query="что-то")
+        assert res["chunks"] == []
+        assert "довекторизованных" in res["hint"]
+
+    def test_query_returns_relevant_chunk(self, service: NoteService) -> None:
+        note_id = service.save(
+            text=long_text(9000) + " ключевое слово котики", title="смешанная"
+        )["id"]
+        self._vectorize(note_id)
+        res = service.get_chunk(note_id, query="котики")
+        assert res["chunks"]
+        assert res["total_chunks"] >= 1
+        assert res["chars"] > 0
+
+    def test_query_returns_up_to_limit_chunks(self, service: NoteService) -> None:
+        note_id = service.save(text=long_text(9000), title="большая")["id"]
+        self._vectorize(note_id)
+        res = service.get_chunk(note_id, query="запрос", limit=3)
+        assert 1 <= len(res["chunks"]) <= 3
