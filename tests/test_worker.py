@@ -24,6 +24,7 @@ from fakes import (
     FixedSummarizer,
     HashEmbedder,
     RecordingDedup,
+    vectorize_notes,
 )
 
 from app.config import get_settings
@@ -149,6 +150,33 @@ class MidFlightUpdateEmbedder(HashEmbedder):
         return result
 
 
+class MidFlightTitleEmbedder(HashEmbedder):
+    """Фейк-гонка по названию: пока воркер кодирует партию, title заметки
+    меняется (пул 1, lsb-0001 FR-1.1: guard расширен на title).
+
+    Аналог MidFlightUpdateEmbedder, но меняется только title (update с
+    валидным title перезаписал бы и текст): прямая правка строки в БД —
+    имитация догенерации названия/операторской правки между вычиткой и
+    записью вектора.
+    """
+
+    def __init__(self, dim: int, settings, note_id: int, new_title: str) -> None:
+        super().__init__(dim)
+        self._settings = settings
+        self._note_id = note_id
+        self._new_title = new_title
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        result = super().embed_texts(texts)
+        # Название меняется между вычиткой воркера и записью вектора.
+        with session(self._settings) as conn, transaction(conn):
+            conn.execute(
+                "UPDATE notes SET title = ? WHERE id = ?",
+                (self._new_title, self._note_id),
+            )
+        return result
+
+
 def test_process_pending_race_with_update(settings) -> None:
     """Гонка с memory_update: протухший вектор не пишется, judge-работа не
     создаётся; остальные заметки партии довекторизованы штатно (пул 1)."""
@@ -202,6 +230,42 @@ def test_process_pending_race_retry_vectorizes_new_text(settings) -> None:
             "WHERE slot='judge' AND kind='dedup' ORDER BY note_id"
         ).fetchall()
         assert [j["note_id"] for j in jobs] == [1, 2]
+
+
+def test_process_pending_race_with_title_change(settings) -> None:
+    """Гонка по названию (пул 1, lsb-0001 FR-1.1): title изменён между
+    вычиткой и записью → guard (`title IS ?`) не пускает протухший вектор:
+    статус остаётся pending, вектора и judge-работы нет; повторная партия
+    кодирует уже с новым названием (title+text)."""
+    notes = NoteService(settings, FailingEmbedder())
+    text = "текст заметки, название которой сменят во время кодирования"
+    notes.save(text, title="Старое название")
+    worker = make_worker(
+        settings, MidFlightTitleEmbedder(8, settings, 1, "Новое название")
+    )
+    assert worker.process_pending() == 0  # guard: протухший вектор не записан
+    with session(settings) as conn:
+        row = conn.execute(
+            "SELECT vector_status, title FROM notes WHERE id = 1"
+        ).fetchone()
+        assert row["vector_status"] == "pending"  # гонка: осталась pending
+        assert row["title"] == "Новое название"  # смена названия всё же прошла
+        assert vectors.get_vector(conn, 1) is None  # протухшего вектора нет
+    # judge-работы нет: вектор не готов (таблица создаётся воркером лениво —
+    # тут довекторизаций не было, создаём вручную, как делает _create_job)
+    worker._ensure_job_table()
+    with session(settings) as conn:
+        jobs = conn.execute(
+            "SELECT COUNT(*) FROM worker_jobs "
+            "WHERE slot='judge' AND kind='dedup'"
+        ).fetchone()[0]
+        assert jobs == 0
+    # повтор: кодирование уже с новым названием (title+text)
+    assert make_worker(settings, HashEmbedder(8)).process_pending() == 1
+    with session(settings) as conn:
+        assert vectors.get_vector(conn, 1) == pytest.approx(
+            HashEmbedder(8).embed(f"Новое название\n{text}"), abs=1e-6
+        )
 
 
 # --- back-off ----------------------------------------------------------------
@@ -607,6 +671,87 @@ def test_title_dogen_failure_keeps_null(settings) -> None:
             "SELECT title FROM notes WHERE id = ?", (saved["id"],)
         ).fetchone()
     assert row["title"] is None
+
+
+def test_title_write_invalidates_full_vector(settings, caplog) -> None:
+    """lsb-0001 FR-1.1: запись названия инвалидирует полный вектор — title
+    участвует в кодировании, вектор по чистому text протухает.
+
+    Заметка с готовым вектором ('ok') и title NULL → догенерация названия:
+    title записан, notes_vec отключён (None), статус pending; повторная
+    партия кодирует уже с названием (title+text), статус 'ok'. Лог события
+    честно сообщает факт инвалидации (vector_invalidated)."""
+    notes = NoteService(settings, FailingEmbedder())
+    text = "текст заметки, название догенерирует воркер"
+    saved = notes.save(text)  # легаси-путь: title=NULL, векторизация — фон
+    assert vectorize_notes(settings, HashEmbedder(8)) == 1  # вектор по чистому text
+    embedder = HashEmbedder(8)
+    with session(settings) as conn:
+        assert vectors.get_vector(conn, saved["id"]) == pytest.approx(
+            embedder.embed(text), abs=1e-6
+        )
+    worker = make_worker(
+        settings, embedder, FixedSummarizer("Сгенерированное название")
+    )
+    with caplog.at_level(logging.INFO, logger="app"):
+        assert worker.process_title_pending() == 1
+    with session(settings) as conn:
+        row = conn.execute(
+            "SELECT title, vector_status FROM notes WHERE id = ?", (saved["id"],)
+        ).fetchone()
+        assert row["title"] == "Сгенерированное название"
+        assert row["vector_status"] == "pending"  # вектор протух — перекодировать
+        assert vectors.get_vector(conn, saved["id"]) is None  # notes_vec отключён
+    invalidated = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "title_generated"
+    ]
+    assert invalidated and invalidated[-1].vector_invalidated is True
+    # повторная партия: кодирование уже с названием (title+text)
+    assert worker.process_pending() == 1
+    with session(settings) as conn:
+        row = conn.execute(
+            "SELECT vector_status FROM notes WHERE id = ?", (saved["id"],)
+        ).fetchone()
+        assert row["vector_status"] == "ok"
+        assert vectors.get_vector(conn, saved["id"]) == pytest.approx(
+            embedder.embed(f"Сгенерированное название\n{text}"), abs=1e-6
+        )
+
+
+def test_title_write_without_vector_stays_pending(settings, caplog) -> None:
+    """Догенерация названия заметки БЕЗ готового вектора (pending): title
+    записан, дропать нечего (вектора и не было), статус остаётся pending;
+    лог честно говорит vector_invalidated=False; повторная партия кодирует
+    уже с названием (title+text)."""
+    notes = NoteService(settings, FailingEmbedder())
+    text = "текст заметки без названия и без вектора"
+    saved = notes.save(text)
+    worker = make_worker(settings, HashEmbedder(8), FixedSummarizer("Позднее название"))
+    with session(settings) as conn:
+        assert vectors.get_vector(conn, saved["id"]) is None  # вектора и не было
+    with caplog.at_level(logging.INFO, logger="app"):
+        assert worker.process_title_pending() == 1
+    with session(settings) as conn:
+        row = conn.execute(
+            "SELECT title, vector_status FROM notes WHERE id = ?", (saved["id"],)
+        ).fetchone()
+        assert row["title"] == "Позднее название"
+        assert row["vector_status"] == "pending"  # статус не сбился
+        assert vectors.get_vector(conn, saved["id"]) is None  # вектора нет
+    invalidated = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "title_generated"
+    ]
+    assert invalidated and invalidated[-1].vector_invalidated is False
+    # повторная партия: кодирование уже с названием (title+text)
+    assert worker.process_pending() == 1
+    with session(settings) as conn:
+        assert vectors.get_vector(conn, saved["id"]) == pytest.approx(
+            HashEmbedder(8).embed(f"Позднее название\n{text}"), abs=1e-6
+        )
 
 
 def test_judge_job_created_after_vector(settings) -> None:

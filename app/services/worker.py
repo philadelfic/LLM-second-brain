@@ -5,7 +5,8 @@
 при старте сервиса):
 
 - **embedding-петля** (`_run_embedding`): вектора заметок (`pending_vector` →
-  batch `embed_texts` → notes_vec, vector_status='ok') + чанковая очередь
+  batch `embed_texts` → notes_vec, vector_status='ok'; полный вектор — по
+  конкатенации title+text, `_embed_input`, lsb-0001 FR-1.1) + чанковая очередь
   (Фаза 7, анти-джоин «нет строки в notes_chunks_vec»). Объединены в одну
   петлю; Semaphore EMBEDDING_CONCURRENT_REQUESTS остаётся. После готовности
   вектора каждой заметки создаётся judge-работа (дедуп) — диспетчер
@@ -50,10 +51,13 @@ Garanties:
 записью воркер мог получить обновлённый текст — UPDATE ограничен условием
 `AND text = ?` (тот же текст; иначе суммари протухшего текста затёрло бы
 свежий). Векторизация защищена так же (пул 1): notes-петля пишет вектор
-только при неизменных с вычитки (id, text, namespace, vector_status) —
+только при неизменных с вычитки (id, text, title, namespace, vector_status) —
 guard-UPDATE в той же транзакции; протухшая партия не пишется, повтор —
 следующей партией (аналог `AND text = ?` у суммари и
-`upsert_vector_if_exists` у чанков).
+`upsert_vector_if_exists` у чанков). Название входит в вектор (lsb-0001
+FR-1.1): запись названия (title-доген) в той же транзакции возвращает
+векторизацию в pending и сбрасывает notes_vec — старый вектор по чистому
+text не кормит ни поиск, ни дедуп до перекодирования.
 
 Чанковая очередь (Фаза 7) закрывает обе проблемы:
 - reuse единичного чанка (brief §6): у заметки с ровно одним чанком
@@ -110,6 +114,17 @@ MAX_INTERVAL_SEC = 15 * 60
 def next_interval(current: float, start: int) -> float:
     """Шаг back-off: интервал удваивается, потолок — 15 минут (§3.4)."""
     return min(max(current * 2.0, float(start)), float(MAX_INTERVAL_SEC))
+
+
+def _embed_input(title: str | None, text: str) -> str:
+    """Вход кодирования полного вектора заметки (lsb-0001 FR-1.1).
+
+    Вектор заметки строится по конкатенации названия и текста:
+    f"{title}\n{text}". title is NULL (миграционная заметка до догенерации
+    названия) — кодируется чистый text без префикса. Чанковые вектора это
+    не касается (решение D1): там кодируется чистый текст чанка без title.
+    """
+    return text if title is None else f"{title}\n{text}"
 
 
 class BackgroundWorker:
@@ -496,12 +511,17 @@ class BackgroundWorker:
         notes-петля режется по EMBEDDING_BATCH_SIZE, как и чанковая
         process_pending_chunks); явный `limit` переопределяет.
 
+        Полный вектор строится по title+text (_embed_input, lsb-0001
+        FR-1.1); заметка без названия (title IS NULL — легаси-путь до
+        догенерации) кодируется чистым text.
+
         Отказ кодирования — 0: статусы не тронуты, воркер выждет back-off.
         Guard (пул 1): вектор пишется только при неизменных с вычитки
-        (id, text, namespace, vector_status='pending') — иначе
-        memory_update/переезд в полёте оставил бы протухший вектор со
-        статусом 'ok'. Промахнувшиеся остаются pending → следующая партия
-        перекодирует новый текст. После каждой фактической довекторизации
+        (id, text, title, namespace, vector_status='pending') — иначе
+        memory_update/переезд/догенерация названия в полёте оставили бы
+        протухший вектор со статусом 'ok'. Промахнувшиеся остаются pending →
+        следующая партия перекодирует заново (новый текст или название).
+        После каждой фактической довекторизации
         создаётся judge-работа (дедуп) в очередь слота judge (решение №10):
         судья опрашивается только по готовому вектору — диспетчер
         зависимостей. Само сведение дублей — в judge-петле
@@ -512,7 +532,7 @@ class BackgroundWorker:
         )
         with session(self._settings) as conn:
             rows = conn.execute(
-                "SELECT id, text, namespace FROM notes "
+                "SELECT id, text, title, namespace FROM notes "
                 "WHERE vector_status = 'pending' AND deleted_at IS NULL "
                 "ORDER BY id LIMIT ?",
                 (batch,),
@@ -520,22 +540,27 @@ class BackgroundWorker:
         if not rows:
             return 0
         try:
-            embeddings = self._embedding.embed_texts([row["text"] for row in rows])
+            embeddings = self._embedding.embed_texts(
+                [_embed_input(row["title"], row["text"]) for row in rows]
+            )
         except EmbeddingError:
             return 0
         processed = 0
         for row, vector in zip(rows, embeddings):
             with session(self._settings) as conn, transaction(conn):
                 # Guard (пул 1): вектор — только если заметка не менялась с
-                # вычитки (id, text, namespace, vector_status='pending') —
-                # иначе memory_update/переезд в полёте оставил бы протухший
-                # вектор со статусом 'ok'. Промахнувшиеся остаются pending →
-                # следующая партия перекодирует новый текст.
+                # вычитки (id, text, title, namespace, vector_status='pending')
+                # — иначе memory_update/переезд/догенерация названия в полёте
+                # оставили бы протухший вектор со статусом 'ok'. `title IS ?`
+                # сравнивает и NULL (SQLite): легаси-заметка без названия
+                # проходит guard только при прежнем NULL. Промахнувшиеся
+                # остаются pending → следующая партия перекодирует заново
+                # (новый текст или название).
                 cursor = conn.execute(
                     "UPDATE notes SET vector_status = 'ok' "
-                    "WHERE id = ? AND text = ? AND namespace = ? "
+                    "WHERE id = ? AND text = ? AND title IS ? AND namespace = ? "
                     "AND vector_status = 'pending'",
-                    (row["id"], row["text"], row["namespace"]),
+                    (row["id"], row["text"], row["title"], row["namespace"]),
                 )
                 if not cursor.rowcount:
                     continue
@@ -841,6 +866,12 @@ class BackgroundWorker:
         механикой, запись title. Отказ генерации
         (SummaryError) — заметка остаётся без названия, повтор по back-off
         (NFR-3). Возвращает число записанных названий.
+
+        Запись названия инвалидирует полный вектор (lsb-0001 FR-1.1: title
+        участвует в кодировании) — в той же транзакции векторизация
+        возвращается в 'pending' и notes_vec сброшен; воркер notes-очереди
+        перекодирует уже с названием (_embed_input). Чанковые вектора не
+        тронуты (решение D1: title на них не влияет).
         """
         if self._summarizer is None:
             return 0
@@ -873,11 +904,30 @@ class BackgroundWorker:
                     "WHERE id = ? AND title IS NULL AND deleted_at IS NULL",
                     (title, row["id"]),
                 )
+                if cursor.rowcount:
+                    # lsb-0001 FR-1.1: title участвует в полном векторе —
+                    # запись названия делает старый вектор (по чистому text)
+                    # протухшим: статус в 'pending', notes_vec сброшен (тот
+                    # же смысл, что vectors.drop в notes.update(): в окне
+                    # pending заметка участвует только в FTS-поиске, старый
+                    # вектор без названия не кормит ни поиск, ни дедуп).
+                    # Чанковые вектора не тронуты (решение D1: кодируются по
+                    # чистому тексту чанка).
+                    conn.execute(
+                        "UPDATE notes SET vector_status = 'pending' WHERE id = ?",
+                        (row["id"],),
+                    )
+                    stale = vectors.get_vector(conn, row["id"]) is not None
+                    vectors.drop(conn, row["id"])
             if cursor.rowcount:
                 done += 1
                 logging.getLogger("app").info(
                     "title: generated for migration note",
-                    extra={"event": "title_generated", "note_id": row["id"]},
+                    extra={
+                        "event": "title_generated",
+                        "note_id": row["id"],
+                        "vector_invalidated": stale,
+                    },
                 )
         return done
 
@@ -1141,7 +1191,9 @@ class BackgroundWorker:
         если полный вектор достроен позже (отказ при save — потом воркер
         notes-очереди), чанк остаётся pending. Повторно кодировать тот же
         текст незачем: у одного чанка текст = полный текст заметки, вектор
-        идентичен — копируем без вызова Ollama.
+        идентичен — копируем без вызова Ollama. Копия остаётся консистентной
+        с notes_vec, который теперь включает название (title+text — lsb-0001
+        FR-1.1); чанковая кодировка чистым текстом (решение D1) это не меняет.
         """
         by_note: dict[int, list] = {}
         for row in rows:

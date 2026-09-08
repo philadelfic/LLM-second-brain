@@ -208,6 +208,33 @@ def test_long_note_chunks_vectorized_by_worker(settings) -> None:
             )
 
 
+def test_chunks_encoded_from_pure_chunk_text_with_title(settings) -> None:
+    """Решение D1 (lsb-0001 FR-1.1): название в чанковые вектора НЕ входит —
+    чанки (как и раньше) кодируются по чистому тексту чанка; title участвует
+    только в полном векторе notes_vec (многочанковая заметка — reuse не
+    применим, чанковая очередь не менялась)."""
+    notes = make_notes(settings, HashEmbedder(8))
+    text = text_with_tokens(3000)  # многочанковая: reuse не применим
+    title = "Название многочанковой заметки"
+    note_id = notes.save(text, title=title)["id"]
+    worker = BackgroundWorker(settings, HashEmbedder(8))
+    expected = len(token_windows(3000, **DEFS))
+    assert asyncio.run(worker.process_pending_chunks()) == expected
+    hash_ = HashEmbedder(8)
+    with session(settings) as conn:
+        rows = chunks.get_note_chunks(conn, note_id)
+        assert chunks.count_pending(conn) == 0
+        for chunk_id, _idx, chunk_text, _tokens in rows:
+            # чистый текст чанка — как и до lsb-0001-01 (решение D1)
+            assert chunks.get_vector(conn, chunk_id) == pytest.approx(
+                hash_.embed(chunk_text), abs=1e-6
+            )
+            # негатив: title+text в чанковый вектор не попадает
+            assert chunks.get_vector(conn, chunk_id) != pytest.approx(
+                hash_.embed(f"{title}\n{chunk_text}"), abs=1e-6
+            )
+
+
 def test_batches_of_batch_size_by_fake_counter(settings) -> None:
     """Юнит брифа «батчи по 32»: 36 pending-чанков → подъёмки [32, 4]."""
     notes = make_notes(settings, HashEmbedder(8))

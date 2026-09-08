@@ -8,6 +8,10 @@
 дословные тексты обе сохраняются. Синхронно отсекается только дословный
 дубль (SQL/FTS) — работает и без Ollama. Ответ save — без warning:
 векторизация всегда фоновая, а не «отложена из-за отказа».
+
+lsb-0001-01 (FR-1.1): полный вектор заметки строится по конкатенации
+title+text (формат f"{title}\n{text}"); заметка без названия (легаси,
+title IS NULL) кодируется чистым text.
 """
 
 from __future__ import annotations
@@ -72,7 +76,10 @@ def test_save_returns_contract_without_embed(dim8) -> None:
 
 
 def test_save_pending_then_worker_vectorizes(dim8) -> None:
-    """Очередь pending_vector живая: воркер доводит заметку до 'ok'."""
+    """Очередь pending_vector живая: воркер доводит заметку до 'ok'.
+
+    Заметка без названия (легаси-путь, title IS NULL): кодируется чистым
+    text — guard `title IS ?` пропускает NULL (lsb-0001 FR-1.1)."""
     notes = notes_with(dim8, HashEmbedder(8))
     text = "Заметка, которую довекторизует воркер"
     notes.save(text)
@@ -82,6 +89,26 @@ def test_save_pending_then_worker_vectorizes(dim8) -> None:
         assert row["vector_status"] == "ok"
         assert vectors.get_vector(conn, 1) == pytest.approx(
             HashEmbedder(8).embed(text), abs=1e-6
+        )
+
+
+def test_save_with_title_vectorizes_from_title_plus_text(dim8) -> None:
+    """lsb-0001 FR-1.1: полный вектор заметки С названием строится по
+    конкатенации title+text (формат f"{title}\n{text}"); без названия —
+    чистый text (см. test_save_pending_then_worker_vectorizes)."""
+    notes = notes_with(dim8, HashEmbedder(8))
+    title = "Название заметки"
+    text = "Заметка с названием для фонового вектора"
+    saved = notes.save(text, title=title)
+    assert saved["stored"] is True
+    assert vectorize_notes(dim8, HashEmbedder(8)) == 1
+    with session(dim8) as conn:
+        row = conn.execute(
+            "SELECT * FROM notes WHERE id = ?", (saved["id"],)
+        ).fetchone()
+        assert row["vector_status"] == "ok"
+        assert vectors.get_vector(conn, saved["id"]) == pytest.approx(
+            HashEmbedder(8).embed(f"{title}\n{text}"), abs=1e-6
         )
 
 
@@ -104,7 +131,10 @@ def test_update_marks_pending_without_embed(dim8) -> None:
 
 
 def test_update_pending_then_worker_vectorizes(dim8) -> None:
-    """Ре-векторизация после update — фон: воркер пишет вектор нового текста."""
+    """Ре-векторизация после update — фон: воркер пишет вектор нового текста.
+
+    update без title не трогает название (title IS NULL остаётся) — вектор
+    строится по чистому тексту (lsb-0001 FR-1.1)."""
     notes = notes_with(dim8, HashEmbedder(8))
     notes.save("Старый текст заметки")
     vectorize_notes(dim8, HashEmbedder(8))
