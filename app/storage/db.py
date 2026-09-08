@@ -7,9 +7,20 @@ CRUD (валидации, статусы, soft delete) — в `app.services.note
 Ключевые решения:
 - Схема создаётся идемпотентно при старте (`init_db`, `IF NOT EXISTS`).
 - `notes_fts` — FTS5 внешнего контента (`content='notes'`,
-  `content_rowid='id'`, `tokenize='trigram'`), синхронизируется триггерами
-  AFTER INSERT / AFTER UPDATE OF text. DELETE-триггер не нужен: удаление —
-  soft (`deleted_at`), строка и FTS-индекс физически остаются в trash.
+  `content_rowid='id'`, `tokenize='trigram'`), индексирует НАЗВАНИЕ и ТЕКСТ
+  заметки (колонки title и text — lsb-0001 FR-1.2/FR-1.3), синхронизируется
+  триггерами AFTER INSERT / AFTER UPDATE OF text, title. DELETE-триггер не
+  нужен: удаление — soft (`deleted_at`), строка и FTS-индекс физически
+  остаются в trash.
+- Title-миграция (lsb-0001-01, решение гейта R4 — миграция при старте, не
+  джоба): у живых БД, созданных до индексации названия, notes_fts
+  пересоздаётся с колонкой title и переливается из notes заново;
+  notes_vec дропается — полные вектора считались по тексту без названия
+  и невалидны (все заметки, включая trash, → vector_status='pending',
+  вектора в этом шаге не кодируются — догоняет фоновый воркер);
+  notes_chunks_vec НЕ трогается: вектора чанков строятся по текстам
+  чанков, название на них не влияет. Идемпотентность — meta-ключ
+  `title_index_version` (значение «2»).
 - `notes_vec` — vec0-таблица, размерность фиксируется при создании БД
   (ARCH §3.3); при несовпадении конфигурации с зафиксированной в БД
   (EMBEDDING_DIM или смена EMBEDDING_MODEL, записанная в таблице meta)
@@ -56,6 +67,12 @@ BUSY_TIMEOUT_MS = 5000
 # Как выцупоть лимит CHECK(length(text) BETWEEN 1 AND ?) из DDL живой таблицы
 # notes (сверка с MAX_NOTE_CHARS при старте — см. init_db).
 _CHECK_LIMIT_RE = re.compile(r"length\(\s*text\s*\)\s+BETWEEN\s+1\s+AND\s+(\d+)")
+
+# Признак «notes_fts уже индексирует title» в DDL из sqlite_master: новая
+# схема начинается с колонки title, легаси (v2.1.1) — с text (миграция
+# lsb-0001-01 — см. _sync_fts_title_index; по образцу _PARTITION_RE в
+# app.storage.vectors).
+_FTS_TITLE_RE = re.compile(r"fts5\(\s*title")
 
 
 class StorageError(RuntimeError):
@@ -107,9 +124,10 @@ CREATE TABLE IF NOT EXISTS namespaces (
 )
 """
 
+# lsb-0001-01 (FR-1.2/FR-1.3): FTS индексирует и название (title), и текст.
 _FTS_DDL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-  text, content='notes', content_rowid='id', tokenize='trigram'
+  title, text, content='notes', content_rowid='id', tokenize='trigram'
 )
 """
 
@@ -144,17 +162,18 @@ CREATE TABLE IF NOT EXISTS meta (
 
 # Синхронизация FTS с notes. Для внешнего контента удаление из индекса —
 # спец-команда 'delete' со СТАРЫМИ значениями индексируемых колонок.
-# UPDATE OF text: изменения прочих колонок (summary, статусы) FTS не трогают.
+# UPDATE OF text, title (lsb-0001-01): изменения прочих колонок (summary,
+# статусы, deleted_at при soft delete) FTS не трогают.
 _TRIGGERS = (
     """
     CREATE TRIGGER IF NOT EXISTS notes_fts_ai AFTER INSERT ON notes BEGIN
-      INSERT INTO notes_fts(rowid, text) VALUES (new.id, new.text);
+      INSERT INTO notes_fts(rowid, title, text) VALUES (new.id, new.title, new.text);
     END
     """,
     """
-    CREATE TRIGGER IF NOT EXISTS notes_fts_au AFTER UPDATE OF text ON notes BEGIN
-      INSERT INTO notes_fts(notes_fts, rowid, text) VALUES ('delete', old.id, old.text);
-      INSERT INTO notes_fts(rowid, text) VALUES (new.id, new.text);
+    CREATE TRIGGER IF NOT EXISTS notes_fts_au AFTER UPDATE OF text, title ON notes BEGIN
+      INSERT INTO notes_fts(notes_fts, rowid, title, text) VALUES ('delete', old.id, old.title, old.text);
+      INSERT INTO notes_fts(rowid, title, text) VALUES (new.id, new.title, new.text);
     END
     """,
 )
@@ -268,6 +287,13 @@ def init_db(settings: Settings) -> None:
     и догоняются воркером (NFR-3 — данные не теряются, поиск деградирует
     к FTS до готовности).
 
+    Миграция title-индекса (lsb-0001-01, решение гейта R4 — при старте,
+    не джоба): notes_fts живых БД перестраивается под индексацию названия
+    (title + text, FR-1.2/FR-1.3), notes_vec дропается — полные вектора
+    считались по тексту без названия и невалидны, все заметки (включая
+    trash) уходят в pending и догоняются воркером; вектора чанков
+    (notes_chunks_vec) остаются валидными — они построены по текстам чанков.
+
     Raises:
         StorageError: БД недоступна, нет FTS5/vec0, схема повреждена,
         env разошёлся с зафиксированной схемой (CHECK-лимит MAX_NOTE_CHARS).
@@ -286,8 +312,9 @@ def init_db(settings: Settings) -> None:
             conn.execute(_FTS_DDL)
             for trigger in _TRIGGERS:
                 conn.execute(trigger)
-            _check_fts_integrity(conn)
             # Названия заметок (Фаза 11, решение №9): notes.title TEXT (nullable).
+            # ДО title-миграции FTS: к моменту _sync_fts_title_index колонка
+            # title уже существует — перелив индекса читает notes.title.
             _migrate_title_column(conn)
             # Неймспейсы (Фаза 10): колонки notes + реестр + дефолт-узел.
             _migrate_namespace_columns(conn)
@@ -300,6 +327,11 @@ def init_db(settings: Settings) -> None:
             conn.execute(_INDEX_NS_DELETED_UPDATED_DDL)
             _ensure_default_namespace(conn)
             conn.execute(_PROMOTIONS_DDL)
+            # Title-индекс (lsb-0001-01, Часть A): перестройка notes_fts под
+            # индексацию названия на живых БД — ДО integrity-check: перелив
+            # выше оставляет индекс консистентным.
+            fts_migrated = _sync_fts_title_index(conn)
+            _check_fts_integrity(conn)
             # Партиция namespace (Фаза 10): vec-таблицы живых БД без `+ns`
             # пересоздаются с партицией, все заметки — в pending. ДО сверки
             # модели/чанков: обе ветки создают таблицы уже с партицией.
@@ -312,6 +344,10 @@ def init_db(settings: Settings) -> None:
             # конфигурации (модель/размерность) с env — полная автореиндексация
             # обоих индексов.
             _sync_embedding_meta(conn, settings)
+            # Title-индекс (lsb-0001-01, Часть B): полные вектора заметок
+            # невалидны (строились по тексту без названия) — notes_vec
+            # дропается, все заметки в pending; штамп meta-ключа — здесь.
+            _sync_title_vectors(conn, settings, fts_migrated)
             selfheal_chunk_orphans(conn)
     except (sqlite3.Error, OSError) as exc:
         raise StorageError(
@@ -448,6 +484,125 @@ def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
+
+
+# --- title-индекс (lsb-0001-01) ---------------------------------------------
+
+# Штамп миграции в meta: «2» — notes_fts индексирует title и text (FR-1.2/
+# FR-1.3); отсутствие ключа = БД, не прошедшая title-миграцию (FTS только
+# по text). Общий для Части A (FTS) и Части B (вектора).
+_TITLE_INDEX_META_KEY = "title_index_version"
+_TITLE_INDEX_VERSION = "2"
+
+
+def _sync_fts_title_index(conn: sqlite3.Connection) -> bool:
+    """Часть A миграции title-индекса (lsb-0001-01): notes_fts под (title, text).
+
+    Живые БД до lsb-0001-01 имеют notes_fts с одной колонкой text: таблица
+    дропается и пересоздаётся по _FTS_DDL, индекс переливается из notes
+    (rowid, title, text — title может быть NULL, FTS5 трактует его как
+    пустую строку), триггеры пересоздаются под новые колонки. Решение
+    гейта R4 — миграция при старте, не джоба; идемпотентность — общий
+    с Частью B meta-ключ _TITLE_INDEX_META_KEY (штамп ставит
+    _sync_title_vectors в конце init_db).
+
+    Условие запуска: ключа нет И DDL notes_fts в sqlite_master без title
+    (регексп _FTS_TITLE_RE). Ключа нет, но DDL уже с title (свежая БД) —
+    no-op. Вызывается после миграций колонок: к моменту вызова notes.title
+    уже существует (перелив читает её) и ДО _check_fts_integrity — перелив
+    оставляет индекс консистентным.
+
+    Возвращает True, если в этом запуске БД была легаси и перестроена, —
+    Часть B (_sync_title_vectors) инвалидирует полные вектора только вслед
+    за фактической перестройкой FTS.
+    """
+    conn.execute(_META_DDL)  # meta может ещё не существовать у древних БД —
+    # штатно таблица создаётся позже, в _sync_embedding_meta (см. init_db)
+    if _get_meta(conn, _TITLE_INDEX_META_KEY) is not None:
+        return False  # мигрировано ранее — штамп ставит _sync_title_vectors
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'notes_fts'"
+    ).fetchone()
+    if row is None or row[0] is None or _FTS_TITLE_RE.search(row[0]):
+        return False  # свежая БД: notes_fts создана выше уже с колонкой title
+    notes_count = int(conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0])
+    logging.getLogger("app").warning(
+        "note title added to FTS index: rebuilding notes_fts",
+        extra={
+            "event": "reindex_started",
+            "notes": notes_count,
+            "reason": "title_index",
+        },
+    )
+    conn.execute("DROP TRIGGER IF EXISTS notes_fts_ai")
+    conn.execute("DROP TRIGGER IF EXISTS notes_fts_au")
+    conn.execute("DROP TABLE IF EXISTS notes_fts")
+    conn.execute(_FTS_DDL)
+    conn.execute(
+        "INSERT INTO notes_fts(rowid, title, text) SELECT id, title, text FROM notes"
+    )
+    for trigger in _TRIGGERS:
+        conn.execute(trigger)
+    logging.getLogger("app").info(
+        "notes_fts rebuilt with title column",
+        extra={
+            "event": "reindex_done",
+            "notes": notes_count,
+            "reason": "title_index",
+        },
+    )
+    return True
+
+
+def _sync_title_vectors(
+    conn: sqlite3.Connection, settings: Settings, fts_migrated: bool
+) -> None:
+    """Часть B миграции title-индекса (lsb-0001-01): полные вектора.
+
+    Полные вектора (notes_vec) считались по тексту БЕЗ названия — после
+    ввода title в FTS (и в кодирование, шаг 2) они невалидны: notes_vec
+    дропается, все заметки (включая trash) уходят в vector_status='pending',
+    вектора в этом шаге не кодируются — догоняет фоновый воркер.
+    notes_chunks_vec НЕ трогается (решение гейта R4): вектора чанков
+    строятся по текстам чанков, название на них не влияет.
+
+    Условие: ключа нет (общий с Частью A) И в этом же запуске была
+    перестроена FTS (`fts_migrated` от _sync_fts_title_index): обе части
+    миграции двигаются вместе — штамп в meta не спасает от ручной потери
+    meta целиком, а дропать валидные вектора из-за одной только потери
+    штампа не нужно (без истории в meta вектора считаются актуальными —
+    как в нулевой миграции _sync_embedding_meta). Штамп ключа — в конце,
+    всегда (в т.ч. свежей БД с нулём заметок — пере-кодировать нечего).
+
+    Вызывается после _sync_embedding_meta: её ветки (смена модели/чанков)
+    успевают пересоздать таблицы текущей конфигурации — дроп здесь их уже
+    не ломает; ДО selfheal_chunk_orphans.
+    """
+    if _get_meta(conn, _TITLE_INDEX_META_KEY) is not None:
+        return
+    notes_count = int(conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0])
+    if fts_migrated and notes_count:
+        logging.getLogger("app").warning(
+            "title index migration: full-text vectors invalidated",
+            extra={
+                "event": "reindex_started",
+                "notes": notes_count,
+                "reason": "title_index",
+            },
+        )
+        conn.execute("DROP TABLE IF EXISTS notes_vec")
+        vectors.create_vec_table(conn, settings.embedding_dim)
+        # Полные вектора невалидны — все заметки (включая trash) в очередь.
+        conn.execute("UPDATE notes SET vector_status = 'pending'")
+        logging.getLogger("app").info(
+            "notes_vec rebuilt; background worker will re-encode all notes",
+            extra={
+                "event": "reindex_done",
+                "notes_pending": notes_count,
+                "reason": "title_index",
+            },
+        )
+    _set_meta(conn, _TITLE_INDEX_META_KEY, _TITLE_INDEX_VERSION)
 
 
 # Описания чанк-параметров (Фаза 7, brief §4): фиксируются в meta —
@@ -667,7 +822,7 @@ def _rechunk_all_notes(
 def _check_fts_integrity(conn: sqlite3.Connection) -> None:
     """Сверить FTS-индекс с notes; рассинхрон (оператор правил `notes.text`
     напрямую, мимо триггеров) лечится rebuild'ом — индекс полностью
-    выводим из text, данные не теряются."""
+    выводим из (title, text) заметок, данные не теряются."""
     try:
         conn.execute("INSERT INTO notes_fts(notes_fts) VALUES('integrity-check')")
         return
@@ -676,7 +831,9 @@ def _check_fts_integrity(conn: sqlite3.Connection) -> None:
     # rebuild: обнулить индекс (спец-команда 'delete' со всеми текущими
     # значениями) и залить заново; нечувствительно к прошлому состоянию.
     conn.execute(
-        "INSERT INTO notes_fts(notes_fts, text, rowid) "
-        "SELECT 'delete', text, id FROM notes"
+        "INSERT INTO notes_fts(notes_fts, rowid, title, text) "
+        "SELECT 'delete', id, title, text FROM notes"
     )
-    conn.execute("INSERT INTO notes_fts(rowid, text) SELECT id, text FROM notes")
+    conn.execute(
+        "INSERT INTO notes_fts(rowid, title, text) SELECT id, title, text FROM notes"
+    )
