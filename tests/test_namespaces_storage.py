@@ -114,10 +114,11 @@ class TestFreshSchema:
             "id", "text", "title", "summary", "author", "vector_status",
             "summary_status", "created_at", "updated_at", "deleted_at",
             "namespace", "classified_at", "domain_hint", "subdomain_hint",
-            "confidence",
+            "confidence", "expires_at",
         }
         assert columns["namespace"]["dflt_value"] == "'default'"
         assert columns["classified_at"]["notnull"] == 0
+        assert columns["expires_at"]["notnull"] == 0  # lsb-0004-02: NULL = постоянная
 
     def test_namespaces_registry_with_default_node(self) -> None:
         """Реестр создан; узел 'default' существует (confirmed)."""

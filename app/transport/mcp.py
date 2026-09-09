@@ -49,7 +49,13 @@ from app.config import Settings
 from app.observability import log_tool_call, preview
 from app.services import Services
 from app.services.namespaces import NamespaceError, NamespaceValidationError
-from app.services.notes import NoteValidationError, TitleValidationError
+from app.services.notes import (
+    _UNSET_EXPIRES_AT,
+    _UNSET_SUMMARY,
+    _UNSET_TEXT,
+    NoteValidationError,
+    TitleValidationError,
+)
 
 SERVER_NAME = "LLM Second Brain"
 
@@ -156,12 +162,15 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "упадёт в default."
     ),
     "memory_update": (
-        "Перезаписывает заметку ЦЕЛИКОМ. Сначала memory_get, чтобы не потерять "
-        "детали, затем запиши обновлённый полный текст. Можно передать `title` "
-        "(≤5 слов) — перезапишет название; не передан — прежнее остаётся. Укажи "
-        "`namespace`, "
-        "чтобы переместить заметку в другой узел карты; без namespace она "
-        "остаётся на месте."
+        "Обновляет заметку по контракту lsb-0004-01: «не передано» = оставить, "
+        "null = сбросить. Можно править title/summary/namespace БЕЗ перезаписи "
+        "text. `text` — новый полный текст; не передан — текст не меняется. "
+        "`title` (≤5 слов) — перезапишет название; не передан — прежнее "
+        "остаётся. `summary` — новое краткое содержание; передан (значение) — "
+        "используется как есть (не перегенерируется); не передан — при смене "
+        "текста перегенерируется, иначе остаётся; null — перегенерировать из "
+        "текущего текста. `namespace` — целевой узел (переезд); не передан — "
+        "остаётся на месте. Сначала memory_get, чтобы не потерять детали."
     ),
     "memory_delete": (
         "Удаляй только если заметка фактически неверна или полностью дублирует "
@@ -187,8 +196,8 @@ TOOL_NAMES = frozenset(TOOL_DESCRIPTIONS)
 # (SearchService отдаёт — follow-up пула 5b, см. _search_hit);
 # в get названия НЕТ — там полный текст (экономия контекста).
 _SEARCH_ITEM = ("id", "summary", "created_at", "updated_at", "namespace")
-_LIST_ITEM = ("id", "title", "summary", "created_at", "updated_at", "namespace")
-_GET_NOTE = ("id", "text", "created_at", "updated_at", "namespace")
+_LIST_ITEM = ("id", "title", "summary", "created_at", "updated_at", "namespace", "expires_at")
+_GET_NOTE = ("id", "text", "created_at", "updated_at", "namespace", "expires_at")
 _NS_ITEM = ("path", "description", "status", "notes_count", "subtree_count", "updated_at")
 
 
@@ -580,11 +589,20 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
                 "default. save не создаёт узлы.",
             ),
         ] = "default",
+        expires_at: Annotated[
+            str | None,
+            Field(
+                description="Срок жизни заметки: относительный TTL вида «1d», "
+                "«2h», «30m», «45s», «2w»; не передан — постоянная заметка",
+                json_schema_extra={"default": None},
+            ),
+        ] = _UNSET_EXPIRES_AT,
     ) -> dict[str, Any]:
         started = time.perf_counter()
         try:
             result = await asyncio.to_thread(
-                services.notes.save, text, title=title, namespace=namespace
+                services.notes.save, text, title=title, namespace=namespace,
+                expires_at=expires_at,
             )
         except (TitleValidationError, NamespaceError, NamespaceValidationError) as exc:
             # Отказ записи: title отсутствует/невалиден (решение №9) или узел
@@ -616,13 +634,14 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
     async def memory_update(
         id: Annotated[int, Field(description="Id заметки")],
         text: Annotated[
-            str,
+            str | None,
             Field(
-                description="Новый полный текст заметки",
+                description="Новый полный текст заметки; не передан — текст "
+                "не меняется",
                 min_length=1,
                 max_length=settings.max_note_chars,
             ),
-        ],
+        ] = None,
         title: Annotated[
             str | None,
             Field(
@@ -630,6 +649,16 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
                 "остаётся",
             ),
         ] = None,
+        summary: Annotated[
+            str | None,
+            Field(
+                description="Новое краткое содержание; передан (значение) — "
+                "используется как есть (не перегенерируется); не передан — "
+                "при смене текста перегенерируется, иначе остаётся; null — "
+                "перегенерировать из текущего текста",
+                json_schema_extra={"default": None},
+            ),
+        ] = _UNSET_SUMMARY,
         namespace: Annotated[
             str | None,
             Field(
@@ -637,11 +666,28 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
                 "остаётся на месте",
             ),
         ] = None,
+        expires_at: Annotated[
+            str | None,
+            Field(
+                description="Срок жизни: относительный TTL вида «1d», «2h», "
+                "«30m», «45s», «2w»; передан (значение) — установить; не "
+                "передан — оставить; null — снять TTL (постоянная)",
+                json_schema_extra={"default": None},
+            ),
+        ] = _UNSET_EXPIRES_AT,
     ) -> dict[str, Any]:
         started = time.perf_counter()
+        # text=None (не передан) → сентинел _UNSET_TEXT: текст не трогаем.
+        note_chars = len(text) if text is not None else None
         try:
             result = await asyncio.to_thread(
-                services.notes.update, id, text, namespace, title
+                services.notes.update,
+                note_id=id,
+                text=text if text is not None else _UNSET_TEXT,
+                namespace=namespace,
+                title=title,
+                summary=summary,
+                expires_at=expires_at,
             )
         except (TitleValidationError, NamespaceError, NamespaceValidationError) as exc:
             # title невалиден (решение №9) или узел не зарегистрирован —
@@ -653,7 +699,7 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
                 reason=str(exc),
                 id=id,
                 namespace=namespace,
-                note_chars=len(text),
+                note_chars=note_chars,
             )
             return {"id": id, "updated": False, "hint": str(exc)}
         log_tool_call(
@@ -663,7 +709,7 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             id=id,
             updated=bool(result.get("updated")),
             namespace=namespace,
-            note_chars=len(text),
+            note_chars=note_chars,
         )
         return _compact_update(result)
 

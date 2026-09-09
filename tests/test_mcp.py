@@ -213,14 +213,16 @@ class TestToolsList:
     async def test_save_update_schema(self, server_url: str) -> None:
         """Контракты FR-4/FR-5: text 1..MAX_NOTE_CHARS (35000), id обязателен;
         title (Фаза 11, решение №9) — опционален в схеме: отказ за сервисом
-        (fail+hint «задай title ≤5 слов»), не схемой.
+        (fail+hint «задай title ≤5 слов»), не схемой. lsb-0004-01: text в
+        memory_update стал опционален (можно править title/summary/namespace
+        без перезаписи текста) — обязателен только id.
         """
         async with connect(server_url) as session:
             tools = {t.name: t for t in (await session.list_tools()).tools}
         save_text = tools["memory_save"].input_schema["properties"]["text"]
         assert save_text["maxLength"] == 35000
         assert tools["memory_save"].input_schema["required"] == ["text"]
-        assert tools["memory_update"].input_schema["required"] == ["id", "text"]
+        assert tools["memory_update"].input_schema["required"] == ["id"]
         assert tools["memory_save"].input_schema["properties"]["title"]["default"] is None
         assert tools["memory_update"].input_schema["properties"]["title"]["default"] is None
 
@@ -381,7 +383,7 @@ class TestMemoryFlow:
         assert note["text"] == text
         assert note["created_at"].endswith("Z") and note["updated_at"].endswith("Z")
         # Компактный контракт Фазы 9: get — белый список из пяти полей (+namespace Фаза 10).
-        assert set(note) == {"id", "text", "created_at", "updated_at", "namespace"}
+        assert set(note) == {"id", "text", "created_at", "updated_at", "namespace", "expires_at"}
         assert note["namespace"] == "default"  # save без узла → default (§5.7)
         assert "title" not in note  # Фаза 11: get без названия (там полный текст)
 
@@ -488,6 +490,7 @@ class TestMemoryFlow:
         for item in listed["items"]:
             assert set(item) == {
                 "id", "summary", "created_at", "updated_at", "namespace", "title",
+                "expires_at",  # lsb-0004-02
             }  # Фаза 11 (решение №9): +title
             assert "summary_status" not in item
             assert "author" not in item
@@ -562,6 +565,7 @@ class TestMemoryFlow:
         for item in listed["items"]:
             assert set(item) == {
                 "id", "summary", "created_at", "updated_at", "namespace", "title",
+                "expires_at",  # lsb-0004-02
             }
 
     @pytest.mark.asyncio

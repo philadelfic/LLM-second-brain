@@ -8,6 +8,8 @@ Summary — fallback-усечение (Фаза 4).
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from fakes import HashEmbedder
 
@@ -20,6 +22,7 @@ from app.services.notes import (
     NoteValidationError,
     TitleValidationError,
 )
+from app.services.ttl import TTLValidationError
 from app.storage import chunks, vectors
 from app.storage.db import init_db, session
 
@@ -127,6 +130,7 @@ class TestGet:
         assert set(notes[0]) == {
             "id", "title", "text", "summary", "summary_status",
             "author", "created_at", "updated_at", "namespace",  # Фаза 10 + title (Фаза 11)
+            "expires_at",  # lsb-0004-02
         }
         assert notes[0]["text"] == "Полный текст заметки"
         assert notes[0]["summary_status"] == "pending"
@@ -209,6 +213,7 @@ class TestList:
         assert set(item) == {
             "id", "title", "summary", "summary_status", "author",
             "created_at", "updated_at", "namespace",  # Фаза 10 + title (Фаза 11)
+            "expires_at",  # lsb-0004-02
         }
         assert item["author"] == "model-x"
         assert item["namespace"] == "default"  # Фаза 10
@@ -691,3 +696,304 @@ class TestGetChunk:
         self._vectorize(note_id)
         res = service.get_chunk(note_id, query="запрос", limit=3)
         assert 1 <= len(res["chunks"]) <= 3
+
+
+class TestUpdateMetadata:
+    """lsb-0004-01 (решение О. 2026-09-09): правка title/summary/namespace
+    БЕЗ перезаписи текста. Контракт «не передано» = оставить, null = сбросить.
+
+    Если text не передан — vector_status НЕ трогаем, вектор НЕ дропаем,
+    чанки НЕ пересчитываем, разметку причёски НЕ сбрасываем: меняются только
+    запрошенные поля. Если text передан — полный штатный набор сбросов
+    (vector_status='pending', замена чанков, дроп вектора, сброс причёски).
+    """
+
+    @staticmethod
+    def _processed_note(service: NoteService, text: str, title: str) -> int:
+        """Заметка в «готовом» состоянии: vector_status='ready', причёска
+        разобрана — чтобы проверить, что правка метаданных без text их
+        не сбрасывает (в отличие от правки с text)."""
+        nid = service.save(text, title=title)["id"]
+        with session(get_settings()) as conn:
+            conn.execute(
+                "UPDATE notes SET vector_status='ready', "
+                "classified_at='2026-09-09T00:00:00Z', domain_hint='work', "
+                "subdomain_hint='deploy', confidence=0.9 WHERE id=?",
+                (nid,),
+            )
+        return nid
+
+    def test_title_without_text_keeps_text_and_state(
+        self, service: NoteService
+    ) -> None:
+        """title без text: перезапись title; text, vector_status, причёска,
+        summary не трогаются."""
+        nid = self._processed_note(service, "старый текст", "Старое название")
+        assert service.update(nid, title="Новое название") == {
+            "id": nid, "updated": True, "summary_pending": False,
+        }
+        with session(get_settings()) as conn:
+            row = conn.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()
+        assert row["title"] == "Новое название"
+        assert row["text"] == "старый текст"  # текст не тронут
+        assert row["vector_status"] == "ready"  # не сброшен в pending
+        assert row["classified_at"] is not None  # причёска не сброшена
+        assert row["domain_hint"] == "work"
+        assert row["subdomain_hint"] == "deploy"
+        assert row["confidence"] == 0.9
+        assert row["summary"] == ""  # summary не тронут
+        assert row["summary_status"] == "pending"
+
+    def test_title_without_text_keeps_chunks(self, service: NoteService) -> None:
+        """title без text: чанки не пересчитываются (остаются прежние)."""
+        nid = self._processed_note(service, long_text(9000), "большая")
+        with session(get_settings()) as conn:
+            before = [c[1] for c in chunks.get_note_chunks(conn, nid)]
+        service.update(nid, title="Новое название")
+        with session(get_settings()) as conn:
+            after = [c[1] for c in chunks.get_note_chunks(conn, nid)]
+        assert after == before  # чанки не пересчитаны
+
+    def test_summary_without_text_overwrites_not_regenerated(
+        self, service: NoteService
+    ) -> None:
+        """summary без text: перезапись summary, не перегенерируется
+        (summary_status='ok' — воркер не тронет); text/vector_status не
+        трогаются."""
+        nid = service.save("текст заметки", title="Название")["id"]
+        assert service.update(nid, summary="Новое суммари") == {
+            "id": nid, "updated": True, "summary_pending": False,
+        }
+        with session(get_settings()) as conn:
+            row = conn.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()
+        assert row["summary"] == "Новое суммари"
+        assert row["summary_status"] == "ok"  # не перегенерируется
+        assert row["text"] == "текст заметки"  # текст не тронут
+        assert row["vector_status"] == "pending"  # не тронут
+
+    def test_text_without_summary_regenerates(self, service: NoteService) -> None:
+        """text без summary: summary перегенерируется (summary='' +
+        summary_status='pending', summary_pending=True)."""
+        nid = service.save("старый текст", title="Название")["id"]
+        assert service.update(nid, "новый текст") == {
+            "id": nid, "updated": True, "summary_pending": True,
+        }
+        with session(get_settings()) as conn:
+            row = conn.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()
+        assert row["text"] == "новый текст"
+        assert row["summary"] == ""  # перегенерируется воркером
+        assert row["summary_status"] == "pending"
+
+    def test_text_with_summary_uses_provided(self, service: NoteService) -> None:
+        """text+summary вместе: summary не перегенерируется — используется
+        переданный (summary_status='ok')."""
+        nid = service.save("старый текст", title="Название")["id"]
+        assert service.update(nid, "новый текст", summary="Своё суммари") == {
+            "id": nid, "updated": True, "summary_pending": False,
+        }
+        with session(get_settings()) as conn:
+            row = conn.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()
+        assert row["text"] == "новый текст"
+        assert row["summary"] == "Своё суммари"  # не перегенерирован
+        assert row["summary_status"] == "ok"
+
+    def test_summary_null_regenerates_from_current_text(
+        self, service: NoteService
+    ) -> None:
+        """summary=null: перегенерация из текущего текста (summary='' +
+        pending); text не тронут."""
+        nid = service.save("текущий текст", title="Название")["id"]
+        service.update(nid, summary="Старое суммари")  # задали готовое
+        assert service.update(nid, summary=None) == {
+            "id": nid, "updated": True, "summary_pending": True,
+        }
+        with session(get_settings()) as conn:
+            row = conn.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()
+        assert row["summary"] == ""  # перегенерируется из текущего текста
+        assert row["summary_status"] == "pending"
+        assert row["text"] == "текущий текст"  # текст не тронут
+
+    def test_namespace_without_text_moves_keeps_text(
+        self, service: NoteService
+    ) -> None:
+        """namespace без text: переезд; text и vector_status не трогаются."""
+        NamespaceService(get_settings()).create("work", "Рабочие заметки.")
+        nid = self._processed_note(service, "текст", "Название")
+        assert service.update(nid, namespace="work")["updated"] is True
+        with session(get_settings()) as conn:
+            row = conn.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()
+        assert row["namespace"] == "work"
+        assert row["text"] == "текст"  # текст не тронут
+        assert row["vector_status"] == "ready"  # не тронут
+
+    def test_backward_compat_update_text_only(self, service: NoteService) -> None:
+        """Обратная совместимость: update(note_id, text) работает как раньше —
+        текст заменяется, summary перегенерируется (summary_pending=True),
+        vector_status='pending'."""
+        nid = service.save("старый текст", title="Название")["id"]
+        assert service.update(nid, "новый текст") == {
+            "id": nid, "updated": True, "summary_pending": True,
+        }
+        with session(get_settings()) as conn:
+            row = conn.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()
+        assert row["text"] == "новый текст"
+        assert row["summary"] == ""
+        assert row["summary_status"] == "pending"
+        assert row["vector_status"] == "pending"
+
+    def test_invalid_title_without_text_rejected(
+        self, service: NoteService
+    ) -> None:
+        """Невалидный title (длиннее 5 слов) при правке без text →
+        TitleValidationError; заметка не тронута."""
+        nid = service.save("текст", title="Название")["id"]
+        with pytest.raises(TitleValidationError, match="задай title ≤5 слов"):
+            service.update(nid, title="раз два три четыре пять шесть")
+        with session(get_settings()) as conn:
+            row = conn.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()
+        assert row["title"] == "Название"  # не тронута
+        assert row["text"] == "текст"
+
+
+# --- lsb-0004-02, этап 3: контракты expires_at (set/keep/clear + синхронизация
+# note_expirations + видимость в get/list) -----------------------------------
+
+
+def _expiration_row(note_id: int) -> dict | None:
+    """Строка из note_expirations для заметки (или None, если нет TTL)."""
+    with session(get_settings()) as conn:
+        row = conn.execute(
+            "SELECT note_id, expires_at FROM note_expirations WHERE note_id = ?",
+            (note_id,),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _note_expires(note_id: int) -> str | None:
+    """notes.expires_at для заметки."""
+    with session(get_settings()) as conn:
+        return conn.execute(
+            "SELECT expires_at FROM notes WHERE id = ?", (note_id,)
+        ).fetchone()[0]
+
+
+class TestExpiresAtSave:
+    """memory_save с expires_at: notes.expires_at + note_expirations."""
+
+    def test_save_with_ttl_writes_both(self, service: NoteService) -> None:
+        """TTL передан → notes.expires_at = абсолютный ISO-8601 UTC + строка
+        в note_expirations с тем же значением."""
+        nid = service.save("временная заметка", title="Название",
+                           expires_at="1d")["id"]
+        stored = _note_expires(nid)
+        assert stored is not None
+        # Абсолютный ISO-8601 UTC (формат БД), в будущем.
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stored)
+        # notes.expires_at и note_expirations синхронизированы (одно значение).
+        assert _expiration_row(nid) == {"note_id": nid, "expires_at": stored}
+
+    def test_save_without_ttl_is_permanent(self, service: NoteService) -> None:
+        """TTL не передан → notes.expires_at NULL, в note_expirations не пишем."""
+        nid = service.save("постоянная заметка", title="Название")["id"]
+        assert _note_expires(nid) is None
+        assert _expiration_row(nid) is None
+
+    def test_save_invalid_ttl_rejected(self, service: NoteService) -> None:
+        """Невалидный TTL → TTLValidationError (мягкий отказ), заметка НЕ
+        создаётся (нет ни notes, ни note_expirations)."""
+        with pytest.raises(TTLValidationError):
+            service.save("временная", title="Название", expires_at="1x")
+        with session(get_settings()) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 0
+            assert conn.execute(
+                "SELECT COUNT(*) FROM note_expirations"
+            ).fetchone()[0] == 0
+
+
+class TestExpiresAtUpdate:
+    """memory_update expires_at: set/keep/clear + синхронизация."""
+
+    def test_update_set_adds_ttl(self, service: NoteService) -> None:
+        """set: передан TTL → notes.expires_at обновлён + upsert в
+        note_expirations."""
+        nid = service.save("заметка", title="Название")["id"]
+        assert _expiration_row(nid) is None  # была постоянной
+        assert service.update(nid, expires_at="2h")["updated"] is True
+        stored = _note_expires(nid)
+        assert stored is not None
+        assert _expiration_row(nid) == {"note_id": nid, "expires_at": stored}
+
+    def test_update_set_overwrites_ttl(self, service: NoteService) -> None:
+        """set поверх существующего TTL: upsert перезаписывает expires_at
+        (одна строка на заметку)."""
+        nid = service.save("заметка", title="Название", expires_at="1d")["id"]
+        assert service.update(nid, expires_at="30m")["updated"] is True
+        stored = _note_expires(nid)
+        assert stored is not None
+        assert _expiration_row(nid) == {"note_id": nid, "expires_at": stored}
+
+    def test_update_keep_preserves_ttl(self, service: NoteService) -> None:
+        """keep: expires_at не передан → notes.expires_at и note_expirations
+        не трогаются."""
+        nid = service.save("заметка", title="Название", expires_at="1d")["id"]
+        before = _expiration_row(nid)
+        assert service.update(nid, title="Новое")["updated"] is True
+        assert _note_expires(nid) == before["expires_at"]
+        assert _expiration_row(nid) == before
+
+    def test_update_clear_removes_ttl(self, service: NoteService) -> None:
+        """clear: expires_at=None → notes.expires_at NULL + строка удалена из
+        note_expirations (заметка становится постоянной)."""
+        nid = service.save("заметка", title="Название", expires_at="1d")["id"]
+        assert _expiration_row(nid) is not None
+        assert service.update(nid, expires_at=None)["updated"] is True
+        assert _note_expires(nid) is None
+        assert _expiration_row(nid) is None
+
+    def test_update_invalid_ttl_rejected(self, service: NoteService) -> None:
+        """Невалидный TTL при set → TTLValidationError; заметка не тронута."""
+        nid = service.save("заметка", title="Название", expires_at="1d")["id"]
+        before = _expiration_row(nid)
+        with pytest.raises(TTLValidationError):
+            service.update(nid, expires_at="abc")
+        assert _note_expires(nid) == before["expires_at"]
+        assert _expiration_row(nid) == before
+
+
+class TestExpiresAtVisible:
+    """expires_at виден в выдаче get/list."""
+
+    def test_get_exposes_expires_at(self, service: NoteService) -> None:
+        """memory_get: expires_at в полной заметке (None для постоянной)."""
+        nid = service.save("заметка", title="Название", expires_at="1d")["id"]
+        note = service.get([nid])["notes"][0]
+        assert note["expires_at"] == _note_expires(nid)
+        permanent = service.save("постоянная", title="Название")["id"]
+        assert service.get([permanent])["notes"][0]["expires_at"] is None
+
+    def test_list_exposes_expires_at(self, service: NoteService) -> None:
+        """memory_list: expires_at в item (None для постоянной)."""
+        nid = service.save("заметка", title="Название", expires_at="1d")["id"]
+        service.save("постоянная", title="Название")
+        by_id = {item["id"]: item for item in service.list()["items"]}
+        assert by_id[nid]["expires_at"] == _note_expires(nid)
+        assert any(item["expires_at"] is None for item in by_id.values())
+
+
+class TestExpiresAtDelete:
+    """Синхронизация note_expirations при удалении заметки (memory_delete).
+
+    Постановка lsb-0004-02 (этап 5): «удаление при снятии/удалении заметки» —
+    строка из note_expirations должна сниматься и при операторском удалении.
+    delete() — soft delete (deleted_at), физически строка/индекс живы; строка
+    из note_expirations при этом НЕ снимается (пробел сервиса, см. отчёт).
+    Джоба зачистки снимет её позже, когда expires_at <= now().
+    """
+
+    def test_delete_removes_expiration_row(self, service: NoteService) -> None:
+        """Требование постановки: удаление заметки снимает строку из
+        note_expirations (lsb-0004-02, этап 5)."""
+        nid = service.save("временная", title="Название", expires_at="1d")["id"]
+        assert _expiration_row(nid) is not None
+        assert service.delete(nid)["deleted"] is True
+        assert _expiration_row(nid) is None  # должно быть снято при удалении

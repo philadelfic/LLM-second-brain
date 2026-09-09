@@ -95,7 +95,7 @@ from app.services.notes import NoteService
 from app.services.promotion import PromotionService
 from app.services.summary import Summarizer, SummaryError
 from app.storage import chunks, vectors
-from app.storage.db import session, transaction
+from app.storage.db import delete_note_physical, session, transaction
 
 # Сколько хранить выполненные done-работы в worker_jobs (retention). Не env —
 # по паттерну TITLE_MAX_WORDS: после этого срока работы вычищаются idle-веткой
@@ -104,6 +104,10 @@ WORKER_JOBS_RETENTION_DAYS = 7
 
 # Потолок back-off (REQUIREMENTS §5.3 «max 15 мин»), env не настраивается.
 MAX_INTERVAL_SEC = 15 * 60
+
+# Интервал джобы зачистки просроченных заметок (lsb-0004-02, этап 4):
+# фиксированные 5 минут (решение О. 2026-09-09), без настройки в компоузе.
+EXPIRATION_CLEANUP_INTERVAL_SEC = 5 * 60
 
 # Промпт догенерации названия (решение №9): ЗАШИТ в SummaryService.title
 # (follow-up 6b — протокол Summarizer получил метод title; здесь раньше был
@@ -243,7 +247,8 @@ class BackgroundWorker:
         Петли независимы: back-off и выгребание — раздельные.
         """
         await asyncio.gather(
-            self._run_embedding(), self._run_summary(), self._run_judge()
+            self._run_embedding(), self._run_summary(), self._run_judge(),
+            self._run_expiration_cleanup(),
         )
 
     async def _run_embedding(self) -> None:
@@ -365,6 +370,68 @@ class BackgroundWorker:
                 self._judge_interval = next_interval(
                     self._judge_interval, self._settings.pending_retry_sec
                 )
+
+    # --- джоба зачистки просроченных заметок (lsb-0004-02, этап 4) -----------
+
+    async def _run_expiration_cleanup(self) -> None:
+        """Петля зачистки просроченных заметок (lsb-0004-02, этап 4).
+
+        Раз в EXPIRATION_CLEANUP_INTERVAL_SEC (фиксированные 5 минут, решение
+        О. 2026-09-09) выгребает note_expirations: заметки с
+        `expires_at <= now()` удаляются ПОЛНОСТЬЮ (notes+chunks+вектора+fts)
+        вместе со строкой из note_expirations. Интервал фиксированный — без
+        back-off (в отличие от очередей pending): зачистка не зависит от
+        внешних сервисов, сбой итерации не ускоряет/замедляет расписание.
+        Супервизор петли (пул 4): непредвиденный сбой итерации не убивает
+        петлю — warning с traceback, пауза на интервал, повтор.
+        """
+        while not self._stopping:
+            try:
+                deleted = await asyncio.to_thread(self.process_expired_notes)
+                if deleted:
+                    logging.getLogger("app").info(
+                        "expiration cleanup: purged expired notes",
+                        extra={"event": "expiration_cleanup", "count": deleted},
+                    )
+                await asyncio.sleep(EXPIRATION_CLEANUP_INTERVAL_SEC)
+            except asyncio.CancelledError:
+                raise  # отмена петли (graceful stop) — не глотать
+            except Exception:
+                logging.getLogger("app").warning(
+                    "expiration cleanup loop iteration failed — loop continues",
+                    extra={"event": "loop_iteration_failed", "loop": "expiration"},
+                    exc_info=True,
+                )
+                await asyncio.sleep(EXPIRATION_CLEANUP_INTERVAL_SEC)
+
+    def process_expired_notes(self) -> int:
+        """Удалить просроченные заметки; возвращает число удалённых.
+
+        SELECT note_id FROM note_expirations WHERE expires_at <= now() (now —
+        в том же ISO-8601 UTC формате, что expires_at: strftime
+        '%Y-%m-%dT%H:%M:%SZ','now'); для каждого id — полное физическое
+        удаление (notes+chunks+вектора+fts) + удаление строки из
+        note_expirations (delete_note_physical).
+
+        Идемпотентно и безопасно: если заметка уже удалена (например,
+        оператором) — delete_note_physical просто не матчит ничего, не падает;
+        строка из note_expirations при этом всё равно снимается. Каждая
+        заметка — короткая транзакция: сбой одной не откатывает остальных.
+        """
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT note_id FROM note_expirations "
+                "WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+            ).fetchall()
+        if not rows:
+            return 0
+        deleted = 0
+        for row in rows:
+            note_id = int(row["note_id"])
+            with session(self._settings) as conn, transaction(conn):
+                delete_note_physical(conn, note_id)
+                deleted += 1
+        return deleted
 
     # --- job-очереди по слотам (Фаза 11, решение №10) -------------------------
 

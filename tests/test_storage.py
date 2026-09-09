@@ -31,9 +31,9 @@ def _match(conn: sqlite3.Connection, needle: str) -> list[int]:
 
 class TestSchemaCreated:
     def test_notes_columns(self) -> None:
-        """Таблица notes — 14 колонок из ARCHITECTURE §3.3 (+Фаза 10 §5.7):
+        """Таблица notes — 15 колонок из ARCHITECTURE §3.3 (+Фаза 10 §5.7):
         9 базовых + namespace/classified_at + разметка причёски
-        domain_hint/subdomain_hint/confidence."""
+        domain_hint/subdomain_hint/confidence + expires_at (lsb-0004-02)."""
         init_db(get_settings())
         with session(get_settings()) as conn:
             columns = {
@@ -43,7 +43,7 @@ class TestSchemaCreated:
             "id", "text", "title", "summary", "author", "vector_status",
             "summary_status", "created_at", "updated_at", "deleted_at",
             "namespace", "classified_at", "domain_hint", "subdomain_hint",
-            "confidence",
+            "confidence", "expires_at",
         }
         # DDL-умолчания: summary пуст, статусы pending, author unknown.
         assert columns["summary"]["dflt_value"] == "''"
@@ -53,6 +53,7 @@ class TestSchemaCreated:
         assert columns["deleted_at"]["notnull"] == 0  # NULL = активна
         assert columns["namespace"]["dflt_value"] == "'default'"  # Фаза 10
         assert columns["classified_at"]["notnull"] == 0  # Фаза 10: NULL = не классифицирована
+        assert columns["expires_at"]["notnull"] == 0  # lsb-0004-02: NULL = постоянная
 
     def test_fts_external_content_trigram(self) -> None:
         """notes_fts — FTS5 внешний контент с trigram-токенизатором."""
@@ -75,6 +76,41 @@ class TestSchemaCreated:
                 )
             }
         assert {"notes_fts_ai", "notes_fts_au"} <= names  # DELETE-триггер не нужен
+
+    def test_note_expirations_table_created(self) -> None:
+        """lsb-0004-02: очередь удаления note_expirations создаётся при старте."""
+        init_db(get_settings())
+        with session(get_settings()) as conn:
+            ddl = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='note_expirations'"
+            ).fetchone()[0]
+        assert "note_id" in ddl and "expires_at" in ddl
+        assert "PRIMARY KEY" in ddl
+
+    def test_expiration_migration_idempotent_on_live_db(self) -> None:
+        """Живая БД без expires_at/note_expirations → init_db добавляет их;
+        повторный init_db не ломает (идемпотентность)."""
+        settings = get_settings()
+        init_db(settings)
+        with session(settings) as conn:
+            conn.execute("INSERT INTO notes(text) VALUES ('заметка')")
+            # Ручной откат к схеме до lsb-0004-02: дроп колонки и таблицы.
+            conn.execute("ALTER TABLE notes DROP COLUMN expires_at")
+            conn.execute("DROP TABLE note_expirations")
+        init_db(settings)  # миграция добавляет колонку и таблицу
+        with session(settings) as conn:
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(notes)")
+            }
+            assert "expires_at" in columns
+            assert conn.execute(
+                "SELECT name FROM sqlite_master WHERE name='note_expirations'"
+            ).fetchone()
+            assert conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 1
+        init_db(settings)  # повторный прогон — без ошибок, данные целы
+        with session(settings) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 1
 
     def test_check_backstop_rejects_out_of_range(self) -> None:
         """CHECK — последний рубеж: пустой и слишком длинный текст отвергнут."""

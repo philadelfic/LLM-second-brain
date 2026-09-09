@@ -58,7 +58,7 @@ from pathlib import Path
 import sqlite_vec
 
 from app.config import Settings
-from app.storage import chunks, vectors
+from app.storage import chunks, expirations, vectors
 
 # Сколько ждать блокировку записи, прежде чем сдаться (как timeout sqlite3,
 # так и PRAGMA busy_timeout).
@@ -104,7 +104,8 @@ CREATE TABLE IF NOT EXISTS notes (
   classified_at  TEXT    NULL,
   domain_hint    TEXT    NULL,
   subdomain_hint TEXT    NULL,
-  confidence     REAL    NULL
+  confidence     REAL    NULL,
+  expires_at     TEXT    NULL
 )
 """
 
@@ -146,6 +147,18 @@ CREATE TABLE IF NOT EXISTS promotions (
   canonical_path TEXT NULL,
   decided_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   PRIMARY KEY (domain, subdomain)
+)
+"""
+
+# lsb-0004-02 (FR-5…FR-8): очередь удаления просроченных заметок. note_id —
+# PK (одна запись на заметку), expires_at — абсолютный ISO-8601 (UTC) срок
+# жизни. Создаётся идемпотентно (IF NOT EXISTS); синхронизация с notes —
+# на уровне сервиса (вставка при TTL, обновление при смене, удаление при
+# снятии/удалении заметки).
+_NOTE_EXPIRATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS note_expirations (
+  note_id    INTEGER PRIMARY KEY,
+  expires_at TEXT    NOT NULL
 )
 """
 
@@ -320,6 +333,9 @@ def init_db(settings: Settings) -> None:
             _migrate_namespace_columns(conn)
             _migrate_classification_columns(conn)
             conn.execute(_NAMESPACES_DDL)
+            # Временное хранение (lsb-0004-02): колонка notes.expires_at +
+            # очередь удаления note_expirations (идемпотентно).
+            _migrate_expiration_columns(conn)
             # List-индексы (пул 15): старый idx_notes_namespace заменён
             # (prefix namespace, deleted_at покрыт новым ns-индексом).
             conn.execute("DROP INDEX IF EXISTS idx_notes_namespace")
@@ -419,6 +435,19 @@ def _migrate_classification_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE notes ADD COLUMN subdomain_hint TEXT")
     if "confidence" not in columns:
         conn.execute("ALTER TABLE notes ADD COLUMN confidence REAL")
+
+
+def _migrate_expiration_columns(conn: sqlite3.Connection) -> None:
+    """Нулевая миграция lsb-0004-02 поверх живых БД: колонка notes.expires_at
+    и таблица note_expirations. Свежие БД получают колонку из _NOTES_DDL и
+    таблицу из _NOTE_EXPIRATIONS_DDL; унаследованные — ALTER TABLE ADD
+    COLUMN (существующие заметки без TTL → NULL, постоянные) + CREATE TABLE
+    IF NOT EXISTS (очередь удаления). Идемпотентно: повторный запуск не
+    ломает (колонка уже есть — ALTER пропускается, таблица — IF NOT EXISTS)."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
+    if "expires_at" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN expires_at TEXT")
+    conn.execute(_NOTE_EXPIRATIONS_DDL)
 
 
 def _ensure_default_namespace(conn: sqlite3.Connection) -> None:
@@ -837,3 +866,26 @@ def _check_fts_integrity(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT INTO notes_fts(rowid, title, text) SELECT id, title, text FROM notes"
     )
+
+
+def delete_note_physical(conn: sqlite3.Connection, note_id: int) -> None:
+    """Физически удалить заметку из всех индексов (lsb-0004-02, джоба зачистки).
+
+    Полное физическое удаление (НЕ soft delete): просроченная заметка должна
+    исчезнуть из всех индексов — notes + notes_chunks + notes_chunks_vec +
+    notes_vec + notes_fts + note_expirations. Композиция существующих
+    примитивов слоя (chunks.drop_note_chunks, vectors.drop, expirations.delete)
+    + явный DELETE из notes_fts (внешний контент: DELETE-триггера нет, индекс
+    не чистится каскадом) и notes.
+
+    Идемпотентно и безопасно: отсутствующей заметки нет — каждый DELETE
+    просто не матчит ничего; повторный вызов не падает. Вызывается внутри
+    открытой транзакции вызывающего (transaction()).
+    """
+    # Чанки и их вектора (notes_chunks_vec + notes_chunks) — до notes:
+    # notes_chunks_vec без FK, каскад от notes его не тронет.
+    chunks.drop_note_chunks(conn, note_id)
+    vectors.drop(conn, note_id)  # notes_vec
+    conn.execute("DELETE FROM notes_fts WHERE rowid = ?", (note_id,))
+    conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+    expirations.delete(conn, note_id)  # note_expirations

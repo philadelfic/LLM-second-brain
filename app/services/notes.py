@@ -75,8 +75,7 @@ from app.services.embedding import Embedder, EmbeddingService
 from app.services.emit import summary_of
 from app.services.namespaces import NamespaceService
 from app.services.splitter import split_text
-from app.storage import chunks
-from app.storage import vectors
+from app.storage import chunks, expirations, vectors
 from app.storage.db import session, transaction
 
 # Фиксированные верхние границы контрактов (REQUIREMENTS §5.1/NFR-6; env —
@@ -94,6 +93,25 @@ TITLE_HINT = "задай title ≤5 слов"
 # воркер). Транспорты (MCP/REST) всегда передают title явно — в том числе
 # None, когда клиент-модель не назвала заметку: это отказ (fail+hint).
 _UNSET_TITLE: Any = object()
+
+# Сентинелы «не передан» для update (lsb-0004-01, решение О. 2026-09-09):
+# контракт «не передано» = оставить, null = сбросить. Для text и summary
+# нужно отличать «параметр не передавали» от явного None (для summary None =
+# перегенерировать из текущего текста). Транспорт (MCP) передаёт эти же
+# сентинелы, когда клиент не указал параметр.
+_UNSET_TEXT: Any = object()
+# Сентинел summary — JSON-серизуемая строка: используется как дефолт параметра
+# MCP-инструмента memory_update, pydantic не должен ругаться на несеризуемый
+# дефолт (иначе PydanticJsonSchemaWarning ломает JSON-логи, NFR-4). Сравнение
+# в сервисе — по идентичности (is), поэтому коллизия с реальным summary
+# невозможна даже при совпадении строки.
+_UNSET_SUMMARY: str = "__LSB_UNSET_SUMMARY__"
+# Сентинел expires_at (lsb-0004-02, решение О. 2026-09-09): «не передано» =
+# оставить (update) / постоянная заметка (save), null = сбросить TTL (clear).
+# JSON-серизуемая строка (как _UNSET_SUMMARY): дефолт параметра MCP-инструмента,
+# pydantic не ругается на несеризуемый дефолт (NFR-4). Сравнение в сервисе —
+# по идентичности (is), коллизия с реальным TTL невозможна.
+_UNSET_EXPIRES_AT: str = "__LSB_UNSET_EXPIRES_AT__"
 
 
 def is_valid_title(title: str | None) -> bool:
@@ -163,6 +181,7 @@ class NoteService:
         author: str | None = None,
         namespace: str = "default",
         title: str | None = _UNSET_TITLE,
+        expires_at: str | None = _UNSET_EXPIRES_AT,
     ) -> dict[str, Any]:
         """Валидация (текст, title) → дословный дедуп → INSERT транзакцией.
 
@@ -193,6 +212,10 @@ class NoteService:
         self._validate_text(text)
         note_title = self._validated_save_title(title)
         ns = self._namespaces.validate_placement(namespace)
+        # expires_at (lsb-0004-02): передан → распарсить в абсолютный ISO-8601
+        # UTC (TTLValidationError — мягкий отказ ДО записи); не передан
+        # (сентинел) → None — постоянная заметка, в note_expirations не пишем.
+        expires_value = self._resolve_save_expires(expires_at)
         # Чанки считаем чистым сплиттером (~миллисекунды, без Ollama) ДО
         # транзакции — сама транзакция остаётся короткой.
         chunks_data = self._chunks_of(text)
@@ -220,8 +243,12 @@ class NoteService:
                     )
                 note_id = self._insert(
                     conn, text, author, vector_status="pending", namespace=ns,
-                    title=note_title,
+                    title=note_title, expires_at=expires_value,
                 )
+                if expires_value is not None:
+                    # TTL задан: синхронизируем очередь удаления (одна запись
+                    # на заметку, PK note_id).
+                    expirations.upsert(conn, note_id, expires_value)
                 self._store_chunks(conn, note_id, chunks_data, None)
         if duplicate is not None:
             return duplicate_response(duplicate)
@@ -243,20 +270,24 @@ class NoteService:
         vector_status: str = "pending",
         namespace: str = "default",
         title: str | None = None,
+        expires_at: str | None = None,
     ) -> int:
         """INSERT строки заметки (внутри открытой транзакции).
 
         title (решение №9) — проверен/нормализован вызывающим (_validated_save_title);
-        None — легаси-путь миграции (название догенерирует воркер)."""
+        None — легаси-путь миграции (название догенерирует воркер).
+        expires_at (lsb-0004-02) — абсолютный ISO-8601 UTC (распарсен
+        вызывающим); None — постоянная заметка (без TTL)."""
         cursor = conn.execute(
-            "INSERT INTO notes (text, title, author, vector_status, namespace) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO notes (text, title, author, vector_status, namespace, "
+            "expires_at) VALUES (?, ?, ?, ?, ?, ?)",
             (
                 text,
                 title,
                 author if author else self._settings.author_default,
                 vector_status,
                 namespace,
+                expires_at,
             ),
         )
         return int(cursor.lastrowid or 0)
@@ -408,7 +439,7 @@ class NoteService:
         with session(self._settings) as conn:
             rows = conn.execute(
                 "SELECT id, title, namespace, summary, summary_status, author, "
-                "created_at, updated_at, text "
+                "created_at, updated_at, expires_at, text "
                 "FROM notes WHERE deleted_at IS NULL"
                 f"{ns_clause} "
                 "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -428,6 +459,7 @@ class NoteService:
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
                 "namespace": row["namespace"],
+                "expires_at": row["expires_at"],
             }
             for row in rows
         ]
@@ -446,39 +478,53 @@ class NoteService:
     def update(
         self,
         note_id: int,
-        text: str,
+        text: str | None = _UNSET_TEXT,
         namespace: str | None = None,
         title: str | None = None,
+        summary: str | None = _UNSET_SUMMARY,
+        expires_at: str | None = _UNSET_EXPIRES_AT,
     ) -> dict[str, Any]:
-        """UPDATE text целиком; summary reset; ре-векторизация — фоном (Фаза 8).
+        """UPDATE заметки по контракту lsb-0004-01 (решение О. 2026-09-09):
+        «не передано» = оставить, null = сбросить. text опционален — можно
+        править title/summary/namespace БЕЗ перезаписи текста.
 
-        Заметка помечается vector_status='pending' — вектора заметки и чанков
-        строит фоновый воркер; warning контрактом FR-5 не предусмотрен, ответ
-        не меняется. С Фазы 8 Этапа 2.2 update() — штатный путь сведения
-        дублей: воркер объединяет пару merge-промптом суммаризатора и
-        обновляет раннюю заметку этим методом (поздняя — soft delete).
+        Семантика параметров:
+        - `text`: передан → заменить текст (text_changed=True); не передан
+          (сентинел _UNSET_TEXT) → текст не трогаем.
+        - `title`: передан и валиден → перезапись; не передан (None) →
+          прежний остаётся (решение №9; merge-путь воркера не затирает
+          название ранней заметки). Невалидный → TitleValidationError.
+        - `summary`: передан (значение) → использовать как есть, НЕ
+          перегенерировать (summary_status='ok'); не передан (сентинел) →
+          если text_changed → перегенерировать, иначе оставить; None →
+          перегенерировать из текущего текста.
+        - `namespace`: передан → переезд; не передан → оставить.
 
-        Фаза 10 (§5.7): `namespace` — опциональный целевой узел переезда;
-        не указан — заметка остаётся в своём namespace (перемещение
-        уложенной заметки назад в default не требуется). Зарегистрирован ли
-        узел — проверяется той же точкой, что и save (NamespaceError →
-        транспорт Шага 3 обернёт в fail + hint).
+        expires_at (lsb-0004-02, решение О. 2026-09-09): передан (значение) →
+        set — распарсить в абсолютный ISO-8601 UTC, обновить notes.expires_at
+        + upsert в note_expirations; не передан (сентинел _UNSET_EXPIRES_AT) →
+        keep — не трогаем; None → clear — notes.expires_at=NULL + удалить из
+        note_expirations (заметка становится постоянной).
 
-        Фаза 11 (решение №9): `title` опционален — передан и валиден →
-        перезапись, не передан (None) → прежний остаётся: merge-путь воркера
-        вызывает update без title и название ранней заметки не затирается.
-        Невалидный title → TitleValidationError; сбросить название нельзя
-        (новые — всегда с названием, без него остаются только миграционные).
+        Правила перегенерации summary (О. 2026-09-09): апдейт текста без
+        явного summary → перегенерируем (summary='' + 'pending'); апдейт
+        summary → не генерим (только векторизуем); правка summary и текста
+        вместе → не перегенерируем (используем переданный summary).
 
-        v2.1.1 (аудит 2026-09-05): update сбрасывает и разметку причёски —
-        `classified_at = NULL` + `domain_hint`/`subdomain_hint`/`confidence`
-        = NULL: повтор классификации после обновления текста (§5.7 —
-        «повтор только после memory_update»), протухшие hints не участвуют
-        в агрегации триггера до новой разметки. Повтор пройдёт только у
-        default-заметок (воркер классифицирует только их); merge-путь тоже
-        проходит здесь — слитая заметка переоценивается по новому тексту.
+        Если text НЕ передан (правка только title/summary/namespace):
+        vector_status НЕ трогаем, вектор НЕ дропаем, чанки НЕ пересчитываем,
+        разметку причёски НЕ сбрасываем — меняются только запрошенные поля.
+        Если text передан — полный штатный набор сбросов как раньше:
+        vector_status='pending', замена чанков, дроп протухшего вектора,
+        сброс разметки причёски (v2.1.1, аудит 2026-09-05).
+
+        Обратная совместимость: вызов update(note_id, text) без
+        title/summary/namespace работает как раньше — текст заменяется,
+        summary перегенерируется (summary_pending=True).
         """
-        self._validate_text(text)
+        text_changed = text is not _UNSET_TEXT
+        if text_changed:
+            self._validate_text(text)
         note_title = None if title is None else self._checked_title(title)
         # Быстрая проверка до записи: несуществующий id не трогаем.
         with session(self._settings) as conn:
@@ -491,48 +537,108 @@ class NoteService:
             return self._not_found(note_id)
         ns = self._namespaces.validate_placement(namespace) if namespace is not None \
             else row["namespace"]
-        chunks_data = self._chunks_of(text)
+
+        # --- summary: правила перегенерации (lsb-0004-01) ---
+        # summary не передан (сентинел): text_changed → перегенерировать,
+        # иначе оставить (summary не трогаем). summary=None → перегенерировать
+        # из текущего текста. summary=значение → использовать, не
+        # перегенерировать (summary_status='ok' — воркер не тронет).
+        if summary is not _UNSET_SUMMARY:
+            summary_touched = True
+            if summary is None:
+                summary_value, summary_status = "", "pending"
+            else:
+                summary_value, summary_status = summary, "ok"
+        else:
+            summary_touched = text_changed
+            if text_changed:
+                summary_value, summary_status = "", "pending"
+            else:
+                summary_value, summary_status = None, None
+
+        # --- expires_at: set/keep/clear (lsb-0004-02) ---
+        # передан (значение) → set (распарсить); не передан (сентинел) → keep
+        # (не трогаем); None → clear (снять TTL). expires_value — целевое
+        # значение для notes.expires_at (None = NULL); expires_touched — надо
+        # ли вообще трогать колонку и синхронизировать note_expirations.
+        expires_touched = expires_at is not _UNSET_EXPIRES_AT
+        if expires_touched:
+            # Локальный импорт: ttl.py импортирует NoteValidationError из
+            # notes.py (циклическая зависимость) — на уровне модуля нельзя.
+            from app.services.ttl import parse_ttl
+
+            expires_value = None if expires_at is None else parse_ttl(expires_at)
+        else:
+            expires_value = None  # keep — не трогаем
+
+        # Динамический UPDATE: трогаем только запрошенные поля.
+        sets: list[str] = []
+        params: list[object] = []
+        if text_changed:
+            sets.append("text = ?")
+            params.append(text)
+            sets.append("vector_status = 'pending'")
+            sets.append(
+                "classified_at = NULL, domain_hint = NULL, "
+                "subdomain_hint = NULL, confidence = NULL"
+            )
+        if note_title is not None:
+            sets.append("title = ?")
+            params.append(note_title)
+        sets.append("namespace = ?")
+        params.append(ns)
+        if summary_touched:
+            sets.append("summary = ?")
+            params.append(summary_value)
+            sets.append("summary_status = ?")
+            params.append(summary_status)
+        if expires_touched:
+            sets.append("expires_at = ?")
+            params.append(expires_value)
+        sets.append("updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')")
+        sql = (
+            "UPDATE notes SET " + ", ".join(sets)
+            + " WHERE id = ? AND deleted_at IS NULL"
+        )
+        params.append(note_id)
+        chunks_data = self._chunks_of(text) if text_changed else None
         with session(self._settings) as conn, transaction(conn):
-            if note_title is None:  # title не передан — прежний остаётся (решение №9)
-                cursor = conn.execute(
-                    "UPDATE notes SET text = ?, namespace = ?, "
-                    "vector_status = 'pending', "
-                    "summary = '', summary_status = 'pending', "
-                    "classified_at = NULL, domain_hint = NULL, "
-                    "subdomain_hint = NULL, confidence = NULL, "
-                    "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
-                    "WHERE id = ? AND deleted_at IS NULL",
-                    (text, ns, note_id),
-                )
-            else:  # валидный title передан — перезапись
-                cursor = conn.execute(
-                    "UPDATE notes SET text = ?, title = ?, namespace = ?, "
-                    "vector_status = 'pending', "
-                    "summary = '', summary_status = 'pending', "
-                    "classified_at = NULL, domain_hint = NULL, "
-                    "subdomain_hint = NULL, confidence = NULL, "
-                    "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
-                    "WHERE id = ? AND deleted_at IS NULL",
-                    (text, note_title, ns, note_id),
-                )
+            cursor = conn.execute(sql, params)
             updated = cursor.rowcount  # 0 = нет такой активной заметки
-            # Фаза 7: старые чанки (и их вектора) заменяются новыми одной
-            # транзакцией; Фаза 8: вектора строит фоновый воркер (pending).
-            self._store_chunks(conn, note_id, chunks_data, None)
-            # v2.1.1 (пул 3): сбросить и ПРОТУХШИЙ полный вектор заметки —
-            # notes_vec пуст до догонки воркером: в окне pending заметка
-            # участвует только в FTS-поиске (ARCH §3.3), старый вектор по
-            # прежнему тексту не кормит ни векторный поиск, ни косинус-дедуп.
-            vectors.drop(conn, note_id)
+            if updated and expires_touched:
+                # Синхронизация очереди удаления (lsb-0004-02): set → upsert,
+                # clear → удалить строку. Только если UPDATE сматчился — иначе
+                # не пишем строку для несуществующей заметки.
+                if expires_value is None:
+                    expirations.delete(conn, note_id)
+                else:
+                    expirations.upsert(conn, note_id, expires_value)
+            if text_changed:
+                # Фаза 7: старые чанки (и их вектора) заменяются новыми одной
+                # транзакцией; Фаза 8: вектора строит фоновый воркер (pending).
+                self._store_chunks(conn, note_id, chunks_data, None)
+                # v2.1.1 (пул 3): сбросить и ПРОТУХШИЙ полный вектор заметки —
+                # notes_vec пуст до догонки воркером: в окне pending заметка
+                # участвует только в FTS-поиске (ARCH §3.3), старый вектор по
+                # прежнему тексту не кормит ни векторный поиск, ни косинус-дедуп.
+                vectors.drop(conn, note_id)
         if not updated:
             return self._not_found(note_id)
-        self._notify_summary_pending()
-        return {"id": note_id, "updated": True, "summary_pending": True}
+        summary_pending = summary_touched and summary_status == "pending"
+        if summary_pending:
+            self._notify_summary_pending()
+        return {"id": note_id, "updated": True, "summary_pending": summary_pending}
 
     # --- FR-6 memory_delete (soft delete) ----------------------------------
 
     def delete(self, note_id: int) -> dict[str, Any]:
-        """Soft delete: `deleted_at` = now, физически строка/индекс/вектор живы."""
+        """Soft delete: `deleted_at` = now, физически строка/индекс/вектор живы.
+
+        lsb-0004-02 (этап 5): при успешном soft delete снимаем строку из
+        note_expirations (expirations.delete) в той же транзакции — чтобы
+        удалённая заметка не «висела» в очереди до фоновой зачистки.
+        Если заметка не найдена (deleted=False) — строку не трогаем.
+        """
         with session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
                 "UPDATE notes SET deleted_at = "
@@ -541,6 +647,10 @@ class NoteService:
                 (note_id,),
             )
             deleted = cursor.rowcount
+            if deleted:
+                # Только если soft delete сматчился: снимаем TTL-строку той же
+                # транзакцией (идемпотентно — отсутствующей строки нет).
+                expirations.delete(conn, note_id)
         if not deleted:
             return {
                 "id": note_id,
@@ -696,6 +806,19 @@ class NoteService:
         return self._checked_title(title)
 
     @staticmethod
+    def _resolve_save_expires(expires_at: str | None) -> str | None:
+        """expires_at для save (lsb-0004-02): сентинел → None (постоянная
+        заметка, без TTL); передан → распарсить в абсолютный ISO-8601 UTC
+        (TTLValidationError — мягкий отказ, транспорт даёт fail+hint)."""
+        if expires_at is _UNSET_EXPIRES_AT:
+            return None
+        # Локальный импорт: ttl.py импортирует NoteValidationError из notes.py
+        # (циклическая зависимость) — на уровне модуля импорт невозможен.
+        from app.services.ttl import parse_ttl
+
+        return parse_ttl(expires_at)
+
+    @staticmethod
     def _checked_title(title: str | None) -> str:
         """Валидный title обязателен (решение №9): пустой/длиннее
         TITLE_MAX_WORDS слов → TitleValidationError (транспорт даёт fail+hint).
@@ -717,7 +840,8 @@ class NoteService:
         """Формат выдачи memory_get (FR-3): полный текст + метаданные.
         Фаза 10: +namespace (слой ориентирования: модель видит, где лежит).
         Фаза 11 (решение №9): +title (REST-выдача оператору; MCP memory_get
-        срезает белым списком — экономия контекста, там полный текст)."""
+        срезает белым списком — экономия контекста, там полный текст).
+        lsb-0004-02: +expires_at (абсолютный ISO-8601 UTC или None — постоянная)."""
         return {
             "id": row["id"],
             "title": row["title"],
@@ -728,4 +852,5 @@ class NoteService:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "namespace": row["namespace"],
+            "expires_at": row["expires_at"],
         }
