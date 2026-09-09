@@ -404,9 +404,20 @@ class TestSaveUpdateNamespace:
         assert saved["stored"] is True
         assert service.get([saved["id"]])["notes"][0]["namespace"] == "work"
 
+    def _assert_namespace_hint(self, exc_info: pytest.ExceptionInfo[NamespaceError]) -> None:
+        """Канонический hint при save/update в незарегистрированный узел
+        (lsb-0005-07, FR-7): создать недостающие домены через
+        memory_namespace_create — отдельная от save ручка."""
+        msg = str(exc_info.value)
+        assert msg.startswith("неймспейс «nope» не зарегистрирован")
+        assert "memory_namespace_create" in msg
+        assert "memory_namespaces" in msg
+
     def test_save_unknown_namespace_raises(self, service: NoteService) -> None:
-        with pytest.raises(NamespaceError):
+        with pytest.raises(NamespaceError, match="memory_namespace_create") as exc_info:
             service.save("в никуда", namespace="nope")
+        assert "неймспейс «nope» не зарегистрирован" in str(exc_info.value)
+        assert "memory_namespace_create" in str(exc_info.value)
 
     def test_update_moves_namespace(self, service: NoteService) -> None:
         self._register("work", "Рабочие заметки. Подпроекты — в листьях.")
@@ -422,8 +433,10 @@ class TestSaveUpdateNamespace:
 
     def test_update_unknown_namespace_raises(self, service: NoteService) -> None:
         nid = service.save("есть в default")["id"]
-        with pytest.raises(NamespaceError):
+        with pytest.raises(NamespaceError, match="memory_namespace_create") as exc_info:
             service.update(nid, "куда-то не туда", namespace="nope")
+        assert "неймспейс «nope» не зарегистрирован" in str(exc_info.value)
+        assert "memory_namespace_create" in str(exc_info.value)
 
 
 class TestSaveTitle:
@@ -717,8 +730,8 @@ class TestUpdateMetadata:
         with session(get_settings()) as conn:
             conn.execute(
                 "UPDATE notes SET vector_status='ready', "
-                "classified_at='2026-09-09T00:00:00Z', domain_hint='work', "
-                "subdomain_hint='deploy', confidence=0.9 WHERE id=?",
+                "classified_at='2026-09-09T00:00:00Z', hint_path='work/deploy', "
+                "confidence=0.9 WHERE id=?",
                 (nid,),
             )
         return nid
@@ -738,8 +751,7 @@ class TestUpdateMetadata:
         assert row["text"] == "старый текст"  # текст не тронут
         assert row["vector_status"] == "ready"  # не сброшен в pending
         assert row["classified_at"] is not None  # причёска не сброшена
-        assert row["domain_hint"] == "work"
-        assert row["subdomain_hint"] == "deploy"
+        assert row["hint_path"] == "work/deploy"
         assert row["confidence"] == 0.9
         assert row["summary"] == ""  # summary не тронут
         assert row["summary_status"] == "pending"

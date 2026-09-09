@@ -31,12 +31,12 @@ def _create_node(client: TestClient, token: str, path: str, description: str) ->
     return response.json()
 
 
-def _seed_note(settings, namespace: str, domain_hint=None, subdomain_hint=None) -> int:
+def _seed_note(settings, namespace: str, hint_path=None) -> int:
     with session(settings) as conn, transaction(conn):
         cursor = conn.execute(
-            "INSERT INTO notes (text, namespace, domain_hint, subdomain_hint, "
-            "vector_status) VALUES (?, ?, ?, ?, 'ok')",
-            (f"rest-namespace заметка в {namespace}", namespace, domain_hint, subdomain_hint),
+            "INSERT INTO notes (text, namespace, hint_path, "
+            "vector_status) VALUES (?, ?, ?, 'ok')",
+            (f"rest-namespace заметка в {namespace}", namespace, hint_path),
         )
         return int(cursor.lastrowid or 0)
 
@@ -47,10 +47,10 @@ def _seed_trigger_group(settings, domain: str, slug: str, count: int) -> None:
         for i in range(count):
             conn.execute(
                 "INSERT INTO notes (text, summary, summary_status, namespace, "
-                "domain_hint, subdomain_hint, confidence, classified_at) "
-                "VALUES (?, ?, 'ok', 'default', ?, ?, 0.8, "
+                "hint_path, confidence, classified_at) "
+                "VALUES (?, ?, 'ok', 'default', ?, 0.8, "
                 "strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
-                (f"rest-ns seed {i}", f"суммари {i}", domain, slug),
+                (f"rest-ns seed {i}", f"суммари {i}", f"{domain}/{slug}"),
             )
 
 
@@ -179,10 +179,10 @@ class TestMergeAndDelete:
         assert "work/subo" not in paths
         with session(settings) as conn:
             row = conn.execute(
-                "SELECT namespace, subdomain_hint FROM notes WHERE id = ?", (note_id,)
+                "SELECT namespace, hint_path FROM notes WHERE id = ?", (note_id,)
             ).fetchone()
         assert row["namespace"] == "work/other"
-        assert row["subdomain_hint"] == "other"
+        assert row["hint_path"] == "work/other"
 
     def test_merge_conflicts(self, client: TestClient, token: str) -> None:
         _create_node(client, token, "work", "Рабочие заметки.")
@@ -210,10 +210,10 @@ class TestMergeAndDelete:
         assert response.json() == {"path": "work/subo", "moved": 1}
         with session(settings) as conn:
             row = conn.execute(
-                "SELECT namespace, subdomain_hint FROM notes WHERE id = ?", (note_id,)
+                "SELECT namespace, hint_path FROM notes WHERE id = ?", (note_id,)
             ).fetchone()
         assert row["namespace"] == "work"
-        assert row["subdomain_hint"] is None
+        assert row["hint_path"] is None
 
     def test_delete_conflicts(self, client: TestClient, token: str) -> None:
         _create_node(client, token, "work", "Рабочие заметки.")

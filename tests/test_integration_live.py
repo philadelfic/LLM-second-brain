@@ -311,8 +311,7 @@ def test_live_classifier_returns_valid_markup(live_summary) -> None:
     elapsed = time.monotonic() - t0
     print(f"\n[live-classify] латентность classify: {elapsed:.2f} с")
     assert 0.0 <= result.confidence <= 1.0
-    assert result.domain_hint is None or isinstance(result.domain_hint, str)
-    assert result.subdomain_hint is None or isinstance(result.subdomain_hint, str)
+    assert result.hint_path is None or isinstance(result.hint_path, str)
 
 
 def test_live_promotion_describes_judges_resolves(
@@ -351,8 +350,8 @@ def test_live_promotion_describes_judges_resolves(
         for i in range(15):
             conn.execute(
                 "INSERT INTO notes (text, summary, summary_status, namespace, "
-                "domain_hint, subdomain_hint, confidence, classified_at) "
-                "VALUES (?, ?, 'ok', 'default', 'work', 'subo', 0.8, ?)",
+                "hint_path, confidence, classified_at) "
+                "VALUES (?, ?, 'ok', 'default', 'work/subo', 0.8, ?)",
                 (
                     f"live-promo заметка {i}: СУБО 2020, сервисы HR, деплой "
                     f"реестра зарплат, итерация {i}",

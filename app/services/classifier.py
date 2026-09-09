@@ -2,9 +2,9 @@
 
 Классификатор default-заметок: слот summary — та же модель, что
 суммаризация (SUMMARY_MODEL / SUMMARY_BASE_URL), отдельный промпт,
-JSON-вывод, маленький `num_predict`. Выход — три поля разметки:
-`domain_hint` (корень из реестра), `subdomain_hint` (слаг листа или
-null = общая), `confidence` (0–1). Параметры разметки — внутренние данные,
+JSON-вывод, маленький `num_predict`. Выход — два поля разметки:
+`hint_path` (полный путь 1..3 слага или null = общая), `confidence` (0–1).
+Параметры разметки — внутренние данные,
 НЕ в MCP-контрактах (не теги-2.0): клиент-модель видит только узлы реестра.
 
 Фаза 11: HTTP-транспорт вынесен в `LLMClient` (app/services/llm_client.py)
@@ -25,9 +25,9 @@ base_url). Отказ — `ClassificationError`: заметка остаётся
 `classified_at` не ставится, повтор — после `memory_update` (анти-зацикливание
 §5.7). `last_attempt_ok` — как у суммаризатора (NFR-4, /health).
 
-Оба hint-слага (`domain_hint` и `subdomain_hint`) нормализуются через
-`normalize_slug` (регистр/дефисы), как это делает `validate_path` для узлов
-реестра; не-слаг (не латиница-цифры-дефис) — некорректная разметка →
+Единственный hint-путь (`hint_path`) валидируется через `validate_path`
+реестра (слаги латиница-цифры-дефис, 1..3 сегмента, вложенность под
+`default/...` запрещена); нарушение — некорректная разметка →
 `ClassificationError`, заметка остаётся в default (повтор после update).
 
 Промпт: в user-сообщение передаются известные узлы (path: description) —
@@ -51,7 +51,7 @@ import httpx
 
 from app.config import Settings
 from app.services.llm_client import LLMClient, LLMError, SlotSpec
-from app.services.namespaces import normalize_slug
+from app.services.namespaces import NamespaceService, NamespaceValidationError
 from app.services.prompts import PromptRegistry
 
 # Параметры вызова, не настраиваемые env (ARCH §4.7): маленький бюджет
@@ -67,8 +67,7 @@ class ClassificationError(RuntimeError):
 class Classification:
     """Разметка default-заметки (внутренние данные, §5.7)."""
 
-    domain_hint: str | None  # корень из реестра или null (общая)
-    subdomain_hint: str | None  # слаг листа или null (общая)
+    hint_path: str | None  # полный путь 1..3 слага или null (общая)
     confidence: float  # 0..1
 
 
@@ -159,34 +158,21 @@ class ClassificationService:
         data = self._extract_json(content)
         if not isinstance(data, dict):
             raise ClassificationError("не-JSON объект в ответе классификатора")
-        domain = data.get("domain_hint")
-        subdomain = data.get("subdomain_hint")
+        hint_path = data.get("hint_path")
         confidence = data.get("confidence")
-        if domain is not None and not isinstance(domain, str):
-            raise ClassificationError("domain_hint: ожидается строка или null")
-        if subdomain is not None and not isinstance(subdomain, str):
-            raise ClassificationError("subdomain_hint: ожидается строка или null")
+        if hint_path is not None and not isinstance(hint_path, str):
+            raise ClassificationError("hint_path: ожидается строка или null")
         if not isinstance(confidence, (int, float)) or not 0.0 <= float(confidence) <= 1.0:
             raise ClassificationError("confidence: ожидается число 0..1")
-        if subdomain is not None:
-            slug = normalize_slug(subdomain)
-            if slug is None:
-                raise ClassificationError(
-                    f"subdomain_hint «{subdomain}» не слаг (латиница-цифры-дефис)"
-                )
-            subdomain = slug
-        if domain is not None:
-            slug = normalize_slug(domain)
-            if slug is None:
-                raise ClassificationError(
-                    f"domain_hint «{domain}» не слаг (латиница-цифры-дефис)"
-                )
-            domain = slug
-        return Classification(
-            domain_hint=domain,
-            subdomain_hint=subdomain,
-            confidence=float(confidence),
-        )
+        if hint_path is not None:
+            # Полный путь валидируется как путь узла реестра: слаги
+            # (латиница-цифры-дефис), 1..3 сегмента, вложенность под
+            # `default/...` запрещена (default — системный узел).
+            try:
+                hint_path = NamespaceService(self._settings).validate_path(hint_path)
+            except NamespaceValidationError as exc:
+                raise ClassificationError(f"hint_path: {exc}") from exc
+        return Classification(hint_path=hint_path, confidence=float(confidence))
 
     @staticmethod
     def _extract_json(content: str) -> Any:

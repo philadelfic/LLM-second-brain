@@ -1119,14 +1119,12 @@ class BackgroundWorker:
             # фоном не перекладывается (rowcount 0 — переезда не было, нет и
             # лога classified_moved).
             columns = [
-                "domain_hint = ?",
-                "subdomain_hint = ?",
+                "hint_path = ?",
                 "confidence = ?",
                 "classified_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
             ]
             params: list[object] = [
-                result.domain_hint,
-                result.subdomain_hint,
+                result.hint_path,
                 result.confidence,
             ]
             if move:
@@ -1187,22 +1185,18 @@ class BackgroundWorker:
     def _auto_move_target(self, result) -> str | None:
         """Целевой узел авто-переезда (только существующие узлы, §5.7).
 
-        domain_hint — корень из реестра; если он не зарегистрирован (модель
-        предложила новый корень — корни только оператор) — не двигаем.
-        subdomain_hint: зарегистрированный лист → в него; новый лист → None
-        (остаётся в default, триггер Шага 5 создаст и переложит); null →
-        в корень домена (общая для домена заметка).
+        hint_path — полный путь разметки (1..3 слага); если он не
+        зарегистрирован (модель предложила новый узел — его создаст/
+        переложит триггер Шага 5) — не двигаем. Null (общая) — не двигаем.
+        Не-путь (мусор классификатора) валидируется в `exists` внутри —
+        NamespaceValidationError, ничего в БД не пишется (§5.7).
         """
-        if not result.domain_hint:
+        hint = result.hint_path
+        if not hint:
             return None
-        if not self._namespaces.exists(result.domain_hint):
+        if not self._namespaces.exists(hint):
             return None
-        if result.subdomain_hint:
-            leaf = f"{result.domain_hint}/{result.subdomain_hint}"
-            if self._namespaces.exists(leaf):
-                return leaf
-            return None  # новый лист — триггер (Шаг 5) создаст и переложит
-        return result.domain_hint
+        return hint
 
     # --- чанковая очередь (Фаза 7) ---------------------------------------------
 

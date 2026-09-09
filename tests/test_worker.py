@@ -512,7 +512,7 @@ async def test_run_summary_survives_non_slug_domain_hint(fast) -> None:
     петля продолжает работать, последующие заметки суммаризуются штатно."""
     notes = NoteService(fast, FailingEmbedder())
     notes.save("заметка с мусорной разметкой классификатора")
-    classifier = FixedClassifier(Classification("Работа", None, 0.9))
+    classifier = FixedClassifier(Classification("Работа", 0.9))
     worker = BackgroundWorker(
         fast, FailingEmbedder(), FixedSummarizer("Суммари цикла."), classifier=classifier
     )
@@ -853,7 +853,7 @@ def test_classification_after_summarization(settings) -> None:
     NamespaceService(settings).create("work", "Рабочие заметки.")
     notes = NoteService(settings, FailingEmbedder())
     notes.save("заметка про рабочие процессы")
-    classifier = FixedClassifier(Classification("work", None, 0.95))
+    classifier = FixedClassifier(Classification("work", 0.95))
     worker = BackgroundWorker(
         settings, HashEmbedder(8), FixedSummarizer(), classifier=classifier
     )

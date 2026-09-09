@@ -3,8 +3,8 @@
 «Модель для моделей» (§5.7): структура растёт системой. Конвейер одного
 прогона `run()`:
 
-1. **Триггер — SQL-агрегация, не LLM**: `GROUP BY (domain_hint, subdomain_hint)`
-   среди default-заметок; группа с счётчиком ≥ NAMESPACE_PROMOTION_THRESHOLD
+1. **Триггер — SQL-агрегация, не LLM**: `GROUP BY hint_path` (единый
+   полный путь разметки lsb-0005-02) среди default-заметок; группа с счётчиком ≥ NAMESPACE_PROMOTION_THRESHOLD
    (15) при confidence каждой заметки ≥ NAMESPACE_PROMOTION_MIN_CONFIDENCE
    (0.60) — кандидат на авто-создание листа. `candidates()` — та же агрегация
    для `memory_namespaces.promotion_candidates` (актуальная карта для моделей).
@@ -60,7 +60,6 @@ from app.services.llm_client import LLMClient, LLMError, SlotSpec
 from app.services.namespaces import (
     NamespaceService,
     count_sentences,
-    normalize_slug,
 )
 from app.services.prompts import PromptRegistry
 from app.storage.db import DEFAULT_NAMESPACE, session, transaction
@@ -223,9 +222,11 @@ class DescriptionService:
 
 # --- судья структуры (модель судьи дедупа, паттерн Фазы 8) -----------------
 
-# Путь-цель вердикта СЛИТЬ: слаги латиница/цифры/дефис, максимум 2 уровня.
+# Путь-цель вердикта СЛИТЬ: слаги латиница/цифры/дефис, путь 1..3 уровней
+# (lsb-0005-03: вложенность узлов до глубины 3).
 VERDICT_PATH_RE = re.compile(
-    r"[a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(?:-[a-z0-9]+)*)?"
+    r"[a-z0-9]+(?:-[a-z0-9]+)*"
+    r"(?:/[a-z0-9]+(?:-[a-z0-9]+)*){0,2}"
 )
 
 
@@ -385,20 +386,24 @@ class PromotionService:
         SQL-агрегация: счётчик ≥ NAMESPACE_PROMOTION_THRESHOLD при confidence
         каждой заметки ≥ NAMESPACE_PROMOTION_MIN_CONFIDENCE; далее фильтры
         cooldown: домен hint'а зарегистрирован (корни — оператор), узел ещё
-        не создан, вердикта merged/rejected нет. Сортировка по убыванию
-        счётчика — большие группы первыми, детерминированно.
+        не создан, вердикта merged/rejected нет. Группировка — по единому
+        полному пути hint_path глубины 2 или 3 (lsb-0005-03): глубина-1
+        (домен-общая) не промоутится; родитель обязан существовать
+        (иерархия без дыр — глубина-3 ждёт создания родителя depth 2).
+        Сортировка по убыванию счётчика — большие группы первыми,
+        детерминированно.
         """
         with session(self._settings) as conn:
             rows = conn.execute(
-                "SELECT n.domain_hint AS domain_hint, n.subdomain_hint AS subdomain_hint, "
-                "COUNT(*) AS cnt, ROUND(AVG(n.confidence), 2) AS avg_confidence "
+                "SELECT n.hint_path AS hint_path, COUNT(*) AS cnt, "
+                "ROUND(AVG(n.confidence), 2) AS avg_confidence "
                 "FROM notes n "
                 "WHERE n.namespace = 'default' AND n.deleted_at IS NULL "
-                "AND n.domain_hint IS NOT NULL AND n.subdomain_hint IS NOT NULL "
+                "AND n.hint_path IS NOT NULL AND n.hint_path != '' "
                 "AND n.confidence >= ? "
-                "GROUP BY n.domain_hint, n.subdomain_hint "
+                "GROUP BY n.hint_path "
                 "HAVING COUNT(*) >= ? "
-                "ORDER BY cnt DESC, n.domain_hint, n.subdomain_hint",
+                "ORDER BY cnt DESC, n.hint_path",
                 (
                     self._settings.namespace_promotion_min_confidence,
                     self._settings.namespace_promotion_threshold,
@@ -407,16 +412,18 @@ class PromotionService:
         decided = self._decided_hints()
         result: list[dict[str, Any]] = []
         for row in rows:
-            domain = normalize_slug(row["domain_hint"])
-            slug = normalize_slug(row["subdomain_hint"])
-            if domain is None or slug is None:
-                continue  # мусорный hint классификатора — не кандидат
-            if (domain, slug) in decided:
+            hint = row["hint_path"]
+            depth = len(hint.split("/"))
+            if depth not in (2, 3):
+                continue  # глубина-1 (домен-общая) не промоутится; >3 не бывает
+            domain = hint.split("/", 1)[0]
+            slug = "/".join(hint.split("/")[1:])
+            parent = "/".join(hint.split("/")[:-1])
+            if not self._namespaces.exists(parent):
+                continue  # родитель обязан существовать (иерархия без дыр)
+            if hint in decided:
                 continue  # cooldown: вердикт судьи уже вынесен
-            if not self._namespaces.exists(domain):
-                continue  # новые корни — оператор (§5.7); сигнал — в run()
-            path = f"{domain}/{slug}"
-            if self._namespaces.exists(path):
+            if self._namespaces.exists(hint):
                 continue  # узел уже есть — группа разберётся причёской
             result.append(
                 {
@@ -481,21 +488,21 @@ class PromotionService:
         """
         with session(self._settings) as conn:
             rows = conn.execute(
-                "SELECT n.domain_hint AS domain_hint, COUNT(*) AS cnt "
+                "SELECT n.hint_path AS hint_path, COUNT(*) AS cnt "
                 "FROM notes n WHERE n.namespace = 'default' AND n.deleted_at IS NULL "
-                "AND n.domain_hint IS NOT NULL "
+                "AND n.hint_path IS NOT NULL AND n.hint_path != '' "
                 "AND n.confidence >= ? "
-                "GROUP BY n.domain_hint HAVING COUNT(*) >= ?",
+                "GROUP BY n.hint_path HAVING COUNT(*) >= ?",
                 (
                     self._settings.namespace_promotion_min_confidence,
                     self._settings.namespace_promotion_threshold,
                 ),
             ).fetchall()
-        orphans = [
-            {"domain": row["domain_hint"], "count": int(row["cnt"])}
-            for row in rows
-            if not self._namespaces.exists(normalize_slug(row["domain_hint"]) or "")
-        ]
+        orphans = []
+        for row in rows:
+            root = row["hint_path"].split("/")[0]
+            if not self._namespaces.exists(root):
+                orphans.append({"domain": root, "count": int(row["cnt"])})
         if orphans:
             logging.getLogger("app").warning(
                 "promotion: default accumulates content outside known roots",
@@ -511,7 +518,8 @@ class PromotionService:
         merged/rejected — в promotions, created — узлом реестра.
         """
         logger = logging.getLogger("app")
-        summaries = self._group_summaries(domain, slug)
+        path = f"{domain}/{slug}"
+        summaries = self._group_summaries(path)
         try:
             description = self._describer.describe(summaries, slug, domain)  # type: ignore[union-attr]
         except DescriberError:
@@ -526,7 +534,7 @@ class PromotionService:
             nearest_cosine >= self._settings.namespace_synonym_similarity
         ):
             # Косинус-предфильтр: слияние без LLM (паттерн Фазы 8).
-            self._merge(domain, slug, nearest_path)  # type: ignore[arg-type]
+            self._merge(path, nearest_path)  # type: ignore[arg-type]
             return "merged"
         try:
             verdict = self._judge.review(
@@ -546,7 +554,7 @@ class PromotionService:
             return None
         if verdict.action == "merge":
             target = self._namespaces.validate_path(verdict.target or "")
-            if target == f"{domain}/{slug}":
+            if target == path:
                 # Судья «слил» кандидата с ним самим — вердикт некорректен:
                 # кандидата не создаём и не запрещаем навсегда (записи нет),
                 # повтор — следующий прогон; стабильно мусорные ответы видны
@@ -576,44 +584,43 @@ class PromotionService:
                     extra={"event": "promotion_rejected", "domain": domain,
                            "slug": slug, "target": target},
                 )
-                self._record(domain, slug, "rejected")
+                self._record(path, "rejected")
                 return "rejected"
-            self._merge(domain, slug, target)
+            self._merge(path, target)
             return "merged"
         if verdict.action == "reject":
-            self._record(domain, slug, "rejected")
+            self._record(path, "rejected")
             logger.info(
                 "promotion: structure judge rejected candidate",
                 extra={"event": "promotion_rejected", "domain": domain, "slug": slug,
                        "description": description},
             )
             return "rejected"
-        self._create(domain, slug, description)
+        self._create(path, description)
         return "created"
 
-    def _create(self, domain: str, slug: str, description: str) -> None:
+    def _create(self, path: str, description: str) -> None:
         """Создать provisional-лист и переложить группу (один UPDATE)."""
-        path = f"{domain}/{slug}"
         self._namespaces.create(path, description, status="provisional")
-        moved = self._retro_move(domain, slug, path)
+        moved = self._retro_move(path, path)
         logging.getLogger("app").info(
             "promotion: provisional leaf created",
             extra={"event": "node_created", "path": path, "moved": moved,
                    "status": "provisional"},
         )
 
-    def _merge(self, domain: str, slug: str, canonical: str) -> None:
+    def _merge(self, path: str, canonical: str) -> None:
         """Слияние кандидата с каноническим узлом (один UPDATE + вердикт).
 
-        Заметки группы переехали — hint канонизируется (subdomain_hint =
-        слаг канонического листа; корень → NULL: «общая для домена»).
+        Заметки группы переехали — hint канонизируется (hint_path =
+        канонический путь узла).
         """
-        moved = self._retro_move(domain, slug, canonical)
-        self._record(domain, slug, "merged", canonical)
+        moved = self._retro_move(path, canonical)
+        self._record(path, "merged", canonical)
         logging.getLogger("app").info(
             "promotion: candidate merged into existing node",
             extra={"event": "node_merged", "canonical": canonical,
-                   "hint": f"{domain}/{slug}", "moved": moved},
+                   "hint": path, "moved": moved},
         )
 
     # --- SQL-механика --------------------------------------------------------
@@ -631,58 +638,54 @@ class PromotionService:
             if node["path"] != DEFAULT_NAMESPACE
         ]
 
-    def _retro_move(self, domain: str, slug: str, canonical: str) -> int:
+    def _retro_move(self, path: str, canonical: str) -> int:
         """Ретро-перекладка группы в канонический узел ОДНИМ UPDATE (§5.7).
 
-        Канонизация hint: лист → subdomain_hint = слаг листа; корень →
-        NULL (общая для домена). vector_status='pending' — штатная
-        пере-кодировка векторов в партицию нового узла (воркер). Возврат —
-        число переложенных заметок.
+        Канонизация hint_path: hint_path = канонический путь узла — в лист
+        полный путь листа, в корень — корень («общая» для домена).
+        vector_status='pending' — штатная пере-кодировка векторов в партию
+        нового узла (воркер). Возврат — число переложенных заметок.
         """
-        segments = canonical.split("/")
-        target_subdomain = segments[1] if len(segments) == 2 else None
         with session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
-                "UPDATE notes SET namespace = ?, subdomain_hint = ?, "
+                "UPDATE notes SET namespace = ?, hint_path = ?, "
                 "vector_status = 'pending' "
                 "WHERE namespace = 'default' AND deleted_at IS NULL "
-                "AND domain_hint = ? AND subdomain_hint = ?",
-                (canonical, target_subdomain, domain, slug),
+                "AND hint_path = ?",
+                (canonical, canonical, path),
             )
             return cursor.rowcount
 
     def _record(
-        self, domain: str, slug: str, status: str, canonical: str | None = None
+        self, path: str, status: str, canonical: str | None = None
     ) -> None:
         """Записать вердикт судьи (cooldown: группа больше не кандидат)."""
         with session(self._settings) as conn, transaction(conn):
             conn.execute(
-                "INSERT INTO promotions (domain, subdomain, status, canonical_path) "
-                "VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(domain, subdomain) DO UPDATE SET "
+                "INSERT INTO promotions (hint_path, status, canonical_path) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(hint_path) DO UPDATE SET "
                 "status = excluded.status, canonical_path = excluded.canonical_path, "
                 "decided_at = excluded.decided_at",
-                (domain, slug, status, canonical),
+                (path, status, canonical),
             )
 
-    def _decided_hints(self) -> set[tuple[str, str]]:
+    def _decided_hints(self) -> set[str]:
         """Группы с вынесенным вердиктом (cooldown: не дёргаем судью)."""
         with session(self._settings) as conn:
-            rows = conn.execute(
-                "SELECT domain, subdomain FROM promotions"
-            ).fetchall()
-        return {(row["domain"], row["subdomain"]) for row in rows}
+            rows = conn.execute("SELECT hint_path FROM promotions").fetchall()
+        return {row["hint_path"] for row in rows}
 
-    def _group_summaries(self, domain: str, slug: str) -> list[str]:
+    def _group_summaries(self, path: str) -> list[str]:
         """Топ-3 суммари группы (по confidence, затем id) — вход описания."""
         with session(self._settings) as conn:
             rows = conn.execute(
                 "SELECT summary FROM notes "
                 "WHERE namespace = 'default' AND deleted_at IS NULL "
-                "AND domain_hint = ? AND subdomain_hint = ? "
+                "AND hint_path = ? "
                 "AND summary != '' "
                 "ORDER BY confidence DESC, id LIMIT ?",
-                (domain, slug, SUMMARIES_PER_CANDIDATE),
+                (path, SUMMARIES_PER_CANDIDATE),
             ).fetchall()
         return [row["summary"] for row in rows]
 

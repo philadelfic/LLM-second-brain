@@ -102,8 +102,7 @@ CREATE TABLE IF NOT EXISTS notes (
   deleted_at     TEXT    NULL,
   namespace      TEXT    NOT NULL DEFAULT 'default',
   classified_at  TEXT    NULL,
-  domain_hint    TEXT    NULL,
-  subdomain_hint TEXT    NULL,
+  hint_path      TEXT    NULL,
   confidence     REAL    NULL,
   expires_at     TEXT    NULL
 )
@@ -133,20 +132,24 @@ CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
 """
 
 # Вердикты судьи структуры (Фаза 10, Шаг 5): cooldown триггера. Группа
-# hint'ов, по которой судья вынес вердикт (слияние/отклонение), не
+# hint_path'ов, по которой судья вынес вердикт (слияние/отклонение), не
 # дёргает LLM повторно — иначе отклонённый кандидат зациклил бы вызовы
 # судьи при каждом прогоне (заметки с отклонённым hint'ом остаются в
 # default навсегда — честно-общие). Слияние хранит канонический узел;
 # сброс вердикта — оператор (REST, Шаг 6). Созданный узел записей не
 # требует: группа уходит из default ретро-перекладкой.
+#
+# lsb-0005-03: ключ — единый полный путь разметки hint_path (1..3 уровня),
+# заменяет пару (domain, subdomain). Старая схема (ПК (domain, subdomain))
+# мигрируется в _migrate_promotions_key — существующие вердикты получают
+# hint_path = domain/subdomain.
 _PROMOTIONS_DDL = """
 CREATE TABLE IF NOT EXISTS promotions (
-  domain         TEXT NOT NULL,
-  subdomain      TEXT NOT NULL,
+  hint_path      TEXT NOT NULL,
   status         TEXT NOT NULL CHECK(status IN ('merged', 'rejected')),
   canonical_path TEXT NULL,
   decided_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-  PRIMARY KEY (domain, subdomain)
+  PRIMARY KEY (hint_path)
 )
 """
 
@@ -332,6 +335,9 @@ def init_db(settings: Settings) -> None:
             # Неймспейсы (Фаза 10): колонки notes + реестр + дефолт-узел.
             _migrate_namespace_columns(conn)
             _migrate_classification_columns(conn)
+            # lsb-0005-02: единый полный путь разметки hint_path (замена
+            # паре domain_hint/subdomain_hint) — бэкфилл из старой подписи.
+            _migrate_hint_path_columns(conn)
             conn.execute(_NAMESPACES_DDL)
             # Временное хранение (lsb-0004-02): колонка notes.expires_at +
             # очередь удаления note_expirations (идемпотентно).
@@ -343,6 +349,9 @@ def init_db(settings: Settings) -> None:
             conn.execute(_INDEX_NS_DELETED_UPDATED_DDL)
             _ensure_default_namespace(conn)
             conn.execute(_PROMOTIONS_DDL)
+            # lsb-0005-03: ключ promotions (domain, subdomain) → единый
+            # hint_path; миграция старых вердиктов (идемпотентно).
+            _migrate_promotions_key(conn)
             # Title-индекс (lsb-0001-01, Часть A): перестройка notes_fts под
             # индексацию названия на живых БД — ДО integrity-check: перелив
             # выше оставляет индекс консистентным.
@@ -424,17 +433,80 @@ def _migrate_namespace_columns(conn: sqlite3.Connection) -> None:
 
 def _migrate_classification_columns(conn: sqlite3.Connection) -> None:
     """Нулевая миграция Фазы 10 (Шаг 4): колонки разметки причёски
-    domain_hint/subdomain_hint/confidence. Свежие БД получают их из
-    _NOTES_DDL; унаследованные — ALTER TABLE ADD COLUMN (NULL — причёска
-    разберёт их позже). Параметры разметки — внутренние данные, НЕ в
-    MCP-контрактах (§5.7)."""
+    confidence. Свежие БД получают её из _NOTES_DDL; унаследованные —
+    ALTER TABLE ADD COLUMN (NULL — причёска разберёт их позже). Параметры
+    разметки — внутренние данные, НЕ в MCP-контрактах (§5.7).
+
+    lsb-0005-04: колонки domain_hint/subdomain_hint сняты со схемы (груминг
+    переведён на единый hint_path — пара больше нигде не читается/пишется),
+    поэтому здесь остаётся только confidence. Бэкфилл старой пары для
+    унаследованных БД живёт в _migrate_hint_path_columns."""
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
-    if "domain_hint" not in columns:
-        conn.execute("ALTER TABLE notes ADD COLUMN domain_hint TEXT")
-    if "subdomain_hint" not in columns:
-        conn.execute("ALTER TABLE notes ADD COLUMN subdomain_hint TEXT")
     if "confidence" not in columns:
         conn.execute("ALTER TABLE notes ADD COLUMN confidence REAL")
+
+
+def _migrate_hint_path_columns(conn: sqlite3.Connection) -> None:
+    """Нулевая миграция lsb-0005-02: единый полный путь разметки hint_path.
+
+    Заменяет пару domain_hint+subdomain_hint на один полный путь. Свежие БД
+    получают колонку из _NOTES_DDL; унаследованные — ALTER TABLE ADD COLUMN
+    + бэкфилл из старой пары (`X/Y` → `hint_path='X/Y'`, `X`+NULL →
+    `hint_path='X'`, оба NULL → NULL). Идемпотентно: бэкфилл пишется только
+    там, где `hint_path` ещё NULL, поэтому повторный запуск не перезаписывает
+    уже размеченные заметки.
+
+    Колонки domain_hint/subdomain_hint сняты со схемы (lsb-0005-04: груминг
+    переведён на hint_path — пара нигде в app/ больше не читается/пишется,
+    чистая зачистка), поэтому бэкфилл запускается только для СТАРЫХ БД, где
+    пара ещё физически есть (проверка `domain_hint` в структуре таблицы);
+    свежие БД эти колонки не создают и бэкфилл пропускают.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
+    if "hint_path" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN hint_path TEXT")
+    if "domain_hint" in columns:  # старая БД с парой — бэкфилл
+        conn.execute(
+            """
+            UPDATE notes SET hint_path = (
+              CASE
+                WHEN domain_hint IS NOT NULL AND subdomain_hint IS NOT NULL
+                  THEN domain_hint || '/' || subdomain_hint
+                WHEN domain_hint IS NOT NULL THEN domain_hint
+                ELSE NULL
+              END
+            )
+            WHERE hint_path IS NULL
+              AND (domain_hint IS NOT NULL OR subdomain_hint IS NOT NULL)
+            """
+        )
+
+
+def _migrate_promotions_key(conn: sqlite3.Connection) -> None:
+    """Миграция lsb-0005-03: ключ promotions (domain, subdomain) → единый
+    hint_path (идемпотентно).
+
+    Свежие БД получают схему с hint_path PRIMARY KEY прямо из _PROMOTIONS_DDL;
+    унаследованные (ключ (domain, subdomain)) пересоздаются: существующие
+    вердикты мигрируются `hint_path = domain || '/' || subdomain`. Колонки
+    domain/subdomain не переносятся — вердикт полностью описывается
+    полным путём. Идемпотентность — по признаку старой колонки domain:
+    после пересоздания её нет, повторный запуск — no-op.
+    """
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(promotions)")
+    }
+    if "domain" not in columns:
+        return  # свежая схема (ключ hint_path) или таблицы ещё нет — no-op
+    with transaction(conn):
+        conn.execute("ALTER TABLE promotions RENAME TO promotions_legacy")
+        conn.execute(_PROMOTIONS_DDL)
+        conn.execute(
+            "INSERT INTO promotions (hint_path, status, canonical_path, decided_at) "
+            "SELECT domain || '/' || subdomain, status, canonical_path, decided_at "
+            "FROM promotions_legacy"
+        )
+        conn.execute("DROP TABLE promotions_legacy")
 
 
 def _migrate_expiration_columns(conn: sqlite3.Connection) -> None:

@@ -57,14 +57,13 @@ def _seed_group(
         for i in range(count):
             conn.execute(
                 "INSERT INTO notes (text, summary, summary_status, namespace, "
-                "domain_hint, subdomain_hint, confidence, classified_at) "
-                "VALUES (?, ?, 'ok', ?, ?, ?, ?, ?)",
+                "hint_path, confidence, classified_at) "
+                "VALUES (?, ?, 'ok', ?, ?, ?, ?)",
                 (
                     f"заметка {i} про {slug}: детали проекта",
                     f"суммари {i} по {slug}",
                     namespace,
-                    domain,
-                    slug,
+                    (f"{domain}/{slug}" if domain and slug else None),
                     confidence,
                     "2026-09-03T00:00:00Z",
                 ),
@@ -75,18 +74,17 @@ def _notes_in(settings, namespace: str) -> list[sqlite3.Row]:
     """Активные заметки узла: id, hint-слаг, статус вектора."""
     with session(settings) as conn:
         return conn.execute(
-            "SELECT id, namespace, domain_hint, subdomain_hint, vector_status "
+            "SELECT id, namespace, hint_path, vector_status "
             "FROM notes WHERE namespace = ? AND deleted_at IS NULL",
             (namespace,),
         ).fetchall()
 
 
-def _verdict_row(settings, domain: str, slug: str) -> sqlite3.Row | None:
+def _verdict_row(settings, path: str) -> sqlite3.Row | None:
     with session(settings) as conn:
         return conn.execute(
-            "SELECT status, canonical_path FROM promotions "
-            "WHERE domain = ? AND subdomain = ?",
-            (domain, slug),
+            "SELECT status, canonical_path FROM promotions WHERE hint_path = ?",
+            (path,),
         ).fetchone()
 
 
@@ -130,8 +128,7 @@ class TestCandidates:
         # обновили одну заметку группы — hints сброшены, счётчик упал
         with session(settings) as conn:
             note_id = conn.execute(
-                "SELECT id FROM notes WHERE domain_hint = 'work' AND "
-                "subdomain_hint = 'subo' LIMIT 1"
+                "SELECT id FROM notes WHERE hint_path = 'work/subo' LIMIT 1"
             ).fetchone()[0]
         NoteService(settings, FailingEmbedder()).update(note_id, "обновлённый текст")
         # 14 < порога; сброшенный hint не в счёте
@@ -177,8 +174,8 @@ class TestCandidates:
         _seed_group(settings, "work", "subo", THRESHOLD)
         with session(settings) as conn, transaction(conn):
             conn.execute(
-                "INSERT INTO promotions (domain, subdomain, status) "
-                "VALUES ('work', 'subo', 'rejected')"
+                "INSERT INTO promotions (hint_path, status) "
+                "VALUES ('work/subo', 'rejected')"
             )
         promoter = _promoter(settings, FixedDescriber(), ScriptedStructureJudge())
         assert promoter.candidates() == []
@@ -200,7 +197,7 @@ class TestRunCreate:
         assert node["description"] == "Заметки о СУБО 2020."
         rows = _notes_in(settings, "work/subo")
         assert len(rows) == THRESHOLD
-        assert all(row["subdomain_hint"] == "subo" for row in rows)
+        assert all(row["hint_path"] == "work/subo" for row in rows)
         assert all(row["vector_status"] == "pending" for row in rows)
         # Судья звался с кандидатом и тематическими узлами реестра
         # (default — системный своп, слияний с ним не бывает — §5.7).
@@ -222,10 +219,10 @@ class TestRunCreate:
         assert report["merged"] == ["work/subo"]
         rows = _notes_in(settings, "work/other")
         assert len(rows) == THRESHOLD
-        assert all(row["subdomain_hint"] == "other" for row in rows)
+        assert all(row["hint_path"] == "work/other" for row in rows)
         assert all(row["vector_status"] == "pending" for row in rows)
         assert NamespaceService(settings).get("work/subo") is None  # узла нет
-        verdict_row = _verdict_row(settings, "work", "subo")
+        verdict_row = _verdict_row(settings, "work/subo")
         assert verdict_row is not None
         assert verdict_row["status"] == "merged"
         assert verdict_row["canonical_path"] == "work/other"
@@ -325,7 +322,7 @@ class TestRunLimits:
 
 class TestMergeIntoRoot:
     def test_merge_into_domain_canonicalizes_hint_to_null(self, settings) -> None:
-        """Слияние с корнем: namespace=домен, subdomain_hint=NULL (общая)."""
+        """Слияние с корнем: namespace=домен, hint_path=корень (общая для домена)."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         _seed_group(settings, "work", "subo", THRESHOLD)
         judge = ScriptedStructureJudge(default=Verdict("merge", "work"))
@@ -334,7 +331,7 @@ class TestMergeIntoRoot:
         assert report["merged"] == ["work/subo"]
         rows = _notes_in(settings, "work")
         assert len(rows) == THRESHOLD
-        assert all(row["subdomain_hint"] is None for row in rows)
+        assert all(row["hint_path"] == "work" for row in rows)
 
 
 class TestVerdictParsing:
@@ -351,6 +348,7 @@ class TestVerdictParsing:
             ("**СЛИТЬ work/other**", "merge", "work/other"),
             ("СЛИТЬ projects/site", "merge", "projects/site"),
             ("СЛИТЬ work", "merge", "work"),
+            ("СЛИТЬ a/b/c", "merge", "a/b/c"),  # глубина-3 (lsb-0005-03)
         ],
     )
     def test_verdicts_recognized(self, content, expected_action, expected_target) -> None:
@@ -540,3 +538,133 @@ class TestCosineScaleInvariance:
         leaf = ns.get("work/subo")
         assert leaf is not None
         assert leaf["status"] == "provisional"
+
+
+class TestCandidatesDepth:
+    """Авто-промоушн по hint_path глубины 2 и 3 (lsb-0005-03)."""
+
+    def test_depth2_candidate(self, settings) -> None:
+        ns = NamespaceService(settings)
+        ns.create("work", "Рабочие заметки.")
+        _seed_group(settings, "work", "subo", THRESHOLD)
+        promoter = _promoter(settings, FixedDescriber(), ScriptedStructureJudge())
+        assert promoter.candidates() == [
+            {"domain": "work", "subdomain": "subo", "count": THRESHOLD,
+             "avg_confidence": 0.7}
+        ]
+
+    def test_depth3_candidate(self, settings) -> None:
+        """Глубина-3: hint_path 'work/proj/task', родитель depth 2 существует."""
+        ns = NamespaceService(settings)
+        ns.create("work", "Рабочие заметки.")
+        ns.create("work/proj", "СУБО проект.")
+        _seed_group(settings, "work", "proj/task", THRESHOLD)
+        promoter = _promoter(settings, FixedDescriber(), ScriptedStructureJudge())
+        assert promoter.candidates() == [
+            {"domain": "work", "subdomain": "proj/task", "count": THRESHOLD,
+             "avg_confidence": 0.7}
+        ]
+
+    def test_depth3_without_parent_not_candidate(self, settings) -> None:
+        """Глубина-3 без родителя depth 2 → не кандидат (иерархия без дыр)."""
+        ns = NamespaceService(settings)
+        ns.create("work", "Рабочие заметки.")
+        # 'work/proj' не существует — группа 'work/proj/task' ждёт создания
+        # родителя depth 2, а не кандидат.
+        _seed_group(settings, "work", "proj/task", THRESHOLD)
+        promoter = _promoter(settings, FixedDescriber(), ScriptedStructureJudge())
+        assert promoter.candidates() == []
+
+    def test_depth1_not_candidate(self, settings) -> None:
+        """Глубина-1 (домен-общая) не промоутится — остаётся в default."""
+        ns = NamespaceService(settings)
+        ns.create("work", "Рабочие заметки.")
+        with session(settings) as conn, transaction(conn):
+            for i in range(THRESHOLD):
+                conn.execute(
+                    "INSERT INTO notes (text, summary, summary_status, namespace, "
+                    "hint_path, confidence, classified_at) "
+                    "VALUES (?, ?, 'ok', 'default', 'work', 0.7, ?)",
+                    (f"общая #{i} о работе", f"суммари {i}",
+                     "2026-09-03T00:00:00Z"),
+                )
+        promoter = _promoter(settings, FixedDescriber(), ScriptedStructureJudge())
+        assert promoter.candidates() == []
+
+
+class TestDepth3Run:
+    def test_depth3_run_creates_provisional_leaf(self, settings) -> None:
+        """Вердикт СОЗДАТЬ на глубине 3: лист под существующим узлом depth 2."""
+        ns = NamespaceService(settings)
+        ns.create("work", "Рабочие заметки.")
+        ns.create("work/proj", "СУБО проект.")
+        _seed_group(settings, "work", "proj/task", THRESHOLD)
+        judge = ScriptedStructureJudge(default=Verdict("create"))
+        promoter = _promoter(
+            settings, FixedDescriber("Описания задач проекта."), judge
+        )
+        report = promoter.run()
+        assert report["created"] == ["work/proj/task"]
+        node = ns.get("work/proj/task")
+        assert node is not None and node["status"] == "provisional"
+        rows = _notes_in(settings, "work/proj/task")
+        assert len(rows) == THRESHOLD
+        assert all(r["hint_path"] == "work/proj/task" for r in rows)
+        assert all(r["vector_status"] == "pending" for r in rows)
+
+    def test_depth3_merge_canonicalizes_hint_path(self, settings) -> None:
+        """Глубина-3 слияние: hint_path = канонический полный путь (в лист)."""
+        ns = NamespaceService(settings)
+        ns.create("work", "Рабочие заметки.")
+        ns.create("work/proj", "СУБО проект.")
+        ns.create("work/proj/task", "Задачи.")
+        _seed_group(settings, "work", "proj/junk", THRESHOLD)
+        judge = ScriptedStructureJudge(default=Verdict("merge", "work/proj/task"))
+        promoter = _promoter(settings, FixedDescriber(), judge)
+        report = promoter.run()
+        assert report["merged"] == ["work/proj/junk"]
+        rows = _notes_in(settings, "work/proj/task")
+        assert len(rows) == THRESHOLD
+        assert all(r["hint_path"] == "work/proj/task" for r in rows)
+        assert _verdict_row(settings, "work/proj/junk") is not None
+
+
+class TestPromotionsMigration:
+    def test_legacy_key_migrated_to_hint_path(self, monkeypatch, tmp_path) -> None:
+        """Миграция promotions из ключа (domain, subdomain) → единый hint_path."""
+        db = tmp_path / "legacy.db"
+        monkeypatch.setenv("DB_PATH", str(db))
+        monkeypatch.setenv("EMBEDDING_DIM", "8")
+        get_settings.cache_clear()
+        settings = get_settings()
+        # Старая схема (ключ (domain, subdomain)) — ДО init_db.
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "CREATE TABLE promotions ("
+                " domain TEXT NOT NULL, subdomain TEXT NOT NULL, "
+                " status TEXT NOT NULL, canonical_path TEXT, "
+                " decided_at TEXT NOT NULL DEFAULT '', "
+                " PRIMARY KEY (domain, subdomain))"
+            )
+            conn.execute(
+                "INSERT INTO promotions (domain, subdomain, status, canonical_path) "
+                "VALUES ('work', 'subo', 'merged', 'work/other')"
+            )
+            conn.execute(
+                "INSERT INTO promotions (domain, subdomain, status) "
+                "VALUES ('work', 'junk', 'rejected')"
+            )
+        init_db(settings)
+        with session(settings) as conn:
+            rows = conn.execute(
+                "SELECT hint_path, status, canonical_path FROM promotions "
+                "ORDER BY hint_path"
+            ).fetchall()
+        assert [(r["hint_path"], r["status"], r["canonical_path"]) for r in rows] == [
+            ("work/junk", "rejected", None),
+            ("work/subo", "merged", "work/other"),
+        ]
+        # Идемпотентно: повторный init_db не дублирует и не падает.
+        init_db(settings)
+        with session(settings) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM promotions").fetchone()[0] == 2

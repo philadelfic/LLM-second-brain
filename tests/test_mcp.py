@@ -155,10 +155,10 @@ class TestHandshake:
 
 class TestToolsList:
     @pytest.mark.asyncio
-    async def test_exactly_seven_memory_tools(self, server_url: str) -> None:
+    async def test_exactly_eight_memory_tools(self, server_url: str) -> None:
         async with connect(server_url) as session:
             tools = await session.list_tools()
-        assert len(tools.tools) == 7
+        assert len(tools.tools) == 8
         assert {tool.name for tool in tools.tools} == TOOL_NAMES
 
     @pytest.mark.asyncio
@@ -822,7 +822,7 @@ class TestNamespaceMCP:
                                 "title": "В неизвестный узел",
                                 "namespace": "nope"}
             )).structured_content
-        assert saved == {"stored": False, "hint": "неймспейс «nope» не зарегистрирован; актуальная карта — memory_namespaces"}
+        assert saved == {"stored": False, "hint": "неймспейс «nope» не зарегистрирован; создай недостающие домены через memory_namespace_create с описанием из назначения; актуальная карта — memory_namespaces"}
 
     @pytest.mark.asyncio
     async def test_search_unregistered_namespace_gives_hint(
@@ -928,6 +928,270 @@ class TestNamespaceMCP:
         ]
 
 
+class TestNamespaceCreateMCP:
+    """lsb-0005-05 (FR-6/FR-8): memory_namespace_create — модель создаёт узел
+    любого уровня (1..3, включая корни) с обязательным описанием, confirmed,
+    прямое создание (судья не вызывается). Отказы (дубль / несуществующий
+    родитель / невалидный путь / пустое описание) — мягкий fail + hint.
+    Отдельный процесс от save: save узлы не создаёт."""
+
+    marker = f"nscreate-{uuid.uuid4().hex[:8]}"
+
+    @pytest.mark.asyncio
+    async def test_create_root_depth1(self, ns_url: str) -> None:
+        """Корень глубины 1 создаётся confirmed с обязательным описанием."""
+        path = f"{self.marker}"
+        async with connect(ns_url) as session:
+            res = (await session.call_tool(
+                "memory_namespace_create",
+                {"path": path, "description": "Созданный моделью корень. Домен теста."},
+            )).structured_content
+        assert res["created"] is True
+        assert res["path"] == path
+        assert res["status"] == "confirmed"
+        assert res["description"] == "Созданный моделью корень. Домен теста."
+
+    @pytest.mark.asyncio
+    async def test_create_depth2_and_depth3(self, ns_url: str) -> None:
+        """Поддомен глубины 2 и раздел глубины 3 (родители создаются первыми)."""
+        root = f"{self.marker}2"
+        async with connect(ns_url) as session:
+            root_res = (await session.call_tool(
+                "memory_namespace_create",
+                {"path": root, "description": "Корень для глубины."},
+            )).structured_content
+            assert root_res["created"] is True
+            sub = (await session.call_tool(
+                "memory_namespace_create",
+                {"path": f"{root}/sub", "description": "Поддомен глубины 2."},
+            )).structured_content
+            assert sub["created"] is True
+            assert sub["path"] == f"{root}/sub"
+            leaf = (await session.call_tool(
+                "memory_namespace_create",
+                {"path": f"{root}/sub/leaf", "description": "Раздел глубины 3."},
+            )).structured_content
+        assert leaf["created"] is True
+        assert leaf["path"] == f"{root}/sub/leaf"
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_default_nesting(self, ns_url: str) -> None:
+        """default/x — невалидный путь: мягкий отказ с hint."""
+        async with connect(ns_url) as session:
+            res = (await session.call_tool(
+                "memory_namespace_create",
+                {"path": "default/x", "description": "Вложенность под default."},
+            )).structured_content
+        assert res["created"] is False
+        assert "default" in res["hint"]
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_missing_parent(self, ns_url: str) -> None:
+        """Несуществующий родитель глубины 2 → мягкий отказ с hint."""
+        async with connect(ns_url) as session:
+            res = (await session.call_tool(
+                "memory_namespace_create",
+                {"path": f"{self.marker}-nope/sub",
+                 "description": "Лист без корня."},
+            )).structured_content
+        assert res["created"] is False
+        assert "родитель" in res["hint"]
+
+    @pytest.mark.asyncio
+    async def test_create_duplicate_fails_with_hint(self, ns_url: str) -> None:
+        """Дубль узла → мягкий отказ с hint («уже зарегистрирован»)."""
+        path = f"{self.marker}-dup"
+        async with connect(ns_url) as session:
+            first = (await session.call_tool(
+                "memory_namespace_create",
+                {"path": path, "description": "Первый раз."},
+            )).structured_content
+            assert first["created"] is True
+            second = (await session.call_tool(
+                "memory_namespace_create",
+                {"path": path, "description": "Другое описание."},
+            )).structured_content
+        assert second["created"] is False
+        assert "уже" in second["hint"]
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_empty_description(self, ns_url: str) -> None:
+        """Пустое/пробельное описание → мягкий отказ с hint (обязательность)."""
+        async with connect(ns_url) as session:
+            res = (await session.call_tool(
+                "memory_namespace_create",
+                {"path": f"{self.marker}-empty", "description": ""},
+            )).structured_content
+        assert res["created"] is False
+        assert "пуст" in res["hint"]
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_too_long_description(self, ns_url: str) -> None:
+        """lsb-0005-08: >2 предложений (контракт описаний) → мягкий отказ."""
+        async with connect(ns_url) as session:
+            res = (await session.call_tool(
+                "memory_namespace_create",
+                {"path": f"{self.marker}-long",
+                 "description": "Первое. Второе. Третье."},
+            )).structured_content
+        assert res["created"] is False
+        assert "предложени" in res["hint"]
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_depth4(self, ns_url: str) -> None:
+        """Глубина 4 (> MAX_DEPTH) → мягкий отказ с hint."""
+        async with connect(ns_url) as session:
+            res = (await session.call_tool(
+                "memory_namespace_create",
+                {"path": "a/b/c/d", "description": "Слишком глубоко."},
+            )).structured_content
+        assert res["created"] is False
+        assert "уровней" in res["hint"]
+
+class TestNamespaceCreateAntiseonymy:
+    """lsb-0005-06 (FR-6): антисинонимия при создании — косинус-предфильтр
+    описания нового узла против тематических узлов реестра. In-process MCP
+    с детерминированным HashEmbedder (живые эмбеддинги в юнитах недоступны).
+    Близкое описание (>0.90) → мягкий отказ «есть похожий: <ближайший>»
+    (1 ближайший), создание не происходит; непохожее → создание; корень
+    сверяется против корней; отказ эмбеддинга → создание (деградация)."""
+
+    marker = f"nsanti-{uuid.uuid4().hex[:8]}"
+
+    @pytest.fixture
+    def mcp_fake(self, test_env: dict[str, str]):
+        """In-process MCP над тестовой БД с детерминированным фейк-эмбеддингом."""
+        from app.config import get_settings
+        from app.services import Services
+        from app.services.namespaces import NamespaceService
+        from app.storage.db import init_db
+        from app.transport.mcp import build_mcp
+        from fakes import HashEmbedder
+
+        settings = get_settings()
+        init_db(settings)
+        services = Services(
+            notes=None,
+            search=None,
+            embedding=HashEmbedder(64),
+            dedup=None,
+            summary=None,
+            judge=None,
+            backup=None,
+            namespaces=NamespaceService(settings),
+            classifier=None,
+            promotion=None,
+        )
+        return build_mcp(settings, services)
+
+    @pytest.fixture
+    def mcp_fail(self, test_env: dict[str, str]):
+        """In-process MCP с отказавшим эмбеддингом (проверка деградации NFR-3)."""
+        from app.config import get_settings
+        from app.services import Services
+        from app.services.namespaces import NamespaceService
+        from app.storage.db import init_db
+        from app.transport.mcp import build_mcp
+        from fakes import FailingEmbedder
+
+        settings = get_settings()
+        init_db(settings)
+        services = Services(
+            notes=None,
+            search=None,
+            embedding=FailingEmbedder(),
+            dedup=None,
+            summary=None,
+            judge=None,
+            backup=None,
+            namespaces=NamespaceService(settings),
+            classifier=None,
+            promotion=None,
+        )
+        return build_mcp(settings, services)
+
+    @pytest.mark.asyncio
+    async def test_similar_description_rejected_with_hint(self, mcp_fake) -> None:
+        """Близкое описание (>0.90) → мягкий отказ: created False, hint
+        «есть похожий: <ближайший>» (1 ближайший), создание не происходит."""
+        await mcp_fake.call_tool(
+            "memory_namespace_create",
+            {"path": "work",
+             "description": "Рабочие заметки. Подпроекты в листьях."},
+        )
+        res = (await mcp_fake.call_tool(
+            "memory_namespace_create",
+            {"path": "work2",
+             "description": "Рабочие заметки. Подпроекты в листьях."},
+        )).structured_content
+        assert res == {"created": False, "hint": "есть похожий: work"}
+
+    @pytest.mark.asyncio
+    async def test_unrelated_description_creates(self, mcp_fake) -> None:
+        """Непохожее описание → узел создаётся."""
+        await mcp_fake.call_tool(
+            "memory_namespace_create",
+            {"path": "work",
+             "description": "Рабочие заметки. Подпроекты."},
+        )
+        res = (await mcp_fake.call_tool(
+            "memory_namespace_create",
+            {"path": "finance",
+             "description": "Личные финансы и бюджетирование."},
+        )).structured_content
+        assert res["created"] is True
+        assert res["path"] == "finance"
+
+    @pytest.mark.asyncio
+    async def test_root_checked_against_roots_only(self, mcp_fake) -> None:
+        """Корень сверяется против корней: похожий ЛИСТ корень не блокирует."""
+        await mcp_fake.call_tool(
+            "memory_namespace_create",
+            {"path": "work",
+             "description": "Рабочие заметки. Подпроекты."},
+        )
+        await mcp_fake.call_tool(
+            "memory_namespace_create",
+            {"path": "work/sub",
+             "description": "Подпроекты финансового планирования."},
+        )
+        # Новый корень с описанием, идентичным листу work/sub: корень
+        # сверяется только против корней (work), лист не учитывается → создаётся.
+        res = (await mcp_fake.call_tool(
+            "memory_namespace_create",
+            {"path": "finance",
+             "description": "Подпроекты финансового планирования."},
+        )).structured_content
+        assert res["created"] is True
+        assert res["path"] == "finance"
+
+    @pytest.mark.asyncio
+    async def test_leaf_compared_against_all_thematic(self, mcp_fake) -> None:
+        """Лист сверяется против всех тематических узлов: близкий корень → отказ."""
+        await mcp_fake.call_tool(
+            "memory_namespace_create",
+            {"path": "work",
+             "description": "Сервисы HR и зарплаты."},
+        )
+        res = (await mcp_fake.call_tool(
+            "memory_namespace_create",
+            {"path": "work/payroll",
+             "description": "Сервисы HR и зарплаты."},
+        )).structured_content
+        assert res["created"] is False
+        assert res["hint"] == "есть похожий: work"
+
+    @pytest.mark.asyncio
+    async def test_embedding_failure_still_creates(self, mcp_fail) -> None:
+        """Отказ эмбеддинга → предфильтр пропущен: создание происходит (NFR-3)."""
+        res = (await mcp_fail.call_tool(
+            "memory_namespace_create",
+            {"path": "work", "description": "Рабочие заметки."},
+        )).structured_content
+        assert res["created"] is True
+        assert res["path"] == "work"
+
+
 def _seed_default_group(
     db_path: str, domain: str, slug: str, count: int
 ) -> None:
@@ -936,9 +1200,9 @@ def _seed_default_group(
         for i in range(count):
             conn.execute(
                 "INSERT INTO notes (text, summary, summary_status, namespace, "
-                "domain_hint, subdomain_hint, confidence, classified_at) "
-                "VALUES (?, ?, 'ok', 'default', ?, ?, 0.7, ?)",
-                (f"mcp seed {i} про {slug}", f"суммари {i}", domain, slug,
+                "hint_path, confidence, classified_at) "
+                "VALUES (?, ?, 'ok', 'default', ?, 0.7, ?)",
+                (f"mcp seed {i} про {slug}", f"суммари {i}", f"{domain}/{slug}",
                  "2026-09-03T00:00:00Z"),
             )
 
@@ -1024,6 +1288,29 @@ class TestFailLogging:
         fail = _tool_fail_records(caplog, "memory_list")
         assert fail
         assert "nope" in fail[-1].reason
+        assert fail[-1].latency_ms >= 0
+
+    @pytest.mark.asyncio
+    async def test_namespace_create_fail_logged(self, mcp_inproc, caplog) -> None:
+        """memory_namespace_create: дубль узла и пустое описание — fail-лог,
+        ответ {created: False, hint}, узел не создан дважды."""
+        with caplog.at_level(logging.INFO, logger="app"):
+            first = await mcp_inproc.call_tool(
+                "memory_namespace_create",
+                {"path": "failns", "description": "Создан для проверки."},
+            )
+            duplicate = await mcp_inproc.call_tool(
+                "memory_namespace_create",
+                {"path": "failns", "description": "Дубль."},
+            )
+        assert first.structured_content["created"] is True
+        assert first.structured_content["path"] == "failns"
+        assert duplicate.structured_content == {
+            "created": False, "hint": "узел «failns» уже зарегистрирован",
+        }
+        fail = _tool_fail_records(caplog, "memory_namespace_create")
+        assert fail
+        assert "уже зарегистрирован" in fail[-1].reason
         assert fail[-1].latency_ms >= 0
 
 

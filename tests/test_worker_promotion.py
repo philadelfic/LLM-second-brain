@@ -77,7 +77,7 @@ class TestWorkerPromotion:
         _save_defaults(settings, THRESHOLD, "заметка про СУБО")
         # confidence 0.7 ≥ NAMESPACE_PROMOTION_MIN_CONFIDENCE (0.60):
         # ниже порога триггер группу не видит.
-        classifier = FixedClassifier(Classification("work", "subo", 0.7))
+        classifier = FixedClassifier(Classification("work/subo", 0.7))
         worker = _worker(settings, classifier, "real")
         assert worker.process_summary_pending() == THRESHOLD
         with session(settings) as conn:
@@ -94,7 +94,7 @@ class TestWorkerPromotion:
         """Сбой триггера не роняет воркер: суммаризация уже выполнена."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         _save_defaults(settings, 3, "обычная заметка")
-        classifier = FixedClassifier(Classification("work", None, 0.9))
+        classifier = FixedClassifier(Classification("work", 0.9))
         worker = _worker(settings, classifier, ExplodingPromoter())
         assert worker.process_summary_pending() == 3  # суммаризация прошла
         with session(settings) as conn:
@@ -107,7 +107,7 @@ class TestWorkerPromotion:
         """promoter=None (тестовый режим): классификация работает, узлов нет."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         _save_defaults(settings, 2, "заметка без триггера")
-        classifier = FixedClassifier(Classification("work", "subo", 0.5))
+        classifier = FixedClassifier(Classification("work/subo", 0.5))
         worker = _worker(settings, classifier, None)
         assert worker.process_summary_pending() == 2
         with session(settings) as conn:

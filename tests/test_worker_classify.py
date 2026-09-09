@@ -40,7 +40,7 @@ def _save_default(settings, text: str) -> int:
 def _row(settings, note_id: int):
     with session(settings) as conn:
         return conn.execute(
-            "SELECT namespace, domain_hint, subdomain_hint, confidence, "
+            "SELECT namespace, hint_path, confidence, "
             "classified_at, vector_status, summary_status FROM notes "
             "WHERE id = ?",
             (note_id,),
@@ -59,7 +59,7 @@ class MidMoveClassifier(FixedClassifier):
     перебить операторский переезд (guard `namespace='default'` в WHERE)."""
 
     def __init__(self, notes: NoteService, note_id: int) -> None:
-        super().__init__(Classification("work", None, 0.95))
+        super().__init__(Classification("work", 0.95))
         self._notes = notes
         self._note_id = note_id
 
@@ -73,24 +73,23 @@ class TestClassifyDefault:
         """Высокий confidence + зарегистрированный домен → переезд в корень."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         nid = _save_default(settings, "заметка про рабочие процессы")
-        classifier = FixedClassifier(Classification("work", None, 0.95))
+        classifier = FixedClassifier(Classification("work", 0.95))
         worker = _worker(settings, classifier)
         assert worker.process_summary_pending() == 1
         row = _row(settings, nid)
         assert row["namespace"] == "work"
-        assert row["domain_hint"] == "work"
-        assert row["subdomain_hint"] is None
+        assert row["hint_path"] == "work"
         assert row["confidence"] == 0.95
         assert row["classified_at"] is not None
         assert row["vector_status"] == "pending"  # пере-кодировка в новую партицию
         assert len(classifier.calls) == 1
 
     def test_auto_move_into_existing_leaf(self, settings) -> None:
-        """subdomain_hint совпал с зарегистрированным листом → в лист."""
+        """hint_path совпал с зарегистрированным листом → в лист."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         NamespaceService(settings).create("work/sbos2020", "СУБО 2020: сервисы HR.")
         nid = _save_default(settings, "СУБО 2020: реестр зарплат")
-        classifier = FixedClassifier(Classification("work", "sbos2020", 0.9))
+        classifier = FixedClassifier(Classification("work/sbos2020", 0.9))
         worker = _worker(settings, classifier)
         worker.process_summary_pending()
         assert _row(settings, nid)["namespace"] == "work/sbos2020"
@@ -99,35 +98,35 @@ class TestClassifyDefault:
         """confidence < NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE (0.80) → без переезда."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         nid = _save_default(settings, "неуверенная заметка")
-        classifier = FixedClassifier(Classification("work", None, 0.5))
+        classifier = FixedClassifier(Classification("work", 0.5))
         worker = _worker(settings, classifier)
         worker.process_summary_pending()
         row = _row(settings, nid)
         assert row["namespace"] == "default"
-        assert row["domain_hint"] == "work"  # разметка сохранена
+        assert row["hint_path"] == "work"  # разметка сохранена
         assert row["classified_at"] is not None
 
     def test_new_subdomain_stays_in_default(self, settings) -> None:
         """Новый лист (не зарегистрирован) → остаётся в default (триггер Шага 5)."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         nid = _save_default(settings, "специфичная тема без узла")
-        classifier = FixedClassifier(Classification("work", "newleaf", 0.9))
+        classifier = FixedClassifier(Classification("work/newleaf", 0.9))
         worker = _worker(settings, classifier)
         worker.process_summary_pending()
         row = _row(settings, nid)
         assert row["namespace"] == "default"
-        assert row["subdomain_hint"] == "newleaf"
+        assert row["hint_path"] == "work/newleaf"
         assert row["classified_at"] is not None
 
     def test_general_note_stays_in_default(self, settings) -> None:
         """Общая заметка (null-хинты) → остаётся в default, честно-общая."""
         nid = _save_default(settings, "общий конспект без домена")
-        classifier = FixedClassifier(Classification(None, None, 0.1))
+        classifier = FixedClassifier(Classification(None, 0.1))
         worker = _worker(settings, classifier)
         worker.process_summary_pending()
         row = _row(settings, nid)
         assert row["namespace"] == "default"
-        assert row["domain_hint"] is None and row["subdomain_hint"] is None
+        assert row["hint_path"] is None
         assert row["classified_at"] is not None
 
     def test_non_default_note_not_classified(self, settings) -> None:
@@ -135,7 +134,7 @@ class TestClassifyDefault:
         NamespaceService(settings).create("work", "Рабочие заметки.")
         notes = NoteService(settings, FailingEmbedder())
         nid = notes.save("уже в work", namespace="work")["id"]
-        classifier = FixedClassifier(Classification("work", None, 0.9))
+        classifier = FixedClassifier(Classification("work", 0.9))
         worker = _worker(settings, classifier)
         worker.process_summary_pending()
         assert classifier.calls == []  # классификатор не звали
@@ -152,7 +151,7 @@ class TestClassifyDefault:
         row = _row(settings, nid)
         assert row["namespace"] == "default"
         assert row["classified_at"] is None
-        assert row["domain_hint"] is None
+        assert row["hint_path"] is None
 
     def test_classifier_failure_does_not_break_batch(self, settings) -> None:
         """Отказ классификатора (ClassificationError) не ломает партию: суммари
@@ -173,7 +172,7 @@ class TestClassifyDefault:
         """classified_at — анти-зацикливание: повторный прогон не трогает."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         nid = _save_default(settings, "заметка для повторного прогона")
-        classifier = FixedClassifier(Classification("work", None, 0.9))
+        classifier = FixedClassifier(Classification("work", 0.9))
         worker = _worker(settings, classifier)
         worker.process_summary_pending()
         assert len(classifier.calls) == 1
@@ -214,13 +213,13 @@ class TestGroomingAtomicityP6:
         ни classified_at — целевой узел считается ДО транзакции («отказ
         классификации = не размечено», Уточнения пула 2/6)."""
         nid = _save_default(settings, "заметка с мусорной разметкой классификатора")
-        classifier = FixedClassifier(Classification("Работа", None, 0.9))
+        classifier = FixedClassifier(Classification("Работа", 0.9))
         worker = _worker(settings, classifier)
         worker.process_summary_pending()
         row = _row(settings, nid)
         assert row["namespace"] == "default"
         assert row["classified_at"] is None
-        assert row["domain_hint"] is None and row["subdomain_hint"] is None
+        assert row["hint_path"] is None
         assert row["confidence"] is None
 
     def test_classified_moved_logged_once_on_real_move(self, settings, caplog) -> None:
@@ -228,7 +227,7 @@ class TestGroomingAtomicityP6:
         разметка и namespace/vector_status пишутся одним UPDATE."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         nid = _save_default(settings, "заметка для проверки лога переезда")
-        classifier = FixedClassifier(Classification("work", None, 0.95))
+        classifier = FixedClassifier(Classification("work", 0.95))
         worker = _worker(settings, classifier)
         with caplog.at_level(logging.INFO, logger="app"):
             assert worker.process_summary_pending() == 1
@@ -255,7 +254,7 @@ class TestRepeatAfterUpdate:
         summary/vector (вся цепочка перезапускается)."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         nid = _save_default(settings, "заметка про рабочие процессы")
-        worker = _worker(settings, FixedClassifier(Classification("work", None, 0.5)))
+        worker = _worker(settings, FixedClassifier(Classification("work", 0.5)))
         worker.process_summary_pending()
         assert _row(settings, nid)["classified_at"] is not None  # была разметка
 
@@ -263,7 +262,7 @@ class TestRepeatAfterUpdate:
         notes.update(nid, "обновлённый текст заметки")
         row = _row(settings, nid)
         assert row["classified_at"] is None
-        assert row["domain_hint"] is None and row["subdomain_hint"] is None
+        assert row["hint_path"] is None
         assert row["confidence"] is None
         assert row["vector_status"] == "pending"   # ре-векторизация (Фаза 8)
         assert row["summary_status"] == "pending"  # пересуммаризация (режим «Б»)
@@ -274,7 +273,7 @@ class TestRepeatAfterUpdate:
         (без нового update повторного прохода нет)."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         nid = _save_default(settings, "общая заметка без домена")
-        first = FixedClassifier(Classification(None, None, 0.1))
+        first = FixedClassifier(Classification(None, 0.1))
         worker = _worker(settings, first)
         worker.process_summary_pending()
         row = _row(settings, nid)
@@ -284,7 +283,7 @@ class TestRepeatAfterUpdate:
         NoteService(settings, FailingEmbedder()).update(
             nid, "заметка теперь про рабочие процессы"
         )
-        second = FixedClassifier(Classification("work", None, 0.95))
+        second = FixedClassifier(Classification("work", 0.95))
         worker2 = _worker(settings, second)
         assert worker2.process_summary_pending() == 1  # пересуммаризация
         assert len(second.calls) == 1                  # повторная классификация

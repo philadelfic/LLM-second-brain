@@ -294,7 +294,7 @@ class FixedClassifier:
             raise ClassificationError("классификатор недоступен")
         self.last_attempt_ok = True
         if self.result is None:
-            return Classification(None, None, 0.0)
+            return Classification(None, 0.0)
         return self.result
 
     def close(self) -> None:  # интерфейс-совместимость с ClassificationService

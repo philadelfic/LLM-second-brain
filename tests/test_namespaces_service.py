@@ -46,9 +46,22 @@ class TestSlug:
         assert service.validate_path("Work / SBOS 2020") == "work/sbos-2020"
         assert service.validate_path("default") == "default"
 
-    def test_validate_path_rejects_depth3(self, service: NamespaceService) -> None:
+    def test_validate_path_accepts_depth3(self, service: NamespaceService) -> None:
+        assert service.validate_path("a/b/c") == "a/b/c"
+
+    def test_validate_path_rejects_depth4(self, service: NamespaceService) -> None:
         with pytest.raises(NamespaceValidationError):
-            service.validate_path("a/b/c")
+            service.validate_path("a/b/c/d")
+
+    def test_validate_path_rejects_default_nesting(
+        self, service: NamespaceService
+    ) -> None:
+        """default — системный узел, без вложенности."""
+        assert service.validate_path("default") == "default"
+        with pytest.raises(NamespaceValidationError):
+            service.validate_path("default/x")
+        with pytest.raises(NamespaceValidationError):
+            service.validate_path("default/a/b")
 
     def test_validate_path_rejects_cyrillic(self, service: NamespaceService) -> None:
         with pytest.raises(NamespaceValidationError):
@@ -85,6 +98,16 @@ class TestDescriptionContract:
         with pytest.raises(NamespaceValidationError):
             service.validate_description("   ")
 
+    def test_punctuation_only_is_invalid(self, service: NamespaceService) -> None:
+        """lsb-0005-08: «...»/«?!» — мусор без реальных предложений → отказ."""
+        for garbage in ("...", "???", ".,..", "!!!", "?.!"):
+            with pytest.raises(NamespaceValidationError):
+                service.validate_description(garbage)
+
+    def test_single_clause_without_period_is_valid(self, service: NamespaceService) -> None:
+        """lsb-0005-08: осмысленное 1-предложение без точки — валидно."""
+        assert service.validate_description("СУБО 2020") == "СУБО 2020"
+
 
 class TestCreate:
     def test_create_returns_node(self, service: NamespaceService) -> None:
@@ -116,9 +139,55 @@ class TestCreate:
         with pytest.raises(NamespaceValidationError):
             service.create("work", "Раз. Два. Три.")
 
+    def test_provisional_create_uses_same_description_contract(
+        self, service: NamespaceService
+    ) -> None:
+        """lsb-0005-08: авто-путь судьи (create provisional) проходит ТУ ЖЕ
+        валидацию контракта описаний, что и путь модели (create confirmed)."""
+        service.create("work", "Рабочие заметки.")
+        with pytest.raises(NamespaceValidationError):
+            service.create("work/bad1", "", status="provisional")
+        with pytest.raises(NamespaceValidationError):
+            service.create("work/bad2", "Раз. Два. Три.", status="provisional")
+        with pytest.raises(NamespaceValidationError):
+            service.create("work/bad3", "...", status="provisional")
+        node = service.create("work/ok", "Лист СУБО 2020.", status="provisional")
+        assert node["status"] == "provisional"
+
+    def test_confirmed_create_rejects_punctuation_only(
+        self, service: NamespaceService
+    ) -> None:
+        """lsb-0005-08: мусорное описание отклоняется и в пути модели (confirmed)."""
+        with pytest.raises(NamespaceValidationError):
+            service.create("work", "....")
+
     def test_invalid_status_is_rejected(self, service: NamespaceService) -> None:
         with pytest.raises(NamespaceValidationError):
             service.create("work", "Рабочие заметки.", status="draft")
+
+    def test_depth3_requires_full_parent_chain(self, service: NamespaceService) -> None:
+        """Создание глубины 3 без существующего родителя depth 2 — NamespaceError."""
+        service.create("domain", "Домен.")
+        with pytest.raises(NamespaceError):
+            service.create("domain/a/b", "Лист без родителя depth 2.")
+        service.create("domain/a", "Поддомен.")
+        node = service.create("domain/a/b", "Глубина 3.")
+        assert node["path"] == "domain/a/b"
+        assert service.exists("domain/a/b") is True
+
+    def test_default_nesting_create_is_rejected(
+        self, service: NamespaceService
+    ) -> None:
+        """default/x — NamespaceValidationError на этапе валидации пути."""
+        with pytest.raises(NamespaceValidationError):
+            service.create("default/x", "Вложенность под default.")
+
+    def test_long_depth3_path_within_max_len(self, service: NamespaceService) -> None:
+        """\u0414\u043b\u0438\u043d\u043d\u044b\u0439 3-\u0443\u0440\u043e\u0432\u043d\u0435\u0432\u044b\u0439 \u043f\u0443\u0442\u044c \u0432 \u043f\u0440\u0435\u0434\u0435\u043b\u0430\u0445 MAX_PATH_LEN."""
+        seg = "a" * 60  # \u0441\u043b\u0430\u0433 60 \u0441\u0438\u043c\u0432\u043e\u043b\u043e\u0432, \u0432\u043c\u0435\u0441\u0442\u0435 \u0441 2 \u0441\u043b\u0435\u0448\u0430\u043c\u0438 = 182 < 200
+        path = f"{seg}/{seg}/{seg}"
+        assert service.validate_path(path) == path
+        assert len(path) <= 200
 
 
 class TestListAndCounters:

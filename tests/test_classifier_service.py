@@ -84,27 +84,27 @@ NOTE = "СУБО 2020: реестр зарплат на сервере appsrv pa
 
 def test_classify_returns_classification(monkeypatch) -> None:
     settings = make_settings(monkeypatch)
-    body = ok_body('{"domain_hint": "work", "subdomain_hint": "sbos2020", "confidence": 0.9}')
+    body = ok_body('{"hint_path": "work/sbos-2020", "confidence": 0.9}')
     service, _ = make_service(settings, [httpx.Response(200, json=body)])
     result = service.classify(NOTE, KNOWN)
-    assert result == Classification("work", "sbos2020", 0.9)
+    assert result == Classification("work/sbos-2020", 0.9)
     assert service.last_attempt_ok is True
     service.close()
 
 
 def test_general_note_returns_null_hints(monkeypatch) -> None:
     settings = make_settings(monkeypatch)
-    body = ok_body('{"domain_hint": null, "subdomain_hint": null, "confidence": 0.2}')
+    body = ok_body('{"hint_path": null, "confidence": 0.2}')
     service, _ = make_service(settings, [httpx.Response(200, json=body)])
     result = service.classify(NOTE, KNOWN)
-    assert result == Classification(None, None, 0.2)
+    assert result == Classification(None, 0.2)
     service.close()
 
 
 def test_known_nodes_in_user_message(monkeypatch) -> None:
     """Известные узлы (path: description) попадают в user-сообщение (§5.7)."""
     settings = make_settings(monkeypatch)
-    body = ok_body('{"domain_hint": "work", "subdomain_hint": null, "confidence": 0.8}')
+    body = ok_body('{"hint_path": "work", "confidence": 0.8}')
     service, recorder = make_service(settings, [httpx.Response(200, json=body)])
     service.classify(NOTE, KNOWN)
     payload = last_payload(recorder)
@@ -118,7 +118,7 @@ def test_known_nodes_in_user_message(monkeypatch) -> None:
 def test_payload_small_num_predict_and_think_false(monkeypatch) -> None:
     """Маленький бюджет JSON-разметки и think:false (без рассуждений)."""
     settings = make_settings(monkeypatch)
-    body = ok_body('{"domain_hint": null, "subdomain_hint": null, "confidence": 0.0}')
+    body = ok_body('{"hint_path": null, "confidence": 0.0}')
     service, recorder = make_service(settings, [httpx.Response(200, json=body)])
     service.classify(NOTE, KNOWN)
     payload = last_payload(recorder)
@@ -132,33 +132,34 @@ def test_payload_small_num_predict_and_think_false(monkeypatch) -> None:
     service.close()
 
 
-def test_subdomain_slug_normalized(monkeypatch) -> None:
-    """Слаг листа нормализуется (кириллица/пробелы → дефис, нижний регистр)."""
+def test_hint_path_normalized(monkeypatch) -> None:
+    """Полный путь нормализуется по слагам (кириллица/пробелы → дефис,
+    нижний регистр) — как validates пути узлов реестра."""
     settings = make_settings(monkeypatch)
-    body = ok_body('{"domain_hint": "work", "subdomain_hint": "SBOS 2020", "confidence": 0.9}')
+    body = ok_body('{"hint_path": "work/SBOS 2020", "confidence": 0.9}')
     service, _ = make_service(settings, [httpx.Response(200, json=body)])
     result = service.classify(NOTE, KNOWN)
-    assert result.subdomain_hint == "sbos-2020"
+    assert result.hint_path == "work/sbos-2020"
     service.close()
 
 
-def test_domain_slug_normalized(monkeypatch) -> None:
-    """Слаг корня нормализуется (регистр/дефисы), как у узлов реестра."""
+def test_single_segment_hint_normalized(monkeypatch) -> None:
+    """Глубина-1 hint (домен) нормализуется (регистр/дефисы)."""
     settings = make_settings(monkeypatch)
-    body = ok_body('{"domain_hint": "Work", "subdomain_hint": null, "confidence": 0.9}')
+    body = ok_body('{"hint_path": "Work", "confidence": 0.9}')
     service, _ = make_service(settings, [httpx.Response(200, json=body)])
     result = service.classify(NOTE, KNOWN)
-    assert result.domain_hint == "work"
+    assert result.hint_path == "work"
     service.close()
 
 
 def test_code_fence_stripped(monkeypatch) -> None:
     """Модель может обернуть JSON в код-фенс — вынимаем объект."""
     settings = make_settings(monkeypatch)
-    content = '```json\n{"domain_hint": "work", "subdomain_hint": null, "confidence": 0.7}\n```'
+    content = '```json\n{"hint_path": "work", "confidence": 0.7}\n```'
     service, _ = make_service(settings, [httpx.Response(200, json=ok_body(content))])
     result = service.classify(NOTE, KNOWN)
-    assert result.domain_hint == "work"
+    assert result.hint_path == "work"
     service.close()
 
 
@@ -168,11 +169,11 @@ def test_thinking_response_wrapper_stripped(monkeypatch) -> None:
     content = (
         ' thinking\nThe user asks: "You are a tag classifier..." '
         '"confidence": 0.0}. Ensure no extra text.\n response\n'
-        '{"domain_hint": "work", "subdomain_hint": null, "confidence": 0.7}'
+        '{"hint_path": "work", "confidence": 0.7}'
     )
     service, _ = make_service(settings, [httpx.Response(200, json=ok_body(content))])
     result = service.classify(NOTE, KNOWN)
-    assert result == Classification("work", None, 0.7)
+    assert result == Classification("work", 0.7)
     service.close()
 
 
@@ -180,7 +181,7 @@ def test_thinking_response_wrapper_stripped(monkeypatch) -> None:
 
 def test_invalid_confidence_raises(monkeypatch) -> None:
     settings = make_settings(monkeypatch)
-    body = ok_body('{"domain_hint": "work", "subdomain_hint": null, "confidence": 1.5}')
+    body = ok_body('{"hint_path": "work", "confidence": 1.5}')
     service, _ = make_service(settings, [httpx.Response(200, json=body)])
     with pytest.raises(ClassificationError):
         service.classify(NOTE, KNOWN)
@@ -188,9 +189,10 @@ def test_invalid_confidence_raises(monkeypatch) -> None:
     service.close()
 
 
-def test_invalid_subdomain_slug_raises(monkeypatch) -> None:
+def test_invalid_path_slug_raises(monkeypatch) -> None:
+    """Не-слаг сегмента hint_path — некорректная разметка → ClassificationError."""
     settings = make_settings(monkeypatch)
-    body = ok_body('{"domain_hint": "work", "subdomain_hint": "не слаг", "confidence": 0.9}')
+    body = ok_body('{"hint_path": "work/не слаг", "confidence": 0.9}')
     service, _ = make_service(settings, [httpx.Response(200, json=body)])
     with pytest.raises(ClassificationError):
         service.classify(NOTE, KNOWN)
@@ -202,7 +204,30 @@ def test_invalid_domain_slug_raises(monkeypatch) -> None:
     last_attempt_ok=False (пул 2: иначе NamespaceValidationError убивал
     summary-петлю через _auto_move_target)."""
     settings = make_settings(monkeypatch)
-    body = ok_body('{"domain_hint": "Работа", "subdomain_hint": null, "confidence": 0.9}')
+    body = ok_body('{"hint_path": "Работа", "confidence": 0.9}')
+    service, _ = make_service(settings, [httpx.Response(200, json=body)])
+    with pytest.raises(ClassificationError):
+        service.classify(NOTE, KNOWN)
+    assert service.last_attempt_ok is False
+    service.close()
+
+
+def test_default_path_rejected(monkeypatch) -> None:
+    """Вложенность под default запрещена: hint_path 'default/...' →
+    ClassificationError (default — системный узел)."""
+    settings = make_settings(monkeypatch)
+    body = ok_body('{"hint_path": "default/work", "confidence": 0.9}')
+    service, _ = make_service(settings, [httpx.Response(200, json=body)])
+    with pytest.raises(ClassificationError):
+        service.classify(NOTE, KNOWN)
+    assert service.last_attempt_ok is False
+    service.close()
+
+
+def test_too_deep_path_rejected(monkeypatch) -> None:
+    """Лишний уровень: hint_path из 4 сегментов → ClassificationError."""
+    settings = make_settings(monkeypatch)
+    body = ok_body('{"hint_path": "a/b/c/d", "confidence": 0.9}')
     service, _ = make_service(settings, [httpx.Response(200, json=body)])
     with pytest.raises(ClassificationError):
         service.classify(NOTE, KNOWN)
@@ -237,6 +262,6 @@ def test_http_error_raises(monkeypatch) -> None:
 
 def test_last_attempt_ok_none_before_attempts(monkeypatch) -> None:
     settings = make_settings(monkeypatch)
-    service, _ = make_service(settings, [httpx.Response(200, json=ok_body('{"domain_hint": null, "subdomain_hint": null, "confidence": 0.0}'))])
+    service, _ = make_service(settings, [httpx.Response(200, json=ok_body('{"hint_path": null, "confidence": 0.0}'))])
     assert service.last_attempt_ok is None
     service.close()

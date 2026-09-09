@@ -35,10 +35,26 @@ title ≤5 слов») и memory_update (опционален — передан
 не передан → прежний). `title` добавлен в белые списки выдач search/list;
 в get названия НЕТ (экономия контекста — там полный текст). SearchService
 отдаёт title в выдаче поиска (follow-up пула 5b, Фаза 11).
-"""
+
+lsb-0005-05 (FR-6/FR-8): 8-й инструмент `memory_namespace_create` — модель
+создаёт узел ЛЮБОГО уровня (включая корни 1..3) с обязательным описанием.
+Отдельный процесс от save: save только кладёт заметки в существующий узел,
+создание узлов — через эту ручку (confirmed, прямое создание). Судья не
+вызывается. Отказы (узел уже есть / несуществующий родитель / невалидный
+путь, в т.ч. default/... / пустое описание) — fail + hint.
+
+lsb-0005-06 (FR-6): антисинонимия при создании — перед созданием косинус
+описания нового узла против описаний тематических узлов реестра (default
+исключён); `> NAMESPACE_CREATE_SYNONYM_SIMILARITY` (0.90) → мягкий отказ
+с хинтом «есть похожий: <ближайший>» (1 ближайший), создание не происходит.
+Для корня (depth 1) сравнение — против корней; для листа — против всех
+тематических узлов (тот же предфильтр, что `_nearest_node` промоушна, но
+порог 0.90 и без записи вердикта). Отказ эмбеддинга предфильтр пропускает
+(деградация: создание происходит)."""
 
 import asyncio
 import logging
+import math
 import time
 from typing import Annotated, Any
 
@@ -56,6 +72,7 @@ from app.services.notes import (
     NoteValidationError,
     TitleValidationError,
 )
+from app.storage.db import DEFAULT_NAMESPACE
 
 SERVER_NAME = "LLM Second Brain"
 
@@ -86,8 +103,10 @@ _NS_RULES = (
     "ищи глобально и сужай по результатам (промах ничего не теряет). save "
     "кладёт заметку в `namespace` (только существующий узел; не указан — "
     "`default`); создание/переименование узлов — не через save, структуру "
-    "рулит оператор. Актуальный реестр по запросу — `memory_namespaces`. "
-    "Карта узлов (path: description):\n"
+    "рулит оператор. Создание узлов — отдельная ручка `memory_namespace_create` "
+    "(любой уровень 1..3 с обязательным описанием, узел создаётся confirmed; "
+    "save/update узлы НЕ создают). Актуальный реестр по запросу — "
+    "`memory_namespaces`. Карта узлов (path: description):\n"
 )
 
 
@@ -182,6 +201,21 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "на авто-создание узла из копящихся default-заметок. Используй для "
         "ориентирования перед save/search, когда карта в инструкциях могла "
         "устареть."
+    ),
+    "memory_namespace_create": (
+        "Создаёт НОВЫЙ узел неймспейса любого уровня (1..3), включая корни — "
+        "это отдельная ручка от memory_save (save только кладёт заметки в "
+        "существующий узел и узлы НЕ создаёт). `path` — слэш-путь (например "
+        "`work` или `work/sbos2020`); для глубины 2/3 родитель обязан "
+        "существовать (создай его первым). `description` — ОБЯЗАТЕЛЬНОЕ "
+        "краткое описание (не более 2 предложений): узел без описания "
+        "создать нельзя. Узел создаётся confirmed. Создавай узел, когда "
+        "копится весомая группа заметок на одну тему (см. promotion_candidates "
+        "в memory_namespaces) и его ещё нет в карте. Перед созданием "
+        "описание сверяется на синонимию с существующими узлами (косинус "
+        "порог 0.90): слишком похожее описание откажет с хинтом «есть "
+        "похожий: <путь>» — выбери другое описание/узел. Дубль узла тоже "
+        "откажется с подсказкой."
     ),
 }
 
@@ -310,6 +344,81 @@ def _compact_namespaces(result: dict[str, Any], candidates: list[dict[str, Any]]
         ],
     }
     return out
+
+
+# lsb-0005-06 (FR-6): антисинонимия при создании — порог косинуса описаний
+# нового узла и существующих (с учётом склонений/окончаний, решение О.
+# 2026-09-09); > порога → мягкий отказ с хинтом «есть похожий: <ближайший>».
+# Отличается от промоушна (namespace_synonym_similarity 0.85, merge): создание
+# мягко отклоняется, вердикт не записывается, судья не вызывается.
+NAMESPACE_CREATE_SYNONYM_SIMILARITY = 0.90
+
+
+def _ns_l2_norm(vec: list[float]) -> float:
+    """Евклидова норма вектора (L2) — как `_l2_norm` промоушна."""
+    return math.sqrt(sum(v * v for v in vec))
+
+
+def _antiseonymy_nearest(
+    services: Services, path: str, description: str
+) -> tuple[str | None, float | None]:
+    """Ближайший тематический узел по описанию (косинус-предфильтр создания).
+
+    Тот же подход, что `_nearest_node` промоушна: описание кандидата +
+    описания узлов одним батчем embed_texts, L2-нормализация, dot product =
+    cosine (нечувствителен к масштабу провайдера). default исключён: слияние/
+    сходство со свопом бессмысленно. Для корня (depth 1) сравнение — только
+    против корней (depth 1); для листа (depth ≥ 2) — против всех тематических
+    узлов. Возврат (path, cosine) ближайшего или (None, None): реестр пуст /
+    норма кандидата 0 / отказ эмбеддинга (деградация — предфильтр пропущен,
+    создание происходит).
+    """
+    nodes = [
+        node
+        for node in services.namespaces.list_all()["namespaces"]
+        if node["path"] != DEFAULT_NAMESPACE
+    ]
+    if len(path.split("/")) == 1:  # корень — против корней
+        nodes = [node for node in nodes if "/" not in node["path"]]
+    if not nodes:
+        return None, None
+    try:
+        vectors = services.embedding.embed_texts(
+            [description] + [node["description"] for node in nodes]
+        )
+    except Exception:
+        logging.getLogger("app").warning(
+            "ns_create: embedding failed — antiseonymy prefilter skipped",
+            extra={"event": "ns_create_prefilter_skipped"},
+        )
+        return None, None
+    candidate_vec, node_vecs = vectors[0], vectors[1:]
+    candidate_norm = _ns_l2_norm(candidate_vec)
+    if candidate_norm == 0.0:
+        return None, None
+    candidate_normed = [v / candidate_norm for v in candidate_vec]
+    best_index = 0
+    best_cosine = -1.0
+    for i, node_vec in enumerate(node_vecs):
+        node_norm = _ns_l2_norm(node_vec)
+        if node_norm == 0.0:
+            continue
+        node_normed = [v / node_norm for v in node_vec]
+        cos = sum(a * b for a, b in zip(candidate_normed, node_normed))
+        if cos > best_cosine:
+            best_cosine, best_index = cos, i
+    if best_cosine == -1.0:
+        return None, None
+    return nodes[best_index]["path"], best_cosine
+
+
+# lsb-0005-05: компактная проекция созданного узла (confirmed) + hint при отказе.
+# Белый список минимален: path/description/status — то, что нужно модели.
+_NS_CREATE = ("path", "description", "status")
+
+
+def _compact_namespace_create(result: dict[str, Any]) -> dict[str, Any]:
+    return {"created": True, **_pick(result, _NS_CREATE)}
 
 
 def build_mcp(settings: Settings, services: Services) -> MCPServer:
@@ -742,5 +851,72 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             candidates=len(candidates),
         )
         return _compact_namespaces(result, candidates)
+
+    @mcp.tool(
+        name="memory_namespace_create",
+        description=TOOL_DESCRIPTIONS["memory_namespace_create"],
+    )
+    async def memory_namespace_create(
+        path: Annotated[
+            str,
+            Field(
+                description="Слэш-путь узла (1..3 сегмента), например work или work/sbos2020",
+                max_length=200,
+            ),
+        ],
+        description: Annotated[
+            str,
+            Field(
+                description="Обязательное краткое описание узла (не более 2 предложений)",
+                max_length=500,
+            ),
+        ],
+    ) -> dict[str, Any]:
+        # lsb-0005-05 (FR-6/FR-8): модель создаёт узел любого уровня 1..3
+        # (включая корни), confirmed, прямое создание (судья не вызывается).
+        # Отдельная ручка от save: save узлы не создаёт.
+        # lsb-0005-06 (FR-6): перед созданием — антисинонимия описания нового
+        # узла против тематических узлов реестра; > 0.90 → мягкий отказ.
+        started = time.perf_counter()
+        nearest, cosine = _antiseonymy_nearest(services, path, description)
+        if nearest is not None and (
+            cosine is not None and cosine > NAMESPACE_CREATE_SYNONYM_SIMILARITY
+        ):
+            # Мягкий отказ (fail + hint): описание слишком похоже на
+            # существующий узел — создание не происходит, подсказываем
+            # ближайшего (1). Судья не вызывается (его гейт — для
+            # авто-промоушна, решение О.).
+            log_tool_call(
+                "memory_namespace_create",
+                started,
+                failed=True,
+                reason="synonym",
+                namespace=path,
+                nearest=nearest,
+            )
+            return {"created": False, "hint": f"есть похожий: {nearest}"}
+        try:
+            result = await asyncio.to_thread(
+                services.namespaces.create, path, description, status="confirmed"
+            )
+        except (NamespaceError, NamespaceValidationError) as exc:
+            # Мягкий отказ (fail + hint): узел уже есть / родитель не
+            # существует / невалидный путь (default/..., глубина>3) /
+            # пустое или длинное описание. Текст исключения безопасен.
+            log_tool_call(
+                "memory_namespace_create",
+                started,
+                failed=True,
+                reason=str(exc),
+                namespace=path,
+            )
+            return {"created": False, "hint": str(exc)}
+        log_tool_call(
+            "memory_namespace_create",
+            started,
+            results=1,
+            node=result["path"],
+        )
+        return _compact_namespace_create(result)
 
     return mcp

@@ -579,8 +579,7 @@ class NoteService:
             params.append(text)
             sets.append("vector_status = 'pending'")
             sets.append(
-                "classified_at = NULL, domain_hint = NULL, "
-                "subdomain_hint = NULL, confidence = NULL"
+                "classified_at = NULL, hint_path = NULL, confidence = NULL"
             )
         if note_title is not None:
             sets.append("title = ?")
@@ -694,8 +693,7 @@ class NoteService:
                 "UPDATE notes SET text = ?, "
                 "vector_status = 'pending', "
                 "summary = '', summary_status = 'pending', "
-                "classified_at = NULL, domain_hint = NULL, "
-                "subdomain_hint = NULL, confidence = NULL, "
+                "classified_at = NULL, hint_path = NULL, confidence = NULL, "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
                 "WHERE id = ? AND deleted_at IS NULL",
                 (merged_text, older_id),

@@ -6,8 +6,8 @@
 операторских ручек (REST) и LLM-генерации описаний (причёска, Шаг 5).
 
 Правила пути:
-- слэш-путь, максимум **2 уровня** (`domain`, `domain/subdomain`) — глубже
-  свалка (§5.7);
+- слэш-путь, максимум **3 уровня** (`domain`, `domain/subdomain`,
+  `domain/subdomain/section`) — глубже свалка (§5.7);
 - каждый сегмент — слаг: латиница/цифры/дефис, дефисы не ведут/не кончают
   сегмент; нормализация — нижний регистр, прочие символы → дефис (модель
   классификатора обязана слать латиницу — «СУБО 2020» без транслита
@@ -36,8 +36,8 @@ from typing import Any
 from app.config import Settings
 from app.storage.db import DEFAULT_NAMESPACE, session, transaction
 
-MAX_DEPTH = 2
-MAX_PATH_LEN = 128  # защита от абсурдно длинных путей (2 сегмента по слагу)
+MAX_DEPTH = 3
+MAX_PATH_LEN = 200  # защита от абсурдно длинных путей (3 сегмента × слаг ≤64 + 2 слеша)
 MAX_DESCRIPTION_CHARS = 500  # грубая защита от простыней; контракт — ≤2 предложений
 
 _SEGMENT_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -81,7 +81,8 @@ class NamespaceService:
         """Строка → нормализованный путь узла; нарушение — NamespaceValidationError.
 
         «СУБО 2020» → '2020' (кириллица не слаг); 'Work/SBOS 2020' →
-        'work/sbos-2020'; глубина > 2, пустые сегменты, длина — ошибки.
+        'work/sbos-2020'; глубина > 3, пустые сегменты, длина,
+        вложенность под default — ошибки.
         """
         if not path or not path.strip():
             raise NamespaceValidationError("path: путь не может быть пустым")
@@ -103,13 +104,30 @@ class NamespaceService:
             raise NamespaceValidationError(
                 f"path: ожидается 1..{MAX_DEPTH} уровней, получено {len(segments)}"
             )
+        if len(segments) > 1 and segments[0] == "default":
+            raise NamespaceValidationError(
+                "path: default — системный узел, вложенность запрещена"
+            )
         return "/".join(segments)
 
     def validate_description(self, description: str) -> str:
-        """Описание узла: непустое, ≤2 предложений (контракт О. 2026-09-03)."""
+        """Описание узла: непустое, ≥1 осмысленного предложения, ≤2 предложений
+        (контракт О. 2026-09-03 + аудит lsb-0005-08).
+
+        Единая точка валидации контракта описаний: через неё проходят ОБА
+        пути создания авто-узлов — модель (memory_namespace_create → create
+        confirmed) и судья (авто-промоушн → create provisional). Содержательная
+        проверка «не мусор»: есть хотя бы одна буква/цифра — чистая пунктуация
+        («...», «!?!») не проходит; смысловая осмысленность — гейт судьи
+        (авто-путь) / оператор (операторские ручки), не механика реестра.
+        """
         if not description or not description.strip():
             raise NamespaceValidationError("description: не может быть пустым")
         text = " ".join(description.split())
+        if not any(ch.isalnum() for ch in text):
+            raise NamespaceValidationError(
+                "description: мусор — нет ни одной буквы или цифры"
+            )
         sentences = count_sentences(text)
         if sentences > 2:
             raise NamespaceValidationError(
@@ -138,8 +156,9 @@ class NamespaceService:
         normalized = self.validate_path(namespace)
         if not self.exists(normalized):
             raise NamespaceError(
-                f"неймспейс «{namespace}» не зарегистрирован; актуальная карта — "
-                "memory_namespaces"
+                f"неймспейс «{namespace}» не зарегистрирован; создай недостающие "
+                "домены через memory_namespace_create с описанием из назначения; "
+                "актуальная карта — memory_namespaces"
             )
         return normalized
 
@@ -190,8 +209,9 @@ class NamespaceService:
         normalized = self.validate_path(namespace)
         if not self.exists(normalized):
             raise NamespaceError(
-                f"неймспейс «{namespace}» не зарегистрирован; актуальная карта — "
-                "memory_namespaces"
+                f"неймспейс «{namespace}» не зарегистрирован; создай недостающие "
+                "домены через memory_namespace_create с описанием из назначения; "
+                "актуальная карта — memory_namespaces"
             )
         if exact:
             return [normalized]
@@ -219,13 +239,14 @@ class NamespaceService:
             )
         segments = normalized.split("/")
         with session(self._settings) as conn:
-            if len(segments) == 2:
+            if len(segments) > 1:
+                parent_path = "/".join(segments[:-1])
                 parent = conn.execute(
-                    "SELECT 1 FROM namespaces WHERE path = ?", (segments[0],)
+                    "SELECT 1 FROM namespaces WHERE path = ?", (parent_path,)
                 ).fetchone()
                 if parent is None:
                     raise NamespaceError(
-                        f"родительский узел «{segments[0]}» не зарегистрирован — "
+                        f"родительский узел «{parent_path}» не зарегистрирован — "
                         "сначала создай его"
                     )
             try:
@@ -346,10 +367,10 @@ class NamespaceService:
 
         Переезжают: пути реестра (узел + дети), namespace заметок поддерева
         (vector_status='pending' — пере-кодировка в новую партицию), разметка
-        default-заметок (domain_hint при переименовании корня, subdomain_hint
-        при переименовании листа) и вердикты promotions (domain/subdomain/
-        canonical_path). Ничего не теряется. default не переименовывается;
-        новый путь обязан быть свободным.
+        default-заметок (hint_path — полный путь разметки, префиксная замена
+        как для promotions: корень — все потомки, лист — глубина 2/3) и
+        вердикты promotions (hint_path и canonical_path). Ничего не теряется.
+        default не переименовывается; новый путь обязан быть свободным.
         """
         old_path = self.validate_path(old)
         new_path = self.validate_path(new)
@@ -362,13 +383,6 @@ class NamespaceService:
         if self.exists(new_path):
             raise NamespaceError(f"узел «{new_path}» уже зарегистрирован")
         old_nodes = self.subtree_nodes(old_path)
-        is_root = "/" not in old_path
-        if "/" in old_path:
-            old_domain, old_slug = old_path.split("/", 1)
-        else:
-            old_domain, old_slug = old_path, None
-        new_domain = new_path.split("/", 1)[0]
-        new_slug = new_path.split("/", 1)[1] if "/" in new_path else None
         with session(self._settings) as conn:
             try:
                 with transaction(conn):
@@ -386,33 +400,24 @@ class NamespaceService:
                             "WHERE namespace = ? AND deleted_at IS NULL",
                             (new_path + node_path[len(old_path):], node_path),
                         )
-                    # Разметка default-заметок (причёска ссылается на старые пути).
-                    if is_root:
-                        conn.execute(
-                            "UPDATE notes SET domain_hint = ? "
-                            "WHERE namespace = 'default' AND domain_hint = ?",
-                            (new_domain, old_domain),
-                        )
-                    else:
-                        conn.execute(
-                            "UPDATE notes SET subdomain_hint = ? "
-                            "WHERE namespace = 'default' AND domain_hint = ? "
-                            "AND subdomain_hint = ?",
-                            (new_slug, old_domain, old_slug),
-                        )
-                    # Вердикты триггера: домен/слаг листа/канонические пути. Слаги
-                    # листов не меняются при переименовании КОРНЯ — там только домен.
-                    if is_root:
-                        conn.execute(
-                            "UPDATE promotions SET domain = ? WHERE domain = ?",
-                            (new_domain, old_domain),
-                        )
-                    else:
-                        conn.execute(
-                            "UPDATE promotions SET subdomain = ? "
-                            "WHERE domain = ? AND subdomain = ?",
-                            (new_slug, old_domain, old_slug),
-                        )
+                    # Разметка default-заметок: hint_path (полный путь разметки,
+                    # lsb-0005-02) — префиксная замена старого пути на новый,
+                    # как у promotions: корень — все потомки, лист — глубины 2/3
+                    # (причёска ссылается на путь узла).
+                    conn.execute(
+                        "UPDATE notes SET hint_path = ? || substr(hint_path, ?) "
+                        "WHERE namespace = 'default' "
+                        "AND (hint_path = ? OR hint_path LIKE ? || '/%')",
+                        (new_path, len(old_path) + 1, old_path, old_path),
+                    )
+                    # Вердикты триггера: единый hint_path (lsb-0005-03) —
+                    # префиксная замена как у canonical_path (корень или лист
+                    # с детьми — у всех подпутей меняется только префикс).
+                    conn.execute(
+                        "UPDATE promotions SET hint_path = ? || substr(hint_path, ?) "
+                        "WHERE hint_path = ? OR hint_path LIKE ? || '/%'",
+                        (new_path, len(old_path) + 1, old_path, old_path),
+                    )
                     conn.execute(
                         "UPDATE promotions SET canonical_path = ? WHERE canonical_path = ?",
                         (new_path, old_path),
@@ -440,12 +445,13 @@ class NamespaceService:
     def merge_node(self, path: str, into: str) -> dict[str, Any]:
         """Слить ЛИСТ с существующим узлом: заметки переехали, узел исчез (§5.7).
 
-        Канонизация hint: в лист → subdomain_hint = слаг цели; в корень или
+        Канонизация hint_path: в лист → полный путь цели; в корень или
         default → NULL («общая»). Ничего не теряется: заметки перекладываются
         целиком (vector_status='pending' — пере-кодировка в новую партицию).
-        Слияние корня не поддерживается (дети остались бы без родителя —
-        оператор разбирает поддерево по листьям); default не сливается.
-        Возврат — {path, into, moved}.
+        Вердикты promotions следуют за перекладкой (canonical_path и ключ
+        hint_path источника → цель). Слияние корня не поддерживается (дети
+        остались бы без родителя — оператор разбирает поддерево по листьям);
+        default не сливается. Возврат — {path, into, moved}.
         """
         source = self.validate_path(path)
         target = self.validate_path(into)
@@ -461,20 +467,32 @@ class NamespaceService:
             raise NamespaceError(f"узел «{source}» не зарегистрирован")
         if not self.exists(target):
             raise NamespaceError(f"узел «{target}» не зарегистрирован")
-        target_subdomain = target.split("/", 1)[1] if "/" in target else None
+        target_hint = target if "/" in target else None  # лист → путь цели; корень/default → NULL
         with session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
-                "UPDATE notes SET namespace = ?, subdomain_hint = ?, "
+                "UPDATE notes SET namespace = ?, hint_path = ?, "
                 "vector_status = 'pending' "
                 "WHERE namespace = ? AND deleted_at IS NULL",
-                (target, target_subdomain, source),
+                (target, target_hint, source),
             )
             moved = cursor.rowcount
             conn.execute("DELETE FROM namespaces WHERE path = ?", (source,))
+            # Вердикты триггера: источник слит, его контент ушёл в target —
+            # canonical_path и сам ключ hint_path следуют за перекладкой
+            # (если у цели уже есть свой вердикт — он главенствует, INSERT
+            # OR IGNORE сохраняет его; ключ источника сносится).
             conn.execute(
                 "UPDATE promotions SET canonical_path = ? WHERE canonical_path = ?",
                 (target, source),
             )
+            conn.execute(
+                "INSERT OR IGNORE INTO promotions "
+                "(hint_path, status, canonical_path, decided_at) "
+                "SELECT ?, status, canonical_path, decided_at "
+                "FROM promotions WHERE hint_path = ?",
+                (target, source),
+            )
+            conn.execute("DELETE FROM promotions WHERE hint_path = ?", (source,))
         logging.getLogger("app").info(
             "namespace merged",
             extra={
@@ -490,10 +508,12 @@ class NamespaceService:
     def delete_node(self, path: str) -> dict[str, Any]:
         """Удалить узел с перекладкой заметок (§5.7, ничего не теряется).
 
-        Лист: заметки → родительский корень (subdomain_hint=NULL — общая для
-        домена), vector_status='pending'. Пустой корень удаляется; корень с
-        детьми — NamespaceError (сначала разбери поддерево по листьям).
-        default не удаляется. Возврат — {path, moved}.
+        Лист: заметки → родительский корень (hint_path=NULL — общая для
+        домена), vector_status='pending'; вердикты promotions следуют за
+        перекладкой (canonical_path и ключ hint_path листа → родитель).
+        Пустой корень удаляется; корень с детьми — NamespaceError (сначала
+        разбери поддерево по листьям). default не удаляется. Возврат —
+        {path, moved}.
         """
         normalized = self.validate_path(path)
         if normalized == DEFAULT_NAMESPACE:
@@ -514,12 +534,29 @@ class NamespaceService:
             if "/" in normalized:
                 domain = normalized.split("/", 1)[0]
                 cursor = conn.execute(
-                    "UPDATE notes SET namespace = ?, subdomain_hint = NULL, "
+                    "UPDATE notes SET namespace = ?, hint_path = NULL, "
                     "vector_status = 'pending' "
                     "WHERE namespace = ? AND deleted_at IS NULL",
                     (domain, normalized),
                 )
                 moved = cursor.rowcount
+                # Вердикты триггера: лист удалён, контент ушёл в родительский
+                # корень — canonical_path и ключ hint_path следуют за перекладкой
+                # (если у родителя уже есть вердикт — он главенствует).
+                conn.execute(
+                    "UPDATE promotions SET canonical_path = ? WHERE canonical_path = ?",
+                    (domain, normalized),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO promotions "
+                    "(hint_path, status, canonical_path, decided_at) "
+                    "SELECT ?, status, canonical_path, decided_at "
+                    "FROM promotions WHERE hint_path = ?",
+                    (domain, normalized),
+                )
+                conn.execute(
+                    "DELETE FROM promotions WHERE hint_path = ?", (normalized,)
+                )
             conn.execute("DELETE FROM namespaces WHERE path = ?", (normalized,))
         logging.getLogger("app").info(
             "namespace deleted",

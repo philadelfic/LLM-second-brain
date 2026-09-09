@@ -31,9 +31,11 @@ def _match(conn: sqlite3.Connection, needle: str) -> list[int]:
 
 class TestSchemaCreated:
     def test_notes_columns(self) -> None:
-        """Таблица notes — 15 колонок из ARCHITECTURE §3.3 (+Фаза 10 §5.7):
-        9 базовых + namespace/classified_at + разметка причёски
-        domain_hint/subdomain_hint/confidence + expires_at (lsb-0004-02)."""
+        """Таблица notes — 14 колонок из ARCHITECTURE §3.3 (+Фаза 10 §5.7):
+        9 базовых + namespace/classified_at + разметка причёски hint_path/
+        confidence + expires_at (lsb-0004-02). lsb-0005-04: пара
+        domain_hint/subdomain_hint снята со схемы — груминг переведён на
+        единый hint_path."""
         init_db(get_settings())
         with session(get_settings()) as conn:
             columns = {
@@ -42,8 +44,8 @@ class TestSchemaCreated:
         assert set(columns) == {
             "id", "text", "title", "summary", "author", "vector_status",
             "summary_status", "created_at", "updated_at", "deleted_at",
-            "namespace", "classified_at", "domain_hint", "subdomain_hint",
-            "confidence", "expires_at",
+            "namespace", "classified_at", "hint_path", "confidence",
+            "expires_at",
         }
         # DDL-умолчания: summary пуст, статусы pending, author unknown.
         assert columns["summary"]["dflt_value"] == "''"
@@ -111,6 +113,44 @@ class TestSchemaCreated:
         init_db(settings)  # повторный прогон — без ошибок, данные целы
         with session(settings) as conn:
             assert conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 1
+
+    def test_hint_path_backfilled_from_legacy_subscripts(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """lsb-0005-02: единый hint_path бэкфиллится из пары domain_hint/
+        subdomain_hint СТАРЫХ БД (X/Y → 'X/Y'; X+NULL → 'X'; оба NULL → NULL);
+        повторный init_db идемпотентен. lsb-0005-04: свежая схема пару не
+        создаёт, поэтому тест эмулирует легаси-БД дорисовкой колонок."""
+        monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
+        get_settings.cache_clear()
+        settings = get_settings()
+        init_db(settings)
+        # Эмуляция старой БД: легаси-пара колонок + hint_path пуст.
+        with session(settings) as conn:
+            conn.execute("ALTER TABLE notes ADD COLUMN domain_hint TEXT")
+            conn.execute("ALTER TABLE notes ADD COLUMN subdomain_hint TEXT")
+            conn.execute(
+                "INSERT INTO notes (text, domain_hint, subdomain_hint) "
+                "VALUES ('x', 'work', 'subo')"
+            )
+            conn.execute(
+                "INSERT INTO notes (text, domain_hint, subdomain_hint) "
+                "VALUES ('y', 'work', NULL)"
+            )
+            conn.execute(
+                "INSERT INTO notes (text, domain_hint, subdomain_hint) "
+                "VALUES ('z', NULL, NULL)"
+            )
+        init_db(settings)  # повторный прогон — бэкфилл по требованию
+        with session(settings) as conn:
+            rows = conn.execute(
+                "SELECT text, hint_path FROM notes ORDER BY text"
+            ).fetchall()
+        assert {r["text"]: r["hint_path"] for r in rows} == {
+            "x": "work/subo",
+            "y": "work",
+            "z": None,
+        }
 
     def test_check_backstop_rejects_out_of_range(self) -> None:
         """CHECK — последний рубеж: пустой и слишком длинный текст отвергнут."""
