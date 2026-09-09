@@ -63,18 +63,18 @@ _TOKEN_SPLIT_RE = re.compile(r"[^0-9A-Za-zА-Яа-яЁё]+")
 
 # Отказ кодирования запроса: поиск деградирует к FTS-only + warning (§5.3).
 WARNING_FTS_ONLY = (
-    "поиск без семантики: кодирование запроса не удалось (векторизация "
-    "недоступна), выдача только полнотекстовая — перефразы могут быть пропущены"
+    "search without semantics: query encoding failed (vectorization "
+    "unavailable), output is full-text only — paraphrases may be missed"
 )
 
 HINT_NO_RESULTS = (
-    "по запросу ничего не найдено; переформулируй шире "
-    "(ищется по подстрокам от 3 символов) или сделай обзор через memory_list"
+    "nothing found for the query; rephrase more broadly "
+    "(searches by substrings from 3 characters) or browse via memory_list"
 )
 
 HINT_SHORT_QUERY = (
-    "каждое слово запроса короче 3 символов — trigram по ним не ищет; "
-    "добавь осмысленные слова"
+    "each query word is shorter than 3 characters — trigram does not search them; "
+    "add meaningful words"
 )
 
 # Вес bm25 title-колонки notes_fts (lsb-0001-01, FR-1.2): совпадение
@@ -86,8 +86,8 @@ TITLE_FTS_WEIGHT = 2.0
 # Пустой title-режим (FR-2.2): компактная выдача, обычный semantic-поиск
 # ищет шире — hint обучает модель выбрать нужный инструмент.
 HINT_NO_RESULTS_TITLE = (
-    "по названию ничего не найдено; проверь подстроку названия или сделай "
-    "обзор через memory_list; обычный semantic-поиск ищет и по тексту"
+    "nothing found by title; check the title substring or browse "
+    "via memory_list; regular semantic search also searches by text"
 )
 
 
@@ -127,7 +127,7 @@ class SearchService:
         top_k = self._default_top_k() if top_k is None else top_k
         if not 1 <= top_k <= MAX_TOP_K:
             raise SearchValidationError(
-                f"top_k: ожидается 1..{MAX_TOP_K}, получено {top_k}"
+                f"top_k: expected 1..{MAX_TOP_K}, got {top_k}"
             )
         query_vector = self._query_vector(query)
         expression = self._match_expression(query)
@@ -212,7 +212,7 @@ class SearchService:
         top_k = self._default_top_k() if top_k is None else top_k
         if not 1 <= top_k <= MAX_TOP_K:
             raise SearchValidationError(
-                f"top_k: ожидается 1..{MAX_TOP_K}, получено {top_k}"
+                f"top_k: expected 1..{MAX_TOP_K}, got {top_k}"
             )
         ns_nodes = self._namespaces.filter_nodes(namespace, namespace_exact)
         ns_clause = ""
@@ -511,8 +511,8 @@ class SearchService:
         """1..MAX_QUERY_CHARS — доменное правило FR-1 (бекстоп схемы)."""
         if not 1 <= len(query) <= self._settings.max_query_chars:
             raise SearchValidationError(
-                f"query: длина должна быть 1..{self._settings.max_query_chars} "
-                f"символов, получено {len(query)}"
+                f"query: length must be 1..{self._settings.max_query_chars} "
+                f"characters, got {len(query)}"
             )
         return query
 

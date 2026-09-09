@@ -154,15 +154,18 @@ class JudgeService:
 
     @staticmethod
     def _verdict(content: str) -> bool:
-        """Парсинг вердикта из content (формат брифа: `**ДУБЛЬ**/…`).
+        """Парсинг вердикта из content (формат брифа: `**DUPLICATE**/…`).
 
         Markdown-жирный стрипается, регистр не учитывается; сначала ищем
-        «НЕ ДУБЛЬ» (подстрока содержит «ДУБЛЬ»), затем «ДУБЛЬ». Ответ без
-        вердикта — отказ: неопределённость не превращаем в «не дубль».
+        «NOT DUPLICATE» (подстрока содержит «DUPLICATE»), затем «DUPLICATE».
+        Ответ без вердикта — отказ: неопределённость не превращаем в
+        «не дубль».
         """
         normalized = " ".join(content.replace("*", " ").upper().split())
-        if "НЕ ДУБЛЬ" in normalized:
+        if "NOT DUPLICATE" in normalized:
             return False
-        if "ДУБЛЬ" in normalized:
+        if "DUPLICATE" in normalized:
             return True
-        raise JudgeError(f"судья не дал вердикт ДУБЛЬ/НЕ ДУБЛЬ: {content[:120]}")
+        raise JudgeError(
+            f"judge gave no verdict DUPLICATE/NOT DUPLICATE: {content[:120]}"
+        )

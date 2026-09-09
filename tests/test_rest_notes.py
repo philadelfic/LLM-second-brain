@@ -59,7 +59,7 @@ class TestNotesCrud:
     def test_get_unknown_404(self, client: TestClient, token: str) -> None:
         response = client.get("/notes/999", headers={"Authorization": f"Bearer {token}"})
         assert response.status_code == 404
-        assert "не найдена" in response.json()["detail"]
+        assert "were found" in response.json()["detail"]
 
     def test_list_without_texts(self, client: TestClient, token: str) -> None:
         self._create(client, token, "Рест: " + "длинный " * 100, title="Рест-длинный")
@@ -139,7 +139,7 @@ class TestNotesCrud:
 
 class TestTitleRest:
     """Фаза 11 (решение №9, follow-up 5b): title в REST — валидация переданного
-    названия (422 «задай title ≤5 слов»), перезапись/сохранение в PUT, выдачи
+    названия (422 «set a title ≤5 words»), перезапись/сохранение в PUT, выдачи
     get/list/search. Контракт «новые всегда с title» един на обеих
     поверхностях (MCP memory_save и REST /notes): POST без title — 422,
     заметка НЕ создаётся. Сентинел-легаси save(text) — сервисный путь
@@ -147,7 +147,7 @@ class TestTitleRest:
     """
 
     def test_create_without_title_422(self, client: TestClient, token: str) -> None:
-        """POST без title → 422 fail+hint «задай title ≤5 слов», заметка НЕ
+        """POST без title → 422 fail+hint «set a title ≤5 words», заметка НЕ
         создаётся (легаси-201 отменён follow-up 5b: контракт един с MCP
         memory_save); пустой title — тоже невалидный → 422."""
         created = client.post(
@@ -155,13 +155,13 @@ class TestTitleRest:
             headers={"Authorization": f"Bearer {token}"},
         )
         assert created.status_code == 422
-        assert created.json()["detail"] == "задай title ≤5 слов"
+        assert created.json()["detail"] == "set a title ≤5 words"
         empty = client.post(
             "/notes", json={"text": "Рест: пустое название", "title": ""},
             headers={"Authorization": f"Bearer {token}"},
         )
         assert empty.status_code == 422
-        assert empty.json()["detail"] == "задай title ≤5 слов"
+        assert empty.json()["detail"] == "set a title ≤5 words"
         assert client.get(
             "/notes", headers={"Authorization": f"Bearer {token}"}
         ).json()["total"] == 0  # ни одна не создана
@@ -173,7 +173,7 @@ class TestTitleRest:
             headers={"Authorization": f"Bearer {token}"},
         )
         assert response.status_code == 422
-        assert "задай title ≤5 слов" in response.json()["detail"]
+        assert "set a title ≤5 words" in response.json()["detail"]
 
     def test_create_five_word_title_201(self, client: TestClient, token: str) -> None:
         """Граница TITLE_MAX_WORDS = 5: ровно 5 слов — создано, title в выдаче."""
@@ -262,7 +262,7 @@ class TestSearch:
             headers={"Authorization": f"Bearer {token}"},
         )
         body = response.json()
-        assert body["results"] == [] and "переформулируй" in body["hint"]
+        assert body["results"] == [] and "rephrase" in body["hint"]
 
     def test_search_params_validated(self, client: TestClient, token: str) -> None:
         missing = client.get("/search", headers={"Authorization": f"Bearer {token}"})

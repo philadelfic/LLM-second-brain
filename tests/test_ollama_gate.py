@@ -135,7 +135,7 @@ def test_chat_calls_share_slot(monkeypatch: pytest.MonkeyPatch) -> None:
         settings.summary_base_url
         == settings.judge_base_url
     )
-    body = {"message": {"role": "assistant", "content": "**НЕ ДУБЛЬ**"}}
+    body = {"message": {"role": "assistant", "content": "**NOT DUPLICATE**"}}
     probe = _ConcurrencyProbe(body)
     summarizer = SummaryService(settings, transport=probe)
     judge = JudgeService(settings, transport=probe)

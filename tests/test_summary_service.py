@@ -142,9 +142,9 @@ def test_messages_system_prompt_has_new_wording(monkeypatch) -> None:
     payload = last_payload(recorder)
     messages = payload["messages"]
     assert messages[0]["role"] == "system"
-    assert "1–2 коротких и ёмких предложениях" in messages[0]["content"]
-    assert "не длиннее 30 слов" in messages[0]["content"]
-    assert "на языке заметки" in messages[0]["content"]
+    assert "1–2 short, dense sentences" in messages[0]["content"]
+    assert "no more than 30 words" in messages[0]["content"]
+    assert "in the language of the note" in messages[0]["content"]
     assert messages[1] == {"role": "user", "content": NOTE}
 
 
@@ -380,15 +380,15 @@ def test_merge_system_prompt_and_marked_texts(monkeypatch) -> None:
     payload = last_payload(recorder)
     messages = payload["messages"]
     assert messages[0]["role"] == "system"
-    assert "две версии одной заметки" in messages[0]["content"]
-    assert "каждый факт скажи один раз" in messages[0]["content"]
-    assert "не добавляй от себя" in messages[0]["content"]
+    assert "two versions of the same note" in messages[0]["content"]
+    assert "state each fact once" in messages[0]["content"]
+    assert "do not add anything of your own" in messages[0]["content"]
     # числового лимита в промпте больше нет: потолок держит код, не модель
     assert "35000" not in messages[0]["content"]
-    # оба текста в ОДНОМ user-сообщении: ранний — ТЕКСТ 1, поздний — ТЕКСТ 2
+    # оба текста в ОДНОМ user-сообщении: ранний — TEXT 1, поздний — TEXT 2
     assert messages[1] == {
         "role": "user",
-        "content": "ТЕКСТ 1:\n" + TEXT_A + "\n\nТЕКСТ 2:\n" + TEXT_B,
+        "content": "TEXT 1:\n" + TEXT_A + "\n\nTEXT 2:\n" + TEXT_B,
     }
     # остальное — как у summarize (та же модель и параметры, ARCH §4.7)
     assert payload["model"] == settings.summary_model

@@ -340,15 +340,15 @@ class TestVerdictParsing:
     @pytest.mark.parametrize(
         ("content", "expected_action", "expected_target"),
         [
-            ("**СОЗДАТЬ**", "create", None),
-            ("СОЗДАТЬ", "create", None),
-            ("Создать", "create", None),
-            ("**ОТКЛОНИТЬ**", "reject", None),
-            ("ОТКЛОНИТЬ", "reject", None),
-            ("**СЛИТЬ work/other**", "merge", "work/other"),
-            ("СЛИТЬ projects/site", "merge", "projects/site"),
-            ("СЛИТЬ work", "merge", "work"),
-            ("СЛИТЬ a/b/c", "merge", "a/b/c"),  # глубина-3 (lsb-0005-03)
+            ("**CREATE**", "create", None),
+            ("CREATE", "create", None),
+            ("Create", "create", None),
+            ("**REJECT**", "reject", None),
+            ("REJECT", "reject", None),
+            ("**MERGE work/other**", "merge", "work/other"),
+            ("MERGE projects/site", "merge", "projects/site"),
+            ("MERGE work", "merge", "work"),
+            ("MERGE a/b/c", "merge", "a/b/c"),  # глубина-3 (lsb-0005-03)
         ],
     )
     def test_verdicts_recognized(self, content, expected_action, expected_target) -> None:
@@ -358,7 +358,7 @@ class TestVerdictParsing:
 
     @pytest.mark.parametrize(
         "content",
-        ["", "НЕ ЗНАЮ", "думаю, что да"],
+        ["", "I DON'T KNOW", "I think so"],
     )
     def test_verdicts_unrecognized_fail(self, content) -> None:
         with pytest.raises(StructureJudgeError):
@@ -366,7 +366,7 @@ class TestVerdictParsing:
 
     def test_merge_without_target_fails(self) -> None:
         with pytest.raises(StructureJudgeError):
-            StructureJudgeService._parse("СЛИТЬ")  # type: ignore[arg-type]
+            StructureJudgeService._parse("MERGE")  # type: ignore[arg-type]
 
 
 class TestJudgeThinkFlag:
@@ -382,7 +382,7 @@ class TestJudgeThinkFlag:
         def handler(request: httpx.Request) -> httpx.Response:
             captured["payload"] = json.loads(request.read().decode())
             return httpx.Response(
-                200, json={"message": {"role": "assistant", "content": "**СОЗДАТЬ**"}}
+                200, json={"message": {"role": "assistant", "content": "**CREATE**"}}
             )
 
         judge = StructureJudgeService(settings, transport=httpx.MockTransport(handler))
@@ -509,7 +509,7 @@ class TestCosineScaleInvariance:
         NamespaceService(settings).create("work/hr", "Сервисы HR: зарплаты.")
         _seed_group(settings, "work", "subo", THRESHOLD)
         describer = FixedDescriber("Сервисы HR: зарплаты.")
-        judge = ScriptedStructureJudge(verdicts=[Verdict("СОЗДАТЬ")])
+        judge = ScriptedStructureJudge(verdicts=[Verdict("create")])
         promoter = PromotionService(
             settings,
             embedding=ZeroEmbedder(8),

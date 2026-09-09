@@ -32,8 +32,8 @@ from app.storage.db import session
 
 # Подсказка-обучение (§5.3) — общий канал двух путей дедупа.
 DEDUP_HINT = (
-    "почти идентичная заметка уже есть; чтобы уточнить — вызови memory_update "
-    "(сначала memory_get, чтобы не потерять детали)"
+    "a nearly identical note already exists; to refine it — call memory_update "
+    "(run memory_get first so you don't lose details)"
 )
 
 # Кандидатов из FTS-фоллбека, среди которых ищем нормализованный дубль.

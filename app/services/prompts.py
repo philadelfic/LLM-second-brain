@@ -44,84 +44,87 @@ from app.config import ConfigError
 
 # summary.py::SYSTEM_PROMPT — пересказ заметки.
 SUMMARY_SYSTEM_PROMPT = (
-    "Сделай краткий пересказ заметки в 1–2 коротких и ёмких "
-    "предложениях, суммарно не длиннее 30 слов. Передай главную мысль "
-    "так, чтобы по этому сокращению было предельно понятно, о чём текст. "
-    "Без вступлений, кавычек и пояснений. Отвечай на языке заметки."
+    "Summarize the note in 1–2 short, dense sentences, no more than 30 "
+    "words in total. Convey the main idea so that this condensed version "
+    "alone makes the text perfectly clear. No intros, quotes, or "
+    "explanations. Respond in the language of the note."
 )
 
 # summary.py::MERGE_SYSTEM_PROMPT — слияние дубликатов (системный).
 SUMMARY_MERGE_SYSTEM_PROMPT = (
-    "У тебя две версии одной заметки. Сведи их в единый текст: объедини "
-    "всю информацию обеих — факты, имена, числа, даты, статусы, конфиги "
-    "и пути; каждый факт скажи один раз, повторяющееся опусти. Ничего "
-    "не выбрасывай и не добавляй от себя. Пиши связно, без заголовков, "
-    "вступлений, кавычек и пояснений. Отвечай на языке заметок."
+    "You have two versions of the same note. Merge them into a single "
+    "text: combine all information from both — facts, names, numbers, "
+    "dates, statuses, configs and paths; state each fact once, omit "
+    "repetitions. Do not drop anything and do not add anything of your "
+    "own. Write coherently, no headings, intros, quotes, or explanations. "
+    "Respond in the language of the notes."
 )
 
 # judge.py::JUDGE_SYSTEM_PROMPT — определение одинаковости заметок
 # (ДУБЛЬ/НЕ ДУБЛЬ).
 JUDGE_SYSTEM_PROMPT = (
-    "Ты проверяешь долговременную память на дубли. Определи, являются ли "
-    "два текста дублями: одна и та же мысль, пересказанная другими словами "
-    "(совпадение деталей важнее формы). Ответь строго одной отметкой: "
-    "ДУБЛЬ или НЕ ДУБЛЬ. Без пояснений."
+    "You check long-term memory for duplicates. Determine whether two texts "
+    "are duplicates: the same thought restated in other words (matching "
+    "details matter more than wording). Answer with exactly one marker: "
+    "DUPLICATE or NOT DUPLICATE. No explanations."
 )
 
 # Зашитые 7 (только константы, файлами не создаются).
 
 # summary.py::MERGE_USER_TEMPLATE ({text_a}, {text_b}).
-SUMMARY_MERGE_USER_TEMPLATE = "ТЕКСТ 1:\n{text_a}\n\nТЕКСТ 2:\n{text_b}"
+SUMMARY_MERGE_USER_TEMPLATE = "TEXT 1:\n{text_a}\n\nTEXT 2:\n{text_b}"
 
 # judge.py::JUDGE_USER_TEMPLATE ({text_new}, {text_candidate}).
-JUDGE_USER_TEMPLATE = "ТЕКСТ 1:\n{text_new}\n\nТЕКСТ 2:\n{text_candidate}"
+JUDGE_USER_TEMPLATE = "TEXT 1:\n{text_new}\n\nTEXT 2:\n{text_candidate}"
 
 # classifier.py::CLASSIFY_SYSTEM_PROMPT — JSON-контракт разметки (§5.7).
 CLASSIFIER_SYSTEM_PROMPT = (
-    "Ты классификатор заметок для иерархической памяти. Определи, к какому "
-    "разделу относится заметка. Известные узлы перечислены в запросе. "
-    "Правила: если заметка относится к существующему разделу — верни его "
-    "полный путь (hint_path: слэш-разделитель, слаги латиница-цифры-дефис, "
-    "1..3 уровня, не под 'default/...'); если заметка общая и не привязана "
-    "к разделу — верни null. Ответь строго одним JSON-объектом без "
-    'пояснений: {"hint_path": "work/sbos-2020" или null, "confidence": 0.0}'
-    " — confidence от 0 до 1, насколько уверен в выборе."
+    "You are a note classifier for hierarchical memory. Determine which "
+    "section the note belongs to. Known nodes are listed in the request. "
+    "Rules: if the note belongs to an existing node — return its full path "
+    "as hint_path (1..3 segments, latin letters, digits, hyphens); if the "
+    "note is generic and not bound to a section — return null. Answer with "
+    "exactly one JSON object, no explanations: "
+    '{"hint_path": "...", "confidence": 0.0} — confidence from 0 to 1, '
+    "how confident you are."
 )
 
 # promotion.py::DESCRIBE_SYSTEM_PROMPT — описание узла по примерам заметок.
 DESCRIBE_SYSTEM_PROMPT = (
-    "Ты генератор описаний разделов иерархической памяти. По примерам "
-    "заметок напиши описание раздела: какие заметки в нём живут. Строго "
-    "1–2 коротких предложения, без списков и пояснений — только описание."
+    "You generate descriptions of sections in hierarchical memory. From the "
+    "example notes, write a description of the section: what kind of notes "
+    "live there. Strictly 1–2 short sentences, no lists or explanations — "
+    "only the description."
 )
 
 # promotion.py::DESCRIBE_USER_TEMPLATE ({domain}, {slug}, {summaries}).
 DESCRIBE_USER_TEMPLATE = (
-    "Новый подраздел: {domain}/{slug}\n\n"
-    "Примеры заметок раздела (краткие содержания):\n{summaries}"
+    "New subsection: {domain}/{slug}\n\n"
+    "Example notes of the section (brief summaries):\n{summaries}"
 )
 
 # promotion.py::JUDGE_SYSTEM_PROMPT — судья структуры
 # (протокол СОЗДАТЬ/СЛИТЬ <path>/ОТКЛОНИТЬ).
 STRUCTURE_JUDGE_SYSTEM_PROMPT = (
-    "Ты судья структуры иерархической памяти. Проверь кандидата на новый "
-    "подраздел. Правила: (1) если смысл кандидата совпадает с существующим "
-    "тематическим узлом (та же тема другими словами) — это слияние, а не "
-    "новый узел; (2) слаг и описание должны быть содержательными: "
-    "бессмысленный, мусорный или пустой по смыслу кандидат — отклонить. "
-    "Ответь строго одной отметкой без пояснений: СОЗДАТЬ — кандидат новый "
-    "и осмысленный; СЛИТЬ <path> — кандидат дублирует существующий узел, "
-    "в качестве path укажи ТОЛЬКО тематический путь из списка «Существующие "
-    "узлы» (никогда — путь кандидата; default — системный своп, слияние с "
-    "ним не бывает); ОТКЛОНИТЬ — кандидат бессмысленный."
+    "You are the structure judge of hierarchical memory. Evaluate the "
+    "candidate for a new sub-section. Rules: (1) if the meaning of the "
+    "candidate matches an existing topical node (the same theme in other "
+    "words) — it is a merge, not a new node; (2) the slug and the "
+    "description must be meaningful: a meaningless, junk or empty-in-meaning "
+    "candidate — reject. Answer with exactly one marker, no explanations: "
+    "CREATE — the candidate is new and meaningful; MERGE <path> — the "
+    "candidate duplicates an existing node, for path specify ONLY the "
+    "topical path from the \"Existing nodes\" list (never the candidate's "
+    "path; default is the system swap, merging into it never happens); "
+    "REJECT — the candidate is meaningless."
 )
 
 # promotion.py::JUDGE_USER_TEMPLATE ({domain}, {slug}, {description},
 # {nodes}, {nearest}).
 STRUCTURE_JUDGE_USER_TEMPLATE = (
-    "Кандидат: {domain}/{slug} — {description}\n\n"
-    "Существующие узлы:\n{nodes}\n\n"
-    "Ближайший по векторному сходству: {nearest}"
+    "Candidate: {domain}/{slug} — {description}\n\n"
+    "Existing nodes:\n{nodes}\n\n"
+    "Nearest by vector similarity: {nearest}"
 )
 
 # Имя → встроенный текст (единый словарь: и свойства реестра, и seed-файлы).
@@ -270,43 +273,46 @@ class PromptRegistry:
     # --- валидация -----------------------------------------------------------
 
     def _validate_judge_markers(self) -> None:
-        """Финальный judge_system обязан содержать маркеры «ДУБЛЬ» и «НЕ ДУБЛЬ».
+        """Финальный judge_system обязан содержать маркеры «DUPLICATE» и «NOT DUPLICATE».
 
         Вердикты дедупа парсятся по этим маркерам (judge._verdict: сначала
-        «НЕ ДУБЛЬ», затем «ДУБЛЬ»). Промпт без маркеров не дал бы парсеру
-        ни одного вердикта — дедуп молча встал бы на отказах. Фатально.
+        «NOT DUPLICATE», затем «DUPLICATE»). Промпт без маркеров не дал бы
+        парсеру ни одного вердикта — дедуп молча встал бы на отказах.
+        Фатально.
 
-        «ДУБЛЬ» требуется самостоятельной отметкой (вхождение вне связки
-        «НЕ ДУБЛЬ»): промпт, разрешающий только «НЕ ДУБЛЬ», тихо сломал бы
-        сведение дубликатов в другую сторону — судья не смог бы вынести
-        вердикт «дубль» (тот же класс отказа, что и потеря маркера вовсе).
+        «DUPLICATE» требуется самостоятельной отметкой (вхождение вне связки
+        «NOT DUPLICATE»): промпт, разрешающий только «NOT DUPLICATE», тихо
+        сломал бы сведение дубликатов в другую сторону — судья не смог бы
+        вынести вердикт «дубль» (тот же класс отказа, что и потеря маркера
+        вовсе).
         """
         judge = self._texts["judge_system"]
         missing = self._missing_judge_markers(judge)
         if missing:
             if "judge_system" in self._file_overrides:
-                origin = f"файл {self._file_path('judge_system')}"
+                origin = f"file {self._file_path('judge_system')}"
             else:
-                origin = "встроенный judge_system"
+                origin = "builtin judge_system"
             raise ConfigError(
-                "промпт judge_system не содержит маркер вердикта "
-                + " и ".join(missing)
-                + f" (источник: {origin}). Вердикты дедупа парсятся именно "
-                "по этим маркерам (judge._verdict); без них дедуп молча "
-                "встанет на отказах парсера. Верни в текст обе отметки — "
-                "«ДУБЛЬ» и «НЕ ДУБЛЬ»."
+                "judge_system prompt is missing verdict marker(s): "
+                + " and ".join(missing)
+                + f" (source: {origin}). Dedup verdicts are parsed by these "
+                "markers (judge._verdict); without them dedup would silently "
+                "stall on parser failures. Restore both markers — DUPLICATE "
+                "and NOT DUPLICATE — in the text."
             )
 
     @staticmethod
     def _missing_judge_markers(text: str) -> list[str]:
         """Маркеры вердикта, отсутствующие в тексте промпта.
 
-        «ДУБЛЬ» засчитывается только самостоятельным вхождением: вхождения
-        внутри «НЕ ДУБЛЬ» вычёркиваются. «НЕ ДУБЛЬ» — как связка целиком.
+        «DUPLICATE» засчитывается только самостоятельным вхождением:
+        вхождения внутри «NOT DUPLICATE» вычёркиваются. «NOT DUPLICATE» —
+        как связка целиком.
         """
         missing: list[str] = []
-        if "НЕ ДУБЛЬ" not in text:
-            missing.append("«НЕ ДУБЛЬ»")
-        if "ДУБЛЬ" not in text.replace("НЕ ДУБЛЬ", ""):
-            missing.append("«ДУБЛЬ»")
+        if "NOT DUPLICATE" not in text:
+            missing.append("NOT DUPLICATE")
+        if "DUPLICATE" not in text.replace("NOT DUPLICATE", ""):
+            missing.append("DUPLICATE")
         return missing

@@ -85,10 +85,10 @@ class NamespaceService:
         вложенность под default — ошибки.
         """
         if not path or not path.strip():
-            raise NamespaceValidationError("path: путь не может быть пустым")
+            raise NamespaceValidationError("path: path cannot be empty")
         if len(path) > MAX_PATH_LEN:
             raise NamespaceValidationError(
-                f"path: длина должна быть ≤{MAX_PATH_LEN}, получено {len(path)}"
+                f"path: length must be ≤{MAX_PATH_LEN}, got {len(path)}"
             )
         raw_segments = path.strip().strip("/").split("/")
         segments: list[str] = []
@@ -96,17 +96,17 @@ class NamespaceService:
             slug = normalize_slug(segment)
             if slug is None:
                 raise NamespaceValidationError(
-                    f"path: сегмент «{segment}» не нормализуется в слаг "
-                    "(латиница/цифры/дефис)"
+                    f"path: segment «{segment}» does not normalize to a slug "
+                    "(latin/digits/hyphen)"
                 )
             segments.append(slug)
         if not 1 <= len(segments) <= MAX_DEPTH:
             raise NamespaceValidationError(
-                f"path: ожидается 1..{MAX_DEPTH} уровней, получено {len(segments)}"
+                f"path: expected 1..{MAX_DEPTH} levels, got {len(segments)}"
             )
         if len(segments) > 1 and segments[0] == "default":
             raise NamespaceValidationError(
-                "path: default — системный узел, вложенность запрещена"
+                "path: default — system node, nesting is forbidden"
             )
         return "/".join(segments)
 
@@ -122,16 +122,16 @@ class NamespaceService:
         (авто-путь) / оператор (операторские ручки), не механика реестра.
         """
         if not description or not description.strip():
-            raise NamespaceValidationError("description: не может быть пустым")
+            raise NamespaceValidationError("description: cannot be empty")
         text = " ".join(description.split())
         if not any(ch.isalnum() for ch in text):
             raise NamespaceValidationError(
-                "description: мусор — нет ни одной буквы или цифры"
+                "description: garbage — no letters or digits"
             )
         sentences = count_sentences(text)
         if sentences > 2:
             raise NamespaceValidationError(
-                f"description: не более 2 предложений, получено {sentences}"
+                f"description: no more than 2 sentences, got {sentences}"
             )
         return text
 
@@ -156,9 +156,9 @@ class NamespaceService:
         normalized = self.validate_path(namespace)
         if not self.exists(normalized):
             raise NamespaceError(
-                f"неймспейс «{namespace}» не зарегистрирован; создай недостающие "
-                "домены через memory_namespace_create с описанием из назначения; "
-                "актуальная карта — memory_namespaces"
+                f"namespace «{namespace}» is not registered; create the missing "
+                "domains via memory_namespace_create with a description from the purpose; "
+                "up-to-date map — memory_namespaces"
             )
         return normalized
 
@@ -209,9 +209,9 @@ class NamespaceService:
         normalized = self.validate_path(namespace)
         if not self.exists(normalized):
             raise NamespaceError(
-                f"неймспейс «{namespace}» не зарегистрирован; создай недостающие "
-                "домены через memory_namespace_create с описанием из назначения; "
-                "актуальная карта — memory_namespaces"
+                f"namespace «{namespace}» is not registered; create the missing "
+                "domains via memory_namespace_create with a description from the purpose; "
+                "up-to-date map — memory_namespaces"
             )
         if exact:
             return [normalized]
@@ -235,7 +235,7 @@ class NamespaceService:
         text = self.validate_description(description)
         if status not in ("confirmed", "provisional"):
             raise NamespaceValidationError(
-                f"status: ожидается confirmed|provisional, получено {status}"
+                f"status: expected confirmed|provisional, got {status}"
             )
         segments = normalized.split("/")
         with session(self._settings) as conn:
@@ -246,8 +246,8 @@ class NamespaceService:
                 ).fetchone()
                 if parent is None:
                     raise NamespaceError(
-                        f"родительский узел «{parent_path}» не зарегистрирован — "
-                        "сначала создай его"
+                        f"parent node «{parent_path}» is not registered — "
+                        "create it first"
                     )
             try:
                 with transaction(conn):
@@ -258,7 +258,7 @@ class NamespaceService:
                     )
             except sqlite3.IntegrityError as exc:
                 raise NamespaceError(
-                    f"узел «{normalized}» уже зарегистрирован"
+                    f"node «{normalized}» is already registered"
                 ) from exc
         return self.get(normalized)  # type: ignore[return-value]
 
@@ -281,7 +281,7 @@ class NamespaceService:
         """Сменить статус узла (confirm provisional-аудитом оператора)."""
         if status not in ("confirmed", "provisional"):
             raise NamespaceValidationError(
-                f"status: ожидается confirmed|provisional, получено {status}"
+                f"status: expected confirmed|provisional, got {status}"
             )
         normalized = self.validate_path(path)
         with session(self._settings) as conn, transaction(conn):
@@ -375,13 +375,13 @@ class NamespaceService:
         old_path = self.validate_path(old)
         new_path = self.validate_path(new)
         if old_path == DEFAULT_NAMESPACE or new_path == DEFAULT_NAMESPACE:
-            raise NamespaceError("default — системный узел, переименование запрещено")
+            raise NamespaceError("default — system node, renaming is forbidden")
         if old_path == new_path:
             return self.get(old_path)  # type: ignore[return-value]
         if not self.exists(old_path):
-            raise NamespaceError(f"узел «{old_path}» не зарегистрирован")
+            raise NamespaceError(f"node «{old_path}» is not registered")
         if self.exists(new_path):
-            raise NamespaceError(f"узел «{new_path}» уже зарегистрирован")
+            raise NamespaceError(f"node «{new_path}» is already registered")
         old_nodes = self.subtree_nodes(old_path)
         with session(self._settings) as conn:
             try:
@@ -429,7 +429,7 @@ class NamespaceService:
                     )
             except sqlite3.IntegrityError as exc:
                 raise NamespaceError(
-                    f"узел «{new_path}» уже зарегистрирован"
+                    f"node «{new_path}» is already registered"
                 ) from exc
         logging.getLogger("app").info(
             "namespace renamed",
@@ -456,17 +456,17 @@ class NamespaceService:
         source = self.validate_path(path)
         target = self.validate_path(into)
         if source == DEFAULT_NAMESPACE:
-            raise NamespaceError("default — системный узел, слияние запрещено")
+            raise NamespaceError("default — system node, merging is forbidden")
         if source == target:
-            raise NamespaceError("узел нельзя слить с самим собой")
+            raise NamespaceError("a node cannot be merged with itself")
         if "/" not in source:
             raise NamespaceError(
-                "сливается только лист; корень с детьми разбери по листьям"
+                "only a leaf is merged; a root with children — break down by leaves"
             )
         if not self.exists(source):
-            raise NamespaceError(f"узел «{source}» не зарегистрирован")
+            raise NamespaceError(f"node «{source}» is not registered")
         if not self.exists(target):
-            raise NamespaceError(f"узел «{target}» не зарегистрирован")
+            raise NamespaceError(f"node «{target}» is not registered")
         target_hint = target if "/" in target else None  # лист → путь цели; корень/default → NULL
         with session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
@@ -517,9 +517,9 @@ class NamespaceService:
         """
         normalized = self.validate_path(path)
         if normalized == DEFAULT_NAMESPACE:
-            raise NamespaceError("default — системный узел, удаление запрещено")
+            raise NamespaceError("default — system node, deletion is forbidden")
         if not self.exists(normalized):
-            raise NamespaceError(f"узел «{normalized}» не зарегистрирован")
+            raise NamespaceError(f"node «{normalized}» is not registered")
         with session(self._settings) as conn, transaction(conn):
             children = conn.execute(
                 "SELECT COUNT(*) FROM namespaces WHERE path LIKE ? || '/%'",
@@ -527,8 +527,8 @@ class NamespaceService:
             ).fetchone()[0]
             if children:
                 raise NamespaceError(
-                    f"узел «{normalized}» имеет детей ({children}) — "
-                    "разбери поддерево по листьям"
+                    f"node «{normalized}» has children ({children}) — "
+                    "break down the subtree by leaves"
                 )
             moved = 0
             if "/" in normalized:

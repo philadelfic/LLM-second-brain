@@ -166,7 +166,7 @@ class TestGet:
         """FR-3: пустой результат → мягкий ответ, ошибки нет."""
         result = service.get([42])
         assert result["notes"] == []
-        assert "не найдена" in result["hint"]
+        assert "were found" in result["hint"]
 
     def test_batch_size_enforced(self, service: NoteService) -> None:
         with pytest.raises(NoteValidationError, match="1..20"):
@@ -297,7 +297,7 @@ class TestUpdate:
         """FR-5: неизвестный id → «заметка не найдена» без исключения."""
         result = service.update(999, "Новый текст")
         assert result["updated"] is False
-        assert "не найдена" in result["hint"]
+        assert "not found" in result["hint"]
 
     def test_deleted_id_cannot_be_updated(self, service: NoteService) -> None:
         service.save("Удалим")
@@ -343,7 +343,7 @@ class TestDelete:
     def test_unknown_id_soft_answer(self, service: NoteService) -> None:
         result = service.delete(999)
         assert result["deleted"] is False
-        assert "не найдена" in result["hint"]
+        assert "not found" in result["hint"]
 
     def test_double_delete_is_idempotent_soft(
         self, service: NoteService
@@ -409,14 +409,14 @@ class TestSaveUpdateNamespace:
         (lsb-0005-07, FR-7): создать недостающие домены через
         memory_namespace_create — отдельная от save ручка."""
         msg = str(exc_info.value)
-        assert msg.startswith("неймспейс «nope» не зарегистрирован")
+        assert msg.startswith("namespace «nope» is not registered")
         assert "memory_namespace_create" in msg
         assert "memory_namespaces" in msg
 
     def test_save_unknown_namespace_raises(self, service: NoteService) -> None:
         with pytest.raises(NamespaceError, match="memory_namespace_create") as exc_info:
             service.save("в никуда", namespace="nope")
-        assert "неймспейс «nope» не зарегистрирован" in str(exc_info.value)
+        assert "namespace «nope» is not registered" in str(exc_info.value)
         assert "memory_namespace_create" in str(exc_info.value)
 
     def test_update_moves_namespace(self, service: NoteService) -> None:
@@ -435,7 +435,7 @@ class TestSaveUpdateNamespace:
         nid = service.save("есть в default")["id"]
         with pytest.raises(NamespaceError, match="memory_namespace_create") as exc_info:
             service.update(nid, "куда-то не туда", namespace="nope")
-        assert "неймспейс «nope» не зарегистрирован" in str(exc_info.value)
+        assert "namespace «nope» is not registered" in str(exc_info.value)
         assert "memory_namespace_create" in str(exc_info.value)
 
 
@@ -466,14 +466,14 @@ class TestSaveTitle:
         assert saved["stored"] is True
 
     def test_six_words_rejected_with_hint(self, service: NoteService) -> None:
-        with pytest.raises(NoteValidationError, match="задай title ≤5 слов"):
+        with pytest.raises(NoteValidationError, match="set a title ≤5 words"):
             service.save("текст", title="раз два три четыре пять шесть")
         with session(get_settings()) as conn:  # заметка НЕ создана
             assert conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 0
 
     def test_transport_none_title_rejected(self, service: NoteService) -> None:
         """Транспорт передал None (клиент не назвал заметку) → отказ."""
-        with pytest.raises(NoteValidationError, match="задай title ≤5 слов"):
+        with pytest.raises(NoteValidationError, match="set a title ≤5 words"):
             service.save("текст", title=None)
         with session(get_settings()) as conn:
             assert conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 0
@@ -490,7 +490,7 @@ class TestSaveTitle:
         клиенту-модели как есть (§5.3)."""
         with pytest.raises(TitleValidationError) as exc_info:
             service.save("текст", title="раз два три четыре пять шесть")
-        assert str(exc_info.value) == TITLE_HINT == "задай title ≤5 слов"
+        assert str(exc_info.value) == TITLE_HINT == "set a title ≤5 words"
 
     def test_direct_call_without_title_is_legacy(self, service: NoteService) -> None:
         """Прямой вызов save без title (сентинел) — легаси-путь миграции:
@@ -511,7 +511,7 @@ class TestSaveTitle:
         self, service: NoteService
     ) -> None:
         """Порядок проверок: невалидный title отказывает раньше namespace."""
-        with pytest.raises(NoteValidationError, match="задай title ≤5 слов"):
+        with pytest.raises(NoteValidationError, match="set a title ≤5 words"):
             service.save(
                 "текст", title="раз два три четыре пять шесть", namespace="nope"
             )
@@ -544,7 +544,7 @@ class TestUpdateTitle:
 
     def test_update_invalid_title_rejected(self, service: NoteService) -> None:
         service.save("текст", title="Название")
-        with pytest.raises(NoteValidationError, match="задай title ≤5 слов"):
+        with pytest.raises(NoteValidationError, match="set a title ≤5 words"):
             service.update(1, "новый текст", title="раз два три четыре пять шесть")
         with session(get_settings()) as conn:  # заметка не тронута
             row = conn.execute("SELECT title, text FROM notes WHERE id=1").fetchone()
@@ -641,7 +641,7 @@ class TestGetChunk:
     def test_missing_note_is_soft(self, service: NoteService) -> None:
         res = service.get_chunk(999999, chunk=0)
         assert res["chunks"] == []
-        assert "не найдена" in res["hint"]
+        assert "not found" in res["hint"]
 
     def test_short_note_has_one_chunk(self, service: NoteService) -> None:
         """FR-6: total_chunks >= 1 даже для однострочной заметки."""
@@ -673,7 +673,7 @@ class TestGetChunk:
         res = service.get_chunk(note_id, chunk=5)
         assert res["chunks"] == []
         assert res["total_chunks"] == 1
-        assert "chunk вне диапазона" in res["hint"]
+        assert "chunk out of range" in res["hint"]
 
     def test_limit_too_large_rejected(self, service: NoteService) -> None:
         note_id = service.save(text="текст", title="т")["id"]
@@ -692,7 +692,7 @@ class TestGetChunk:
         note_id = service.save(text=long_text(9000), title="свежая")["id"]
         res = service.get_chunk(note_id, query="что-то")
         assert res["chunks"] == []
-        assert "довекторизованных" in res["hint"]
+        assert "vectorized" in res["hint"]
 
     def test_query_returns_relevant_chunk(self, service: NoteService) -> None:
         note_id = service.save(
@@ -859,7 +859,7 @@ class TestUpdateMetadata:
         """Невалидный title (длиннее 5 слов) при правке без text →
         TitleValidationError; заметка не тронута."""
         nid = service.save("текст", title="Название")["id"]
-        with pytest.raises(TitleValidationError, match="задай title ≤5 слов"):
+        with pytest.raises(TitleValidationError, match="set a title ≤5 words"):
             service.update(nid, title="раз два три четыре пять шесть")
         with session(get_settings()) as conn:
             row = conn.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()

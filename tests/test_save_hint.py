@@ -48,7 +48,7 @@ class TestForeignDuplicateHint:
         assert second["stored"] is True
         assert second["id"] != first["id"]
         assert "work" in second["hint"]
-        assert "блокирует" in second["hint"]
+        assert "blocked" in second["hint"]
 
     def test_normalized_duplicate_gives_hint(self, settings) -> None:
         """«Почти дословный» дубль (регистр/пробелы) — тоже hint."""

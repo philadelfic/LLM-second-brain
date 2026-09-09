@@ -85,7 +85,7 @@ MAX_READ_CHUNKS = 3  # lsb-0003: максимум чанков за один mem
 
 # Название заметки (Фаза 11, решение №9): клиент-модель называет заметку при
 # записи; отсутствие/невалидность — отказ записи с этим hint (§5.3).
-TITLE_HINT = "задай title ≤5 слов"
+TITLE_HINT = "set a title ≤5 words"
 
 # Сентинел «title не передан»: прямой вызов NoteService.save без транспорта
 # (миграция, скрипты, тесты) — легаси-путь, заметка пишется с title=NULL
@@ -238,8 +238,8 @@ class NoteService:
                 foreign = self._dedup.find_by_text(text, namespace=None, conn=conn)
                 if foreign is not None:
                     foreign_hint = (
-                        f"похожее есть в «{foreign['namespace']}»; запись сюда не "
-                        "блокирует — меж-узловые дубли легитимны"
+                        f"a similar one exists in «{foreign['namespace']}»; writing here is not "
+                        "blocked — cross-node duplicates are legitimate"
                     )
                 note_id = self._insert(
                     conn, text, author, vector_status="pending", namespace=ns,
@@ -302,8 +302,8 @@ class NoteService:
         """
         if not 1 <= len(ids) <= self._settings.max_get_batch:
             raise NoteValidationError(
-                f"ids: ожидается 1..{self._settings.max_get_batch} id, "
-                f"получено {len(ids)}"
+                f"ids: expected 1..{self._settings.max_get_batch} id, "
+                f"got {len(ids)}"
             )
         wanted = list(dict.fromkeys(ids))  # порядок запроса, без дублей
         placeholders = ",".join("?" * len(wanted))
@@ -320,8 +320,8 @@ class NoteService:
         if not notes:
             return {
                 "notes": [],
-                "hint": "ни одна из запрошенных заметок не найдена "
-                "(возможно, удалены); обзор — memory_list",
+                "hint": "none of the requested notes were found "
+                "(possibly deleted); browse — memory_list",
             }
         return {"notes": notes}
 
@@ -344,11 +344,11 @@ class NoteService:
         """
         if not 1 <= limit <= MAX_READ_CHUNKS:
             raise NoteValidationError(
-                f"limit: ожидается 1..{MAX_READ_CHUNKS}, получено {limit}"
+                f"limit: expected 1..{MAX_READ_CHUNKS}, got {limit}"
             )
         if query is not None and chunk is not None:
             raise NoteValidationError(
-                "передай либо query (по смыслу), либо chunk (по номеру) — не оба"
+                "pass either query (by meaning) or chunk (by number) — not both"
             )
         with session(self._settings) as conn:
             row = conn.execute(
@@ -358,7 +358,7 @@ class NoteService:
         if row is None:
             return {
                 "chunks": [],
-                "hint": "заметка не найдена (возможно, удалена); обзор — memory_list",
+                "hint": "note not found (possibly deleted); browse — memory_list",
             }
         text = row["text"]
         with session(self._settings) as conn:
@@ -378,8 +378,8 @@ class NoteService:
                 return {
                     "chunks": [],
                     "total_chunks": total_chunks,
-                    "hint": "нет довекторизованных чанков — попробуй позже "
-                    "или прочитай заметку целиком (без query/chunk)",
+                    "hint": "no vectorized chunks — try later or read the note "
+                    "in full (without query/chunk)",
                 }
             items = [
                 {"chunk_index": idx, "text": text_by_idx[idx]} for idx in ranked
@@ -390,8 +390,8 @@ class NoteService:
                 return {
                     "chunks": [],
                     "total_chunks": total_chunks,
-                    "hint": f"chunk вне диапазона: 0..{total_chunks - 1}; "
-                    "для чтения дальше используй следующий номер чанка",
+                    "hint": f"chunk out of range: 0..{total_chunks - 1}; "
+                    "to read further use the next chunk number",
                 }
             selected = sorted(
                 idx for idx in range(chunk, min(chunk + limit, total_chunks))
@@ -424,10 +424,10 @@ class NoteService:
         limit = self._settings.default_list_limit if limit is None else limit
         if not 1 <= limit <= MAX_LIST_LIMIT:
             raise NoteValidationError(
-                f"limit: ожидается 1..{MAX_LIST_LIMIT}, получено {limit}"
+                f"limit: expected 1..{MAX_LIST_LIMIT}, got {limit}"
             )
         if offset < 0:
-            raise NoteValidationError(f"offset: ожидается ≥ 0, получено {offset}")
+            raise NoteValidationError(f"offset: expected ≥ 0, got {offset}")
         ns_nodes = self._namespaces.filter_nodes(namespace, namespace_exact)
         if ns_nodes is not None:
             ns_ph = ",".join("?" * len(ns_nodes))
@@ -464,12 +464,12 @@ class NoteService:
             for row in rows
         ]
         if not items and offset == 0:
-            return {"items": [], "total": total, "hint": "память пуста"}
+            return {"items": [], "total": total, "hint": "memory is empty"}
         if not items:
             return {
                 "items": [],
                 "total": total,
-                "hint": "страница за пределом памяти: offset ≥ total; уменьши offset",
+                "hint": "page beyond the memory: offset ≥ total; reduce offset",
             }
         return {"items": items, "total": total}
 
@@ -654,7 +654,7 @@ class NoteService:
             return {
                 "id": note_id,
                 "deleted": False,
-                "hint": "заметка не найдена (возможно, уже удалена)",
+                "hint": "note not found (possibly already deleted)",
             }
         return {"id": note_id, "deleted": True}
 
@@ -791,7 +791,7 @@ class NoteService:
         return {
             "id": note_id,
             "updated": False,
-            "hint": "заметка не найдена (возможно, удалена)",
+            "hint": "note not found (possibly deleted)",
         }
 
     def _validated_save_title(self, title: str | None) -> str | None:
@@ -830,8 +830,8 @@ class NoteService:
         """1..MAX_NOTE_CHARS — доменное правило REQUIREMENTS FR-4/FR-5."""
         if not 1 <= len(text) <= self._settings.max_note_chars:
             raise NoteValidationError(
-                "text: длина должна быть 1.."
-                f"{self._settings.max_note_chars} символов, получено {len(text)}"
+                "text: length must be 1.."
+                f"{self._settings.max_note_chars} characters, got {len(text)}"
             )
 
     def _full_note(self, row: sqlite3.Row) -> dict[str, Any]:

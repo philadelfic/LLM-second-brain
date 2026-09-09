@@ -182,7 +182,7 @@ class TestFileMechanics:
 
     def test_judge_file_wins_over_builtin(self, tmp_path: pathlib.Path) -> None:
         """Судья дедупа читается из файла (с маркерами) — поверх встроенного."""
-        custom = "Ты судья. Скажи: ДУБЛЬ или НЕ ДУБЛЬ. Без воды."
+        custom = "You are the judge. Say: DUPLICATE or NOT DUPLICATE. No fluff."
         (tmp_path / "judge_system.txt").write_text(custom, encoding="utf-8")
         registry = PromptRegistry(prompts_dir=tmp_path)
         assert registry.judge_system == custom
@@ -209,9 +209,9 @@ class TestJudgeSystemValidation:
     ) -> None:
         """Файл с текстом, но без «ДУБЛЬ»/«НЕ ДУБЛЬ» → фатальный ConfigError."""
         (tmp_path / "judge_system.txt").write_text(
-            "Ты просто сравниваешь тексты.", encoding="utf-8"
+            "You just compare texts.", encoding="utf-8"
         )
-        with pytest.raises(ConfigError, match="ДУБЛЬ"):
+        with pytest.raises(ConfigError, match="DUPLICATE"):
             PromptRegistry(prompts_dir=tmp_path)
 
     def test_file_without_dubl_marker_is_fatal(
@@ -220,9 +220,9 @@ class TestJudgeSystemValidation:
         """Есть «НЕ ДУБЛЬ», но нет «ДУБЛЬ» → тоже фатально (см. judge._verdict:
         сначала ищется «НЕ ДУБЛЬ»; «ДУБЛЬ» отдельно требуется для вердикта True)."""
         (tmp_path / "judge_system.txt").write_text(
-            "Отвечай: НЕ ДУБЛЬ.", encoding="utf-8"
+            "Answer: NOT DUPLICATE.", encoding="utf-8"
         )
-        with pytest.raises(ConfigError, match="ДУБЛЬ"):
+        with pytest.raises(ConfigError, match="DUPLICATE"):
             PromptRegistry(prompts_dir=tmp_path)
 
     def test_file_with_only_marker_word_ne_dubl_is_not_enough(
@@ -231,16 +231,16 @@ class TestJudgeSystemValidation:
         """Слово «НЕ ДУБЛЬ» содержит подстроку «ДУБЛЬ» — но проверка требует
         оба маркера как отдельные токены текста; одного слова мало."""
         (tmp_path / "judge_system.txt").write_text(
-            "Ты отвечаешь только: НЕ ДУБЛЬ.", encoding="utf-8"
+            "You answer only: NOT DUPLICATE.", encoding="utf-8"
         )
-        with pytest.raises(ConfigError, match="ДУБЛЬ"):
+        with pytest.raises(ConfigError, match="DUPLICATE"):
             PromptRegistry(prompts_dir=tmp_path)
 
     def test_validation_applies_to_builtin_too(self) -> None:
         """Встроенный judge_system валиден (содержит оба маркера)."""
         registry = PromptRegistry()
-        assert "ДУБЛЬ" in registry.judge_system
-        assert "НЕ ДУБЛЬ" in registry.judge_system
+        assert "DUPLICATE" in registry.judge_system
+        assert "NOT DUPLICATE" in registry.judge_system
 
     def test_error_names_file_source(self, tmp_path: pathlib.Path) -> None:
         """Сообщение об ошибке называет источник (файл), а не встроенный текст."""

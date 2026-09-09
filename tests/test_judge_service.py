@@ -34,7 +34,7 @@ def make_settings(monkeypatch: pytest.MonkeyPatch, **env: str):
     return settings
 
 
-def ok_body(content: str = "**ДУБЛЬ**\n\nОбе заметки про покупку молока.") -> dict:
+def ok_body(content: str = "**DUPLICATE**\n\nBoth notes are about buying milk.") -> dict:
     """Штатный ответ судьи /api/chat (поле thinking присутствует — пустое или
     нет, не читаем; при think:false Ollama его вообще не возвращает)."""
     return {
@@ -99,7 +99,7 @@ def test_judge_false_on_not_duplicate(monkeypatch) -> None:
     settings = make_settings(monkeypatch)
     service, _ = make_service(
         settings,
-        [httpx.Response(200, json=ok_body("**НЕ ДУБЛЬ**\n\nЗаметки о разном."))],
+        [httpx.Response(200, json=ok_body("**NOT DUPLICATE**\n\nNotes about different things."))],
     )
     assert service.judge(TEXT_NEW, TEXT_CANDIDATE) is False
     assert service.last_attempt_ok is True
@@ -110,7 +110,7 @@ def test_verdict_without_markdown_bold(monkeypatch) -> None:
     """Ответ без markdown-жирного и с хвостом-пояснением парсится тоже."""
     settings = make_settings(monkeypatch)
     service, _ = make_service(
-        settings, [httpx.Response(200, json=ok_body("ДУБЛЬ: смысл идентичен."))]
+        settings, [httpx.Response(200, json=ok_body("DUPLICATE: meaning identical."))]
     )
     assert service.judge(TEXT_NEW, TEXT_CANDIDATE) is True
     service.close()
@@ -120,7 +120,7 @@ def test_verdict_is_case_insensitive(monkeypatch) -> None:
     """Регистр безразличен: модель может ответить не строго."""
     settings = make_settings(monkeypatch)
     service, _ = make_service(
-        settings, [httpx.Response(200, json=ok_body("не дубль — разные события"))]
+        settings, [httpx.Response(200, json=ok_body("not duplicate — different events"))]
     )
     assert service.judge(TEXT_NEW, TEXT_CANDIDATE) is False
     service.close()
@@ -155,11 +155,11 @@ def test_messages_system_prompt_and_marked_texts(monkeypatch) -> None:
     payload = last_payload(recorder)
     messages = payload["messages"]
     assert messages[0]["role"] == "system"
-    assert "дублями" in messages[0]["content"]
-    assert "ДУБЛЬ или НЕ ДУБЛЬ" in messages[0]["content"]
+    assert "duplicates" in messages[0]["content"]
+    assert "DUPLICATE or NOT DUPLICATE" in messages[0]["content"]
     assert messages[1] == {
         "role": "user",
-        "content": "ТЕКСТ 1:\n" + TEXT_NEW + "\n\nТЕКСТ 2:\n" + TEXT_CANDIDATE,
+        "content": "TEXT 1:\n" + TEXT_NEW + "\n\nTEXT 2:\n" + TEXT_CANDIDATE,
     }
 
 
@@ -298,7 +298,7 @@ def test_verdict_less_content_raises(monkeypatch) -> None:
         settings,
         [httpx.Response(200, json=ok_body("Не могу определить, разные ли тексты."))],
     )
-    with pytest.raises(JudgeError, match="не дал вердикт"):
+    with pytest.raises(JudgeError, match="no verdict"):
         service.judge(TEXT_NEW, TEXT_CANDIDATE)
     assert service.last_attempt_ok is False
 

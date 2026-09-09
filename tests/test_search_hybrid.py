@@ -164,7 +164,7 @@ def test_degraded_fts_only_with_warning(dim8) -> None:
     result = searcher.search("внедрить backup кластера")
     assert [hit["id"] for hit in result["results"]] == [1]
     assert result["warning"]
-    assert "семантик" in result["warning"]
+    assert "semantics" in result["warning"]
     assert all(hit["cosine"] is None for hit in result["results"])
     assert result["warning"] == WARNING_FTS_ONLY
 

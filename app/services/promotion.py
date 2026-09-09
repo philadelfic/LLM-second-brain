@@ -327,27 +327,27 @@ class StructureJudgeService:
 
     @staticmethod
     def _parse(content: str) -> Verdict:
-        """Разбор отметки СОЗДАТЬ / СЛИТЬ <path> / ОТКЛОНИТЬ.
+        """Разбор отметки CREATE / MERGE <path> / REJECT.
 
-        Markdown-жирный стрипается, регистр не учитывается. «СЛИТЬ» требует
+        Markdown-жирный стрипается, регистр не учитывается. «MERGE» требует
         узла-цели в ответе: путь извлекается из исходного content (не из
         upper) регэкспом слагов; без пути — отказ (недоопределённый вердикт
         не превращаем в создание). Ответ без отметки — StructureJudgeError.
         """
         upper = " ".join(content.replace("*", " ").upper().split())
-        if "ОТКЛОНИТЬ" in upper:
+        if "REJECT" in upper:
             return Verdict("reject")
-        if "СЛИТЬ" in upper:
+        if "MERGE" in upper:
             match = VERDICT_PATH_RE.search(content.replace("*", ""))
             if match is None:
                 raise StructureJudgeError(
-                    f"вердикт СЛИТЬ без узла-цели: {content[:120]}"
+                    f"MERGE verdict without target node: {content[:120]}"
                 )
             return Verdict("merge", match.group(0))
-        if "СОЗДАТЬ" in upper:
+        if "CREATE" in upper:
             return Verdict("create")
         raise StructureJudgeError(
-            f"судья структуры не дал вердикт СОЗДАТЬ/СЛИТЬ/ОТКЛОНИТЬ: {content[:120]}"
+            f"structure judge gave no verdict CREATE/MERGE/REJECT: {content[:120]}"
         )
 
 

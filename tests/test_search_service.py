@@ -198,14 +198,14 @@ class TestEmptyAndValidation:
         searcher, _notes_service = service
         result = searcher.search("нетакогослова")
         assert result["results"] == []
-        assert "переформулируй" in result["hint"]
+        assert "rephrase" in result["hint"]
 
     def test_all_words_too_short_hint(self, service) -> None:
         """Отдельный hint: каждое слово <3 символов."""
         searcher, _notes_service = service
         result = searcher.search("и а б")
         assert result["results"] == []
-        assert "3 символов" in result["hint"]
+        assert "3 characters" in result["hint"]
 
     def test_query_length_validated(self, service) -> None:
         searcher, _ = service

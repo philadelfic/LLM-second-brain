@@ -142,7 +142,7 @@ class TestHandshake:
         # (§5.7, слой 1 ориентирования). База — префикс; карта зависит от
         # реестра на момент сборки.
         assert result.instructions.startswith(SERVER_INSTRUCTIONS)
-        assert "Карта узлов (path: description)" in result.instructions
+        assert "Node map (path: description)" in result.instructions
         assert result.protocol_version  # версия согласована при handshake
 
     @pytest.mark.asyncio
@@ -213,7 +213,7 @@ class TestToolsList:
     async def test_save_update_schema(self, server_url: str) -> None:
         """Контракты FR-4/FR-5: text 1..MAX_NOTE_CHARS (35000), id обязателен;
         title (Фаза 11, решение №9) — опционален в схеме: отказ за сервисом
-        (fail+hint «задай title ≤5 слов»), не схемой. lsb-0004-01: text в
+        (fail+hint «set a title ≤5 words»), не схемой. lsb-0004-01: text в
         memory_update стал опционален (можно править title/summary/namespace
         без перезаписи текста) — обязателен только id.
         """
@@ -428,7 +428,7 @@ class TestMemoryFlow:
                 await session.call_tool("memory_get", {"ids": [1, 2], "chunk": 0})
             ).structured_content
         assert got["chunks"] == []
-        assert "по одному id" in got["hint"]
+        assert "single id" in got["hint"]
 
     @pytest.mark.asyncio
     async def test_limit_without_query_refused(self, server_url: str) -> None:
@@ -450,7 +450,7 @@ class TestMemoryFlow:
                 )
             ).structured_content
         assert got["chunks"] == []
-        assert "не оба" in got["hint"]
+        assert "not both" in got["hint"]
 
     @pytest.mark.asyncio
     async def test_search_returns_no_full_text(self, server_url: str) -> None:
@@ -626,7 +626,7 @@ class TestMemoryFlow:
                 "memory_search", {"query": "неттакогословафффф"}
             )).structured_content
         assert found["results"] == []
-        assert "переформулируй" in found["hint"]
+        assert "rephrase" in found["hint"]
         assert "warning" not in found
 
     @pytest.mark.asyncio
@@ -657,7 +657,7 @@ class TestMemoryFlow:
         assert set(listed) == {"items", "total", "hint"}
         assert listed["items"] == []
         assert listed["hint"] == (
-            "страница за пределом памяти: offset ≥ total; уменьши offset"
+            "page beyond the memory: offset ≥ total; reduce offset"
         )
 
     @pytest.mark.asyncio
@@ -680,7 +680,7 @@ class TestMemoryFlow:
 class TestTitleMCP:
     """Фаза 11 (решение №9): title в save/update и выдачах — по живому серверу.
 
-    Отказ save без title / с длиннее 5 слов — fail+hint «задай title ≤5 слов»,
+    Отказ save без title / с длиннее 5 слов — fail+hint «set a title ≤5 words»,
     заметка не создаётся; title в search/list; в get — НЕТ; update —
     перезапись валидного, сохранение при отсутствии.
     """
@@ -700,7 +700,7 @@ class TestTitleMCP:
             after = (await session.call_tool(
                 "memory_list", {"limit": 1}
             )).structured_content
-        assert saved == {"stored": False, "hint": "задай title ≤5 слов"}
+        assert saved == {"stored": False, "hint": "set a title ≤5 words"}
         assert after["total"] == before["total"]  # заметка не создана
 
     @pytest.mark.asyncio
@@ -711,7 +711,7 @@ class TestTitleMCP:
                 "memory_save", {"text": f"{self.marker}: длинное название",
                                 "title": "раз два три четыре пять шесть"}
             )).structured_content
-        assert saved == {"stored": False, "hint": "задай title ≤5 слов"}
+        assert saved == {"stored": False, "hint": "set a title ≤5 words"}
 
     @pytest.mark.asyncio
     async def test_save_five_word_title_stored_and_visible(self, server_url: str) -> None:
@@ -773,7 +773,7 @@ class TestTitleMCP:
                 "memory_list", {"limit": 20}
             )).structured_content
         assert upd["updated"] is False
-        assert upd["hint"] == "задай title ≤5 слов"
+        assert upd["hint"] == "set a title ≤5 words"
         item = next(i for i in listed["items"] if i["id"] == note_id)
         assert item["summary"].startswith(f"{self.marker}: апдейт плохого названия")
 
@@ -822,7 +822,7 @@ class TestNamespaceMCP:
                                 "title": "В неизвестный узел",
                                 "namespace": "nope"}
             )).structured_content
-        assert saved == {"stored": False, "hint": "неймспейс «nope» не зарегистрирован; создай недостающие домены через memory_namespace_create с описанием из назначения; актуальная карта — memory_namespaces"}
+        assert saved == {"stored": False, "hint": "namespace «nope» is not registered; create the missing domains via memory_namespace_create with a description from the purpose; up-to-date map — memory_namespaces"}
 
     @pytest.mark.asyncio
     async def test_search_unregistered_namespace_gives_hint(
@@ -995,7 +995,7 @@ class TestNamespaceCreateMCP:
                  "description": "Лист без корня."},
             )).structured_content
         assert res["created"] is False
-        assert "родитель" in res["hint"]
+        assert "parent" in res["hint"]
 
     @pytest.mark.asyncio
     async def test_create_duplicate_fails_with_hint(self, ns_url: str) -> None:
@@ -1012,7 +1012,7 @@ class TestNamespaceCreateMCP:
                 {"path": path, "description": "Другое описание."},
             )).structured_content
         assert second["created"] is False
-        assert "уже" in second["hint"]
+        assert "already" in second["hint"]
 
     @pytest.mark.asyncio
     async def test_create_rejects_empty_description(self, ns_url: str) -> None:
@@ -1023,7 +1023,7 @@ class TestNamespaceCreateMCP:
                 {"path": f"{self.marker}-empty", "description": ""},
             )).structured_content
         assert res["created"] is False
-        assert "пуст" in res["hint"]
+        assert "empty" in res["hint"]
 
     @pytest.mark.asyncio
     async def test_create_rejects_too_long_description(self, ns_url: str) -> None:
@@ -1035,7 +1035,7 @@ class TestNamespaceCreateMCP:
                  "description": "Первое. Второе. Третье."},
             )).structured_content
         assert res["created"] is False
-        assert "предложени" in res["hint"]
+        assert "sentences" in res["hint"]
 
     @pytest.mark.asyncio
     async def test_create_rejects_depth4(self, ns_url: str) -> None:
@@ -1046,7 +1046,7 @@ class TestNamespaceCreateMCP:
                 {"path": "a/b/c/d", "description": "Слишком глубоко."},
             )).structured_content
         assert res["created"] is False
-        assert "уровней" in res["hint"]
+        assert "levels" in res["hint"]
 
 class TestNamespaceCreateAntiseonymy:
     """lsb-0005-06 (FR-6): антисинонимия при создании — косинус-предфильтр
@@ -1124,7 +1124,7 @@ class TestNamespaceCreateAntiseonymy:
             {"path": "work2",
              "description": "Рабочие заметки. Подпроекты в листьях."},
         )).structured_content
-        assert res == {"created": False, "hint": "есть похожий: work"}
+        assert res == {"created": False, "hint": "there is a similar one: work"}
 
     @pytest.mark.asyncio
     async def test_unrelated_description_creates(self, mcp_fake) -> None:
@@ -1179,7 +1179,7 @@ class TestNamespaceCreateAntiseonymy:
              "description": "Сервисы HR и зарплаты."},
         )).structured_content
         assert res["created"] is False
-        assert res["hint"] == "есть похожий: work"
+        assert res["hint"] == "there is a similar one: work"
 
     @pytest.mark.asyncio
     async def test_embedding_failure_still_creates(self, mcp_fail) -> None:
@@ -1243,11 +1243,11 @@ class TestFailLogging:
                 "memory_save", {"text": "x", "title": "раз два три четыре пять шесть"}
             )
         assert result.structured_content == {
-            "stored": False, "hint": "задай title ≤5 слов",
+            "stored": False, "hint": "set a title ≤5 words",
         }
         fail = _tool_fail_records(caplog, "memory_save")
         assert fail
-        assert fail[-1].reason == "задай title ≤5 слов"
+        assert fail[-1].reason == "set a title ≤5 words"
         assert fail[-1].latency_ms >= 0
 
     @pytest.mark.asyncio
@@ -1306,11 +1306,11 @@ class TestFailLogging:
         assert first.structured_content["created"] is True
         assert first.structured_content["path"] == "failns"
         assert duplicate.structured_content == {
-            "created": False, "hint": "узел «failns» уже зарегистрирован",
+            "created": False, "hint": "node «failns» is already registered",
         }
         fail = _tool_fail_records(caplog, "memory_namespace_create")
         assert fail
-        assert "уже зарегистрирован" in fail[-1].reason
+        assert "already registered" in fail[-1].reason
         assert fail[-1].latency_ms >= 0
 
 
@@ -1345,7 +1345,7 @@ class TestInstructionsBudget:
         assert SERVER_INSTRUCTIONS in instructions
         # Фаза 11 (решение №9): правило названий вшито в базу инструкций.
         assert "title" in SERVER_INSTRUCTIONS
-        assert "≤5 слов" in SERVER_INSTRUCTIONS
+        assert "≤5 words" in SERVER_INSTRUCTIONS
         assert "- work: Рабочие заметки. Подпроекты — в листьях." in instructions
         assert "- projects: Личные проекты. Сайт-резюме." in instructions
         assert "- work/sbos2020: СУБО 2020: сервисы HR." in instructions
