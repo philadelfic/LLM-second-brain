@@ -5,6 +5,53 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-09-09
+
+Release 2.2 — «Облегчение жизни моделям»: моделям проще находить заметку по
+названию, управлять формой поиска/листинга одной ручкой, экономить контекст
+и читать понятные промпты.
+
+### Added
+
+- **Title index + title search** (lsb-0001, №2): `notes.title` включён в
+  векторный индекс (векторизуется title+text) и в полнотекстовый индекс
+  `notes_fts`; заметку можно найти по названию.
+- **Unified search & list** (lsb-0001, №6): один метод поиска с параметрами
+  `memory_search(mode=semantic|title)` и один метод листинга
+  `memory_list(detail=titles|summaries)`; путь (namespace) показывается во
+  всех выдачах.
+- **Chunk reading** (lsb-0003, №16): `memory_get(id, query?, chunk?, limit?)`
+  — чтение заметки целиком (как раньше) или нужного чанка по смысловому
+  запросу (`query`) либо по индексу с пагинацией (`chunk`/`limit`); мягкие
+  отказы при `query+chunk` вместе и `chunk` вне диапазона.
+- **Metadata edit without text** (lsb-0004, №5): `memory_update` может менять
+  `title`/`summary`/`namespace` без перезаписи текста; `summary` сохраняется
+  как есть (не перегенерируется).
+- **Temporary storage (TTL)** (lsb-0004, №3): при записи можно указать
+  `expires_at`; просроченные заметки удаляются фоновой зачисткой
+  (`note_expirations`).
+- **Namespace depth 3 + model-created namespaces** (lsb-0005, №7/№9/№10):
+  максимальная вложенность увеличена с 2 до 3; модели создают узлы любого
+  уровня через `memory_namespace_create` (с обязательным описанием);
+  антисинонимия при создании узла; аудит автогенерированных описаний.
+- **English canon for model-facing texts** (lsb-0006, №17): все промпты,
+  подсказки и instructions переведены на английский канон и переписаны на
+  понятность (описания инструментов, хинты мягких отказов, манифест).
+
+### Fixed
+
+- **lsbdef-0001** (№21): флаки живых тестов классификатора/суммаризации —
+  парсер JSON извлекает валидный JSON из ответов, обёрнутых в теги
+  thinking/response.
+- **lsbdef-0002** (№20): стабилизирован флаки-тест параллельности серверов
+  (`test_servers_are_independent`).
+- **lsbdef-0003** (№24): E2E-скрипт lsb-0005 обновлён под EN-хинты после
+  перевода.
+- **lsbdef-0004** (№25): флаки живых тестов из-за недетерминизма судьи
+  структуры — ретрай до 3 попыток.
+- **lsbdef-0005** (№26): обрыв MCP-сессии под фоновой нагрузкой —
+  MCP-таймауты (30 c connect/write/pool, 300 c read) в E2E-скриптах.
+
 ## [2.1.1] - 2026-09-05
 
 ### Fixed
