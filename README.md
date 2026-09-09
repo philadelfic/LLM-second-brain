@@ -57,10 +57,6 @@ first-run walkthrough (compose, token, Open WebUI, `/health`).
 - [Configuration](docs/CONFIG.md) — every environment variable (v2.1), the
   prompt files, and the `OLLAMA_KEEP_ALIVE` note.
 - [Changelog](CHANGELOG.md) — release history (Keep a Changelog).
-- Engineering documentation (REQUIREMENTS, ARCHITECTURE — goals, contracts,
-  architecture; internal, in Russian) — maintained in the team's Outline wiki:
-  [REQUIREMENTS](https://outline.phil/doc/requirements-siwPUXqvNK),
-  [ARCHITECTURE](https://outline.phil/doc/architecture-4vktqbAXdr).
 
 ## Operational notes
 
