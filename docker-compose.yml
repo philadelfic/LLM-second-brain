@@ -53,7 +53,7 @@ services:
       #     (summary_system, summary_merge_system, judge_system) are created
       #     if missing; existing files are NOT overwritten; an empty file
       #     falls back to the built-in default; judge_system must contain
-      #     the "ДУБЛЬ"/"НЕ ДУБЛЬ" markers (otherwise fatal startup error) ---
+      #     judge verdict markers (otherwise fatal startup error) ---
       PROMPTS_DIR: "/app/prompts"
       # --- chunked indexing (Phase 7): note vectors are per-chunk ---
       TEXT_SPLITTER: "tiktoken"              # token splitter; encoding fixed: cl100k_base (cache baked into the image)

@@ -1,7 +1,7 @@
 [project]
 name = "llm-second-brain"
 version = "2.2.1"
-description = "Self-hosted MCP-сервер долговременной памяти для LLM (LLM Second Brain)"
+description = "Self-hosted long-term memory MCP server for LLMs (LLM Second Brain)"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi==0.141.1",
@@ -10,7 +10,7 @@ dependencies = [
     "httpx==0.28.1",
     "pydantic-settings==2.14.2",
     "sqlite-vec==0.1.6",
-    "tiktoken==0.14.0",  # Фаза 7: токен-сплиттер чанков (encoding cl100k_base)
+    "tiktoken==0.14.0",  # Phase 7: chunk token splitter (encoding cl100k_base)
 ]
 
 [project.optional-dependencies]
@@ -30,5 +30,5 @@ include = ["app*"]
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
-    "integration: живые интеграционные тесты (Ollama); при недоступности сервера — SKIP",
+    "integration: live integration tests (Ollama); SKIP if the server is unavailable",
 ]
