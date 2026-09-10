@@ -260,8 +260,8 @@ class TestJudgeSystemValidation:
     def test_fatal_message_has_remediation_hint(
         self, tmp_path: pathlib.Path
     ) -> None:
-        """FATAL при отсутствии маркеров содержит remediation-подсказку
-        (lsbdef-0006): удалить файл для пересоздания сида или вернуть маркеры."""
+        """FATAL on missing markers carries a remediation hint
+        (lsbdef-0006): delete the file to re-seed or restore the markers."""
         (tmp_path / "judge_system.txt").write_text(
             "You just compare texts.", encoding="utf-8"
         )
@@ -272,12 +272,12 @@ class TestJudgeSystemValidation:
         assert "add both markers" in msg
 
 
-# --- авто-миграция сида (lsbdef-0006) --------------------------------------
+# --- seed auto-migration (lsbdef-0006) -------------------------------------
 
 
 class TestSeedAutoMigration:
     def test_legacy_ru_seed_migrated(self, tmp_path: pathlib.Path) -> None:
-        """Установка v2.1.x: RU-сид без seed_meta.json → авто-миграция на EN."""
+        """v2.1.x install: RU seed without seed_meta.json → auto-migrated to EN."""
         (tmp_path / "judge_system.txt").write_text(
             JUDGE_SYSTEM_PROMPT_V21, encoding="utf-8"
         )
@@ -285,10 +285,10 @@ class TestSeedAutoMigration:
             SUMMARY_SYSTEM_PROMPT_V21, encoding="utf-8"
         )
         registry = PromptRegistry(prompts_dir=tmp_path)
-        # Финальные тексты — текущий EN-канон.
+        # Final texts — the current EN canon.
         assert registry.judge_system == PromptRegistry().judge_system
         assert registry.summary_system == PromptRegistry().summary_system
-        # Файлы перезаписаны EN-каноном.
+        # Files rewritten with the EN canon.
         assert (tmp_path / "judge_system.txt").read_text(
             encoding="utf-8"
         ) == PromptRegistry().judge_system
@@ -299,8 +299,8 @@ class TestSeedAutoMigration:
     def test_meta_stamped_unmodified_seed_migrated(
         self, tmp_path: pathlib.Path
     ) -> None:
-        """Файл, засеянный нами и не менявшийся (хэш в seed_meta.json), при
-        устаревшей версии штампа → авто-миграция на текущий канон."""
+        """A file seeded by us and unchanged (hash in seed_meta.json), with
+        an outdated stamp version → auto-migrated to the current canon."""
         (tmp_path / "judge_system.txt").write_text(
             JUDGE_SYSTEM_PROMPT_V21, encoding="utf-8"
         )
@@ -318,8 +318,8 @@ class TestSeedAutoMigration:
         ) == PromptRegistry().judge_system
 
     def test_edited_file_not_migrated(self, tmp_path: pathlib.Path) -> None:
-        """Правленый оператором файл (не совпадает ни с одним известным сидом)
-        не перезаписывается — FATAL остаётся честным сигналом."""
+        """An operator-edited file (matching no known seed) is
+        not rewritten — FATAL remains an honest signal."""
         custom = (
             "Custom operator prompt with DUPLICATE and NOT DUPLICATE markers."
         )
@@ -331,9 +331,9 @@ class TestSeedAutoMigration:
         ) == custom
 
     def test_current_seed_not_rewritten(self, tmp_path: pathlib.Path) -> None:
-        """Файл, уже равный текущему канону, не перезаписывается (no-op)."""
-        PromptRegistry(prompts_dir=tmp_path)  # первый старт: seed
+        """A file already equal to the current canon is not rewritten (no-op)."""
+        PromptRegistry(prompts_dir=tmp_path)  # first start: seed
         before = (tmp_path / "judge_system.txt").read_text(encoding="utf-8")
-        PromptRegistry(prompts_dir=tmp_path)  # повторный старт
+        PromptRegistry(prompts_dir=tmp_path)  # second start
         after = (tmp_path / "judge_system.txt").read_text(encoding="utf-8")
         assert after == before == PromptRegistry().judge_system
