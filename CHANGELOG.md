@@ -7,9 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.2.1] - 2026-09-10
 
-Patch release — «Обрыв апгрейда» (lsbdef-0006): обновление установки с v2.1.x
-до v2.2.x при наличии runtime-промптов (`prompts/`) предыдущего сида больше
-не валит контейнер в restart-loop.
+Patch release — upgrade break (lsbdef-0006): upgrading an install from v2.1.x
+to v2.2.x with runtime prompts (`prompts/`) from the previous seed no longer
+crashes the container into a restart-loop.
 
 ### Fixed
 
