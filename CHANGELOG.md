@@ -125,7 +125,7 @@ Release 2.2 — "Making life easier for models": notes are easier to find by tit
   (`summary_system`, `summary_merge_system`, `judge_system`) are seeded as
   files under `PROMPTS_DIR` when set; existing files are never overwritten;
   an empty file falls back to the built-in default; `judge_system` is
-  validated for the `ДУБЛЬ`/`НЕ ДУБЛЬ` markers at startup (fatal if missing).
+  validated for the judge markers (DUPLICATE / NOT DUPLICATE) at startup (fatal if missing).
 - **Note titles** (decision №9): `notes.title` (nullable); new notes require a
   title of ≤ 5 words (fail + hint otherwise); titles appear in `memory_search`
   and `memory_list` (not in `memory_get`); the worker back-fills titles for

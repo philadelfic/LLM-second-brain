@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Нагрузочный тест: воспроизводит обрыв MCP-соединения под нагрузкой.
+"""Load test: reproduces an MCP connection drop under load.
 
-Делает много namespace_create + save подряд, пока воркер параллельно
-векторизует/суммаризирует. Цель — поймать «SSE stream ended without a
-response» и понять, при каких условиях он возникает.
+Performs many namespace_create + save calls in a row while the worker
+vectorizes/summarizes in parallel. Goal: catch the "SSE stream ended without a
+response" error and understand under which conditions it occurs.
 """
 from __future__ import annotations
 import asyncio, json, os, sys, time
@@ -13,7 +13,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 
 MCP_URL = "http://localhost:8080/mcp"
-TOKEN = os.environ["MCP_AUTH_TOKEN"]  # Bearer-токен из окружения контейнера (секреты в git не коммитим)
+TOKEN = os.environ["MCP_AUTH_TOKEN"]  # Bearer token from the container env (secrets are never committed)
 
 def extract(result):
     sc = getattr(result, "structuredContent", None)
@@ -31,7 +31,7 @@ class Client:
         return extract(res)
 
 async def main():
-    # lsbdef-0005: MCP-таймауты (см. e2e_release22.py) вместо дефолтных 5 c read.
+    # lsbdef-0005: MCP timeouts (see e2e_release22.py) instead of the default 5s read.
     async with httpx2.AsyncClient(
         headers={"Authorization": f"Bearer {TOKEN}"},
         timeout=httpx2.Timeout(30.0, read=300.0),
@@ -55,7 +55,7 @@ async def main():
                         fail += 1
                         print(f"[{i}] {type(e).__name__}: {e}")
                         break
-                    # save тоже нагружает воркер
+                    # save also loads the worker
                     try:
                         await c.call("memory_save", {
                             "text": f"load note {i} with some body text to vectorize",

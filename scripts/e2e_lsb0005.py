@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""E2E lsb-0005 против тест-контура (MCP streamable HTTP).
+"""E2E lsb-0005 against the test contour (MCP streamable HTTP).
 
-Покрывает единый E2E фичи lsb-0005:
-  A. memory_namespace_create: создание узла любого уровня (корень/поддомен/подподдомен), confirmed.
-  B. антисинонимия: близкое описание (>0.90) → отказ с хинтом «есть похожий: <ближайший>».
-  C. save в созданный узел (глубина 3) → сохраняется.
-  D. save в несуществующий узел → ошибка + hint про memory_namespace_create.
-  E. default без вложенности: default/x → отказ.
+Covers the single E2E for the lsb-0005 feature:
+  A. memory_namespace_create: creating a node at any level (root/subdomain/sub-subdomain), confirmed.
+  B. anti-synonymy: a too-similar description (>0.90) → refusal with the hint "there is a similar one: <nearest>".
+  C. save into the created node (depth 3) → stored.
+  D. save into a non-existent node → error + hint about memory_namespace_create.
+  E. default has no nesting: default/x → refusal.
 
-Запуск: внутри контейнера lsb-test (docker exec), URL http://localhost:8080/mcp.
+Run: inside the lsb-test container (docker exec), URL http://localhost:8080/mcp.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 MCP_URL = "http://localhost:8080/mcp"
-TOKEN = os.environ["MCP_AUTH_TOKEN"]  # Bearer-токен из окружения контейнера (секреты в git не коммитим)
+TOKEN = os.environ["MCP_AUTH_TOKEN"]  # Bearer token from the container env (secrets are never committed)
 
 PASS = 0
 FAIL = 0
@@ -64,9 +64,9 @@ class Client:
 
 async def main() -> int:
     global PASS, FAIL
-    # lsbdef-0005: MCP-таймауты (30 c connect/write/pool, 300 c read) вместо
-    # дефолтных 5 c read httpx2: вызовы с эмбеддингом под фоновой нагрузкой
-    # воркера могут превышать 5 c (очередь Ollama) и рвать сессию.
+    # lsbdef-0005: MCP timeouts (30s connect/write/pool, 300s read) instead of
+    # the httpx2 default 5s read: calls with embedding under background worker
+    # load can exceed 5s (Ollama queue) and break the session.
     async with httpx2.AsyncClient(
         headers={"Authorization": f"Bearer {TOKEN}"},
         timeout=httpx2.Timeout(30.0, read=300.0),
@@ -76,85 +76,85 @@ async def main() -> int:
                 await session.initialize()
                 c = Client(session)
 
-                print("=== E2E lsb-0005: вложенность до 3 + создание узлов моделями ===\n")
+                print("=== E2E lsb-0005: nesting up to 3 + model-created nodes ===\n")
 
-                # ---------- A: memory_namespace_create (любой уровень) ----------
-                print("[A] memory_namespace_create: корень / поддомен / подподдомен")
+                # ---------- A: memory_namespace_create (any level) ----------
+                print("[A] memory_namespace_create: root / subdomain / sub-subdomain")
                 r = await c.call("memory_namespace_create", {
                     "path": "e2e5", "description": "E2E test domain for lsb-0005.",
                 })
-                check("создан корень e2e5 (confirmed)", r.get("created") is True,
+                check("root e2e5 created (confirmed)", r.get("created") is True,
                       f"path={r.get('path')} status={r.get('status')}")
-                check("корень имеет статус confirmed", r.get("status") == "confirmed",
+                check("root has status confirmed", r.get("status") == "confirmed",
                       f"status={r.get('status')}")
 
                 r = await c.call("memory_namespace_create", {
                     "path": "e2e5/sub", "description": "E2E subdomain under e2e5.",
                 })
-                check("создан поддомен e2e5/sub (глубина 2)", r.get("created") is True,
+                check("subdomain e2e5/sub created (depth 2)", r.get("created") is True,
                       f"path={r.get('path')}")
 
                 r = await c.call("memory_namespace_create", {
                     "path": "e2e5/sub/deep", "description": "E2E deep subdomain depth 3.",
                 })
-                check("создан подподдомен e2e5/sub/deep (глубина 3)", r.get("created") is True,
+                check("sub-subdomain e2e5/sub/deep created (depth 3)", r.get("created") is True,
                       f"path={r.get('path')}")
 
-                # ---------- E: default без вложенности ----------
-                print("\n[E] default без вложенности")
+                # ---------- E: default has no nesting ----------
+                print("\n[E] default has no nesting")
                 r = await c.call("memory_namespace_create", {
                     "path": "default/x", "description": "should be rejected.",
                 })
-                check("default/x → отказ (default без вложенности)",
+                check("default/x → refusal (no nesting under default)",
                       r.get("created") is False and "default" in (r.get("hint") or "").lower(),
                       f"hint={r.get('hint')}")
 
-                # ---------- B: антисинонимия ----------
-                print("\n[B] антисинонимия при создании (порог 0.90)")
+                # ---------- B: anti-synonymy ----------
+                print("\n[B] anti-synonymy on creation (threshold 0.90)")
                 r = await c.call("memory_namespace_create", {
                     "path": "e2e5/sub/deep2",
                     "description": "E2E deep subdomain depth 3.",
                 })
-                check("похожее описание → отказ с EN-хинтом «there is a similar one»",
+                check("similar description → refusal with the EN hint 'there is a similar one'",
                       r.get("created") is False and "there is a similar one" in (r.get("hint") or ""),
                       f"hint={r.get('hint')}")
-                check("хинт показывает ближайший узел",
+                check("hint names the nearest node",
                       "e2e5/sub/deep" in (r.get("hint") or ""),
                       f"hint={r.get('hint')}")
 
-                # ---------- C: save в созданный узел (глубина 3) ----------
-                print("\n[C] save в созданный узел глубины 3")
+                # ---------- C: save into the created node (depth 3) ----------
+                print("\n[C] save into a depth-3 node")
                 s = await c.call("memory_save", {
                     "text": "note placed into depth-3 namespace e2e5/sub/deep",
                     "title": "Depth3 Note",
                     "namespace": "e2e5/sub/deep",
                 })
                 nid = s.get("id")
-                check("заметка сохранена в e2e5/sub/deep", nid is not None, f"id={nid}")
+                check("note saved into e2e5/sub/deep", nid is not None, f"id={nid}")
                 li = await c.call("memory_list", {"limit": 50, "detail": "summaries"})
                 found = any(i.get("id") == nid and i.get("namespace") == "e2e5/sub/deep"
                             for i in li.get("items", []))
                 check("list: namespace = e2e5/sub/deep", found)
 
-                # ---------- D: save в несуществующий узел ----------
-                print("\n[D] save в несуществующий узел → ошибка + hint")
+                # ---------- D: save into a non-existent node ----------
+                print("\n[D] save into a non-existent node → error + hint")
                 r = await c.call("memory_save", {
                     "text": "should fail", "title": "Fail",
                     "namespace": "e2e5/nope",
                 })
-                check("save в несуществующий узел → не создан",
+                check("save into a non-existent node → not created",
                       r.get("id") is None and r.get("created") is not True)
                 hint = r.get("hint") or ""
-                check("hint упоминает memory_namespace_create",
+                check("hint mentions memory_namespace_create",
                       "memory_namespace_create" in hint, f"hint={hint}")
-                check("hint упоминает «is not registered»",
+                check("hint mentions 'is not registered'",
                       "is not registered" in hint, f"hint={hint}")
 
-                # ---------- итог ----------
-                print("\n=== ИТОГ ===")
+                # ---------- summary of results ----------
+                print("\n=== RESULT ===")
                 print(f"PASS: {PASS}, FAIL: {FAIL}")
                 if FAILURES:
-                    print("Проваленные сценарии:")
+                    print("Failed scenarios:")
                     for f in FAILURES:
                         print(f"  - {f}")
                 return 0 if FAIL == 0 else 1
