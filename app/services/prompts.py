@@ -8,8 +8,11 @@
   `judge_system`): при заданном `prompts_dir` выносятся в файлы
   (seed-if-missing — создаются с встроенным дефолтом как стартовым
   текстом) и правятся оператором без пересборки образа; существующие
-  файлы НЕ перезаписываются; пустой файл = встроенный дефолт; непустой
-  файл побеждает;
+  файлы НЕ перезаписываются, если они правлены оператором; пустой файл =
+  встроенный дефолт; непустой файл побеждает. Авто-миграция (lsbdef-0006):
+  файл, байт-в-байт равный засеянному ранее (seed_meta.json) или
+  известному legacy-сиду (LEGACY_SEEDS), перезаписывается текущим каноном
+  при смене версии сида;
 - **7 зашитых** (`merge_user`, `judge_user`, `classifier_system`,
   `describe_system`, `describe_user`, `structure_judge_system`,
   `structure_judge_user`): только константы в коде, файлами не создаются
@@ -30,6 +33,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -150,6 +155,51 @@ EDITABLE_PROMPTS: tuple[str, ...] = (
 
 _PROMPT_FILE_SUFFIX = ".txt"
 
+# Версия текущего канона промптов (штамп сида). Меняется при каждой смене
+# канона редактируемых промптов; используется для авто-миграции нетронутых
+# сидов старых версий (lsbdef-0006).
+SEED_VERSION = "2.2.1"
+
+# Имя sidecar-файла штампа сида в prompts_dir: версия + SHA-256 засеянного
+# содержимого по каждому редактируемому промпту.
+_SEED_META_FILENAME = "seed_meta.json"
+
+# --- Legacy-сиды (до введения штампа) --------------------------------------
+# RU-канон v2.1.x трёх редактируемых промптов (извлечён из git-истории,
+# коммит 227c110^, до lsb-0006). Установки, пережившие v2.1.x, имеют в
+# prompts/ эти файлы без seed_meta.json; авто-миграция распознаёт их как
+# нетронутые сиды и перезаписывает текущим каноном.
+SUMMARY_SYSTEM_PROMPT_V21 = (
+    "Сделай краткий пересказ заметки в 1–2 коротких и ёмких "
+    "предложениях, суммарно не длиннее 30 слов. Передай главную мысль "
+    "так, чтобы по этому сокращению было предельно понятно, о чём текст. "
+    "Без вступлений, кавычек и пояснений. Отвечай на языке заметки."
+)
+
+SUMMARY_MERGE_SYSTEM_PROMPT_V21 = (
+    "У тебя две версии одной заметки. Сведи их в единый текст: объедини "
+    "всю информацию обеих — факты, имена, числа, даты, статусы, конфиги "
+    "и пути; каждый факт скажи один раз, повторяющееся опусти. Ничего "
+    "не выбрасывай и не добавляй от себя. Пиши связно, без заголовков, "
+    "вступлений, кавычек и пояснений. Отвечай на языке заметок."
+)
+
+JUDGE_SYSTEM_PROMPT_V21 = (
+    "Ты проверяешь долговременную память на дубли. Определи, являются ли "
+    "два текста дублями: одна и та же мысль, пересказанная другими словами "
+    "(совпадение деталей важнее формы). Ответь строго одной отметкой: "
+    "ДУБЛЬ или НЕ ДУБЛЬ. Без пояснений."
+)
+
+# Имя промпта → известные старые сиды (для авто-миграции установок до
+# введения seed_meta.json). Файл, байт-в-байт равный одному из них, считается
+# нетронутым сидом старой версии и перезаписывается текущим каноном.
+LEGACY_SEEDS: dict[str, tuple[str, ...]] = {
+    "summary_system": (SUMMARY_SYSTEM_PROMPT_V21,),
+    "summary_merge_system": (SUMMARY_MERGE_SYSTEM_PROMPT_V21,),
+    "judge_system": (JUDGE_SYSTEM_PROMPT_V21,),
+}
+
 
 class PromptRegistry:
     """Встроенные константы всех 10 промптов + файловые переопределения.
@@ -248,27 +298,85 @@ class PromptRegistry:
         return self.prompts_dir / f"{name}{_PROMPT_FILE_SUFFIX}"
 
     def _load_files(self) -> None:
-        """Seed-if-missing трёх редактируемых + чтение непустых файлов.
+        """Seed-if-missing трёх редактируемых + авто-миграция устаревших сидов.
 
-        Существующие файлы НЕ перезаписываются никогда: файл, созданный на
-        прошлом старте или оператором вручную, остаётся как есть. Пустой
-        (в т.ч. пробельный) файл → встроенный дефолт; непустой → побеждает.
+        Существующие файлы НЕ перезаписываются, если они правлены оператором.
+        Авто-миграция (lsbdef-0006): файл, байт-в-байт равный засеянному
+        ранее (по seed_meta.json) или известному legacy-сиду (LEGACY_SEEDS),
+        считается нетронутым сидом старой версии и перезаписывается текущим
+        каноном. Правленый файл (не совпадает ни с одним известным сидом)
+        не трогается — FATAL остаётся честным сигналом. Пустой (в т.ч.
+        пробельный) файл → встроенный дефолт; непустой → побеждает.
         """
         directory = self.prompts_dir
         assert directory is not None
         directory.mkdir(parents=True, exist_ok=True)
+        meta = self._read_meta()
         for name in EDITABLE_PROMPTS:
             path = self._file_path(name)
             if not path.exists():
                 # Первый старт: создаём файл со встроенным дефолтом как
                 # стартовым текстом (текст уже в self._texts — перечитывать
-                # не нужно).
+                # не нужно) и фиксируем штамп сида.
                 path.write_text(self._texts[name], encoding="utf-8")
+                meta["files"][name] = self._hash(self._texts[name])
                 continue
             content = path.read_text(encoding="utf-8").strip()
-            if content:
-                self._texts[name] = content
-                self._file_overrides.add(name)
+            if not content:
+                # Пустой файл → встроенный дефолт (как раньше).
+                continue
+            if self._should_migrate(name, content, meta):
+                # Авто-миграция: нетронутый сид старой версии → текущий канон.
+                path.write_text(self._texts[name], encoding="utf-8")
+                meta["files"][name] = self._hash(self._texts[name])
+                continue
+            # Правленый/актуальный файл побеждает.
+            self._texts[name] = content
+            self._file_overrides.add(name)
+        meta["seed_version"] = SEED_VERSION
+        self._write_meta(meta)
+
+    # --- штамп сида (lsbdef-0006) ------------------------------------------
+
+    def _meta_path(self) -> Path:
+        assert self.prompts_dir is not None
+        return self.prompts_dir / _SEED_META_FILENAME
+
+    def _read_meta(self) -> dict:
+        """Чтение seed_meta.json; при отсутствии/повреждении — пустой штамп."""
+        path = self._meta_path()
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and isinstance(data.get("files"), dict):
+                    return data
+            except (json.JSONDecodeError, OSError):
+                pass
+        return {"seed_version": "", "files": {}}
+
+    def _write_meta(self, meta: dict) -> None:
+        self._meta_path().write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _hash(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _should_migrate(self, name: str, content: str, meta: dict) -> bool:
+        """Нужна ли авто-миграция файла на текущий канон.
+
+        True, если файл — нетронутый сид старой версии: либо засеян нами и
+        не менялся с тех пор (хэш совпадает с seed_meta.json) при устаревшей
+        версии штампа, либо байт-в-байт равен известному legacy-сиду.
+        """
+        recorded = meta["files"].get(name)
+        if recorded is not None and self._hash(content) == recorded:
+            # Файл не менялся с момента нашего seed.
+            return meta.get("seed_version") != SEED_VERSION
+        # Файл не засеян нами (legacy) — проверяем известные старые сиды.
+        return content in LEGACY_SEEDS.get(name, ())
 
     # --- валидация -----------------------------------------------------------
 
@@ -299,7 +407,9 @@ class PromptRegistry:
                 + f" (source: {origin}). Dedup verdicts are parsed by these "
                 "markers (judge._verdict); without them dedup would silently "
                 "stall on parser failures. Restore both markers — DUPLICATE "
-                "and NOT DUPLICATE — in the text."
+                "and NOT DUPLICATE — in the text. To re-seed from the built-in "
+                "default, delete the file and restart; or edit it to add both "
+                "markers."
             )
 
     @staticmethod

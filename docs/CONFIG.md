@@ -147,17 +147,23 @@ independently:
 Three system prompts are **editable** (Phase 11, decision №7). When
 `PROMPTS_DIR` is set, the service creates them on first start if they are
 missing (seeded with the built-in default as the starting text); existing
-files are **never** overwritten; an **empty** file falls back to the built-in
-default; a non-empty file wins:
+files are **never** overwritten unless they are an unmodified seed of an older
+version (auto-migrated to the current canon on upgrade, lsbdef-0006); an
+**empty** file falls back to the built-in default; a non-empty file wins:
 
 - `summary_system` — note summarization;
 - `summary_merge_system` — dedup merge (system);
 - `judge_system` — dedup verdict.
 
-The `judge_system` file **must** contain the markers `ДУБЛЬ` and `НЕ ДУБЛЬ`
-(the dedup verdicts are parsed by them). If they are missing, the service
-refuses to start with a clear message. The other seven prompts are hard-coded
-and never created as files.
+The `judge_system` file **must** contain the markers `DUPLICATE` and
+`NOT DUPLICATE` (the dedup verdicts are parsed by them). If they are missing,
+the service refuses to start with a clear message that also tells you how to
+recover (delete the file to re-seed, or add both markers). The other seven
+prompts are hard-coded and never created as files.
+
+The seed version is stamped in a sidecar `seed_meta.json` in the same
+directory; it is used to detect unmodified seeds of older versions and migrate
+them automatically. Do not edit it by hand.
 
 In compose, mount the directory and point `PROMPTS_DIR` at it:
 

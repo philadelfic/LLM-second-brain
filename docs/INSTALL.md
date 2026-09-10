@@ -100,6 +100,19 @@ curl -s http://localhost:8080/mcp \
 `tools/list` returns exactly the 7 `memory_*` tools; without or with a wrong
 token — `401`.
 
+## Upgrading
+
+When upgrading an existing install, the service **auto-migrates** editable
+prompt files (`prompts/`) that are byte-identical to a previously seeded or
+known legacy seed (v2.1.x RU canon): they are rewritten with the current canon
+on startup, so an upgrade from v2.1.x to v2.2.x needs no manual prompt work.
+
+Files **edited by hand** are never overwritten. If such a file no longer
+matches the current canon (e.g. a `judge_system.txt` missing the
+`DUPLICATE`/`NOT DUPLICATE` markers), the service refuses to start with a
+clear message. To fix: delete the file to re-seed it from the built-in default,
+or edit it to add both markers (see [Configuration](CONFIG.md) → Prompts).
+
 ## Operations
 
 - **Logs**: `docker compose logs -f second-brain` (one JSON line per event).

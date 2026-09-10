@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] - 2026-09-10
+
+Patch release — «Обрыв апгрейда» (lsbdef-0006): обновление установки с v2.1.x
+до v2.2.x при наличии runtime-промптов (`prompts/`) предыдущего сида больше
+не валит контейнер в restart-loop.
+
+### Fixed
+
+- **Auto-migration of prompt seeds** (lsbdef-0006): `PromptRegistry` now
+  stamps the seed version in a sidecar `seed_meta.json` and, on startup,
+  rewrites any editable prompt file that is byte-identical to a previously
+  seeded or known legacy seed (v2.1.x RU canon) with the current canon.
+  Operator-edited files are never overwritten.
+- **FATAL remediation hint**: the `ConfigError` for a `judge_system` file
+  missing the `DUPLICATE`/`NOT DUPLICATE` markers now tells the operator to
+  delete the file to re-seed, or to add both markers.
+
+### Changed
+
+- **Upgrade note**: when upgrading from v2.1.x, unmodified prompt files are
+  migrated automatically; files edited by hand must be updated to the new
+  canon manually (see [Installation](docs/INSTALL.md) → Upgrading).
+
 ## [2.2.0] - 2026-09-09
 
 Release 2.2 — «Облегчение жизни моделям»: моделям проще находить заметку по
