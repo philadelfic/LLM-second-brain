@@ -30,50 +30,25 @@ crashes the container into a restart-loop.
 
 ## [2.2.0] - 2026-09-09
 
-Release 2.2 — «Облегчение жизни моделям»: моделям проще находить заметку по
-названию, управлять формой поиска/листинга одной ручкой, экономить контекст
-и читать понятные промпты.
+Release 2.2 — "Making life easier for models": notes are easier to find by title, search and listing shape is controlled with a single knob, context is saved, and the prompts the model reads are clear.
 
 ### Added
 
-- **Title index + title search** (lsb-0001, №2): `notes.title` включён в
-  векторный индекс (векторизуется title+text) и в полнотекстовый индекс
-  `notes_fts`; заметку можно найти по названию.
-- **Unified search & list** (lsb-0001, №6): один метод поиска с параметрами
-  `memory_search(mode=semantic|title)` и один метод листинга
-  `memory_list(detail=titles|summaries)`; путь (namespace) показывается во
-  всех выдачах.
-- **Chunk reading** (lsb-0003, №16): `memory_get(id, query?, chunk?, limit?)`
-  — чтение заметки целиком (как раньше) или нужного чанка по смысловому
-  запросу (`query`) либо по индексу с пагинацией (`chunk`/`limit`); мягкие
-  отказы при `query+chunk` вместе и `chunk` вне диапазона.
-- **Metadata edit without text** (lsb-0004, №5): `memory_update` может менять
-  `title`/`summary`/`namespace` без перезаписи текста; `summary` сохраняется
-  как есть (не перегенерируется).
-- **Temporary storage (TTL)** (lsb-0004, №3): при записи можно указать
-  `expires_at`; просроченные заметки удаляются фоновой зачисткой
-  (`note_expirations`).
-- **Namespace depth 3 + model-created namespaces** (lsb-0005, №7/№9/№10):
-  максимальная вложенность увеличена с 2 до 3; модели создают узлы любого
-  уровня через `memory_namespace_create` (с обязательным описанием);
-  антисинонимия при создании узла; аудит автогенерированных описаний.
-- **English canon for model-facing texts** (lsb-0006, №17): все промпты,
-  подсказки и instructions переведены на английский канон и переписаны на
-  понятность (описания инструментов, хинты мягких отказов, манифест).
+- **Title index + title search** (lsb-0001): `notes.title` is included in the vector index (title+text are vectorized together) and in the full-text index `notes_fts`; a note can now be found by its title.
+- **Unified search & list** (lsb-0001): one search method with `memory_search(mode=semantic|title)` and one listing method `memory_list(detail=titles|summaries)`; the namespace path is shown in every output.
+- **Chunk reading** (lsb-0003): `memory_get(id, query?, chunk?, limit?)` — read a note in full (as before) or just the needed chunk, either by semantic query (`query`) or by index with pagination (`chunk`/`limit`); soft refusals when `query` and `chunk` are combined and when `chunk` is out of range.
+- **Metadata edit without text** (lsb-0004): `memory_update` can change `title`/`summary`/`namespace` without rewriting the text; `summary` is kept as is (not regenerated).
+- **Temporary storage (TTL)** (lsb-0004): `expires_at` can be set on save; expired notes are removed by background cleanup (`note_expirations`).
+- **Namespace depth 3 + model-created namespaces** (lsb-0005): maximum depth raised from 2 to 3; models create nodes at any level via `memory_namespace_create` (description required); anti-synonymy check on node creation; audit of auto-generated descriptions.
+- **English canon for model-facing texts** (lsb-0006): all prompts, hints and MCP instructions moved to an English canon and rewritten for clarity (tool descriptions, soft-refusal hints, instructions manifest).
 
 ### Fixed
 
-- **lsbdef-0001** (№21): флаки живых тестов классификатора/суммаризации —
-  парсер JSON извлекает валидный JSON из ответов, обёрнутых в теги
-  thinking/response.
-- **lsbdef-0002** (№20): стабилизирован флаки-тест параллельности серверов
-  (`test_servers_are_independent`).
-- **lsbdef-0003** (№24): E2E-скрипт lsb-0005 обновлён под EN-хинты после
-  перевода.
-- **lsbdef-0004** (№25): флаки живых тестов из-за недетерминизма судьи
-  структуры — ретрай до 3 попыток.
-- **lsbdef-0005** (№26): обрыв MCP-сессии под фоновой нагрузкой —
-  MCP-таймауты (30 c connect/write/pool, 300 c read) в E2E-скриптах.
+- **lsbdef-0001**: flaky live classifier/summarization tests — the JSON parser now extracts valid JSON from responses wrapped in thinking/response tags.
+- **lsbdef-0002**: stabilized the flaky server-independence test (`test_servers_are_independent`).
+- **lsbdef-0003**: the lsb-0005 E2E script updated for the EN hints after the translation.
+- **lsbdef-0004**: flaky live tests caused by structure-judge non-determinism — retry up to 3 attempts.
+- **lsbdef-0005**: MCP session drop under background load — MCP timeouts (30 s connect/write/pool, 300 s read) in the E2E scripts.
 
 ## [2.1.1] - 2026-09-05
 
