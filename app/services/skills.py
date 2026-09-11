@@ -19,6 +19,14 @@
   ОДНА транзакция (`transaction()`), полусостояние исключено. Архив не
   участвует ни в одной выдаче: `get`/`list` читают только `skills` и только
   активные строки.
+* **Антисинонимия создания (FR-5.2, lsb-0007-03):** при создании (без `id`)
+  текст кандидата (`name + description`) сверяется косинусом с активными
+  навыками — один батч `embed_texts`, L2-нормализация, порог
+  `SKILL_SYNONYM_SIMILARITY=0.90` → мягкий отказ `{created: False, hint}` с
+  дословным hint канона §3.8 (создание НЕ происходит); правка по `id`
+  префильтр не гоняет (иначе нельзя переименовать навык); отказ эмбеддера —
+  префильтр пропущен (создание проходит) + событие
+  `skills_antiseonymy_skipped` в логе. Механика — по образцу lsb-0005.
 * **Удаление мягкое** (`deleted_at`): повторный/несуществующий id → мягкий
   ответ с hint «skill not found…» (восстановление — оператором, ручки нет).
 * **Композит чтения** (`get`) собирается поверх глобального
@@ -32,6 +40,7 @@
 Контракты ответов (полные; MCP-слой срезает служебные поля белым списком —
 lsb-0007-03):
 - save (создание) → {id, created: True, version}
+- save (создание слишком похожего) → {created: False, hint}
 - save (правка)   → {id, updated: True, version}
 - save (правка несуществующего id) → {id, updated: False, hint}
 - get    → {id, name, description, example?, steps, text, instruction_template,
@@ -47,6 +56,8 @@ lsb-0007-03):
 from __future__ import annotations
 
 import json
+import logging
+import math
 import sqlite3
 from collections.abc import Callable
 from typing import Any
@@ -109,6 +120,13 @@ HINT_SEARCH_EMPTY = (
     "repeatable procedure, save it via skills_save"
 )
 
+# Антисинонимия создания (§3.8): подсказка ведёт к существующему навыку,
+# создание не происходит. Шаблон подставляет id и name ближайшего навыка.
+HINT_SIMILAR_SKILL = (
+    "there is a similar skill: {id} — {name}; reuse or update it "
+    "(skills_save with id=…) or make this skill clearly different"
+)
+
 # Hint'ы, которых таблица канона §3.8 не задаёт (канон описывает только
 # лимиты): обязательность полей формы, незнакомый ключ `extra`, значение
 # `mode` и лимит глобального шаблона. Стиль и язык — как у канонических.
@@ -119,6 +137,11 @@ HINT_MODE = "skill not saved: mode must be collaborative or autonomous"
 HINT_TEMPLATE_LIMIT = (
     "template not saved: instruction template limit is 1000 characters — shorten it"
 )
+
+
+def _l2_norm(vec: list[float]) -> float:
+    """Евклидова норма вектора (L2) — как `_l2_norm` промоушна/mcp.py."""
+    return math.sqrt(sum(value * value for value in vec))
 
 
 class SkillValidationError(ValueError):
@@ -134,15 +157,19 @@ class SkillsService:
     """CRUD области навыков: форма, архив версий, глобальный шаблон.
 
     DI: `settings` (лимиты формы), `embedding` (кодирование запроса
-    гибридного поиска — lsb-0007-02; антисинонимия создания — lsb-0007-04).
-    Синхронный путь записи кодировщик НЕ зовёт (субстрат §3.3): вектора
-    записи догоняет петля `areas` воркера по `vector_status='pending'`.
+    гибридного поиска — lsb-0007-02; антисинонимия создания — lsb-0007-03).
+    Тело навыка синхронный путь записи кодировщику НЕ отдаёт (субстрат
+    §3.3): вектора записи догоняет петля `areas` воркера по
+    `vector_status='pending'`; кодировщик в пути записи зовёт только
+    антисинонимия создания (текст `name + description` кандидата).
     """
 
     def __init__(self, settings: Settings, embedding: Embedder | None = None) -> None:
         self._settings = settings
         # DI для тестов: HashEmbedder/фейк с журналом вызовов вместо сети.
-        # Запись сервиса кодировщик не вызывает — держим как точку сборки.
+        # Тело навыка запись кодировщику не отдаёт (вектора догоняет петля
+        # areas); кодировщик в пути записи зовёт только антисинонимия
+        # создания (текст кандидата `name + description`).
         self._embedding: Embedder = (
             embedding if embedding is not None else EmbeddingService(settings)
         )
@@ -179,10 +206,13 @@ class SkillsService:
 
         Валидация формы — обязательна и идёт ДО любой записи: нарушение
         лимита/`extra` → `SkillValidationError` с дословным hint (§3.8).
-        Правка копирует прежнее содержимое в `skill_versions` и обновляет
-        строку одной транзакцией; `version` растёт на 1. Запись всегда
-        оставляет `vector_status='pending'` — вектора догоняет петля `areas`
-        (кодировщик в синхронном пути не вызывается).
+        Создание (без `id`) гоняет антисинонимию (FR-5.2, lsb-0007-03):
+        слишком похожий на активный навык кандидат → мягкий отказ
+        `{created: False, hint}` без записи; правка по `id` префильтр не
+        гоняет. Правка копирует прежнее содержимое в `skill_versions` и
+        обновляет строку одной транзакцией; `version` растёт на 1. Запись
+        всегда оставляет `vector_status='pending'` — вектора догоняет петля
+        `areas` (тело навыка в синхронном пути не кодируется).
         """
         checked_name = self._checked_field(
             "name", name, self._settings.skill_name_max_chars, HINT_NAME_LIMIT
@@ -202,6 +232,20 @@ class SkillsService:
         checked_example = self._checked_example(example)
         checked_extra = self._checked_extra(extra)
         if id is None:
+            # Антисинонимия создания (FR-5.2, arch §3.4): косинус текста
+            # кандидата (`name + description`) против активных навыков.
+            # Ближайший выше порога — мягкий отказ (записи нет), hint ведёт
+            # к правке существующего навыка; правка по `id` сюда не идёт.
+            similar = self._antiseonymy_nearest(checked_name, checked_description)
+            if similar is not None:
+                nearest_id, nearest_name, cosine = similar
+                if cosine > self._settings.skill_synonym_similarity:
+                    return {
+                        "created": False,
+                        "hint": HINT_SIMILAR_SKILL.format(
+                            id=nearest_id, name=nearest_name
+                        ),
+                    }
             result = self._create(
                 checked_name,
                 checked_description,
@@ -462,6 +506,67 @@ class SkillsService:
         return {"instruction_template": normalized, "updated": True}
 
     # --- внутреннее ---------------------------------------------------------
+
+    def _antiseonymy_nearest(
+        self, name: str, description: str
+    ) -> tuple[int, str, float] | None:
+        """Ближайший активный навык по косинусу текста `name + description`.
+
+        Механика — по образцу `_antiseonymy_nearest` (lsb-0005, mcp.py) и
+        `_nearest_node` промоушна: текст кандидата и тексты активных навыков
+        ОДНИМ батчем `embed_texts` (формат — `AreaSpec.embed_text`, тот же,
+        что у вектора области: `name + description`), L2-нормализация,
+        dot product = косинус (нечувствителен к масштабу провайдера).
+
+        Возврат `(id, name, cosine)` ближайшего или None: реестр активных
+        пуст / норма кандидата 0 / отказ эмбеддера — деградация NFR-3:
+        префильтр пропускается (создание проходит), в лог идёт событие
+        `skills_antiseonymy_skipped`. Порог сравнивает вызывающий (save).
+        """
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT id, name, description FROM skills "
+                "WHERE deleted_at IS NULL"
+            ).fetchall()
+        if not rows:
+            return None  # активных навыков нет — сравнивать не с чем
+        candidate = {"name": name, "description": description}
+        try:
+            vectors = self._embedding.embed_texts(
+                [SKILLS_AREA.embed_text(candidate)]
+                + [SKILLS_AREA.embed_text(row) for row in rows]
+            )
+        except Exception:
+            # Отказ эмбеддера не блокирует создание (прецедент lsb-0005):
+            # предфильтр пропущен, событие наблюдаемо в логе (NFR-4).
+            logging.getLogger("app").warning(
+                "skills_create: embedding failed — antiseonymy prefilter skipped",
+                extra={"event": "skills_antiseonymy_skipped"},
+            )
+            return None
+        candidate_vec, skill_vecs = vectors[0], vectors[1:]
+        candidate_norm = _l2_norm(candidate_vec)
+        if candidate_norm == 0.0:
+            return None
+        candidate_normed = [value / candidate_norm for value in candidate_vec]
+        best_index = -1
+        best_cosine = -1.0
+        for index, skill_vec in enumerate(skill_vecs):
+            skill_norm = _l2_norm(skill_vec)
+            if skill_norm == 0.0:
+                continue
+            cosine = sum(
+                left * right
+                for left, right in zip(
+                    candidate_normed, [value / skill_norm for value in skill_vec]
+                )
+            )
+            if cosine > best_cosine:
+                best_cosine, best_index = cosine, index
+        if best_index == -1:
+            return None  # все нормы нулевые — сравнивать нечего
+        nearest = rows[best_index]
+        return int(nearest["id"]), str(nearest["name"]), best_cosine
 
     @staticmethod
     def _required_hint(field: str) -> str:

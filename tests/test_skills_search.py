@@ -142,8 +142,17 @@ class TestSearchHybrid:
         assert other_id != skill_id  # второй навык существует — выбор осмыслен
 
     def test_top_k_default_and_truncation(self, service: SkillsService) -> None:
-        for index in range(3):
-            service.save(**form(name=f"Deploy routine {index}"))
+        # Описания разные: с антисинонимией создания (lsb-0007-03) три навыка
+        # с общим описанием — дубли, и создался бы только первый.
+        routines = [
+            "Publish nightly package",
+            "Roll out production release",
+            "Ship the beta build",
+        ]
+        for index, description in enumerate(routines):
+            service.save(
+                **form(name=f"Deploy routine {index}", description=description)
+            )
         assert len(service.search("deploy routine")["results"]) == 3
         assert len(service.search("deploy routine", top_k=2)["results"]) == 2
         assert len(service.search("deploy routine", top_k=1)["results"]) == 1

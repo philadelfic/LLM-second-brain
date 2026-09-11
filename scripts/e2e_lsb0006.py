@@ -114,8 +114,8 @@ async def main() -> int:
                 print("\n[B] Descriptions of the 8 tools in EN")
                 tools = await session.list_tools()
                 tool_map = {t.name: t for t in tools.tools}
-                check("exactly 8 tools",
-                      len(tool_map) == len(EXPECTED_TOOLS),
+                check("all 8 lsb-0006 tools present",
+                      EXPECTED_TOOLS <= set(tool_map),
                       f"got={sorted(tool_map)}")
                 missing = EXPECTED_TOOLS - set(tool_map)
                 check("all expected tools present", not missing,

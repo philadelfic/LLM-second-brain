@@ -1,8 +1,9 @@
 """Тесты MCP-поверхности (Фаза 1, Шаг 3) — против живого uvicorn-сервера.
 
 ARCHITECTURE §7 «MCP-поверхность»: handshake (включая поле instructions),
-tools/list → все 6, вызовы реальным MCP-клиентом, негативы токена, кастомный
-MCP_PATH. Сервер поднимается в subprocess на отдельных портах.
+tools/list → все 13 (8 ручек заметок/узлов + 5 области навыков, lsb-0007-03),
+вызовы реальным MCP-клиентом, негативы токена, кастомный MCP_PATH. Сервер
+поднимается в subprocess на отдельных портах.
 """
 
 from __future__ import annotations
@@ -155,10 +156,11 @@ class TestHandshake:
 
 class TestToolsList:
     @pytest.mark.asyncio
-    async def test_exactly_eight_memory_tools(self, server_url: str) -> None:
+    async def test_exactly_thirteen_tools(self, server_url: str) -> None:
+        """lsb-0007-03: поверхность = 8 ручек заметок/узлов + 5 области навыков."""
         async with connect(server_url) as session:
             tools = await session.list_tools()
-        assert len(tools.tools) == 8
+        assert len(tools.tools) == 13
         assert {tool.name for tool in tools.tools} == TOOL_NAMES
 
     @pytest.mark.asyncio

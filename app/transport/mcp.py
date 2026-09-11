@@ -1,4 +1,5 @@
-"""MCP-поверхность (ARCHITECTURE §3.1, §5): 7 инструментов `memory_*` + инструкции.
+"""MCP-поверхность (ARCHITECTURE §3.1, §5): 13 инструментов (8 `memory_*`
+заметок/узлов + 5 `skills_*` области навыков) + инструкции.
 
 `MCPServer` — официальный высокоуровневый API mcp SDK 2.x (ex-`FastMCP`).
 Фаза 2: инструменты вызывают тот же service-слой, что и REST (ARCH §1);
@@ -50,7 +51,18 @@ lsb-0005-06 (FR-6): антисинонимия при создании — пе�
 Для корня (depth 1) сравнение — против корней; для листа — против всех
 тематических узлов (тот же предфильтр, что `_nearest_node` промоушна, но
 порог 0.90 и без записи вердикта). Отказ эмбеддинга предфильтр пропускает
-(деградация: создание происходит)."""
+(деградация: создание происходит).
+
+lsb-0007-03 (релиз 3.0.0): 5 инструментов области навыков — `skills_search`,
+`skills_list`, `skills_get`, `skills_save`, `skills_delete` — тонкие обёртки
+над `SkillsService` (один код с REST-зеркалами §3.7). Описания — дословно
+канон arch lsb-0007 §3.8 (правило «перед рутинной задачей —
+`skills_search`/`skills_list`, тело — только `skills_get` вшито в тексты:
+инструкции MCP на OWUI не доходят, гарантированный канал — tools). Выдачи
+компактны (белые списки), `hint` — только при мягком отказе. Антисинонимия
+создания (FR-5.2) живёт в сервисном слое (`SkillsService.save`): её обязан
+звать и REST POST /skills, у сервиса уже есть DI-эмбеддер; транспорт лишь
+отдаёт мягкий отказ `{created: False, hint}`."""
 
 import asyncio
 import logging
@@ -72,6 +84,7 @@ from app.services.notes import (
     NoteValidationError,
     TitleValidationError,
 )
+from app.services.skills import SkillValidationError
 from app.storage.db import DEFAULT_NAMESPACE
 
 SERVER_NAME = "LLM Second Brain"
@@ -217,6 +230,49 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "similar a description is rejected with the hint «there is a similar "
         "one: <path>» — choose a different description/node. A node duplicate "
         "is also rejected with a hint."
+    ),
+    # lsb-0007-03: описания области навыков — дословно канон arch lsb-0007
+    # §3.8 (английский, править только в арх-доке). Правило-страховка
+    # «перед рутинной задачей — skills_search/skills_list, тело — только
+    # skills_get» вшито в тексты (инструкции MCP на OWUI не доходят —
+    # гарантированный канал только tools, §3.5).
+    "skills_search": (
+        "Search the skills area BEFORE doing a routine or repeatable task: "
+        "skills are stored procedures (how-to), kept separately from notes. "
+        "Empty result = there is no such skill — do not browse skills without "
+        "reason. Returns short hits (id, name, description); the full "
+        "procedure — only via skills_get."
+    ),
+    "skills_list": (
+        "List all available skills (id, name, description) — compact, without "
+        "bodies. Use it to see which routines this memory already has; many "
+        "conversations need no skills at all."
+    ),
+    "skills_get": (
+        "Read a full skill by id: name + description + example (if any) + "
+        "steps (the order) + text (what exactly each step does), composed over "
+        "the global instruction_template (how to execute steps). Follow it as "
+        "a procedure when the task matches its description; if a step cannot "
+        "be executed, stop and report what is missing instead of skipping it."
+    ),
+    "skills_save": (
+        "Create a new skill or update an existing one by id. A skill is a "
+        "stored procedure: name ≤65 characters (≤5 words recommended), "
+        "description ≤250 (what it does), steps ≤500 (the order: what after "
+        "what), text ≤4000 (what exactly each step does); optional example "
+        "≤1000 and optional class fields (trigger, mode, preconditions, "
+        "fallbacks, invariant, exceptions, guardrails, references, "
+        "output_contract, behavior_contract) — only when this skill class "
+        "needs them. Run skills_search first: if a similar skill exists, "
+        "update it instead of creating a duplicate (a too-similar creation is "
+        "refused with a hint). Read the skill via skills_get before editing; "
+        "every update keeps the previous version as a copy automatically."
+    ),
+    "skills_delete": (
+        "Delete a skill by id (soft delete: it disappears from search, list "
+        "and the skills announce; restoring is the operator's job). Delete "
+        "only a skill that is factually wrong, fully duplicates another one "
+        "or was created by mistake."
     ),
 }
 
@@ -422,9 +478,81 @@ def _compact_namespace_create(result: dict[str, Any]) -> dict[str, Any]:
     return {"created": True, **_pick(result, _NS_CREATE)}
 
 
+# lsb-0007-03: компактные выдачи области навыков — белые списки полей (§3.3).
+# Тело навыка в контекст попадает только через `skills_get` (экономия
+# контекста, §3.5): search/list несут лишь опознавательные поля. `score` в
+# search и `example` в get — soft-ключи: показываются только когда сервис их
+# отдал (гибрид области / необязательное поле формы). hint — только при
+# мягком отказе; warning сервиса срезается всегда.
+_SKILL_SEARCH_ITEM = ("id", "name", "description")
+_SKILL_LIST_ITEM = ("id", "name", "description")
+_SKILL_GET_ITEM = ("name", "description", "steps", "text", "instruction_template")
+
+
+def _skill_hit(row: dict[str, Any]) -> dict[str, Any]:
+    """Компактный хит skills_search: id/name/description (+score, если есть)."""
+    hit: dict[str, Any] = _pick(row, _SKILL_SEARCH_ITEM)
+    if row.get("score") is not None:
+        hit["score"] = row["score"]
+    return hit
+
+
+def _compact_skill_search(result: dict[str, Any]) -> dict[str, Any]:
+    """skills_search: {results: [{id, name, description, score?}], hint?}.
+
+    Пустой поиск — не fail сервиса, а мягкий ответ с дословным hint канона
+    §3.8 (проба: навыка нет — валидный исход).
+    """
+    out = {"results": [_skill_hit(row) for row in result["results"]]}
+    return _with_hint(out, result)  # warning не копируется никогда
+
+
+def _compact_skill_list(result: dict[str, Any]) -> dict[str, Any]:
+    """skills_list: {items: [{id, name, description}], total} — без тел."""
+    out = {"items": [_pick(item, _SKILL_LIST_ITEM) for item in result["items"]],
+           "total": result["total"]}
+    return _with_hint(out, result)
+
+
+def _compact_skill_get(result: dict[str, Any]) -> dict[str, Any]:
+    """skills_get: композит §3.1 — name/description/example?/steps/text/шаблон.
+
+    Не найден → `{hint}` канона §3.8 (композита нет: строки нет); `id` в
+    успешную выдачу не входит (модель уже знает id — экономия контекста),
+    `extra` тоже (полная запись — REST).
+    """
+    if "name" not in result:
+        return _with_hint({}, result)
+    out = _pick(result, _SKILL_GET_ITEM)
+    if result.get("example"):
+        out["example"] = result["example"]
+    return out
+
+
+def _compact_skill_save(result: dict[str, Any]) -> dict[str, Any]:
+    """skills_save: (id, version, created|updated); отказ — fail + hint.
+
+    Создание слишком похожего навыка (антисинонимия, §3.4) → `{created:
+    False, hint}` с hint канона; правка несуществующего id → `{id, updated:
+    False, hint}`.
+    """
+    if result.get("created"):
+        return _pick(result, ("id", "version", "created"))
+    if result.get("updated"):
+        return _pick(result, ("id", "version", "updated"))
+    if "created" in result:
+        return _with_hint({"created": False}, result)
+    return _with_hint({"id": result["id"], "updated": False}, result)
+
+
+def _compact_skill_delete(result: dict[str, Any]) -> dict[str, Any]:
+    """skills_delete: (id, deleted); повторный/чужой id → hint канона."""
+    return _with_hint(_pick(result, ("id", "deleted")), result)
+
+
 def build_mcp(settings: Settings, services: Services) -> MCPServer:
     """Собрать MCP-сервер: инструкции (§5.1, база + карта неймспейсов) +
-    7 инструментов над сервисами.
+    13 инструментов (8 `memory_*` + 5 `skills_*`) над сервисами.
 
     Сигнатуры и ограничения параметров — контракты REQUIREMENTS §5.1/§5.7;
     значения по умолчанию (DEFAULT_TOP_K, DEFAULT_LIST_LIMIT) — из env.
@@ -915,5 +1043,171 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             node=result["path"],
         )
         return _compact_namespace_create(result)
+
+    # --- область навыков (lsb-0007-03, arch §3.3–3.4) ------------------------
+    # Тонкие обёртки над `SkillsService` (один код с REST-зеркалами §3.7):
+    # блокирующие вызовы — в `asyncio.to_thread`, выдачи — белые списки,
+    # hint — только при мягком отказе. Антисинонимия создания живёт в
+    # сервисе (её обязан звать и REST POST /skills), транспорт лишь отдаёт
+    # `{created: False, hint}` как есть: `_compact_skill_save`.
+
+    @mcp.tool(name="skills_search", description=TOOL_DESCRIPTIONS["skills_search"])
+    async def skills_search(
+        query: Annotated[
+            str,
+            Field(
+                description="Task wording: what you are about to do",
+                min_length=1,
+                max_length=settings.max_query_chars,
+            ),
+        ],
+        top_k: Annotated[
+            int,
+            Field(description="Number of results", ge=1, le=20),
+        ] = settings.default_top_k,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            result = await asyncio.to_thread(services.skills.search, query, top_k)
+        except SkillValidationError as exc:
+            # Мягкий отказ (fail + hint): запрос/top_k вне домена области.
+            log_tool_call(
+                "skills_search",
+                started,
+                failed=True,
+                reason=str(exc),
+                query=preview(query),
+            )
+            return {"results": [], "hint": str(exc)}
+        # Пустой результат — валидный исход пробы (hint канона в выдаче),
+        # не fail: событие несёт число хитов и признак FTS-only деградации.
+        log_tool_call(
+            "skills_search",
+            started,
+            results=len(result["results"]),
+            top_k=top_k,
+            query=preview(query),
+            fts_only=bool(result.get("warning")),
+        )
+        return _compact_skill_search(result)
+
+    @mcp.tool(name="skills_list", description=TOOL_DESCRIPTIONS["skills_list"])
+    async def skills_list() -> dict[str, Any]:
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.skills.list)
+        log_tool_call("skills_list", started, results=len(result["items"]))
+        return _compact_skill_list(result)
+
+    @mcp.tool(name="skills_get", description=TOOL_DESCRIPTIONS["skills_get"])
+    async def skills_get(
+        id: Annotated[int, Field(description="Skill id")],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.skills.get, id)
+        if "hint" in result:
+            # Мягкий отказ: навыка нет (мягко — возможно, удалён).
+            log_tool_call(
+                "skills_get", started, failed=True, reason=result["hint"], id=id
+            )
+        else:
+            log_tool_call("skills_get", started, results=1, id=id)
+        return _compact_skill_get(result)
+
+    @mcp.tool(name="skills_save", description=TOOL_DESCRIPTIONS["skills_save"])
+    async def skills_save(
+        name: Annotated[
+            str,
+            Field(description="Skill name: ≤65 characters (≤5 words recommended)"),
+        ],
+        description: Annotated[
+            str,
+            Field(description="What it does: ≤250 characters"),
+        ],
+        steps: Annotated[
+            str,
+            Field(description="The order: what after what: ≤500 characters"),
+        ],
+        text: Annotated[
+            str,
+            Field(description="What exactly each step does: ≤4000 characters"),
+        ],
+        id: Annotated[
+            int | None,
+            Field(description="Skill id to update; omitted — create a new skill"),
+        ] = None,
+        example: Annotated[
+            str | None,
+            Field(description="Optional example: ≤1000 characters"),
+        ] = None,
+        extra: Annotated[
+            dict[str, str] | None,
+            Field(
+                description="Optional class fields (trigger, mode, preconditions, "
+                "fallbacks, invariant, exceptions, guardrails, references, "
+                "output_contract, behavior_contract; each ≤500 characters, "
+                "together ≤2000) — only when this skill class needs them",
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        # Лимиты формы валидирует СЕРВИС (не схема — как title у заметок):
+        # нарушение → SkillValidationError с дословным hint канона §3.8.
+        # Приватность (NFR-4): в лог идут длины, не содержимое.
+        started = time.perf_counter()
+        sizes = {
+            "name_chars": len(name),
+            "description_chars": len(description),
+            "steps_chars": len(steps),
+            "text_chars": len(text),
+        }
+        try:
+            result = await asyncio.to_thread(
+                services.skills.save,
+                id=id,
+                name=name,
+                description=description,
+                steps=steps,
+                text=text,
+                example=example,
+                extra=extra,
+            )
+        except SkillValidationError as exc:
+            log_tool_call(
+                "skills_save", started, failed=True, reason=str(exc), id=id, **sizes
+            )
+            if id is None:
+                return {"created": False, "hint": str(exc)}
+            return {"id": id, "updated": False, "hint": str(exc)}
+        if result.get("created") or result.get("updated"):
+            log_tool_call(
+                "skills_save",
+                started,
+                results=1,
+                id=result["id"],
+                version=result["version"],
+                **sizes,
+            )
+        else:
+            # Мягкий отказ сервиса: дубль (антисинонимия) или правка
+            # несуществующего id — навык не записан, hint ведёт к решению.
+            log_tool_call(
+                "skills_save", started, failed=True, reason=result["hint"],
+                id=id, **sizes,
+            )
+        return _compact_skill_save(result)
+
+    @mcp.tool(name="skills_delete", description=TOOL_DESCRIPTIONS["skills_delete"])
+    async def skills_delete(
+        id: Annotated[int, Field(description="Skill id")],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.skills.delete, id)
+        if result.get("deleted"):
+            log_tool_call("skills_delete", started, id=id, deleted=True)
+        else:
+            # Повторный/несуществующий id — мягкий отказ с hint канона.
+            log_tool_call(
+                "skills_delete", started, failed=True, reason=result["hint"], id=id
+            )
+        return _compact_skill_delete(result)
 
     return mcp
