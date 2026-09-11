@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from fakes import clear_seeded_skills
 
 from app.config import Settings, get_settings
 from app.services.embedding import EmbeddingError
@@ -87,8 +88,13 @@ def embedder() -> RecordingEmbedder:
 
 @pytest.fixture
 def service(settings: Settings, embedder: RecordingEmbedder) -> SkillsService:
-    """SkillsService над инициализированной БД (без сети, DI-эмбеддер)."""
+    """SkillsService над инициализированной БД (без сети, DI-эмбеддер).
+
+    Сид skill-создателя (lsb-0007-04) снимаем: пул 01 проверяет форму,
+    версии и удаление на пустом реестре.
+    """
     init_db(settings)
+    clear_seeded_skills(settings)
     return SkillsService(settings, embedder)
 
 

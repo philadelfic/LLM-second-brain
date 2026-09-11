@@ -308,6 +308,39 @@ INSTRUCTION_TEMPLATE_SEED = (
     "improvising."
 )
 
+# Сид skill-создателя (lsb-0007 §3.6/§3.8): запись `skills` — процедура «как
+# создавать навыки», тексты дословно канон арх-доки §3.8 (в доке разбиты на
+# строки по ~80 симв. — это вёрстка, строки склеены пробелами, как у
+# INSTRUCTION_TEMPLATE_SEED). `extra` пуст, `vector_status='pending'` — вектор
+# догоняет петля `areas` воркера (субстрат §3.3).
+# Маркер сида в `skills_meta` пишется при первой попытке сида: пока он есть,
+# init_db сид НЕ воскрешает — удаление навыка оператором или моделью остаётся
+# осмысленным (маркер живёт в БД дольше мягко удалённой строки).
+CREATOR_SKILL_SEED_KEY = "creator_skill_seed"
+CREATOR_SKILL_SEED_VALUE = "seeded"
+CREATOR_SKILL_NAME = "Create skills"
+CREATOR_SKILL_DESCRIPTION = "How to add or update a skill in this memory"
+CREATOR_SKILL_STEPS = (
+    "1) search for a similar skill; 2) name and description; 3) steps and "
+    "text; 4) save; 5) read back and check."
+)
+CREATOR_SKILL_TEXT = (
+    "1) Call skills_search with the task wording: a similar skill exists → "
+    "update it (skills_save with id), never create a duplicate. 2) name ≤65 "
+    "characters (≤5 words recommended); description ≤250 — what the procedure "
+    "does. 3) steps ≤500 — the order (what after what); text ≤4000 — what "
+    "exactly each step does (result/format/rule); keep the \"how to execute\" "
+    "wording in the global instruction_template, never duplicate it per skill. "
+    "4) Optional class fields (trigger, mode, preconditions, fallbacks, "
+    "invariant, exceptions, guardrails, references, output_contract, "
+    "behavior_contract) and example (≤1000) — only when this skill class needs "
+    "them. 5) skills_save, then skills_get to check that the procedure reads "
+    "as a ready-to-execute routine. 6) Self-improvement: when you are sure a "
+    "skill can be improved, propose the exact edit (what and why) and ask the "
+    "user for approval; apply it only after approval — the server keeps the "
+    "previous version as a copy automatically."
+)
+
 # Частичный UNIQUE (lsb-0008 §3.3): ключ термина (term_norm + context_norm)
 # уникален только среди АКТИВНЫХ записей — soft-deleted строку ключ не держит
 # (удалённый ключ освобождается, «undo — оператором»).
@@ -575,6 +608,9 @@ def init_db(settings: Settings) -> None:
             # Сид глобального шаблона навыков (lsb-0007 §3.8): сразу после
             # создания skills_meta, идемпотентно, существующее не трогаем.
             _ensure_skills_meta(conn)
+            # Сид skill-создателя (lsb-0007 §3.6/§3.8): сразу после шаблона,
+            # идемпотентно, с маркером в skills_meta (удалённый — не воскреснет).
+            _ensure_creator_skill(conn)
             # Вектора (Фаза 3 + решение 2026-08-29; Фаза 7: + вектора чанков):
             # создание при первом старте; при несовпадении зафиксированной
             # конфигурации (модель/размерность) с env — полная автореиндексация
@@ -745,6 +781,43 @@ def _ensure_skills_meta(conn: sqlite3.Connection) -> None:
         "INSERT INTO skills_meta (key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO NOTHING",
         (INSTRUCTION_TEMPLATE_KEY, INSTRUCTION_TEMPLATE_SEED),
+    )
+
+
+def _ensure_creator_skill(conn: sqlite3.Connection) -> None:
+    """Сид skill-создателя области навыков (lsb-0007 §3.6/§3.8), идемпотентно.
+
+    Сид — ОДНА попытка на жизнь БД (маркер `creator_skill_seed` в
+    `skills_meta`): пока маркера нет и активной записи с именем
+    `CREATOR_SKILL_NAME` нет — навык вставляется; маркер пишется в любом
+    случае, когда сид проходит гейт. Так повторный init_db (рестарт сервиса)
+    не плодит копий, а удалённый оператором или моделью сид НЕ воскресает
+    (мягко удалённая строка остаётся в trash, маркер — в skills_meta).
+    """
+    seeded = conn.execute(
+        "SELECT 1 FROM skills_meta WHERE key = ?", (CREATOR_SKILL_SEED_KEY,)
+    ).fetchone()
+    if seeded is not None:
+        return
+    exists = conn.execute(
+        "SELECT 1 FROM skills WHERE name = ? AND deleted_at IS NULL",
+        (CREATOR_SKILL_NAME,),
+    ).fetchone()
+    if exists is None:
+        conn.execute(
+            "INSERT INTO skills (name, description, steps, text, extra, "
+            "version, vector_status) VALUES (?, ?, ?, ?, NULL, 1, 'pending')",
+            (
+                CREATOR_SKILL_NAME,
+                CREATOR_SKILL_DESCRIPTION,
+                CREATOR_SKILL_STEPS,
+                CREATOR_SKILL_TEXT,
+            ),
+        )
+    conn.execute(
+        "INSERT INTO skills_meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO NOTHING",
+        (CREATOR_SKILL_SEED_KEY, CREATOR_SKILL_SEED_VALUE),
     )
 
 

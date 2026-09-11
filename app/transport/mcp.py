@@ -68,8 +68,10 @@ import asyncio
 import logging
 import math
 import time
+from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
 
+from mcp.server.context import ServerRequestContext
 from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
@@ -152,8 +154,137 @@ def _namespace_map(services: Services) -> str:
 
 
 def build_instructions(services: Services) -> str:
-    """Полный текст инструкций: база + правило неймспейсов + карта реестра."""
-    return SERVER_INSTRUCTIONS + _NS_RULES + _namespace_map(services)
+    """Полный текст инструкций: база + правило неймспейсов + карта + анонс.
+
+    Блок анонса навыков — ХВОСТ (lsb-0007 §3.5): манифест, правила и карта
+    не меняются, блок лишь дописывается и не добавляется вовсе, если
+    активных навыков нет (или БД ещё недоступна).
+    """
+    return (
+        SERVER_INSTRUCTIONS
+        + _NS_RULES
+        + _namespace_map(services)
+        + _skills_announce(services)
+    )
+
+
+# Блок анонса навыков (arch lsb-0007 §3.5/§3.8): правило поведения —
+# дословный канон (§3.8, в доке разбит на строки по ~80 симв. — это вёрстка,
+# строки склеены пробелами, как у остальных модельных текстов). Строки
+# реестра — ДАННЫЕ, а не канон: `  - {id} — {name}: {description}`.
+_SKILLS_ANNOUNCE_RULES = (
+    "\n\nSkills are stored procedures (how-to), kept separately from notes. "
+    "Rule: before a routine/repeatable task, check whether a skill exists — "
+    "`skills_search` (by the task) or `skills_list`; read the full procedure "
+    "via `skills_get` and follow it. For many conversations skills are "
+    "irrelevant — do not fetch bodies without reason. Available skills "
+    "(id — name: description):\n"
+)
+
+# Строка переполнения бюджета (канон §3.8); хвостовые пробелы арх-доки —
+# вёрстка (плейсхолдер {n} заменяется числом не вместившихся навыков).
+_SKILLS_ANNOUNCE_MORE = "  (+{n} more — skills_list)"
+
+# Деградация сборки до init_db / недоступности БД — паттерн карты неймспейсов
+# (§3.5): блок анонса не собирается, инструкции остаются валидными, модель
+# идёт в листинг. Пустой реестр — тоже без блока (но без этой подсказки:
+# реестр известен и он пуст).
+_SKILLS_ANNOUNCE_DEGRADED = (
+    "\n\n(skills announce loads at startup; up-to-date — skills_list)"
+)
+
+
+def _skills_announce(services: Services) -> str:
+    """Хвост инструкций — блок анонса навыков (arch lsb-0007 §3.5).
+
+    Правило поведения + строки реестра `  - {id} — {name}: {description}`;
+    `description` обрезается до `skill_announce_description_chars` (120),
+    весь блок — не длиннее `skill_announce_max_chars` (2000); не вместившиеся
+    навыки заменяются последней строкой `  (+{n} more — skills_list)`.
+    Бюджет считается по всему блоку (правило + строки) — иначе блок вылезал
+    бы за заявленный предел; место под строку переполнения резервируется
+    заранее, чтобы она влезла. Активных навыков нет — блок НЕ добавляется;
+    БД недоступна — деградация по паттерну карты неймспейсов.
+    """
+    skills = services.skills
+    if skills is None:
+        # DI-сборки тестов без области навыков (Services.skills опционален).
+        return ""
+    settings = skills.settings
+    try:
+        items = skills.announce_items()
+    except Exception:
+        # БД ещё не инициализирована (init_db в lifespan) либо реестр временно
+        # недоступен — деградируем, а не падаем при сборке приложения.
+        logging.getLogger("app").info(
+            "skills announce unavailable at build — degraded instructions",
+            extra={"event": "startup"},
+        )
+        return _SKILLS_ANNOUNCE_DEGRADED
+    if not items:
+        return ""
+    budget = settings.skill_announce_max_chars - len(_SKILLS_ANNOUNCE_RULES)
+    cut = settings.skill_announce_description_chars
+    lines: list[str] = []
+    used = 0
+    truncated = 0
+    for index, skill in enumerate(items):
+        description = skill["description"]
+        if len(description) > cut:
+            description = description[:cut]
+        line = f"  - {skill['id']} — {skill['name']}: {description}\n"
+        rest = len(items) - index - 1
+        reserve = len(_SKILLS_ANNOUNCE_MORE.format(n=rest)) + 1 if rest else 0
+        if used + len(line) + reserve > budget:
+            truncated = len(items) - index
+            break
+        lines.append(line)
+        used += len(line)
+    if truncated:
+        lines.append(_SKILLS_ANNOUNCE_MORE.format(n=truncated) + "\n")
+    return _SKILLS_ANNOUNCE_RULES + "".join(lines)
+
+
+class InstructionsRefresher:
+    """ServerMiddleware SDK mcp 2.x — пересборка instructions на каждый initialize.
+
+    Механизм откатанного 2.2 (lsb-0002), но БЕЗ данных пользователя: перед
+    обработкой `initialize` middleware пересобирает инструкции (манифест +
+    правила + карта + анонс навыков) в рабочем потоке (`asyncio.to_thread` —
+    блокирующие вызовы SQLite не занимают event loop) и присваивает атрибут
+    low-level сервера: ответ на initialize собирается в момент handshake,
+    поэтому обновления атрибута достаточно — транспорт не меняется, а новый
+    чат видит актуальный реестр навыков.
+
+    SDK 2.x: `MCPServer.instructions` — read-only свойство поверх
+    `_lowlevel_server.instructions` (provisional API — обновляем атрибут
+    напрямую, см. middleware guide).
+    """
+
+    def __init__(self, services: Services, server: MCPServer) -> None:
+        self._services = services
+        self._server = server
+
+    async def __call__(
+        self,
+        ctx: ServerRequestContext[Any, Any],
+        call_next: Callable[[ServerRequestContext[Any, Any]], Awaitable[Any]],
+    ) -> Any:
+        if ctx.method == "initialize":
+            try:
+                text = await asyncio.to_thread(build_instructions, self._services)
+            except Exception:
+                # Пересборка не должна ломать handshake: прежние инструкции
+                # остаются (недоступность БД уже деградирована внутри
+                # build_instructions — сюда доходит только дефект кода).
+                logging.getLogger("app").warning(
+                    "instructions rebuild failed — keeping previous",
+                    extra={"event": "instructions_refresh_failed"},
+                    exc_info=True,
+                )
+            else:
+                self._server._lowlevel_server.instructions = text
+        return await call_next(ctx)
 
 
 # Обучающие описания инструментов (ARCHITECTURE §5.2) — гарантированный канал
@@ -561,6 +692,10 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
         name=SERVER_NAME,
         instructions=build_instructions(services),
     )
+    # Свежесть анонса навыков (lsb-0007 §3.5): ServerMiddleware пересобирает
+    # инструкции перед каждым initialize — новый чат видит актуальный реестр
+    # (данных пользователя в пересборке нет, только реестр навыков).
+    mcp.middleware.append(InstructionsRefresher(services, mcp))
 
     @mcp.tool(name="memory_search", description=TOOL_DESCRIPTIONS["memory_search"])
     async def memory_search(

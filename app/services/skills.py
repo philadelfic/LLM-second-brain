@@ -418,6 +418,41 @@ class SkillsService:
             "total": total,
         }
 
+    @property
+    def settings(self) -> Settings:
+        """Настройки сервиса — лимиты анонса читает транспорт (§3.5).
+
+        Транспорт собирает блок анонса сам (`_skills_announce`), но лимиты
+        (`skill_announce_max_chars` / `skill_announce_description_chars`)
+        живут в Settings: `build_instructions(services)` настроек не получает.
+        """
+        return self._settings
+
+    def announce_items(self) -> list[dict[str, Any]]:
+        """Реестр активных навыков ЦЕЛИКОМ — для блока анонса (§3.5).
+
+        Отдельный метод, а не `list()`: анонсу нужен весь реестр (строки
+        `id — name: description`), а листинг-контракт ограничен потолком
+        `MAX_LIST_LIMIT=50` (пагинация REST/MCP — lsb-0007-05). Порядок тот
+        же, что у листинга: `updated_at DESC, id DESC`; архив версий и
+        удалённые записи не видны. Тела навыков не читаются — только
+        компактные поля.
+        """
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT id, name, description FROM skills "
+                "WHERE deleted_at IS NULL "
+                "ORDER BY updated_at DESC, id DESC"
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "name": row["name"],
+                "description": row["description"],
+            }
+            for row in rows
+        ]
+
     def search(self, query: str, top_k: int | None = None) -> dict[str, Any]:
         """Гибридный поиск навыка — «проба» (arch §3.3, субстрат §3.5).
 

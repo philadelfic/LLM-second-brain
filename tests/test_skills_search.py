@@ -12,7 +12,7 @@ FTS-only + warning (NFR-3). Изоляция проверяется в обе с
 from __future__ import annotations
 
 import pytest
-from fakes import FailingEmbedder, HashEmbedder
+from fakes import FailingEmbedder, HashEmbedder, clear_seeded_skills
 
 from app.config import get_settings
 from app.services.notes import NoteService
@@ -38,12 +38,17 @@ CANON_HINT_SEARCH_EMPTY = (
 
 @pytest.fixture
 def settings(tmp_path, monkeypatch: pytest.MonkeyPatch):
-    """БД размерности 8 + настройки (вектора — HashEmbedder, без сети)."""
+    """БД размерности 8 + настройки (вектора — HashEmbedder, без сети).
+
+    Сид skill-создателя (lsb-0007-04) снимаем: пул 02 проверяет поиск и
+    листинг на пустом реестре.
+    """
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
+    clear_seeded_skills(settings)
     return settings
 
 

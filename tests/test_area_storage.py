@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 
 import pytest
-from fakes import HashEmbedder
+from fakes import HashEmbedder, clear_seeded_skills
 
 from app.config import get_settings
 from app.storage import area_vectors, vectors
@@ -46,12 +46,18 @@ COMMON_COLUMNS = {"id", "vector_status", "created_at", "updated_at", "deleted_at
 
 @pytest.fixture
 def dim8(tmp_path, monkeypatch: pytest.MonkeyPatch):
-    """БД размерности 8 (вектора — литеральные, без внешних сервисов)."""
+    """БД размерности 8 (вектора — литеральные, без внешних сервисов).
+
+    Сид skill-создателя (lsb-0007-04) снимаем: субстрат проверяет схему
+    областей на пустых таблицах (сид — контракт фичи lsb-0007, его проверяет
+    tests/test_skills_announce.py).
+    """
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     monkeypatch.setenv("EMBEDDING_DIM", "8")
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
+    clear_seeded_skills(settings)
     return settings
 
 

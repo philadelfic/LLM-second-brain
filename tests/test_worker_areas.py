@@ -13,24 +13,26 @@ import contextlib
 import time
 
 import pytest
-from fakes import FailingEmbedder, HashEmbedder
+from fakes import FailingEmbedder, HashEmbedder, clear_seeded_skills
 
 from app.config import get_settings
 from app.services.areas import SKILLS_AREA, TERMS_AREA, USER_FACTS_AREA
 from app.services.worker import BackgroundWorker
 from app.storage import area_vectors
-from app.storage.db import init_db, session, transaction
+from app.storage.db import CREATOR_SKILL_NAME, init_db, session, transaction
 
 DIM = 8
 
 
 @pytest.fixture
 def settings(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """БД области без записей: сид skill-создателя (lsb-0007-04) снят."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
+    clear_seeded_skills(settings)
     return settings
 
 
@@ -43,6 +45,7 @@ def fast(tmp_path, monkeypatch: pytest.MonkeyPatch):
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
+    clear_seeded_skills(settings)
     return settings
 
 
@@ -216,3 +219,35 @@ async def test_areas_loop_closes_pending_in_all_areas(fast) -> None:
         await task
     assert statuses == {"skills": "ok", "terms": "ok", "user_facts": "ok"}
     assert worker.areas_interval == float(fast.pending_retry_sec)
+
+
+def test_seeded_creator_skill_is_vectorized(tmp_path, monkeypatch) -> None:
+    """Сид skill-создателя (lsb-0007-04) — обычная pending-запись области.
+
+    Свежая БД несёт навык «Create skills» с `vector_status='pending'`; петля
+    `areas` кодирует его наравне с остальными записями (вектор по
+    `name + description`) — проверка стыка сида и субстрата.
+    """
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
+    monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
+    get_settings.cache_clear()
+    settings = get_settings()
+    init_db(settings)  # сид НЕ снимаем — проверяем его штатную векторизацию
+    worker = BackgroundWorker(settings, HashEmbedder(DIM))
+    assert worker.process_pending_areas() == 1
+    with session(settings) as conn:
+        row = conn.execute(
+            "SELECT id, vector_status FROM skills WHERE name = ?",
+            (CREATOR_SKILL_NAME,),
+        ).fetchone()
+        assert row["vector_status"] == "ok"
+        assert area_vectors.count(conn, area_vectors.SKILLS_VEC_TABLE) == 1
+        assert (
+            area_vectors.get_vector(
+                conn,
+                area_vectors.SKILLS_VEC_TABLE,
+                area_vectors.SKILLS_VEC_ID_COLUMN,
+                int(row["id"]),
+            )
+            is not None
+        )

@@ -16,7 +16,7 @@ import sqlite3
 import uuid
 
 import pytest
-from fakes import FailingEmbedder, HashEmbedder
+from fakes import FailingEmbedder, HashEmbedder, clear_seeded_skills
 
 from app.config import get_settings
 from app.services import Services, build_services
@@ -172,11 +172,16 @@ def _services(settings, embedding) -> Services:
 
 @pytest.fixture
 def mcp_skills(tmp_path, monkeypatch: pytest.MonkeyPatch):
-    """In-process MCP с детерминированным эмбеддером (префильтр работает)."""
+    """In-process MCP с детерминированным эмбеддером (префильтр работает).
+
+    Сид skill-создателя (lsb-0007-04) снимаем: пул 03 проверяет свои ручки
+    на пустом реестре (сид — в tests/test_skills_announce.py).
+    """
     monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
+    clear_seeded_skills(settings)
     return build_mcp(settings, _services(settings, HashEmbedder(DIM)))
 
 
@@ -187,6 +192,7 @@ def mcp_fail(tmp_path, monkeypatch: pytest.MonkeyPatch):
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
+    clear_seeded_skills(settings)
     return build_mcp(settings, _services(settings, FailingEmbedder()))
 
 
@@ -196,6 +202,7 @@ def mcp_notes(tmp_path, monkeypatch: pytest.MonkeyPatch):
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
+    clear_seeded_skills(settings)
     return build_mcp(settings, build_services(settings))
 
 
@@ -272,16 +279,17 @@ class TestToolRegistry:
         assert "skills_search" in TOOL_DESCRIPTIONS["skills_save"]
 
     def test_instructions_not_changed_by_this_pool(self, test_env: dict[str, str]) -> None:
-        """Анонс скиллов — отдельный пул 7-04: инструкции не трогаем."""
+        """Анонс скиллов — отдельный пул 7-04: база и карта не тронуты."""
         settings = get_settings()
         init_db(settings)
         services = _services(settings, HashEmbedder(DIM))
         instructions = build_instructions(services)
         assert instructions.startswith(SERVER_INSTRUCTIONS)
         assert "Node map (path: description)" in instructions
-        # В этом пуле блока анонса скиллов в instructions нет.
-        assert "skill" not in instructions.lower()
+        # В этом пуле тексты описаний инструментов и манифест не менялись.
         assert "skill" not in SERVER_INSTRUCTIONS.lower()
+        # Блок анонса — хвост пула 7-04 (его регресс — test_skills_announce.py).
+        assert "Available skills (id — name: description):" in instructions
 
 
 class TestCompactOutputs:
