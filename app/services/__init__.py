@@ -36,6 +36,7 @@ from app.services.prompts import PromptRegistry
 from app.services.search import SearchService
 from app.services.skills import SkillsService
 from app.services.summary import SummaryService
+from app.services.user_facts import UserFactsService
 
 __all__ = [
     "BackupService",
@@ -52,6 +53,7 @@ __all__ = [
     "Services",
     "SkillsService",
     "SummaryService",
+    "UserFactsService",
     "build_services",
 ]
 
@@ -78,6 +80,11 @@ class Services:
     namespaces: NamespaceService  # реестр узлов (Фаза 10, memory_namespaces)
     classifier: ClassificationService  # причёска default-заметок (Фаза 10, Шаг 4)
     promotion: PromotionService  # триггер домена (Фаза 10, Шаг 5, memory_namespaces + воркер)
+    # 3.0.0: область «user» (lsb-0009-01) — атомарные факты о пользователе.
+    # Обязательна, как notes/search: контейнер в проде и в DI-сборках полный.
+    # embedding — общий экземпляр слота (запись факта его не зовёт — §3.4;
+    # точка сборки для гибридного поиска области).
+    user_facts: UserFactsService
     llm_embedding: LLMClient | None = None  # клиент слота embedding (Фаза 11, решение №5)
     llm_summary: LLMClient | None = None  # клиент слота summary (summarize/merge/classify/describe)
     llm_judge: LLMClient | None = None  # клиент слота judge (дедуп + судья структуры)
@@ -147,4 +154,8 @@ def build_services(
         # общий экземпляр слота (запись его не зовёт — точка сборки для
         # поиска/антисинонимии трека).
         skills=SkillsService(settings, embedding=embedding),
+        # Субстрат 3.0.0: сервис области «user» (lsb-0009-01); embedding —
+        # общий экземпляр слота (запись факта его не зовёт — дедуп триграммами,
+        # arch lsb-0009 §3.4; точка сборки гибридного поиска области).
+        user_facts=UserFactsService(settings, embedding=embedding),
     )

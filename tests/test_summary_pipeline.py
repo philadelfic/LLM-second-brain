@@ -36,6 +36,7 @@ from app.services import (
 )
 from app.services.backup import BackupService
 from app.services.judge import JudgeService
+from app.services.user_facts import UserFactsService
 
 AUTH = "Bearer test-secret-token"
 
@@ -81,6 +82,9 @@ def _make_client(
             promotion=PromotionService(
                 settings, embedding=embedding, namespaces=namespaces
             ),
+            # 3.0.0: область «user» обязательна в контейнере (lsb-0009-02)
+            # — фейков в ней нет, эмбеддер общий (запись его не зовёт).
+            user_facts=UserFactsService(settings, embedding=embedding),
         )
 
     monkeypatch.setattr("app.main.build_services", builder)

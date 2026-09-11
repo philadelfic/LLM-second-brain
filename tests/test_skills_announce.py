@@ -20,6 +20,7 @@ from app.config import get_settings
 from app.services import Services
 from app.services.namespaces import NamespaceService
 from app.services.skills import SkillsService
+from app.services.user_facts import UserFactsService
 from app.storage.db import CREATOR_SKILL_SEED_KEY, init_db, session
 from app.transport.mcp import (
     SERVER_INSTRUCTIONS,
@@ -90,6 +91,7 @@ def _services(settings, embedding, skills: bool = True) -> Services:
         classifier=None,
         promotion=None,
         skills=SkillsService(settings, embedding=embedding) if skills else None,
+        user_facts=UserFactsService(settings, embedding=embedding),
     )
 
 

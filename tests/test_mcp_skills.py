@@ -22,6 +22,7 @@ from app.config import get_settings
 from app.services import Services, build_services
 from app.services.namespaces import NamespaceService
 from app.services.skills import SkillsService
+from app.services.user_facts import UserFactsService
 from app.storage.db import init_db
 from app.transport.mcp import (
     SERVER_INSTRUCTIONS,
@@ -140,6 +141,13 @@ MEMORY_TOOL_NAMES = frozenset(
     }
 )
 
+# 5 ручек области «user» (lsb-0009-02) — поверхность релиза 3.0.0 растёт: этот
+# пул сверяет лишь то, что ручки заметок/узлов не тронуты (регресс выдач —
+# tests/test_mcp_user_facts.py).
+USER_TOOL_NAMES = frozenset(
+    {"user_search", "user_save", "user_update", "user_delete", "user_get"}
+)
+
 
 def form(**overrides: object) -> dict[str, object]:
     """Валидная форма навыка; overrides правят отдельные поля."""
@@ -167,6 +175,7 @@ def _services(settings, embedding) -> Services:
         classifier=None,
         promotion=None,
         skills=SkillsService(settings, embedding=embedding),
+        user_facts=UserFactsService(settings, embedding=embedding),
     )
 
 
@@ -226,9 +235,11 @@ class TestToolRegistry:
     ) -> None:
         names = {tool.name for tool in await mcp_skills.list_tools()}
         assert set(CANON_TOOL_DESCRIPTIONS) <= names
-        assert names - set(CANON_TOOL_DESCRIPTIONS) == MEMORY_TOOL_NAMES
+        assert names - set(CANON_TOOL_DESCRIPTIONS) == (
+            MEMORY_TOOL_NAMES | USER_TOOL_NAMES
+        )
         assert set(TOOL_NAMES) == names
-        assert len(names) == 13
+        assert len(names) == 18
 
     @pytest.mark.asyncio
     async def test_tool_descriptions_are_canon_verbatim(self, mcp_skills) -> None:

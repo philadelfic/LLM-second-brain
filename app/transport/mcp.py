@@ -1,5 +1,6 @@
-"""MCP-поверхность (ARCHITECTURE §3.1, §5): 13 инструментов (8 `memory_*`
-заметок/узлов + 5 `skills_*` области навыков) + инструкции.
+"""MCP-поверхность (ARCHITECTURE §3.1, §5): 18 инструментов (8 `memory_*`
+заметок/узлов + 5 `skills_*` области навыков + 5 `user_*` области «user»)
++ инструкции.
 
 `MCPServer` — официальный высокоуровневый API mcp SDK 2.x (ex-`FastMCP`).
 Фаза 2: инструменты вызывают тот же service-слой, что и REST (ARCH §1);
@@ -62,7 +63,20 @@ lsb-0007-03 (релиз 3.0.0): 5 инструментов области нав
 компактны (белые списки), `hint` — только при мягком отказе. Антисинонимия
 создания (FR-5.2) живёт в сервисном слое (`SkillsService.save`): её обязан
 звать и REST POST /skills, у сервиса уже есть DI-эмбеддер; транспорт лишь
-отдаёт мягкий отказ `{created: False, hint}`."""
+отдаёт мягкий отказ `{created: False, hint}`.
+
+lsb-0009-02 (релиз 3.0.0): 5 инструментов области «user» — `user_search`,
+`user_save`, `user_update`, `user_delete`, `user_get` — тонкие обёртки над
+`UserFactsService` (один код с REST-зеркалами lsb-0009-03). Описания — дословно
+канон arch lsb-0009 §3.7 (правило «один факт = одна запись; несколько фактов —
+отдельные вызовы» + запрет секретов); выдачи компактны (белые списки), тело
+факта в контекст попадает только через `user_get` (поиск — `excerpt`). Хинты —
+четыре канала FR-7: описание инструмента (1), ПОСТОЯННЫЙ hint в каждом успешном
+`user_save` (2), дедуп-hint с id/name (3), мягкий отказ при `body` > 1200 (4).
+Инъекции при init НЕТ (arch §2): блока «user» в `instructions` не появляется —
+текст инструкций относительно предыдущего состояния не меняется (анонс навыков
+существовал и раньше, lsb-0007-04).
+"""
 
 import asyncio
 import logging
@@ -87,6 +101,11 @@ from app.services.notes import (
     TitleValidationError,
 )
 from app.services.skills import SkillValidationError
+from app.services.user_facts import (
+    _UNSET_BODY,
+    _UNSET_NAME,
+    UserFactValidationError,
+)
 from app.storage.db import DEFAULT_NAMESPACE
 
 SERVER_NAME = "LLM Second Brain"
@@ -405,6 +424,40 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "only a skill that is factually wrong, fully duplicates another one "
         "or was created by mistake."
     ),
+    # lsb-0009-02: описания области «user» — дословно канон arch lsb-0009
+    # §3.7 (английский, править только в арх-доке). Правило «один факт =
+    # одна запись; несколько фактов — отдельные вызовы» и запрет секретов
+    # вшиты в тексты: описания — гарантированный канал (FR-7.1),
+    # инструкции MCP блока «user» не содержат (инъекции нет, §2).
+    "user_search": (
+        "Search the user area: atomic facts about the user (steady preferences, "
+        "working habits, agreements — ONE FACT PER RECORD, never a list). Returns "
+        "{id, name, excerpt}; the full body — user_get. Search here when the "
+        "answer depends on the user's preferences or arrangements; do not invent "
+        "what might be stored — search first."
+    ),
+    "user_save": (
+        "Save ONE atomic durable fact about the user: name ≤5 words (like a note "
+        "title) + body ≤1200 characters. ONE FACT = ONE RECORD: never pack a list "
+        "of facts into one record and never repeat a fact that is already stored "
+        "— several facts mean several separate calls. A strong overlap with an "
+        "existing fact is refused with a hint pointing to it: the same fact — "
+        "refine it via user_update(id=…); a new fact — save it as a separate "
+        "record. Never store secrets (passwords, tokens, keys)."
+    ),
+    "user_update": (
+        "Update a fact by id: name and/or body; a value that is not passed = keep "
+        "the current one. Run user_get first so you don't lose details. This is "
+        "the right tool when user_save hinted that a similar fact already exists."
+    ),
+    "user_delete": (
+        "Delete a fact by id (soft delete: it disappears from all outputs; "
+        "restoring is the operator's job). Delete only a fact that is wrong or "
+        "fully duplicates another one."
+    ),
+    "user_get": (
+        "Read one fact by id: name + body."
+    ),
 }
 
 TOOL_NAMES = frozenset(TOOL_DESCRIPTIONS)
@@ -681,9 +734,72 @@ def _compact_skill_delete(result: dict[str, Any]) -> dict[str, Any]:
     return _with_hint(_pick(result, ("id", "deleted")), result)
 
 
+# lsb-0009-02: компактные выдачи области «user» — белые списки полей
+# (arch lsb-0009 §3.3, §3.7). Тело факта в контекст попадает только через
+# `user_get` (поиск отдаёт `excerpt`); `score` — soft-ключ (гибрид области —
+# показывается, если сервис его отдал). hint — маркер мягкого отказа, но в
+# УСПЕШНОМ `user_save` он ПОСТОЯННЫЙ (FR-7.2, hint атомарности) — поэтому
+# он не срезается, а средняя зона дедупа несёт ещё и справочный `related`.
+_USER_SEARCH_ITEM = ("id", "name", "excerpt")
+_USER_GET_ITEM = ("id", "name", "body")
+_USER_RELATED_ITEM = ("id", "name")
+
+
+def _user_hit(row: dict[str, Any]) -> dict[str, Any]:
+    """Компактный хит user_search: id/name/excerpt (+score, если есть)."""
+    hit: dict[str, Any] = _pick(row, _USER_SEARCH_ITEM)
+    if row.get("score") is not None:
+        hit["score"] = row["score"]
+    return hit
+
+
+def _compact_user_search(result: dict[str, Any]) -> dict[str, Any]:
+    """user_search: {results: [{id, name, excerpt, score?}], hint?}.
+
+    Пустой поиск — не fail сервиса, а мягкий ответ с дословным hint канона
+    §3.7 (проба: факта нет — валидный исход). warning всегда срезается.
+    """
+    out = {"results": [_user_hit(row) for row in result["results"]]}
+    return _with_hint(out, result)  # warning не копируется никогда
+
+
+def _compact_user_get(result: dict[str, Any]) -> dict[str, Any]:
+    """user_get: (id, name, body); не найден → {id} + hint канона §3.7."""
+    if "name" not in result:
+        return _with_hint({"id": result["id"]}, result)
+    return _pick(result, _USER_GET_ITEM)
+
+
+def _compact_user_save(result: dict[str, Any]) -> dict[str, Any]:
+    """user_save: (id, stored, hint?, related?); отказ дедупа — fail + hint.
+
+    Успех всегда несёт постоянный hint атомарности (FR-7.2); средняя зона
+    дедупа — справочный `related` (id/name похожих). Мягкий отказ сильного
+    совпадения (`stored: False`) записи не имеет — `id` в выдачу не входит,
+    hint канона ведёт к `user_update` существующего факта.
+    """
+    if not result.get("stored"):
+        return _with_hint({"stored": False}, result)
+    out = _pick(result, ("id", "stored"))
+    related = result.get("related")
+    if related:
+        out["related"] = [_pick(item, _USER_RELATED_ITEM) for item in related]
+    return _with_hint(out, result)  # hint — ВСЕГДА (постоянный, FR-7.2)
+
+
+def _compact_user_update(result: dict[str, Any]) -> dict[str, Any]:
+    """user_update: (id, changed); нет записи → hint канона §3.7."""
+    return _with_hint(_pick(result, ("id", "changed")), result)
+
+
+def _compact_user_delete(result: dict[str, Any]) -> dict[str, Any]:
+    """user_delete: (id, deleted); повторный/чужой id → hint канона §3.7."""
+    return _with_hint(_pick(result, ("id", "deleted")), result)
+
+
 def build_mcp(settings: Settings, services: Services) -> MCPServer:
     """Собрать MCP-сервер: инструкции (§5.1, база + карта неймспейсов) +
-    13 инструментов (8 `memory_*` + 5 `skills_*`) над сервисами.
+    18 инструментов (8 `memory_*` + 5 `skills_*` + 5 `user_*`) над сервисами.
 
     Сигнатуры и ограничения параметров — контракты REQUIREMENTS §5.1/§5.7;
     значения по умолчанию (DEFAULT_TOP_K, DEFAULT_LIST_LIMIT) — из env.
@@ -1344,5 +1460,167 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
                 "skills_delete", started, failed=True, reason=result["hint"], id=id
             )
         return _compact_skill_delete(result)
+
+    # --- область «user» (lsb-0009-02, arch §3.3/§3.7) ----------------------
+    # Тонкие обёртки над `UserFactsService` (один код с REST-зеркалами
+    # lsb-0009-03): блокирующие вызовы — в `asyncio.to_thread`, выдачи — белые
+    # списки, hint пробрасывается при мягком отказе, НО в успешном `user_save`
+    # он постоянный (FR-7.2) и не срезается. Валидация формы (лимиты `name`/
+    # `body`) живёт в сервисе — нарушение даёт дословный hint канона (§3.7)
+    # вместо схемного отказа. Инъекции при init НЕТ: блока «user» в инструкциях
+    # не появляется (FR-6, arch §2) — гарантированный канал лишь описания.
+
+    @mcp.tool(name="user_search", description=TOOL_DESCRIPTIONS["user_search"])
+    async def user_search(
+        query: Annotated[
+            str,
+            Field(
+                description="Topic wording: the user's preferences or "
+                "arrangements the answer depends on",
+                min_length=1,
+                max_length=settings.max_query_chars,
+            ),
+        ],
+        top_k: Annotated[
+            int,
+            Field(description="Number of results", ge=1, le=20),
+        ] = settings.default_top_k,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            result = await asyncio.to_thread(services.user_facts.search, query, top_k)
+        except UserFactValidationError as exc:
+            # Мягкий отказ (fail + hint): запрос/top_k вне домена области.
+            log_tool_call(
+                "user_search",
+                started,
+                failed=True,
+                reason=str(exc),
+                query=preview(query),
+            )
+            return {"results": [], "hint": str(exc)}
+        # Пустой результат — валидный исход пробы (hint канона в выдаче),
+        # не fail: событие несёт число хитов и признак FTS-only деградации.
+        log_tool_call(
+            "user_search",
+            started,
+            results=len(result["results"]),
+            top_k=top_k,
+            query=preview(query),
+            fts_only=bool(result.get("warning")),
+        )
+        return _compact_user_search(result)
+
+    @mcp.tool(name="user_save", description=TOOL_DESCRIPTIONS["user_save"])
+    async def user_save(
+        name: Annotated[
+            str,
+            Field(description="Fact name: ≤5 words (like a note title)"),
+        ],
+        body: Annotated[
+            str,
+            Field(description="Fact body: ≤1200 characters; one fact per record"),
+        ],
+    ) -> dict[str, Any]:
+        # Лимиты формы валидирует СЕРВИС (не схема — как title у заметок):
+        # нарушение → UserFactValidationError с дословным hint канона §3.7.
+        # Приватность (NFR-4): в лог идут длины, не содержимое.
+        started = time.perf_counter()
+        sizes = {"name_chars": len(name), "body_chars": len(body)}
+        try:
+            result = await asyncio.to_thread(
+                services.user_facts.save, name=name, body=body
+            )
+        except UserFactValidationError as exc:
+            log_tool_call(
+                "user_save", started, failed=True, reason=str(exc), **sizes
+            )
+            return {"stored": False, "hint": str(exc)}
+        if result.get("stored"):
+            log_tool_call(
+                "user_save", started, results=1, id=result["id"], **sizes
+            )
+        else:
+            # Мягкий отказ дедупа (сильное совпадение): записи нет, hint ведёт
+            # к правке существующего факта либо к отдельной записи.
+            log_tool_call(
+                "user_save", started, failed=True, reason=result["hint"], **sizes
+            )
+        return _compact_user_save(result)
+
+    @mcp.tool(name="user_update", description=TOOL_DESCRIPTIONS["user_update"])
+    async def user_update(
+        id: Annotated[int, Field(description="Fact id")],
+        name: Annotated[
+            str | None,
+            Field(
+                description="New name: ≤5 words (like a note title); not passed "
+                "— the current one stays",
+                json_schema_extra={"default": None},
+            ),
+        ] = _UNSET_NAME,
+        body: Annotated[
+            str | None,
+            Field(
+                description="New body: ≤1200 characters; not passed — the "
+                "current one stays",
+                json_schema_extra={"default": None},
+            ),
+        ] = _UNSET_BODY,
+    ) -> dict[str, Any]:
+        # Сентинелы «не передано» (прецедент lsb-0004/`memory_update`): дефолты
+        # параметров — JSON-серизуемые строки; схема показывает null, поэтому
+        # модель либо не передаёт поле, либо передаёт значение (null в
+        # обязательном поле — мягкий отказ сервиса).
+        started = time.perf_counter()
+        try:
+            result = await asyncio.to_thread(
+                services.user_facts.update, id, name=name, body=body
+            )
+        except UserFactValidationError as exc:
+            log_tool_call(
+                "user_update", started, failed=True, reason=str(exc), id=id
+            )
+            return {"id": id, "changed": False, "hint": str(exc)}
+        if "hint" in result:
+            # Не найден/удалён — мягкий отказ с hint канона §3.7.
+            log_tool_call(
+                "user_update", started, failed=True, reason=result["hint"], id=id
+            )
+        else:
+            log_tool_call(
+                "user_update", started, id=id, changed=bool(result.get("changed"))
+            )
+        return _compact_user_update(result)
+
+    @mcp.tool(name="user_delete", description=TOOL_DESCRIPTIONS["user_delete"])
+    async def user_delete(
+        id: Annotated[int, Field(description="Fact id")],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.user_facts.delete, id)
+        if result.get("deleted"):
+            log_tool_call("user_delete", started, id=id, deleted=True)
+        else:
+            # Повторный/несуществующий id — мягкий отказ с hint канона §3.7.
+            log_tool_call(
+                "user_delete", started, failed=True, reason=result["hint"], id=id
+            )
+        return _compact_user_delete(result)
+
+    @mcp.tool(name="user_get", description=TOOL_DESCRIPTIONS["user_get"])
+    async def user_get(
+        id: Annotated[int, Field(description="Fact id")],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.user_facts.get, id)
+        if "hint" in result:
+            # Мягкий отказ: факта нет (мягко — возможно, удалён).
+            log_tool_call(
+                "user_get", started, failed=True, reason=result["hint"], id=id
+            )
+        else:
+            log_tool_call("user_get", started, results=1, id=id)
+        return _compact_user_get(result)
 
     return mcp
