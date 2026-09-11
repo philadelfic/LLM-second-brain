@@ -19,6 +19,7 @@ from fakes import HashEmbedder, clear_seeded_skills
 from app.config import get_settings
 from app.services import Services, build_services
 from app.services.namespaces import NamespaceService
+from app.services.terms import TermsService
 from app.services.user_facts import (
     HINT_NOT_FOUND,
     HINT_RELATED_FACTS,
@@ -132,6 +133,8 @@ MEMORY_TOOL_NAMES = frozenset(
 SKILL_TOOL_NAMES = frozenset(
     {"skills_search", "skills_list", "skills_get", "skills_save", "skills_delete"}
 )
+# 3 ручки области terms (lsb-0008-02) — поверхность релиза 3.0.0 растёт.
+TERMS_TOOL_NAMES = frozenset({"terms_search", "terms_save", "terms_get"})
 
 FACT_NAME = "Moscow timezone"
 FACT_BODY = "Oleg is in Moscow, Europe/Moscow is the default for weather and time"
@@ -154,6 +157,7 @@ def _services(settings, embedding) -> Services:
         classifier=None,
         promotion=None,
         user_facts=UserFactsService(settings, embedding=embedding),
+        terms=TermsService(settings, embedding=embedding),
     )
 
 
@@ -210,10 +214,10 @@ class TestToolRegistry:
         names = {tool.name for tool in await mcp_user.list_tools()}
         assert set(CANON_TOOL_DESCRIPTIONS) <= names
         assert names - set(CANON_TOOL_DESCRIPTIONS) == (
-            MEMORY_TOOL_NAMES | SKILL_TOOL_NAMES
+            MEMORY_TOOL_NAMES | SKILL_TOOL_NAMES | TERMS_TOOL_NAMES
         )
         assert set(TOOL_NAMES) == names
-        assert len(names) == 18
+        assert len(names) == 21
 
     @pytest.mark.asyncio
     async def test_tool_descriptions_are_canon_verbatim(self, mcp_user) -> None:

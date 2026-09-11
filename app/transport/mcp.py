@@ -1,6 +1,6 @@
-"""MCP-поверхность (ARCHITECTURE §3.1, §5): 18 инструментов (8 `memory_*`
-заметок/узлов + 5 `skills_*` области навыков + 5 `user_*` области «user»)
-+ инструкции.
+"""MCP-поверхность (ARCHITECTURE §3.1, §5): 21 инструмент (8 `memory_*`
+заметок/узлов + 5 `skills_*` области навыков + 5 `user_*` области «user»
++ 3 `terms_*` области «terms») + инструкции.
 
 `MCPServer` — официальный высокоуровневый API mcp SDK 2.x (ex-`FastMCP`).
 Фаза 2: инструменты вызывают тот же service-слой, что и REST (ARCH §1);
@@ -76,6 +76,19 @@ lsb-0009-02 (релиз 3.0.0): 5 инструментов области «user
 Инъекции при init НЕТ (arch §2): блока «user» в `instructions` не появляется —
 текст инструкций относительно предыдущего состояния не меняется (анонс навыков
 существовал и раньше, lsb-0007-04).
+
+lsb-0008-02 (релиз 3.0.0): 3 инструмента области terms — `terms_search`,
+`terms_save`, `terms_get` — тонкие обёртки над `TermsService` (один код с
+REST-зеркалами lsb-0008-03). Описания — дословно канон arch lsb-0008 §3.7
+(правило «все смыслы термина; выбор смысла — по контексту разговора, из
+разговора неясно — уточнить у пользователя, не додумывать» и «контекст
+обязателен всегда» вшиты в тексты: инструкции MCP на OWUI не доходят,
+гарантированный канал — tools). Листинга нет: поиск — единственный путь к
+определению. Выдачи компактны (белые списки), внутренние нормализованные
+колонки в MCP не просачиваются, `warning` сервиса срезается; hint — маркер
+мягкого отказа (нет точного термина / термина нет / близкий контекст /
+лимиты / пустой контекст). Инъекции при init НЕТ (arch §2): блока «terms» в
+`instructions` не появляется — анонса области terms нет.
 """
 
 import asyncio
@@ -101,6 +114,7 @@ from app.services.notes import (
     TitleValidationError,
 )
 from app.services.skills import SkillValidationError
+from app.services.terms import TermValidationError
 from app.services.user_facts import (
     _UNSET_BODY,
     _UNSET_NAME,
@@ -458,6 +472,35 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "user_get": (
         "Read one fact by id: name + body."
     ),
+    # lsb-0008-02: описания области terms — дословно канон arch lsb-0008 §3.7
+    # (английский, править только в арх-доке). Правило «один термин — все
+    # смыслы; выбор смысла — по контексту разговора, из разговора неясно —
+    # уточнить у пользователя, не додумывать» и «контекст обязателен всегда»
+    # вшиты в тексты: описания — гарантированный канал (инструкции блока
+    # «terms» не содержат — инъекции нет, arch §2).
+    "terms_search": (
+        "Look up a term or an abbreviation in the terms area. Returns ALL "
+        "senses of the term together with their contexts: one term means "
+        "different things in different contexts — never pick a single sense "
+        "silently, choose by the context of the conversation, and if it is "
+        "unclear, ask the user instead of guessing. If there is no exact term, "
+        "the closest senses by meaning are returned (not an exact match). There "
+        "is no listing — search is the only way to a definition."
+    ),
+    "terms_save": (
+        "Save a term with a MANDATORY context: term ≤100 characters, context "
+        "≤40 (always filled in — even when the term has a single sense), "
+        "definition ≤350. The key is (term + context): the same key updates the "
+        "record; the same term with a new context creates a NEW sense and never "
+        "overwrites the old one. Reuse one of the contexts already used in this "
+        "memory (the response lists them) instead of inventing a near-duplicate "
+        "wording — a too-close context is refused with a hint that points to the "
+        "existing context. The response also lists the senses this term already "
+        "has."
+    ),
+    "terms_get": (
+        "Read one term record by id: term, context, definition."
+    ),
 }
 
 TOOL_NAMES = frozenset(TOOL_DESCRIPTIONS)
@@ -797,9 +840,82 @@ def _compact_user_delete(result: dict[str, Any]) -> dict[str, Any]:
     return _with_hint(_pick(result, ("id", "deleted")), result)
 
 
+# lsb-0008-02: компактные выдачи области «terms» — белые списки полей
+# (arch lsb-0008 §3.4–3.5). Внутренние нормализованные колонки области
+# (`term_norm`, `context_norm`, `vector_status`, `created_at`/`updated_at`,
+# `deleted_at`) в MCP не выводятся. `term`/`score` в выдаче смысла —
+# soft-ключи: в точной ветке сервис их не отдаёт (смыслы уже опознаны по
+# термину), в неточной — отдаёт (ближайшие по смыслу, не точное совпадение);
+# `warning` сервиса срезается всегда, `hint` — маркер мягкого отказа.
+_TERM_SENSE_ITEM = ("id", "context", "definition")
+_TERM_SENSE_HINT_ITEM = ("id", "context")
+_TERM_GET_ITEM = ("id", "term", "context", "definition")
+
+
+def _term_sense(row: dict[str, Any]) -> dict[str, Any]:
+    """Компактный смысл terms_search: id/context/definition (+term/score).
+
+    `term`/`score` — soft-ключи неточной ветки: показываются только когда
+    сервис их отдал (гибрид области) — точная ветка идёт без них.
+    """
+    sense: dict[str, Any] = _pick(row, _TERM_SENSE_ITEM)
+    if "term" in row:
+        sense["term"] = row["term"]
+    if "score" in row:
+        sense["score"] = row["score"]
+    return sense
+
+
+def _compact_term_search(result: dict[str, Any]) -> dict[str, Any]:
+    """terms_search: {senses: [{id, context, definition, term?, score?}],
+    exact, hint?}.
+
+    Точная ветка (`exact: true`) — ВСЕ смыслы термина, без `term`/`score`
+    (один смысл не выбирается за модель, §3.4); неточная — ближайшие по
+    смыслу + дословный hint «не точное совпадение». Пусто — мягкий ответ
+    с hint «термина нет вовсе» (не fail). warning не копируется никогда.
+    """
+    out: dict[str, Any] = {
+        "senses": [_term_sense(row) for row in result["senses"]],
+        "exact": result["exact"],
+    }
+    return _with_hint(out, result)
+
+
+def _compact_term_save(result: dict[str, Any]) -> dict[str, Any]:
+    """terms_save: {created|updated, id, senses, contexts, hint?}.
+
+    Оба успешных исхода (§3.5) несут справочно `senses` этого термина
+    `[{id, context}]` и `contexts` области — чтобы модель переиспользовала
+    формулировку контекста (FR-3.2). Мягкий отказ близкого контекста
+    (`created: False`) записи не имеет: `id` в выдачу не входит, hint ведёт
+    к существующему контексту. Дословный hint лимитов/пустого контекста — из
+    мягкого отказа сервиса (§3.7).
+    """
+    if not (result.get("created") or result.get("updated")):
+        return _with_hint({"created": False}, result)
+    flag = "created" if result.get("created") else "updated"
+    return {
+        flag: True,
+        "id": result["id"],
+        "senses": [
+            _pick(sense, _TERM_SENSE_HINT_ITEM) for sense in result["senses"]
+        ],
+        "contexts": list(result["contexts"]),
+    }
+
+
+def _compact_term_get(result: dict[str, Any]) -> dict[str, Any]:
+    """terms_get: (id, term, context, definition); нет — hint канона §3.7."""
+    if "term" not in result:
+        return _with_hint({}, result)
+    return _pick(result, _TERM_GET_ITEM)
+
+
 def build_mcp(settings: Settings, services: Services) -> MCPServer:
     """Собрать MCP-сервер: инструкции (§5.1, база + карта неймспейсов) +
-    18 инструментов (8 `memory_*` + 5 `skills_*` + 5 `user_*`) над сервисами.
+    21 инструмент (8 `memory_*` + 5 `skills_*` + 5 `user_*` + 3 `terms_*`)
+    над сервисами.
 
     Сигнатуры и ограничения параметров — контракты REQUIREMENTS §5.1/§5.7;
     значения по умолчанию (DEFAULT_TOP_K, DEFAULT_LIST_LIMIT) — из env.
@@ -1622,5 +1738,117 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
         else:
             log_tool_call("user_get", started, results=1, id=id)
         return _compact_user_get(result)
+
+    # --- область terms (lsb-0008-02, arch §3.4–3.5) -------------------------
+    # Тонкие обёртки над `TermsService` (один код с REST-зеркалами §3.6):
+    # блокирующие вызовы — в `asyncio.to_thread`, выдачи — белые списки,
+    # hint — только при мягком отказе. Листинга НЕТ (решение О.): поиск —
+    # единственный путь к определению; «все смыслы» и выбор смысла по
+    # контексту разговора живут в описаниях инструментов. Инъекции при init
+    # НЕТ: блока «terms» в инструкциях не появляется (arch §2).
+
+    @mcp.tool(name="terms_search", description=TOOL_DESCRIPTIONS["terms_search"])
+    async def terms_search(
+        query: Annotated[
+            str,
+            Field(
+                description="Term or abbreviation to look up; all senses are "
+                "returned",
+                min_length=1,
+                max_length=settings.max_query_chars,
+            ),
+        ],
+        top_k: Annotated[
+            int,
+            Field(description="Number of results", ge=1, le=20),
+        ] = settings.default_top_k,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            result = await asyncio.to_thread(services.terms.search, query, top_k)
+        except TermValidationError as exc:
+            # Мягкий отказ (fail + hint): запрос/top_k вне домена области.
+            log_tool_call(
+                "terms_search",
+                started,
+                failed=True,
+                reason=str(exc),
+                query=preview(query),
+            )
+            return {"senses": [], "exact": False, "hint": str(exc)}
+        # Пустой результат — валидный исход пробы (hint канона в выдаче),
+        # не fail: событие несёт число смыслов и признак FTS-only деградации.
+        log_tool_call(
+            "terms_search",
+            started,
+            results=len(result["senses"]),
+            top_k=top_k,
+            query=preview(query),
+            fts_only=bool(result.get("warning")),
+        )
+        return _compact_term_search(result)
+
+    @mcp.tool(name="terms_save", description=TOOL_DESCRIPTIONS["terms_save"])
+    async def terms_save(
+        term: Annotated[
+            str,
+            Field(description="Term: ≤100 characters"),
+        ],
+        context: Annotated[
+            str,
+            Field(
+                description="Context: ≤40 characters; always required — even "
+                "for a single sense"
+            ),
+        ],
+        definition: Annotated[
+            str,
+            Field(description="Definition: ≤350 characters"),
+        ],
+    ) -> dict[str, Any]:
+        # Лимиты формы валидирует СЕРВИС (не схема — как title у заметок):
+        # нарушение → TermValidationError с дословным hint канона §3.7, запись
+        # при этом НЕ идёт. Приватность (NFR-4): в лог идут длины, не текст.
+        started = time.perf_counter()
+        sizes = {
+            "term_chars": len(term),
+            "context_chars": len(context),
+            "definition_chars": len(definition),
+        }
+        try:
+            result = await asyncio.to_thread(
+                services.terms.save, term, context, definition
+            )
+        except TermValidationError as exc:
+            log_tool_call(
+                "terms_save", started, failed=True, reason=str(exc), **sizes
+            )
+            return {"created": False, "hint": str(exc)}
+        if result.get("created") or result.get("updated"):
+            log_tool_call(
+                "terms_save", started, results=1, id=result["id"], **sizes
+            )
+        else:
+            # Мягкий отказ близкого контекста: записи нет, hint ведёт к
+            # существующему контексту (§3.5, «подсказка ДО записи»).
+            log_tool_call(
+                "terms_save", started, failed=True, reason=result["hint"], **sizes
+            )
+        return _compact_term_save(result)
+
+    @mcp.tool(name="terms_get", description=TOOL_DESCRIPTIONS["terms_get"])
+    async def terms_get(
+        id: Annotated[int, Field(description="Term record id")],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.terms.get, id)
+        if "hint" in result:
+            # Мягкий отказ: записи нет (мягко — возможно, удалена).
+            log_tool_call(
+                "terms_get", started, failed=True, reason=result["hint"], id=id
+            )
+        else:
+            log_tool_call("terms_get", started, results=1, id=id)
+        return _compact_term_get(result)
 
     return mcp

@@ -36,6 +36,7 @@ from app.services.prompts import PromptRegistry
 from app.services.search import SearchService
 from app.services.skills import SkillsService
 from app.services.summary import SummaryService
+from app.services.terms import TermsService
 from app.services.user_facts import UserFactsService
 
 __all__ = [
@@ -53,6 +54,7 @@ __all__ = [
     "Services",
     "SkillsService",
     "SummaryService",
+    "TermsService",
     "UserFactsService",
     "build_services",
 ]
@@ -85,6 +87,11 @@ class Services:
     # embedding — общий экземпляр слота (запись факта его не зовёт — §3.4;
     # точка сборки для гибридного поиска области).
     user_facts: UserFactsService
+    # 3.0.0: область «terms» (lsb-0008-01) — термины с ключом (term + context).
+    # Обязательна, как user_facts: контейнер в проде и в DI-сборках полный.
+    # embedding — общий экземпляр слота (запись его не зовёт — близость
+    # контекста триграммная, §3.5; точка сборки гибридного поиска области).
+    terms: TermsService
     llm_embedding: LLMClient | None = None  # клиент слота embedding (Фаза 11, решение №5)
     llm_summary: LLMClient | None = None  # клиент слота summary (summarize/merge/classify/describe)
     llm_judge: LLMClient | None = None  # клиент слота judge (дедуп + судья структуры)
@@ -158,4 +165,8 @@ def build_services(
         # общий экземпляр слота (запись факта его не зовёт — дедуп триграммами,
         # arch lsb-0009 §3.4; точка сборки гибридного поиска области).
         user_facts=UserFactsService(settings, embedding=embedding),
+        # Субстрат 3.0.0: сервис области terms (lsb-0008-01); embedding —
+        # общий экземпляр слота (запись его не зовёт — близость контекста
+        # триграммная, arch lsb-0008 §3.5; точка сборки гибридного поиска).
+        terms=TermsService(settings, embedding=embedding),
     )

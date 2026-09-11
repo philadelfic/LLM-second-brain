@@ -22,6 +22,7 @@ from app.config import get_settings
 from app.services import Services, build_services
 from app.services.namespaces import NamespaceService
 from app.services.skills import SkillsService
+from app.services.terms import TermsService
 from app.services.user_facts import UserFactsService
 from app.storage.db import init_db
 from app.transport.mcp import (
@@ -148,6 +149,9 @@ USER_TOOL_NAMES = frozenset(
     {"user_search", "user_save", "user_update", "user_delete", "user_get"}
 )
 
+# 3 ручки области terms (lsb-0008-02) — поверхность релиза 3.0.0 растёт.
+TERMS_TOOL_NAMES = frozenset({"terms_search", "terms_save", "terms_get"})
+
 
 def form(**overrides: object) -> dict[str, object]:
     """Валидная форма навыка; overrides правят отдельные поля."""
@@ -176,6 +180,7 @@ def _services(settings, embedding) -> Services:
         promotion=None,
         skills=SkillsService(settings, embedding=embedding),
         user_facts=UserFactsService(settings, embedding=embedding),
+        terms=TermsService(settings, embedding=embedding),
     )
 
 
@@ -236,10 +241,10 @@ class TestToolRegistry:
         names = {tool.name for tool in await mcp_skills.list_tools()}
         assert set(CANON_TOOL_DESCRIPTIONS) <= names
         assert names - set(CANON_TOOL_DESCRIPTIONS) == (
-            MEMORY_TOOL_NAMES | USER_TOOL_NAMES
+            MEMORY_TOOL_NAMES | USER_TOOL_NAMES | TERMS_TOOL_NAMES
         )
         assert set(TOOL_NAMES) == names
-        assert len(names) == 18
+        assert len(names) == 21
 
     @pytest.mark.asyncio
     async def test_tool_descriptions_are_canon_verbatim(self, mcp_skills) -> None:

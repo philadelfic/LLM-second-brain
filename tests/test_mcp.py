@@ -156,11 +156,12 @@ class TestHandshake:
 
 class TestToolsList:
     @pytest.mark.asyncio
-    async def test_eighteen_tools(self, server_url: str) -> None:
-        """lsb-0009-02: поверхность = 8 ручек заметок/узлов + 5 навыков + 5 user."""
+    async def test_twenty_one_tools(self, server_url: str) -> None:
+        """lsb-0008-02: поверхность = 8 ручек заметок/узлов + 5 навыков +
+        5 user + 3 terms."""
         async with connect(server_url) as session:
             tools = await session.list_tools()
-        assert len(tools.tools) == 18
+        assert len(tools.tools) == 21
         assert {tool.name for tool in tools.tools} == TOOL_NAMES
 
     @pytest.mark.asyncio
@@ -1066,6 +1067,7 @@ class TestNamespaceCreateAntiseonymy:
         from app.config import get_settings
         from app.services import Services
         from app.services.namespaces import NamespaceService
+        from app.services.terms import TermsService
         from app.services.user_facts import UserFactsService
         from app.storage.db import init_db
         from app.transport.mcp import build_mcp
@@ -1085,6 +1087,7 @@ class TestNamespaceCreateAntiseonymy:
             classifier=None,
             promotion=None,
             user_facts=UserFactsService(settings, embedding=HashEmbedder(64)),
+            terms=TermsService(settings, embedding=HashEmbedder(64)),
         )
         return build_mcp(settings, services)
 
@@ -1094,6 +1097,7 @@ class TestNamespaceCreateAntiseonymy:
         from app.config import get_settings
         from app.services import Services
         from app.services.namespaces import NamespaceService
+        from app.services.terms import TermsService
         from app.services.user_facts import UserFactsService
         from app.storage.db import init_db
         from app.transport.mcp import build_mcp
@@ -1113,6 +1117,7 @@ class TestNamespaceCreateAntiseonymy:
             classifier=None,
             promotion=None,
             user_facts=UserFactsService(settings, embedding=FailingEmbedder()),
+            terms=TermsService(settings, embedding=FailingEmbedder()),
         )
         return build_mcp(settings, services)
 

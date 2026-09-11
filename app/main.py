@@ -181,6 +181,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # выросшему back-off (прецедент области навыков). Сервис обязателен в
     # контейнере — проверки на None не требуется.
     services.user_facts.set_areas_notifier(worker.notify_areas_pending)
+    # Область terms (3.0.0, lsb-0008): запись/правка/удаление термина будит
+    # петлю areas тем же сигналом — вектора записи догоняются сразу, а не по
+    # выросшему back-off (прецедент областей навыков и «user»). Сервис
+    # обязателен в контейнере — проверки на None не требуется.
+    services.terms.set_areas_notifier(worker.notify_areas_pending)
     # Внутренний маршрут MCP-сервера — ровно MCP_PATH. host="0.0.0.0" — не
     # localhost, поэтому SDK не включает DNS-rebinding protection (сервис
     # живёт в LAN за Bearer-токеном; Open WebUI ходит с не-localhost Host).
