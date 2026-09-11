@@ -239,6 +239,17 @@ class AreaSearch:
                     query_vector,
                     CANDIDATE_LIMIT,
                 )
+                # Гейт порога косинуса (прецедент заметок, SCORE_THRESHOLD):
+                # vec0-KNN ВСЕГДА отдаёт k ближайших — без порога «проба»
+                # области («пусто = такой записи нет») стала бы недостижимой
+                # при любой непустой таблице, и мягкий hint пустого поиска
+                # (субстрат §3.5) не выдавался бы никогда. Порог — общая
+                # калибровка кодировщика, не отдельная для областей.
+                hits = [
+                    (row_id, cosine)
+                    for row_id, cosine in hits
+                    if cosine >= self._settings.score_threshold
+                ]
                 rankings.append([row_id for row_id, _cosine in hits])
             if expression:
                 rankings.append(

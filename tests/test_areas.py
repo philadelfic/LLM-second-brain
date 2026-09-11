@@ -202,6 +202,25 @@ class TestAreaSearchHybrid:
         assert result["hint"] == HINT_NO_RESULTS
         assert result["warning"] is None
 
+    def test_vector_gate_score_threshold_keeps_probe_real(self, dim8) -> None:
+        """Порог косинуса: vec0-KNN отдаёт k ближайших — нерелевантное режем.
+
+        Без гейта порога (прецедент заметок, SCORE_THRESHOLD) любая непустая
+        область отвечала бы на ЛЮБОЙ запрос, и «пусто = такой записи нет»
+        (мягкий hint пробы, субстрат §3.5) стало бы недостижимым.
+        """
+        with session(dim8) as conn, transaction(conn):
+            row_id = _skill(conn, "Деплой релиза", "как катить релиз")
+            _vectorize(conn, SKILLS_AREA, row_id, "Деплой релиза\nкак катить релиз")
+        searcher = AreaSearch(dim8, SKILLS_AREA, HashEmbedder(DIM))
+        # связанный запрос: вектор выше порога (+ FTS-совпадение) — хит есть
+        assert [hit["id"] for hit in searcher.search("деплой релиза")["results"]] == [row_id]
+        # нерелевантный запрос: FTS не совпал, вектор ниже порога — пусто + hint
+        result = searcher.search("метеостанция на крыше общежития")
+        assert result["results"] == []
+        assert result["hint"] == HINT_NO_RESULTS
+        assert result["warning"] is None
+
     def test_short_query_hint_without_expression(self, dim8) -> None:
         """Все слова короче 3 символов: trigram не ищет — отдельный hint.
 
