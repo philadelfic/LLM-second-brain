@@ -39,7 +39,6 @@ SearchService.search_title: строгий поиск по названиям (�
 
 from __future__ import annotations
 
-import re
 import sqlite3
 from typing import Any
 
@@ -47,6 +46,7 @@ from app.config import Settings
 from app.services.embedding import Embedder, EmbeddingError, EmbeddingService
 from app.services.emit import snippet, summary_of
 from app.services.namespaces import NamespaceError, NamespaceService
+from app.services.ranking import fuse_rrf, match_expression
 from app.storage import chunks, vectors
 from app.storage.db import session
 
@@ -59,7 +59,8 @@ CANDIDATE_LIMIT = 50
 
 # Разбивка составных токенов запроса (BUG-001): «open-webui» → «open» +
 # «webui» — FTS ловит тексты, где написание отличается («Open WebUI»).
-_TOKEN_SPLIT_RE = re.compile(r"[^0-9A-Za-zА-Яа-яЁё]+")
+# FTS-выражение запроса — общий примитив app.services.ranking.match_expression
+# (с релиза 3.0.0 его же использует поиск внутри области).
 
 # Отказ кодирования запроса: поиск деградирует к FTS-only + warning (§5.3).
 WARNING_FTS_ONLY = (
@@ -146,19 +147,20 @@ class SearchService:
             # --- слияние RRF: score(d) = Σ 1/(RRF_K + rank) -----------------
             # Векторный источник — уже агрегированный список заметок
             # (лучший чанк задал cosine и snippet), Фаза 3 — полный вектор.
-            scores: dict[int, float] = {}
+            # Слияние — общий примитив app.services.ranking.fuse_rrf (тот же
+            # счёт у поиска внутри области, субстрат 3.0.0).
             cosine_by_id: dict[int, float] = {}
             snippet_source: dict[int, str | None] = {}
-            for rank, (note_id, cosine, chunk_text) in enumerate(vector_hits, start=1):
-                scores[note_id] = scores.get(note_id, 0.0) + 1.0 / (
-                    self._settings.rrf_k + rank
-                )
+            for note_id, cosine, chunk_text in vector_hits:
                 cosine_by_id[note_id] = cosine
                 snippet_source[note_id] = chunk_text
-            for rank, row in enumerate(fts_rows, start=1):
-                scores[row["id"]] = scores.get(row["id"], 0.0) + 1.0 / (
-                    self._settings.rrf_k + rank
-                )
+            scores = fuse_rrf(
+                (
+                    [note_id for note_id, _cosine, _text in vector_hits],
+                    [row["id"] for row in fts_rows],
+                ),
+                self._settings.rrf_k,
+            )
 
             rows = self._fetch_rows(conn, list(scores))
         results = self._merge(scores, cosine_by_id, snippet_source, rows)[:top_k]
@@ -521,26 +523,9 @@ class SearchService:
 
     @staticmethod
     def _match_expression(query: str) -> str | None:
-        """Слова ≥3 символов (плюс ≥3-символьные части составных токенов)
-        как цитированные подстроки через OR.
+        """FTS-выражение запроса (общий примитив app.services.ranking).
 
-        OR, а не AND (BUG-001): AND выкидывал заметку целиком, если хотя бы
-        одно слово запроса не встречалось в её тексте («openwebui chat_id»
-        не находило заметку про chat_id без «openwebui»). При OR BM25
-        ранжирует по числу/редкости совпавших слов — заметка со всеми
-        словами выше; шум отсекается RRF-слиянием и top_k.
-        None — нет ни одного слова, по которому trigram вообще может искать.
+        Слова ≥3 символов как цитированные подстроки через OR (trigram);
+        None — нет ни одного слова, по которому trigram может искать.
         """
-        tokens: list[str] = []
-        for word in query.split():
-            if len(word) >= 3:
-                tokens.append(word)
-            for part in _TOKEN_SPLIT_RE.split(word):
-                if len(part) >= 3 and part != word:
-                    tokens.append(part)
-        unique = dict.fromkeys(tokens)
-        if not unique:
-            return None
-        return " OR ".join(
-            f'"{token.replace(chr(34), chr(34) * 2)}"' for token in unique
-        )
+        return match_expression(query)

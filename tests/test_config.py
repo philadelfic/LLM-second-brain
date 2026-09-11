@@ -84,6 +84,29 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     # Фаза 10.1: флаг think судьи структуры отделён от дедуп-судьи (A/B Шага 7);
     # умолчание None = наследует JUDGE_THINK.
     "NAMESPACE_JUDGE_THINK": ("namespace_judge_think", None),
+    # Релиз 3.0.0, субстрат областей (постановка 00): лимиты формы и пороги
+    # сходства skills/terms/user — из контрактов фич lsb-0007/0008/0009.
+    "SKILL_NAME_MAX_CHARS": ("skill_name_max_chars", 65),
+    "SKILL_DESCRIPTION_MAX_CHARS": ("skill_description_max_chars", 250),
+    "SKILL_STEPS_MAX_CHARS": ("skill_steps_max_chars", 500),
+    "SKILL_TEXT_MAX_CHARS": ("skill_text_max_chars", 4000),
+    "SKILL_EXAMPLE_MAX_CHARS": ("skill_example_max_chars", 1000),
+    "SKILL_EXTRA_FIELD_MAX_CHARS": ("skill_extra_field_max_chars", 500),
+    "SKILL_EXTRA_TOTAL_MAX_CHARS": ("skill_extra_total_max_chars", 2000),
+    "INSTRUCTION_TEMPLATE_MAX_CHARS": ("instruction_template_max_chars", 1000),
+    "SKILL_ANNOUNCE_MAX_CHARS": ("skill_announce_max_chars", 2000),
+    "SKILL_ANNOUNCE_DESCRIPTION_CHARS": ("skill_announce_description_chars", 120),
+    "SKILL_SYNONYM_SIMILARITY": ("skill_synonym_similarity", 0.90),
+    "TERM_MAX_CHARS": ("term_max_chars", 100),
+    "TERM_CONTEXT_MAX_CHARS": ("term_context_max_chars", 40),
+    "TERM_DEFINITION_MAX_CHARS": ("term_definition_max_chars", 350),
+    "TERM_CONTEXT_SIMILARITY": ("term_context_similarity", 0.75),
+    "TERM_CONTEXTS_HINT_LIMIT": ("term_contexts_hint_limit", 30),
+    "USER_NAME_MAX_WORDS": ("user_name_max_words", 5),
+    "USER_BODY_MAX_CHARS": ("user_body_max_chars", 1200),
+    "USER_SIMILAR_STRONG": ("user_similar_strong", 0.85),
+    "USER_SIMILAR_WEAK": ("user_similar_weak", 0.55),
+    "USER_SEARCH_EXCERPT_CHARS": ("user_search_excerpt_chars", 300),
 }
 
 
@@ -111,10 +134,11 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 57 полей: 6 обязательных + 51 с умолчаниями
+        """В Settings — ровно 78 полей: 6 обязательных + 72 с умолчаниями
         (25 §8 + 6 чанковых Фазы 7 + 2 фонового дедупа + 3 судьи Фазы 8
         + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера + 3 ключа
-        + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None)."""
+        + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21 субстрата
+        областей релиза 3.0.0: лимиты/пороги skills/terms/user)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

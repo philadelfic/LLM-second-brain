@@ -145,6 +145,32 @@ class Settings(BaseSettings):
     # — 10–50 токенов, рассуждения не нужны). None — наследует JUDGE_THINK.
     namespace_judge_think: bool | None = None
 
+    # --- области 3.0.0 (субстрат: skills / terms / user) ---------------------
+    # Лимиты формы и пороги сходства — из контрактов фич lsb-0007/0008/0009;
+    # env-настраиваемые, валидируются при старте (см. _validate_ranges): лимиты
+    # применяет сервис области (CHECK-констрейнты, как у заметок, не используем).
+    skill_name_max_chars: int = 65
+    skill_description_max_chars: int = 250
+    skill_steps_max_chars: int = 500
+    skill_text_max_chars: int = 4000
+    skill_example_max_chars: int = 1000
+    skill_extra_field_max_chars: int = 500  # одно поле класса навыка (JSON extra)
+    skill_extra_total_max_chars: int = 2000  # сумма всех полей extra
+    instruction_template_max_chars: int = 1000  # глобальный шаблон (skills_meta)
+    skill_announce_max_chars: int = 2000  # бюджет блока анонса скиллов
+    skill_announce_description_chars: int = 120  # обрезка description в анонсе
+    skill_synonym_similarity: float = 0.90  # антисинонимия создания навыка
+    term_max_chars: int = 100
+    term_context_max_chars: int = 40
+    term_definition_max_chars: int = 350
+    term_context_similarity: float = 0.75  # триграммная близость контекста
+    term_contexts_hint_limit: int = 30  # топ использованных контекстов в hint'е
+    user_name_max_words: int = 5  # контракт title заметок (TITLE_MAX_WORDS)
+    user_body_max_chars: int = 1200
+    user_similar_strong: float = 0.85  # мягкий отказ «почти тот же факт»
+    user_similar_weak: float = 0.55  # средняя зона: запись + список похожих
+    user_search_excerpt_chars: int = 300  # обрезка body в выдаче поиска
+
     @field_validator(
         "embedding_base_url",
         "summary_base_url",
@@ -294,6 +320,53 @@ class Settings(BaseSettings):
             "namespace_max_leaves_per_domain", self.namespace_max_leaves_per_domain, 1
         )
         need_low("namespace_groom_min_notes", self.namespace_groom_min_notes, 0)
+
+        # --- области 3.0.0 (субстрат: skills / terms / user) ---
+        for field in (
+            "skill_name_max_chars",
+            "skill_description_max_chars",
+            "skill_steps_max_chars",
+            "skill_text_max_chars",
+            "skill_example_max_chars",
+            "skill_extra_field_max_chars",
+            "skill_extra_total_max_chars",
+            "instruction_template_max_chars",
+            "skill_announce_max_chars",
+            "skill_announce_description_chars",
+            "term_max_chars",
+            "term_context_max_chars",
+            "term_definition_max_chars",
+            "term_contexts_hint_limit",
+            "user_name_max_words",
+            "user_body_max_chars",
+            "user_search_excerpt_chars",
+        ):
+            need_low(field, getattr(self, field), 1)
+        # Пороги сходства — косинус/триграммы: шкала 0..1 (как у дедупа).
+        need_range("skill_synonym_similarity", self.skill_synonym_similarity, 0.0, 1.0)
+        need_range("term_context_similarity", self.term_context_similarity, 0.0, 1.0)
+        need_range("user_similar_strong", self.user_similar_strong, 0.0, 1.0)
+        need_range("user_similar_weak", self.user_similar_weak, 0.0, 1.0)
+        # Реляционные проверки (по образцу dedup_candidate_similarity):
+        # сумма бюджета extra обязана вмещать хотя бы одно поле класса;
+        # обрезка description в анонсе — в пределах бюджета блока;
+        # слабый порог «похоже» не выше сильного «тот же факт» — иначе
+        # средняя зона пуста и подсказка не приходит никогда.
+        if self.skill_extra_field_max_chars > self.skill_extra_total_max_chars:
+            errors.append(
+                "  - skill_extra_field_max_chars: лимит одного поля extra выше "
+                "суммарного skill_extra_total_max_chars — ни одно поле не влезет"
+            )
+        if self.skill_announce_description_chars > self.skill_announce_max_chars:
+            errors.append(
+                "  - skill_announce_description_chars: обрезка description выше "
+                "бюджета блока skill_announce_max_chars"
+            )
+        if self.user_similar_weak > self.user_similar_strong:
+            errors.append(
+                "  - user_similar_weak: слабый порог выше сильного "
+                "user_similar_strong — средняя зона окажется пустой"
+            )
 
         # --- прочее ---
         if not self.author_default.strip():

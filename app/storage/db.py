@@ -44,6 +44,14 @@ CRUD (валидации, статусы, soft delete) — в `app.services.note
 - На старте FTS-индекс сверяется с `notes` (оператор имеет прямой доступ к
   файлу БД, REQUIREMENTS §4); рассинхрон лечится rebuild'ом, прочие ошибки
   целостности — фатальны (StorageError).
+- Области 3.0.0 (субстрат, ARCH substrate §3.1–3.2): отдельные таблицы,
+  FTS5-индексы и vec0-индексы по областям skills/terms/user в той же БД.
+  Ни один объект заметок не пересоздаётся; старые записи не мигрируются
+  (данные областей — с нуля). FTS — внешнего контента с триггерами
+  AFTER INSERT / AFTER UPDATE; `terms` несёт ЧАСТИЧНЫЙ UNIQUE по активным
+  записям (`WHERE deleted_at IS NULL`). Area-vec дропаются вместе с
+  notes_vec в ветке смены модели/размерности — все записи областей →
+  pending, догоняет петля `areas` воркера.
 """
 
 from __future__ import annotations
@@ -58,7 +66,7 @@ from pathlib import Path
 import sqlite_vec
 
 from app.config import Settings
-from app.storage import chunks, expirations, vectors
+from app.storage import area_vectors, chunks, expirations, vectors
 
 # Сколько ждать блокировку записи, прежде чем сдаться (как timeout sqlite3,
 # так и PRAGMA busy_timeout).
@@ -193,6 +201,190 @@ _TRIGGERS = (
     END
     """,
 )
+
+
+# --- области 3.0.0 (субстрат: skills / terms / user) ----------------------
+
+# Один раз на релиз: изолированный слой областей в общей БД notes.db.
+# Ни один SQL области не адресует notes* (изоляция — тесты в обе стороны).
+SKILLS_TABLE = "skills"
+SKILLS_FTS_TABLE = "skills_fts"
+SKILLS_FTS_COLUMNS = ("name", "description", "steps", "text")
+TERMS_TABLE = "terms"
+TERMS_FTS_TABLE = "terms_fts"
+TERMS_FTS_COLUMNS = ("term", "context", "definition")
+USER_FACTS_TABLE = "user_facts"
+USER_FACTS_FTS_TABLE = "user_facts_fts"
+USER_FACTS_FTS_COLUMNS = ("name", "body")
+
+# Записи областей (без vec-таблиц): общие колонки + поля конкретной области.
+AREA_RECORD_TABLES = (SKILLS_TABLE, TERMS_TABLE, USER_FACTS_TABLE)
+
+# (таблица записей, FTS-таблица, индексируемые колонки) — реестр FTS/триггеров:
+# один DDL и один набор триггеров на каждую область (без копипасты по областям).
+_AREA_FTS_SPECS = (
+    (SKILLS_TABLE, SKILLS_FTS_TABLE, SKILLS_FTS_COLUMNS),
+    (TERMS_TABLE, TERMS_FTS_TABLE, TERMS_FTS_COLUMNS),
+    (USER_FACTS_TABLE, USER_FACTS_FTS_TABLE, USER_FACTS_FTS_COLUMNS),
+)
+
+# Поля записей — по архитектурам фич lsb-0007/0008/0009; общее у всех —
+# id, vector_status (default pending), created_at, updated_at, deleted_at.
+# CHECK-констрейнты, как у заметок, не используем: лимиты формы — валидация
+# сервиса (мягкий отказ с hint), DDL — только структура.
+_AREA_DDL = (
+    """
+CREATE TABLE IF NOT EXISTS skills (
+  id            INTEGER PRIMARY KEY,
+  name          TEXT    NOT NULL DEFAULT '',
+  description   TEXT    NOT NULL DEFAULT '',
+  example       TEXT    NULL,
+  steps         TEXT    NOT NULL DEFAULT '',
+  text          TEXT    NOT NULL DEFAULT '',
+  extra         TEXT    NULL,
+  version       INTEGER NOT NULL DEFAULT 1,
+  vector_status TEXT    NOT NULL DEFAULT 'pending',
+  created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  deleted_at    TEXT    NULL
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS skill_versions (
+  skill_id    INTEGER NOT NULL,
+  version     INTEGER NOT NULL,
+  name        TEXT    NOT NULL DEFAULT '',
+  description TEXT    NOT NULL DEFAULT '',
+  example     TEXT    NULL,
+  steps       TEXT    NOT NULL DEFAULT '',
+  text        TEXT    NOT NULL DEFAULT '',
+  extra       TEXT    NULL,
+  created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  PRIMARY KEY (skill_id, version)
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS skills_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS terms (
+  id            INTEGER PRIMARY KEY,
+  term          TEXT    NOT NULL DEFAULT '',
+  term_norm     TEXT    NOT NULL DEFAULT '',
+  context       TEXT    NOT NULL DEFAULT '',
+  context_norm  TEXT    NOT NULL DEFAULT '',
+  definition    TEXT    NOT NULL DEFAULT '',
+  vector_status TEXT    NOT NULL DEFAULT 'pending',
+  created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  deleted_at    TEXT    NULL
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS user_facts (
+  id            INTEGER PRIMARY KEY,
+  name          TEXT    NOT NULL DEFAULT '',
+  body          TEXT    NOT NULL DEFAULT '',
+  vector_status TEXT    NOT NULL DEFAULT 'pending',
+  created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  deleted_at    TEXT    NULL
+)
+""",
+)
+
+# Частичный UNIQUE (lsb-0008 §3.3): ключ термина (term_norm + context_norm)
+# уникален только среди АКТИВНЫХ записей — soft-deleted строку ключ не держит
+# (удалённый ключ освобождается, «undo — оператором»).
+_TERMS_ACTIVE_KEY_INDEX_DDL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_terms_key_active "
+    "ON terms(term_norm, context_norm) WHERE deleted_at IS NULL"
+)
+
+
+def _area_fts_ddl(table: str, fts_table: str, columns: tuple[str, ...]) -> str:
+    """DDL FTS5-индекса области: внешний контент, trigram (как notes_fts)."""
+    return (
+        f"CREATE VIRTUAL TABLE IF NOT EXISTS {fts_table} USING fts5("
+        f"  {', '.join(columns)}, content='{table}', content_rowid='id', "
+        "tokenize='trigram')"
+    )
+
+
+def _area_trigger_ddls(
+    table: str, fts_table: str, columns: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Триггеры синхронизации FTS области: AFTER INSERT и AFTER UPDATE.
+
+    DELETE-триггер не нужен: удаление области — soft (`deleted_at`), строка и
+    FTS-индекс физически остаются в trash (прецедент заметок). Для внешнего
+    контента удаление из индекса — спец-команда 'delete' со СТАРЫМИ
+    значениями индексируемых колонок (только в UPDATE).
+    """
+    joined = ", ".join(columns)
+    new_values = ", ".join(f"new.{column}" for column in columns)
+    old_values = ", ".join(f"old.{column}" for column in columns)
+    return (
+        f"""
+CREATE TRIGGER IF NOT EXISTS {fts_table}_ai AFTER INSERT ON {table} BEGIN
+  INSERT INTO {fts_table}(rowid, {joined}) VALUES (new.id, {new_values});
+END
+""",
+        f"""
+CREATE TRIGGER IF NOT EXISTS {fts_table}_au AFTER UPDATE ON {table} BEGIN
+  INSERT INTO {fts_table}({fts_table}, rowid, {joined}) VALUES ('delete', old.id, {old_values});
+  INSERT INTO {fts_table}(rowid, {joined}) VALUES (new.id, {new_values});
+END
+""",
+    )
+
+
+def _create_area_schema(conn: sqlite3.Connection, settings: Settings) -> None:
+    """Создать схему областей при старте — идемпотентно (ARCH substrate §3.1).
+
+    Таблицы записей + FTS5 внешнего контента + триггеры + частичный UNIQUE
+    ключа terms + vec0-таблицы текущей размерности. Живые БД апгрейдятся без
+    ручных миграций (всё `IF NOT EXISTS`); существующие объекты заметок не
+    трогаются вовсе.
+    """
+    for ddl in _AREA_DDL:
+        conn.execute(ddl)
+    for table, fts_table, columns in _AREA_FTS_SPECS:
+        conn.execute(_area_fts_ddl(table, fts_table, columns))
+        for trigger in _area_trigger_ddls(table, fts_table, columns):
+            conn.execute(trigger)
+    conn.execute(_TERMS_ACTIVE_KEY_INDEX_DDL)
+    area_vectors.create_vec_tables(conn, settings.embedding_dim)
+
+
+def _create_area_vec_if_missing(conn: sqlite3.Connection, dim: int) -> None:
+    """Создать отсутствующие area-vec (наследники до 3.0.0, ручные правки)."""
+    if not area_vectors.vec_tables_exist(conn):
+        area_vectors.create_vec_tables(conn, dim)
+
+
+def _reset_area_vectors(conn: sqlite3.Connection, settings: Settings) -> None:
+    """Смена модели/размерности: area-vec дропаются и пересоздаются.
+
+    Вектора другой модели несовместимы: все записи областей (включая trash)
+    → `vector_status='pending'`, догоняет петля `areas` воркера — по образцу
+    notes_vec (NFR-3: данные не теряются, поиск деградирует к FTS).
+    """
+    area_vectors.drop_vec_tables(conn)
+    area_vectors.create_vec_tables(conn, settings.embedding_dim)
+    for table in AREA_RECORD_TABLES:
+        conn.execute(f"UPDATE {table} SET vector_status = 'pending'")
+
+
+def _count_area_records(conn: sqlite3.Connection) -> int:
+    """Число записей областей (события автореиндексации, наблюдение)."""
+    return sum(
+        int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        for table in AREA_RECORD_TABLES
+    )
 
 
 # --- соединения ---------------------------------------------------------
@@ -364,6 +556,10 @@ def init_db(settings: Settings) -> None:
             # Чанки (Фаза 7): таблица текстов чанков — до векторной сверки,
             # при несовпадении конфигурации дропается и notes_chunks_vec.
             chunks.create_table(conn)
+            # Области 3.0.0 (субстрат): таблицы/FTS/индексы/vec0 областей —
+            # до сверки модели/размерности: её ветка дропает area-vec и
+            # пересоздаёт их под текущую размерность (_reset_area_vectors).
+            _create_area_schema(conn, settings)
             # Вектора (Фаза 3 + решение 2026-08-29; Фаза 7: + вектора чанков):
             # создание при первом старте; при несовпадении зафиксированной
             # конфигурации (модель/размерность) с env — полная автореиндексация
@@ -788,6 +984,7 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
         if existing_dim is None:
             vectors.create_vec_table(conn, settings.embedding_dim)
         _create_chunk_vec_if_missing(conn, settings.embedding_dim)
+        _create_area_vec_if_missing(conn, settings.embedding_dim)
         _set_chunk_meta_defaults(conn, settings)
         _set_meta(conn, "embedding_model", settings.embedding_model)
         _set_meta(conn, "embedding_dim", str(settings.embedding_dim))
@@ -815,8 +1012,10 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
     }
     if not model_changed and not chunk_changes:
         # Совпало: но notes_chunks_vec могла ещё не существовать на живой БД
-        # (Фаза 7 поверх Фазы 5) — создать при отсутствии.
+        # (Фаза 7 поверх Фазы 5) — создать при отсутствии. Area-vec — та же
+        # логика (наследники до 3.0.0: у них есть meta, но нет областей).
         _create_chunk_vec_if_missing(conn, settings.embedding_dim)
+        _create_area_vec_if_missing(conn, settings.embedding_dim)
         _set_chunk_meta_defaults(conn, settings)
         return
     notes_count = int(
@@ -846,6 +1045,9 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
         vectors.create_vec_table(conn, settings.embedding_dim)
         # Вектора полных текстов невалидны — все заметки (вкл. trash) в очередь.
         conn.execute("UPDATE notes SET vector_status = 'pending'")
+        # Области 3.0.0: вектора другой модели несовместимы — area-vec
+        # дропаются и пересоздаются, все записи областей → pending.
+        _reset_area_vectors(conn, settings)
     # Вектора чанков невалидны при любой из причин (другая модель — другая
     # векторизация; другие параметры — другие чанки, их вектора больше не
     # соответствуют их же новым текстам). Дроп: все чанки → pending
@@ -871,6 +1073,7 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
     }
     if model_changed:
         done_extra["pending_vector"] = notes_count
+        done_extra["pending_areas"] = _count_area_records(conn)
     message_done = (
         "vector index rebuilt; background worker will re-encode all notes"
         if model_changed

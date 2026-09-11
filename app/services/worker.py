@@ -1,8 +1,8 @@
 """Фоновый воркер (ARCHITECTURE §3.4): до-векторизация + до-суммаризация.
 
-Единственный воркер на процесс, **три независимые петли по СЛОТАМ** (Фаза 11,
-решение №10) — состояния pending-статусов в БД (переживают рестарт, догоняются
-при старте сервиса):
+Единственный воркер на процесс, **четыре независимые петли по СЛОТАМ**
+(Фаза 11, решение №10; релиз 3.0.0 — петля областей) — состояния
+pending-статусов в БД (переживают рестарт, догоняются при старте сервиса):
 
 - **embedding-петля** (`_run_embedding`): вектора заметок (`pending_vector` →
   batch `embed_texts` → notes_vec, vector_status='ok'; полный вектор — по
@@ -18,6 +18,14 @@
 - **judge-петля** (`_run_judge`): судья дедупа (по judge-работам, созданным
   embedding-петлёй) + судья структуры (внутри PromotionService, триггер после
   классификации).
+- **петля areas** (`_run_areas`, субстрат 3.0.0): вектора записей областей
+  skills/terms/user (`vector_status='pending'` → батч `embed_texts` → vec0
+  области, 'ok'). Без LLM в момент записи (архитектура субстрата §3.3):
+  тексты областей — `AreaSpec.embed_text` (skills `name + description`,
+  terms `term + context + definition`, user `name + body`); отказ — событие
+  `area_embed_failed`, записи остаются pending, повтор по своему back-off.
+  Смена модели/размерности дропает area-vec вместе с notes_vec
+  (`db._sync_embedding_meta`) — все записи областей возвращаются в pending.
 
 Job-очереди в БД по слотам (`worker_jobs`): judge-работа (kind='dedup')
 создаётся ТОЛЬКО после готовности вектора заметки; merge-работа (kind='merge')
@@ -86,6 +94,7 @@ import json
 import logging
 
 from app.config import TITLE_MAX_WORDS, Settings
+from app.services.areas import AreaSpec, ALL_AREAS
 from app.services.classifier import ClassificationError, Classifier
 from app.services.dedup import DeduplicationService
 from app.services.embedding import Embedder, EmbeddingError
@@ -94,7 +103,7 @@ from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
 from app.services.promotion import PromotionService
 from app.services.summary import Summarizer, SummaryError
-from app.storage import chunks, vectors
+from app.storage import area_vectors, chunks, vectors
 from app.storage.db import delete_note_physical, session, transaction
 
 # Сколько хранить выполненные done-работы в worker_jobs (retention). Не env —
@@ -177,6 +186,7 @@ class BackgroundWorker:
         self._vector_interval = float(max(settings.pending_retry_sec, 0))
         self._summary_interval = float(max(settings.pending_retry_sec, 0))
         self._judge_interval = float(max(settings.pending_retry_sec, 0))
+        self._areas_interval = float(max(settings.pending_retry_sec, 0))
         self._stopping = False
         # Сигнал «появилась заметка с pending summary» — будит петлю
         # суммаризации немедленно (save/update), минуя выросший back-off.
@@ -184,6 +194,11 @@ class BackgroundWorker:
         # Сигнал «появилась judge-работа» — будит judge-петлю (embedding-петля
         # создала дедуп-работу после довекторизации).
         self._judge_event = asyncio.Event()
+        # Сигнал «появилась pending-запись области» — будит петлю areas
+        # (save/update сервисов областей зовут notify_areas_pending): текст
+        # записывается мгновенно, вектор догоняет фоном (архитектура
+        # субстрата §3.3 — без LLM в момент записи).
+        self._areas_event = asyncio.Event()
         # Мемоизация создания таблицы job-очередей (пул 5): DDL исполняется
         # один раз на экземпляр воркера, а не при каждом обращении к очередям
         # (_create_job/_pending_jobs/_mark_job_done звали _ensure_job_table
@@ -218,6 +233,11 @@ class BackgroundWorker:
         """Текущий интервал judge-петли (диагностика, тесты, Фаза 11)."""
         return self._judge_interval
 
+    @property
+    def areas_interval(self) -> float:
+        """Текущий интервал петли areas (диагностика, тесты, субстрат 3.0.0)."""
+        return self._areas_interval
+
     def stop(self) -> None:
         """Мягкая остановка: петли завершатся после разборки текущей итерации."""
         self._stopping = True
@@ -239,6 +259,16 @@ class BackgroundWorker:
         """
         self._judge_event.set()
 
+    def notify_areas_pending(self) -> None:
+        """Разбудить петлю areas: появилась pending-запись области.
+
+        Вызывается сервисами областей из save/update (поток
+        `asyncio.to_thread`) — `asyncio.Event.set()` потокобезопасен. Петля
+        немедленно выходит из ожидания и догоняет очередь векторов, не
+        дожидаясь выросшего back-off.
+        """
+        self._areas_event.set()
+
     async def run(self) -> None:
         """Все петли очередей (запускается asyncio-таской при старте).
 
@@ -248,7 +278,7 @@ class BackgroundWorker:
         """
         await asyncio.gather(
             self._run_embedding(), self._run_summary(), self._run_judge(),
-            self._run_expiration_cleanup(),
+            self._run_areas(), self._run_expiration_cleanup(),
         )
 
     async def _run_embedding(self) -> None:
@@ -369,6 +399,48 @@ class BackgroundWorker:
                 await asyncio.sleep(self._judge_interval)
                 self._judge_interval = next_interval(
                     self._judge_interval, self._settings.pending_retry_sec
+                )
+
+    # --- петля areas: вектора записей областей (субстрат 3.0.0) ---------------
+
+    async def _run_areas(self) -> None:
+        """Петля векторизации областей (субстрат 3.0.0, архитектура §3.3).
+
+        Своя очередь, свой интервал/back-off и свой сигнал: отказ векторизации
+        областей не мешает заметкам и наоборот (ARCH §3.4). Пустой прогон —
+        проверка очереди ПОСЛЕ clear() (пул 6, lost wakeup, как в
+        _run_summary/_run_judge) и ожидание сигнала notify_areas_pending() или
+        таймаута интервала. Супервизор петли (пул 4): непредвиденный сбой
+        итерации не убивает петлю — warning с traceback, пауза, повтор.
+        """
+        while not self._stopping:
+            try:
+                processed = await asyncio.to_thread(self.process_pending_areas)
+                if processed:
+                    self._areas_interval = float(self._settings.pending_retry_sec)
+                    continue
+                if not await asyncio.to_thread(self._areas_queue_empty):
+                    continue
+                self._areas_event.clear()
+                try:
+                    await asyncio.wait_for(
+                        self._areas_event.wait(), timeout=self._areas_interval
+                    )
+                except asyncio.TimeoutError:
+                    self._areas_interval = next_interval(
+                        self._areas_interval, self._settings.pending_retry_sec
+                    )
+            except asyncio.CancelledError:
+                raise  # отмена петли (graceful stop) — не глотать
+            except Exception:
+                logging.getLogger("app").warning(
+                    "worker loop iteration failed — loop continues",
+                    extra={"event": "loop_iteration_failed", "loop": "areas"},
+                    exc_info=True,
+                )
+                await asyncio.sleep(self._areas_interval)
+                self._areas_interval = next_interval(
+                    self._areas_interval, self._settings.pending_retry_sec
                 )
 
     # --- джоба зачистки просроченных заметок (lsb-0004-02, этап 4) -----------
@@ -639,6 +711,95 @@ class BackgroundWorker:
             self._create_job("judge", "dedup", int(row["id"]))
         self.notify_judge_pending()
         return processed
+
+    # --- петля areas: вектора записей областей (субстрат 3.0.0) ---------------
+
+    def process_pending_areas(self, limit: int | None = None) -> int:
+        """Векторизовать партию pending записей областей; число обработанных.
+
+        Каждая область (skills/terms/user) — своим батчем: pending записи
+        (`vector_status='pending'`, активные) → `embed_texts` по тексту
+        области (`AreaSpec.embed_text`) → upsert в её vec0 → `'ok'`. Размер
+        батча — `embedding_batch_size` (как у notes-очереди). Guard: вектор
+        пишется только если запись не менялась с вычиты (поля векторизации)
+        — иначе update в полёте оставил бы протухший вектор со статусом 'ok'.
+        Отказ кодировщика — записи остаются pending, событие
+        `area_embed_failed` (NFR-3), повтор по back-off петли areas.
+        """
+        batch = (
+            limit if limit is not None else self._settings.embedding_batch_size
+        )
+        processed = 0
+        for spec in ALL_AREAS:
+            processed += self._process_area_batch(spec, batch)
+        return processed
+
+    def _process_area_batch(self, spec: AreaSpec, batch: int) -> int:
+        """Батч одной области: вычитка pending → кодирование → upsert + 'ok'."""
+        columns = ", ".join(("id", *spec.embed_fields))
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                f"SELECT {columns} FROM {spec.table} "
+                "WHERE vector_status = 'pending' AND deleted_at IS NULL "
+                "ORDER BY id LIMIT ?",
+                (batch,),
+            ).fetchall()
+        if not rows:
+            return 0
+        try:
+            embeddings = self._embedding.embed_texts(
+                [spec.embed_text(row) for row in rows]
+            )
+        except EmbeddingError:
+            logging.getLogger("app").warning(
+                "area vectorization failed — records stay pending",
+                extra={
+                    "event": "area_embed_failed",
+                    "area": spec.name,
+                    "count": len(rows),
+                },
+            )
+            return 0
+        processed = 0
+        guard = " AND ".join(f"{column} IS ?" for column in spec.embed_fields)
+        for row, vector in zip(rows, embeddings):
+            with session(self._settings) as conn, transaction(conn):
+                # Guard по полям векторизации: `IS ?` сравнивает и NULL.
+                cursor = conn.execute(
+                    f"UPDATE {spec.table} SET vector_status = 'ok' "
+                    "WHERE id = ? AND vector_status = 'pending' "
+                    f"AND deleted_at IS NULL AND {guard}",
+                    (row["id"], *(row[column] for column in spec.embed_fields)),
+                )
+                if not cursor.rowcount:
+                    continue
+                area_vectors.upsert(
+                    conn,
+                    spec.vec_table,
+                    spec.vec_id_column,
+                    int(row["id"]),
+                    vector,
+                )
+                processed += 1
+        return processed
+
+    def _areas_queue_empty(self) -> bool:
+        """Пуста ли очередь областей (дешёвый SELECT, пул 6, lost wakeup).
+
+        pending-записи считаются по всем областям реестра (ALL_AREAS) —
+        та же очередь, что выгребает process_pending_areas.
+        """
+        pending = 0
+        with session(self._settings) as conn:
+            for spec in ALL_AREAS:
+                pending += int(
+                    conn.execute(
+                        f"SELECT COUNT(*) FROM {spec.table} "
+                        "WHERE vector_status = 'pending' "
+                        "AND deleted_at IS NULL"
+                    ).fetchone()[0]
+                )
+        return pending == 0
 
     # --- judge-петля: судья дедупа (Фаза 8, Этап 3.2; Фаза 11, решение №10) ---
 
