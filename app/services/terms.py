@@ -50,6 +50,8 @@ REST-зеркало — lsb-0008-03):
 - search (близкие) → {senses: [{id, term, context, definition, score}],
                        exact: False, hint}
 - search (пусто)   → {senses: [], exact: False, hint}
+- update           → {id, updated: True} | {id, updated: False, hint};
+                       занятый ключ → TermKeyConflictError (транспорт → 409)
 - get              → {id, term, context, definition}; не найдена → {id, hint}
 - delete           → {id, deleted: True} | {id, deleted: False, hint}
 """
@@ -110,6 +112,16 @@ HINT_CONTEXT_REQUIRED = (
 # ломает ключ области — отказ; стиль и язык — как у канонических.
 HINT_TERM_REQUIRED = "not saved: term is required"
 
+# Конфликт ключа при правке ПО ID (PUT /terms/{id}, субстрат §3.6: 409). Канон
+# §3.7 задаёт тексты мягких отказов записи, но не конфликт ключа: транспорт
+# обязан отличить его от валидации, поэтому текст собран по стилю канонических
+# (английский, ведёт к существующей записи и к безопасному выходу).
+HINT_KEY_CONFLICT = (
+    "not saved: the key (term + context) is already used by another active "
+    "record (id={id}: '{term}' / '{context}') — edit that record instead, or "
+    "choose a different context or term"
+)
+
 
 class TermValidationError(ValueError):
     """Нарушение доменных ограничений термина (лимиты формы, запрос поиска).
@@ -120,6 +132,16 @@ class TermValidationError(ValueError):
     """
 
 
+class TermKeyConflictError(ValueError):
+    """Новый ключ правки занят ДРУГОЙ активной записью области (субстрат
+    §3.6: конфликт ключа → 409; отдельный тип, чтобы транспорт не путал его
+    с нарушениями формы и мягкими отказами, которые отдаются как 422).
+
+    Текст исключения — дословная hint-константа `HINT_KEY_CONFLICT` с id
+    существующей записи: запись НЕ идёт, оператор правит её или меняет ключ.
+    """
+
+
 class TermsService:
     """CRUD области «terms»: ключ (term + context), смыслы, подсказки, поиск.
 
@@ -127,7 +149,7 @@ class TermsService:
     контекстов), `embedding` (кодирование запроса гибридного поиска). Путь
     записи кодировщик НЕ зовёт (§3.5, субстрат §3.3): близость контекста
     триграммная, вектора догоняет петля `areas` воркера. Листинга у сервиса нет
-    — публичные ручки только `save`/`search`/`get`/`delete`.
+    — публичные ручки только `save`/`update`/`search`/`get`/`delete`.
     """
 
     def __init__(
@@ -244,6 +266,73 @@ class TermsService:
             answer["contexts"] = self._contexts(conn)
         self._notify_areas_pending()
         return answer
+
+    def update(
+        self, id: int, term: str, context: str, definition: str
+    ) -> dict[str, Any]:
+        """Править запись ПО ID (PUT /terms/{id}; arch §3.6, субстрат §3.6).
+
+        Отличается от `save` тем, что адресует строку по id, а не по ключу:
+        цель — редкая чистка/правка терминологии оператором, включая переезд
+        на другой ключ (`term`/`context`). Форма проверяется ДО БД (нарушение
+        лимита или пустой контекст → `TermValidationError` → 422 с дословным
+        hint §3.7); ключ пересчитывается (`term_norm`/`context_norm`), вектор
+        уходит в `pending`, `updated_at` обновляется (догоняет петля `areas`).
+
+        Исходы:
+
+        * новый ключ занят ДРУГОЙ активной записью → `TermKeyConflictError`
+          (`HINT_KEY_CONFLICT`, транспорт → 409): ключ области уникален, и
+          переезд не должен затирать чужой смысл;
+        * тот же ключ (сама запись) — не конфликт: правка идёт штатно;
+        * записи нет/она soft-deleted → мягкий ответ `{id, updated: False,
+          hint}` канона §3.7 (транспорт → 404).
+
+        Подсказка «близкий контекст» здесь НЕ применяется: это защита записи
+        НОВОГО смысла (§3.5), а правка адресует существующую строку осознанно.
+        """
+        checked_term = self._checked_term(term)
+        checked_context = self._checked_context(context)
+        checked_definition = self._checked_definition(definition)
+        term_norm = normalize_key(checked_term)
+        context_norm = normalize_key(checked_context)
+        with session(self._settings) as conn, transaction(conn):
+            row = conn.execute(
+                "SELECT id FROM terms WHERE id = ? AND deleted_at IS NULL",
+                (id,),
+            ).fetchone()
+            if row is None:
+                return {"id": id, "updated": False, "hint": HINT_NOT_FOUND}
+            occupied = conn.execute(
+                "SELECT id, term, context FROM terms WHERE term_norm = ? "
+                "AND context_norm = ? AND deleted_at IS NULL AND id != ?",
+                (term_norm, context_norm, id),
+            ).fetchone()
+            if occupied is not None:
+                raise TermKeyConflictError(
+                    HINT_KEY_CONFLICT.format(
+                        id=int(occupied["id"]),
+                        term=str(occupied["term"]),
+                        context=str(occupied["context"]),
+                    )
+                )
+            conn.execute(
+                "UPDATE terms SET term = ?, term_norm = ?, context = ?, "
+                "context_norm = ?, definition = ?, "
+                "vector_status = 'pending', "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (
+                    checked_term,
+                    term_norm,
+                    checked_context,
+                    context_norm,
+                    checked_definition,
+                    id,
+                ),
+            )
+        self._notify_areas_pending()
+        return {"id": id, "updated": True}
 
     # --- чтение (arch §3.4, §3.5) -------------------------------------------
 

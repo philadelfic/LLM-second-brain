@@ -36,13 +36,23 @@ Bearer и тот же сервисный слой, что у MCP (`user_save`/`u
 200 — чтение/правка/удаление, 422 — валидация формы и мягкие отказы
 сервиса (текст = дословный hint канона lsb-0009 §3.7, включая сильное
 совпадение дедупа), 404 — факт не найден (в т.ч. удалённый).
+
+Релиз 3.0.0 (lsb-0008-03): REST-зеркала области «terms» — /terms (поиск,
+запись по ключу, чтение, правка по id, soft delete). Тот же Bearer и тот же
+сервисный слой, что у MCP (`terms_save`/`terms_search`/`terms_get`); выдачи
+полные — без MCP-среза. Листинга нет (решение О.): единственная дорога к
+определению — поиск. Коды: 201 — создание, 200 — обновление по ключу, чтение,
+правка, удаление, 422 — валидация формы и мягкие отказы сервиса (текст =
+дословный hint канона lsb-0008 §3.7, в т.ч. близкий контекст), 404 — запись
+не найдена (в т.ч. удалённая), 409 — новый ключ правки занят другой активной
+записью (субстрат §3.6).
 """
 
 from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
 from app.config import Settings
@@ -51,6 +61,11 @@ from app.services.namespaces import NamespaceError, NamespaceValidationError
 from app.services.notes import NoteValidationError
 from app.services.search import SearchValidationError
 from app.services.skills import SkillValidationError, SkillsService
+from app.services.terms import (
+    TermKeyConflictError,
+    TermValidationError,
+    TermsService,
+)
 from app.services.user_facts import UserFactValidationError, UserFactsService
 
 
@@ -171,6 +186,30 @@ class UserFactUpdate(BaseModel):
     body: str | None = None
 
 
+class TermCreate(BaseModel):
+    """Тело POST /terms: форма термина с обязательным контекстом (§3.1).
+
+    Ключ области — (`term` + `context`), повтор ключа = обновление (201/200).
+    Лимиты (term ≤100, context ≤40, definition ≤350) и обязательность
+    контекста проверяет СЕРВИС (не схема — как у формы навыка): нарушение →
+    `TermValidationError` → 422 с дословным hint канона §3.7, запись НЕ идёт.
+    """
+
+    term: str
+    context: str
+    definition: str
+
+
+class TermUpdate(TermCreate):
+    """Тело PUT /terms/{id}: та же полная форма ключа (`term` + `context`).
+
+    Отдельного частичного обновления нет (прецедент формы навыка): правка
+    адресует запись по id и пересобирает ключ целиком; новый ключ занят
+    другой активной записью → 409 (`TermKeyConflictError`) — чужой смысл
+    не затирается, старый ключ освобождается только при удалении.
+    """
+
+
 class HealthResponse(BaseModel):
     """Контракт /health (NFR-4): для docker healthcheck и оператора."""
 
@@ -208,6 +247,16 @@ def _user_facts_service(request: Request) -> UserFactsService:
     выдача (REST — полные контракты полей).
     """
     return _services(request).user_facts
+
+
+def _terms_service(request: Request) -> TermsService:
+    """Сервис области «terms» — общий для всех REST-ручек /terms.
+
+    Тот же сервисный слой, что у MCP-инструментов `terms_*` (субстрат §3.4):
+    поведение области идентично на обеих поверхностях, отличается только
+    выдача (REST — полные контракты полей, без среза белыми списками).
+    """
+    return _services(request).terms
 
 
 def _unprocessable(exc: ValueError) -> HTTPException:
@@ -722,6 +771,130 @@ def build_rest_router(settings: Settings) -> APIRouter:
         if not result.get("deleted"):
             raise HTTPException(
                 status_code=404, detail=result.get("hint", "user fact not found")
+            )
+        return result
+
+    # --- область terms: REST-зеркала (релиз 3.0.0, lsb-0008-03) ------------
+    # Arch lsb-0008 §3.6 + субстрат §3.6: операторская поверхность области
+    # терминологии — тот же Bearer и тот же сервис, что у MCP (`terms_save`/
+    # `terms_search`/`terms_get`); выдачи полные (срез белыми списками —
+    # только в инструментах). Коды: 201 — создание, 200 — обновление по
+    # ключу/чтение/правка/удаление, 422 — валидация формы и мягкие отказы
+    # сервиса (текст = дословный hint канона §3.7, в т.ч. близкий контекст
+    # `created: False`), 404 — запись не найдена (в т.ч. удалённая),
+    # 409 — новый ключ правки занят другой активной записью (субстрат §3.6).
+    # Листинга НЕТ (решение О.): единственная дорога к определению — поиск;
+    # зеркала однотипны MCP-ручкам области. ПОРЯДОК МАРШРУТОВ: статический
+    # `/terms/search` объявлен ДО `/terms/{term_id}` — иначе «search» ушёл бы
+    # в целочисленный путь.
+
+    @rest_router.post("/terms", status_code=201)
+    async def create_term(
+        payload: TermCreate, request: Request, response: Response
+    ) -> dict:
+        """Записать термин по ключу: 201 — создан, 200 — обновлён (§3.5).
+
+        Механика FR-3.1 и тексты — сервисные: ключ совпал → правка
+        существующего смысла (динамический статус ответа 200); близкий
+        контекст (`created: False` + hint с id существующей записи) и
+        нарушение лимитов/пустой контекст (`TermValidationError`)
+        → 422 с дословным hint канона §3.7. Иначе — новый смысл → 201.
+        """
+        try:
+            result = await asyncio.to_thread(
+                _terms_service(request).save,
+                term=payload.term,
+                context=payload.context,
+                definition=payload.definition,
+            )
+        except TermValidationError as exc:
+            raise _unprocessable(exc) from exc
+        if result.get("created"):
+            return result
+        if result.get("updated"):
+            response.status_code = 200  # правка по ключу — динамический статус
+            return result
+        # Мягкий отказ сервиса (близкий контекст) — 422 с его hint'ом.
+        raise HTTPException(status_code=422, detail=result.get("hint", ""))
+
+    @rest_router.get("/terms/search")
+    async def search_terms(
+        request: Request,
+        q: str = Query(..., min_length=1, max_length=settings.max_query_chars),
+        top_k: int | None = Query(default=None, ge=1, le=20),
+    ) -> dict:
+        """Двухшаговый поиск термина (§3.4) выдачей ПОЛНОСТЬЮ.
+
+        Шаг 1 — точный нормализованный lookup: ВСЕ смыслы термина с
+        контекстами (`senses`/`exact: true`); шаг 2 — гибрид области
+        (`senses`/`exact: false` + hint «не точное совпадение»); шаг 3 —
+        пусто + hint канона §3.7. Отличие от MCP `terms_search` — без среза
+        выдачи: `warning` деградации (FTS-only, NFR-3) оператору виден.
+        """
+        try:
+            return await asyncio.to_thread(
+                _terms_service(request).search, q, top_k
+            )
+        except TermValidationError as exc:
+            raise _unprocessable(exc) from exc
+
+    @rest_router.get("/terms/{term_id}")
+    async def get_term(term_id: int, request: Request) -> dict:
+        """Прочитать запись (`id`, `term`, `context`, `definition`).
+
+        Несуществующая/удалённая запись не отличается от «нет строки» →
+        404 с hint канона §3.7 (служебное восстановление — оператор).
+        """
+        record = await asyncio.to_thread(_terms_service(request).get, term_id)
+        if "term" not in record:  # мягкий ответ сервиса: строки нет/удалена
+            raise HTTPException(
+                status_code=404, detail=record.get("hint", "term not found")
+            )
+        return record
+
+    @rest_router.put("/terms/{term_id}")
+    async def update_term(
+        term_id: int, payload: TermUpdate, request: Request
+    ) -> dict:
+        """Правка по id: форма целиком, переезд на занятый ключ → 409 (§3.6).
+
+        Валидация формы — как при создании (422 + дословный hint канона);
+        новый ключ занят ДРУГОЙ активной записью → `TermKeyConflictError` →
+        409 с hint'ом (чужой смысл не затирается, оператор правит его или
+        меняет ключ); `updated: False` сервиса (нет активной строки) → 404.
+        """
+        try:
+            result = await asyncio.to_thread(
+                _terms_service(request).update,
+                term_id,
+                payload.term,
+                payload.context,
+                payload.definition,
+            )
+        except TermKeyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except TermValidationError as exc:
+            raise _unprocessable(exc) from exc
+        if not result.get("updated"):
+            raise HTTPException(
+                status_code=404, detail=result.get("hint", "term not found")
+            )
+        return result
+
+    @rest_router.delete("/terms/{term_id}")
+    async def delete_term(term_id: int, request: Request) -> dict:
+        """Soft delete (§3.3): строка/индексы живы, выдачи его не видят.
+
+        Удалённый ключ освобождается (частичный UNIQUE по активным записям):
+        тот же ключ можно создать заново. Повторное/несуществующее удаление →
+        404 с hint канона §3.7.
+        """
+        result = await asyncio.to_thread(
+            _terms_service(request).delete, term_id
+        )
+        if not result.get("deleted"):
+            raise HTTPException(
+                status_code=404, detail=result.get("hint", "term not found")
             )
         return result
 
