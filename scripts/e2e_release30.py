@@ -232,39 +232,65 @@ def extract(result: Any) -> dict:
 
 
 class Client:
-    """Тонкая обёртка над ClientSession: вызов инструмента → dict."""
+    """Тонкая обёртка над ClientSession: вызов инструмента → dict.
 
-    def __init__(self, session: ClientSession):
+    `stack` (необязательный) — собственный AsyncExitStack сеанса: он нужен,
+    когда сеанс закрывается ДО конца прогона (шаг «повторный старт — no-op»).
+    Сеансы без собственного стека закрываются общим стеком `run_all`.
+    """
+
+    def __init__(self, session: ClientSession,
+                 stack: AsyncExitStack | None = None):
         self.session = session
+        self._stack = stack
 
     async def call(self, tool: str, args: dict) -> dict:
         return extract(await self.session.call_tool(tool, args))
 
+    async def close(self) -> None:
+        """Закрыть сеанс и транспорт: идемпотентно, ошибки не валят прогон."""
+        stack, self._stack = self._stack, None
+        if stack is None:
+            return
+        try:
+            await stack.aclose()
+        except Exception as exc:  # noqa: BLE001 — закрытие не предмет проверки
+            info(f"закрытие MCP-сеанса: {describe(exc)}")
+
 
 async def fresh_session(stack: AsyncExitStack, url: str | None = None,
-                         token: str | None = None) -> tuple[Client, Any]:
+                         token: str | None = None,
+                         own_stack: bool = False) -> tuple[Client, Any]:
     """Новый MCP-сеанс: свой `initialize` (инструкции пересобираются сервером).
 
     ClientSession кэширует результат `initialize()` (SDK mcp 2.x) — второй
     `initialize()` в ТОМ ЖЕ сеансе не идёт на сервер. Поэтому свежесть анонса
     навыков проверяется новым соединением: только оно даёт новый handshake.
 
+    Сеансы живут в общем стеке прогона и закрываются штатно в конце `run_all`.
+
+    `own_stack=True` — сеанс со своим стеком: его закрывает `Client.close`.
+    Так делается для первого сеанса, который после рестарта контура теряет
+    session_id: закрыть его можно только до рестарта (шаг «повторный старт —
+    no-op»), иначе разорванный SSE-поток отдаёт ошибку в общий TaskGroup.
+
     Таймауты — как в e2e_release22.py (30s connect/write/pool, 300s read):
     вызовы с синхронным эмбеддингом под нагрузкой воркера не должны рвать
     сессию дефолтными 5s (lsbdef-0005).
     """
-    http_client = await stack.enter_async_context(
+    target = AsyncExitStack() if own_stack else stack
+    http_client = await target.enter_async_context(
         httpx2.AsyncClient(
             headers={"Authorization": f"Bearer {token or CFG['token']}"},
             timeout=httpx2.Timeout(30.0, read=CFG["read_timeout"]),
         )
     )
-    streams = await stack.enter_async_context(
+    streams = await target.enter_async_context(
         streamable_http_client(url or CFG["mcp_url"], http_client=http_client)
     )
-    session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
+    session = await target.enter_async_context(ClientSession(streams[0], streams[1]))
     init = await session.initialize()
-    return Client(session), init
+    return Client(session, target if own_stack else None), init
 
 
 async def rest_client(stack: AsyncExitStack, base_url: str | None = None,
@@ -284,6 +310,26 @@ async def rest_client(stack: AsyncExitStack, base_url: str | None = None,
 
 def db_ready() -> bool:
     return bool(CFG.get("db")) and Path(CFG["db"]).exists()
+
+
+def _load_vec_extension(conn: sqlite3.Connection) -> None:
+    """Подключить sqlite-vec к соединению скрипта (как app.storage.db).
+
+    Расширение — свойство соединения, а не файла БД: без него vec0-таблицы не
+    читаются вовсе («no such module: vec0»), и проверка векторной строки
+    области уходит в SKIP. Ошибки загрузки глушим: вызывающий сам решит, как
+    трактовать отсутствие модуля.
+    """
+    try:
+        import sqlite_vec
+    except ImportError:
+        return
+    try:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+    except (AttributeError, sqlite3.Error):
+        return
 
 
 def db_try(sql: str, params: tuple = ()) -> tuple[list[dict] | None, str]:
@@ -306,6 +352,7 @@ def db_try(sql: str, params: tuple = ()) -> tuple[list[dict] | None, str]:
             continue
         try:
             conn.row_factory = sqlite3.Row
+            _load_vec_extension(conn)
             return [dict(row) for row in conn.execute(sql, params).fetchall()], ""
         except sqlite3.Error as exc:
             last = f"{type(exc).__name__}: {exc}"
@@ -420,7 +467,8 @@ async def prepare(c: Client) -> None:
 
 # --- сценарий 1: апгрейд ------------------------------------------------------
 
-async def scenario_1_upgrade(c: Client, rest: httpx2.AsyncClient) -> None:
+async def scenario_1_upgrade(c: Client, rest: httpx2.AsyncClient,
+                             stack: AsyncExitStack) -> None:
     scenario(1, "Апгрейд: 3.0.0 поверх БД v2.2.1 без ручных миграций")
 
     r = await rest.get("/health")
@@ -496,6 +544,9 @@ async def scenario_1_upgrade(c: Client, rest: httpx2.AsyncClient) -> None:
         before_health = await health_snapshot(rest)
         before_skills = await rest.get("/skills", params={"limit": 50})
         before_total = before_skills.json().get("total") if before_skills.status_code == 200 else None
+        # Сеанс закрываем ДО рестарта: сервер ещё помнит session_id — DELETE
+        # проходит штатно, и мёртвый SSE-поток не остаётся в общем стеке.
+        await c.close()
         proc = await asyncio.to_thread(
             subprocess.run, CFG["restart_cmd"], shell=True,
             capture_output=True, text=True, timeout=600,
@@ -505,6 +556,15 @@ async def scenario_1_upgrade(c: Client, rest: httpx2.AsyncClient) -> None:
         after_health = await wait_health(rest)
         check("повторный старт: /health снова ok", after_health.get("status") == "ok",
               f"status={after_health.get('status')}")
+        # Новый handshake после рестарта: прежний session_id сервер не помнит,
+        # а обращение по нему — 404 и падение TaskGroup (SDK mcp 2.x). Сеанс
+        # подменяем в текущем клиенте, дальше сценарии идут по свежему.
+        revived, _init_after = await fresh_session(stack)
+        c.session = revived.session
+        relisting = await c.call("memory_list", {"limit": 5, "detail": "titles"})
+        check("после рестарта MCP-сеанс поднимается заново (handshake + вызов)",
+              isinstance(relisting.get("items"), list),
+              f"n={len(relisting.get('items') or [])}")
         check("повторный старт: число заметок не изменилось",
               after_health.get("notes_count") == before_health.get("notes_count"),
               f"{before_health.get('notes_count')} → {after_health.get('notes_count')}")
@@ -1137,7 +1197,10 @@ async def scenario_9_regression(cfg: dict) -> None:
 
 async def run_all() -> None:
     async with AsyncExitStack() as stack:
-        c, init = await fresh_session(stack)
+        # Первый сеанс живёт в своём стеке: его закрывает шаг «повторный старт —
+        # no-op» (сеанс до рестарта контура), остальные сеансы закрывает
+        # общий стек прогона.
+        c, init = await fresh_session(stack, own_stack=True)
         instructions = init.instructions or ""
         rest = await rest_client(stack)
 
@@ -1161,7 +1224,7 @@ async def run_all() -> None:
               f"len={len(instructions)}")
 
         await prepare(c)
-        await scenario_1_upgrade(c, rest)
+        await scenario_1_upgrade(c, rest, stack)
         await scenario_2_isolation(c)
         await scenario_3_skills(c, rest, stack, instructions)
         await scenario_4_terms(c, rest)

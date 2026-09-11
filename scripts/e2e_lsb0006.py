@@ -107,8 +107,16 @@ async def main() -> int:
                       f"len={len(instructions)}")
                 check("contain 'You have persistent long-term memory'",
                       "You have persistent long-term memory" in instructions)
-                check("no cyrillic in instructions",
-                      not CYRILLIC.search(instructions))
+                # EN-канон lsb-0006 покрывает СТАТИЧНУЮ (модельную) часть
+                # инструкций: манифест + правила неймспейсов — это они ниже
+                # до заголовка карты. Строки реестра (карта узлов и анонс
+                # навыков) — ДАННЫЕ, а не канон: описания узлов задаёт
+                # оператор, по умолчанию у `default` они русские
+                # (DEFAULT_NAMESPACE_DESCRIPTION). Проверка сужена, иначе она
+                # падала бы и на v2.2.1 (карта в инструкциях с 2026-09-03).
+                static_canon = instructions.split("Node map (path: description):")[0]
+                check("no cyrillic in instructions (static canon)",
+                      not CYRILLIC.search(static_canon))
 
                 # ---------- B: tool descriptions in EN ----------
                 print("\n[B] Descriptions of the 8 tools in EN")
