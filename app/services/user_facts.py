@@ -278,8 +278,18 @@ class UserFactsService:
         checked_name = self._checked_name(name) if name_passed else None
         checked_body = self._checked_body(body) if body_passed else None
         if checked_name is None and checked_body is None:
-            # Оба параметра «не передано»: менять нечего (прецедент lsb-0004 —
-            # «не передано» не сбрасывает и не переписывает запись).
+            # Оба параметра «не передано»: содержимое не меняем (прецедент
+            # lsb-0004 — «не передано» не сбрасывает и не переписывает
+            # запись), но существование строки всё же проверяем: PUT по удалённому
+            # или несуществующему id обязан дать «не найден» (транспорт → 404),
+            # иначе пустой PUT маскировал бы отсутствие факта.
+            with session(self._settings) as conn:
+                exists = conn.execute(
+                    "SELECT 1 FROM user_facts WHERE id = ? AND deleted_at IS NULL",
+                    (id,),
+                ).fetchone()
+            if exists is None:
+                return {"id": id, "changed": False, "hint": HINT_NOT_FOUND}
             return {"id": id, "changed": False}
         with session(self._settings) as conn, transaction(conn):
             row = conn.execute(

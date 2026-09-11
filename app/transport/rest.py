@@ -27,6 +27,15 @@ title» един на обеих поверхностях: POST /notes без ti
 выдачи полные — без MCP-среза белыми списками. Коды: 201 — создание, 200 —
 чтение/правка/удаление, 422 — валидация формы и мягкие отказы (текст
 сервиса = hint), 404 — навык не найден (в т.ч. удалённый).
+
+Релиз 3.0.0 (lsb-0009-03): REST-зеркала области «user» — /user-facts
+(создание с дедуп-подсказкой, поиск, чтение, правка, soft delete). Тот же
+Bearer и тот же сервисный слой, что у MCP (`user_save`/`user_search`/
+`user_get`/`user_update`/`user_delete`); выдачи полные — без MCP-среза.
+Листинга нет (зеркала однотипны ручкам области). Коды: 201 — создание,
+200 — чтение/правка/удаление, 422 — валидация формы и мягкие отказы
+сервиса (текст = дословный hint канона lsb-0009 §3.7, включая сильное
+совпадение дедупа), 404 — факт не найден (в т.ч. удалённый).
 """
 
 from __future__ import annotations
@@ -42,6 +51,7 @@ from app.services.namespaces import NamespaceError, NamespaceValidationError
 from app.services.notes import NoteValidationError
 from app.services.search import SearchValidationError
 from app.services.skills import SkillValidationError, SkillsService
+from app.services.user_facts import UserFactValidationError, UserFactsService
 
 
 class NoteCreate(BaseModel):
@@ -133,6 +143,34 @@ class InstructionTemplate(BaseModel):
     instruction_template: str
 
 
+class UserFactCreate(BaseModel):
+    """Тело POST /user-facts: один атомарный факт (arch lsb-0009 §3.1).
+
+    `name` — название факта, ≤5 слов (контракт `title` заметок); `body` —
+    тело, ≤1200 символов. Лимиты и пустые значения проверяет СЕРВИС (не
+    схема — как у `title` заметок и формы навыка): нарушение →
+    `UserFactValidationError` → 422 с дословным hint канона §3.7, факт НЕ
+    сохраняется.
+    """
+
+    name: str
+    body: str
+
+
+class UserFactUpdate(BaseModel):
+    """Тело PUT /user-facts/{id}: правка `name` и/или `body` (arch §3.3).
+
+    Семантика сервиса «не передано = оставить» пробрасывается точным
+    набором переданных полей (`model_fields_set`): опущенное поле доходит до
+    сервиса дефолтом-сентинелом `_UNSET_*` (значение остаётся прежним), а
+    `null` в обязательном поле доходит как `None` и получает мягкий отказ
+    422 с hint «не передано = оставить» (обязательные поля не сбрасываются).
+    """
+
+    name: str | None = None
+    body: str | None = None
+
+
 class HealthResponse(BaseModel):
     """Контракт /health (NFR-4): для docker healthcheck и оператора."""
 
@@ -160,6 +198,16 @@ def _skills_service(request: Request) -> SkillsService:
     if service is None:
         raise HTTPException(status_code=503, detail="skills area is not available")
     return service
+
+
+def _user_facts_service(request: Request) -> UserFactsService:
+    """Сервис области «user» — общий для всех REST-ручек /user-facts.
+
+    Тот же сервисный слой, что у MCP-инструментов `user_*` (субстрат §3.4):
+    поведение областей идентично на обеих поверхностях, отличается только
+    выдача (REST — полные контракты полей).
+    """
+    return _services(request).user_facts
 
 
 def _unprocessable(exc: ValueError) -> HTTPException:
@@ -561,6 +609,120 @@ def build_rest_router(settings: Settings) -> APIRouter:
         result = await asyncio.to_thread(_skills_service(request).versions, skill_id)
         if "hint" in result:
             raise HTTPException(status_code=404, detail=result["hint"])
+        return result
+
+    # --- область user: REST-зеркала (релиз 3.0.0, lsb-0009-03) ------------
+    # Arch lsb-0009 §3.6 + субстрат §3.6: операторская поверхность фактов о
+    # пользователе — тот же Bearer и тот же сервисный слой, что у MCP
+    # (`user_save`/`user_search`/`user_get`/`user_update`/`user_delete`);
+    # выдачи полные (срез белыми списками — только в инструментах). Коды:
+    # 201 — создание, 200 — чтение/правка/удаление, 422 — валидация формы и
+    # мягкие отказы сервиса (текст = дословный hint канона §3.7, в т.ч.
+    # сильное совпадение дедупа `stored: False`), 404 — факт не найден
+    # (в т.ч. удалённый — soft delete). Листинга нет: зеркала однотипны
+    # MCP-ручкам области (arch §3.6). ПОРЯДОК МАРШРУТОВ: статический
+    # `/user-facts/search` объявлен ДО `/user-facts/{fact_id}` — иначе
+    # «search» ушёл бы в целочисленный путь.
+
+    @rest_router.post("/user-facts", status_code=201)
+    async def create_user_fact(payload: UserFactCreate, request: Request) -> dict:
+        """Создать факт: валидация формы + дедуп-подсказка как в MCP (§3.4).
+
+        Порядок и тексты сервисные: нарушение лимита (`name` >5 слов,
+        `body` >1200, пустое обязательное поле) → `UserFactValidationError` →
+        422 с дословным hint; сильное совпадение с активным фактом → мягкий
+        отказ сервиса (`stored: False`) → 422 с hint, ведущим к `user_update`;
+        средняя зона → 201, в ответе `related` (id/name похожих) и hint.
+        Успех всегда несёт постоянный hint атомарности (FR-7.2).
+        """
+        try:
+            result = await asyncio.to_thread(
+                _user_facts_service(request).save,
+                name=payload.name,
+                body=payload.body,
+            )
+        except UserFactValidationError as exc:
+            raise _unprocessable(exc) from exc
+        if not result.get("stored"):
+            # Мягкий отказ сервиса (сильное совпадение) — 422 с его hint'ом.
+            raise HTTPException(status_code=422, detail=result.get("hint", ""))
+        return result
+
+    @rest_router.get("/user-facts/search")
+    async def search_user_facts(
+        request: Request,
+        q: str = Query(..., min_length=1, max_length=settings.max_query_chars),
+        top_k: int | None = Query(default=None, ge=1, le=20),
+    ) -> dict:
+        """Гибридный поиск по области — «проба» (arch §3.3) выдачей ПОЛНОСТЬЮ.
+
+        Отличие от MCP `user_search` — без среза выдачи: `warning` деградации
+        (FTS-only, NFR-3) оператору виден; пустой результат — мягкий ответ с
+        дословным hint канона §3.7 (не ошибка). В выдаче — `excerpt` (≤300
+        символов), полное тело отдаёт только `GET /user-facts/{id}`.
+        """
+        try:
+            return await asyncio.to_thread(
+                _user_facts_service(request).search, q, top_k
+            )
+        except UserFactValidationError as exc:
+            raise _unprocessable(exc) from exc
+
+    @rest_router.get("/user-facts/{fact_id}")
+    async def get_user_fact(fact_id: int, request: Request) -> dict:
+        """Полный факт (`id`, `name`, `body`) — полное тело отдаёт только эта ручка.
+
+        Несуществующий/удалённый факт не отличается от «нет строки» → 404 с
+        hint канона §3.7 (служебное восстановление — оператор).
+        """
+        result = await asyncio.to_thread(_user_facts_service(request).get, fact_id)
+        if "name" not in result:  # мягкий ответ сервиса: строки нет/удалена
+            raise HTTPException(
+                status_code=404, detail=result.get("hint", "user fact not found")
+            )
+        return result
+
+    @rest_router.put("/user-facts/{fact_id}")
+    async def update_user_fact(
+        fact_id: int, payload: UserFactUpdate, request: Request
+    ) -> dict:
+        """Правка факта: «не передано» = оставить, `null` в обязательном — 422.
+
+        В сервис уходят ТОЛЬКО реально переданные поля (`model_fields_set`):
+        опущенное поле остаётся за сентинелом `_UNSET_*`, поэтому прежнее
+        значение сохраняется; `null` доходит как `None` и сервис отвечает
+        мягким отказом с hint «не передано = оставить» (422). Валидация
+        переданных значений — как при создании (422 + дословный hint);
+        `hint` в ответе сервиса (нет активной строки) → 404 с hint канона.
+        """
+        updates: dict[str, str | None] = {}
+        if "name" in payload.model_fields_set:
+            updates["name"] = payload.name
+        if "body" in payload.model_fields_set:
+            updates["body"] = payload.body
+        try:
+            result = await asyncio.to_thread(
+                _user_facts_service(request).update, fact_id, **updates
+            )
+        except UserFactValidationError as exc:
+            raise _unprocessable(exc) from exc
+        if "hint" in result:  # не найден/удалён — 404 с hint канона §3.7
+            raise HTTPException(status_code=404, detail=result["hint"])
+        return result
+
+    @rest_router.delete("/user-facts/{fact_id}")
+    async def delete_user_fact(fact_id: int, request: Request) -> dict:
+        """Soft delete факта (§3.4): строка/индексы живы, выдачи его не видят.
+
+        Повторное/несуществующее удаление — 404 с hint канона §3.7.
+        """
+        result = await asyncio.to_thread(
+            _user_facts_service(request).delete, fact_id
+        )
+        if not result.get("deleted"):
+            raise HTTPException(
+                status_code=404, detail=result.get("hint", "user fact not found")
+            )
         return result
 
     return rest_router

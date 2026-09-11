@@ -294,11 +294,27 @@ class TestUpdate:
             "changed": False,
             "hint": CANON_HINT_NOT_FOUND,
         }
-        # «не передано» в обоих — тоже мягкий ответ, не исключение.
+        # «не передано» в обоих — тоже мягкий ответ с hint: PUT по удалённому
+        # или несуществующему id обязан сообщать «не найден» (транспорт → 404),
+        # иначе пустой PUT маскировал бы отсутствие факта.
         assert service.update(999, name=_UNSET_NAME, body=_UNSET_BODY) == {
             "id": 999,
             "changed": False,
+            "hint": CANON_HINT_NOT_FOUND,
         }
+
+    def test_empty_update_of_existing_fact_is_noop(self, service: UserFactsService) -> None:
+        """Пустой PUT существующего факта: без hint, без правки строки."""
+        fact_id = service.save(name="Timezone fact", body="Europe/Moscow")["id"]
+        before = _row(fact_id)
+        assert service.update(fact_id, name=_UNSET_NAME, body=_UNSET_BODY) == {
+            "id": fact_id,
+            "changed": False,
+        }
+        after = _row(fact_id)
+        assert after is not None and before is not None
+        assert after["updated_at"] == before["updated_at"]
+        assert after["vector_status"] == before["vector_status"]
 
 
 class TestGetAndDelete:
