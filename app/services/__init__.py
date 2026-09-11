@@ -34,6 +34,7 @@ from app.services.notes import NoteService
 from app.services.promotion import DescriptionService, PromotionService, StructureJudgeService
 from app.services.prompts import PromptRegistry
 from app.services.search import SearchService
+from app.services.skills import SkillsService
 from app.services.summary import SummaryService
 
 __all__ = [
@@ -49,6 +50,7 @@ __all__ = [
     "PromptRegistry",
     "SearchService",
     "Services",
+    "SkillsService",
     "SummaryService",
     "build_services",
 ]
@@ -79,6 +81,10 @@ class Services:
     llm_embedding: LLMClient | None = None  # клиент слота embedding (Фаза 11, решение №5)
     llm_summary: LLMClient | None = None  # клиент слота summary (summarize/merge/classify/describe)
     llm_judge: LLMClient | None = None  # клиент слота judge (дедуп + судья структуры)
+    # 3.0.0: область навыков (lsb-0007). Опционально — только для DI-сборок
+    # тестов, созданных до появления области (их Services(...) без skills
+    # остаются валидны); в проде build_services всегда кладёт сервис.
+    skills: SkillsService | None = None
 
 
 def build_services(
@@ -137,4 +143,8 @@ def build_services(
         llm_embedding=llm_embedding,
         llm_summary=llm_summary,
         llm_judge=llm_judge,
+        # Субстрат 3.0.0: сервис области навыков (lsb-0007-01); embedding —
+        # общий экземпляр слота (запись его не зовёт — точка сборки для
+        # поиска/антисинонимии трека).
+        skills=SkillsService(settings, embedding=embedding),
     )

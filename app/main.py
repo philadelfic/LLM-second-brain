@@ -171,6 +171,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Суммаризация стартует сразу при save/update: NoteService сигналит
     # воркеру, тот немедленно догоняет pending_summary (не ждёт back-off).
     services.notes.set_summary_notifier(worker.notify_summary_pending)
+    # Область навыков (3.0.0): save/правка сигналит петле areas — вектора
+    # записи догоняются сразу, а не по выросшему back-off (прецедент
+    # summary-нотификатора). None — DI-сборка тестов без области навыков.
+    if services.skills is not None:
+        services.skills.set_areas_notifier(worker.notify_areas_pending)
     # Внутренний маршрут MCP-сервера — ровно MCP_PATH. host="0.0.0.0" — не
     # localhost, поэтому SDK не включает DNS-rebinding protection (сервис
     # живёт в LAN за Bearer-токеном; Open WebUI ходит с не-localhost Host).

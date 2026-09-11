@@ -296,6 +296,18 @@ CREATE TABLE IF NOT EXISTS user_facts (
 """,
 )
 
+# Глобальный шаблон области навыков (lsb-0007 §3.1/§3.8): одна запись
+# skills_meta на область — «как исполнять шаги» (не дублируется у навыков).
+# Ключ и текст сида: значение создаётся только при отсутствии ключа (правка —
+# оператором через REST, lsb-0007-05; сид её не затирает).
+INSTRUCTION_TEMPLATE_KEY = "instruction_template"
+INSTRUCTION_TEMPLATE_SEED = (
+    "Execute the steps in order: the content of each step in `text` says what "
+    "exactly to do (result, format, rule). Do not skip or reorder steps; if a "
+    "step cannot be executed, stop and report what is missing instead of "
+    "improvising."
+)
+
 # Частичный UNIQUE (lsb-0008 §3.3): ключ термина (term_norm + context_norm)
 # уникален только среди АКТИВНЫХ записей — soft-deleted строку ключ не держит
 # (удалённый ключ освобождается, «undo — оператором»).
@@ -560,6 +572,9 @@ def init_db(settings: Settings) -> None:
             # до сверки модели/размерности: её ветка дропает area-vec и
             # пересоздаёт их под текущую размерность (_reset_area_vectors).
             _create_area_schema(conn, settings)
+            # Сид глобального шаблона навыков (lsb-0007 §3.8): сразу после
+            # создания skills_meta, идемпотентно, существующее не трогаем.
+            _ensure_skills_meta(conn)
             # Вектора (Фаза 3 + решение 2026-08-29; Фаза 7: + вектора чанков):
             # создание при первом старте; при несовпадении зафиксированной
             # конфигурации (модель/размерность) с env — полная автореиндексация
@@ -716,6 +731,21 @@ def _migrate_expiration_columns(conn: sqlite3.Connection) -> None:
     if "expires_at" not in columns:
         conn.execute("ALTER TABLE notes ADD COLUMN expires_at TEXT")
     conn.execute(_NOTE_EXPIRATIONS_DDL)
+
+
+def _ensure_skills_meta(conn: sqlite3.Connection) -> None:
+    """Сид глобального instruction_template области навыков (идемпотентно).
+
+    По образцу _ensure_default_namespace: запись создаётся только при
+    отсутствии ключа. Существующее значение НЕ перезаписывается — шаблон
+    правит оператор через REST (lsb-0007-05), повторный init_db (рестарт
+    сервиса) его правку не затирает.
+    """
+    conn.execute(
+        "INSERT INTO skills_meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO NOTHING",
+        (INSTRUCTION_TEMPLATE_KEY, INSTRUCTION_TEMPLATE_SEED),
+    )
 
 
 def _ensure_default_namespace(conn: sqlite3.Connection) -> None:
