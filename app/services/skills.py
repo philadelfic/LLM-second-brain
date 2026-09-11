@@ -51,6 +51,9 @@ lsb-0007-03):
 - delete → {id, deleted: True} | {id, deleted: False, hint}
 - instruction_template() → {instruction_template}
 - set_instruction_template(text) → {instruction_template, updated: True}
+- versions(id) → {id, versions: [{version, name, description, example, steps,
+                 text, extra, created_at}]}; не найден/удалён →
+                 {id, versions: [], hint} (архив виден только REST-оператору)
 """
 
 from __future__ import annotations
@@ -539,6 +542,49 @@ class SkillsService:
                 (INSTRUCTION_TEMPLATE_KEY, normalized),
             )
         return {"instruction_template": normalized, "updated": True}
+
+    # --- архив версий (только REST-оператор, arch §3.4) ---------------------
+
+    def versions(self, id: int) -> dict[str, Any]:
+        """Архив копий версий навыка (`skill_versions`) — только REST.
+
+        Каждая правка копирует туда ПРЕЖНЕЕ содержимое с прежним номером
+        версии (§3.4), поэтому архив — это «старые версии как копии».
+        Порядок — от новых к старым. Архив в выдачах области не участвует:
+        этот метод читает его отдельно, ни `get`, ни `list`, ни `search`
+        `skill_versions` не видят (MCP-инструмента для архива нет вовсе).
+        Навык не найден/удалён → мягкий ответ с пустым архивом и hint
+        канона §3.8: транспорт превращает его в 404.
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT id FROM skills WHERE id = ? AND deleted_at IS NULL",
+                (id,),
+            ).fetchone()
+            if row is None:
+                return {"id": id, "versions": [], "hint": HINT_NOT_FOUND}
+            rows = conn.execute(
+                "SELECT version, name, description, example, steps, text, "
+                "extra, created_at FROM skill_versions WHERE skill_id = ? "
+                "ORDER BY version DESC",
+                (id,),
+            ).fetchall()
+        return {
+            "id": id,
+            "versions": [
+                {
+                    "version": int(item["version"]),
+                    "name": item["name"],
+                    "description": item["description"],
+                    "example": item["example"],
+                    "steps": item["steps"],
+                    "text": item["text"],
+                    "extra": _extra_dict(item["extra"]),
+                    "created_at": item["created_at"],
+                }
+                for item in rows
+            ],
+        }
 
     # --- внутреннее ---------------------------------------------------------
 

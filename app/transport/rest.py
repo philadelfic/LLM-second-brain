@@ -19,6 +19,14 @@ null — миграционная заметка без названия). Ко�
 title» един на обеих поверхностях: POST /notes без title или с невалидным
 → 422 fail+hint, заметка НЕ создаётся. Сентинел-легаси NoteService.save(text)
 без title — путь миграции/скриптов на сервис-слое, транспортам недоступен.
+
+Релиз 3.0.0 (lsb-0007-05): REST-зеркала области навыков — /skills
+(создание/листинг/поиск/чтение/правка/soft delete), глобальный
+`/skills/instruction-template` и архив копий версий (GET /skills/{id}/versions;
+только REST, в MCP не выводится). Тот же Bearer и тот же сервисный слой;
+выдачи полные — без MCP-среза белыми списками. Коды: 201 — создание, 200 —
+чтение/правка/удаление, 422 — валидация формы и мягкие отказы (текст
+сервиса = hint), 404 — навык не найден (в т.ч. удалённый).
 """
 
 from __future__ import annotations
@@ -33,6 +41,7 @@ from app.services import Services
 from app.services.namespaces import NamespaceError, NamespaceValidationError
 from app.services.notes import NoteValidationError
 from app.services.search import SearchValidationError
+from app.services.skills import SkillValidationError, SkillsService
 
 
 class NoteCreate(BaseModel):
@@ -89,6 +98,41 @@ class NoteUpdate(BaseModel):
     title: str | None = None
 
 
+class SkillCreate(BaseModel):
+    """Тело POST /skills: форма навыка (arch lsb-0007 §3.1).
+
+    Обязательные поля формы — `name`/`description`/`steps`/`text`;
+    `example` и `extra` (поля класса навыка) опциональны. Лимиты и
+    антисинонимия создания проверяются сервисом: нарушение → 422 с
+    дословным hint канона §3.8.
+    """
+
+    name: str
+    description: str
+    steps: str
+    text: str
+    example: str | None = None
+    extra: dict[str, str] | None = None
+
+
+class SkillUpdate(SkillCreate):
+    """Тело PUT /skills/{id}: та же полная форма; прежняя версия — в архив.
+
+    Отдельного частичного обновления нет (§3.4): форма перезаписывается
+    целиком, копия прежнего содержимого уходит в `skill_versions`.
+    """
+
+
+class InstructionTemplate(BaseModel):
+    """Тело PUT /skills/instruction-template: глобальный шаблон (§3.1).
+
+    Один шаблон на область («как исполнять шаги», ≤1000 символов); пустое
+    или слишком длинное значение → 422 с hint сервиса.
+    """
+
+    instruction_template: str
+
+
 class HealthResponse(BaseModel):
     """Контракт /health (NFR-4): для docker healthcheck и оператора."""
 
@@ -103,6 +147,19 @@ class HealthResponse(BaseModel):
 
 def _services(request: Request) -> Services:
     return request.app.state.services  # type: ignore[no-any-return]
+
+
+def _skills_service(request: Request) -> SkillsService:
+    """Сервис области навыков — общий для всех REST-ручек /skills.
+
+    `Services.skills` опционален только ради старых DI-сборок; приложение
+    (`create_app`) всегда собирает область — её недоступность означала бы
+    ошибку конфигурации, поэтому отвечаем 503, а не падаем трейсбеком.
+    """
+    service = _services(request).skills
+    if service is None:
+        raise HTTPException(status_code=503, detail="skills area is not available")
+    return service
 
 
 def _unprocessable(exc: ValueError) -> HTTPException:
@@ -334,5 +391,176 @@ def build_rest_router(settings: Settings) -> APIRouter:
             raise _unprocessable(exc) from exc
         except NamespaceError as exc:
             raise _conflict(exc) from exc
+
+    # --- область навыков: REST-зеркала (релиз 3.0.0, lsb-0007-05) ----------
+    # Arch lsb-0007 §3.7 + субстрат §3.6: операторская поверхность навыков —
+    # тот же Bearer и тот же сервисный слой, что у MCP; выдачи полные (срез
+    # белыми списками — только в инструментах). Коды: 201 — создание, 200 —
+    # чтение/правка/удаление, 422 — валидация формы и мягкие отказы сервиса
+    # (текст = hint), 404 — навык не найден/удалён. ПОРЯДОК МАРШРУТОВ:
+    # статические (`/skills/search`, `/skills/instruction-template`) объявлены
+    # ДО `/skills/{skill_id}` — иначе «search» ушёл бы в целочисленный путь.
+
+    @rest_router.post("/skills", status_code=201)
+    async def create_skill(payload: SkillCreate, request: Request) -> dict:
+        """Создать навык: валидация формы + антисинонимия как в MCP (§3.4).
+
+        Мягкие отказы сервиса → 422 с дословным hint канона §3.8: нарушение
+        лимита формы (`SkillValidationError`) и «слишком похожий» на активный
+        навык кандидат (`created: False` + hint с id/name существующего).
+        """
+        try:
+            result = await asyncio.to_thread(
+                _skills_service(request).save,
+                name=payload.name,
+                description=payload.description,
+                steps=payload.steps,
+                text=payload.text,
+                example=payload.example,
+                extra=payload.extra,
+            )
+        except SkillValidationError as exc:
+            raise _unprocessable(exc) from exc
+        if not result.get("created"):
+            raise HTTPException(status_code=422, detail=result.get("hint", ""))
+        return result
+
+    @rest_router.get("/skills")
+    async def list_skills(
+        request: Request,
+        limit: int | None = Query(default=None, ge=1, le=50),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        """Листинг активных навыков ПОЛНЫМИ записями (пагинация как /notes).
+
+        MCP `skills_list` отдаёт компактный срез (id/name/description) —
+        оператору нужна полная запись, поэтому на каждый активный навык
+        собирается тот же композит §3.1, что и у `GET /skills/{id}` (включая
+        секцию глобального `instruction_template`). Архив версий и удалённые
+        строки в листинг не попадают.
+        """
+        skills = _skills_service(request)
+
+        def _full_listing() -> dict:
+            """Сервисные вызовы в одном потоке: листинг + композит по каждому."""
+            listing = skills.list(limit, offset)
+            return {
+                "items": [skills.get(item["id"]) for item in listing["items"]],
+                "total": listing["total"],
+            }
+
+        try:
+            return await asyncio.to_thread(_full_listing)
+        except SkillValidationError as exc:
+            raise _unprocessable(exc) from exc
+
+    @rest_router.get("/skills/search")
+    async def search_skills(
+        request: Request,
+        q: str = Query(..., min_length=1, max_length=settings.max_query_chars),
+        top_k: int | None = Query(default=None, ge=1, le=20),
+    ) -> dict:
+        """Гибридный поиск навыка (vec0 + FTS → RRF) — выдача полная.
+
+        Отличие от MCP `skills_search` — без среза выдачи: `warning`
+        деградации (FTS-only, NFR-3) оператору виден; пустой результат —
+        мягкий ответ с дословным hint канона §3.8 (не ошибка).
+        """
+        try:
+            return await asyncio.to_thread(
+                _skills_service(request).search, q, top_k
+            )
+        except SkillValidationError as exc:
+            raise _unprocessable(exc) from exc
+
+    @rest_router.get("/skills/instruction-template")
+    async def get_instruction_template(request: Request) -> dict:
+        """Глобальный `instruction_template` («как исполнять шаги», §3.1)."""
+        return await asyncio.to_thread(
+            _skills_service(request).instruction_template
+        )
+
+    @rest_router.put("/skills/instruction-template")
+    async def put_instruction_template(
+        payload: InstructionTemplate, request: Request
+    ) -> dict:
+        """Правка глобального шаблона: пусто/длиннее 1000 симв. → 422 + hint."""
+        try:
+            return await asyncio.to_thread(
+                _skills_service(request).set_instruction_template,
+                payload.instruction_template,
+            )
+        except SkillValidationError as exc:
+            raise _unprocessable(exc) from exc
+
+    @rest_router.get("/skills/{skill_id}")
+    async def get_skill(skill_id: int, request: Request) -> dict:
+        """Полная запись навыка + композит (`instruction_template`, `extra`).
+
+        Удалённый/несуществующий навык не отличается от «нет строки» →
+        404 с hint канона §3.8 (служебное восстановление — оператор).
+        """
+        record = await asyncio.to_thread(_skills_service(request).get, skill_id)
+        if "name" not in record:  # мягкий ответ сервиса: строки нет/удалена
+            raise HTTPException(
+                status_code=404, detail=record.get("hint", "навык не найден")
+            )
+        return record
+
+    @rest_router.put("/skills/{skill_id}")
+    async def update_skill(
+        skill_id: int, payload: SkillUpdate, request: Request
+    ) -> dict:
+        """Правка формы навыка: прежняя версия уходит в архив (§3.4).
+
+        Валидация формы — как при создании (422 + hint); `updated: False`
+        сервиса (нет активной строки) → 404 с hint канона.
+        """
+        try:
+            result = await asyncio.to_thread(
+                _skills_service(request).save,
+                id=skill_id,
+                name=payload.name,
+                description=payload.description,
+                steps=payload.steps,
+                text=payload.text,
+                example=payload.example,
+                extra=payload.extra,
+            )
+        except SkillValidationError as exc:
+            raise _unprocessable(exc) from exc
+        if not result.get("updated"):
+            raise HTTPException(
+                status_code=404, detail=result.get("hint", "навык не найден")
+            )
+        return result
+
+    @rest_router.delete("/skills/{skill_id}")
+    async def delete_skill(skill_id: int, request: Request) -> dict:
+        """Soft delete навыка (§3.4): строка/индексы живы, выдачи его не видят.
+
+        Повторное/несуществующее удаление — 404 с hint канона §3.8.
+        """
+        result = await asyncio.to_thread(
+            _skills_service(request).delete, skill_id
+        )
+        if not result.get("deleted"):
+            raise HTTPException(
+                status_code=404, detail=result.get("hint", "навык не найден")
+            )
+        return result
+
+    @rest_router.get("/skills/{skill_id}/versions")
+    async def get_skill_versions(skill_id: int, request: Request) -> dict:
+        """Архив копий версий навыка — только REST, оператору (в MCP нет).
+
+        Каждая правка копирует прежнее содержимое с прежним номером версии
+        (§3.4); строки архива в листинг/поиск/чтение не попадают. Навык не
+        найден/удалён → 404 с hint канона §3.8.
+        """
+        result = await asyncio.to_thread(_skills_service(request).versions, skill_id)
+        if "hint" in result:
+            raise HTTPException(status_code=404, detail=result["hint"])
+        return result
 
     return rest_router
