@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-09-11
+
+Release 3.0.0 — "Skills and knowledge": three new knowledge areas (procedural skills, terminology, facts about the user) on a shared isolated substrate — one database, separate tables and indexes per area — with MCP tools, operator REST mirrors and background vectorization.
+
+### Added
+
+- **Area substrate**: `skills`, `terms` and `user_facts` live in the same SQLite database as notes, each with its own tables, FTS5 (trigram) and `vec0` indexes; the schema is created idempotently at startup, so an install of any previous version upgrades without manual migrations. Areas are isolated by design: no area query reads notes or another area, and note search never returns area records.
+- **Skills area** (lsb-0007): `skills_search` / `skills_list` / `skills_get` / `skills_save` / `skills_delete`. A skill is a stored procedure with a validated form: `name` ≤ 65 chars (≤ 5 words recommended), `description` ≤ 250, `steps` ≤ 500, `text` ≤ 4000, optional `example` ≤ 1000 and optional class fields (trigger, mode, preconditions, fallbacks, invariant, exceptions, guardrails, references, output_contract, behavior_contract; ≤ 500 chars each, ≤ 2000 together). Every edit keeps the previous version as a copy (`skill_versions`, operator-only via `GET /skills/{id}/versions`); a too-similar creation is refused with a hint pointing at the existing skill (cosine 0.90). The global "how to execute steps" template lives once per area (`instruction_template`). Bodies never enter the context unless `skills_get` asks for them.
+- **Skills announce at initialize**: MCP instructions carry a compact tail with the available skills (id — name: description, description cut to 120 chars, block budget 2000 chars, `(+n more — skills_list)` on overflow), rebuilt on every `initialize`, so a new chat sees the current registry. The built-in "Create skills" procedure is seeded on first start.
+- **Terms area** (lsb-0008): `terms_search` / `terms_save` / `terms_get`. A term is keyed by (term + context) with a mandatory context; the same term in a different context is a new sense and never overwrites the old one. Search returns ALL senses with their contexts; with no exact term the closest senses by meaning are returned and marked as not an exact match. A context too close to an existing one is refused with a hint pointing at the existing wording; successful writes return the term's senses and the contexts already used in the memory. There is no listing — search is the only way.
+- **User area** (lsb-0009): `user_search` / `user_save` / `user_update` / `user_delete` / `user_get` for atomic facts (`name` ≤ 5 words + `body` ≤ 1200 chars). A strong overlap with an existing fact is refused with a hint pointing at it (refine via `user_update`, or save a new fact as a separate record); every successful save repeats the atomicity rule. Search returns ≤ 300-char excerpts; the full body is one `user_get` away. Nothing is injected into the instructions at initialize.
+- **Operator REST mirrors**: `/skills` (plus `/skills/search`, `/skills/instruction-template`, `/skills/{id}/versions`), `/terms` (plus `/terms/search`) and `/user-facts` (plus `/user-facts/search`) — the same service layer and Bearer token as MCP, full contracts, status codes 201/200/401/404/409/422.
+- **Area limits and thresholds** are environment-tunable and validated at startup (form limits; anti-synonymy 0.90; context similarity 0.75; fact similarity 0.85/0.55; announce budget 2000/120; search excerpt 300).
+
+### Changed
+
+- **MCP tool surface**: 8 → **21** tools (`memory_*` + `skills_*` + `user_*` + `terms_*`); existing tools and their outputs are unchanged.
+- **Worker**: a fourth independent background loop (`areas`) vectorizes area records with its own back-off; writes stay instant (`vector_status=pending`), and an embedding failure never blocks a write or a search (full-text fallback with a warning).
+- **MCP instructions**: the manifest and the namespace map are unchanged; the skills announce is appended as a tail and refreshed per `initialize` (the mechanism returns from the reverted 2.2 profile block — without any user data).
+- **Vectorization inputs**: `name + description` (skills), `term + context + definition` (terms), `name + body` (user facts); changing the embedding model or dimension rebuilds the area indexes as well.
+
+### Fixed
+
+- **Area hybrid search returned neighbours regardless of relevance**: `vec0` KNN always returns the k nearest records, so any non-empty area answered any query and the documented "probe" semantics (empty result = no such record, soft hint) was unreachable. Vector hits are now gated by `SCORE_THRESHOLD`, the same calibration the note search uses.
+
+### Upgrade
+
+- Drop-in: start the new image over the existing database. The schema is created and seeded idempotently, notes, namespaces and their indexes are untouched, and the new areas start empty (except the seeded "Create skills" procedure and the instruction template). Reverting is a matter of restoring the pre-upgrade database snapshot.
+
 ## [2.2.1] - 2026-09-10
 
 Patch release — upgrade break (lsbdef-0006): upgrading an install from v2.1.x
