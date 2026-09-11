@@ -142,6 +142,51 @@ independently:
 | `NAMESPACE_MAX_LEAVES_PER_DOMAIN` | `12` | leaf cap per root |
 | `NAMESPACE_GROOM_MIN_NOTES` | `2` | grooming: node below this → merge candidate |
 
+### Knowledge areas (v3.0)
+
+Since v3.0 the store has three knowledge areas next to notes — `skills`,
+`terms` and `user_facts`. They live in the same SQLite database but in their
+own tables, full-text and vector indexes, isolated from notes in both
+directions (a note search never returns an area record and vice versa).
+All limits and thresholds below are validated at startup, like every other
+limit.
+
+**Skills** — stored procedures:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SKILL_NAME_MAX_CHARS` | `65` | skill name (≤ 5 words recommended) |
+| `SKILL_DESCRIPTION_MAX_CHARS` | `250` | what the skill does |
+| `SKILL_STEPS_MAX_CHARS` | `500` | the order of the steps |
+| `SKILL_TEXT_MAX_CHARS` | `4000` | what exactly each step does |
+| `SKILL_EXAMPLE_MAX_CHARS` | `1000` | optional example |
+| `SKILL_EXTRA_FIELD_MAX_CHARS` | `500` | one optional class field inside `extra` |
+| `SKILL_EXTRA_TOTAL_MAX_CHARS` | `2000` | all class fields together |
+| `INSTRUCTION_TEMPLATE_MAX_CHARS` | `1000` | global "how to execute steps" template |
+| `SKILL_ANNOUNCE_MAX_CHARS` | `2000` | budget of the skills announce block in MCP instructions |
+| `SKILL_ANNOUNCE_DESCRIPTION_CHARS` | `120` | description cut inside the announce |
+| `SKILL_SYNONYM_SIMILARITY` | `0.90` | cosine above which a new skill is "too similar" to an existing one |
+
+**Terms** — terminology keyed by (term + context):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TERM_MAX_CHARS` | `100` | term limit |
+| `TERM_CONTEXT_MAX_CHARS` | `40` | context limit (the context is mandatory) |
+| `TERM_DEFINITION_MAX_CHARS` | `350` | definition limit |
+| `TERM_CONTEXT_SIMILARITY` | `0.75` | similarity above which a new context is "too close" to a used one |
+| `TERM_CONTEXTS_HINT_LIMIT` | `30` | how many used contexts are returned as write hints |
+
+**User facts** — atomic facts about the user:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `USER_NAME_MAX_WORDS` | `5` | fact name, words (same contract as a note title) |
+| `USER_BODY_MAX_CHARS` | `1200` | fact body |
+| `USER_SIMILAR_STRONG` | `0.85` | similarity above which a new fact is refused as a duplicate |
+| `USER_SIMILAR_WEAK` | `0.55` | above which a new fact is saved with a "possibly related" hint |
+| `USER_SEARCH_EXCERPT_CHARS` | `300` | excerpt length in user-area search results |
+
 ## Prompts
 
 Three system prompts are **editable** (Phase 11, decision №7). When
@@ -183,8 +228,9 @@ environment:
   and a cold start (~22.6 GB for the summarizer) returns to latency.
 - **Reindex**: changing `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` /
   `EMBEDDING_DIM` triggers an automatic full reindex on startup (all notes →
-  `pending`, the worker re-encodes). Search/dedup thresholds are calibrated
-  for `qwen3-embedding:8b` — recalibrate after a model change.
+  `pending`, the worker re-encodes); the knowledge-area indexes are rebuilt
+  the same way (their records return to `pending`). Search/dedup thresholds
+  are calibrated for `qwen3-embedding:8b` — recalibrate after a model change.
 - **Validation**: all limits are validated at startup; an out-of-range or
   malformed value is a fatal configuration error listing every violation at
   once. Changing `MAX_NOTE_CHARS` over an existing DB is forbidden (the limit
