@@ -24,6 +24,10 @@
 * **Композит чтения** (`get`) собирается поверх глобального
   `instruction_template` из `skills_meta` (сид — `init_db`): шаблон подан
   отдельной секцией «как исполнять шаги», а не частью конкретного навыка.
+* **Поиск — проба** (`search`, lsb-0007-02): гибрид области (субстрат §3.5)
+  vec0-KNN (`skills_vec`, вектор = `name + description`) + FTS5/BM25
+  (`skills_fts`) → RRF; выдача без тел, пусто — мягкий ответ с hint
+  канона §3.8. Заметки и другие области не читаются (изоляция).
 
 Контракты ответов (полные; MCP-слой срезает служебные поля белым списком —
 lsb-0007-03):
@@ -33,6 +37,8 @@ lsb-0007-03):
 - get    → {id, name, description, example?, steps, text, instruction_template,
             extra?} (example/extra — только когда заданы); не найден → {id, hint}
 - list   → {items: [{id, name, description}], total} (только активные; тел нет)
+- search → {results: [{id, name, description, score}], warning?} (тел нет);
+            пусто → {results: [], hint, warning?} с дословным hint канона §3.8
 - delete → {id, deleted: True} | {id, deleted: False, hint}
 - instruction_template() → {instruction_template}
 - set_instruction_template(text) → {instruction_template, updated: True}
@@ -46,7 +52,9 @@ from collections.abc import Callable
 from typing import Any
 
 from app.config import Settings
+from app.services.areas import AreaSearch, AreaSearchValidationError, SKILLS_AREA
 from app.services.embedding import Embedder, EmbeddingService
+from app.services.search import MAX_TOP_K
 from app.storage.db import (
     INSTRUCTION_TEMPLATE_KEY,
     INSTRUCTION_TEMPLATE_SEED,
@@ -94,6 +102,13 @@ HINT_EXTRA_LIMIT = (
 )
 HINT_NOT_FOUND = "skill not found (possibly deleted); the actual list — skills_list"
 
+# Пустой `skills_search` (§3.8): поиск работает как проба — «навыка нет»
+# валидный исход, модель не лезет в навыки без причины.
+HINT_SEARCH_EMPTY = (
+    "no skill found for this task — do the task as usual; if you worked out a "
+    "repeatable procedure, save it via skills_save"
+)
+
 # Hint'ы, которых таблица канона §3.8 не задаёт (канон описывает только
 # лимиты): обязательность полей формы, незнакомый ключ `extra`, значение
 # `mode` и лимит глобального шаблона. Стиль и язык — как у канонических.
@@ -118,10 +133,10 @@ class SkillValidationError(ValueError):
 class SkillsService:
     """CRUD области навыков: форма, архив версий, глобальный шаблон.
 
-    DI: `settings` (лимиты формы) и — точка сборки для будущих поиска и
-    антисинонимии (lsb-0007-02/-03) — `embedding`. Синхронный путь записи
-    кодировщик НЕ зовёт (субстрат §3.3): вектора записи догоняет петля
-    `areas` воркера по `vector_status='pending'`.
+    DI: `settings` (лимиты формы), `embedding` (кодирование запроса
+    гибридного поиска — lsb-0007-02; антисинонимия создания — lsb-0007-04).
+    Синхронный путь записи кодировщик НЕ зовёт (субстрат §3.3): вектора
+    записи догоняет петля `areas` воркера по `vector_status='pending'`.
     """
 
     def __init__(self, settings: Settings, embedding: Embedder | None = None) -> None:
@@ -131,6 +146,10 @@ class SkillsService:
         self._embedding: Embedder = (
             embedding if embedding is not None else EmbeddingService(settings)
         )
+        # Гибридный поиск области (субстрат §3.5): та же механика, что у
+        # заметок, — vec0-KNN по `skills_vec` + FTS5/BM25 по `skills_fts` →
+        # RRF. SQL помощника адресует только таблицы навыков (изоляция).
+        self._area_search = AreaSearch(settings, SKILLS_AREA, self._embedding)
         # Сигнал воркеру (main.py): будить петлю areas сразу при появлении
         # pending-записи области, а не ждать выросший back-off.
         self._areas_notifier: Callable[[], None] | None = None
@@ -354,6 +373,44 @@ class SkillsService:
             ],
             "total": total,
         }
+
+    def search(self, query: str, top_k: int | None = None) -> dict[str, Any]:
+        """Гибридный поиск навыка — «проба» (arch §3.3, субстрат §3.5).
+
+        Сборка `AreaSearch` под область skills: vec0-KNN по `skills_vec`
+        (вектор = `name + description`, субстрат §3.3) + FTS5/BM25 по
+        `skills_fts` (`name`/`description`/`steps`/`text`) → RRF, фильтр
+        `deleted_at IS NULL`. Выдача компактна — тел нет: `{results: [{id,
+        name, description, score}], warning?}`; пустой результат — мягкий
+        ответ с дословным hint канона §3.8 (проба: навыка нет — валидный
+        исход, без fail). Отказ эмбеддера поиск не ломает: FTS-only +
+        `warning` (прецедент заметок, NFR-3) — warning в ответе сервиса
+        сохраняется, MCP-слой его срежет (lsb-0007-03).
+
+        `top_k` — границы как у поиска заметок (`1..MAX_TOP_K`), нарушение —
+        `SkillValidationError` (мягкий отказ транспорта, как у `list`).
+        Доменные ограничения запроса помощника (длина) приводятся к тому же
+        типу отказа сервиса области. Изоляция: SQL помощника адресует только
+        `skills`/`skills_fts`/`skills_vec` — заметки и другие области не
+        читаются.
+        """
+        if top_k is not None and not 1 <= top_k <= MAX_TOP_K:
+            raise SkillValidationError(
+                f"top_k: expected 1..{MAX_TOP_K}, got {top_k}"
+            )
+        try:
+            found = self._area_search.search(query, top_k)
+        except AreaSearchValidationError as exc:  # запрос вне домена области
+            raise SkillValidationError(str(exc)) from exc
+        answer: dict[str, Any] = {
+            "results": found["results"],
+            "warning": found.get("warning"),
+        }
+        if not found["results"]:
+            # Канон §3.8: у пустого поиска навыка ровно один hint (подсказки
+            # субстрата про короткий запрос в выдачу навыков не выносим).
+            answer["hint"] = HINT_SEARCH_EMPTY
+        return answer
 
     # --- удаление (soft delete, arch §3.4) ---------------------------------
 
