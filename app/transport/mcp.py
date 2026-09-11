@@ -1,4 +1,6 @@
-"""MCP-поверхность (ARCHITECTURE §3.1, §5): 7 инструментов `memory_*` + инструкции.
+"""MCP-поверхность (ARCHITECTURE §3.1, §5): 21 инструмент (8 `memory_*`
+заметок/узлов + 5 `skills_*` области навыков + 5 `user_*` области «user»
++ 3 `terms_*` области «terms») + инструкции.
 
 `MCPServer` — официальный высокоуровневый API mcp SDK 2.x (ex-`FastMCP`).
 Фаза 2: инструменты вызывают тот же service-слой, что и REST (ARCH §1);
@@ -50,14 +52,53 @@ lsb-0005-06 (FR-6): антисинонимия при создании — пе�
 Для корня (depth 1) сравнение — против корней; для листа — против всех
 тематических узлов (тот же предфильтр, что `_nearest_node` промоушна, но
 порог 0.90 и без записи вердикта). Отказ эмбеддинга предфильтр пропускает
-(деградация: создание происходит)."""
+(деградация: создание происходит).
+
+lsb-0007-03 (релиз 3.0.0): 5 инструментов области навыков — `skills_search`,
+`skills_list`, `skills_get`, `skills_save`, `skills_delete` — тонкие обёртки
+над `SkillsService` (один код с REST-зеркалами §3.7). Описания — дословно
+канон arch lsb-0007 §3.8 (правило «перед рутинной задачей —
+`skills_search`/`skills_list`, тело — только `skills_get` вшито в тексты:
+инструкции MCP на OWUI не доходят, гарантированный канал — tools). Выдачи
+компактны (белые списки), `hint` — только при мягком отказе. Антисинонимия
+создания (FR-5.2) живёт в сервисном слое (`SkillsService.save`): её обязан
+звать и REST POST /skills, у сервиса уже есть DI-эмбеддер; транспорт лишь
+отдаёт мягкий отказ `{created: False, hint}`.
+
+lsb-0009-02 (релиз 3.0.0): 5 инструментов области «user» — `user_search`,
+`user_save`, `user_update`, `user_delete`, `user_get` — тонкие обёртки над
+`UserFactsService` (один код с REST-зеркалами lsb-0009-03). Описания — дословно
+канон arch lsb-0009 §3.7 (правило «один факт = одна запись; несколько фактов —
+отдельные вызовы» + запрет секретов); выдачи компактны (белые списки), тело
+факта в контекст попадает только через `user_get` (поиск — `excerpt`). Хинты —
+четыре канала FR-7: описание инструмента (1), ПОСТОЯННЫЙ hint в каждом успешном
+`user_save` (2), дедуп-hint с id/name (3), мягкий отказ при `body` > 1200 (4).
+Инъекции при init НЕТ (arch §2): блока «user» в `instructions` не появляется —
+текст инструкций относительно предыдущего состояния не меняется (анонс навыков
+существовал и раньше, lsb-0007-04).
+
+lsb-0008-02 (релиз 3.0.0): 3 инструмента области terms — `terms_search`,
+`terms_save`, `terms_get` — тонкие обёртки над `TermsService` (один код с
+REST-зеркалами lsb-0008-03). Описания — дословно канон arch lsb-0008 §3.7
+(правило «все смыслы термина; выбор смысла — по контексту разговора, из
+разговора неясно — уточнить у пользователя, не додумывать» и «контекст
+обязателен всегда» вшиты в тексты: инструкции MCP на OWUI не доходят,
+гарантированный канал — tools). Листинга нет: поиск — единственный путь к
+определению. Выдачи компактны (белые списки), внутренние нормализованные
+колонки в MCP не просачиваются, `warning` сервиса срезается; hint — маркер
+мягкого отказа (нет точного термина / термина нет / близкий контекст /
+лимиты / пустой контекст). Инъекции при init НЕТ (arch §2): блока «terms» в
+`instructions` не появляется — анонса области terms нет.
+"""
 
 import asyncio
 import logging
 import math
 import time
+from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
 
+from mcp.server.context import ServerRequestContext
 from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
@@ -71,6 +112,13 @@ from app.services.notes import (
     _UNSET_TEXT,
     NoteValidationError,
     TitleValidationError,
+)
+from app.services.skills import SkillValidationError
+from app.services.terms import TermValidationError
+from app.services.user_facts import (
+    _UNSET_BODY,
+    _UNSET_NAME,
+    UserFactValidationError,
 )
 from app.storage.db import DEFAULT_NAMESPACE
 
@@ -139,8 +187,137 @@ def _namespace_map(services: Services) -> str:
 
 
 def build_instructions(services: Services) -> str:
-    """Полный текст инструкций: база + правило неймспейсов + карта реестра."""
-    return SERVER_INSTRUCTIONS + _NS_RULES + _namespace_map(services)
+    """Полный текст инструкций: база + правило неймспейсов + карта + анонс.
+
+    Блок анонса навыков — ХВОСТ (lsb-0007 §3.5): манифест, правила и карта
+    не меняются, блок лишь дописывается и не добавляется вовсе, если
+    активных навыков нет (или БД ещё недоступна).
+    """
+    return (
+        SERVER_INSTRUCTIONS
+        + _NS_RULES
+        + _namespace_map(services)
+        + _skills_announce(services)
+    )
+
+
+# Блок анонса навыков (arch lsb-0007 §3.5/§3.8): правило поведения —
+# дословный канон (§3.8, в доке разбит на строки по ~80 симв. — это вёрстка,
+# строки склеены пробелами, как у остальных модельных текстов). Строки
+# реестра — ДАННЫЕ, а не канон: `  - {id} — {name}: {description}`.
+_SKILLS_ANNOUNCE_RULES = (
+    "\n\nSkills are stored procedures (how-to), kept separately from notes. "
+    "Rule: before a routine/repeatable task, check whether a skill exists — "
+    "`skills_search` (by the task) or `skills_list`; read the full procedure "
+    "via `skills_get` and follow it. For many conversations skills are "
+    "irrelevant — do not fetch bodies without reason. Available skills "
+    "(id — name: description):\n"
+)
+
+# Строка переполнения бюджета (канон §3.8); хвостовые пробелы арх-доки —
+# вёрстка (плейсхолдер {n} заменяется числом не вместившихся навыков).
+_SKILLS_ANNOUNCE_MORE = "  (+{n} more — skills_list)"
+
+# Деградация сборки до init_db / недоступности БД — паттерн карты неймспейсов
+# (§3.5): блок анонса не собирается, инструкции остаются валидными, модель
+# идёт в листинг. Пустой реестр — тоже без блока (но без этой подсказки:
+# реестр известен и он пуст).
+_SKILLS_ANNOUNCE_DEGRADED = (
+    "\n\n(skills announce loads at startup; up-to-date — skills_list)"
+)
+
+
+def _skills_announce(services: Services) -> str:
+    """Хвост инструкций — блок анонса навыков (arch lsb-0007 §3.5).
+
+    Правило поведения + строки реестра `  - {id} — {name}: {description}`;
+    `description` обрезается до `skill_announce_description_chars` (120),
+    весь блок — не длиннее `skill_announce_max_chars` (2000); не вместившиеся
+    навыки заменяются последней строкой `  (+{n} more — skills_list)`.
+    Бюджет считается по всему блоку (правило + строки) — иначе блок вылезал
+    бы за заявленный предел; место под строку переполнения резервируется
+    заранее, чтобы она влезла. Активных навыков нет — блок НЕ добавляется;
+    БД недоступна — деградация по паттерну карты неймспейсов.
+    """
+    skills = services.skills
+    if skills is None:
+        # DI-сборки тестов без области навыков (Services.skills опционален).
+        return ""
+    settings = skills.settings
+    try:
+        items = skills.announce_items()
+    except Exception:
+        # БД ещё не инициализирована (init_db в lifespan) либо реестр временно
+        # недоступен — деградируем, а не падаем при сборке приложения.
+        logging.getLogger("app").info(
+            "skills announce unavailable at build — degraded instructions",
+            extra={"event": "startup"},
+        )
+        return _SKILLS_ANNOUNCE_DEGRADED
+    if not items:
+        return ""
+    budget = settings.skill_announce_max_chars - len(_SKILLS_ANNOUNCE_RULES)
+    cut = settings.skill_announce_description_chars
+    lines: list[str] = []
+    used = 0
+    truncated = 0
+    for index, skill in enumerate(items):
+        description = skill["description"]
+        if len(description) > cut:
+            description = description[:cut]
+        line = f"  - {skill['id']} — {skill['name']}: {description}\n"
+        rest = len(items) - index - 1
+        reserve = len(_SKILLS_ANNOUNCE_MORE.format(n=rest)) + 1 if rest else 0
+        if used + len(line) + reserve > budget:
+            truncated = len(items) - index
+            break
+        lines.append(line)
+        used += len(line)
+    if truncated:
+        lines.append(_SKILLS_ANNOUNCE_MORE.format(n=truncated) + "\n")
+    return _SKILLS_ANNOUNCE_RULES + "".join(lines)
+
+
+class InstructionsRefresher:
+    """ServerMiddleware SDK mcp 2.x — пересборка instructions на каждый initialize.
+
+    Механизм откатанного 2.2 (lsb-0002), но БЕЗ данных пользователя: перед
+    обработкой `initialize` middleware пересобирает инструкции (манифест +
+    правила + карта + анонс навыков) в рабочем потоке (`asyncio.to_thread` —
+    блокирующие вызовы SQLite не занимают event loop) и присваивает атрибут
+    low-level сервера: ответ на initialize собирается в момент handshake,
+    поэтому обновления атрибута достаточно — транспорт не меняется, а новый
+    чат видит актуальный реестр навыков.
+
+    SDK 2.x: `MCPServer.instructions` — read-only свойство поверх
+    `_lowlevel_server.instructions` (provisional API — обновляем атрибут
+    напрямую, см. middleware guide).
+    """
+
+    def __init__(self, services: Services, server: MCPServer) -> None:
+        self._services = services
+        self._server = server
+
+    async def __call__(
+        self,
+        ctx: ServerRequestContext[Any, Any],
+        call_next: Callable[[ServerRequestContext[Any, Any]], Awaitable[Any]],
+    ) -> Any:
+        if ctx.method == "initialize":
+            try:
+                text = await asyncio.to_thread(build_instructions, self._services)
+            except Exception:
+                # Пересборка не должна ломать handshake: прежние инструкции
+                # остаются (недоступность БД уже деградирована внутри
+                # build_instructions — сюда доходит только дефект кода).
+                logging.getLogger("app").warning(
+                    "instructions rebuild failed — keeping previous",
+                    extra={"event": "instructions_refresh_failed"},
+                    exc_info=True,
+                )
+            else:
+                self._server._lowlevel_server.instructions = text
+        return await call_next(ctx)
 
 
 # Обучающие описания инструментов (ARCHITECTURE §5.2) — гарантированный канал
@@ -217,6 +394,112 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "similar a description is rejected with the hint «there is a similar "
         "one: <path>» — choose a different description/node. A node duplicate "
         "is also rejected with a hint."
+    ),
+    # lsb-0007-03: описания области навыков — дословно канон arch lsb-0007
+    # §3.8 (английский, править только в арх-доке). Правило-страховка
+    # «перед рутинной задачей — skills_search/skills_list, тело — только
+    # skills_get» вшито в тексты (инструкции MCP на OWUI не доходят —
+    # гарантированный канал только tools, §3.5).
+    "skills_search": (
+        "Search the skills area BEFORE doing a routine or repeatable task: "
+        "skills are stored procedures (how-to), kept separately from notes. "
+        "Empty result = there is no such skill — do not browse skills without "
+        "reason. Returns short hits (id, name, description); the full "
+        "procedure — only via skills_get."
+    ),
+    "skills_list": (
+        "List all available skills (id, name, description) — compact, without "
+        "bodies. Use it to see which routines this memory already has; many "
+        "conversations need no skills at all."
+    ),
+    "skills_get": (
+        "Read a full skill by id: name + description + example (if any) + "
+        "steps (the order) + text (what exactly each step does), composed over "
+        "the global instruction_template (how to execute steps). Follow it as "
+        "a procedure when the task matches its description; if a step cannot "
+        "be executed, stop and report what is missing instead of skipping it."
+    ),
+    "skills_save": (
+        "Create a new skill or update an existing one by id. A skill is a "
+        "stored procedure: name ≤65 characters (≤5 words recommended), "
+        "description ≤250 (what it does), steps ≤500 (the order: what after "
+        "what), text ≤4000 (what exactly each step does); optional example "
+        "≤1000 and optional class fields (trigger, mode, preconditions, "
+        "fallbacks, invariant, exceptions, guardrails, references, "
+        "output_contract, behavior_contract) — only when this skill class "
+        "needs them. Run skills_search first: if a similar skill exists, "
+        "update it instead of creating a duplicate (a too-similar creation is "
+        "refused with a hint). Read the skill via skills_get before editing; "
+        "every update keeps the previous version as a copy automatically."
+    ),
+    "skills_delete": (
+        "Delete a skill by id (soft delete: it disappears from search, list "
+        "and the skills announce; restoring is the operator's job). Delete "
+        "only a skill that is factually wrong, fully duplicates another one "
+        "or was created by mistake."
+    ),
+    # lsb-0009-02: описания области «user» — дословно канон arch lsb-0009
+    # §3.7 (английский, править только в арх-доке). Правило «один факт =
+    # одна запись; несколько фактов — отдельные вызовы» и запрет секретов
+    # вшиты в тексты: описания — гарантированный канал (FR-7.1),
+    # инструкции MCP блока «user» не содержат (инъекции нет, §2).
+    "user_search": (
+        "Search the user area: atomic facts about the user (steady preferences, "
+        "working habits, agreements — ONE FACT PER RECORD, never a list). Returns "
+        "{id, name, excerpt}; the full body — user_get. Search here when the "
+        "answer depends on the user's preferences or arrangements; do not invent "
+        "what might be stored — search first."
+    ),
+    "user_save": (
+        "Save ONE atomic durable fact about the user: name ≤5 words (like a note "
+        "title) + body ≤1200 characters. ONE FACT = ONE RECORD: never pack a list "
+        "of facts into one record and never repeat a fact that is already stored "
+        "— several facts mean several separate calls. A strong overlap with an "
+        "existing fact is refused with a hint pointing to it: the same fact — "
+        "refine it via user_update(id=…); a new fact — save it as a separate "
+        "record. Never store secrets (passwords, tokens, keys)."
+    ),
+    "user_update": (
+        "Update a fact by id: name and/or body; a value that is not passed = keep "
+        "the current one. Run user_get first so you don't lose details. This is "
+        "the right tool when user_save hinted that a similar fact already exists."
+    ),
+    "user_delete": (
+        "Delete a fact by id (soft delete: it disappears from all outputs; "
+        "restoring is the operator's job). Delete only a fact that is wrong or "
+        "fully duplicates another one."
+    ),
+    "user_get": (
+        "Read one fact by id: name + body."
+    ),
+    # lsb-0008-02: описания области terms — дословно канон arch lsb-0008 §3.7
+    # (английский, править только в арх-доке). Правило «один термин — все
+    # смыслы; выбор смысла — по контексту разговора, из разговора неясно —
+    # уточнить у пользователя, не додумывать» и «контекст обязателен всегда»
+    # вшиты в тексты: описания — гарантированный канал (инструкции блока
+    # «terms» не содержат — инъекции нет, arch §2).
+    "terms_search": (
+        "Look up a term or an abbreviation in the terms area. Returns ALL "
+        "senses of the term together with their contexts: one term means "
+        "different things in different contexts — never pick a single sense "
+        "silently, choose by the context of the conversation, and if it is "
+        "unclear, ask the user instead of guessing. If there is no exact term, "
+        "the closest senses by meaning are returned (not an exact match). There "
+        "is no listing — search is the only way to a definition."
+    ),
+    "terms_save": (
+        "Save a term with a MANDATORY context: term ≤100 characters, context "
+        "≤40 (always filled in — even when the term has a single sense), "
+        "definition ≤350. The key is (term + context): the same key updates the "
+        "record; the same term with a new context creates a NEW sense and never "
+        "overwrites the old one. Reuse one of the contexts already used in this "
+        "memory (the response lists them) instead of inventing a near-duplicate "
+        "wording — a too-close context is refused with a hint that points to the "
+        "existing context. The response also lists the senses this term already "
+        "has."
+    ),
+    "terms_get": (
+        "Read one term record by id: term, context, definition."
     ),
 }
 
@@ -422,9 +705,217 @@ def _compact_namespace_create(result: dict[str, Any]) -> dict[str, Any]:
     return {"created": True, **_pick(result, _NS_CREATE)}
 
 
+# lsb-0007-03: компактные выдачи области навыков — белые списки полей (§3.3).
+# Тело навыка в контекст попадает только через `skills_get` (экономия
+# контекста, §3.5): search/list несут лишь опознавательные поля. `score` в
+# search и `example` в get — soft-ключи: показываются только когда сервис их
+# отдал (гибрид области / необязательное поле формы). hint — только при
+# мягком отказе; warning сервиса срезается всегда.
+_SKILL_SEARCH_ITEM = ("id", "name", "description")
+_SKILL_LIST_ITEM = ("id", "name", "description")
+_SKILL_GET_ITEM = ("name", "description", "steps", "text", "instruction_template")
+
+
+def _skill_hit(row: dict[str, Any]) -> dict[str, Any]:
+    """Компактный хит skills_search: id/name/description (+score, если есть)."""
+    hit: dict[str, Any] = _pick(row, _SKILL_SEARCH_ITEM)
+    if row.get("score") is not None:
+        hit["score"] = row["score"]
+    return hit
+
+
+def _compact_skill_search(result: dict[str, Any]) -> dict[str, Any]:
+    """skills_search: {results: [{id, name, description, score?}], hint?}.
+
+    Пустой поиск — не fail сервиса, а мягкий ответ с дословным hint канона
+    §3.8 (проба: навыка нет — валидный исход).
+    """
+    out = {"results": [_skill_hit(row) for row in result["results"]]}
+    return _with_hint(out, result)  # warning не копируется никогда
+
+
+def _compact_skill_list(result: dict[str, Any]) -> dict[str, Any]:
+    """skills_list: {items: [{id, name, description}], total} — без тел."""
+    out = {"items": [_pick(item, _SKILL_LIST_ITEM) for item in result["items"]],
+           "total": result["total"]}
+    return _with_hint(out, result)
+
+
+def _compact_skill_get(result: dict[str, Any]) -> dict[str, Any]:
+    """skills_get: композит §3.1 — name/description/example?/steps/text/шаблон.
+
+    Не найден → `{hint}` канона §3.8 (композита нет: строки нет); `id` в
+    успешную выдачу не входит (модель уже знает id — экономия контекста),
+    `extra` тоже (полная запись — REST).
+    """
+    if "name" not in result:
+        return _with_hint({}, result)
+    out = _pick(result, _SKILL_GET_ITEM)
+    if result.get("example"):
+        out["example"] = result["example"]
+    return out
+
+
+def _compact_skill_save(result: dict[str, Any]) -> dict[str, Any]:
+    """skills_save: (id, version, created|updated); отказ — fail + hint.
+
+    Создание слишком похожего навыка (антисинонимия, §3.4) → `{created:
+    False, hint}` с hint канона; правка несуществующего id → `{id, updated:
+    False, hint}`.
+    """
+    if result.get("created"):
+        return _pick(result, ("id", "version", "created"))
+    if result.get("updated"):
+        return _pick(result, ("id", "version", "updated"))
+    if "created" in result:
+        return _with_hint({"created": False}, result)
+    return _with_hint({"id": result["id"], "updated": False}, result)
+
+
+def _compact_skill_delete(result: dict[str, Any]) -> dict[str, Any]:
+    """skills_delete: (id, deleted); повторный/чужой id → hint канона."""
+    return _with_hint(_pick(result, ("id", "deleted")), result)
+
+
+# lsb-0009-02: компактные выдачи области «user» — белые списки полей
+# (arch lsb-0009 §3.3, §3.7). Тело факта в контекст попадает только через
+# `user_get` (поиск отдаёт `excerpt`); `score` — soft-ключ (гибрид области —
+# показывается, если сервис его отдал). hint — маркер мягкого отказа, но в
+# УСПЕШНОМ `user_save` он ПОСТОЯННЫЙ (FR-7.2, hint атомарности) — поэтому
+# он не срезается, а средняя зона дедупа несёт ещё и справочный `related`.
+_USER_SEARCH_ITEM = ("id", "name", "excerpt")
+_USER_GET_ITEM = ("id", "name", "body")
+_USER_RELATED_ITEM = ("id", "name")
+
+
+def _user_hit(row: dict[str, Any]) -> dict[str, Any]:
+    """Компактный хит user_search: id/name/excerpt (+score, если есть)."""
+    hit: dict[str, Any] = _pick(row, _USER_SEARCH_ITEM)
+    if row.get("score") is not None:
+        hit["score"] = row["score"]
+    return hit
+
+
+def _compact_user_search(result: dict[str, Any]) -> dict[str, Any]:
+    """user_search: {results: [{id, name, excerpt, score?}], hint?}.
+
+    Пустой поиск — не fail сервиса, а мягкий ответ с дословным hint канона
+    §3.7 (проба: факта нет — валидный исход). warning всегда срезается.
+    """
+    out = {"results": [_user_hit(row) for row in result["results"]]}
+    return _with_hint(out, result)  # warning не копируется никогда
+
+
+def _compact_user_get(result: dict[str, Any]) -> dict[str, Any]:
+    """user_get: (id, name, body); не найден → {id} + hint канона §3.7."""
+    if "name" not in result:
+        return _with_hint({"id": result["id"]}, result)
+    return _pick(result, _USER_GET_ITEM)
+
+
+def _compact_user_save(result: dict[str, Any]) -> dict[str, Any]:
+    """user_save: (id, stored, hint?, related?); отказ дедупа — fail + hint.
+
+    Успех всегда несёт постоянный hint атомарности (FR-7.2); средняя зона
+    дедупа — справочный `related` (id/name похожих). Мягкий отказ сильного
+    совпадения (`stored: False`) записи не имеет — `id` в выдачу не входит,
+    hint канона ведёт к `user_update` существующего факта.
+    """
+    if not result.get("stored"):
+        return _with_hint({"stored": False}, result)
+    out = _pick(result, ("id", "stored"))
+    related = result.get("related")
+    if related:
+        out["related"] = [_pick(item, _USER_RELATED_ITEM) for item in related]
+    return _with_hint(out, result)  # hint — ВСЕГДА (постоянный, FR-7.2)
+
+
+def _compact_user_update(result: dict[str, Any]) -> dict[str, Any]:
+    """user_update: (id, changed); нет записи → hint канона §3.7."""
+    return _with_hint(_pick(result, ("id", "changed")), result)
+
+
+def _compact_user_delete(result: dict[str, Any]) -> dict[str, Any]:
+    """user_delete: (id, deleted); повторный/чужой id → hint канона §3.7."""
+    return _with_hint(_pick(result, ("id", "deleted")), result)
+
+
+# lsb-0008-02: компактные выдачи области «terms» — белые списки полей
+# (arch lsb-0008 §3.4–3.5). Внутренние нормализованные колонки области
+# (`term_norm`, `context_norm`, `vector_status`, `created_at`/`updated_at`,
+# `deleted_at`) в MCP не выводятся. `term`/`score` в выдаче смысла —
+# soft-ключи: в точной ветке сервис их не отдаёт (смыслы уже опознаны по
+# термину), в неточной — отдаёт (ближайшие по смыслу, не точное совпадение);
+# `warning` сервиса срезается всегда, `hint` — маркер мягкого отказа.
+_TERM_SENSE_ITEM = ("id", "context", "definition")
+_TERM_SENSE_HINT_ITEM = ("id", "context")
+_TERM_GET_ITEM = ("id", "term", "context", "definition")
+
+
+def _term_sense(row: dict[str, Any]) -> dict[str, Any]:
+    """Компактный смысл terms_search: id/context/definition (+term/score).
+
+    `term`/`score` — soft-ключи неточной ветки: показываются только когда
+    сервис их отдал (гибрид области) — точная ветка идёт без них.
+    """
+    sense: dict[str, Any] = _pick(row, _TERM_SENSE_ITEM)
+    if "term" in row:
+        sense["term"] = row["term"]
+    if "score" in row:
+        sense["score"] = row["score"]
+    return sense
+
+
+def _compact_term_search(result: dict[str, Any]) -> dict[str, Any]:
+    """terms_search: {senses: [{id, context, definition, term?, score?}],
+    exact, hint?}.
+
+    Точная ветка (`exact: true`) — ВСЕ смыслы термина, без `term`/`score`
+    (один смысл не выбирается за модель, §3.4); неточная — ближайшие по
+    смыслу + дословный hint «не точное совпадение». Пусто — мягкий ответ
+    с hint «термина нет вовсе» (не fail). warning не копируется никогда.
+    """
+    out: dict[str, Any] = {
+        "senses": [_term_sense(row) for row in result["senses"]],
+        "exact": result["exact"],
+    }
+    return _with_hint(out, result)
+
+
+def _compact_term_save(result: dict[str, Any]) -> dict[str, Any]:
+    """terms_save: {created|updated, id, senses, contexts, hint?}.
+
+    Оба успешных исхода (§3.5) несут справочно `senses` этого термина
+    `[{id, context}]` и `contexts` области — чтобы модель переиспользовала
+    формулировку контекста (FR-3.2). Мягкий отказ близкого контекста
+    (`created: False`) записи не имеет: `id` в выдачу не входит, hint ведёт
+    к существующему контексту. Дословный hint лимитов/пустого контекста — из
+    мягкого отказа сервиса (§3.7).
+    """
+    if not (result.get("created") or result.get("updated")):
+        return _with_hint({"created": False}, result)
+    flag = "created" if result.get("created") else "updated"
+    return {
+        flag: True,
+        "id": result["id"],
+        "senses": [
+            _pick(sense, _TERM_SENSE_HINT_ITEM) for sense in result["senses"]
+        ],
+        "contexts": list(result["contexts"]),
+    }
+
+
+def _compact_term_get(result: dict[str, Any]) -> dict[str, Any]:
+    """terms_get: (id, term, context, definition); нет — hint канона §3.7."""
+    if "term" not in result:
+        return _with_hint({}, result)
+    return _pick(result, _TERM_GET_ITEM)
+
+
 def build_mcp(settings: Settings, services: Services) -> MCPServer:
     """Собрать MCP-сервер: инструкции (§5.1, база + карта неймспейсов) +
-    7 инструментов над сервисами.
+    21 инструмент (8 `memory_*` + 5 `skills_*` + 5 `user_*` + 3 `terms_*`)
+    над сервисами.
 
     Сигнатуры и ограничения параметров — контракты REQUIREMENTS §5.1/§5.7;
     значения по умолчанию (DEFAULT_TOP_K, DEFAULT_LIST_LIMIT) — из env.
@@ -433,6 +924,10 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
         name=SERVER_NAME,
         instructions=build_instructions(services),
     )
+    # Свежесть анонса навыков (lsb-0007 §3.5): ServerMiddleware пересобирает
+    # инструкции перед каждым initialize — новый чат видит актуальный реестр
+    # (данных пользователя в пересборке нет, только реестр навыков).
+    mcp.middleware.append(InstructionsRefresher(services, mcp))
 
     @mcp.tool(name="memory_search", description=TOOL_DESCRIPTIONS["memory_search"])
     async def memory_search(
@@ -915,5 +1410,445 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             node=result["path"],
         )
         return _compact_namespace_create(result)
+
+    # --- область навыков (lsb-0007-03, arch §3.3–3.4) ------------------------
+    # Тонкие обёртки над `SkillsService` (один код с REST-зеркалами §3.7):
+    # блокирующие вызовы — в `asyncio.to_thread`, выдачи — белые списки,
+    # hint — только при мягком отказе. Антисинонимия создания живёт в
+    # сервисе (её обязан звать и REST POST /skills), транспорт лишь отдаёт
+    # `{created: False, hint}` как есть: `_compact_skill_save`.
+
+    @mcp.tool(name="skills_search", description=TOOL_DESCRIPTIONS["skills_search"])
+    async def skills_search(
+        query: Annotated[
+            str,
+            Field(
+                description="Task wording: what you are about to do",
+                min_length=1,
+                max_length=settings.max_query_chars,
+            ),
+        ],
+        top_k: Annotated[
+            int,
+            Field(description="Number of results", ge=1, le=20),
+        ] = settings.default_top_k,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            result = await asyncio.to_thread(services.skills.search, query, top_k)
+        except SkillValidationError as exc:
+            # Мягкий отказ (fail + hint): запрос/top_k вне домена области.
+            log_tool_call(
+                "skills_search",
+                started,
+                failed=True,
+                reason=str(exc),
+                query=preview(query),
+            )
+            return {"results": [], "hint": str(exc)}
+        # Пустой результат — валидный исход пробы (hint канона в выдаче),
+        # не fail: событие несёт число хитов и признак FTS-only деградации.
+        log_tool_call(
+            "skills_search",
+            started,
+            results=len(result["results"]),
+            top_k=top_k,
+            query=preview(query),
+            fts_only=bool(result.get("warning")),
+        )
+        return _compact_skill_search(result)
+
+    @mcp.tool(name="skills_list", description=TOOL_DESCRIPTIONS["skills_list"])
+    async def skills_list() -> dict[str, Any]:
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.skills.list)
+        log_tool_call("skills_list", started, results=len(result["items"]))
+        return _compact_skill_list(result)
+
+    @mcp.tool(name="skills_get", description=TOOL_DESCRIPTIONS["skills_get"])
+    async def skills_get(
+        id: Annotated[int, Field(description="Skill id")],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.skills.get, id)
+        if "hint" in result:
+            # Мягкий отказ: навыка нет (мягко — возможно, удалён).
+            log_tool_call(
+                "skills_get", started, failed=True, reason=result["hint"], id=id
+            )
+        else:
+            log_tool_call("skills_get", started, results=1, id=id)
+        return _compact_skill_get(result)
+
+    @mcp.tool(name="skills_save", description=TOOL_DESCRIPTIONS["skills_save"])
+    async def skills_save(
+        name: Annotated[
+            str,
+            Field(description="Skill name: ≤65 characters (≤5 words recommended)"),
+        ],
+        description: Annotated[
+            str,
+            Field(description="What it does: ≤250 characters"),
+        ],
+        steps: Annotated[
+            str,
+            Field(description="The order: what after what: ≤500 characters"),
+        ],
+        text: Annotated[
+            str,
+            Field(description="What exactly each step does: ≤4000 characters"),
+        ],
+        id: Annotated[
+            int | None,
+            Field(description="Skill id to update; omitted — create a new skill"),
+        ] = None,
+        example: Annotated[
+            str | None,
+            Field(description="Optional example: ≤1000 characters"),
+        ] = None,
+        extra: Annotated[
+            dict[str, str] | None,
+            Field(
+                description="Optional class fields (trigger, mode, preconditions, "
+                "fallbacks, invariant, exceptions, guardrails, references, "
+                "output_contract, behavior_contract; each ≤500 characters, "
+                "together ≤2000) — only when this skill class needs them",
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        # Лимиты формы валидирует СЕРВИС (не схема — как title у заметок):
+        # нарушение → SkillValidationError с дословным hint канона §3.8.
+        # Приватность (NFR-4): в лог идут длины, не содержимое.
+        started = time.perf_counter()
+        sizes = {
+            "name_chars": len(name),
+            "description_chars": len(description),
+            "steps_chars": len(steps),
+            "text_chars": len(text),
+        }
+        try:
+            result = await asyncio.to_thread(
+                services.skills.save,
+                id=id,
+                name=name,
+                description=description,
+                steps=steps,
+                text=text,
+                example=example,
+                extra=extra,
+            )
+        except SkillValidationError as exc:
+            log_tool_call(
+                "skills_save", started, failed=True, reason=str(exc), id=id, **sizes
+            )
+            if id is None:
+                return {"created": False, "hint": str(exc)}
+            return {"id": id, "updated": False, "hint": str(exc)}
+        if result.get("created") or result.get("updated"):
+            log_tool_call(
+                "skills_save",
+                started,
+                results=1,
+                id=result["id"],
+                version=result["version"],
+                **sizes,
+            )
+        else:
+            # Мягкий отказ сервиса: дубль (антисинонимия) или правка
+            # несуществующего id — навык не записан, hint ведёт к решению.
+            log_tool_call(
+                "skills_save", started, failed=True, reason=result["hint"],
+                id=id, **sizes,
+            )
+        return _compact_skill_save(result)
+
+    @mcp.tool(name="skills_delete", description=TOOL_DESCRIPTIONS["skills_delete"])
+    async def skills_delete(
+        id: Annotated[int, Field(description="Skill id")],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.skills.delete, id)
+        if result.get("deleted"):
+            log_tool_call("skills_delete", started, id=id, deleted=True)
+        else:
+            # Повторный/несуществующий id — мягкий отказ с hint канона.
+            log_tool_call(
+                "skills_delete", started, failed=True, reason=result["hint"], id=id
+            )
+        return _compact_skill_delete(result)
+
+    # --- область «user» (lsb-0009-02, arch §3.3/§3.7) ----------------------
+    # Тонкие обёртки над `UserFactsService` (один код с REST-зеркалами
+    # lsb-0009-03): блокирующие вызовы — в `asyncio.to_thread`, выдачи — белые
+    # списки, hint пробрасывается при мягком отказе, НО в успешном `user_save`
+    # он постоянный (FR-7.2) и не срезается. Валидация формы (лимиты `name`/
+    # `body`) живёт в сервисе — нарушение даёт дословный hint канона (§3.7)
+    # вместо схемного отказа. Инъекции при init НЕТ: блока «user» в инструкциях
+    # не появляется (FR-6, arch §2) — гарантированный канал лишь описания.
+
+    @mcp.tool(name="user_search", description=TOOL_DESCRIPTIONS["user_search"])
+    async def user_search(
+        query: Annotated[
+            str,
+            Field(
+                description="Topic wording: the user's preferences or "
+                "arrangements the answer depends on",
+                min_length=1,
+                max_length=settings.max_query_chars,
+            ),
+        ],
+        top_k: Annotated[
+            int,
+            Field(description="Number of results", ge=1, le=20),
+        ] = settings.default_top_k,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            result = await asyncio.to_thread(services.user_facts.search, query, top_k)
+        except UserFactValidationError as exc:
+            # Мягкий отказ (fail + hint): запрос/top_k вне домена области.
+            log_tool_call(
+                "user_search",
+                started,
+                failed=True,
+                reason=str(exc),
+                query=preview(query),
+            )
+            return {"results": [], "hint": str(exc)}
+        # Пустой результат — валидный исход пробы (hint канона в выдаче),
+        # не fail: событие несёт число хитов и признак FTS-only деградации.
+        log_tool_call(
+            "user_search",
+            started,
+            results=len(result["results"]),
+            top_k=top_k,
+            query=preview(query),
+            fts_only=bool(result.get("warning")),
+        )
+        return _compact_user_search(result)
+
+    @mcp.tool(name="user_save", description=TOOL_DESCRIPTIONS["user_save"])
+    async def user_save(
+        name: Annotated[
+            str,
+            Field(description="Fact name: ≤5 words (like a note title)"),
+        ],
+        body: Annotated[
+            str,
+            Field(description="Fact body: ≤1200 characters; one fact per record"),
+        ],
+    ) -> dict[str, Any]:
+        # Лимиты формы валидирует СЕРВИС (не схема — как title у заметок):
+        # нарушение → UserFactValidationError с дословным hint канона §3.7.
+        # Приватность (NFR-4): в лог идут длины, не содержимое.
+        started = time.perf_counter()
+        sizes = {"name_chars": len(name), "body_chars": len(body)}
+        try:
+            result = await asyncio.to_thread(
+                services.user_facts.save, name=name, body=body
+            )
+        except UserFactValidationError as exc:
+            log_tool_call(
+                "user_save", started, failed=True, reason=str(exc), **sizes
+            )
+            return {"stored": False, "hint": str(exc)}
+        if result.get("stored"):
+            log_tool_call(
+                "user_save", started, results=1, id=result["id"], **sizes
+            )
+        else:
+            # Мягкий отказ дедупа (сильное совпадение): записи нет, hint ведёт
+            # к правке существующего факта либо к отдельной записи.
+            log_tool_call(
+                "user_save", started, failed=True, reason=result["hint"], **sizes
+            )
+        return _compact_user_save(result)
+
+    @mcp.tool(name="user_update", description=TOOL_DESCRIPTIONS["user_update"])
+    async def user_update(
+        id: Annotated[int, Field(description="Fact id")],
+        name: Annotated[
+            str | None,
+            Field(
+                description="New name: ≤5 words (like a note title); not passed "
+                "— the current one stays",
+                json_schema_extra={"default": None},
+            ),
+        ] = _UNSET_NAME,
+        body: Annotated[
+            str | None,
+            Field(
+                description="New body: ≤1200 characters; not passed — the "
+                "current one stays",
+                json_schema_extra={"default": None},
+            ),
+        ] = _UNSET_BODY,
+    ) -> dict[str, Any]:
+        # Сентинелы «не передано» (прецедент lsb-0004/`memory_update`): дефолты
+        # параметров — JSON-серизуемые строки; схема показывает null, поэтому
+        # модель либо не передаёт поле, либо передаёт значение (null в
+        # обязательном поле — мягкий отказ сервиса).
+        started = time.perf_counter()
+        try:
+            result = await asyncio.to_thread(
+                services.user_facts.update, id, name=name, body=body
+            )
+        except UserFactValidationError as exc:
+            log_tool_call(
+                "user_update", started, failed=True, reason=str(exc), id=id
+            )
+            return {"id": id, "changed": False, "hint": str(exc)}
+        if "hint" in result:
+            # Не найден/удалён — мягкий отказ с hint канона §3.7.
+            log_tool_call(
+                "user_update", started, failed=True, reason=result["hint"], id=id
+            )
+        else:
+            log_tool_call(
+                "user_update", started, id=id, changed=bool(result.get("changed"))
+            )
+        return _compact_user_update(result)
+
+    @mcp.tool(name="user_delete", description=TOOL_DESCRIPTIONS["user_delete"])
+    async def user_delete(
+        id: Annotated[int, Field(description="Fact id")],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.user_facts.delete, id)
+        if result.get("deleted"):
+            log_tool_call("user_delete", started, id=id, deleted=True)
+        else:
+            # Повторный/несуществующий id — мягкий отказ с hint канона §3.7.
+            log_tool_call(
+                "user_delete", started, failed=True, reason=result["hint"], id=id
+            )
+        return _compact_user_delete(result)
+
+    @mcp.tool(name="user_get", description=TOOL_DESCRIPTIONS["user_get"])
+    async def user_get(
+        id: Annotated[int, Field(description="Fact id")],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.user_facts.get, id)
+        if "hint" in result:
+            # Мягкий отказ: факта нет (мягко — возможно, удалён).
+            log_tool_call(
+                "user_get", started, failed=True, reason=result["hint"], id=id
+            )
+        else:
+            log_tool_call("user_get", started, results=1, id=id)
+        return _compact_user_get(result)
+
+    # --- область terms (lsb-0008-02, arch §3.4–3.5) -------------------------
+    # Тонкие обёртки над `TermsService` (один код с REST-зеркалами §3.6):
+    # блокирующие вызовы — в `asyncio.to_thread`, выдачи — белые списки,
+    # hint — только при мягком отказе. Листинга НЕТ (решение О.): поиск —
+    # единственный путь к определению; «все смыслы» и выбор смысла по
+    # контексту разговора живут в описаниях инструментов. Инъекции при init
+    # НЕТ: блока «terms» в инструкциях не появляется (arch §2).
+
+    @mcp.tool(name="terms_search", description=TOOL_DESCRIPTIONS["terms_search"])
+    async def terms_search(
+        query: Annotated[
+            str,
+            Field(
+                description="Term or abbreviation to look up; all senses are "
+                "returned",
+                min_length=1,
+                max_length=settings.max_query_chars,
+            ),
+        ],
+        top_k: Annotated[
+            int,
+            Field(description="Number of results", ge=1, le=20),
+        ] = settings.default_top_k,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            result = await asyncio.to_thread(services.terms.search, query, top_k)
+        except TermValidationError as exc:
+            # Мягкий отказ (fail + hint): запрос/top_k вне домена области.
+            log_tool_call(
+                "terms_search",
+                started,
+                failed=True,
+                reason=str(exc),
+                query=preview(query),
+            )
+            return {"senses": [], "exact": False, "hint": str(exc)}
+        # Пустой результат — валидный исход пробы (hint канона в выдаче),
+        # не fail: событие несёт число смыслов и признак FTS-only деградации.
+        log_tool_call(
+            "terms_search",
+            started,
+            results=len(result["senses"]),
+            top_k=top_k,
+            query=preview(query),
+            fts_only=bool(result.get("warning")),
+        )
+        return _compact_term_search(result)
+
+    @mcp.tool(name="terms_save", description=TOOL_DESCRIPTIONS["terms_save"])
+    async def terms_save(
+        term: Annotated[
+            str,
+            Field(description="Term: ≤100 characters"),
+        ],
+        context: Annotated[
+            str,
+            Field(
+                description="Context: ≤40 characters; always required — even "
+                "for a single sense"
+            ),
+        ],
+        definition: Annotated[
+            str,
+            Field(description="Definition: ≤350 characters"),
+        ],
+    ) -> dict[str, Any]:
+        # Лимиты формы валидирует СЕРВИС (не схема — как title у заметок):
+        # нарушение → TermValidationError с дословным hint канона §3.7, запись
+        # при этом НЕ идёт. Приватность (NFR-4): в лог идут длины, не текст.
+        started = time.perf_counter()
+        sizes = {
+            "term_chars": len(term),
+            "context_chars": len(context),
+            "definition_chars": len(definition),
+        }
+        try:
+            result = await asyncio.to_thread(
+                services.terms.save, term, context, definition
+            )
+        except TermValidationError as exc:
+            log_tool_call(
+                "terms_save", started, failed=True, reason=str(exc), **sizes
+            )
+            return {"created": False, "hint": str(exc)}
+        if result.get("created") or result.get("updated"):
+            log_tool_call(
+                "terms_save", started, results=1, id=result["id"], **sizes
+            )
+        else:
+            # Мягкий отказ близкого контекста: записи нет, hint ведёт к
+            # существующему контексту (§3.5, «подсказка ДО записи»).
+            log_tool_call(
+                "terms_save", started, failed=True, reason=result["hint"], **sizes
+            )
+        return _compact_term_save(result)
+
+    @mcp.tool(name="terms_get", description=TOOL_DESCRIPTIONS["terms_get"])
+    async def terms_get(
+        id: Annotated[int, Field(description="Term record id")],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        result = await asyncio.to_thread(services.terms.get, id)
+        if "hint" in result:
+            # Мягкий отказ: записи нет (мягко — возможно, удалена).
+            log_tool_call(
+                "terms_get", started, failed=True, reason=result["hint"], id=id
+            )
+        else:
+            log_tool_call("terms_get", started, results=1, id=id)
+        return _compact_term_get(result)
 
     return mcp

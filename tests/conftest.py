@@ -38,6 +38,8 @@ for _name, _value in TEST_ENV.items():
 # create_app(), который без обязательных переменных фатален.
 from app.config import get_settings
 from app.main import create_app
+from app.storage.db import init_db
+from fakes import clear_seeded_skills
 
 
 @pytest.fixture(autouse=True)
@@ -67,7 +69,18 @@ def client(test_env: dict[str, str]) -> Iterator[TestClient]:
     Notifier суммаризации отключён: REST-тесты проверяют контракты CRUD и
     pending-счётчики детерминированно (воркер спит на back-off, а не
     будится сразу при save).
+
+    Перед стартом приложения снимаем сид skill-создателя (lsb-0007-04):
+    свежая БД несёт pending-навык «Create skills», и петля areas воркера
+    сразу делает попытку кодирования — в тестах внешние LLM недоступны, и
+    `/health.embedding_ok` стал бы False недетерминированно (гонка с первой
+    итерацией петли). Маркер сида в `skills_meta` остаётся, поэтому lifespan
+    сид не воссоздаёт; тесты заметок/узлов работают с пустым реестром
+    навыков, а сам сид проверяет tests/test_skills_announce.py.
     """
+    settings = get_settings()
+    init_db(settings)  # схема + сид + маркер — до старта приложения
+    clear_seeded_skills(settings)  # пустой реестр, маркер на месте
     with TestClient(create_app()) as test_client:
         test_client.app.state.services.notes.set_summary_notifier(None)
         yield test_client

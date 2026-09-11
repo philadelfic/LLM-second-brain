@@ -34,7 +34,10 @@ from app.services.notes import NoteService
 from app.services.promotion import DescriptionService, PromotionService, StructureJudgeService
 from app.services.prompts import PromptRegistry
 from app.services.search import SearchService
+from app.services.skills import SkillsService
 from app.services.summary import SummaryService
+from app.services.terms import TermsService
+from app.services.user_facts import UserFactsService
 
 __all__ = [
     "BackupService",
@@ -49,7 +52,10 @@ __all__ = [
     "PromptRegistry",
     "SearchService",
     "Services",
+    "SkillsService",
     "SummaryService",
+    "TermsService",
+    "UserFactsService",
     "build_services",
 ]
 
@@ -76,9 +82,23 @@ class Services:
     namespaces: NamespaceService  # реестр узлов (Фаза 10, memory_namespaces)
     classifier: ClassificationService  # причёска default-заметок (Фаза 10, Шаг 4)
     promotion: PromotionService  # триггер домена (Фаза 10, Шаг 5, memory_namespaces + воркер)
+    # 3.0.0: область «user» (lsb-0009-01) — атомарные факты о пользователе.
+    # Обязательна, как notes/search: контейнер в проде и в DI-сборках полный.
+    # embedding — общий экземпляр слота (запись факта его не зовёт — §3.4;
+    # точка сборки для гибридного поиска области).
+    user_facts: UserFactsService
+    # 3.0.0: область «terms» (lsb-0008-01) — термины с ключом (term + context).
+    # Обязательна, как user_facts: контейнер в проде и в DI-сборках полный.
+    # embedding — общий экземпляр слота (запись его не зовёт — близость
+    # контекста триграммная, §3.5; точка сборки гибридного поиска области).
+    terms: TermsService
     llm_embedding: LLMClient | None = None  # клиент слота embedding (Фаза 11, решение №5)
     llm_summary: LLMClient | None = None  # клиент слота summary (summarize/merge/classify/describe)
     llm_judge: LLMClient | None = None  # клиент слота judge (дедуп + судья структуры)
+    # 3.0.0: область навыков (lsb-0007). Опционально — только для DI-сборок
+    # тестов, созданных до появления области (их Services(...) без skills
+    # остаются валидны); в проде build_services всегда кладёт сервис.
+    skills: SkillsService | None = None
 
 
 def build_services(
@@ -137,4 +157,16 @@ def build_services(
         llm_embedding=llm_embedding,
         llm_summary=llm_summary,
         llm_judge=llm_judge,
+        # Субстрат 3.0.0: сервис области навыков (lsb-0007-01); embedding —
+        # общий экземпляр слота (запись его не зовёт — точка сборки для
+        # поиска/антисинонимии трека).
+        skills=SkillsService(settings, embedding=embedding),
+        # Субстрат 3.0.0: сервис области «user» (lsb-0009-01); embedding —
+        # общий экземпляр слота (запись факта его не зовёт — дедуп триграммами,
+        # arch lsb-0009 §3.4; точка сборки гибридного поиска области).
+        user_facts=UserFactsService(settings, embedding=embedding),
+        # Субстрат 3.0.0: сервис области terms (lsb-0008-01); embedding —
+        # общий экземпляр слота (запись его не зовёт — близость контекста
+        # триграммная, arch lsb-0008 §3.5; точка сборки гибридного поиска).
+        terms=TermsService(settings, embedding=embedding),
     )

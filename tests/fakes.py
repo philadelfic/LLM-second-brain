@@ -55,6 +55,7 @@ from app.services.promotion import (
 )
 from app.services.summary import SummaryError
 from app.services.worker import BackgroundWorker
+from app.storage.db import CREATOR_SKILL_NAME, session, transaction
 
 
 class HashEmbedder:
@@ -416,3 +417,20 @@ class ScriptedJudge:
 
     def close(self) -> None:  # интерфейс-совместимость с JudgeService
         return None
+
+
+def clear_seeded_skills(settings) -> None:
+    """Убрать сид skill-создателя (lsb-0007-04) — «пустая область» в тестах.
+
+    Сид — штатная запись `init_db` (навык «Create skills», arch lsb-0007
+    §3.6/§3.8), поэтому реестр свежей БД НЕ пуст: пулы 01–03 (форма, архив
+    версий, поиск/листинг, MCP-инструменты) проверяют свои контракты на
+    пустом реестре (в т.ч. нумерацию: первый созданный навык — id=1) — в
+    фикстурах этих пулов сид физически снимается, FTS-индекс области
+    перестраивается (`rebuild` внешнего контента: строк-призраков не
+    остаётся). Маркер сида в `skills_meta` повторную вставку не допускает —
+    область остаётся пустой; сам сид проверяется в tests/test_skills_announce.py.
+    """
+    with session(settings) as conn, transaction(conn):
+        conn.execute("DELETE FROM skills WHERE name = ?", (CREATOR_SKILL_NAME,))
+        conn.execute("INSERT INTO skills_fts(skills_fts) VALUES('rebuild')")

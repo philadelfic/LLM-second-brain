@@ -231,6 +231,143 @@ class TestChunkingParams:
         assert settings.embedding_concurrent_requests == 1
 
 
+class TestAreaLimits:
+    """Лимиты и пороги областей (субстрат 3.0.0, постановка 00).
+
+    Значения — из контракта постановки: env-настраиваемые, валидируются при
+    старте; реляционные проверки — по образцу dedup-порогов.
+    """
+
+    DEFAULT_FIELDS = [
+        ("skill_name_max_chars", 65),
+        ("skill_description_max_chars", 250),
+        ("skill_steps_max_chars", 500),
+        ("skill_text_max_chars", 4000),
+        ("skill_example_max_chars", 1000),
+        ("skill_extra_field_max_chars", 500),
+        ("skill_extra_total_max_chars", 2000),
+        ("instruction_template_max_chars", 1000),
+        ("skill_announce_max_chars", 2000),
+        ("skill_announce_description_chars", 120),
+        ("skill_synonym_similarity", 0.90),
+        ("term_max_chars", 100),
+        ("term_context_max_chars", 40),
+        ("term_definition_max_chars", 350),
+        ("term_context_similarity", 0.75),
+        ("term_contexts_hint_limit", 30),
+        ("user_name_max_words", 5),
+        ("user_body_max_chars", 1200),
+        ("user_similar_strong", 0.85),
+        ("user_similar_weak", 0.55),
+        ("user_search_excerpt_chars", 300),
+    ]
+
+    def test_contract_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Все новые поля есть и равны значениям контракта постановки 00."""
+        settings = load_env(monkeypatch)
+        for field, default in self.DEFAULT_FIELDS:
+            assert getattr(settings, field) == default, field
+
+    @pytest.mark.parametrize(
+        ("env_name", "bad_value"),
+        [
+            ("SKILL_NAME_MAX_CHARS", "0"),
+            ("SKILL_DESCRIPTION_MAX_CHARS", "-1"),
+            ("SKILL_STEPS_MAX_CHARS", "0"),
+            ("SKILL_TEXT_MAX_CHARS", "0"),
+            ("SKILL_EXAMPLE_MAX_CHARS", "0"),
+            ("INSTRUCTION_TEMPLATE_MAX_CHARS", "0"),
+            ("SKILL_ANNOUNCE_MAX_CHARS", "0"),
+            ("TERM_MAX_CHARS", "0"),
+            ("TERM_CONTEXT_MAX_CHARS", "-5"),
+            ("TERM_DEFINITION_MAX_CHARS", "0"),
+            ("TERM_CONTEXTS_HINT_LIMIT", "0"),
+            ("USER_NAME_MAX_WORDS", "0"),
+            ("USER_BODY_MAX_CHARS", "0"),
+            ("USER_SEARCH_EXCERPT_CHARS", "0"),
+        ],
+    )
+    def test_zero_or_negative_area_limit_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, env_name: str, bad_value: str
+    ) -> None:
+        with pytest.raises(ConfigError, match=env_name.lower()):
+            load_env(monkeypatch, **{env_name: bad_value})
+
+    @pytest.mark.parametrize(
+        ("env_name", "bad_value"),
+        [
+            ("SKILL_SYNONYM_SIMILARITY", "1.5"),
+            ("SKILL_SYNONYM_SIMILARITY", "-0.1"),
+            ("TERM_CONTEXT_SIMILARITY", "1.5"),
+            ("USER_SIMILAR_STRONG", "1.1"),
+            ("USER_SIMILAR_WEAK", "-0.1"),
+        ],
+    )
+    def test_similarity_out_of_range_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, env_name: str, bad_value: str
+    ) -> None:
+        with pytest.raises(ConfigError, match=env_name.lower()):
+            load_env(monkeypatch, **{env_name: bad_value})
+
+    def test_relational_checks_are_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Реляционные границы: extra, бюджет анонса, зоны дедупа user."""
+        with pytest.raises(ConfigError, match="skill_extra_field_max_chars"):
+            load_env(
+                monkeypatch,
+                SKILL_EXTRA_FIELD_MAX_CHARS="3000",
+                SKILL_EXTRA_TOTAL_MAX_CHARS="2000",
+            )
+        with pytest.raises(ConfigError, match="skill_announce_description_chars"):
+            load_env(
+                monkeypatch,
+                SKILL_ANNOUNCE_DESCRIPTION_CHARS="2500",
+                SKILL_ANNOUNCE_MAX_CHARS="2000",
+            )
+        with pytest.raises(ConfigError, match="user_similar_weak"):
+            load_env(
+                monkeypatch,
+                USER_SIMILAR_WEAK="0.90",
+                USER_SIMILAR_STRONG="0.85",
+            )
+
+    def test_boundaries_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Границы и равенство порогов — валидная конфигурация."""
+        settings = load_env(
+            monkeypatch,
+            SKILL_NAME_MAX_CHARS="1",
+            TERM_CONTEXT_MAX_CHARS="1",
+            USER_NAME_MAX_WORDS="1",
+            SKILL_SYNONYM_SIMILARITY="1",
+            TERM_CONTEXT_SIMILARITY="0",
+            USER_SIMILAR_STRONG="0.55",
+            USER_SIMILAR_WEAK="0.55",
+            SKILL_EXTRA_FIELD_MAX_CHARS="2000",
+            SKILL_EXTRA_TOTAL_MAX_CHARS="2000",
+        )
+        assert settings.skill_name_max_chars == 1
+        assert settings.skill_synonym_similarity == 1.0
+        assert settings.term_context_similarity == 0.0
+        assert settings.user_similar_weak == settings.user_similar_strong == 0.55
+
+    def test_all_offenders_reported_at_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Кривые поля областей собираются в общий отчёт NFR-6."""
+        with pytest.raises(ConfigError) as exc_info:
+            load_env(
+                monkeypatch,
+                TERM_MAX_CHARS="0",
+                USER_BODY_MAX_CHARS="0",
+                SKILL_SYNONYM_SIMILARITY="2",
+            )
+        message = str(exc_info.value)
+        assert "term_max_chars" in message
+        assert "user_body_max_chars" in message
+        assert "skill_synonym_similarity" in message
+
+
 class TestBoundaryAcceptance:
     """Штатные переопределения проходят (0 для PENDING_RETRY_SEC — тестовый режим)."""
 

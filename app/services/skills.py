@@ -1,0 +1,749 @@
+"""SkillsService — сервисный слой области навыков (lsb-0007, релиз 3.0.0).
+
+Форма навыка и лимиты — arch lsb-0007 §3.1; запись/правка/версии/удаление —
+§3.4; канонические тексты (hint'ы мягких отказов, сид шаблона) — §3.8. Один
+код сервиса для MCP и REST (субстрат §3.4): транспорт — тонкая обёртка над
+сервисом.
+
+Ключевые свойства
+-----------------
+* **Валидация формы обязательна** — лимиты из настроек (`SKILL_*_MAX_CHARS`);
+  нарушение → `SkillValidationError`, текст исключения = дословный hint
+  канона §3.8 (транспорт отдаёт его клиенту как fail + hint, навык НЕ
+  сохраняется).
+* **Векторизации в момент записи нет** (субстрат §3.3): запись идёт с
+  `vector_status='pending'`, вектора записи догоняет петля `areas` воркера
+  (после создания/правки сервис её будит — `set_areas_notifier`).
+* **Версии:** на каждой правке текущее содержимое копируется в
+  `skill_versions` (номер — прежняя версия навыка); запись копии и правка —
+  ОДНА транзакция (`transaction()`), полусостояние исключено. Архив не
+  участвует ни в одной выдаче: `get`/`list` читают только `skills` и только
+  активные строки.
+* **Антисинонимия создания (FR-5.2, lsb-0007-03):** при создании (без `id`)
+  текст кандидата (`name + description`) сверяется косинусом с активными
+  навыками — один батч `embed_texts`, L2-нормализация, порог
+  `SKILL_SYNONYM_SIMILARITY=0.90` → мягкий отказ `{created: False, hint}` с
+  дословным hint канона §3.8 (создание НЕ происходит); правка по `id`
+  префильтр не гоняет (иначе нельзя переименовать навык); отказ эмбеддера —
+  префильтр пропущен (создание проходит) + событие
+  `skills_antiseonymy_skipped` в логе. Механика — по образцу lsb-0005.
+* **Удаление мягкое** (`deleted_at`): повторный/несуществующий id → мягкий
+  ответ с hint «skill not found…» (восстановление — оператором, ручки нет).
+* **Композит чтения** (`get`) собирается поверх глобального
+  `instruction_template` из `skills_meta` (сид — `init_db`): шаблон подан
+  отдельной секцией «как исполнять шаги», а не частью конкретного навыка.
+* **Поиск — проба** (`search`, lsb-0007-02): гибрид области (субстрат §3.5)
+  vec0-KNN (`skills_vec`, вектор = `name + description`) + FTS5/BM25
+  (`skills_fts`) → RRF; выдача без тел, пусто — мягкий ответ с hint
+  канона §3.8. Заметки и другие области не читаются (изоляция).
+
+Контракты ответов (полные; MCP-слой срезает служебные поля белым списком —
+lsb-0007-03):
+- save (создание) → {id, created: True, version}
+- save (создание слишком похожего) → {created: False, hint}
+- save (правка)   → {id, updated: True, version}
+- save (правка несуществующего id) → {id, updated: False, hint}
+- get    → {id, name, description, example?, steps, text, instruction_template,
+            extra?} (example/extra — только когда заданы); не найден → {id, hint}
+- list   → {items: [{id, name, description}], total} (только активные; тел нет)
+- search → {results: [{id, name, description, score}], warning?} (тел нет);
+            пусто → {results: [], hint, warning?} с дословным hint канона §3.8
+- delete → {id, deleted: True} | {id, deleted: False, hint}
+- instruction_template() → {instruction_template}
+- set_instruction_template(text) → {instruction_template, updated: True}
+- versions(id) → {id, versions: [{version, name, description, example, steps,
+                 text, extra, created_at}]}; не найден/удалён →
+                 {id, versions: [], hint} (архив виден только REST-оператору)
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import sqlite3
+from collections.abc import Callable
+from typing import Any
+
+from app.config import Settings
+from app.services.areas import AreaSearch, AreaSearchValidationError, SKILLS_AREA
+from app.services.embedding import Embedder, EmbeddingService
+from app.services.search import MAX_TOP_K
+from app.storage.db import (
+    INSTRUCTION_TEMPLATE_KEY,
+    INSTRUCTION_TEMPLATE_SEED,
+    session,
+    transaction,
+)
+
+# Поля класса навыка (lsb-0007 §3.1): только эти ключи допустимы в JSON `extra`.
+EXTRA_FIELDS: tuple[str, ...] = (
+    "trigger",
+    "mode",
+    "preconditions",
+    "fallbacks",
+    "invariant",
+    "exceptions",
+    "guardrails",
+    "references",
+    "output_contract",
+    "behavior_contract",
+)
+
+# Допустимые значения поля `mode` (§3.1): совместное / автономное исполнение.
+SKILL_MODES: tuple[str, ...] = ("collaborative", "autonomous")
+
+# Потолок листинга — фиксированный контракт инструмента (как у заметок):
+# env задаёт только умолчание, потолок не настраивается.
+MAX_LIST_LIMIT = 50
+
+# --- Hint'ы мягких отказов (канон §3.8: «дословные константы в коде») --------
+# Таблица лимитов канона; тексты — английские, модель читает их как подсказку.
+HINT_NAME_LIMIT = (
+    "skill not saved: name limit is 65 characters (≤5 words recommended)"
+)
+HINT_DESCRIPTION_LIMIT = (
+    "skill not saved: description limit is 250 characters — shorten it"
+)
+HINT_STEPS_LIMIT = "skill not saved: steps limit is 500 characters — shorten it"
+HINT_TEXT_LIMIT = "skill not saved: text limit is 4000 characters — shorten it"
+HINT_EXAMPLE_LIMIT = (
+    "skill not saved: example limit is 1000 characters — shorten it"
+)
+HINT_EXTRA_LIMIT = (
+    "skill not saved: an optional field limit is 500 characters, all optional "
+    "fields together — 2000"
+)
+HINT_NOT_FOUND = "skill not found (possibly deleted); the actual list — skills_list"
+
+# Пустой `skills_search` (§3.8): поиск работает как проба — «навыка нет»
+# валидный исход, модель не лезет в навыки без причины.
+HINT_SEARCH_EMPTY = (
+    "no skill found for this task — do the task as usual; if you worked out a "
+    "repeatable procedure, save it via skills_save"
+)
+
+# Антисинонимия создания (§3.8): подсказка ведёт к существующему навыку,
+# создание не происходит. Шаблон подставляет id и name ближайшего навыка.
+HINT_SIMILAR_SKILL = (
+    "there is a similar skill: {id} — {name}; reuse or update it "
+    "(skills_save with id=…) or make this skill clearly different"
+)
+
+# Hint'ы, которых таблица канона §3.8 не задаёт (канон описывает только
+# лимиты): обязательность полей формы, незнакомый ключ `extra`, значение
+# `mode` и лимит глобального шаблона. Стиль и язык — как у канонических.
+HINT_EXTRA_OBJECT = (
+    "skill not saved: extra must be a single JSON object with known fields"
+)
+HINT_MODE = "skill not saved: mode must be collaborative or autonomous"
+HINT_TEMPLATE_LIMIT = (
+    "template not saved: instruction template limit is 1000 characters — shorten it"
+)
+
+
+def _l2_norm(vec: list[float]) -> float:
+    """Евклидова норма вектора (L2) — как `_l2_norm` промоушна/mcp.py."""
+    return math.sqrt(sum(value * value for value in vec))
+
+
+class SkillValidationError(ValueError):
+    """Нарушение формы навыка (лимиты, `extra`) — мягкий отказ с hint.
+
+    Текст исключения — hint для модели (транспорт MCP/REST отдаёт его
+    клиенту как fail + hint), навык при этом НЕ сохраняется: прецедент
+    `TitleValidationError`/`TITLE_HINT` (Фаза 11) и `NamespaceError`.
+    """
+
+
+class SkillsService:
+    """CRUD области навыков: форма, архив версий, глобальный шаблон.
+
+    DI: `settings` (лимиты формы), `embedding` (кодирование запроса
+    гибридного поиска — lsb-0007-02; антисинонимия создания — lsb-0007-03).
+    Тело навыка синхронный путь записи кодировщику НЕ отдаёт (субстрат
+    §3.3): вектора записи догоняет петля `areas` воркера по
+    `vector_status='pending'`; кодировщик в пути записи зовёт только
+    антисинонимия создания (текст `name + description` кандидата).
+    """
+
+    def __init__(self, settings: Settings, embedding: Embedder | None = None) -> None:
+        self._settings = settings
+        # DI для тестов: HashEmbedder/фейк с журналом вызовов вместо сети.
+        # Тело навыка запись кодировщику не отдаёт (вектора догоняет петля
+        # areas); кодировщик в пути записи зовёт только антисинонимия
+        # создания (текст кандидата `name + description`).
+        self._embedding: Embedder = (
+            embedding if embedding is not None else EmbeddingService(settings)
+        )
+        # Гибридный поиск области (субстрат §3.5): та же механика, что у
+        # заметок, — vec0-KNN по `skills_vec` + FTS5/BM25 по `skills_fts` →
+        # RRF. SQL помощника адресует только таблицы навыков (изоляция).
+        self._area_search = AreaSearch(settings, SKILLS_AREA, self._embedding)
+        # Сигнал воркеру (main.py): будить петлю areas сразу при появлении
+        # pending-записи области, а не ждать выросший back-off.
+        self._areas_notifier: Callable[[], None] | None = None
+
+    def set_areas_notifier(self, notifier: Callable[[], None] | None) -> None:
+        """Подключить сигнал пробуждения петли `areas` воркера (main.py).
+
+        По образцу `NoteService.set_summary_notifier`: сервис собирается
+        раньше воркера, нотификатор приходит после его создания.
+        """
+        self._areas_notifier = notifier
+
+    # --- запись: создание и правка (arch §3.4) ------------------------------
+
+    def save(
+        self,
+        *,
+        id: int | None = None,
+        name: str,
+        description: str,
+        steps: str,
+        text: str,
+        example: str | None = None,
+        extra: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Создать навык (без `id`) или отредактировать существующий (с `id`).
+
+        Валидация формы — обязательна и идёт ДО любой записи: нарушение
+        лимита/`extra` → `SkillValidationError` с дословным hint (§3.8).
+        Создание (без `id`) гоняет антисинонимию (FR-5.2, lsb-0007-03):
+        слишком похожий на активный навык кандидат → мягкий отказ
+        `{created: False, hint}` без записи; правка по `id` префильтр не
+        гоняет. Правка копирует прежнее содержимое в `skill_versions` и
+        обновляет строку одной транзакцией; `version` растёт на 1. Запись
+        всегда оставляет `vector_status='pending'` — вектора догоняет петля
+        `areas` (тело навыка в синхронном пути не кодируется).
+        """
+        checked_name = self._checked_field(
+            "name", name, self._settings.skill_name_max_chars, HINT_NAME_LIMIT
+        )
+        checked_description = self._checked_field(
+            "description",
+            description,
+            self._settings.skill_description_max_chars,
+            HINT_DESCRIPTION_LIMIT,
+        )
+        checked_steps = self._checked_field(
+            "steps", steps, self._settings.skill_steps_max_chars, HINT_STEPS_LIMIT
+        )
+        checked_text = self._checked_field(
+            "text", text, self._settings.skill_text_max_chars, HINT_TEXT_LIMIT
+        )
+        checked_example = self._checked_example(example)
+        checked_extra = self._checked_extra(extra)
+        if id is None:
+            # Антисинонимия создания (FR-5.2, arch §3.4): косинус текста
+            # кандидата (`name + description`) против активных навыков.
+            # Ближайший выше порога — мягкий отказ (записи нет), hint ведёт
+            # к правке существующего навыка; правка по `id` сюда не идёт.
+            similar = self._antiseonymy_nearest(checked_name, checked_description)
+            if similar is not None:
+                nearest_id, nearest_name, cosine = similar
+                if cosine > self._settings.skill_synonym_similarity:
+                    return {
+                        "created": False,
+                        "hint": HINT_SIMILAR_SKILL.format(
+                            id=nearest_id, name=nearest_name
+                        ),
+                    }
+            result = self._create(
+                checked_name,
+                checked_description,
+                checked_example,
+                checked_steps,
+                checked_text,
+                checked_extra,
+            )
+        else:
+            result = self._update(
+                id,
+                checked_name,
+                checked_description,
+                checked_example,
+                checked_steps,
+                checked_text,
+                checked_extra,
+            )
+        if result.get("created") or result.get("updated"):
+            self._notify_areas_pending()
+        return result
+
+    def _create(
+        self,
+        name: str,
+        description: str,
+        example: str | None,
+        steps: str,
+        text: str,
+        extra: str | None,
+    ) -> dict[str, Any]:
+        """INSERT нового навыка (version=1, vector_status='pending')."""
+        with session(self._settings) as conn, transaction(conn):
+            cursor = conn.execute(
+                "INSERT INTO skills (name, description, example, steps, text, "
+                "extra, version, vector_status) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1, 'pending')",
+                (name, description, example, steps, text, extra),
+            )
+            new_id = int(cursor.lastrowid or 0)
+        return {"id": new_id, "created": True, "version": 1}
+
+    def _update(
+        self,
+        skill_id: int,
+        name: str,
+        description: str,
+        example: str | None,
+        steps: str,
+        text: str,
+        extra: str | None,
+    ) -> dict[str, Any]:
+        """Копия прежней версии в архив + правка строки — ОДНОЙ транзакцией.
+
+        Архивная копия сохраняет содержимое и НОМЕР прежней версии; навык
+        получает номер на 1 больше (требование «старая версия сохраняется
+        как копия»). Неактивный/несуществующий id → мягкий ответ с hint.
+        """
+        with session(self._settings) as conn, transaction(conn):
+            row = conn.execute(
+                "SELECT * FROM skills WHERE id = ? AND deleted_at IS NULL",
+                (skill_id,),
+            ).fetchone()
+            if row is None:
+                return {"id": skill_id, "updated": False, "hint": HINT_NOT_FOUND}
+            conn.execute(
+                "INSERT INTO skill_versions (skill_id, version, name, description, "
+                "example, steps, text, extra) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    int(row["id"]),
+                    int(row["version"]),
+                    row["name"],
+                    row["description"],
+                    row["example"],
+                    row["steps"],
+                    row["text"],
+                    row["extra"],
+                ),
+            )
+            new_version = int(row["version"]) + 1
+            conn.execute(
+                "UPDATE skills SET name = ?, description = ?, example = ?, "
+                "steps = ?, text = ?, extra = ?, version = ?, "
+                "vector_status = 'pending', "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (
+                    name,
+                    description,
+                    example,
+                    steps,
+                    text,
+                    extra,
+                    new_version,
+                    skill_id,
+                ),
+            )
+        return {"id": skill_id, "updated": True, "version": new_version}
+
+    # --- чтение (arch §3.1, §3.3) -------------------------------------------
+
+    def get(self, id: int) -> dict[str, Any]:
+        """Композит навыка: секции формы + глобальный `instruction_template`.
+
+        Секции: `name` + `description` + `example` (только если задан) +
+        `steps` + `text` + `instruction_template` («как исполнять шаги» —
+        отдельная секция, не часть конкретного навыка, §3.1). `extra` (поля
+        класса) добавляется только когда задан — полная запись для REST.
+        Архив версий и удалённые строки в выдаче не участвуют; не найден →
+        мягкий ответ с hint канона §3.8.
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT * FROM skills WHERE id = ? AND deleted_at IS NULL",
+                (id,),
+            ).fetchone()
+            if row is None:
+                return {"id": id, "hint": HINT_NOT_FOUND}
+            template = self._read_template(conn)
+        composite: dict[str, Any] = {
+            "id": int(row["id"]),
+            "name": row["name"],
+            "description": row["description"],
+        }
+        if row["example"]:
+            composite["example"] = row["example"]
+        composite["steps"] = row["steps"]
+        composite["text"] = row["text"]
+        composite["instruction_template"] = template
+        extra = _extra_dict(row["extra"])
+        if extra:
+            composite["extra"] = extra
+        return composite
+
+    def list(self, limit: int | None = None, offset: int = 0) -> dict[str, Any]:
+        """Компактный листинг активных навыков: `{items, total}`, без тел.
+
+        `items` — только `id`, `name`, `description` (§3.3); архив версий и
+        удалённые записи не видны. Пагинация — контракт REST-зеркала
+        (lsb-0007-05): потолок `MAX_LIST_LIMIT`, `offset ≥ 0`.
+        """
+        limit = self._settings.default_list_limit if limit is None else limit
+        if not 1 <= limit <= MAX_LIST_LIMIT:
+            raise SkillValidationError(
+                f"limit: expected 1..{MAX_LIST_LIMIT}, got {limit}"
+            )
+        if offset < 0:
+            raise SkillValidationError(f"offset: expected ≥ 0, got {offset}")
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT id, name, description FROM skills "
+                "WHERE deleted_at IS NULL "
+                "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+            total = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM skills WHERE deleted_at IS NULL"
+                ).fetchone()[0]
+            )
+        return {
+            "items": [
+                {
+                    "id": int(row["id"]),
+                    "name": row["name"],
+                    "description": row["description"],
+                }
+                for row in rows
+            ],
+            "total": total,
+        }
+
+    @property
+    def settings(self) -> Settings:
+        """Настройки сервиса — лимиты анонса читает транспорт (§3.5).
+
+        Транспорт собирает блок анонса сам (`_skills_announce`), но лимиты
+        (`skill_announce_max_chars` / `skill_announce_description_chars`)
+        живут в Settings: `build_instructions(services)` настроек не получает.
+        """
+        return self._settings
+
+    def announce_items(self) -> list[dict[str, Any]]:
+        """Реестр активных навыков ЦЕЛИКОМ — для блока анонса (§3.5).
+
+        Отдельный метод, а не `list()`: анонсу нужен весь реестр (строки
+        `id — name: description`), а листинг-контракт ограничен потолком
+        `MAX_LIST_LIMIT=50` (пагинация REST/MCP — lsb-0007-05). Порядок тот
+        же, что у листинга: `updated_at DESC, id DESC`; архив версий и
+        удалённые записи не видны. Тела навыков не читаются — только
+        компактные поля.
+        """
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT id, name, description FROM skills "
+                "WHERE deleted_at IS NULL "
+                "ORDER BY updated_at DESC, id DESC"
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "name": row["name"],
+                "description": row["description"],
+            }
+            for row in rows
+        ]
+
+    def search(self, query: str, top_k: int | None = None) -> dict[str, Any]:
+        """Гибридный поиск навыка — «проба» (arch §3.3, субстрат §3.5).
+
+        Сборка `AreaSearch` под область skills: vec0-KNN по `skills_vec`
+        (вектор = `name + description`, субстрат §3.3) + FTS5/BM25 по
+        `skills_fts` (`name`/`description`/`steps`/`text`) → RRF, фильтр
+        `deleted_at IS NULL`. Выдача компактна — тел нет: `{results: [{id,
+        name, description, score}], warning?}`; пустой результат — мягкий
+        ответ с дословным hint канона §3.8 (проба: навыка нет — валидный
+        исход, без fail). Отказ эмбеддера поиск не ломает: FTS-only +
+        `warning` (прецедент заметок, NFR-3) — warning в ответе сервиса
+        сохраняется, MCP-слой его срежет (lsb-0007-03).
+
+        `top_k` — границы как у поиска заметок (`1..MAX_TOP_K`), нарушение —
+        `SkillValidationError` (мягкий отказ транспорта, как у `list`).
+        Доменные ограничения запроса помощника (длина) приводятся к тому же
+        типу отказа сервиса области. Изоляция: SQL помощника адресует только
+        `skills`/`skills_fts`/`skills_vec` — заметки и другие области не
+        читаются.
+        """
+        if top_k is not None and not 1 <= top_k <= MAX_TOP_K:
+            raise SkillValidationError(
+                f"top_k: expected 1..{MAX_TOP_K}, got {top_k}"
+            )
+        try:
+            found = self._area_search.search(query, top_k)
+        except AreaSearchValidationError as exc:  # запрос вне домена области
+            raise SkillValidationError(str(exc)) from exc
+        answer: dict[str, Any] = {
+            "results": found["results"],
+            "warning": found.get("warning"),
+        }
+        if not found["results"]:
+            # Канон §3.8: у пустого поиска навыка ровно один hint (подсказки
+            # субстрата про короткий запрос в выдачу навыков не выносим).
+            answer["hint"] = HINT_SEARCH_EMPTY
+        return answer
+
+    # --- удаление (soft delete, arch §3.4) ---------------------------------
+
+    def delete(self, id: int) -> dict[str, Any]:
+        """Мягкое удаление навыка: `deleted_at` = now, строка/индексы живы.
+
+        Идемпотентно по смыслу: повторный/несуществующий id → мягкий ответ
+        `deleted: False` + hint «skill not found…» (восстановление — оператор,
+        прецедент заметок). Удалённый навык исчезает из всех выдач области.
+        """
+        with session(self._settings) as conn, transaction(conn):
+            cursor = conn.execute(
+                "UPDATE skills SET deleted_at = "
+                "strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (id,),
+            )
+            deleted = bool(cursor.rowcount)
+        if not deleted:
+            return {"id": id, "deleted": False, "hint": HINT_NOT_FOUND}
+        return {"id": id, "deleted": True}
+
+    # --- глобальный шаблон (skills_meta, arch §3.1) ------------------------
+
+    def instruction_template(self) -> dict[str, Any]:
+        """Прочитать глобальный `instruction_template` («как исполнять шаги»)."""
+        with session(self._settings) as conn:
+            return {"instruction_template": self._read_template(conn)}
+
+    def set_instruction_template(self, text: str) -> dict[str, Any]:
+        """Отредактировать глобальный шаблон (оператор через REST).
+
+        Валидация ≤ `INSTRUCTION_TEMPLATE_MAX_CHARS` (канон §3.1/§3.8):
+        нарушение → `SkillValidationError` + мягкий отказ. Существующее
+        значение перезаписывается осознанно (это и есть правка оператора);
+        сид `init_db` правку не затирает.
+        """
+        normalized = text.strip() if isinstance(text, str) else ""
+        if not normalized:
+            raise SkillValidationError(self._required_hint("instruction_template"))
+        if len(normalized) > self._settings.instruction_template_max_chars:
+            raise SkillValidationError(HINT_TEMPLATE_LIMIT)
+        with session(self._settings) as conn, transaction(conn):
+            conn.execute(
+                "INSERT INTO skills_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (INSTRUCTION_TEMPLATE_KEY, normalized),
+            )
+        return {"instruction_template": normalized, "updated": True}
+
+    # --- архив версий (только REST-оператор, arch §3.4) ---------------------
+
+    def versions(self, id: int) -> dict[str, Any]:
+        """Архив копий версий навыка (`skill_versions`) — только REST.
+
+        Каждая правка копирует туда ПРЕЖНЕЕ содержимое с прежним номером
+        версии (§3.4), поэтому архив — это «старые версии как копии».
+        Порядок — от новых к старым. Архив в выдачах области не участвует:
+        этот метод читает его отдельно, ни `get`, ни `list`, ни `search`
+        `skill_versions` не видят (MCP-инструмента для архива нет вовсе).
+        Навык не найден/удалён → мягкий ответ с пустым архивом и hint
+        канона §3.8: транспорт превращает его в 404.
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT id FROM skills WHERE id = ? AND deleted_at IS NULL",
+                (id,),
+            ).fetchone()
+            if row is None:
+                return {"id": id, "versions": [], "hint": HINT_NOT_FOUND}
+            rows = conn.execute(
+                "SELECT version, name, description, example, steps, text, "
+                "extra, created_at FROM skill_versions WHERE skill_id = ? "
+                "ORDER BY version DESC",
+                (id,),
+            ).fetchall()
+        return {
+            "id": id,
+            "versions": [
+                {
+                    "version": int(item["version"]),
+                    "name": item["name"],
+                    "description": item["description"],
+                    "example": item["example"],
+                    "steps": item["steps"],
+                    "text": item["text"],
+                    "extra": _extra_dict(item["extra"]),
+                    "created_at": item["created_at"],
+                }
+                for item in rows
+            ],
+        }
+
+    # --- внутреннее ---------------------------------------------------------
+
+    def _antiseonymy_nearest(
+        self, name: str, description: str
+    ) -> tuple[int, str, float] | None:
+        """Ближайший активный навык по косинусу текста `name + description`.
+
+        Механика — по образцу `_antiseonymy_nearest` (lsb-0005, mcp.py) и
+        `_nearest_node` промоушна: текст кандидата и тексты активных навыков
+        ОДНИМ батчем `embed_texts` (формат — `AreaSpec.embed_text`, тот же,
+        что у вектора области: `name + description`), L2-нормализация,
+        dot product = косинус (нечувствителен к масштабу провайдера).
+
+        Возврат `(id, name, cosine)` ближайшего или None: реестр активных
+        пуст / норма кандидата 0 / отказ эмбеддера — деградация NFR-3:
+        префильтр пропускается (создание проходит), в лог идёт событие
+        `skills_antiseonymy_skipped`. Порог сравнивает вызывающий (save).
+        """
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT id, name, description FROM skills "
+                "WHERE deleted_at IS NULL"
+            ).fetchall()
+        if not rows:
+            return None  # активных навыков нет — сравнивать не с чем
+        candidate = {"name": name, "description": description}
+        try:
+            vectors = self._embedding.embed_texts(
+                [SKILLS_AREA.embed_text(candidate)]
+                + [SKILLS_AREA.embed_text(row) for row in rows]
+            )
+        except Exception:
+            # Отказ эмбеддера не блокирует создание (прецедент lsb-0005):
+            # предфильтр пропущен, событие наблюдаемо в логе (NFR-4).
+            logging.getLogger("app").warning(
+                "skills_create: embedding failed — antiseonymy prefilter skipped",
+                extra={"event": "skills_antiseonymy_skipped"},
+            )
+            return None
+        candidate_vec, skill_vecs = vectors[0], vectors[1:]
+        candidate_norm = _l2_norm(candidate_vec)
+        if candidate_norm == 0.0:
+            return None
+        candidate_normed = [value / candidate_norm for value in candidate_vec]
+        best_index = -1
+        best_cosine = -1.0
+        for index, skill_vec in enumerate(skill_vecs):
+            skill_norm = _l2_norm(skill_vec)
+            if skill_norm == 0.0:
+                continue
+            cosine = sum(
+                left * right
+                for left, right in zip(
+                    candidate_normed, [value / skill_norm for value in skill_vec]
+                )
+            )
+            if cosine > best_cosine:
+                best_cosine, best_index = cosine, index
+        if best_index == -1:
+            return None  # все нормы нулевые — сравнивать нечего
+        nearest = rows[best_index]
+        return int(nearest["id"]), str(nearest["name"]), best_cosine
+
+    @staticmethod
+    def _required_hint(field: str) -> str:
+        """Hint пустого обязательного поля: в таблице канона §3.8 только лимиты."""
+        return f"skill not saved: {field} is required"
+
+    @classmethod
+    def _checked_field(cls, field: str, value: str | None, limit: int, hint: str) -> str:
+        """Обязательное поле формы: непустое и ≤ лимита, иначе hint канона."""
+        normalized = value.strip() if isinstance(value, str) else ""
+        if not normalized:
+            raise SkillValidationError(cls._required_hint(field))
+        if len(normalized) > limit:
+            raise SkillValidationError(hint)
+        return normalized
+
+    def _checked_example(self, example: str | None) -> str | None:
+        """Опциональный `example`: пустой/отсутствующий → None, иначе ≤ лимита."""
+        if example is None:
+            return None
+        normalized = str(example).strip()
+        if not normalized:
+            return None
+        if len(normalized) > self._settings.skill_example_max_chars:
+            raise SkillValidationError(HINT_EXAMPLE_LIMIT)
+        return normalized
+
+    def _checked_extra(self, extra: dict[str, str] | None) -> str | None:
+        """Валидация `extra` и сериализация в один JSON-объект (§3.1).
+
+        Только известные ключи класса; каждое поле строкой ≤
+        `SKILL_EXTRA_FIELD_MAX_CHARS`; сумма всех полей ≤
+        `SKILL_EXTRA_TOTAL_MAX_CHARS`; `mode` (если задан) — только
+        `collaborative`|`autonomous`. Незнакомый ключ — мягкий отказ. Пустой
+        объект хранится как NULL (нет полей класса — нет `extra`).
+        """
+        if extra is None:
+            return None
+        if not isinstance(extra, dict):
+            raise SkillValidationError(HINT_EXTRA_OBJECT)
+        if not extra:
+            return None
+        total = 0
+        for key, value in extra.items():
+            if key not in EXTRA_FIELDS:
+                raise SkillValidationError(self._unknown_extra_hint(key))
+            if not isinstance(value, str):
+                raise SkillValidationError(HINT_EXTRA_OBJECT)
+            if len(value) > self._settings.skill_extra_field_max_chars:
+                raise SkillValidationError(HINT_EXTRA_LIMIT)
+            total += len(value)
+        if total > self._settings.skill_extra_total_max_chars:
+            raise SkillValidationError(HINT_EXTRA_LIMIT)
+        mode = extra.get("mode")
+        if mode is not None and mode not in SKILL_MODES:
+            raise SkillValidationError(HINT_MODE)
+        return json.dumps(extra, ensure_ascii=False)
+
+    @staticmethod
+    def _unknown_extra_hint(key: str) -> str:
+        """Hint незнакомого ключа `extra` (список известных полей — §3.1)."""
+        return (
+            f"skill not saved: unknown optional field «{key}»; available: "
+            + ", ".join(EXTRA_FIELDS)
+        )
+
+    def _read_template(self, conn: sqlite3.Connection) -> str:
+        """Значение `instruction_template` из `skills_meta`.
+
+        Строки нет (БД до `init_db`/сида) — отдаём канон §3.8: композит
+        всегда несёт секцию «как исполнять шаги» (деградация без отказа).
+        """
+        row = conn.execute(
+            "SELECT value FROM skills_meta WHERE key = ?",
+            (INSTRUCTION_TEMPLATE_KEY,),
+        ).fetchone()
+        if row is None:
+            return INSTRUCTION_TEMPLATE_SEED
+        return str(row["value"])
+
+    def _notify_areas_pending(self) -> None:
+        """Сигнал воркеру: появилась pending-запись области (будить сразу)."""
+        if self._areas_notifier is not None:
+            self._areas_notifier()
+
+
+def _extra_dict(raw: Any) -> dict[str, Any] | None:
+    """`extra` строки → dict; NULL/пусто/повреждённый JSON → None.
+
+    Чтение защитное: битый JSON (ручная правка БД оператором) не роняет
+    композит — `extra` просто не показывается (запись при этом жива).
+    """
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(str(raw))
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) and parsed else None

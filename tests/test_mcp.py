@@ -1,8 +1,9 @@
 """Тесты MCP-поверхности (Фаза 1, Шаг 3) — против живого uvicorn-сервера.
 
 ARCHITECTURE §7 «MCP-поверхность»: handshake (включая поле instructions),
-tools/list → все 6, вызовы реальным MCP-клиентом, негативы токена, кастомный
-MCP_PATH. Сервер поднимается в subprocess на отдельных портах.
+tools/list → все 13 (8 ручек заметок/узлов + 5 области навыков, lsb-0007-03),
+вызовы реальным MCP-клиентом, негативы токена, кастомный MCP_PATH. Сервер
+поднимается в subprocess на отдельных портах.
 """
 
 from __future__ import annotations
@@ -155,10 +156,12 @@ class TestHandshake:
 
 class TestToolsList:
     @pytest.mark.asyncio
-    async def test_exactly_eight_memory_tools(self, server_url: str) -> None:
+    async def test_twenty_one_tools(self, server_url: str) -> None:
+        """lsb-0008-02: поверхность = 8 ручек заметок/узлов + 5 навыков +
+        5 user + 3 terms."""
         async with connect(server_url) as session:
             tools = await session.list_tools()
-        assert len(tools.tools) == 8
+        assert len(tools.tools) == 21
         assert {tool.name for tool in tools.tools} == TOOL_NAMES
 
     @pytest.mark.asyncio
@@ -1064,6 +1067,8 @@ class TestNamespaceCreateAntiseonymy:
         from app.config import get_settings
         from app.services import Services
         from app.services.namespaces import NamespaceService
+        from app.services.terms import TermsService
+        from app.services.user_facts import UserFactsService
         from app.storage.db import init_db
         from app.transport.mcp import build_mcp
         from fakes import HashEmbedder
@@ -1081,6 +1086,8 @@ class TestNamespaceCreateAntiseonymy:
             namespaces=NamespaceService(settings),
             classifier=None,
             promotion=None,
+            user_facts=UserFactsService(settings, embedding=HashEmbedder(64)),
+            terms=TermsService(settings, embedding=HashEmbedder(64)),
         )
         return build_mcp(settings, services)
 
@@ -1090,6 +1097,8 @@ class TestNamespaceCreateAntiseonymy:
         from app.config import get_settings
         from app.services import Services
         from app.services.namespaces import NamespaceService
+        from app.services.terms import TermsService
+        from app.services.user_facts import UserFactsService
         from app.storage.db import init_db
         from app.transport.mcp import build_mcp
         from fakes import FailingEmbedder
@@ -1107,6 +1116,8 @@ class TestNamespaceCreateAntiseonymy:
             namespaces=NamespaceService(settings),
             classifier=None,
             promotion=None,
+            user_facts=UserFactsService(settings, embedding=FailingEmbedder()),
+            terms=TermsService(settings, embedding=FailingEmbedder()),
         )
         return build_mcp(settings, services)
 
