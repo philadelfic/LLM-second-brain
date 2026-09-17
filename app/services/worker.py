@@ -98,6 +98,12 @@ from app.services.areas import AreaSpec, ALL_AREAS
 from app.services.classifier import ClassificationError, Classifier
 from app.services.dedup import DeduplicationService
 from app.services.embedding import Embedder, EmbeddingError
+# Back-off и его потолок перенесены в каркас джоб (lsb-0014, arch §3.3):
+# каркас владеет контрактом надёжности, петли воркера переиспользуют имена.
+# `MAX_INTERVAL_SEC as MAX_INTERVAL_SEC` — явный ре-экспорт: на него по-прежнему
+# ссылаются существующие тесты (tests/test_worker.py).
+from app.services.jobs import MAX_INTERVAL_SEC as MAX_INTERVAL_SEC
+from app.services.jobs import next_interval
 from app.services.judge import Judge, JudgeError
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
@@ -111,9 +117,6 @@ from app.storage.db import delete_note_physical, session, transaction
 # embedding-петли (_purge_done_jobs), очередь не растёт безгранично.
 WORKER_JOBS_RETENTION_DAYS = 7
 
-# Потолок back-off (REQUIREMENTS §5.3 «max 15 мин»), env не настраивается.
-MAX_INTERVAL_SEC = 15 * 60
-
 # Интервал джобы зачистки просроченных заметок (lsb-0004-02, этап 4):
 # фиксированные 5 минут (решение О. 2026-09-09), без настройки в компоузе.
 EXPIRATION_CLEANUP_INTERVAL_SEC = 5 * 60
@@ -122,11 +125,6 @@ EXPIRATION_CLEANUP_INTERVAL_SEC = 5 * 60
 # (follow-up 6b — протокол Summarizer получил метод title; здесь раньше был
 # мёртвый дубль константы, генерация шла с промптом суммаризации).
 # Думающий вызов слота summary, обрезка до TITLE_MAX_WORDS — механика воркера.
-
-
-def next_interval(current: float, start: int) -> float:
-    """Шаг back-off: интервал удваивается, потолок — 15 минут (§3.4)."""
-    return min(max(current * 2.0, float(start)), float(MAX_INTERVAL_SEC))
 
 
 def _embed_input(title: str | None, text: str) -> str:

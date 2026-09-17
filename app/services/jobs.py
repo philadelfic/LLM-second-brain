@@ -1,0 +1,227 @@
+"""Каркас фоновых джоб (lsb-0014, релиз 3.1.0): реестр, единый цикл, журнал.
+
+Задача №48: джоба описывается структурой `JobSpec` и обслуживается одним
+циклом `run_loop` — новая джоба добавляется **регистрацией, а не копией
+петли**. Существующие петли `BackgroundWorker` в этой постановке работают
+по-старому (их перевод — отдельная постановка 4); реестр собирает
+`build_job_specs(worker, settings)` — точка расширения каркаса.
+
+Контракт надёжности (REQUIREMENTS §5.2, job-framework arch §3.3) здесь не
+переизобретается, а переносится как есть: back-off `PENDING_RETRY_SEC` (30 с)
+→ ×2 → `MAX_INTERVAL_SEC` (15 мин) со сбросом при прогрессе
+(`next_interval`/`MAX_INTERVAL_SEC` живут в этом модуле — каркас владеет
+контрактом, воркер переиспользует те же имена); исключение итерации не
+убивает петлю (событие `loop_iteration_failed` с обязательным полем `job`);
+форма «по требованию» — пробуждение по событию с перепроверкой очереди
+**после** `clear()` (пул 6, lost wakeup — существующий паттерн).
+
+Ключевое правило отложенных заданий (arch §3.2): `process()` возвращает
+число **фактически обработанных** заданий. Задание, ждущее модель или
+готовую суммари, остаётся pending и прогрессом не считается — иначе петля
+крутилась бы вхолостую без back-off.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # только аннотации: рантайм-зависимостей у каркаса нет
+    from app.config import Settings
+    from app.services.worker import BackgroundWorker
+
+# Потолок back-off (REQUIREMENTS §5.3 «max 15 мин»), env не настраивается.
+MAX_INTERVAL_SEC = 15 * 60
+
+
+def next_interval(current: float, start: int) -> float:
+    """Шаг back-off: интервал удваивается, потолок — 15 минут (§3.4)."""
+    return min(max(current * 2.0, float(start)), float(MAX_INTERVAL_SEC))
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    """Описание фоновой джобы (FR-1.1): регистрация вместо копии цикла.
+
+    `name` — имя джобы в журнале (`job=...`); `queue` — имя очереди для
+    `/health.queues` (None — очередь не наблюдаемая); `interval_sec` —
+    стартовая пауза ожидания (= старт back-off); `batch` — размер батча за
+    прогон (если применимо); `enabled=False` — джоба вообще не запускается
+    (но из реестра не исчезает: очередь выключенной джобы должна быть видна);
+    `process` — прогон, возвращает число ОБРАБОТАННЫХ заданий; `queue_empty` —
+    дешёвая перепроверка очереди (пул 6); `wait_event` — форма «по требованию»
+    (пробуждение по событию); `idle_hook` — гигиена в idle-ветке (например
+    retention `worker_jobs`); `queue_stat` — снимок своей очереди
+    `{"pending": int, "oldest_pending_sec": int | null}` для `/health.queues`.
+    """
+
+    name: str
+    queue: str | None
+    interval_sec: int
+    batch: int | None
+    enabled: bool
+    process: Callable[[], Awaitable[int]]
+    queue_empty: Callable[[], bool] | None
+    wait_event: asyncio.Event | None
+    idle_hook: Callable[[], None] | None
+    queue_stat: Callable[[], dict] | None
+
+
+class BackoffState:
+    """Мутабельное состояние back-off петли: текущий интервал ожидания.
+
+    Хранится вызывающей стороной (воркером), а не внутри `run_loop`: интервал
+    переживает итерации и сбрасывается в `spec.interval_sec` при прогрессе,
+    поэтому его видно в диагностике (`worker.interval` в тестах).
+    """
+
+    __slots__ = ("interval",)
+
+    def __init__(self, start_sec: int) -> None:
+        self.interval = float(max(start_sec, 0))
+
+
+def log_job(
+    job: JobSpec,
+    event: str,
+    *,
+    note_id: int | None = None,
+    outcome: str | None = None,
+    reason: str | None = None,
+    target: str | None = None,
+    **extra: Any,
+) -> None:
+    """Записать событие джобы в общий журнал (FR-1.4): обязательное поле `job`.
+
+    Формат един для всех джоб: имя события + `job` и общие поля по факту —
+    `note_id`, `outcome`, `reason`, `target` (None не пишется: поле появляется
+    только там, где применимо) плюс служебные поля из `extra`. Уровень — INFO;
+    непредвиденный сбой итерации цикл логирует сам (warning с traceback,
+    событие `loop_iteration_failed` — те же поля `event`/`job`).
+    """
+    fields: dict[str, Any] = {"event": event, "job": job.name}
+    for key, value in (
+        ("note_id", note_id),
+        ("outcome", outcome),
+        ("reason", reason),
+        ("target", target),
+    ):
+        if value is not None:
+            fields[key] = value
+    fields.update(extra)
+    logging.getLogger("app").info(event, extra=fields)
+
+
+async def _call_hook(hook: Callable[[], Any]) -> Any:
+    """Вызвать `queue_empty`/`idle_hook`: корутина — напрямую, sync — в to_thread.
+
+    Существующие петли зовут проверки очереди и гигиену через
+    `asyncio.to_thread` (внутри синхронный SQL): каркас сохраняет это
+    поведение — синхронный хук уходит в поток и не занимает event loop,
+    корутина ожидается как есть.
+    """
+    if inspect.iscoroutinefunction(hook):
+        return await hook()
+    return await asyncio.to_thread(hook)
+
+
+async def run_loop(
+    spec: JobSpec,
+    stopping: Callable[[], bool],
+    backoff_state: BackoffState,
+) -> None:
+    """Единый цикл джобы (arch §3.2): прогон → idle → ожидание с back-off.
+
+    `stopping` — предикат мягкой остановки (проверяется в начале каждой
+    итерации); `backoff_state` — текущий интервал ожидания, который цикл
+    сбрасывает в `spec.interval_sec` при прогрессе и растит при таймауте.
+
+    Прогон вернул > 0 обработанных заданий — интервал сбрасывается и следующая
+    партия идёт сразу (очередь выгребаем). Пустой прогон — `idle_hook`, затем
+    ожидание: у формы «по требованию» очередь перепроверяется **после**
+    `clear()` события (пул 6: работа до clear() видна селекту, после — будит
+    событие), у формы «по интервалу» — `sleep(interval)`. Таймаут ожидания —
+    `next_interval()`. `CancelledError` пробрасывается (graceful stop); прочее
+    исключение не убивает петлю — warning с traceback, пауза, back-off.
+
+    Выключенная джоба (`enabled=False`) цикл не запускает вовсе: реестр её
+    сохраняет (очередь видна в `/health`), но обслуживать нечего.
+    """
+    if not spec.enabled:
+        return
+    while not stopping():
+        try:
+            processed = await spec.process()
+            if processed > 0:
+                backoff_state.interval = float(spec.interval_sec)
+                continue
+            # Пустой прогон: гигиена idle-ветки (если она у джобы есть).
+            if spec.idle_hook is not None:
+                await _call_hook(spec.idle_hook)
+            if spec.wait_event is None:
+                await asyncio.sleep(backoff_state.interval)
+                backoff_state.interval = next_interval(
+                    backoff_state.interval, spec.interval_sec
+                )
+                continue
+            # Форма «по требованию»: перепроверка очереди ПОСЛЕ clear() (пул 6,
+            # lost wakeup) — работа, появившаяся до clear(), видна селекту
+            # (продолжаем без сна); появившаяся после — будит уже очищенное
+            # событие, сигнал не стирается.
+            spec.wait_event.clear()
+            if spec.queue_empty is not None and not await _call_hook(spec.queue_empty):
+                continue
+            try:
+                await asyncio.wait_for(
+                    spec.wait_event.wait(), timeout=backoff_state.interval
+                )
+            except asyncio.TimeoutError:
+                backoff_state.interval = next_interval(
+                    backoff_state.interval, spec.interval_sec
+                )
+        except asyncio.CancelledError:
+            raise  # отмена петли (graceful stop) — не глотать
+        except Exception:
+            # Супервизор итерации (пул 4): непредвиденный сбой не убивает
+            # корутину — warning с traceback, пауза и повтор по back-off.
+            logging.getLogger("app").warning(
+                "job loop iteration failed — loop continues",
+                extra={"event": "loop_iteration_failed", "job": spec.name},
+                exc_info=True,
+            )
+            await asyncio.sleep(backoff_state.interval)
+            backoff_state.interval = next_interval(
+                backoff_state.interval, spec.interval_sec
+            )
+
+
+# Сборщик джобы: описывает свою джобу и возвращает None, если она неприменима
+# в текущей сборке (например, джоба суммаризации без суммаризатора).
+JobBuilder = Callable[["BackgroundWorker", "Settings"], JobSpec | None]
+
+# Реестр сборщиков — точка расширения каркаса (FR-1.6). Новая джоба = функция
+# `build_job(worker, settings)` в своём модуле + строка в этом кортеже.
+# Выключенные джобы из реестра не исчезают: их очередь должна быть видна в
+# `/health` (деградация видна, а не молчит) — цикл такие джобы не запускает.
+JOB_BUILDERS: tuple[JobBuilder, ...] = ()
+
+
+def build_job_specs(
+    worker: BackgroundWorker, settings: Settings
+) -> list[JobSpec]:
+    """Собрать реестр джоб по зарегистрированным сборщикам (FR-1.1).
+
+    Сборщик, вернувший None (джоба неприменима в этой сборке), в реестр не
+    попадает. Существующие петли воркера пока работают по-старому — их
+    регистрация здесь появляется постановкой 4.
+    """
+    specs: list[JobSpec] = []
+    for build in JOB_BUILDERS:
+        spec = build(worker, settings)
+        if spec is not None:
+            specs.append(spec)
+    return specs
