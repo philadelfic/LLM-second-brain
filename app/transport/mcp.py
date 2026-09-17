@@ -89,6 +89,19 @@ REST-зеркалами lsb-0008-03). Описания — дословно ка
 мягкого отказа (нет точного термина / термина нет / близкий контекст /
 лимиты / пустой контекст). Инъекции при init НЕТ (arch §2): блока «terms» в
 `instructions` не появляется — анонса области terms нет.
+
+lsb-0013-02 (релиз 3.1.0): листинги — транспортная часть контракта lsb-0013
+(arch §3.3–3.4). Оба листинга (`memory_list`, `skills_list`) несут поля
+страницы `total`/`has_more`/`next_offset`/`next_cursor` (их считает сервисный
+`page_fields`) и ровно одну подсказку «есть ещё»: `+N more — offset=K` при
+`has_more` и отсутствии другой подсказки. Существующие `memory is empty` /
+`page beyond the memory` сохраняются дословно и «+N more» не дополняются.
+Потолок лимита проверяет СЕРВИС, а не схема (у `limit` остаётся только
+`ge=1`): `limit=50` на MCP — мягкий отказ с единым текстом
+`limit: expected 1..20, got 50`, а не schema-error транспорта. `skills_list`
+получает `limit`/`offset` (дефолт и потолок те же, поведение как у
+`memory_list`). `memory_search` и `memory_namespaces` не меняются; состав
+поверхности — 21 инструмент.
 """
 
 import asyncio
@@ -549,10 +562,41 @@ def _compact_search(result: dict[str, Any]) -> dict[str, Any]:
     return _with_hint(out, result)  # warning не копируется никогда (и null тоже)
 
 
+# lsb-0013-02 (FR-2.1, arch §3.3): подсказка «есть ещё» — ОДНА на выдачу
+# листинга (ослабление правила «hint — только в мягком отказе»). `n` — остаток
+# записей, `offset` — готовое смещение следующей страницы (`next_offset`).
+HINT_MORE = "+{n} more — offset={offset}"
+
+
+def _listing_page(result: dict[str, Any]) -> dict[str, Any]:
+    """Поля страницы листинга + единственная подсказка «есть ещё» (lsb-0013-02).
+
+    Поля страницы считает сервисный `page_fields` (arch §3.1–3.2) — транспорт
+    лишь переносит их в компактную выдачу: `total`/`has_more`/`next_offset`/
+    `next_cursor`. Подсказка `+N more — offset=K` добавляется РОВНО ОДНА и
+    только при `has_more`, если сервис не отдал своей: `memory is empty` и
+    `page beyond the memory` сохраняются дословно и не дополняются.
+    """
+    out = {
+        "total": result["total"],
+        "has_more": result["has_more"],
+        "next_offset": result["next_offset"],
+        "next_cursor": result["next_cursor"],
+    }
+    if "hint" in result:
+        out["hint"] = result["hint"]
+    elif result["has_more"]:
+        # next_offset = offset + len(items) — из него и остаток записей (FR-2.1).
+        out["hint"] = HINT_MORE.format(
+            n=result["total"] - result["next_offset"],
+            offset=result["next_offset"],
+        )
+    return out
+
+
 def _compact_list(result: dict[str, Any]) -> dict[str, Any]:
-    out = {"items": [_pick(i, _LIST_ITEM) for i in result["items"]],
-           "total": result["total"]}
-    return _with_hint(out, result)
+    return {"items": [_pick(i, _LIST_ITEM) for i in result["items"]],
+            **_listing_page(result)}
 
 
 # lsb-0001-02 (FR-3.4/FR-4.1): title-режим поиска и titles-деталь листинга —
@@ -584,9 +628,9 @@ def _compact_title_search(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_list_titles(result: dict[str, Any]) -> dict[str, Any]:
-    out = {"items": [_pick(i, _TITLE_LIST_ITEM) for i in result["items"]],
-           "total": result["total"]}
-    return _with_hint(out, result)
+    # Деталь titles — тот же контракт страницы, что у summaries (lsb-0013-02).
+    return {"items": [_pick(i, _TITLE_LIST_ITEM) for i in result["items"]],
+            **_listing_page(result)}
 
 
 def _compact_get(result: dict[str, Any]) -> dict[str, Any]:
@@ -735,10 +779,13 @@ def _compact_skill_search(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_skill_list(result: dict[str, Any]) -> dict[str, Any]:
-    """skills_list: {items: [{id, name, description}], total} — без тел."""
-    out = {"items": [_pick(item, _SKILL_LIST_ITEM) for item in result["items"]],
-           "total": result["total"]}
-    return _with_hint(out, result)
+    """skills_list: {items: [{id, name, description}], total, …} — без тел.
+
+    Поля страницы и подсказка «есть ещё» — как у листинга заметок
+    (lsb-0013-02: один контракт листинга на обе ручки).
+    """
+    return {"items": [_pick(item, _SKILL_LIST_ITEM) for item in result["items"]],
+            **_listing_page(result)}
 
 
 def _compact_skill_get(result: dict[str, Any]) -> dict[str, Any]:
@@ -1021,7 +1068,9 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
     async def memory_list(
         limit: Annotated[
             int,
-            Field(description="Page size", ge=1, le=50),
+            # lsb-0013-02: верхнюю границу проверяет СЕРВИС (у схемы — только
+            # ge=1), иначе limit=50 давал бы schema-error вместо мягкого отказа.
+            Field(description="Page size (1..20)", ge=1),
         ] = settings.default_list_limit,
         offset: Annotated[
             int,
@@ -1060,7 +1109,13 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             return {"items": [], "total": 0, "hint": HINT_INVALID_DETAIL}
         try:
             result = await asyncio.to_thread(
-                services.notes.list, limit, offset, namespace, namespace_exact
+                services.notes.list,
+                limit,
+                offset,
+                namespace,
+                namespace_exact,
+                # Потолок поверхности передаёт транспорт (arch §3.2).
+                max_limit=settings.list_max_limit_mcp,
             )
         except (NamespaceError, NamespaceValidationError) as exc:
             log_tool_call(
@@ -1068,6 +1123,19 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
                 started,
                 failed=True,
                 reason=str(exc),
+                namespace=namespace,
+            )
+            return {"items": [], "total": 0, "hint": str(exc)}
+        except NoteValidationError as exc:
+            # lsb-0013-02 (FR-1.4): лимит вне потолка поверхности — мягкий отказ
+            # с единым текстом сервиса, а не schema-error транспорта.
+            log_tool_call(
+                "memory_list",
+                started,
+                failed=True,
+                reason=str(exc),
+                limit=limit,
+                offset=offset,
                 namespace=namespace,
             )
             return {"items": [], "total": 0, "hint": str(exc)}
@@ -1459,10 +1527,45 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
         return _compact_skill_search(result)
 
     @mcp.tool(name="skills_list", description=TOOL_DESCRIPTIONS["skills_list"])
-    async def skills_list() -> dict[str, Any]:
+    async def skills_list(
+        limit: Annotated[
+            int,
+            # Потолок проверяет СЕРВИС — как у memory_list (lsb-0013-02).
+            Field(description="Page size (1..20)", ge=1),
+        ] = settings.default_list_limit,
+        offset: Annotated[
+            int,
+            Field(description="Page offset", ge=0),
+        ] = 0,
+    ) -> dict[str, Any]:
+        # lsb-0013-02 (FR-1.3): параметры страницы — дефолт/потолок и поведение
+        # те же, что у memory_list (один сервисный контракт листинга).
         started = time.perf_counter()
-        result = await asyncio.to_thread(services.skills.list)
-        log_tool_call("skills_list", started, results=len(result["items"]))
+        try:
+            result = await asyncio.to_thread(
+                services.skills.list,
+                limit,
+                offset,
+                max_limit=settings.list_max_limit_mcp,
+            )
+        except SkillValidationError as exc:
+            # Мягкий отказ: лимит вне потолка поверхности — единый текст сервиса.
+            log_tool_call(
+                "skills_list",
+                started,
+                failed=True,
+                reason=str(exc),
+                limit=limit,
+                offset=offset,
+            )
+            return {"items": [], "total": 0, "hint": str(exc)}
+        log_tool_call(
+            "skills_list",
+            started,
+            results=len(result["items"]),
+            limit=limit,
+            offset=offset,
+        )
         return _compact_skill_list(result)
 
     @mcp.tool(name="skills_get", description=TOOL_DESCRIPTIONS["skills_get"])

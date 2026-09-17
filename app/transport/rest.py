@@ -46,6 +46,13 @@ Bearer и тот же сервисный слой, что у MCP (`user_save`/`u
 дословный hint канона lsb-0008 §3.7, в т.ч. близкий контекст), 404 — запись
 не найдена (в т.ч. удалённая), 409 — новый ключ правки занят другой активной
 записью (субстрат §3.6).
+
+Релиз 3.1.0 (lsb-0013-02): листинги оператора — тот же контракт страницы,
+что и у MCP (arch lsb-0013 §3.4): `GET /notes` и `GET /skills` передают
+сервису потолок поверхности (`list_max_limit_rest`, 50) и несут в ответе
+`total`/`has_more`/`next_offset`/`next_cursor`. Текстовой подсказки листания
+(«+N more») на REST нет — это признак «есть ещё» для модели в MCP-выдаче;
+собственная подсказка сервиса («memory is empty») остаётся как была.
 """
 
 from __future__ import annotations
@@ -326,10 +333,19 @@ def build_rest_router(settings: Settings) -> APIRouter:
         limit: int | None = Query(default=None, ge=1, le=50),
         offset: int = Query(default=0, ge=0),
     ) -> dict:
-        """Обзор памяти: краткие содержания по свежести + total (FR-2)."""
+        """Обзор памяти: страница кратких содержаний + поля пагинации (FR-2).
+
+        lsb-0013-02 (arch §3.4): потолок поверхности (`list_max_limit_rest`,
+        50) проверяет сервис, в ответе — те же поля страницы, что у MCP
+        (`total`/`has_more`/`next_offset`/`next_cursor`); подсказки «+N more»
+        на REST нет — полный контракт оператора.
+        """
         try:
             return await asyncio.to_thread(
-                _services(request).notes.list, limit, offset
+                _services(request).notes.list,
+                limit,
+                offset,
+                max_limit=settings.list_max_limit_rest,
             )
         except NoteValidationError as exc:
             raise _unprocessable(exc) from exc
@@ -535,15 +551,23 @@ def build_rest_router(settings: Settings) -> APIRouter:
         собирается тот же композит §3.1, что и у `GET /skills/{id}` (включая
         секцию глобального `instruction_template`). Архив версий и удалённые
         строки в листинг не попадают.
+        lsb-0013-02 (arch §3.4): в сервис уходит потолок поверхности
+        (`list_max_limit_rest`), в ответе — те же поля страницы, что у MCP;
+        подсказки «+N more» на REST нет.
         """
         skills = _skills_service(request)
 
         def _full_listing() -> dict:
             """Сервисные вызовы в одном потоке: листинг + композит по каждому."""
-            listing = skills.list(limit, offset)
+            listing = skills.list(
+                limit, offset, max_limit=settings.list_max_limit_rest
+            )
             return {
                 "items": [skills.get(item["id"]) for item in listing["items"]],
                 "total": listing["total"],
+                "has_more": listing["has_more"],
+                "next_offset": listing["next_offset"],
+                "next_cursor": listing["next_cursor"],
             }
 
         try:

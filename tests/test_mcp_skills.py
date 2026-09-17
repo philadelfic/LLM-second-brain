@@ -85,7 +85,11 @@ CANON_FIELD_DESCRIPTIONS = {
         "query": "Task wording: what you are about to do",
         "top_k": "Number of results",
     },
-    "skills_list": {},
+    "skills_list": {
+        # lsb-0013-02: параметры страницы — как у memory_list (постановка 02).
+        "limit": "Page size (1..20)",
+        "offset": "Page offset",
+    },
     "skills_get": {"id": "Skill id"},
     "skills_save": {
         "name": "Skill name: ≤65 characters (≤5 words recommended)",
@@ -362,7 +366,12 @@ class TestCompactOutputs:
         skill_id = (await _save(mcp_skills))["id"]
         got = (await mcp_skills.call_tool("skills_list", {})).structured_content
         assert got["total"] == 1
-        assert set(got) == {"items", "total"}
+        # lsb-0013-02: поля страницы появились, подсказки при одной странице нет.
+        assert set(got) == {
+            "items", "total", "has_more", "next_offset", "next_cursor"
+        }
+        assert got["has_more"] is False
+        assert got["next_offset"] is None and got["next_cursor"] is None
         assert got["items"] == [
             {
                 "id": skill_id,

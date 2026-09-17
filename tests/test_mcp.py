@@ -190,12 +190,18 @@ class TestToolsList:
 
     @pytest.mark.asyncio
     async def test_list_schema(self, server_url: str) -> None:
-        """Контракт FR-2: limit 1..50 (дефолт 20), offset ≥ 0."""
+        """Контракт FR-1/FR-2 (lsb-0013-02): limit 1..20 (дефолт 20), offset ≥ 0.
+
+        Верхнюю границу схема НЕ объявляет: её проверяет сервис — иначе
+        limit=50 давал бы schema-error вместо мягкого отказа с hint.
+        """
         async with connect(server_url) as session:
             tools = {t.name: t for t in (await session.list_tools()).tools}
         props = tools["memory_list"].input_schema["properties"]
         assert props["limit"]["default"] == 20  # DEFAULT_LIST_LIMIT
-        assert props["limit"]["maximum"] == 50
+        assert props["limit"]["minimum"] == 1
+        assert props["limit"]["description"] == "Page size (1..20)"
+        assert "maximum" not in props["limit"]
         assert props["offset"]["default"] == 0
         assert props["offset"]["minimum"] == 0
 
@@ -652,13 +658,21 @@ class TestMemoryFlow:
 
     @pytest.mark.asyncio
     async def test_list_beyond_total_gives_page_hint(self, server_url: str) -> None:
-        """offset >= total: пустая страница + каноничный hint сервиса."""
+        """offset >= total: пустая страница + каноничный hint сервиса.
+
+        lsb-0013-02: поля страницы есть всегда, «+N more» к этому hint НЕ
+        добавляется (подсказка на выдачу — ровно одна).
+        """
         async with connect(server_url) as session:
             listed = (await session.call_tool(
                 "memory_list", {"limit": 1, "offset": 10**9}
             )).structured_content
-        assert set(listed) == {"items", "total", "hint"}
+        assert set(listed) == {
+            "items", "total", "has_more", "next_offset", "next_cursor", "hint"
+        }
         assert listed["items"] == []
+        assert listed["has_more"] is False
+        assert listed["next_offset"] is None and listed["next_cursor"] is None
         assert listed["hint"] == (
             "page beyond the memory: offset ≥ total; reduce offset"
         )
