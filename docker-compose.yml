@@ -63,6 +63,10 @@ services:
       EMBEDDING_BATCH_SIZE: "32"             # chunks per worker /api/embed request
       EMBEDDING_CONCURRENT_REQUESTS: "1"     # server = one generation at a time; ollama_slot queue enforces this in code as well
       SCORE_THRESHOLD: "0.50"                # cosine cutoff for search (calibrated for qwen3-embedding:8b — recalibrate after switching)
+      # --- related notes, level 0 (lsb-0010): lazy graph over note vectors ---
+      LINK_TOP: "3"                          # related-notes ceiling per note (FR-1.1)
+      LINK_LAZY_THRESHOLD: "0.50"            # lazy-graph cosine cutoff (default = SCORE_THRESHOLD)
+      LINK_POOL: "20"                        # KNN candidate pool for related notes
       DEDUP_SIMILARITY: "0.92"               # "duplicate" cosine threshold in background dedup (Phase 8)
       DEDUP_CANDIDATE_TOP_N: "3"             # top-N cosine candidates for the dedup judge
       DEDUP_CANDIDATE_SIMILARITY: "0.80"     # lower paraphrase-candidate threshold (≤ DEDUP_SIMILARITY)

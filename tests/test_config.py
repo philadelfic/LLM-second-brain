@@ -59,6 +59,10 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "LIST_MAX_LIMIT_MCP": ("list_max_limit_mcp", 20),
     "LIST_MAX_LIMIT_REST": ("list_max_limit_rest", 50),
     "SCORE_THRESHOLD": ("score_threshold", 0.50),
+    # lsb-0010 (3.1.0): связи заметок, уровень 0 («ленивый граф»).
+    "LINK_TOP": ("link_top", 3),
+    "LINK_LAZY_THRESHOLD": ("link_lazy_threshold", 0.50),
+    "LINK_POOL": ("link_pool", 20),
     "DEDUP_SIMILARITY": ("dedup_similarity", 0.92),
     # Фаза 8 (Этап 2.1): фоновый дедуп — косинус-кандидаты.
     "DEDUP_CANDIDATE_TOP_N": ("dedup_candidate_top_n", 3),
@@ -137,11 +141,11 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 78 полей: 6 обязательных + 72 с умолчаниями
-        (25 §8 + 6 чанковых Фазы 7 + 2 фонового дедупа + 3 судьи Фазы 8
-        + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера + 3 ключа
-        + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21 субстрата
-        областей релиза 3.0.0: лимиты/пороги skills/terms/user)."""
+        """В Settings — ровно 81 поле: 6 обязательных + 75 с умолчаниями
+        (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
+        + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
+        + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
+        субстрата областей релиза 3.0.0: лимиты/пороги skills/terms/user)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

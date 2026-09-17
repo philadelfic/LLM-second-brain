@@ -156,6 +156,7 @@ def _services(settings, embedding) -> Services:
         promotion=None,
         user_facts=UserFactsService(settings, embedding=embedding),
         terms=TermsService(settings, embedding=embedding),
+        links=None,
     )
 
 

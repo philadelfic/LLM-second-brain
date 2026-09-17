@@ -1102,6 +1102,7 @@ class TestNamespaceCreateAntiseonymy:
             promotion=None,
             user_facts=UserFactsService(settings, embedding=HashEmbedder(64)),
             terms=TermsService(settings, embedding=HashEmbedder(64)),
+            links=None,
         )
         return build_mcp(settings, services)
 
@@ -1132,6 +1133,7 @@ class TestNamespaceCreateAntiseonymy:
             promotion=None,
             user_facts=UserFactsService(settings, embedding=FailingEmbedder()),
             terms=TermsService(settings, embedding=FailingEmbedder()),
+            links=None,
         )
         return build_mcp(settings, services)
 

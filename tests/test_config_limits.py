@@ -422,3 +422,36 @@ class TestErrorReport:
         assert "default_top_k" in message
         assert "backup_keep" in message
         assert "port" in message
+
+
+class TestLinkLimits:
+    """Связи заметок, уровень 0 (lsb-0010): потолок/пул ≥ 1, порог 0..1."""
+
+    @pytest.mark.parametrize("bad_value", ["0", "-1"])
+    def test_link_top_below_one_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, bad_value: str
+    ) -> None:
+        with pytest.raises(ConfigError, match="link_top"):
+            load_env(monkeypatch, LINK_TOP=bad_value)
+
+    @pytest.mark.parametrize("bad_value", ["0", "-1"])
+    def test_link_pool_below_one_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, bad_value: str
+    ) -> None:
+        with pytest.raises(ConfigError, match="link_pool"):
+            load_env(monkeypatch, LINK_POOL=bad_value)
+
+    @pytest.mark.parametrize("bad_value", ["1.5", "-0.1"])
+    def test_link_lazy_threshold_out_of_range_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, bad_value: str
+    ) -> None:
+        with pytest.raises(ConfigError, match="link_lazy_threshold"):
+            load_env(monkeypatch, LINK_LAZY_THRESHOLD=bad_value)
+
+    def test_link_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Дефолты §3.1: потолок 3, порог = SCORE_THRESHOLD (0.50), пул 20."""
+        settings = load_env(monkeypatch)
+        assert settings.link_top == 3
+        assert settings.link_lazy_threshold == 0.50
+        assert settings.link_lazy_threshold == settings.score_threshold
+        assert settings.link_pool == 20

@@ -185,6 +185,7 @@ def _services(settings, embedding) -> Services:
         skills=SkillsService(settings, embedding=embedding),
         user_facts=UserFactsService(settings, embedding=embedding),
         terms=TermsService(settings, embedding=embedding),
+        links=None,
     )
 
 

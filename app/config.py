@@ -121,6 +121,14 @@ class Settings(BaseSettings):
     judge_timeout_sec: int = 30  # клиентский таймаут вызова судьи
     rrf_k: int = 60
 
+    # --- связи заметок, уровень 0 (lsb-0010, релиз 3.1.0) ---
+    # LINK_TOP — потолок связей на заметку (FR-1.1); LINK_LAZY_THRESHOLD —
+    # порог косинуса «ленивого графа» (дефолт равен SCORE_THRESHOLD);
+    # LINK_POOL — окно KNN-кандидатов связей (arch §3.1).
+    link_top: int = 3
+    link_lazy_threshold: float = 0.50
+    link_pool: int = 20
+
     # --- лимиты (NFR-6: env-переопределяемы, валидируются; см. _validate_ranges) ---
     max_note_chars: int = 35000  # 2000→20000 (Фаза 7) → 35000 (решение О. 2026-08-30)
     max_query_chars: int = 512
@@ -287,6 +295,11 @@ class Settings(BaseSettings):
                 "нельзя будет признать дублем"
             )
         need_low("rrf_k", self.rrf_k, 1)
+
+        # --- связи заметок (lsb-0010): потолок и пул ≥ 1, порог 0..1 ---
+        need_low("link_top", self.link_top, 1)
+        need_low("link_pool", self.link_pool, 1)
+        need_range("link_lazy_threshold", self.link_lazy_threshold, 0.0, 1.0)
 
         # --- векторизация / суммаризация ---
         need_low("embedding_dim", self.embedding_dim, 1)

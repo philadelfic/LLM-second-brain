@@ -28,6 +28,7 @@ from app.services.classifier import ClassificationService
 from app.services.dedup import DeduplicationService
 from app.services.embedding import EmbeddingService
 from app.services.judge import JudgeService
+from app.services.links import LinksService
 from app.services.llm_client import LLMClient, SlotSpec
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
@@ -45,6 +46,7 @@ __all__ = [
     "DeduplicationService",
     "EmbeddingService",
     "JudgeService",
+    "LinksService",
     "LLMClient",
     "NamespaceService",
     "NoteService",
@@ -92,6 +94,9 @@ class Services:
     # embedding — общий экземпляр слота (запись его не зовёт — близость
     # контекста триграммная, §3.5; точка сборки гибридного поиска области).
     terms: TermsService
+    # 3.1.0: связи заметок (lsb-0010) — уровень 0 («ленивый граф»). В проде (build_services)
+    # всегда с общим экземпляром search; DI-сборки тестов без связей передают None.
+    links: LinksService
     llm_embedding: LLMClient | None = None  # клиент слота embedding (Фаза 11, решение №5)
     llm_summary: LLMClient | None = None  # клиент слота summary (summarize/merge/classify/describe)
     llm_judge: LLMClient | None = None  # клиент слота judge (дедуп + судья структуры)
@@ -128,6 +133,10 @@ def build_services(
     embedding = EmbeddingService(settings, llm=llm_embedding)
     dedup = DeduplicationService(settings)
     namespaces = NamespaceService(settings)
+    search = SearchService(settings, embedding)
+    # 3.1.0: связи заметок (lsb-0010) — уровень 0 живёт над тем же search
+    # (общий экземпляр: тот же эмбеддер/пороги, без второй точки сборки).
+    links = LinksService(settings, search=search)
     promotion = PromotionService(
         settings,
         embedding=embedding,
@@ -137,7 +146,7 @@ def build_services(
     )
     return Services(
         notes=NoteService(settings, embedding, dedup),
-        search=SearchService(settings, embedding),
+        search=search,
         embedding=embedding,
         dedup=dedup,
         summary=(
@@ -169,4 +178,5 @@ def build_services(
         # общий экземпляр слота (запись его не зовёт — близость контекста
         # триграммная, arch lsb-0008 §3.5; точка сборки гибридного поиска).
         terms=TermsService(settings, embedding=embedding),
+        links=links,
     )
