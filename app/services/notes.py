@@ -74,6 +74,7 @@ from app.config import TITLE_MAX_WORDS, Settings
 from app.services.dedup import DeduplicationService, duplicate_response
 from app.services.embedding import Embedder, EmbeddingService
 from app.services.emit import summary_of
+from app.services.jobs import queue_snapshot
 from app.services.listing import page_fields
 from app.services.namespaces import NamespaceService
 from app.services.splitter import split_text
@@ -757,6 +758,39 @@ class NoteService:
             "pending_vector": row["pending_vector"],
             "pending_summary": row["pending_summary"],
         }
+
+    def vector_queue_stat(self) -> dict[str, int | None]:
+        """Снимок очереди векторизации заметок для `/health.queues` (FR-2.2).
+
+        Тот же предикат, что у легаси-счётчика `pending_vector` (числа обязаны
+        совпадать): pending-статус активных заметок, trash не считается.
+        """
+        return self._pending_queue_stat("vector_status")
+
+    def summary_queue_stat(self) -> dict[str, int | None]:
+        """Снимок очереди суммаризации заметок для `/health.queues` (FR-2.2).
+
+        Тот же предикат, что у легаси-счётчика `pending_summary`.
+        """
+        return self._pending_queue_stat("summary_status")
+
+    def _pending_queue_stat(self, status_column: str) -> dict[str, int | None]:
+        """Агрегат очереди заметок: число pending и возраст старейшего (сек).
+
+        `status_column` — только внутренние константы ('vector_status' /
+        'summary_status'), не пользовательский ввод. Возраст считается в SQL
+        по часам БД (`now - updated_at`) — при недоступных моделях pending не
+        убывает, а возраст растёт (FR-2.2/FR-2.4).
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS pending, "
+                "MAX(CAST(strftime('%s','now') AS INTEGER) - "
+                "CAST(strftime('%s', updated_at) AS INTEGER)) "
+                "AS oldest_pending_sec FROM notes "
+                f"WHERE deleted_at IS NULL AND {status_column} = 'pending'"
+            ).fetchone()
+        return queue_snapshot(row["pending"], row["oldest_pending_sec"])
 
     # --- внутренне ---------------------------------------------------------
 

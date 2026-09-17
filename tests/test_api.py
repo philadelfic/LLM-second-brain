@@ -23,10 +23,14 @@ class TestHealth:
             "notes_count": 0,
             "pending_vector": 0,
             "pending_summary": 0,
+            "queues": {
+                queue: {"pending": 0, "oldest_pending_sec": None}
+                for queue in ("vector", "summary", "judge", "areas")
+            },
         }
 
     def test_contract_fields(self, client: TestClient) -> None:
-        """Ровно 6 полей контракта NFR-4, в Фазе 1 — заготовки значений."""
+        """7 прежних полей контракта NFR-4 + queues (FR-2.7, lsb-0014-03)."""
         body = client.get("/health").json()
         assert set(body) == {
             "status",
@@ -36,8 +40,14 @@ class TestHealth:
             "notes_count",
             "pending_vector",
             "pending_summary",
+            "queues",
         }
         assert body["status"] == "ok"
+        # Каждая наблюдаемая очередь отдаёт pending + возраст старейшего;
+        # expiration очереди не имеет и в объект не попадает.
+        assert set(body["queues"]) == {"vector", "summary", "judge", "areas"}
+        for stat in body["queues"].values():
+            assert set(stat) == {"pending", "oldest_pending_sec"}
 
     def test_query_string_does_not_break_openness(self, client: TestClient) -> None:
         assert client.get("/health", params={"verbose": 1}).status_code == 200

@@ -217,6 +217,17 @@ class TermUpdate(TermCreate):
     """
 
 
+class QueueStat(BaseModel):
+    """Снимок одной очереди для /health.queues (FR-2.2).
+
+    `pending` — сколько заданий ждёт в очереди; `oldest_pending_sec` — возраст
+    старейшего задания в секундах (null — очередь пуста).
+    """
+
+    pending: int
+    oldest_pending_sec: int | None
+
+
 class HealthResponse(BaseModel):
     """Контракт /health (NFR-4): для docker healthcheck и оператора."""
 
@@ -227,6 +238,7 @@ class HealthResponse(BaseModel):
     notes_count: int
     pending_vector: int
     pending_summary: int
+    queues: dict[str, QueueStat]  # lsb-0014-03: ожидание по каждой очереди
 
 
 def _services(request: Request) -> Services:
@@ -293,9 +305,15 @@ def build_rest_router(settings: Settings) -> APIRouter:
         проверка при ok даёт True; при недоступности остаётся None — False
         поставит первый реальный отказ, см. app/main.py).
         Счётчики — из БД: активные заметки (trash не обслуживается).
+        `queues` — снимки очередей джоб (FR-2.2, lsb-0014-03): по каждой
+        очереди число ожидающих заданий и возраст старейшего; собираются
+        воркером по реестру, только SQL — обращений к моделям нет.
+        Легаси-поля (`pending_vector`/`pending_summary`) сохранены.
         """
         services = _services(request)
+        worker = request.app.state.worker  # type: ignore[attr-defined]
         counts = await asyncio.to_thread(services.notes.health_counts)
+        queues = await asyncio.to_thread(worker.queues_health)
         return HealthResponse(
             status="ok",
             embedding_ok=services.embedding.last_attempt_ok,
@@ -304,6 +322,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
             notes_count=counts["notes_count"],
             pending_vector=counts["pending_vector"],
             pending_summary=counts["pending_summary"],
+            queues=queues,
         )
 
     @rest_router.post("/notes", status_code=201)

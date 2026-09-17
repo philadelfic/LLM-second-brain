@@ -32,6 +32,9 @@ pending-статусов в БД (переживают рестарт, дого�
 воркер держит работу (`process_*`), перепроверку очереди, сигналы и гигиену.
 Сборщики своих джоб — `build_*_job` в конце модуля (регистрация — строка в
 реестре каркаса). События работ несут обязательное поле `job` (FR-1.4).
+Снимки очередей для `/health.queues` собирает `queues_health` по реестру:
+каждая джоба описывает свою очередь сама (`queue_stat`), `/health` при
+добавлении джобы не правится (lsb-0014-03, FR-2.2).
 
 Job-очереди в БД по слотам (`worker_jobs`): judge-работа (kind='dedup')
 создаётся ТОЛЬКО после готовности вектора заметки; merge-работа (kind='merge')
@@ -115,6 +118,7 @@ from app.services.jobs import (
     JobSpec,
     build_job_specs,
     next_interval,
+    queue_snapshot,
     run_loop,
 )
 from app.services.judge import Judge, JudgeError
@@ -540,6 +544,27 @@ class BackgroundWorker:
                 (slot, kind, note_id, payload),
             )
 
+    def _ensure_job(
+        self, slot: str, kind: str, note_id: int, payload: str | None = None
+    ) -> None:
+        """Идемпотентно поставить работу в очередь слота (arch §3.5, FR-2.5).
+
+        `INSERT ... WHERE NOT EXISTS (pending с теми же slot/kind/note_id)`:
+        частая правка одной заметки не плодит дубли заданий (нужно джобам,
+        которые ставят работу по событию). Существующий `_create_job`
+        (judge/merge) не трогается: там дедуп не требуется — пара
+        «поздняя ↔ ранняя» и вердикт судьи дают свои инварианты.
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn, transaction(conn):
+            conn.execute(
+                "INSERT INTO worker_jobs (slot, kind, note_id, payload) "
+                "SELECT ?, ?, ?, ? WHERE NOT EXISTS ("
+                "SELECT 1 FROM worker_jobs WHERE slot = ? AND kind = ? "
+                "AND note_id = ? AND status = 'pending')",
+                (slot, kind, note_id, payload, slot, kind, note_id),
+            )
+
     def _pending_jobs(
         self, slot: str, kind: str, limit: int
     ) -> list:
@@ -598,6 +623,80 @@ class BackgroundWorker:
                 "WHERE slot = 'judge' AND kind = 'dedup' AND status = 'pending'"
             ).fetchone()
         return int(row[0]) == 0
+
+    # --- наблюдаемость очередей (lsb-0014-03, FR-2.2) -------------------------
+
+    def queues_health(self) -> dict[str, dict]:
+        """Собрать `/health.queues` по реестру джоб (FR-2.2): только SQL.
+
+        У каждой зарегистрированной джобы с очередью берётся её собственный
+        снимок (`JobSpec.queue_stat`) — `/health` не правится при добавлении
+        джобы. Джоба без очереди (`expiration`) в объект не попадает;
+        обращений к моделям нет (только чтение pending-состояния).
+        """
+        queues: dict[str, dict] = {}
+        for spec in build_job_specs(self, self._settings):
+            if spec.queue is None or spec.queue_stat is None:
+                continue
+            queues[spec.queue] = spec.queue_stat()
+        return queues
+
+    def _vector_queue_stat(self) -> dict:
+        """Снимок очереди векторизации заметок: pending и возраст старейшего.
+
+        Источник — `notes.vector_status='pending'` (тот же предикат, что у
+        легаси-счётчика `pending_vector`); SQL живёт рядом с `health_counts`
+        в NoteService.
+        """
+        return self._notes.vector_queue_stat()
+
+    def _summary_queue_stat(self) -> dict:
+        """Снимок очереди суммаризации заметок (`notes.summary_status`)."""
+        return self._notes.summary_queue_stat()
+
+    def _judge_queue_stat(self) -> dict:
+        """Снимок очереди judge: pending-работы слота в `worker_jobs`.
+
+        Число — `worker_jobs(slot='judge', status='pending')`, возраст
+        старейшего — `now - MIN(created_at)`. Таблица создаётся лениво
+        (`_ensure_job_table`), моделей не зовём.
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS pending, "
+                "MAX(CAST(strftime('%s','now') AS INTEGER) - "
+                "CAST(strftime('%s', created_at) AS INTEGER)) "
+                "AS oldest_pending_sec FROM worker_jobs "
+                "WHERE slot = 'judge' AND status = 'pending'"
+            ).fetchone()
+        return queue_snapshot(row["pending"], row["oldest_pending_sec"])
+
+    def _areas_queue_stat(self) -> dict:
+        """Снимок очереди областей: сумма pending по `ALL_AREAS` (FR-2.2).
+
+        Источник pending — тот же, что у `_areas_queue_empty`: pending-записи
+        активных строк каждой области (skills/terms/user). Суммы складываются,
+        возраст старейшего — максимум `now - updated_at` по областям; пусто —
+        `null`.
+        """
+        pending = 0
+        oldest: int | None = None
+        with session(self._settings) as conn:
+            for spec in ALL_AREAS:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS pending, "
+                    "MAX(CAST(strftime('%s','now') AS INTEGER) - "
+                    "CAST(strftime('%s', updated_at) AS INTEGER)) "
+                    "AS oldest_pending_sec FROM "
+                    f"{spec.table} WHERE vector_status = 'pending' "
+                    "AND deleted_at IS NULL"
+                ).fetchone()
+                pending += int(row["pending"])
+                value = row["oldest_pending_sec"]
+                if value is not None:
+                    oldest = int(value) if oldest is None else max(oldest, int(value))
+        return queue_snapshot(pending, oldest)
 
     # --- синхронная работа (выполняется в to_thread) --------------------------
 
@@ -1483,8 +1582,8 @@ class BackgroundWorker:
 # и добавляется в реестр каркаса; цикл, back-off и супервизор итерации — общие
 # (`app/services/jobs.py`). Интервалы существующих петель — как были (FR-1.5):
 # PENDING_RETRY_SEC у очередей и фиксированные 300 с у зачистки (новых env эта
-# постановка не заводит). `queue_stat` пока None: снимки очередей для
-# `/health.queues` наполняет наблюдаемость (lsb-0014-03).
+# постановка не заводит). `queue_stat` — снимок своей очереди для
+# `/health.queues` (lsb-0014-03, FR-2.2): у `expiration` очереди нет (`None`).
 
 
 def build_embedding_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
@@ -1505,7 +1604,7 @@ def build_embedding_job(worker: BackgroundWorker, settings: Settings) -> JobSpec
         queue_empty=None,
         wait_event=None,
         idle_hook=worker._purge_done_jobs,
-        queue_stat=None,
+        queue_stat=worker._vector_queue_stat,
     )
 
 
@@ -1529,7 +1628,7 @@ def build_summary_job(
         queue_empty=worker._summary_queue_empty,
         wait_event=worker._summary_event,
         idle_hook=None,
-        queue_stat=None,
+        queue_stat=worker._summary_queue_stat,
     )
 
 
@@ -1545,7 +1644,7 @@ def build_judge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         queue_empty=worker._judge_queue_empty,
         wait_event=worker._judge_event,
         idle_hook=None,
-        queue_stat=None,
+        queue_stat=worker._judge_queue_stat,
     )
 
 
@@ -1561,7 +1660,7 @@ def build_areas_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         queue_empty=worker._areas_queue_empty,
         wait_event=worker._areas_event,
         idle_hook=None,
-        queue_stat=None,
+        queue_stat=worker._areas_queue_stat,
     )
 
 

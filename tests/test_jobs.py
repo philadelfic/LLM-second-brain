@@ -453,3 +453,125 @@ async def test_run_serves_registry_jobs(settings, monkeypatch) -> None:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+# --- наблюдаемость очередей (lsb-0014-03) ------------------------------------
+
+
+def _queue_waiting_records(caplog) -> list:
+    """События `queue_waiting` из журнала (FR-2.3)."""
+    return [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "queue_waiting"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_queue_waiting_logged_when_waiting_with_pending_queue(
+    monkeypatch, caplog
+) -> None:
+    """FR-2.3: уход в ожидание с непустой очередью — событие `queue_waiting`.
+
+    Джоба формы «по интервалу» (как embedding): прогон пуст, своя очередь
+    не пуста (`queue_stat`) — «работа есть, но она не выполняется» видно в
+    журнале, а не только в `/health`.
+    """
+    patch_sleep(monkeypatch)
+    calls = 0
+
+    async def process() -> int:
+        nonlocal calls
+        calls += 1
+        return 0
+
+    spec = make_spec(
+        process,
+        interval_sec=300,
+        queue="vector",
+        queue_stat=lambda: {"pending": 3, "oldest_pending_sec": 42},
+    )
+    with caplog.at_level(logging.INFO, logger="app"):
+        await asyncio.wait_for(
+            run_loop(spec, lambda: calls >= 2, BackoffState(300)), timeout=1.0
+        )
+    waited = _queue_waiting_records(caplog)
+    assert len(waited) == 2  # по одному событию на каждый уход в ожидание
+    first = waited[0]
+    assert (first.job, first.queue) == ("synthetic", "vector")
+    assert (first.pending, first.oldest_pending_sec) == (3, 42)
+
+
+@pytest.mark.asyncio
+async def test_queue_waiting_logged_before_event_wait(monkeypatch, caplog) -> None:
+    """Форма «по требованию»: перед ожиданием события — тот же сигнал.
+
+    Событие выставляется чуть позже (петля сама зовёт `clear()` после
+    прогона — «по требованию» перепроверяет очередь), путь кода тот же:
+    `queue_stat` перед `wait_for`.
+    """
+    patch_sleep(monkeypatch)
+    event = asyncio.Event()
+    calls = 0
+
+    async def process() -> int:
+        nonlocal calls
+        calls += 1
+        asyncio.get_running_loop().call_later(0.01, event.set)
+        return 0
+
+    spec = make_spec(
+        process,
+        interval_sec=300,
+        queue="judge",
+        wait_event=event,
+        queue_empty=lambda: True,
+        queue_stat=lambda: {"pending": 1, "oldest_pending_sec": 0},
+    )
+    with caplog.at_level(logging.INFO, logger="app"):
+        await asyncio.wait_for(
+            run_loop(spec, lambda: calls >= 2, BackoffState(300)), timeout=1.0
+        )
+    waited = _queue_waiting_records(caplog)
+    assert len(waited) == 2
+    assert (waited[0].job, waited[0].queue) == ("synthetic", "judge")
+    assert (waited[0].pending, waited[0].oldest_pending_sec) == (1, 0)
+
+
+@pytest.mark.asyncio
+async def test_queue_waiting_silent_on_empty_or_absent_queue(
+    monkeypatch, caplog
+) -> None:
+    """Пустая очередь и джоба без очереди — `queue_waiting` не пишется.
+
+    Пустая очередь — ждать нечего; `expiration` очереди не имеет вовсе
+    (`queue=None`) — снимок не берётся, даже если бы он был непустым.
+    """
+    patch_sleep(monkeypatch)
+    calls = 0
+
+    async def process() -> int:
+        nonlocal calls
+        calls += 1
+        return 0
+
+    empty = make_spec(
+        process,
+        interval_sec=300,
+        queue="vector",
+        queue_stat=lambda: {"pending": 0, "oldest_pending_sec": None},
+    )
+    invisible = make_spec(
+        process,
+        interval_sec=300,
+        queue=None,
+        queue_stat=lambda: {"pending": 5, "oldest_pending_sec": 7},
+    )
+    with caplog.at_level(logging.INFO, logger="app"):
+        await asyncio.wait_for(
+            run_loop(empty, lambda: calls >= 1, BackoffState(300)), timeout=1.0
+        )
+        await asyncio.wait_for(
+            run_loop(invisible, lambda: calls >= 2, BackoffState(300)), timeout=1.0
+        )
+    assert _queue_waiting_records(caplog) == []

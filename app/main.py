@@ -252,6 +252,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.include_router(build_rest_router(settings))
     app.state.services = services  # REST-ручки достают сервисы отсюда
+    # Воркер нужен REST-ручке /health: снимки очередей (queues, FR-2.2)
+    # собираются по реестру джоб — только SQL, без обращений к моделям.
+    app.state.worker = worker
     # Монтирование в корень: MCP_PATH задаёт точный путь MCP-эндпоинта;
     # маршруты FastAPI (/health и будущие REST) матчатся раньше mount.
     app.mount("/", mcp_app)

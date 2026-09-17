@@ -25,6 +25,12 @@
 число **фактически обработанных** заданий. Задание, ждущее модель или
 готовую суммари, остаётся pending и прогрессом не считается — иначе петля
 крутилась бы вхолостую без back-off.
+
+Наблюдаемость очередей (lsb-0014-03, FR-2.2/FR-2.3): очередь описывает сама
+джоба (`JobSpec.queue_stat` — снимок `{"pending", "oldest_pending_sec"}`),
+каркас лишь собирает объект по реестру и пишет событие `queue_waiting`,
+когда петля уходит в ожидание при непустой своей очереди — «работа есть, но
+она не выполняется» видно в журнале, а не только в `/health`.
 """
 
 from __future__ import annotations
@@ -47,6 +53,23 @@ MAX_INTERVAL_SEC = 15 * 60
 def next_interval(current: float, start: int) -> float:
     """Шаг back-off: интервал удваивается, потолок — 15 минут (§3.4)."""
     return min(max(current * 2.0, float(start)), float(MAX_INTERVAL_SEC))
+
+
+def queue_snapshot(
+    pending: int | None, oldest_pending_sec: int | None
+) -> dict[str, int | None]:
+    """Снимок очереди для `/health.queues` (FR-2.2): число и возраст старейшего.
+
+    Единая форма для всех джоб: `{"pending": int, "oldest_pending_sec":
+    int | null}`. Возраст — секунды, посчитанные в SQL (`now - MIN(ts)`),
+    поэтому его отдаёт вызывающая сторона уже числом; `null` — очередь пуста
+    (у неё нет «старейшего» задания). Защита от расхождения часов и
+    неожиданного NULL у непустой очереди — `max(0, ...)`/`null`.
+    """
+    count = int(pending or 0)
+    if count == 0 or oldest_pending_sec is None:
+        return {"pending": count, "oldest_pending_sec": None}
+    return {"pending": count, "oldest_pending_sec": max(0, int(oldest_pending_sec))}
 
 
 @dataclass(frozen=True)
@@ -154,6 +177,29 @@ async def _call_hook(hook: Callable[[], Any]) -> Any:
     return await asyncio.to_thread(hook)
 
 
+async def _log_queue_waiting(spec: JobSpec) -> None:
+    """Событие `queue_waiting` перед сном при непустой своей очереди (FR-2.3).
+
+    «Работа есть, но она не выполняется» (модель недоступна, задание ждёт) —
+    залипание видно в журнале без опроса `/health`. Снимок берётся у самой
+    джобы (`queue_stat`, только SQL через поток — как прочие хуки); джоба без
+    очереди или с пустой очередью молчит.
+    """
+    if spec.queue is None or spec.queue_stat is None:
+        return
+    stat = await _call_hook(spec.queue_stat)
+    pending = int(stat.get("pending", 0) or 0)
+    if pending <= 0:
+        return
+    log_job(
+        spec,
+        "queue_waiting",
+        queue=spec.queue,
+        pending=pending,
+        oldest_pending_sec=stat.get("oldest_pending_sec"),
+    )
+
+
 async def run_loop(
     spec: JobSpec,
     stopping: Callable[[], bool],
@@ -180,6 +226,9 @@ async def run_loop(
 
     Выключенная джоба (`enabled=False`) цикл не запускает вовсе: реестр её
     сохраняет (очередь видна в `/health`), но обслуживать нечего.
+
+    Перед каждым ожиданием пишется событие `queue_waiting`, если своя очередь
+    не пуста (FR-2.3): «работа есть, но не выполняется» — в журнале.
     """
     if not spec.enabled:
         return
@@ -189,6 +238,7 @@ async def run_loop(
             if backoff_state.fixed:
                 # Периодический обход с фиксированным расписанием: пауза — это
                 # интервал джобы, а не наличие работы (выгребать нечего).
+                await _log_queue_waiting(spec)
                 await asyncio.sleep(backoff_state.interval)
                 continue
             if processed > 0:
@@ -198,6 +248,7 @@ async def run_loop(
             if spec.idle_hook is not None:
                 await _call_hook(spec.idle_hook)
             if spec.wait_event is None:
+                await _log_queue_waiting(spec)
                 await asyncio.sleep(backoff_state.interval)
                 backoff_state.grow(spec.interval_sec)
                 continue
@@ -208,6 +259,7 @@ async def run_loop(
             spec.wait_event.clear()
             if spec.queue_empty is not None and not await _call_hook(spec.queue_empty):
                 continue
+            await _log_queue_waiting(spec)
             try:
                 await asyncio.wait_for(
                     spec.wait_event.wait(), timeout=backoff_state.interval
