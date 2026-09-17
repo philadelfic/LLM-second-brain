@@ -29,8 +29,9 @@ MCP-слой срезает служебные поля — см. Фаза 9):
 - get    → {notes: [...]} (массив даже для одного id; отсутствующие/удалённые
            id пропускаются; пустой результат — мягкий ответ с hint; каждая
            заметка несёт title, Фаза 11 — MCP memory_get его срезает)
-- list   → {items: [...], total} (без полных текстов; каждый item несёт
-           title, Фаза 11) (+hint, если пусто)
+- list   → {items: [...], total, has_more, next_offset, next_cursor} (без
+           полных текстов; каждый item несёт title, Фаза 11) (+hint, если
+           пусто) — lsb-0013 page fields
 - update → {id, updated: True, summary_pending: True} | мягкий ответ updated: False
 - delete → {id, deleted: True} | мягкий ответ deleted: False (soft delete)
 
@@ -73,15 +74,16 @@ from app.config import TITLE_MAX_WORDS, Settings
 from app.services.dedup import DeduplicationService, duplicate_response
 from app.services.embedding import Embedder, EmbeddingService
 from app.services.emit import summary_of
+from app.services.listing import page_fields
 from app.services.namespaces import NamespaceService
 from app.services.splitter import split_text
 from app.storage import chunks, expirations, vectors
 from app.storage.db import session, transaction
 
-# Фиксированные верхние границы контрактов (REQUIREMENTS §5.1/NFR-6; env —
-# только для умолчаний: DEFAULT_LIST_LIMIT), поэтому не настраиваются.
-MAX_LIST_LIMIT = 50
-MAX_READ_CHUNKS = 3  # lsb-0003: максимум чанков за один memory_get (решение О. 2026-09-08)
+# Maximum number of chunks per one memory_get call (lsb-0003, decision of O.,
+# 2026-09-08). Listing ceilings (lsb-0013) are env parameters of the surfaces
+# (list_max_limit_mcp / list_max_limit_rest), not module constants.
+MAX_READ_CHUNKS = 3
 
 # Название заметки (Фаза 11, решение №9): клиент-модель называет заметку при
 # записи; отсутствие/невалидность — отказ записи с этим hint (§5.3).
@@ -415,16 +417,27 @@ class NoteService:
         offset: int = 0,
         namespace: str | None = None,
         namespace_exact: bool = False,
+        max_limit: int | None = None,
     ) -> dict[str, Any]:
         """Обзор памяти: краткие содержания по свежести + total (FR-2).
 
         Фаза 10: namespace — фильтр узла/поддерева (None — глобально, как
         раньше); каждый item несёт свой namespace.
+
+        lsb-0013: `max_limit` is the listing ceiling of the calling surface
+        (None → `list_max_limit_rest`, so existing callers keep working; the
+        MCP surface passes `list_max_limit_mcp`), and the limit error text is
+        the single one shared by all listings. Page fields come from the shared
+        `page_fields` helper and are present in every branch of the answer;
+        ordering, filters and `total` are unchanged.
         """
+        max_limit = (
+            self._settings.list_max_limit_rest if max_limit is None else max_limit
+        )
         limit = self._settings.default_list_limit if limit is None else limit
-        if not 1 <= limit <= MAX_LIST_LIMIT:
+        if not 1 <= limit <= max_limit:
             raise NoteValidationError(
-                f"limit: expected 1..{MAX_LIST_LIMIT}, got {limit}"
+                f"limit: expected 1..{max_limit}, got {limit}"
             )
         if offset < 0:
             raise NoteValidationError(f"offset: expected ≥ 0, got {offset}")
@@ -463,15 +476,16 @@ class NoteService:
             }
             for row in rows
         ]
+        fields = page_fields(total, offset, len(items))
         if not items and offset == 0:
-            return {"items": [], "total": total, "hint": "memory is empty"}
+            return {"items": [], **fields, "hint": "memory is empty"}
         if not items:
             return {
                 "items": [],
-                "total": total,
+                **fields,
                 "hint": "page beyond the memory: offset ≥ total; reduce offset",
             }
-        return {"items": items, "total": total}
+        return {"items": items, **fields}
 
     # --- FR-5 memory_update (перезапись целиком; векторизация — фон) -------
 

@@ -16,7 +16,6 @@ from fakes import HashEmbedder
 from app.config import TITLE_MAX_WORDS, get_settings
 from app.services.namespaces import NamespaceError, NamespaceService
 from app.services.notes import (
-    MAX_LIST_LIMIT,
     TITLE_HINT,
     NoteService,
     NoteValidationError,
@@ -263,13 +262,14 @@ class TestList:
         assert [item["id"] for item in result["items"]] == [1]
 
     def test_limit_validation(self, service: NoteService) -> None:
+        ceiling = get_settings().list_max_limit_rest  # lsb-0013: surface ceiling
         with pytest.raises(NoteValidationError):
             service.list(limit=0)
         with pytest.raises(NoteValidationError):
-            service.list(limit=MAX_LIST_LIMIT + 1)
+            service.list(limit=ceiling + 1)
         with pytest.raises(NoteValidationError):
             service.list(offset=-1)
-        assert service.list(limit=MAX_LIST_LIMIT)["items"] == []
+        assert service.list(limit=ceiling)["items"] == []
 
 
 class TestUpdate:

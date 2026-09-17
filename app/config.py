@@ -103,6 +103,12 @@ class Settings(BaseSettings):
     # --- поиск ---
     default_top_k: int = 5
     default_list_limit: int = 20
+    # Listing ceilings per surface (lsb-0013, release 3.1.0): the MCP surface
+    # keeps the model context tight (20 records), the REST surface for the
+    # operator is looser (50). The order default ≤ MCP ≤ REST is validated at
+    # startup (see _validate_ranges).
+    list_max_limit_mcp: int = 20
+    list_max_limit_rest: int = 50
     score_threshold: float = 0.50  # калибровка 2026-09-02: 0.35→0.50 (эксперимент на 82 реальных запросах, решение О.)
     dedup_similarity: float = 0.92
     # --- фоновый дедуп (Фаза 8, Этап 2.1): кандидат-предфильтр до сводки ---
@@ -211,9 +217,9 @@ class Settings(BaseSettings):
         """Диапазоны всех лимитов и полей, влияющих на поведение (NFR-6).
 
         Собираем ВСЕ нарушения сразу — оператор правит окружение за один
-        перезапуск, а не по ошибке на рестарт. Проверка жёстких потолков
-        контрактов NFR-6: top_k ≤ 20, limit ≤ 50 (сам потолок не env — это
-        фиксированный контракт инструментов, env задаёт только умолчания).
+        перезапуск, а не по ошибке на рестарт. The hard contract ceiling stays
+        with top_k ≤ 20; listing ceilings (lsb-0013) are env parameters of the
+        surfaces (MCP ≤ REST) — their order and the default are validated.
         """
         errors: list[str] = []
 
@@ -246,7 +252,23 @@ class Settings(BaseSettings):
         need_low("snippet_chars", self.snippet_chars, 1)
         need_low("max_get_batch", self.max_get_batch, 1)
         need_range("default_top_k", self.default_top_k, 1, 20)
-        need_range("default_list_limit", self.default_list_limit, 1, 50)
+        # Listing limits (lsb-0013): the ceiling is a surface parameter now, so
+        # positivity is checked per field and the order default ≤ MCP ≤ REST is
+        # a relational check right below.
+        need_low("default_list_limit", self.default_list_limit, 1)
+        need_low("list_max_limit_mcp", self.list_max_limit_mcp, 1)
+        need_low("list_max_limit_rest", self.list_max_limit_rest, 1)
+        if self.default_list_limit > self.list_max_limit_mcp:
+            errors.append(
+                "  - default_list_limit: default page size above the MCP "
+                "listing ceiling list_max_limit_mcp — the default page would "
+                "be rejected by the MCP listing"
+            )
+        if self.list_max_limit_mcp > self.list_max_limit_rest:
+            errors.append(
+                "  - list_max_limit_mcp: MCP listing ceiling above the REST one "
+                "list_max_limit_rest — MCP cannot be looser than REST"
+            )
 
         # --- пороги и слияние ---
         need_range("score_threshold", self.score_threshold, 0.0, 1.0)

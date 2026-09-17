@@ -89,7 +89,28 @@ class TestRangeLimits:
     def test_default_list_limit_bounds_are_valid(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        assert load_env(monkeypatch, DEFAULT_LIST_LIMIT="50").default_list_limit == 50
+        # lsb-0013: the default is bounded by the MCP ceiling; 50 is valid
+        # once the MCP surface is raised to 50 (order default ≤ MCP ≤ REST).
+        assert load_env(monkeypatch, DEFAULT_LIST_LIMIT="20").default_list_limit == 20
+        assert (
+            load_env(
+                monkeypatch, DEFAULT_LIST_LIMIT="50", LIST_MAX_LIMIT_MCP="50"
+            ).default_list_limit
+            == 50
+        )
+
+    def test_listing_ceiling_order_is_validated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """lsb-0013: default ≤ MCP ≤ REST, otherwise startup is fatal."""
+        with pytest.raises(ConfigError, match="default_list_limit"):
+            load_env(monkeypatch, DEFAULT_LIST_LIMIT="30")  # above MCP 20
+        with pytest.raises(ConfigError, match="list_max_limit_mcp"):
+            load_env(monkeypatch, LIST_MAX_LIMIT_MCP="60")  # above REST 50
+        with pytest.raises(ConfigError, match="list_max_limit_rest"):
+            load_env(monkeypatch, LIST_MAX_LIMIT_REST="0")
+        with pytest.raises(ConfigError, match="list_max_limit_mcp"):
+            load_env(monkeypatch, LIST_MAX_LIMIT_MCP="0")
 
     def test_port_out_of_range_is_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
         with pytest.raises(ConfigError, match="port"):
