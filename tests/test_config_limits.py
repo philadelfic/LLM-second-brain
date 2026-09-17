@@ -490,3 +490,41 @@ class TestLinkLimits:
         assert settings.link_cosine_threshold > settings.link_lazy_threshold
         assert settings.link_entities_min_common == 2
         assert settings.link_entities_min_word_chars == 5
+
+
+class TestJobLimits:
+    """Фоновые джобы каркаса (lsb-0014): расписание из окружения (FR-1.2).
+
+    Джоба расчёта связей `links` (lsb-0010-03, FR-2.2): интервал ≥ 30,
+    батч ≥ 1 (нулевой батч не разобрал бы backfill никогда).
+    """
+
+    def test_links_interval_below_thirty_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with pytest.raises(ConfigError, match="job_links_interval_sec"):
+            load_env(monkeypatch, JOB_LINKS_INTERVAL_SEC="29")
+
+    def test_links_batch_below_one_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with pytest.raises(ConfigError, match="job_links_batch"):
+            load_env(monkeypatch, JOB_LINKS_BATCH="0")
+
+    def test_links_job_defaults_and_overrides(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Дефолты §3.6: включена, 300 с, батч 100; значения переопределяемы."""
+        defaults = load_env(monkeypatch)
+        assert defaults.job_links_enabled is True
+        assert defaults.job_links_interval_sec == 300
+        assert defaults.job_links_batch == 100
+        custom = load_env(
+            monkeypatch,
+            JOB_LINKS_ENABLED="false",
+            JOB_LINKS_INTERVAL_SEC="45",
+            JOB_LINKS_BATCH="7",
+        )
+        assert custom.job_links_enabled is False
+        assert custom.job_links_interval_sec == 45
+        assert custom.job_links_batch == 7

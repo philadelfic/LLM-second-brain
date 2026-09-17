@@ -346,11 +346,17 @@ def test_backoff_helpers_shared_with_worker() -> None:
 # --- перевод петель воркера на каркас (lsb-0014-02) ---------------------------
 
 
-def test_worker_registers_five_jobs(settings) -> None:
-    """Реестр собирает пять джоб воркера: имена, очереди, интервалы и формы."""
+def test_registry_contains_worker_jobs_and_links(settings) -> None:
+    """Реестр собирает джобы воркера: имена, очереди, интервалы и формы.
+
+    Пять петель воркера + джоба `links` из своего модуля (`links.py`
+    регистрирует себя сама, постановка lsb-0010-03) — порядок в реестре
+    задаётся импортом (`app.services` → links, затем worker).
+    """
     worker = BackgroundWorker(settings, HashEmbedder(8), FixedSummarizer("С."))
     specs = {spec.name: spec for spec in build_job_specs(worker, settings)}
     assert list(specs) == [
+        "links",
         "embedding",
         "summary",
         "judge",
@@ -363,6 +369,12 @@ def test_worker_registers_five_jobs(settings) -> None:
     assert specs["judge"].queue == "judge"
     assert specs["areas"].queue == "areas"
     assert specs["expiration"].queue is None  # очередь не наблюдаемая
+    # Джоба связей (lsb-0010-03): своя очередь и расписание из env.
+    assert specs["links"].queue == "links"
+    assert specs["links"].interval_sec == settings.job_links_interval_sec
+    assert specs["links"].batch == settings.job_links_batch
+    assert specs["links"].idle_hook is not None  # гигиена purge_orphans
+    assert specs["links"].queue_stat is not None
     for name in ("embedding", "summary", "judge", "areas"):
         assert specs[name].interval_sec == retry  # как было (FR-1.5)
     assert specs["expiration"].interval_sec == EXPIRATION_CLEANUP_INTERVAL_SEC
@@ -382,7 +394,7 @@ def test_summary_job_is_not_registered_without_summarizer(settings) -> None:
     worker = BackgroundWorker(settings, HashEmbedder(8))
     names = [spec.name for spec in build_job_specs(worker, settings)]
     assert "summary" not in names
-    assert names == ["embedding", "judge", "areas", "expiration"]
+    assert names == ["links", "embedding", "judge", "areas", "expiration"]
 
 
 @pytest.mark.asyncio

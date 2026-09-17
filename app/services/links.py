@@ -9,7 +9,9 @@
 моделей (FR-2, arch §3.2–3.4): косинус — KNN по готовому вектору, значимые
 слова и упоминания по названию — FTS-пул + точная проверка правил в коде.
 Маркер `notes.links_at` — очередь расчёта (backfill и инкремент одним
-правилом выборки в джобе `links`, постановка 8).
+правилом выборки в джобе `links`, постановка 8): `recompute_batch` разбирает
+партию очереди, `queue_stat` описывает её для `/health`, `purge_orphans` —
+гигиена idle-ветки. Джоба регистрируется в реестре каркаса (`build_links_job`).
 
 Выдача связей (уровень 1 с приоритетом, фолбэк на уровень 0) — постановка 10:
 `related` пока отдаёт уровень 0 как есть.
@@ -17,13 +19,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import sqlite3
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.config import Settings
+from app.services import jobs
+from app.services.jobs import JobSpec, queue_snapshot
 from app.services.search import SearchService
 from app.storage.db import session, transaction
+
+if TYPE_CHECKING:  # только аннотации: рантайм-зависимости на воркер нет
+    from app.services.worker import BackgroundWorker
 
 # Приоритет видов связи: на пару заметок хранится ОДНА строка — побеждает
 # вид с высшим приоритетом (arch §3.2: mention > entities > cosine).
@@ -38,6 +46,30 @@ _FTS_MAX_WORDS = 8
 # Предел триграммы: FTS5/trigram не ищет строки короче 3 символов — название
 # короче не становится кандидатом вида `mention` (arch §3.3).
 _TRIGRAM_MIN_CHARS = 3
+
+# Имя джобы расчёта связей в журнале и реестре каркаса (FR-1.1); очередь для
+# `/health.queues` — то же имя.
+LINKS_JOB = "links"
+
+# Единое правило выборки очереди расчёта связей (arch §3.4): backfill и
+# инкремент разбираются одной выборкой — активные заметки с готовым вектором и
+# пустым маркером `links_at`, свежие первыми. Заметки с `vector_status='pending'`
+# в выборку не попадают (ждут вектора в очереди `vector`), маркер не теряется.
+_PENDING_SELECT = (
+    "SELECT id FROM notes "
+    "WHERE deleted_at IS NULL AND vector_status = 'ok' AND links_at IS NULL "
+    "ORDER BY updated_at DESC, id DESC LIMIT ?"
+)
+
+# Снимок очереди для `/health.queues` (FR-2.2): тот же предикат, что у выборки;
+# возраст старейшего — `now - MIN(updated_at)` (через MAX разниц — иначе).
+_QUEUE_STAT_SQL = (
+    "SELECT COUNT(*) AS pending, "
+    "MAX(CAST(strftime('%s','now') AS INTEGER) - "
+    "CAST(strftime('%s', updated_at) AS INTEGER)) AS oldest_pending_sec "
+    "FROM notes "
+    "WHERE deleted_at IS NULL AND vector_status = 'ok' AND links_at IS NULL"
+)
 
 # Стоп-слова значимых слов (ru+en) — константа кода, не env (arch §3.3).
 _STOP_WORDS = frozenset(
@@ -243,6 +275,42 @@ class LinksService:
             )
             return cursor.rowcount
 
+    # --- очередь расчёта: батч и снимок (lsb-0010-03, FR-2.2) ---------------
+
+    def recompute_batch(self, limit: int) -> int:
+        """Разобрать партию заметок из очереди расчёта; вернуть число обработанных.
+
+        Единое правило выборки для backfill и инкремента (arch §3.4): активные
+        заметки с готовым вектором (`vector_status='ok'`) и пустым маркером
+        `links_at IS NULL`, свежие первыми (`updated_at DESC, id DESC`), не
+        больше `limit` за прогон. Каждая выбранная заметка пересчитывается
+        `compute_for_note` — маркер `links_at` проставляется в той же транзакции,
+        поэтому следующая выборка её уже не вернёт. Первый прогон естественно
+        разбирает накопленную базу батчами, дальше выборка пуста — джоба спит.
+
+        Заметки с `vector_status='pending'` в выборку не попадают: их видно в
+        очереди `vector`, задание не теряется — маркер ждёт готового вектора.
+        Моделей расчёт не зовёт (FR-2.2). Возврат — размер разобранного батча.
+        """
+        with session(self._settings) as conn:
+            rows = conn.execute(_PENDING_SELECT, (limit,)).fetchall()
+        for row in rows:
+            self.compute_for_note(int(row["id"]))
+        return len(rows)
+
+    def queue_stat(self) -> dict[str, int | None]:
+        """Снимок очереди расчёта связей для `/health.queues` (FR-2.2).
+
+        `pending` — активные заметки с готовым вектором и пустым маркером
+        (`vector_status='ok' AND links_at IS NULL`) — ровно та выборка, что
+        выгребает `recompute_batch`; `oldest_pending_sec` — возраст старейшей
+        заметки (`now - MIN(updated_at)`), `null` — очередь пуста. Только SQL,
+        без обращений к моделям (общая форма — `jobs.queue_snapshot`).
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(_QUEUE_STAT_SQL).fetchone()
+        return queue_snapshot(row["pending"], row["oldest_pending_sec"])
+
     # --- уровень 1: кандидаты и правила ------------------------------------
 
     def _candidate_kinds(
@@ -382,3 +450,47 @@ class LinksService:
         return " OR ".join(
             f'"{word.replace(chr(34), chr(34) * 2)}"' for word in unique
         )
+
+
+# --- сборщик джобы расчёта связей (каркас lsb-0014) --------------------------
+
+
+def build_links_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
+    """Джоба `links`: фоновый расчёт связей уровня 1, очередь — маркер `links_at`.
+
+    Форма «по интервалу» (сигнала `notify_*` у связей нет): прогон разбирает
+    партию `JOB_LINKS_BATCH` из очереди (свежие первыми), прогресс сбрасывает
+    back-off, пустая выборка — гигиена `purge_orphans` (idle_hook) и сон на
+    `JOB_LINKS_INTERVAL_SEC`. `JOB_LINKS_ENABLED=false` джобу не запускает,
+    но очередь остаётся видна в `/health` (реестр её сохраняет). Расчёт связей
+    моделей не зовёт (FR-2.2): косинус — готовый вектор, entities/mention — FTS.
+
+    Сервис собирается над общим эмбеддером воркера (отдельный клиент не
+    заводим): расчёт связей кодирование не зовёт, но `LinksService` требует
+    `SearchService` для KNN-пула `cosine`.
+    """
+    links = LinksService(settings, search=SearchService(settings, worker._embedding))
+    batch = settings.job_links_batch
+
+    async def process() -> int:
+        # Синхронный SQL/расчёт уводим в поток — event loop не занимаем
+        # (как петли воркера: process_* синхронные).
+        return await asyncio.to_thread(links.recompute_batch, batch)
+
+    return JobSpec(
+        name=LINKS_JOB,
+        queue=LINKS_JOB,
+        interval_sec=settings.job_links_interval_sec,
+        batch=batch,
+        enabled=settings.job_links_enabled,
+        process=process,
+        queue_empty=None,
+        wait_event=None,
+        idle_hook=links.purge_orphans,
+        queue_stat=links.queue_stat,
+    )
+
+
+# Регистрация джобы в реестре каркаса (FR-1.1): своя джоба — в своём модуле
+# (одна строка в `JOB_BUILDERS`); импорт односторонний — links → jobs, круга нет.
+jobs.JOB_BUILDERS += (build_links_job,)

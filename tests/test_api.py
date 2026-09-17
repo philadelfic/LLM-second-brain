@@ -25,7 +25,7 @@ class TestHealth:
             "pending_summary": 0,
             "queues": {
                 queue: {"pending": 0, "oldest_pending_sec": None}
-                for queue in ("vector", "summary", "judge", "areas")
+                for queue in ("vector", "summary", "judge", "areas", "links")
             },
         }
 
@@ -45,7 +45,13 @@ class TestHealth:
         assert body["status"] == "ok"
         # Каждая наблюдаемая очередь отдаёт pending + возраст старейшего;
         # expiration очереди не имеет и в объект не попадает.
-        assert set(body["queues"]) == {"vector", "summary", "judge", "areas"}
+        assert set(body["queues"]) == {
+            "vector",
+            "summary",
+            "judge",
+            "areas",
+            "links",
+        }
         for stat in body["queues"].values():
             assert set(stat) == {"pending", "oldest_pending_sec"}
 

@@ -67,6 +67,10 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "LINK_COSINE_THRESHOLD": ("link_cosine_threshold", 0.70),
     "LINK_ENTITIES_MIN_COMMON": ("link_entities_min_common", 2),
     "LINK_ENTITIES_MIN_WORD_CHARS": ("link_entities_min_word_chars", 5),
+    # lsb-0010-03 (3.1.0): джоба расчёта связей на каркасе lsb-0014 (FR-1.2).
+    "JOB_LINKS_ENABLED": ("job_links_enabled", True),
+    "JOB_LINKS_INTERVAL_SEC": ("job_links_interval_sec", 300),
+    "JOB_LINKS_BATCH": ("job_links_batch", 100),
     "DEDUP_SIMILARITY": ("dedup_similarity", 0.92),
     # Фаза 8 (Этап 2.1): фоновый дедуп — косинус-кандидаты.
     "DEDUP_CANDIDATE_TOP_N": ("dedup_candidate_top_n", 3),
@@ -145,11 +149,12 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 81 поле: 6 обязательных + 75 с умолчаниями
+        """В Settings — ровно 84 поля: 6 обязательных + 78 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
-        субстрата областей релиза 3.0.0: лимиты/пороги skills/terms/user)."""
+        субстрата областей релиза 3.0.0: лимиты/пороги skills/terms/user;
+        + 3 джобы расчёта связей lsb-0010-03)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

@@ -132,6 +132,24 @@ def _sql_judge_stat(settings) -> dict:
     }
 
 
+def _sql_links_stat(settings) -> dict:
+    """Прямой SQL по очереди расчёта связей (маркер links_at) — эталон."""
+    with session(settings) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS pending, "
+            "MAX(CAST(strftime('%s','now') AS INTEGER) - "
+            "CAST(strftime('%s', updated_at) AS INTEGER)) AS oldest_pending_sec "
+            "FROM notes WHERE deleted_at IS NULL AND vector_status = 'ok' "
+            "AND links_at IS NULL"
+        ).fetchone()
+    pending = int(row["pending"])
+    oldest = row["oldest_pending_sec"]
+    return {
+        "pending": pending,
+        "oldest_pending_sec": None if pending == 0 or oldest is None else int(oldest),
+    }
+
+
 def _sql_areas_stat(settings) -> dict:
     """Прямой SQL по областям (сумма pending, максимум возраста) — эталон."""
     pending = 0
@@ -174,7 +192,7 @@ def test_queues_health_empty_queues_are_null(settings) -> None:
     `expiration` очереди не имеет и не наблюдаема.
     """
     queues = make_worker(settings).queues_health()
-    assert set(queues) == {"vector", "summary", "judge", "areas"}
+    assert set(queues) == {"vector", "summary", "judge", "areas", "links"}
     for stat in queues.values():
         assert stat == {"pending": 0, "oldest_pending_sec": None}
 
@@ -195,11 +213,12 @@ def test_queues_health_matches_direct_sql(settings) -> None:
 
     queues = worker.queues_health()
 
-    assert set(queues) == {"vector", "summary", "judge", "areas"}
+    assert set(queues) == {"vector", "summary", "judge", "areas", "links"}
     _assert_stat(queues["vector"], _sql_note_stat(settings, "vector_status"))
     _assert_stat(queues["summary"], _sql_note_stat(settings, "summary_status"))
     _assert_stat(queues["judge"], _sql_judge_stat(settings))
     _assert_stat(queues["areas"], _sql_areas_stat(settings))
+    _assert_stat(queues["links"], _sql_links_stat(settings))
     # Явные ожидания — снимок считает именно своё состояние.
     assert queues["vector"]["pending"] == 2
     assert queues["summary"]["pending"] == 2

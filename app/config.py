@@ -138,6 +138,16 @@ class Settings(BaseSettings):
     link_entities_min_common: int = 2
     link_entities_min_word_chars: int = 5
 
+    # --- фоновые джобы каркаса (lsb-0014, релиз 3.1.0): расписание из env ---
+    # Джоба расчёта связей `links` (lsb-0010-03, FR-2.2): очередь — служебный
+    # маркер notes.links_at; JOB_LINKS_INTERVAL_SEC — стартовая пауза ожидания
+    # (≥ 30 с), JOB_LINKS_BATCH — сколько заметок разбирается за прогон (≥ 1),
+    # JOB_LINKS_ENABLED — операторский выключатель (false — джоба не стартует,
+    # но её очередь остаётся видна в /health).
+    job_links_enabled: bool = True
+    job_links_interval_sec: int = 300
+    job_links_batch: int = 100
+
     # --- лимиты (NFR-6: env-переопределяемы, валидируются; см. _validate_ranges) ---
     max_note_chars: int = 35000  # 2000→20000 (Фаза 7) → 35000 (решение О. 2026-08-30)
     max_query_chars: int = 512
@@ -322,6 +332,12 @@ class Settings(BaseSettings):
                 "связи link_cosine_threshold — связь уровня 1 оказалась бы "
                 "строже фолбэка уровня 0"
             )
+
+        # --- фоновые джобы каркаса (lsb-0014): расписание из окружения ---
+        # Джоба `links` (lsb-0010-03): интервал ≥ 30 (дёшево, но не в цикле),
+        # батч ≥ 1 (нулевой батч не разобрал бы backfill никогда).
+        need_low("job_links_interval_sec", self.job_links_interval_sec, 30)
+        need_low("job_links_batch", self.job_links_batch, 1)
 
         # --- векторизация / суммаризация ---
         need_low("embedding_dim", self.embedding_dim, 1)
