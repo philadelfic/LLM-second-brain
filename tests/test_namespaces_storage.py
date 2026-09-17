@@ -114,7 +114,7 @@ class TestFreshSchema:
             "id", "text", "title", "summary", "author", "vector_status",
             "summary_status", "created_at", "updated_at", "deleted_at",
             "namespace", "classified_at", "hint_path", "confidence",
-            "expires_at",
+            "expires_at", "links_at",
         }
         assert columns["namespace"]["dflt_value"] == "'default'"
         assert columns["classified_at"]["notnull"] == 0

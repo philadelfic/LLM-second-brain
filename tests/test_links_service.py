@@ -7,7 +7,9 @@
 
 * связи приходят только из ДРУГИХ неймспейсов (свой узел исключён);
 * потолок LINK_TOP (3) и сортировка по убыванию близости;
-* порог LINK_LAZY_THRESHOLD — граница включительная; ниже порога кандидат не идёт;
+* порог LINK_LAZY_THRESHOLD — граница включительная; ниже порога кандидат не идёт
+  (там, где тест поднимает его выше дефолта, вместе с ним поднимается
+  LINK_COSINE_THRESHOLD — инвариант 3.1.0: ленивый порог не выше порога связи);
 * сама заметка и soft-deleted исключены; заметка удалённого узла исключена;
 * заметка без вектора (`vector_status='pending'`) даёт пустой список без ошибки
   (отсутствие связей — не ошибка и не повод для hint);
@@ -121,14 +123,18 @@ class TestRelatedLevel0:
         self, seeded, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Кандидат ровно на пороге (косинус 1.0 при пороге 1.0) остаётся."""
-        related = _links(monkeypatch, LINK_LAZY_THRESHOLD="1.0").related(1)
+        related = _links(
+            monkeypatch, LINK_LAZY_THRESHOLD="1.0", LINK_COSINE_THRESHOLD="1.0"
+        ).related(1)
         assert [item["id"] for item in related] == [2]
 
     def test_candidate_below_threshold_is_dropped(
         self, seeded, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Порог 0.85: 3 (0.8) и ниже не проходят, 10 (0.9) проходит."""
-        related = _links(monkeypatch, LINK_LAZY_THRESHOLD="0.85").related(1)
+        related = _links(
+            monkeypatch, LINK_LAZY_THRESHOLD="0.85", LINK_COSINE_THRESHOLD="0.85"
+        ).related(1)
         assert [item["id"] for item in related] == [2, 10]
 
     def test_item_shape_and_chars(
@@ -153,7 +159,9 @@ class TestRelatedLevel0:
         self, seeded, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Нет кандидатов выше порога (порог 1.0, косинуса 1.0 ни у кого нет)."""
-        assert _links(monkeypatch, LINK_LAZY_THRESHOLD="1.0").related(5) == []
+        assert _links(
+            monkeypatch, LINK_LAZY_THRESHOLD="1.0", LINK_COSINE_THRESHOLD="1.0"
+        ).related(5) == []
 
     def test_limit_lowers_but_never_raises_ceiling(
         self, seeded, monkeypatch: pytest.MonkeyPatch

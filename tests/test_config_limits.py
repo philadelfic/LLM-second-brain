@@ -425,7 +425,8 @@ class TestErrorReport:
 
 
 class TestLinkLimits:
-    """Связи заметок, уровень 0 (lsb-0010): потолок/пул ≥ 1, порог 0..1."""
+    """Связи заметок (lsb-0010): потолок/пул ≥ 1, пороги 0..1 (уровень 0),
+    пороги и правила уровня 1 (lsb-0010-02)."""
 
     @pytest.mark.parametrize("bad_value", ["0", "-1"])
     def test_link_top_below_one_is_fatal(
@@ -455,3 +456,37 @@ class TestLinkLimits:
         assert settings.link_lazy_threshold == 0.50
         assert settings.link_lazy_threshold == settings.score_threshold
         assert settings.link_pool == 20
+
+    @pytest.mark.parametrize("bad_value", ["1.5", "-0.1"])
+    def test_link_cosine_threshold_out_of_range_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, bad_value: str
+    ) -> None:
+        """Уровень 1 (lsb-0010-02): порог косинуса — доля 0..1."""
+        with pytest.raises(ConfigError, match="link_cosine_threshold"):
+            load_env(monkeypatch, LINK_COSINE_THRESHOLD=bad_value)
+
+    @pytest.mark.parametrize(
+        ("env_name", "bad_value"),
+        [("LINK_ENTITIES_MIN_COMMON", "0"), ("LINK_ENTITIES_MIN_WORD_CHARS", "0")],
+    )
+    def test_link_entities_below_one_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, env_name: str, bad_value: str
+    ) -> None:
+        """Правило `entities`: число общих слов и длина значимого слова ≥ 1."""
+        with pytest.raises(ConfigError, match=env_name.lower()):
+            load_env(monkeypatch, **{env_name: bad_value})
+
+    def test_lazy_above_cosine_is_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Ленивый порог не выше порога связи: иначе фолбэк строже ядра."""
+        with pytest.raises(ConfigError, match="link_lazy_threshold"):
+            load_env(
+                monkeypatch, LINK_LAZY_THRESHOLD="0.80", LINK_COSINE_THRESHOLD="0.60"
+            )
+
+    def test_level1_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Дефолты уровня 1 (FR-2.3, arch §3.3): порог 0.70, слова 2 и 5."""
+        settings = load_env(monkeypatch)
+        assert settings.link_cosine_threshold == 0.70
+        assert settings.link_cosine_threshold > settings.link_lazy_threshold
+        assert settings.link_entities_min_common == 2
+        assert settings.link_entities_min_word_chars == 5

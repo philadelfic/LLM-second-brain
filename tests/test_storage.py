@@ -31,9 +31,10 @@ def _match(conn: sqlite3.Connection, needle: str) -> list[int]:
 
 class TestSchemaCreated:
     def test_notes_columns(self) -> None:
-        """Таблица notes — 14 колонок из ARCHITECTURE §3.3 (+Фаза 10 §5.7):
+        """Таблица notes — 15 колонок из ARCHITECTURE §3.3 (+Фаза 10 §5.7):
         9 базовых + namespace/classified_at + разметка причёски hint_path/
-        confidence + expires_at (lsb-0004-02). lsb-0005-04: пара
+        confidence + expires_at (lsb-0004-02) + links_at (lsb-0010-02 — маркер
+        расчёта связей уровня 1). lsb-0005-04: пара
         domain_hint/subdomain_hint снята со схемы — груминг переведён на
         единый hint_path."""
         init_db(get_settings())
@@ -45,7 +46,7 @@ class TestSchemaCreated:
             "id", "text", "title", "summary", "author", "vector_status",
             "summary_status", "created_at", "updated_at", "deleted_at",
             "namespace", "classified_at", "hint_path", "confidence",
-            "expires_at",
+            "expires_at", "links_at",
         }
         # DDL-умолчания: summary пуст, статусы pending, author unknown.
         assert columns["summary"]["dflt_value"] == "''"
@@ -56,6 +57,7 @@ class TestSchemaCreated:
         assert columns["namespace"]["dflt_value"] == "'default'"  # Фаза 10
         assert columns["classified_at"]["notnull"] == 0  # Фаза 10: NULL = не классифицирована
         assert columns["expires_at"]["notnull"] == 0  # lsb-0004-02: NULL = постоянная
+        assert columns["links_at"]["notnull"] == 0  # lsb-0010-02: NULL = связи не считаны
 
     def test_fts_external_content_trigram(self) -> None:
         """notes_fts — FTS5 внешний контент с trigram-токенизатором."""

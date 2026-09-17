@@ -63,6 +63,10 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "LINK_TOP": ("link_top", 3),
     "LINK_LAZY_THRESHOLD": ("link_lazy_threshold", 0.50),
     "LINK_POOL": ("link_pool", 20),
+    # lsb-0010 (3.1.0, постановка 7): связи уровня 1 — пороги расчёта.
+    "LINK_COSINE_THRESHOLD": ("link_cosine_threshold", 0.70),
+    "LINK_ENTITIES_MIN_COMMON": ("link_entities_min_common", 2),
+    "LINK_ENTITIES_MIN_WORD_CHARS": ("link_entities_min_word_chars", 5),
     "DEDUP_SIMILARITY": ("dedup_similarity", 0.92),
     # Фаза 8 (Этап 2.1): фоновый дедуп — косинус-кандидаты.
     "DEDUP_CANDIDATE_TOP_N": ("dedup_candidate_top_n", 3),

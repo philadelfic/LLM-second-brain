@@ -528,10 +528,15 @@ class NoteService:
 
         Если text НЕ передан (правка только title/summary/namespace):
         vector_status НЕ трогаем, вектор НЕ дропаем, чанки НЕ пересчитываем,
-        разметку причёски НЕ сбрасываем — меняются только запрошенные поля.
+        разметку причёски НЕ сбрасываем — меняются только запрошенные поля
+        (плюс сброс маркера связей при правке title — lsb-0010-02 ниже).
         Если text передан — полный штатный набор сбросов как раньше:
         vector_status='pending', замена чанков, дроп протухшего вектора,
         сброс разметки причёски (v2.1.1, аудит 2026-09-05).
+
+        lsb-0010-02: маркер связей `links_at` сбрасывается при правке `text`
+        ИЛИ `title` (название меняет и вектор, и правила entities/mention) —
+        заметка снова попадает в очередь расчёта связей.
 
         Обратная совместимость: вызов update(note_id, text) без
         title/summary/namespace работает как раньше — текст заменяется,
@@ -589,6 +594,12 @@ class NoteService:
         # Динамический UPDATE: трогаем только запрошенные поля.
         sets: list[str] = []
         params: list[object] = []
+        # lsb-0010-02: правка text или title возвращает заметку в очередь
+        # расчёта связей (маркер links_at). Название меняет и вектор, и правила
+        # entities/mention, поэтому сбрасывается и при правке одного title
+        # (разметка причёски — как раньше, только при text).
+        if text_changed or note_title is not None:
+            sets.append("links_at = NULL")
         if text_changed:
             sets.append("text = ?")
             params.append(text)
@@ -688,8 +699,9 @@ class NoteService:
         обе операции, либо ни одной (rollback), полусостояние исключено.
 
         Штатный набор update-сбросов (как в update без title): текст, замена
-        чанков, vector_status='pending', сброс summary и разметки причёски,
-        updated_at; **title не трогается** (решение №9), namespace сохраняется
+        чанков, vector_status='pending', сброс summary, разметки причёски и
+        маркера связей links_at; updated_at; **title не трогается** (решение
+        №9), namespace сохраняется
         (ранняя остаётся в своём узле). Guard `deleted_at IS NULL` на обеих
         заметках: операторский soft delete не перебивается.
 
@@ -709,6 +721,7 @@ class NoteService:
                 "vector_status = 'pending', "
                 "summary = '', summary_status = 'pending', "
                 "classified_at = NULL, hint_path = NULL, confidence = NULL, "
+                "links_at = NULL, "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
                 "WHERE id = ? AND deleted_at IS NULL",
                 (merged_text, older_id),

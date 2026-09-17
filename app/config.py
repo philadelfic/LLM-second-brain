@@ -129,6 +129,15 @@ class Settings(BaseSettings):
     link_lazy_threshold: float = 0.50
     link_pool: int = 20
 
+    # --- связи заметок, уровень 1: таблица links, расчёт без LLM (lsb-0010-02) ---
+    # LINK_COSINE_THRESHOLD — порог вида `cosine` (выше поискового: связь
+    # должна быть сильнее «просто похоже», FR-2.3); LINK_ENTITIES_MIN_COMMON —
+    # сколько общих значимых слов делают пару связью; LINK_ENTITIES_MIN_WORD_CHARS
+    # — минимальная длина значимого слова (arch §3.3).
+    link_cosine_threshold: float = 0.70
+    link_entities_min_common: int = 2
+    link_entities_min_word_chars: int = 5
+
     # --- лимиты (NFR-6: env-переопределяемы, валидируются; см. _validate_ranges) ---
     max_note_chars: int = 35000  # 2000→20000 (Фаза 7) → 35000 (решение О. 2026-08-30)
     max_query_chars: int = 512
@@ -300,6 +309,19 @@ class Settings(BaseSettings):
         need_low("link_top", self.link_top, 1)
         need_low("link_pool", self.link_pool, 1)
         need_range("link_lazy_threshold", self.link_lazy_threshold, 0.0, 1.0)
+        # Уровень 1 (lsb-0010-02): порог связи выше порога «ленивого графа»
+        # (FR-2.3, arch §3.1), иначе связь уровня 1 слабее своего фолбэка.
+        need_range("link_cosine_threshold", self.link_cosine_threshold, 0.0, 1.0)
+        need_low("link_entities_min_common", self.link_entities_min_common, 1)
+        need_low(
+            "link_entities_min_word_chars", self.link_entities_min_word_chars, 1
+        )
+        if self.link_lazy_threshold > self.link_cosine_threshold:
+            errors.append(
+                "  - link_lazy_threshold: порог ленивого уровня выше порога "
+                "связи link_cosine_threshold — связь уровня 1 оказалась бы "
+                "строже фолбэка уровня 0"
+            )
 
         # --- векторизация / суммаризация ---
         need_low("embedding_dim", self.embedding_dim, 1)
