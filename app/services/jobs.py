@@ -2,9 +2,10 @@
 
 Задача №48: джоба описывается структурой `JobSpec` и обслуживается одним
 циклом `run_loop` — новая джоба добавляется **регистрацией, а не копией
-петли**. Существующие петли `BackgroundWorker` в этой постановке работают
-по-старому (их перевод — отдельная постановка 4); реестр собирает
-`build_job_specs(worker, settings)` — точка расширения каркаса.
+петли**. Существующие петли `BackgroundWorker` переехали на этот каркас
+(постановка 4): тела цикла в воркере не дублируются — он описывает свои
+джобы сборщиками `build_*_job` и регистрирует их в `JOB_BUILDERS` (та же
+точка расширения собирает `build_job_specs(worker, settings)`).
 
 Контракт надёжности (REQUIREMENTS §5.2, job-framework arch §3.3) здесь не
 переизобретается, а переносится как есть: back-off `PENDING_RETRY_SEC` (30 с)
@@ -14,6 +15,11 @@
 убивает петлю (событие `loop_iteration_failed` с обязательным полем `job`);
 форма «по требованию» — пробуждение по событию с перепроверкой очереди
 **после** `clear()` (пул 6, lost wakeup — существующий паттерн).
+
+Джоба без очереди и без события (периодический обход, `expiration`)
+обслуживается **фиксированным** интервалом: `backoff_state.fixed=True` —
+пауза всегда равна `interval_sec`, back-off не растёт (FR-1.5 — поведение
+сохранено дословно).
 
 Ключевое правило отложенных заданий (arch §3.2): `process()` возвращает
 число **фактически обработанных** заданий. Задание, ждущее модель или
@@ -77,12 +83,31 @@ class BackoffState:
     Хранится вызывающей стороной (воркером), а не внутри `run_loop`: интервал
     переживает итерации и сбрасывается в `spec.interval_sec` при прогрессе,
     поэтому его видно в диагностике (`worker.interval` в тестах).
+
+    `fixed=True` — расписание БЕЗ back-off: рост интервала выключен, пауза
+    всегда равна стартовому интервалу джобы (`expiration`, arch §3.6: 300 с
+    «фикс, как сейчас») — периодический обход не зависит от внешних сервисов,
+    и сбой итерации не ускоряет/замедляет расписание (FR-1.5).
     """
 
-    __slots__ = ("interval",)
+    __slots__ = ("interval", "fixed")
 
-    def __init__(self, start_sec: int) -> None:
+    def __init__(self, start_sec: int, *, fixed: bool = False) -> None:
         self.interval = float(max(start_sec, 0))
+        self.fixed = fixed
+
+    def grow(self, start_sec: int) -> None:
+        """Следующий интервал ожидания: back-off до потолка или фиксированный.
+
+        Единая точка роста интервала для `run_loop`: у обычных джоб —
+        `next_interval` (удвоение до `MAX_INTERVAL_SEC`), у джоб с фиксированным
+        расписанием — стартовый интервал без изменений.
+        """
+        self.interval = (
+            float(max(start_sec, 0))
+            if self.fixed
+            else next_interval(self.interval, start_sec)
+        )
 
 
 def log_job(
@@ -148,6 +173,11 @@ async def run_loop(
     `next_interval()`. `CancelledError` пробрасывается (graceful stop); прочее
     исключение не убивает петлю — warning с traceback, пауза, back-off.
 
+    Расписание может быть фиксированным (`backoff_state.fixed` — периодический
+    обход без очереди, `expiration`, arch §3.6): пауза всегда равна стартовому
+    интервалу джобы, back-off не растёт, прогон расписание не сдвигает
+    (FR-1.5 — поведение сохранено дословно).
+
     Выключенная джоба (`enabled=False`) цикл не запускает вовсе: реестр её
     сохраняет (очередь видна в `/health`), но обслуживать нечего.
     """
@@ -156,6 +186,11 @@ async def run_loop(
     while not stopping():
         try:
             processed = await spec.process()
+            if backoff_state.fixed:
+                # Периодический обход с фиксированным расписанием: пауза — это
+                # интервал джобы, а не наличие работы (выгребать нечего).
+                await asyncio.sleep(backoff_state.interval)
+                continue
             if processed > 0:
                 backoff_state.interval = float(spec.interval_sec)
                 continue
@@ -164,9 +199,7 @@ async def run_loop(
                 await _call_hook(spec.idle_hook)
             if spec.wait_event is None:
                 await asyncio.sleep(backoff_state.interval)
-                backoff_state.interval = next_interval(
-                    backoff_state.interval, spec.interval_sec
-                )
+                backoff_state.grow(spec.interval_sec)
                 continue
             # Форма «по требованию»: перепроверка очереди ПОСЛЕ clear() (пул 6,
             # lost wakeup) — работа, появившаяся до clear(), видна селекту
@@ -180,9 +213,7 @@ async def run_loop(
                     spec.wait_event.wait(), timeout=backoff_state.interval
                 )
             except asyncio.TimeoutError:
-                backoff_state.interval = next_interval(
-                    backoff_state.interval, spec.interval_sec
-                )
+                backoff_state.grow(spec.interval_sec)
         except asyncio.CancelledError:
             raise  # отмена петли (graceful stop) — не глотать
         except Exception:
@@ -194,9 +225,7 @@ async def run_loop(
                 exc_info=True,
             )
             await asyncio.sleep(backoff_state.interval)
-            backoff_state.interval = next_interval(
-                backoff_state.interval, spec.interval_sec
-            )
+            backoff_state.grow(spec.interval_sec)
 
 
 # Сборщик джобы: описывает свою джобу и возвращает None, если она неприменима
@@ -216,8 +245,9 @@ def build_job_specs(
     """Собрать реестр джоб по зарегистрированным сборщикам (FR-1.1).
 
     Сборщик, вернувший None (джоба неприменима в этой сборке), в реестр не
-    попадает. Существующие петли воркера пока работают по-старому — их
-    регистрация здесь появляется постановкой 4.
+    попадает. Свои сборщики в реестр дописывает модуль, которому принадлежат
+    джобы: существующие петли воркера регистрируются в `worker.py`
+    (постановка 4), новые джобы — каждый в своём модуле (FR-1.6).
     """
     specs: list[JobSpec] = []
     for build in JOB_BUILDERS:

@@ -251,3 +251,17 @@ def test_seeded_creator_skill_is_vectorized(tmp_path, monkeypatch) -> None:
             )
             is not None
         )
+
+
+def test_area_embed_failed_event_carries_job_areas(settings, caplog) -> None:
+    """События джобы areas несут обязательное поле job (FR-1.4)."""
+    _seed_pending_areas()
+    worker = BackgroundWorker(settings, FailingEmbedder())
+    with caplog.at_level("WARNING", logger="app"):
+        assert worker.process_pending_areas() == 0
+    events = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "area_embed_failed"
+    ]
+    assert {record.job for record in events} == {"areas"}

@@ -12,14 +12,19 @@ WHERE expires_at <= now(); для каждого id — полное физич�
 
 from __future__ import annotations
 
+import asyncio
+import logging
+
 import pytest
 from fakes import HashEmbedder
 
 from app.config import get_settings
+from app.services.jobs import run_loop
 from app.services.notes import NoteService
 from app.services.worker import (
     EXPIRATION_CLEANUP_INTERVAL_SEC,
     BackgroundWorker,
+    build_expiration_job,
 )
 from app.storage import chunks, vectors
 from app.storage.db import init_db, session, transaction
@@ -161,3 +166,72 @@ class TestExpirationCleanup:
     def test_interval_constant(self) -> None:
         """Интервал фиксированный — 5 минут (решение О. 2026-09-09)."""
         assert EXPIRATION_CLEANUP_INTERVAL_SEC == 5 * 60
+
+
+# --- каркас джоб (lsb-0014-02): джоба expiration на едином цикле --------------
+
+
+def test_expiration_job_is_pinned_to_fixed_schedule(settings) -> None:
+    """Джоба зачистки: расписание фиксировано — 300 с без back-off (FR-1.5).
+
+    Описание джобы (queue=None, без сигнала, интервал 300 с) плюс состояние
+    back-off с `fixed=True`: каркасный цикл держит паузу 300 с, рост интервала
+    на пустых прогонах и на сбое итерации выключен — как было до перевода.
+    """
+    worker = make_worker(settings)
+    spec = build_expiration_job(worker, settings)
+    assert (spec.name, spec.queue, spec.wait_event) == ("expiration", None, None)
+    assert spec.enabled and spec.idle_hook is None  # без очереди и без события
+    assert spec.interval_sec == EXPIRATION_CLEANUP_INTERVAL_SEC == 5 * 60
+    assert worker._backoff["expiration"].fixed is True
+
+
+@pytest.mark.asyncio
+async def test_expiration_loop_keeps_fixed_300(
+    settings, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """Цикл джобы зачистки: пауза ровно 300 с, прогресс расписание не сдвигает.
+
+    Прогон с удалением просроченной заметки (прогресс) и пустые прогоны —
+    пауза всегда EXPIRATION_CLEANUP_INTERVAL_SEC (back-off не растёт), событие
+    `expiration_cleanup` несёт обязательное поле `job` (FR-1.4/FR-1.5).
+    """
+    note_id = _insert_note_with_ttl(
+        settings, "просроченная заметка", "2000-01-01T00:00:00Z"
+    )
+    worker = make_worker(settings)
+    spec = build_expiration_job(worker, settings)
+    state = worker._backoff["expiration"]  # боевое состояние джобы воркера
+    real_process = worker.process_expired_notes
+    calls = 0
+
+    def counting_process() -> int:
+        nonlocal calls
+        calls += 1
+        return real_process()
+
+    worker.process_expired_notes = counting_process
+    delays: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def spy_sleep(delay: float, *args: object, **kwargs: object) -> None:
+        delays.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", spy_sleep)
+    with caplog.at_level(logging.INFO, logger="app"):
+        await asyncio.wait_for(
+            run_loop(spec, lambda: calls >= 3, state), timeout=2.0
+        )
+    assert calls == 3
+    assert delays == [300.0, 300.0, 300.0]  # фиксированные 300 с, без роста
+    assert state.interval == float(EXPIRATION_CLEANUP_INTERVAL_SEC)
+    # Зачистка выполнена (уборка идёт), событие несёт поле job.
+    assert _counts(settings, note_id)["notes"] == 0
+    events = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "expiration_cleanup"
+    ]
+    assert [record.job for record in events] == ["expiration"]
+    assert events[0].count == 1

@@ -4,7 +4,7 @@
 (Фаза 11, решение №10; релиз 3.0.0 — петля областей) — состояния
 pending-статусов в БД (переживают рестарт, догоняются при старте сервиса):
 
-- **embedding-петля** (`_run_embedding`): вектора заметок (`pending_vector` →
+- **embedding-джоба** (`build_embedding_job`): вектора заметок (`pending_vector` →
   batch `embed_texts` → notes_vec, vector_status='ok'; полный вектор — по
   конкатенации title+text, `_embed_input`, lsb-0001 FR-1.1) + чанковая очередь
   (Фаза 7, анти-джоин «нет строки в notes_chunks_vec»). Объединены в одну
@@ -12,13 +12,13 @@ pending-статусов в БД (переживают рестарт, дого�
   вектора каждой заметки создаётся judge-работа (дедуп) — диспетчер
   зависимостей (решение №10): судья опрашивается только по довекторизованной
   заметке.
-- **summary-петля** (`_run_summary`): title-догенерация (миграция, title IS
+- **summary-джоба** (`build_summary_job`): title-догенерация (миграция, title IS
   NULL) → summarize → merge (слияние дублей) → классификация → описание узла.
   notify будит эту петлю (save/update).
-- **judge-петля** (`_run_judge`): судья дедупа (по judge-работам, созданным
+- **judge-джоба** (`build_judge_job`): судья дедупа (по judge-работам, созданным
   embedding-петлёй) + судья структуры (внутри PromotionService, триггер после
   классификации).
-- **петля areas** (`_run_areas`, субстрат 3.0.0): вектора записей областей
+- **джоба areas** (`build_areas_job`, субстрат 3.0.0): вектора записей областей
   skills/terms/user (`vector_status='pending'` → батч `embed_texts` → vec0
   области, 'ok'). Без LLM в момент записи (архитектура субстрата §3.3):
   тексты областей — `AreaSpec.embed_text` (skills `name + description`,
@@ -26,6 +26,12 @@ pending-статусов в БД (переживают рестарт, дого�
   `area_embed_failed`, записи остаются pending, повтор по своему back-off.
   Смена модели/размерности дропает area-vec вместе с notes_vec
   (`db._sync_embedding_meta`) — все записи областей возвращаются в pending.
+
+Петли описаны `JobSpec`-ами и обслуживаются каркасом джоб (lsb-0014-02,
+`app/services/jobs.py`): тела цикла, back-off и супервизор итерации — общие,
+воркер держит работу (`process_*`), перепроверку очереди, сигналы и гигиену.
+Сборщики своих джоб — `build_*_job` в конце модуля (регистрация — строка в
+реестре каркаса). События работ несут обязательное поле `job` (FR-1.4).
 
 Job-очереди в БД по слотам (`worker_jobs`): judge-работа (kind='dedup')
 создаётся ТОЛЬКО после готовности вектора заметки; merge-работа (kind='merge')
@@ -52,8 +58,8 @@ Garanties:
 - `process_*` синхронные (выполняются в `asyncio.to_thread` — event loop не
   занимаем); чанковая очередь Фазы 7 — своя async-обработка: кодирование
   подъёмок размножается Semaphore'ом прямо в петле, транзакции записи —
-  короткие в to_thread. `run` — asyncio-таска (все петли под gather),
-  старт/стоп — в lifespan.
+  короткие в to_thread. `run` — asyncio-таска (все джобы реестра под
+  каркасным `run_loop`), старт/стоп — в lifespan.
 
 Запись суммари защищена от гонки с memory_update: между вычиткой текста и
 записью воркер мог получить обновлённый текст — UPDATE ограничен условием
@@ -94,6 +100,7 @@ import json
 import logging
 
 from app.config import TITLE_MAX_WORDS, Settings
+from app.services import jobs
 from app.services.areas import AreaSpec, ALL_AREAS
 from app.services.classifier import ClassificationError, Classifier
 from app.services.dedup import DeduplicationService
@@ -103,7 +110,13 @@ from app.services.embedding import Embedder, EmbeddingError
 # `MAX_INTERVAL_SEC as MAX_INTERVAL_SEC` — явный ре-экспорт: на него по-прежнему
 # ссылаются существующие тесты (tests/test_worker.py).
 from app.services.jobs import MAX_INTERVAL_SEC as MAX_INTERVAL_SEC
-from app.services.jobs import next_interval
+from app.services.jobs import (
+    BackoffState,
+    JobSpec,
+    build_job_specs,
+    next_interval,
+    run_loop,
+)
 from app.services.judge import Judge, JudgeError
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
@@ -119,7 +132,18 @@ WORKER_JOBS_RETENTION_DAYS = 7
 
 # Интервал джобы зачистки просроченных заметок (lsb-0004-02, этап 4):
 # фиксированные 5 минут (решение О. 2026-09-09), без настройки в компоузе.
+# Джоба без очереди и без события: её состояние back-off помечено
+# `fixed=True` — каркас держит паузу 300 с, back-off не растёт (поведение
+# дословно как было, FR-1.5).
 EXPIRATION_CLEANUP_INTERVAL_SEC = 5 * 60
+
+# Имена джоб воркера (каркас lsb-0014): `JobSpec.name`, ключ состояния back-off
+# и обязательное поле `job` в журнале — одна строка на джобу.
+EMBEDDING_JOB = "embedding"
+SUMMARY_JOB = "summary"
+JUDGE_JOB = "judge"
+AREAS_JOB = "areas"
+EXPIRATION_JOB = "expiration"
 
 # Промпт догенерации названия (решение №9): ЗАШИТ в SummaryService.title
 # (follow-up 6b — протокол Summarizer получил метод title; здесь раньше был
@@ -139,7 +163,13 @@ def _embed_input(title: str | None, text: str) -> str:
 
 
 class BackgroundWorker:
-    """Единственный фоновый воркер; очереди — pending-статусы в БД + worker_jobs."""
+    """Единственный фоновый воркер; очереди — pending-статусы в БД + worker_jobs.
+
+    Цикл, back-off и супервизор итерации — каркасные (app/services/jobs.py,
+    lsb-0014-02): воркер описывает свои джобы `JobSpec`-ами (сборщики
+    `build_*_job` в конце модуля) и регистрирует их в реестре. События работ
+    несут обязательное поле `job` (имя джобы, которой принадлежит работа).
+    """
 
     def __init__(
         self,
@@ -181,10 +211,22 @@ class BackgroundWorker:
         # после классификации; None — тестовый режим без триггера (в проде
         # DI из build_services: describer + судья структуры).
         self._promoter = promoter
-        self._vector_interval = float(max(settings.pending_retry_sec, 0))
-        self._summary_interval = float(max(settings.pending_retry_sec, 0))
-        self._judge_interval = float(max(settings.pending_retry_sec, 0))
-        self._areas_interval = float(max(settings.pending_retry_sec, 0))
+        # Состояние back-off по джобам (каркас lsb-0014): один объект на джобу,
+        # живёт в воркере — интервал переживает итерации цикла и виден в
+        # диагностике (свойства interval/summary_interval/judge_interval/
+        # areas_interval). Стартовые интервалы — как были: PENDING_RETRY_SEC у
+        # очередей, фиксированные 300 с у зачистки просроченных заметок.
+        # Зачистка — единственная джоба с ФИКСИРОВАННЫМ расписанием
+        # (`fixed=True`): пауза всегда 300 с, back-off не растёт (FR-1.5).
+        self._backoff: dict[str, BackoffState] = {
+            EMBEDDING_JOB: BackoffState(settings.pending_retry_sec),
+            SUMMARY_JOB: BackoffState(settings.pending_retry_sec),
+            JUDGE_JOB: BackoffState(settings.pending_retry_sec),
+            AREAS_JOB: BackoffState(settings.pending_retry_sec),
+            EXPIRATION_JOB: BackoffState(
+                EXPIRATION_CLEANUP_INTERVAL_SEC, fixed=True
+            ),
+        }
         self._stopping = False
         # Сигнал «появилась заметка с pending summary» — будит петлю
         # суммаризации немедленно (save/update), минуя выросший back-off.
@@ -209,32 +251,32 @@ class BackgroundWorker:
 
     @property
     def interval(self) -> float:
-        """Текущий интервал embedding-петли (диагностика, тесты)."""
-        return self._vector_interval
+        """Текущий интервал embedding-джобы (диагностика, тесты)."""
+        return self._backoff[EMBEDDING_JOB].interval
 
     @property
     def summary_interval(self) -> float:
-        """Текущий интервал суммаризационной петли (диагностика, тесты)."""
-        return self._summary_interval
+        """Текущий интервал summary-джобы (диагностика, тесты)."""
+        return self._backoff[SUMMARY_JOB].interval
 
     @property
     def chunk_interval(self) -> float:
         """Интервал чанковой очереди (диагностика, тесты, Фаза 7).
 
-        Чанковая очередь объединена с векторной в embedding-петлю (решение
-        №10) — интервал общий с `interval`.
+        Чанковая очередь объединена с векторной в одну джобу (решение №10) —
+        интервал общий с `interval`.
         """
-        return self._vector_interval
+        return self._backoff[EMBEDDING_JOB].interval
 
     @property
     def judge_interval(self) -> float:
-        """Текущий интервал judge-петли (диагностика, тесты, Фаза 11)."""
-        return self._judge_interval
+        """Текущий интервал judge-джобы (диагностика, тесты, Фаза 11)."""
+        return self._backoff[JUDGE_JOB].interval
 
     @property
     def areas_interval(self) -> float:
-        """Текущий интервал петли areas (диагностика, тесты, субстрат 3.0.0)."""
-        return self._areas_interval
+        """Текущий интервал джобы areas (диагностика, тесты, субстрат 3.0.0)."""
+        return self._backoff[AREAS_JOB].interval
 
     def stop(self) -> None:
         """Мягкая остановка: петли завершатся после разборки текущей итерации."""
@@ -267,212 +309,129 @@ class BackgroundWorker:
         """
         self._areas_event.set()
 
-    async def run(self) -> None:
-        """Все петли очередей (запускается asyncio-таской при старте).
+    def _is_stopping(self) -> bool:
+        """Предикат мягкой остановки для каркасного цикла (`run_loop`)."""
+        return self._stopping
 
-        Обработанные партии идут одна за другой (очередь выгребаем сразу);
-        пустой прогон — пауза на текущий интервал петли с удвоением.
-        Петли независимы: back-off и выгребание — раздельные.
-        """
-        await asyncio.gather(
-            self._run_embedding(), self._run_summary(), self._run_judge(),
-            self._run_areas(), self._run_expiration_cleanup(),
+    def _job_backoff(self, spec: JobSpec) -> BackoffState:
+        """Состояние back-off джобы (для незарегистрированной — её интервал)."""
+        return self._backoff.setdefault(
+            spec.name, BackoffState(spec.interval_sec)
         )
 
-    async def _run_embedding(self) -> None:
-        while not self._stopping:
-            try:
-                processed = 0
-                processed += await asyncio.to_thread(self.process_pending)
-                processed += await self.process_pending_chunks()
-                if processed:
-                    self._vector_interval = float(
-                        self._settings.pending_retry_sec
-                    )  # успех — сброс
-                    continue
-                # Idle-ветка (пул 5): работ нет — гигиена worker_jobs
-                # (done-старше retention вычищаются) перед сном.
-                await asyncio.to_thread(self._purge_done_jobs)
-                await asyncio.sleep(self._vector_interval)
-                self._vector_interval = next_interval(
-                    self._vector_interval, self._settings.pending_retry_sec
-                )
-            except asyncio.CancelledError:
-                raise  # отмена петли (graceful stop) — не глотать
-            except Exception:
-                # Супервизор петли (пул 4): НЕПРЕДВИДЕННЫЙ сбой итерации
-                # (StorageError при исчерпании busy_timeout, дефект кода,
-                # «громкий» re-raise из _store_chunk_vectors) не убивает
-                # корутину — warning с traceback, пауза и повтор по back-off.
-                logging.getLogger("app").warning(
-                    "worker loop iteration failed — loop continues",
-                    extra={"event": "loop_iteration_failed", "loop": "embedding"},
-                    exc_info=True,
-                )
-                await asyncio.sleep(self._vector_interval)
-                self._vector_interval = next_interval(
-                    self._vector_interval, self._settings.pending_retry_sec
-                )
+    async def run(self) -> None:
+        """Все джобы реестра — единым каркасным циклом (asyncio-таска).
+
+        Джобы собираются `build_job_specs` (реестр `JobSpec`-ов каркаса; свои
+        джобы воркер регистрирует в конце модуля) и обслуживаются `run_loop`.
+        Обработанные партии идут одна за другой (очередь выгребаем сразу);
+        пустой прогон — ожидание сигнала `notify_*` (форма «по требованию») или
+        пауза по back-off. Джобы независимы: интервал и выгребание —
+        раздельные (свой `BackoffState` на джобу).
+        """
+        specs = build_job_specs(self, self._settings)
+        await asyncio.gather(
+            *(
+                run_loop(spec, self._is_stopping, self._job_backoff(spec))
+                for spec in specs
+            )
+        )
+
+    # --- работа джоб (цикл, back-off и супервизор — в каркасе) -----------------
+
+    async def _process_embedding(self) -> int:
+        """Прогон embedding-джобы: notes-очередь (в потоке) + чанковая очередь.
+
+        Обе очереди — одна джоба (решение №10): полные вектора заметок
+        (`process_pending` — синхронный SQL/HTTP, уходит в `to_thread`) и
+        чанковая очередь (`process_pending_chunks` — своя async-обработка с
+        Semaphore внутри). Возвращает число фактически обработанных заданий:
+        0 уводит каркасную петлю в ожидание с back-off (arch §3.2).
+        """
+        processed = await asyncio.to_thread(self.process_pending)
+        processed += await self.process_pending_chunks()
+        return processed
+
+    async def _process_summary(self) -> int:
+        """Прогон summary-джобы: title-доген → summarize → merge (три шага).
+
+        Каждый шаг — синхронный SQL/LLM, уходит в `to_thread`; порядок шагов
+        сохранён (как в исходной петле). Возвращает число обработанных
+        заданий: 0 уводит каркасную петлю к ожиданию сигнала
+        `notify_summary_pending` (форма «по требованию», пул 6) или таймаута.
+        """
+        processed = await asyncio.to_thread(self.process_title_pending)
+        processed += await asyncio.to_thread(self.process_summary_pending)
+        processed += await asyncio.to_thread(self.process_merge_pending)
+        return processed
 
     async def _run_summary(self) -> None:
-        if self._summarizer is None:
-            return  # тестовый режим без суммаризатора: петля не нужна
-        while not self._stopping:
-            try:
-                processed = 0
-                processed += await asyncio.to_thread(self.process_title_pending)
-                processed += await asyncio.to_thread(self.process_summary_pending)
-                processed += await asyncio.to_thread(self.process_merge_pending)
-                if processed:
-                    self._summary_interval = float(self._settings.pending_retry_sec)
-                    continue
-                # Пустой прогон: ждём сигнал «новая заметка» (save/update) или
-                # таймаут back-off. Сигнал будит петлю немедленно — суммаризация
-                # стартует сразу после записи, а не через выросший интервал.
-                # Пул 6 (lost wakeup): перепроверяем очередь ПОСЛЕ clear() —
-                # так окно гонки закрыто полностью: работа, появившаяся до
-                # clear(), видна селекту (продолжаем без сна); появившаяся
-                # после — будит event, который clear() уже не трогает.
-                # (Перепроверка ДО clear оставляла микро-окно «notify между
-                # селектом и clear» — сигнал стирался бы.)
-                if not await asyncio.to_thread(self._summary_queue_empty):
-                    continue
-                self._summary_event.clear()
-                try:
-                    await asyncio.wait_for(
-                        self._summary_event.wait(), timeout=self._summary_interval
-                    )
-                except asyncio.TimeoutError:
-                    self._summary_interval = next_interval(
-                        self._summary_interval, self._settings.pending_retry_sec
-                    )
-            except asyncio.CancelledError:
-                raise  # отмена петли (graceful stop) — не глотать
-            except Exception:
-                # Супервизор петли (пул 4): непредвиденный сбой итерации не
-                # убивает summary-петлю — warning с traceback, пауза, повтор.
-                logging.getLogger("app").warning(
-                    "worker loop iteration failed — loop continues",
-                    extra={"event": "loop_iteration_failed", "loop": "summary"},
-                    exc_info=True,
-                )
-                await asyncio.sleep(self._summary_interval)
-                self._summary_interval = next_interval(
-                    self._summary_interval, self._settings.pending_retry_sec
-                )
+        """Обслуживать summary-джобу каркасным циклом (запуск одной джобы).
+
+        Тело петли живёт в каркасе; метод оставлен для изолированного запуска
+        одной джобы — так тесты пула 6 (lost wakeup) проверяют селект по
+        очереди и `clear()` сигнала без остальных петель.
+        """
+        spec = build_summary_job(self, self._settings)
+        if spec is None:
+            return  # без суммаризатора джоба неприменима (тестовый режим)
+        await run_loop(spec, self._is_stopping, self._backoff[SUMMARY_JOB])
+
+    async def _process_judge(self) -> int:
+        """Прогон judge-джобы: партия judge-работ (дедуп) в `to_thread`.
+
+        0 уводит каркасную петлю к ожиданию сигнала `notify_judge_pending`
+        (форма «по требованию», пул 6) или таймаута интервала.
+        """
+        return await asyncio.to_thread(self.process_judge_pending)
 
     async def _run_judge(self) -> None:
-        while not self._stopping:
-            try:
-                processed = await asyncio.to_thread(self.process_judge_pending)
-                if processed:
-                    self._judge_interval = float(self._settings.pending_retry_sec)
-                    continue
-                # Пустой прогон: ждём сигнал «появилась judge-работа» или таймаут
-                # back-off. Сигнал будит петлю немедленно после довекторизации.
-                # Пул 6 (lost wakeup): перепроверка ПОСЛЕ clear() — окно
-                # «notify между селектом и clear» закрыто (см. комментарий
-                # в _run_summary).
-                if not await asyncio.to_thread(self._judge_queue_empty):
-                    continue
-                self._judge_event.clear()
-                try:
-                    await asyncio.wait_for(
-                        self._judge_event.wait(), timeout=self._judge_interval
-                    )
-                except asyncio.TimeoutError:
-                    self._judge_interval = next_interval(
-                        self._judge_interval, self._settings.pending_retry_sec
-                    )
-            except asyncio.CancelledError:
-                raise  # отмена петли (graceful stop) — не глотать
-            except Exception:
-                # Супервизор петли (пул 4): непредвиденный сбой итерации не
-                # убивает judge-петлю — warning с traceback, пауза, повтор.
-                logging.getLogger("app").warning(
-                    "worker loop iteration failed — loop continues",
-                    extra={"event": "loop_iteration_failed", "loop": "judge"},
-                    exc_info=True,
-                )
-                await asyncio.sleep(self._judge_interval)
-                self._judge_interval = next_interval(
-                    self._judge_interval, self._settings.pending_retry_sec
-                )
+        """Обслуживать judge-джобу каркасным циклом (запуск одной джобы).
 
-    # --- петля areas: вектора записей областей (субстрат 3.0.0) ---------------
-
-    async def _run_areas(self) -> None:
-        """Петля векторизации областей (субстрат 3.0.0, архитектура §3.3).
-
-        Своя очередь, свой интервал/back-off и свой сигнал: отказ векторизации
-        областей не мешает заметкам и наоборот (ARCH §3.4). Пустой прогон —
-        проверка очереди ПОСЛЕ clear() (пул 6, lost wakeup, как в
-        _run_summary/_run_judge) и ожидание сигнала notify_areas_pending() или
-        таймаута интервала. Супервизор петли (пул 4): непредвиденный сбой
-        итерации не убивает петлю — warning с traceback, пауза, повтор.
+        См. `_run_summary`: изоляция одной джобы — для тестов пула 6
+        (lost wakeup) по judge-очереди.
         """
-        while not self._stopping:
-            try:
-                processed = await asyncio.to_thread(self.process_pending_areas)
-                if processed:
-                    self._areas_interval = float(self._settings.pending_retry_sec)
-                    continue
-                if not await asyncio.to_thread(self._areas_queue_empty):
-                    continue
-                self._areas_event.clear()
-                try:
-                    await asyncio.wait_for(
-                        self._areas_event.wait(), timeout=self._areas_interval
-                    )
-                except asyncio.TimeoutError:
-                    self._areas_interval = next_interval(
-                        self._areas_interval, self._settings.pending_retry_sec
-                    )
-            except asyncio.CancelledError:
-                raise  # отмена петли (graceful stop) — не глотать
-            except Exception:
-                logging.getLogger("app").warning(
-                    "worker loop iteration failed — loop continues",
-                    extra={"event": "loop_iteration_failed", "loop": "areas"},
-                    exc_info=True,
-                )
-                await asyncio.sleep(self._areas_interval)
-                self._areas_interval = next_interval(
-                    self._areas_interval, self._settings.pending_retry_sec
-                )
+        spec = build_judge_job(self, self._settings)
+        await run_loop(spec, self._is_stopping, self._backoff[JUDGE_JOB])
+
+    # --- джоба areas: вектора записей областей (субстрат 3.0.0) ---------------
+
+    async def _process_areas(self) -> int:
+        """Прогон джобы areas: партия pending-записей областей в `to_thread`.
+
+        Своя очередь, свой back-off и свой сигнал: отказ векторизации областей
+        не мешает заметкам и наоборот (ARCH §3.4). 0 уводит каркасную петлю к
+        ожиданию `notify_areas_pending` (пул 6) или таймаута интервала.
+        """
+        return await asyncio.to_thread(self.process_pending_areas)
 
     # --- джоба зачистки просроченных заметок (lsb-0004-02, этап 4) -----------
 
-    async def _run_expiration_cleanup(self) -> None:
-        """Петля зачистки просроченных заметок (lsb-0004-02, этап 4).
+    async def _process_expiration(self) -> int:
+        """Прогон джобы expiration: зачистка просроченных заметок.
 
-        Раз в EXPIRATION_CLEANUP_INTERVAL_SEC (фиксированные 5 минут, решение
-        О. 2026-09-09) выгребает note_expirations: заметки с
-        `expires_at <= now()` удаляются ПОЛНОСТЬЮ (notes+chunks+вектора+fts)
-        вместе со строкой из note_expirations. Интервал фиксированный — без
-        back-off (в отличие от очередей pending): зачистка не зависит от
-        внешних сервисов, сбой итерации не ускоряет/замедляет расписание.
-        Супервизор петли (пул 4): непредвиденный сбой итерации не убивает
-        петлю — warning с traceback, пауза на интервал, повтор.
+        Выгребает note_expirations: заметки с `expires_at <= now()` удаляются
+        ПОЛНОСТЬЮ (notes+chunks+вектора+fts) вместе со строкой из
+        note_expirations (`process_expired_notes` в `to_thread`); удалено > 0
+        — событие `expiration_cleanup` с обязательным полем `job`. Джоба
+        обслуживается по ФИКСИРОВАННОМУ расписанию (её состояние back-off —
+        `fixed=True`): пауза всегда EXPIRATION_CLEANUP_INTERVAL_SEC
+        (фиксированные 5 минут, решение О. 2026-09-09), back-off не растёт —
+        зачистка не зависит от внешних сервисов, расписание не
+        ускоряется/замедляется (FR-1.5). Возвращает число удалённых заметок
+        (расписание ведёт интервал, а не прогресс — см. `run_loop`).
         """
-        while not self._stopping:
-            try:
-                deleted = await asyncio.to_thread(self.process_expired_notes)
-                if deleted:
-                    logging.getLogger("app").info(
-                        "expiration cleanup: purged expired notes",
-                        extra={"event": "expiration_cleanup", "count": deleted},
-                    )
-                await asyncio.sleep(EXPIRATION_CLEANUP_INTERVAL_SEC)
-            except asyncio.CancelledError:
-                raise  # отмена петли (graceful stop) — не глотать
-            except Exception:
-                logging.getLogger("app").warning(
-                    "expiration cleanup loop iteration failed — loop continues",
-                    extra={"event": "loop_iteration_failed", "loop": "expiration"},
-                    exc_info=True,
-                )
-                await asyncio.sleep(EXPIRATION_CLEANUP_INTERVAL_SEC)
+        deleted = await asyncio.to_thread(self.process_expired_notes)
+        if deleted:
+            logging.getLogger("app").info(
+                "expiration cleanup: purged expired notes",
+                extra={
+                    "event": "expiration_cleanup",
+                    "job": EXPIRATION_JOB,
+                    "count": deleted,
+                },
+            )
+        return deleted
 
     def process_expired_notes(self) -> int:
         """Удалить просроченные заметки; возвращает число удалённых.
@@ -563,6 +522,7 @@ class BackgroundWorker:
                 "worker_jobs: purged done jobs older than retention window",
                 extra={
                     "event": "jobs_purged",
+                    "job": EMBEDDING_JOB,
                     "count": cursor.rowcount,
                     "retention_days": WORKER_JOBS_RETENTION_DAYS,
                 },
@@ -753,6 +713,7 @@ class BackgroundWorker:
                 "area vectorization failed — records stay pending",
                 extra={
                     "event": "area_embed_failed",
+                    "job": AREAS_JOB,
                     "area": spec.name,
                     "count": len(rows),
                 },
@@ -873,6 +834,7 @@ class BackgroundWorker:
                         "dedup: judge undecidable — both notes kept, retry queued",
                         extra={
                             "event": "dedup_judge_failed",
+                            "job": JUDGE_JOB,
                             "note_id": note_id,
                             "candidates": [
                                 candidate_id for candidate_id, _ in alive
@@ -968,6 +930,7 @@ class BackgroundWorker:
                     "dedup: summarizer merge failed — both notes kept, retry queued",
                     extra={
                         "event": "dedup_merge_failed",
+                        "job": SUMMARY_JOB,
                         "older_id": older_id,
                         "note_id": note_id,
                     },
@@ -977,6 +940,7 @@ class BackgroundWorker:
                 "dedup: duplicate merged into earlier note",
                 extra={
                     "event": "dedup_merged",
+                    "job": SUMMARY_JOB,
                     "older_id": older_id,
                     "note_id": note_id,
                     "cosine": payload.get("cosine"),
@@ -1018,6 +982,7 @@ class BackgroundWorker:
                 "dedup: cosine candidates found for vectorized note",
                 extra={
                     "event": "dedup_candidates",
+                    "job": JUDGE_JOB,
                     "note_id": note_id,
                     "candidates": older,
                 },
@@ -1070,6 +1035,7 @@ class BackgroundWorker:
                 "dedup: judge verdict for cosine candidate",
                 extra={
                     "event": "dedup_judge",
+                    "job": JUDGE_JOB,
                     "note_id": note_id,
                     "candidate_id": candidate_id,
                     "cosine": cosine_value,
@@ -1118,7 +1084,11 @@ class BackgroundWorker:
             except SummaryError:
                 logging.getLogger("app").warning(
                     "title: generation failed — kept null, retry by back-off",
-                    extra={"event": "title_failed", "note_id": row["id"]},
+                    extra={
+                        "event": "title_failed",
+                        "job": SUMMARY_JOB,
+                        "note_id": row["id"],
+                    },
                 )
                 continue  # отказ: title остаётся NULL, повтор по back-off
             title = self._truncate_title(generated)
@@ -1151,6 +1121,7 @@ class BackgroundWorker:
                     "title: generated for migration note",
                     extra={
                         "event": "title_generated",
+                        "job": SUMMARY_JOB,
                         "note_id": row["id"],
                         "vector_invalidated": stale,
                     },
@@ -1197,7 +1168,11 @@ class BackgroundWorker:
             except SummaryError:
                 logging.getLogger("app").warning(
                     "summary: generation failed — kept pending, retry by back-off",
-                    extra={"event": "summary_failed", "note_id": row["id"]},
+                    extra={
+                        "event": "summary_failed",
+                        "job": SUMMARY_JOB,
+                        "note_id": row["id"],
+                    },
                 )
                 continue  # отказ: status pending остаётся, повтор по back-off
             with session(self._settings) as conn, transaction(conn):
@@ -1221,7 +1196,11 @@ class BackgroundWorker:
                         # дальше, классификация этой — после следующего update.
                         logging.getLogger("app").warning(
                             "classify: internal error — enrichment deferred",
-                            extra={"event": "classify_crashed", "note_id": row["id"]},
+                            extra={
+                                "event": "classify_crashed",
+                                "job": SUMMARY_JOB,
+                                "note_id": row["id"],
+                            },
                             exc_info=True,
                         )
         return done
@@ -1262,7 +1241,11 @@ class BackgroundWorker:
         except ClassificationError:
             logging.getLogger("app").warning(
                 "classify: failed — note stays in default, retry on next update",
-                extra={"event": "classify_failed", "note_id": note_id},
+                extra={
+                    "event": "classify_failed",
+                    "job": SUMMARY_JOB,
+                    "note_id": note_id,
+                },
             )
             return
         # Пул 6: целевой узел авто-переезда ДО транзакции — если он падает
@@ -1302,6 +1285,7 @@ class BackgroundWorker:
                 "classify: default note auto-moved into existing node",
                 extra={
                     "event": "classified_moved",
+                    "job": SUMMARY_JOB,
                     "note_id": note_id,
                     "namespace": target,
                     "confidence": result.confidence,
@@ -1329,7 +1313,11 @@ class BackgroundWorker:
         except Exception:
             logging.getLogger("app").warning(
                 "promotion: run failed — trigger deferred to next classification",
-                extra={"event": "promotion_failed", "reason": "run"},
+                extra={
+                    "event": "promotion_failed",
+                    "job": SUMMARY_JOB,
+                    "reason": "run",
+                },
                 exc_info=True,
             )
             return
@@ -1338,7 +1326,11 @@ class BackgroundWorker:
             # LogRecord (время создания) — extra его не принимает.
             logging.getLogger("app").info(
                 "promotion: trigger run finished",
-                extra={"event": "promotion_run", "report": report},
+                extra={
+                    "event": "promotion_run",
+                    "job": SUMMARY_JOB,
+                    "report": report,
+                },
             )
 
     def _auto_move_target(self, result) -> str | None:
@@ -1483,3 +1475,126 @@ class BackgroundWorker:
                     ):
                         written += 1
         return written
+
+
+# --- сборщики джоб воркера (каркас lsb-0014-02) -------------------------------
+#
+# Регистрация вместо копии цикла (FR-1.1): каждая джоба описывается `JobSpec`
+# и добавляется в реестр каркаса; цикл, back-off и супервизор итерации — общие
+# (`app/services/jobs.py`). Интервалы существующих петель — как были (FR-1.5):
+# PENDING_RETRY_SEC у очередей и фиксированные 300 с у зачистки (новых env эта
+# постановка не заводит). `queue_stat` пока None: снимки очередей для
+# `/health.queues` наполняет наблюдаемость (lsb-0014-03).
+
+
+def build_embedding_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
+    """Джоба `embedding`: notes-очередь + чанковая очередь (одна джоба).
+
+    Форма «по интервалу»: сигнала `notify_*` у embedding-петли не было и
+    раньше. Пустой прогон — гигиена `worker_jobs` (`idle_hook`, пул 5) и пауза
+    PENDING_RETRY_SEC с back-off; перепроверка очереди не нужна (задание живёт
+    в статусе заметки и будет выбрано следующим прогоном).
+    """
+    return JobSpec(
+        name=EMBEDDING_JOB,
+        queue="vector",
+        interval_sec=settings.pending_retry_sec,
+        batch=None,
+        enabled=True,
+        process=worker._process_embedding,
+        queue_empty=None,
+        wait_event=None,
+        idle_hook=worker._purge_done_jobs,
+        queue_stat=None,
+    )
+
+
+def build_summary_job(
+    worker: BackgroundWorker, settings: Settings
+) -> JobSpec | None:
+    """Джоба `summary`: title-доген → summarize → merge, сигнал `summary`.
+
+    Без суммаризатора (тестовый режим Фазы 3) джоба неприменима — сборщик
+    возвращает None, в реестр она не попадает (петли не было и раньше).
+    """
+    if worker._summarizer is None:
+        return None
+    return JobSpec(
+        name=SUMMARY_JOB,
+        queue="summary",
+        interval_sec=settings.pending_retry_sec,
+        batch=None,
+        enabled=True,
+        process=worker._process_summary,
+        queue_empty=worker._summary_queue_empty,
+        wait_event=worker._summary_event,
+        idle_hook=None,
+        queue_stat=None,
+    )
+
+
+def build_judge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
+    """Джоба `judge`: партия judge-работ (дедуп), сигнал `judge`."""
+    return JobSpec(
+        name=JUDGE_JOB,
+        queue="judge",
+        interval_sec=settings.pending_retry_sec,
+        batch=None,
+        enabled=True,
+        process=worker._process_judge,
+        queue_empty=worker._judge_queue_empty,
+        wait_event=worker._judge_event,
+        idle_hook=None,
+        queue_stat=None,
+    )
+
+
+def build_areas_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
+    """Джоба `areas`: вектора записей областей (субстрат 3.0.0), сигнал `areas`."""
+    return JobSpec(
+        name=AREAS_JOB,
+        queue="areas",
+        interval_sec=settings.pending_retry_sec,
+        batch=None,
+        enabled=True,
+        process=worker._process_areas,
+        queue_empty=worker._areas_queue_empty,
+        wait_event=worker._areas_event,
+        idle_hook=None,
+        queue_stat=None,
+    )
+
+
+def build_expiration_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
+    """Джоба `expiration`: зачистка просроченных заметок (lsb-0004-02, этап 4).
+
+    Очереди нет (зачистка — не pending-состояние) и сигнала нет: джоба
+    описана формой «по интервалу», а её состояние back-off помечено
+    `fixed=True` (создаётся в `__init__`) — пауза всегда 300 с, без back-off
+    (решение О. 2026-09-09; поведение сохранено дословно, FR-1.5).
+    """
+    return JobSpec(
+        name=EXPIRATION_JOB,
+        queue=None,
+        interval_sec=EXPIRATION_CLEANUP_INTERVAL_SEC,
+        batch=None,
+        enabled=True,
+        process=worker._process_expiration,
+        queue_empty=None,
+        wait_event=None,
+        idle_hook=None,
+        queue_stat=None,
+    )
+
+
+# Регистрация петель воркера в реестре каркаса (FR-1.1): каркас собирает джобы
+# из `JOB_BUILDERS`; свой модуль дописывает свои сборщики после их определения
+# (импорт односторонний — worker → jobs, круга нет). Порядок — как у петель
+# раньше: embedding, summary, judge, areas, expiration.
+jobs.JOB_BUILDERS += (
+    build_embedding_job,
+    build_summary_job,
+    build_judge_job,
+    build_areas_job,
+    build_expiration_job,
+)

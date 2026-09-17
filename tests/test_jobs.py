@@ -18,8 +18,10 @@ import logging
 import time
 
 import pytest
+from fakes import FixedSummarizer, HashEmbedder
 
 import app.services.jobs as jobs
+from app.config import get_settings
 from app.services import worker as worker_module
 from app.services.jobs import (
     MAX_INTERVAL_SEC,
@@ -30,6 +32,11 @@ from app.services.jobs import (
     next_interval,
     run_loop,
 )
+from app.services.worker import (
+    EXPIRATION_CLEANUP_INTERVAL_SEC,
+    BackgroundWorker,
+)
+from app.storage.db import init_db
 
 
 async def _noop_process() -> int:
@@ -72,6 +79,15 @@ async def wait_until(predicate, timeout: float = 1.0) -> None:
             return
         await asyncio.sleep(0.005)
     raise AssertionError("условие не наступило за отведённое время")
+
+
+@pytest.fixture
+def settings(test_env):
+    """Настройки на тестовой БД (окружение выставляет autouse-фикстура)."""
+    get_settings.cache_clear()
+    settings = get_settings()
+    init_db(settings)
+    return settings
 
 
 def patch_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
@@ -325,3 +341,115 @@ def test_backoff_helpers_shared_with_worker() -> None:
     """Back-off живёт в каркасе: воркер переиспользует те же имена (поведение то же)."""
     assert worker_module.next_interval is next_interval
     assert worker_module.MAX_INTERVAL_SEC == MAX_INTERVAL_SEC
+
+
+# --- перевод петель воркера на каркас (lsb-0014-02) ---------------------------
+
+
+def test_worker_registers_five_jobs(settings) -> None:
+    """Реестр собирает пять джоб воркера: имена, очереди, интервалы и формы."""
+    worker = BackgroundWorker(settings, HashEmbedder(8), FixedSummarizer("С."))
+    specs = {spec.name: spec for spec in build_job_specs(worker, settings)}
+    assert list(specs) == [
+        "embedding",
+        "summary",
+        "judge",
+        "areas",
+        "expiration",
+    ]
+    retry = settings.pending_retry_sec
+    assert specs["embedding"].queue == "vector"
+    assert specs["summary"].queue == "summary"
+    assert specs["judge"].queue == "judge"
+    assert specs["areas"].queue == "areas"
+    assert specs["expiration"].queue is None  # очередь не наблюдаемая
+    for name in ("embedding", "summary", "judge", "areas"):
+        assert specs[name].interval_sec == retry  # как было (FR-1.5)
+    assert specs["expiration"].interval_sec == EXPIRATION_CLEANUP_INTERVAL_SEC
+    # Форма «по требованию» — там, где есть сигнал notify_*; у embedding его
+    # не было и раньше (интервал + back-off).
+    assert specs["embedding"].wait_event is None
+    assert specs["expiration"].wait_event is None
+    assert specs["summary"].wait_event is not None
+    assert specs["judge"].wait_event is not None
+    assert specs["areas"].wait_event is not None
+    # Гигиена worker_jobs — idle-ветка embedding-джобы (пул 5).
+    assert specs["embedding"].idle_hook == worker._purge_done_jobs
+
+
+def test_summary_job_is_not_registered_without_summarizer(settings) -> None:
+    """Без суммаризатора summary-джоба неприменима — в реестр не попадает."""
+    worker = BackgroundWorker(settings, HashEmbedder(8))
+    names = [spec.name for spec in build_job_specs(worker, settings)]
+    assert "summary" not in names
+    assert names == ["embedding", "judge", "areas", "expiration"]
+
+
+@pytest.mark.asyncio
+async def test_fixed_schedule_ignores_progress_and_does_not_grow(
+    monkeypatch,
+) -> None:
+    """Фиксированное расписание (expiration): пауза 300 с, прогресс не сдвигает.
+
+    Состояние back-off с `fixed=True`: прогон, отчитавшийся о выполненной
+    уборке, расписание не сдвигает — каркас спит ровно `interval_sec` и не
+    растит интервал (300 с «как сейчас», FR-1.5).
+    """
+    delays = patch_sleep(monkeypatch)
+    calls = 0
+
+    async def process() -> int:
+        nonlocal calls
+        calls += 1
+        return 1  # «уборка выполнена» — прогресс для очереди, не для расписания
+
+    state = BackoffState(300, fixed=True)
+    spec = make_spec(process, interval_sec=300)
+    await asyncio.wait_for(run_loop(spec, lambda: calls >= 4, state), timeout=1.0)
+    assert calls == 4
+    assert delays == [300.0, 300.0, 300.0, 300.0]
+    assert state.interval == 300.0  # back-off не вырос
+
+
+@pytest.mark.asyncio
+async def test_fixed_schedule_does_not_grow_on_failure(caplog, monkeypatch) -> None:
+    """Сбой итерации фиксированной джобы: warning, пауза 300 с, без роста."""
+    delays = patch_sleep(monkeypatch)
+    calls = 0
+
+    async def process() -> int:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("boom")
+
+    state = BackoffState(300, fixed=True)
+    spec = make_spec(process, interval_sec=300)
+    with caplog.at_level(logging.WARNING, logger="app"):
+        await asyncio.wait_for(
+            run_loop(spec, lambda: calls >= 3, state), timeout=1.0
+        )
+    assert calls == 3  # петля жива после сбоев
+    assert delays == [300.0, 300.0, 300.0]
+    assert state.interval == 300.0
+
+
+@pytest.mark.asyncio
+async def test_run_serves_registry_jobs(settings, monkeypatch) -> None:
+    """`run()` обслуживает джобы реестра: своих циклов у воркера больше нет."""
+    called = asyncio.Event()
+
+    async def process() -> int:
+        called.set()
+        return 0  # пусто: джоба уходит в паузу (цикл живёт, yield есть)
+
+    spec = make_spec(process, interval_sec=3600)
+    monkeypatch.setattr(jobs, "JOB_BUILDERS", (lambda worker, settings: spec,))
+    worker = BackgroundWorker(settings, HashEmbedder(8))
+    task = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(called.wait(), timeout=1.0)
+    finally:
+        worker.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
