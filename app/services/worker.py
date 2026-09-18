@@ -36,6 +36,12 @@ pending-статусов в БД (переживают рестарт, дого�
 каждая джоба описывает свою очередь сама (`queue_stat`), `/health` при
 добавлении джобы не правится (lsb-0014-03, FR-2.2).
 
+Джоба `nodes` (lsb-0011-01) разбирает накопленный `default`: сначала промоция,
+затем быстрый пул обхода — переезд по готовой разметке (`hint_path` +
+`confidence`) без вызова моделей; механика переезда одна на обход и на
+причёску после суммаризации (`_apply_node_order`). Маркер `node_order_at` —
+анти-зацикливание обхода.
+
 Job-очереди в БД по слотам (`worker_jobs`): judge-работа (kind='dedup')
 создаётся ТОЛЬКО после готовности вектора заметки; merge-работа (kind='merge')
 создаётся после вердикта судьи и ходит в summary-слот. Порядок заметок в
@@ -105,7 +111,7 @@ import logging
 from app.config import TITLE_MAX_WORDS, Settings
 from app.services import jobs
 from app.services.areas import AreaSpec, ALL_AREAS
-from app.services.classifier import ClassificationError, Classifier
+from app.services.classifier import Classification, ClassificationError, Classifier
 from app.services.dedup import DeduplicationService
 from app.services.embedding import Embedder, EmbeddingError
 # Back-off и его потолок перенесены в каркас джоб (lsb-0014, arch §3.3):
@@ -148,6 +154,32 @@ SUMMARY_JOB = "summary"
 JUDGE_JOB = "judge"
 AREAS_JOB = "areas"
 EXPIRATION_JOB = "expiration"
+# Джоба «порядок в узлах» (lsb-0011-01): обход накопленного `default`.
+NODES_JOB = "nodes"
+
+# Единое правило выборки быстрого пула обхода `default` (lsb-0011-01, arch §3.2):
+# активные default-заметки с готовой разметкой (`hint_path` + `confidence` не
+# ниже порога авто-переезда), ещё не разобранные (`node_order_at IS NULL`),
+# свежие первыми — переезд без вызова модели. Классификаторный пул и общий
+# бюджет обоих пулов — постановка 12.
+_NODES_SWEEP_SELECT = (
+    "SELECT id, hint_path, confidence FROM notes "
+    "WHERE namespace = 'default' AND deleted_at IS NULL "
+    "AND node_order_at IS NULL AND hint_path IS NOT NULL AND confidence >= ? "
+    "ORDER BY updated_at DESC, id DESC LIMIT ?"
+)
+
+# Снимок очереди `nodes` для `/health.queues` (FR-2.2): тот же предикат
+# быстрого пула; возраст старейшего — `now - MIN(updated_at)`. Задания после
+# сшивания (lsb-0012) добавятся к снимку в постановке 12.
+_NODES_QUEUE_STAT_SQL = (
+    "SELECT COUNT(*) AS pending, "
+    "MAX(CAST(strftime('%s','now') AS INTEGER) - "
+    "CAST(strftime('%s', updated_at) AS INTEGER)) AS oldest_pending_sec "
+    "FROM notes "
+    "WHERE namespace = 'default' AND deleted_at IS NULL "
+    "AND node_order_at IS NULL AND hint_path IS NOT NULL AND confidence >= ?"
+)
 
 # Промпт догенерации названия (решение №9): ЗАШИТ в SummaryService.title
 # (follow-up 6b — протокол Summarizer получил метод title; здесь раньше был
@@ -1306,6 +1338,67 @@ class BackgroundWorker:
 
     # --- причёска (Фаза 10, Шаг 4) -------------------------------------------
 
+    def _apply_node_order(
+        self, note_id: int, expected_namespace: str, result: Classification
+    ) -> tuple[str, str, str | None]:
+        """Единственная точка переезда заметки по разметке (lsb-0011-01, arch §3.3).
+
+        Один UPDATE: разметка (`hint_path`, `confidence`, `classified_at`) +
+        маркер разбора `node_order_at` + (при переезде) `namespace` и
+        `vector_status='pending'` (пере-кодировка в партицию нового узла —
+        существующий механизм). Guard `namespace = :expected_namespace` и
+        `deleted_at IS NULL`: операторский/клиентский переезд в полёте фоном
+        не перебивается — `rowcount = 0` даёт `kept`/`node_changed`.
+
+        Целевой узел считается ДО транзакции: отказ валидации разметки
+        (`NamespaceValidationError` из `_auto_move_target`, в т.ч. мусорный
+        `hint_path`) не пишет в БД вовсе — строгая семантика «отказ = не
+        размечено». Возврат `(outcome, reason, target)`: `moved` — переезд;
+        `kept` — оставлена (`hint_unknown` — узла нет в реестре,
+        `low_confidence` — уверенность ниже порога, `node_changed` — узел
+        сменён в полёте).
+
+        Механика одна на два источника (arch §3.3): её переиспользует
+        причёска после суммаризации (вход по полному тексту) и обход
+        `default` (быстрый путь по готовой разметке, без модели).
+        """
+        target = self._auto_move_target(result)
+        move = (
+            target is not None
+            and result.confidence >= self._settings.namespace_auto_move_min_confidence
+        )
+        # Маркер разбора ставится в ТОЙ ЖЕ транзакции, что и разметка
+        # (lsb-0011-01, §3.6): атомарно, анти-зацикливание не отстаёт от решения.
+        columns = [
+            "hint_path = ?",
+            "confidence = ?",
+            "classified_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+            "node_order_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+        ]
+        params: list[object] = [result.hint_path, result.confidence]
+        if move:
+            columns.append("namespace = ?")
+            columns.append("vector_status = 'pending'")
+            params.append(target)
+        with session(self._settings) as conn, transaction(conn):
+            cursor = conn.execute(
+                "UPDATE notes SET "
+                + ", ".join(columns)
+                + " WHERE id = ? AND namespace = ? AND deleted_at IS NULL",
+                (*params, note_id, expected_namespace),
+            )
+        if not cursor.rowcount:
+            return "kept", "node_changed", target
+        if move:
+            return "moved", "hint_exists", target
+        if target is None:
+            return (
+                "kept",
+                "hint_unknown" if result.hint_path else "low_confidence",
+                target,
+            )
+        return "kept", "low_confidence", target
+
     def _classify_default_note(self, note_id: int, text: str) -> None:
         """Разметить default-заметку после суммаризации; авто-переезд.
 
@@ -1331,6 +1424,11 @@ class BackgroundWorker:
         авто-переезда считаем до транзакции — отказ _auto_move_target (в т.ч.
         NamespaceValidationError на мусорном hint) ничего не пишет в БД
         (строгая семантика «отказ классификации = не размечено»).
+
+        lsb-0011-01: сама механика переезда вынесена в общую точку
+        `_apply_node_order` (её же переиспользует обход `default`) — здесь
+        остаётся только вход по полному тексту и триггер промоции; поведение
+        классификации после суммаризации не меняется.
         """
         if self._classifier is None:
             return  # тестовый режим без классификатора
@@ -1347,39 +1445,13 @@ class BackgroundWorker:
                 },
             )
             return
-        # Пул 6: целевой узел авто-переезда ДО транзакции — если он падает
-        # (в т.ч. NamespaceValidationError), БД не пишем вовсе.
-        target = self._auto_move_target(result)
-        move = (
-            target is not None
-            and result.confidence >= self._settings.namespace_auto_move_min_confidence
-        )
-        with session(self._settings) as conn, transaction(conn):
-            # Один UPDATE: разметка + (при переезде) namespace/vector_status.
-            # Guard `namespace = 'default'`: оператор, уложивший заметку в полёте,
-            # фоном не перекладывается (rowcount 0 — переезда не было, нет и
-            # лога classified_moved).
-            columns = [
-                "hint_path = ?",
-                "confidence = ?",
-                "classified_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
-            ]
-            params: list[object] = [
-                result.hint_path,
-                result.confidence,
-            ]
-            if move:
-                columns.append("namespace = ?")
-                columns.append("vector_status = 'pending'")
-                params.append(target)
-            cursor = conn.execute(
-                "UPDATE notes SET "
-                + ", ".join(columns)
-                + " WHERE id = ? AND namespace = 'default' AND deleted_at IS NULL",
-                (*params, note_id),
-            )
+        # Пул 6: переезд — ОДНА общая точка `_apply_node_order` (разметка +
+        # namespace/vector_status одним UPDATE, guard внутри); отказ
+        # вычисления цели (в т.ч. NamespaceValidationError на мусорном hint)
+        # ничего не пишет в БД.
+        outcome, _reason, target = self._apply_node_order(note_id, "default", result)
         # Лог — только при ФАКТИЧЕСКОМ переезде (rowcount+condition).
-        if move and cursor.rowcount:
+        if outcome == "moved":
             logging.getLogger("app").info(
                 "classify: default note auto-moved into existing node",
                 extra={
@@ -1394,8 +1466,14 @@ class BackgroundWorker:
         # до порога — прогоняем конвейер промоции (авто-создание/слияние).
         self._run_promotion()
 
-    def _run_promotion(self) -> None:
+    def _run_promotion(self, job: str = SUMMARY_JOB) -> None:
         """Триггер домена (Шаг 5) после классификации default-заметки.
+
+        Вызывается причёской (слот summary, `job=summary`) и обходом `nodes`
+        перед подметанием `default` (`job=nodes`, lsb-0011-01): промоция идёт
+        первой, чтобы заметка не «переезжала» в узел, который появится в этом
+        же прогоне. Имя джобы в журнале — параметр (события не переименовываем,
+        меняется лишь значение обязательного поля `job`).
 
         Сбои триггера не роняют воркер: это этап обогащения, а не конвейера
         данных — суммаризация/векторизация важнее структурной автоматики.
@@ -1403,7 +1481,8 @@ class BackgroundWorker:
         PromotionService (кандидат остаётся без вердикта, NFR-3); здесь
         ловится ВСЁ остальное (включая баги) — warning с traceback в логи,
         петли очередей живут. Повтор — следующая классификация default-
-        заметки: группы не теряются, просто дотягивают до порога позже.
+        заметки или следующий прогон обхода: группы не теряются, просто
+        дотягивают до порога позже.
         """
         if self._promoter is None:
             return  # тестовый режим без триггера
@@ -1414,7 +1493,7 @@ class BackgroundWorker:
                 "promotion: run failed — trigger deferred to next classification",
                 extra={
                     "event": "promotion_failed",
-                    "job": SUMMARY_JOB,
+                    "job": job,
                     "reason": "run",
                 },
                 exc_info=True,
@@ -1427,7 +1506,7 @@ class BackgroundWorker:
                 "promotion: trigger run finished",
                 extra={
                     "event": "promotion_run",
-                    "job": SUMMARY_JOB,
+                    "job": job,
                     "report": report,
                 },
             )
@@ -1447,6 +1526,79 @@ class BackgroundWorker:
         if not self._namespaces.exists(hint):
             return None
         return hint
+
+    # --- джоба «порядок в узлах» (lsb-0011-01) ---------------------------
+
+    def process_nodes(self, budget: int | None = None) -> int:
+        """Прогон джобы `nodes`: промоция → быстрый пул обхода `default`.
+
+        Порядок прогона (FR-3.1, arch §3.2): (1) промоция — `PromotionService.run()`
+        (создание/слияние листов, ретро-перекладка), отказ не роняет джобу;
+        (2) быстрый пул обхода — остаток бюджета; (3) задания после сшивания
+        появятся в постановке 12. Бюджет — общий на прогон (`JOB_NODES_BATCH`,
+        дефолт 20): не более него обработок (`moved` + `kept`) за прогон;
+        повторные прогоны продолжают backlog.
+
+        Быстрый пул (arch §3.2): default-заметки с готовой разметкой
+        (`hint_path` + `confidence` не ниже порога авто-переезда), ещё не
+        разобранные (`node_order_at IS NULL`), свежие первыми — переезд БЕЗ
+        вызова модели. Узел зарегистрирован → переезд (`moved`/`hint_exists`,
+        разметка не меняется); узла нет в реестре → `kept`/`hint_unknown`
+        (лист создаст промоция — узел здесь не создаём). Маркер `node_order_at`
+        ставится при любом исходе быстрого пути (анти-зацикливание, §3.6):
+        оставленная заметка не выедает бюджет повторно до изменения
+        текста/названия (сброс маркера — NoteService.update/merge_pair).
+
+        Каждая заметка — событие `node_order` (`job='nodes'`,
+        `source='sweep'`, `outcome`, `reason`, `target`, `note_id`).
+        Возврат — число разобранных заметок (0 уводит каркасную петлю к
+        ожиданию интервала).
+        """
+        limit = self._settings.job_nodes_batch if budget is None else budget
+        # (1) Промоция первой: заметка не «переезжает» в узел, который
+        # появится в этом же прогоне (FR-3.1). Отказ не роняет джобу (FR-3.2).
+        self._run_promotion(NODES_JOB)
+        # (2) Быстрый пул обхода: переезд по готовой разметке, без модели.
+        threshold = self._settings.namespace_auto_move_min_confidence
+        with session(self._settings) as conn:
+            rows = conn.execute(_NODES_SWEEP_SELECT, (threshold, limit)).fetchall()
+        logger = logging.getLogger("app")
+        done = 0
+        for row in rows:
+            note_id = int(row["id"])
+            result = Classification(row["hint_path"], row["confidence"])
+            outcome, reason, target = self._apply_node_order(
+                note_id, "default", result
+            )
+            done += 1
+            logger.info(
+                "nodes: default sweep decided note order",
+                extra={
+                    "event": "node_order",
+                    "job": NODES_JOB,
+                    "source": "sweep",
+                    "note_id": note_id,
+                    "outcome": outcome,
+                    "reason": reason,
+                    "target": target,
+                },
+            )
+        return done
+
+    def _nodes_queue_stat(self) -> dict:
+        """Снимок очереди `nodes` для `/health.queues` (FR-2.2).
+
+        `pending` — кандидаты быстрого пула обхода (тот же предикат, что у
+        выборки); `oldest_pending_sec` — возраст старейшего (`now -
+        MIN(updated_at)`), `null` — очередь пуста. Только SQL, без обращений к
+        моделям; задания после сшивания добавятся в снимок в постановке 12.
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                _NODES_QUEUE_STAT_SQL,
+                (self._settings.namespace_auto_move_min_confidence,),
+            ).fetchone()
+        return queue_snapshot(row["pending"], row["oldest_pending_sec"])
 
     # --- чанковая очередь (Фаза 7) ---------------------------------------------
 
@@ -1686,14 +1838,44 @@ def build_expiration_job(worker: BackgroundWorker, settings: Settings) -> JobSpe
     )
 
 
+def build_nodes_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
+    """Джоба `nodes`: обход накопленного `default` (lsb-0011-01).
+
+    Форма «по интервалу» (сигнала `notify_*` у обхода нет): прогон — промоция,
+    затем быстрый пул обхода батчем `JOB_NODES_BATCH` (переезд по готовой
+    разметке без вызова моделей), прогресс сбрасывает back-off, пустая
+    выборка — сон на `JOB_NODES_INTERVAL_SEC`. `JOB_NODES_ENABLED=false`
+    джобу не запускает, но очередь остаётся видна в `/health` (реестр её
+    сохраняет). Синхронный SQL/механика уходят в поток — event loop не занимаем.
+    """
+    batch = settings.job_nodes_batch
+
+    async def process() -> int:
+        return await asyncio.to_thread(worker.process_nodes, batch)
+
+    return JobSpec(
+        name=NODES_JOB,
+        queue=NODES_JOB,
+        interval_sec=settings.job_nodes_interval_sec,
+        batch=batch,
+        enabled=settings.job_nodes_enabled,
+        process=process,
+        queue_empty=None,
+        wait_event=None,
+        idle_hook=None,
+        queue_stat=worker._nodes_queue_stat,
+    )
+
+
 # Регистрация петель воркера в реестре каркаса (FR-1.1): каркас собирает джобы
 # из `JOB_BUILDERS`; свой модуль дописывает свои сборщики после их определения
 # (импорт односторонний — worker → jobs, круга нет). Порядок — как у петель
-# раньше: embedding, summary, judge, areas, expiration.
+# раньше: embedding, summary, judge, areas, expiration, nodes.
 jobs.JOB_BUILDERS += (
     build_embedding_job,
     build_summary_job,
     build_judge_job,
     build_areas_job,
     build_expiration_job,
+    build_nodes_job,
 )

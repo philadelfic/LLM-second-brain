@@ -117,7 +117,8 @@ CREATE TABLE IF NOT EXISTS notes (
   hint_path      TEXT    NULL,
   confidence     REAL    NULL,
   expires_at     TEXT    NULL,
-  links_at       TEXT    NULL
+  links_at       TEXT    NULL,
+  node_order_at  TEXT    NULL
 )
 """
 
@@ -609,6 +610,10 @@ def init_db(settings: Settings) -> None:
             # notes.links_at — идемпотентно, до ветки автореиндексации
             # (та очищает связи при смене модели/размерности).
             _migrate_link_columns(conn)
+            # Порядок в узлах (lsb-0011-01): служебный маркер notes.node_order_at
+            # — идемпотентно; у существующих заметок NULL (первый прогон джобы
+            # `nodes` разбирает накопленный default — ретро-прогон, arch §4).
+            _migrate_node_order_columns(conn)
             # List-индексы (пул 15): старый idx_notes_namespace заменён
             # (prefix namespace, deleted_at покрыт новым ns-индексом).
             conn.execute("DROP INDEX IF EXISTS idx_notes_namespace")
@@ -797,6 +802,20 @@ def _migrate_expiration_columns(conn: sqlite3.Connection) -> None:
     if "expires_at" not in columns:
         conn.execute("ALTER TABLE notes ADD COLUMN expires_at TEXT")
     conn.execute(_NOTE_EXPIRATIONS_DDL)
+
+
+def _migrate_node_order_columns(conn: sqlite3.Connection) -> None:
+    """Нулевая миграция lsb-0011-01 поверх живых БД: маркер notes.node_order_at.
+
+    Свежие БД получают колонку из _NOTES_DDL; унаследованные — ALTER TABLE
+    ADD COLUMN (node_order_at NULL у всех заметок: первый прогон джобы `nodes`
+    естественно разбирает накопленный `default` — ретро-прогон). Маркер
+    служебный: в выдачи MCP/REST не выходит, warning'ом не является.
+    Идемпотентно: повторный запуск (рестарт сервиса) — no-op.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
+    if "node_order_at" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN node_order_at TEXT")
 
 
 def _migrate_link_columns(conn: sqlite3.Connection) -> None:

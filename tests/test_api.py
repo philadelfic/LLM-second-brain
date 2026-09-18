@@ -25,7 +25,7 @@ class TestHealth:
             "pending_summary": 0,
             "queues": {
                 queue: {"pending": 0, "oldest_pending_sec": None}
-                for queue in ("vector", "summary", "judge", "areas", "links")
+                for queue in ("vector", "summary", "judge", "areas", "links", "nodes")
             },
         }
 
@@ -51,6 +51,7 @@ class TestHealth:
             "judge",
             "areas",
             "links",
+            "nodes",
         }
         for stat in body["queues"].values():
             assert set(stat) == {"pending", "oldest_pending_sec"}

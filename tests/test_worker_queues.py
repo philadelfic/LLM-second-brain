@@ -188,11 +188,11 @@ def _job_rows(settings) -> list:
 def test_queues_health_empty_queues_are_null(settings) -> None:
     """Пустые очереди: pending 0, возраст старейшего — null.
 
-    В объект попадают все наблюдаемые очереди (vector/summary/judge/areas);
-    `expiration` очереди не имеет и не наблюдаема.
+    В объект попадают все наблюдаемые очереди (vector/summary/judge/areas/
+    links/nodes); `expiration` очереди не имеет и не наблюдаема.
     """
     queues = make_worker(settings).queues_health()
-    assert set(queues) == {"vector", "summary", "judge", "areas", "links"}
+    assert set(queues) == {"vector", "summary", "judge", "areas", "links", "nodes"}
     for stat in queues.values():
         assert stat == {"pending": 0, "oldest_pending_sec": None}
 
@@ -213,7 +213,7 @@ def test_queues_health_matches_direct_sql(settings) -> None:
 
     queues = worker.queues_health()
 
-    assert set(queues) == {"vector", "summary", "judge", "areas", "links"}
+    assert set(queues) == {"vector", "summary", "judge", "areas", "links", "nodes"}
     _assert_stat(queues["vector"], _sql_note_stat(settings, "vector_status"))
     _assert_stat(queues["summary"], _sql_note_stat(settings, "summary_status"))
     _assert_stat(queues["judge"], _sql_judge_stat(settings))

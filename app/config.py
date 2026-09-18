@@ -148,6 +148,14 @@ class Settings(BaseSettings):
     job_links_interval_sec: int = 300
     job_links_batch: int = 100
 
+    # Джоба «порядок в узлах» `nodes` (lsb-0011-01, FR-1.1/FR-1.2): обход
+    # накопленного `default` — интервал ≥ 30 с (дефолт 1 час), батч ≥ 1
+    # (общий бюджет обработок за прогон, дефолт 20), выключатель (false —
+    # джоба не стартует, но её очередь остаётся видна в /health).
+    job_nodes_enabled: bool = True
+    job_nodes_interval_sec: int = 3600
+    job_nodes_batch: int = 20
+
     # --- лимиты (NFR-6: env-переопределяемы, валидируются; см. _validate_ranges) ---
     max_note_chars: int = 35000  # 2000→20000 (Фаза 7) → 35000 (решение О. 2026-08-30)
     max_query_chars: int = 512
@@ -338,6 +346,10 @@ class Settings(BaseSettings):
         # батч ≥ 1 (нулевой батч не разобрал бы backfill никогда).
         need_low("job_links_interval_sec", self.job_links_interval_sec, 30)
         need_low("job_links_batch", self.job_links_batch, 1)
+        # Джоба `nodes` (lsb-0011-01): обход default — интервал ≥ 30,
+        # батч ≥ 1 (общий бюджет обработок за прогон).
+        need_low("job_nodes_interval_sec", self.job_nodes_interval_sec, 30)
+        need_low("job_nodes_batch", self.job_nodes_batch, 1)
 
         # --- векторизация / суммаризация ---
         need_low("embedding_dim", self.embedding_dim, 1)

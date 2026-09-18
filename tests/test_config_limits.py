@@ -528,3 +528,37 @@ class TestJobLimits:
         assert custom.job_links_enabled is False
         assert custom.job_links_interval_sec == 45
         assert custom.job_links_batch == 7
+
+
+class TestNodesJobLimits:
+    """Джоба обхода `default` `nodes` (lsb-0011-01): интервал ≥ 30, батч ≥ 1."""
+
+    def test_nodes_interval_below_thirty_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with pytest.raises(ConfigError, match="job_nodes_interval_sec"):
+            load_env(monkeypatch, JOB_NODES_INTERVAL_SEC="29")
+
+    def test_nodes_batch_below_one_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with pytest.raises(ConfigError, match="job_nodes_batch"):
+            load_env(monkeypatch, JOB_NODES_BATCH="0")
+
+    def test_nodes_job_defaults_and_overrides(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Дефолты §3.2: включена, 3600 с, батч 20; значения переопределяемы."""
+        defaults = load_env(monkeypatch)
+        assert defaults.job_nodes_enabled is True
+        assert defaults.job_nodes_interval_sec == 3600
+        assert defaults.job_nodes_batch == 20
+        custom = load_env(
+            monkeypatch,
+            JOB_NODES_ENABLED="false",
+            JOB_NODES_INTERVAL_SEC="45",
+            JOB_NODES_BATCH="7",
+        )
+        assert custom.job_nodes_enabled is False
+        assert custom.job_nodes_interval_sec == 45
+        assert custom.job_nodes_batch == 7

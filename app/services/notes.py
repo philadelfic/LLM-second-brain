@@ -603,8 +603,12 @@ class NoteService:
         # расчёта связей (маркер links_at). Название меняет и вектор, и правила
         # entities/mention, поэтому сбрасывается и при правке одного title
         # (разметка причёски — как раньше, только при text).
+        # lsb-0011-01: там же сбрасывается маркер обхода default
+        # (`node_order_at`) — заметка, разобранная джобой `nodes`, снова
+        # становится кандидатом обхода при изменении текста/названия.
         if text_changed or note_title is not None:
             sets.append("links_at = NULL")
+            sets.append("node_order_at = NULL")
         if text_changed:
             sets.append("text = ?")
             params.append(text)
@@ -704,8 +708,10 @@ class NoteService:
         обе операции, либо ни одной (rollback), полусостояние исключено.
 
         Штатный набор update-сбросов (как в update без title): текст, замена
-        чанков, vector_status='pending', сброс summary, разметки причёски и
-        маркера связей links_at; updated_at; **title не трогается** (решение
+        чанков, vector_status='pending', сброс summary, разметки причёски,
+        маркера связей links_at и маркера обхода default node_order_at
+        (lsb-0011-01: сшивание делает заметку кандидатом обхода заново);
+        updated_at; **title не трогается** (решение
         №9), namespace сохраняется
         (ранняя остаётся в своём узле). Guard `deleted_at IS NULL` на обеих
         заметках: операторский soft delete не перебивается.
@@ -727,6 +733,7 @@ class NoteService:
                 "summary = '', summary_status = 'pending', "
                 "classified_at = NULL, hint_path = NULL, confidence = NULL, "
                 "links_at = NULL, "
+                "node_order_at = NULL, "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
                 "WHERE id = ? AND deleted_at IS NULL",
                 (merged_text, older_id),

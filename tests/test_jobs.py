@@ -350,8 +350,9 @@ def test_registry_contains_worker_jobs_and_links(settings) -> None:
     """Реестр собирает джобы воркера: имена, очереди, интервалы и формы.
 
     Пять петель воркера + джоба `links` из своего модуля (`links.py`
-    регистрирует себя сама, постановка lsb-0010-03) — порядок в реестре
-    задаётся импортом (`app.services` → links, затем worker).
+    регистрирует себя сама, постановка lsb-0010-03) и джоба `nodes`
+    (lsb-0011-01, обход `default`) — порядок в реестре задаётся импортом
+    (`app.services` → links, затем worker).
     """
     worker = BackgroundWorker(settings, HashEmbedder(8), FixedSummarizer("С."))
     specs = {spec.name: spec for spec in build_job_specs(worker, settings)}
@@ -362,6 +363,7 @@ def test_registry_contains_worker_jobs_and_links(settings) -> None:
         "judge",
         "areas",
         "expiration",
+        "nodes",
     ]
     retry = settings.pending_retry_sec
     assert specs["embedding"].queue == "vector"
@@ -375,6 +377,12 @@ def test_registry_contains_worker_jobs_and_links(settings) -> None:
     assert specs["links"].batch == settings.job_links_batch
     assert specs["links"].idle_hook is not None  # гигиена purge_orphans
     assert specs["links"].queue_stat is not None
+    # Джоба обхода default (lsb-0011-01): своя очередь и расписание из env.
+    assert specs["nodes"].queue == "nodes"
+    assert specs["nodes"].interval_sec == settings.job_nodes_interval_sec
+    assert specs["nodes"].batch == settings.job_nodes_batch
+    assert specs["nodes"].wait_event is None  # форма «по интервалу»
+    assert specs["nodes"].queue_stat is not None
     for name in ("embedding", "summary", "judge", "areas"):
         assert specs[name].interval_sec == retry  # как было (FR-1.5)
     assert specs["expiration"].interval_sec == EXPIRATION_CLEANUP_INTERVAL_SEC
@@ -394,7 +402,7 @@ def test_summary_job_is_not_registered_without_summarizer(settings) -> None:
     worker = BackgroundWorker(settings, HashEmbedder(8))
     names = [spec.name for spec in build_job_specs(worker, settings)]
     assert "summary" not in names
-    assert names == ["links", "embedding", "judge", "areas", "expiration"]
+    assert names == ["links", "embedding", "judge", "areas", "expiration", "nodes"]
 
 
 @pytest.mark.asyncio

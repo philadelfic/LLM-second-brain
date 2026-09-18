@@ -74,6 +74,10 @@ services:
       JOB_LINKS_ENABLED: "true"        # links recompute job on/off (its queue stays visible in /health)
       JOB_LINKS_INTERVAL_SEC: "300"    # start pause between links runs in seconds (≥30)
       JOB_LINKS_BATCH: "100"           # notes recomputed per links run (≥1)
+      # --- background jobs (lsb-0014): default sweep job (lsb-0011-01) ---
+      JOB_NODES_ENABLED: "true"        # default sweep job on/off (its queue stays visible in /health)
+      JOB_NODES_INTERVAL_SEC: "3600"   # start pause between nodes runs in seconds (≥30)
+      JOB_NODES_BATCH: "20"            # default notes processed per nodes run (≥1)
       DEDUP_SIMILARITY: "0.92"               # "duplicate" cosine threshold in background dedup (Phase 8)
       DEDUP_CANDIDATE_TOP_N: "3"             # top-N cosine candidates for the dedup judge
       DEDUP_CANDIDATE_SIMILARITY: "0.80"     # lower paraphrase-candidate threshold (≤ DEDUP_SIMILARITY)
