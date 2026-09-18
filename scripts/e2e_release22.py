@@ -77,9 +77,29 @@ async def get_note(c: Client, note_id: int) -> dict | None:
     return notes[0] if notes else None
 
 
+async def list_notes(c: Client, *, detail: str = "summaries",
+                     max_pages: int = 25) -> list[dict]:
+    """Walk all memory_list pages: the MCP listing ceiling is 20 since 3.1.0.
+
+    `limit=50` is a soft refusal now (lsb-0013 FR-2.1), and one `limit=20` page
+    would stop seeing our own note once the base grows past a page. Pages are
+    followed by `next_offset` until `has_more` is false, bounded by `max_pages`.
+    """
+    items: list[dict] = []
+    offset = 0
+    for _ in range(max_pages):
+        page = await c.call("memory_list",
+                            {"limit": 20, "offset": offset, "detail": detail})
+        items.extend(page.get("items", []))
+        nxt = page.get("next_offset")
+        if not page.get("has_more") or not isinstance(nxt, int):
+            break
+        offset = nxt
+    return items
+
+
 async def get_list_item(c: Client, note_id: int) -> dict | None:
-    r = await c.call("memory_list", {"limit": 50, "detail": "summaries"})
-    for i in r.get("items", []):
+    for i in await list_notes(c):
         if i.get("id") == note_id:
             return i
     return None
@@ -128,9 +148,9 @@ async def scenario(c: Client, prefix: str) -> None:
     })
     nid_auth = s.get("id")
     check("note saved into the depth-3 node", nid_auth is not None, f"id={nid_auth}")
-    li = await c.call("memory_list", {"limit": 50, "detail": "summaries"})
+    li_items = await list_notes(c)
     found = any(i.get("id") == nid_auth and i.get("namespace") == f"{prefix}/backend/api"
-                for i in li.get("items", []))
+                for i in li_items)
     check("list: namespace = <prefix>/backend/api", found)
 
     # ---------- long note for chunk reading ----------
@@ -165,12 +185,12 @@ async def scenario(c: Client, prefix: str) -> None:
 
     # ---------- D. lsb-0001: unified listing ----------
     print("\n[D] lsb-0001: unified listing (detail=titles / summaries)")
-    r = await c.call("memory_list", {"limit": 50, "detail": "titles"})
+    r = await c.call("memory_list", {"limit": 20, "detail": "titles"})
     items = r.get("items", [])
     check("detail=titles: compact output (id/title/namespace)",
           all(set(i) >= {"id", "title", "namespace"} for i in items),
           f"n={len(items)}")
-    r = await c.call("memory_list", {"limit": 50, "detail": "summaries"})
+    r = await c.call("memory_list", {"limit": 20, "detail": "summaries"})
     items = r.get("items", [])
     check("detail=summaries: full output (summary present)",
           all("summary" in i for i in items), f"n={len(items)}")

@@ -54,6 +54,9 @@ Bearer и тот же сервисный слой, что у MCP (`user_save`/`u
 («+N more») на REST нет — это признак «есть ещё» для модели в MCP-выдаче;
 собственная подсказка сервиса («memory is empty») остаётся как была.
 
+Релиз 3.1.0 (techdebt-0036): `/health` несёт `version` — версию приложения
+(`app.__version__`), согласованную с тегом релиза; поле `queues` сохранено.
+
 Релиз 3.1.0 (lsb-0010-05): `GET /notes/{id}` несёт связи заметки — `links` из
 ДРУГИХ неймспейсов (элемент {id, title, namespace, chars}, уровень 1 с
 фолбэком на уровень 0, arch §3.5). Новых ручек нет: отдельного просмотра связей
@@ -67,6 +70,7 @@ import asyncio
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
+from app import __version__
 from app.config import Settings
 from app.services import Services
 from app.services.namespaces import NamespaceError, NamespaceValidationError
@@ -234,9 +238,15 @@ class QueueStat(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    """Контракт /health (NFR-4): для docker healthcheck и оператора."""
+    """Контракт /health (NFR-4): для docker healthcheck и оператора.
+
+    `version` — версия приложения (FR-4.2, techdebt-0036): источник ровно один
+    — `app.__version__` (§7.1 канона), дублирующего поля в настройках нет.
+    Оператор сверяет её с тегом релиза: «на контуре поднят ровно этот релиз».
+    """
 
     status: str
+    version: str  # techdebt-0036 (FR-4.2): версия приложения
     embedding_ok: bool | None  # Фаза 3
     summarizer_ok: bool | None  # Фаза 4
     judge_ok: bool | None  # Фаза 11: судья дедупа/структуры (слот judge)
@@ -314,6 +324,8 @@ def build_rest_router(settings: Settings) -> APIRouter:
         очереди число ожидающих заданий и возраст старейшего; собираются
         воркером по реестру, только SQL — обращений к моделям нет.
         Легаси-поля (`pending_vector`/`pending_summary`) сохранены.
+        `version` — версия приложения (FR-4.2, techdebt-0036): оператор
+        сверяет её с тегом релиза при приёмке.
         """
         services = _services(request)
         worker = request.app.state.worker  # type: ignore[attr-defined]
@@ -321,6 +333,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
         queues = await asyncio.to_thread(worker.queues_health)
         return HealthResponse(
             status="ok",
+            version=__version__,
             embedding_ok=services.embedding.last_attempt_ok,
             summarizer_ok=services.summary.last_attempt_ok,
             judge_ok=services.judge.last_attempt_ok,

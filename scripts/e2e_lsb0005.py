@@ -131,9 +131,12 @@ async def main() -> int:
                 })
                 nid = s.get("id")
                 check("note saved into e2e5/sub/deep", nid is not None, f"id={nid}")
-                li = await c.call("memory_list", {"limit": 50, "detail": "summaries"})
+                li = await c.call("memory_list", {"limit": 20, "detail": "summaries"})
                 found = any(i.get("id") == nid and i.get("namespace") == "e2e5/sub/deep"
                             for i in li.get("items", []))
+                # The note was just saved and the listing is newest-first, so the
+                # first page (20, the MCP ceiling since 3.1.0) always contains it;
+                # limit=50 would be a soft refusal now (lsb-0013 FR-2.1).
                 check("list: namespace = e2e5/sub/deep", found)
 
                 # ---------- D: save into a non-existent node ----------

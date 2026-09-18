@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from app import __version__
 from app.config import get_settings
 from app.main import create_app
 from app.transport.auth import BearerAuthMiddleware
@@ -17,6 +18,7 @@ class TestHealth:
         assert response.status_code == 200
         assert response.json() == {
             "status": "ok",
+            "version": __version__,
             "embedding_ok": None,
             "summarizer_ok": None,
             "judge_ok": None,
@@ -30,10 +32,11 @@ class TestHealth:
         }
 
     def test_contract_fields(self, client: TestClient) -> None:
-        """7 прежних полей контракта NFR-4 + queues (FR-2.7, lsb-0014-03)."""
+        """7 прежних полей NFR-4 + queues (FR-2.7) + version (FR-4.2)."""
         body = client.get("/health").json()
         assert set(body) == {
             "status",
+            "version",
             "embedding_ok",
             "summarizer_ok",
             "judge_ok",
@@ -43,6 +46,9 @@ class TestHealth:
             "queues",
         }
         assert body["status"] == "ok"
+        # techdebt-0036 (FR-4.2): версия — из приложения, не из окружения.
+        assert body["version"] == __version__
+        assert body["version"].count(".") == 2
         # Каждая наблюдаемая очередь отдаёт pending + возраст старейшего;
         # expiration очереди не имеет и в объект не попадает.
         assert set(body["queues"]) == {

@@ -3,6 +3,18 @@
 
 FROM python:3.12-slim
 
+# OCI labels (techdebt-0036, FR-4.1): the acceptance image carries the git
+# revision (and the app version) it was built from, so "what exactly was
+# checked" is provable — `docker inspect --format '{{index .Config.Labels
+# "org.opencontainers.image.revision"}}' llm-second-brain:test`. Pass the
+# commit at build time: `--build-arg GIT_COMMIT=$(git rev-parse HEAD)`
+# (see scripts/build_image.sh). Defaults are honest about being unknown.
+ARG GIT_COMMIT=unknown
+ARG APP_VERSION=unknown
+LABEL org.opencontainers.image.revision=$GIT_COMMIT \
+      org.opencontainers.image.version=$APP_VERSION \
+      org.opencontainers.image.title="llm-second-brain"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
