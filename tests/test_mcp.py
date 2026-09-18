@@ -392,7 +392,8 @@ class TestMemoryFlow:
         assert note["text"] == text
         assert note["created_at"].endswith("Z") and note["updated_at"].endswith("Z")
         # Компактный контракт Фазы 9: get — белый список из пяти полей (+namespace Фаза 10).
-        assert set(note) == {"id", "text", "created_at", "updated_at", "namespace", "expires_at"}
+        assert set(note) == {"id", "text", "chars", "created_at", "updated_at", "namespace", "expires_at"}
+        assert note["chars"] == len(text)  # lsb-0010-04: объём полного текста
         assert note["namespace"] == "default"  # save без узла → default (§5.7)
         assert "title" not in note  # Фаза 11: get без названия (там полный текст)
 
@@ -476,8 +477,9 @@ class TestMemoryFlow:
             r for r in found["results"] if r["summary"].startswith(f"{self.marker}")
         )
         assert set(hit) == {
-            "id", "summary", "created_at", "updated_at", "namespace", "title",
+            "id", "summary", "chars", "created_at", "updated_at", "namespace", "title",
         }  # Фаза 11 (решение №9): +title (ключ резервируется — search.py вне пула 5)
+        assert hit["chars"] == len(text)  # lsb-0010-04: chars — полный текст
         assert hit["namespace"] == "default"
         assert "snippet" not in hit
         assert "cosine" not in hit
@@ -498,9 +500,9 @@ class TestMemoryFlow:
         assert listed["items"]  # среди первой страницы есть наша
         for item in listed["items"]:
             assert set(item) == {
-                "id", "summary", "created_at", "updated_at", "namespace", "title",
+                "id", "summary", "chars", "created_at", "updated_at", "namespace", "title",
                 "expires_at",  # lsb-0004-02
-            }  # Фаза 11 (решение №9): +title
+            }  # Фаза 11 (решение №9): +title; lsb-0010-04: +chars
             assert "summary_status" not in item
             assert "author" not in item
 
@@ -533,7 +535,7 @@ class TestMemoryFlow:
             r for r in found["results"] if r["summary"].startswith(f"{self.marker}")
         )
         assert set(hit) == {
-            "id", "summary", "created_at", "updated_at", "namespace", "title",
+            "id", "summary", "chars", "created_at", "updated_at", "namespace", "title",
         }
         assert "score" not in hit
 
@@ -573,7 +575,7 @@ class TestMemoryFlow:
         assert listed["total"] >= 1
         for item in listed["items"]:
             assert set(item) == {
-                "id", "summary", "created_at", "updated_at", "namespace", "title",
+                "id", "summary", "chars", "created_at", "updated_at", "namespace", "title",
                 "expires_at",  # lsb-0004-02
             }
 

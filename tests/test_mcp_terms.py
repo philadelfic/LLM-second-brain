@@ -473,6 +473,7 @@ class TestOtherOutputsRegression:
         assert set(found["results"][0]) == {
             "id",
             "summary",
+            "chars",
             "created_at",
             "updated_at",
             "namespace",

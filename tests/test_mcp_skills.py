@@ -417,6 +417,7 @@ class TestCompactOutputs:
         assert set(got["notes"][0]) == {
             "id",
             "text",
+            "chars",
             "created_at",
             "updated_at",
             "namespace",
@@ -427,6 +428,7 @@ class TestCompactOutputs:
             "id",
             "title",
             "summary",
+            "chars",
             "created_at",
             "updated_at",
             "namespace",

@@ -130,8 +130,10 @@ class TestGet:
             "id", "title", "text", "summary", "summary_status",
             "author", "created_at", "updated_at", "namespace",  # Фаза 10 + title (Фаза 11)
             "expires_at",  # lsb-0004-02
+            "chars",  # lsb-0010-04 (FR-4.1): объём полного текста в символах
         }
         assert notes[0]["text"] == "Полный текст заметки"
+        assert notes[0]["chars"] == len("Полный текст заметки")  # lsb-0010-04
         assert notes[0]["summary_status"] == "pending"
         assert notes[0]["namespace"] == "default"  # save без namespace → default (Фаза 10)
         assert notes[0]["title"] is None  # легаси-путь save без title (решение №9)
@@ -213,7 +215,9 @@ class TestList:
             "id", "title", "summary", "summary_status", "author",
             "created_at", "updated_at", "namespace",  # Фаза 10 + title (Фаза 11)
             "expires_at",  # lsb-0004-02
+            "chars",  # lsb-0010-04 (FR-4.1): объём полного текста в символах
         }
+        assert item["chars"] == len(long_text(300))  # lsb-0010-04: полный текст
         assert item["author"] == "model-x"
         assert item["namespace"] == "default"  # Фаза 10
         assert item["title"] is None  # легаси-путь save без title (решение №9)

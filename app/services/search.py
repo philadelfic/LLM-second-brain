@@ -22,6 +22,9 @@
 Выдача FR-1: summary/snippet, без полного текста (memory_get адресно).
 Фаза 11 (решение №9): +title — реальное значение notes.title (None остаётся
 только у миграционных заметок без названия).
+lsb-0010-04 (FR-4.1/FR-4.2): +chars — объём ПОЛНОГО текста заметки в
+символах (не snippet/summary); значение для одной заметки совпадает с
+memory_list/memory_get без чанков.
 Snippet — из ЛУЧШЕГО чанка (первые SNIPPET_CHARS символов чанка): модель видит
 релевантный фрагмент длинной заметки, а не её начало; у fallback-кандидатов —
 из полного текста, как в Фазе 3. Ties (равный rrf_score) — по updated_at DESC,
@@ -540,10 +543,14 @@ class SearchService:
         Фаза 11 (решение №9, follow-up 5b): +title — реальное значение
         notes.title (None только у миграционных заметок без названия);
         REST /search отдаёт выдачу как есть, MCP-слой берёт то же поле.
+        lsb-0010-04 (FR-4.2): +chars — объём ПОЛНОГО текста заметки в
+        символах (не snippet/summary); текст уже в выборке (snippet-fallback)
+        — новых чтений нет. То же значение, что в memory_list/memory_get.
         """
         return {
             "id": row["id"],
             "title": row["title"],
+            "chars": len(row["text"]),  # lsb-0010-04: объём полного текста
             "summary": summary_of(row, self._settings),
             "snippet": snippet(snippet_source or row["text"], self._settings),
             "summary_status": row["summary_status"],

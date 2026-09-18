@@ -102,6 +102,15 @@ lsb-0013-02 (релиз 3.1.0): листинги — транспортная ч
 получает `limit`/`offset` (дефолт и потолок те же, поведение как у
 `memory_list`). `memory_search` и `memory_namespaces` не меняются; состав
 поверхности — 21 инструмент.
+
+lsb-0010-04 (релиз 3.1.0, задача №44): в компактные выдачи добавлено поле
+`chars` — объём ПОЛНОГО текста заметки в символах: `_SEARCH_ITEM` (semantic),
+`_LIST_ITEM` (деталь summaries) и `_GET_NOTE` (чтение без чанков). Модель
+видит объём и сама решает, хватит ли `memory_get` или нужен чанк. Деталь
+`titles` (`_TITLE_LIST_ITEM`) и title-режим поиска (`_TITLE_SEARCH_ITEM`)
+остаются без `chars` — режим сканирования реестра, объём там не нужен. В
+chunk-режиме `memory_get` белый список не применяется: верхний `chars` там —
+сумма символов ОТДАННЫХ чанков (контракт lsb-0003, не переопределяется).
 """
 
 import asyncio
@@ -526,9 +535,16 @@ TOOL_NAMES = frozenset(TOOL_DESCRIPTIONS)
 # Фаза 11 (решение №9): +title в list (сервис notes отдаёт) и в search
 # (SearchService отдаёт — follow-up пула 5b, см. _search_hit);
 # в get названия НЕТ — там полный текст (экономия контекста).
-_SEARCH_ITEM = ("id", "summary", "created_at", "updated_at", "namespace")
-_LIST_ITEM = ("id", "title", "summary", "created_at", "updated_at", "namespace", "expires_at")
-_GET_NOTE = ("id", "text", "created_at", "updated_at", "namespace", "expires_at")
+# lsb-0010-04 (FR-4.1/FR-4.3): +chars (объём полного текста в символах) в
+# search/list(summaries)/get — модель решает, хватит ли memory_get или нужен
+# чанк. Деталь titles (_TITLE_LIST_ITEM) остаётся {id, title, namespace}:
+# режим сканирования реестра, объём там не нужен (обратная совместимость).
+# В chunk-режиме memory_get белый список не применяется — сервисный контракт
+# отдаётся как есть, верхний `chars` там = сумма символов отданных чанков
+# (контракт lsb-0003, не переопределяем, FR-3.5/FR-4.2).
+_SEARCH_ITEM = ("id", "summary", "chars", "created_at", "updated_at", "namespace")
+_LIST_ITEM = ("id", "title", "summary", "chars", "created_at", "updated_at", "namespace", "expires_at")
+_GET_NOTE = ("id", "text", "chars", "created_at", "updated_at", "namespace", "expires_at")
 _NS_ITEM = ("path", "description", "status", "notes_count", "subtree_count", "updated_at")
 
 

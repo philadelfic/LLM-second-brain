@@ -29,9 +29,10 @@ MCP-слой срезает служебные поля — см. Фаза 9):
 - get    → {notes: [...]} (массив даже для одного id; отсутствующие/удалённые
            id пропускаются; пустой результат — мягкий ответ с hint; каждая
            заметка несёт title, Фаза 11 — MCP memory_get его срезает)
+           lsb-0010-04: +chars — объём полного текста в символах (FR-4.1/FR-4.2)
 - list   → {items: [...], total, has_more, next_offset, next_cursor} (без
-           полных текстов; каждый item несёт title, Фаза 11) (+hint, если
-           пусто) — lsb-0013 page fields
+           полных текстов; каждый item несёт title, Фаза 11, и chars —
+           lsb-0010-04) (+hint, если пусто) — lsb-0013 page fields
 - update → {id, updated: True, summary_pending: True} | мягкий ответ updated: False
 - delete → {id, deleted: True} | мягкий ответ deleted: False (soft delete)
 
@@ -468,6 +469,10 @@ class NoteService:
                 "id": row["id"],
                 "title": row["title"],  # Фаза 11 (решение №9): может быть None (миграция)
                 "summary": summary_of(row, self._settings),
+                # lsb-0010-04 (FR-4.1…FR-4.3): объём ПОЛНОГО текста в символах —
+                # модель решает, хватит ли memory_get или нужен чанк. Текст уже
+                # выбран для summary-fallback — новых чтений из БД нет.
+                "chars": len(row["text"]),
                 "summary_status": row["summary_status"],
                 "author": row["author"],
                 "created_at": row["created_at"],
@@ -900,11 +905,16 @@ class NoteService:
         Фаза 10: +namespace (слой ориентирования: модель видит, где лежит).
         Фаза 11 (решение №9): +title (REST-выдача оператору; MCP memory_get
         срезает белым списком — экономия контекста, там полный текст).
-        lsb-0004-02: +expires_at (абсолютный ISO-8601 UTC или None — постоянная)."""
+        lsb-0004-02: +expires_at (абсолютный ISO-8601 UTC или None — постоянная).
+        lsb-0010-04 (FR-4.2): +chars — объём ПОЛНОГО текста в символах (не
+        байты/токены); в режиме без чанков совпадает со значением в
+        memory_search/memory_list. В chunk-режиме верхнеуровневый `chars`
+        ответа — по-прежнему сумма отданных чанков (контракт lsb-0003)."""
         return {
             "id": row["id"],
             "title": row["title"],
             "text": row["text"],
+            "chars": len(row["text"]),  # lsb-0010-04: объём полного текста
             "summary": summary_of(row, self._settings),
             "summary_status": row["summary_status"],
             "author": row["author"],
