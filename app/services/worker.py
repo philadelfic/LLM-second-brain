@@ -36,11 +36,14 @@ pending-статусов в БД (переживают рестарт, дого�
 каждая джоба описывает свою очередь сама (`queue_stat`), `/health` при
 добавлении джобы не правится (lsb-0014-03, FR-2.2).
 
-Джоба `nodes` (lsb-0011-01) разбирает накопленный `default`: сначала промоция,
-затем быстрый пул обхода — переезд по готовой разметке (`hint_path` +
-`confidence`) без вызова моделей; механика переезда одна на обход и на
-причёску после суммаризации (`_apply_node_order`). Маркер `node_order_at` —
-анти-зацикливание обхода.
+Джоба `nodes` (lsb-0011) разбирает накопленный `default` и реклассифицирует
+объединённые заметки: (1) промоция, (2) задания `reclass` после сшивания
+(lsb-0012 — приоритетный источник), (3) быстрый пул обхода — переезд по
+готовой разметке (`hint_path` + `confidence`) без вызова моделей,
+(4) классификаторный пул обхода — вызов классификатора в жёстком бюджете
+(`JOB_NODES_CLASSIFIER_BUDGET`) по `title` + готовой суммари. Механика переезда
+одна на все источники и на причёску после суммаризации (`_apply_node_order`).
+Маркер `node_order_at` — анти-зацикливание (ставится при любом исходе разбора).
 
 Job-очереди в БД по слотам (`worker_jobs`): judge-работа (kind='dedup')
 создаётся ТОЛЬКО после готовности вектора заметки; merge-работа (kind='merge')
@@ -157,11 +160,15 @@ EXPIRATION_JOB = "expiration"
 # Джоба «порядок в узлах» (lsb-0011-01): обход накопленного `default`.
 NODES_JOB = "nodes"
 
+# Имя работы слота `nodes` после сшивания (lsb-0012, arch §3.5): объединённая
+# заметка может лежать в ЛЮБОМ узле — обход `default` её не найдёт, поэтому
+# реклассификация ставится заданием.
+NODES_RECLASS_KIND = "reclass"
+
 # Единое правило выборки быстрого пула обхода `default` (lsb-0011-01, arch §3.2):
 # активные default-заметки с готовой разметкой (`hint_path` + `confidence` не
 # ниже порога авто-переезда), ещё не разобранные (`node_order_at IS NULL`),
-# свежие первыми — переезд без вызова модели. Классификаторный пул и общий
-# бюджет обоих пулов — постановка 12.
+# свежие первыми — переезд без вызова модели.
 _NODES_SWEEP_SELECT = (
     "SELECT id, hint_path, confidence FROM notes "
     "WHERE namespace = 'default' AND deleted_at IS NULL "
@@ -169,16 +176,46 @@ _NODES_SWEEP_SELECT = (
     "ORDER BY updated_at DESC, id DESC LIMIT ?"
 )
 
-# Снимок очереди `nodes` для `/health.queues` (FR-2.2): тот же предикат
-# быстрого пула; возраст старейшего — `now - MIN(updated_at)`. Задания после
-# сшивания (lsb-0012) добавятся к снимку в постановке 12.
-_NODES_QUEUE_STAT_SQL = (
-    "SELECT COUNT(*) AS pending, "
-    "MAX(CAST(strftime('%s','now') AS INTEGER) - "
-    "CAST(strftime('%s', updated_at) AS INTEGER)) AS oldest_pending_sec "
-    "FROM notes "
+# Классификаторный пул обхода `default` (lsb-0011-02, arch §3.2): активные
+# default-заметки БЕЗ разметки (`classified_at IS NULL`), но с готовой непустой
+# суммари, ещё не разобранные, свежие первыми — вызов классификатора по
+# `title` + `summary` (arch §3.4). Неготовая суммари в пул не попадает: заметка
+# ждёт, маркер не ставится (FR-2.4). Число вызовов ограничивает бюджет
+# `JOB_NODES_CLASSIFIER_BUDGET`.
+_NODES_CLASSIFY_SELECT = (
+    "SELECT id, title, summary FROM notes "
     "WHERE namespace = 'default' AND deleted_at IS NULL "
-    "AND node_order_at IS NULL AND hint_path IS NOT NULL AND confidence >= ?"
+    "AND node_order_at IS NULL AND classified_at IS NULL "
+    "AND summary_status = 'ok' AND summary IS NOT NULL AND summary <> '' "
+    "ORDER BY updated_at DESC, id DESC LIMIT ?"
+)
+
+# Снимок очереди `nodes` для `/health.queues` (FR-2.2): pending-задания
+# `reclass` после сшивания (lsb-0012) + кандидаты обоих пулов обхода (быстрый
+# и классификаторный); возраст старейшего — старейший из двух источников
+# (задания — `created_at`, обход — `updated_at`), `null` — очередь пуста.
+_NODES_QUEUE_STAT_SQL = (
+    "SELECT "
+    "(SELECT COUNT(*) FROM worker_jobs WHERE slot = 'nodes' "
+    " AND kind = 'reclass' AND status = 'pending') "
+    "+ (SELECT COUNT(*) FROM notes WHERE namespace = 'default' "
+    " AND deleted_at IS NULL AND node_order_at IS NULL "
+    " AND hint_path IS NOT NULL AND confidence >= ?) "
+    "+ (SELECT COUNT(*) FROM notes WHERE namespace = 'default' "
+    " AND deleted_at IS NULL AND node_order_at IS NULL "
+    " AND classified_at IS NULL AND summary_status = 'ok' "
+    " AND summary IS NOT NULL AND summary <> '') AS pending, "
+    "MAX("
+    "COALESCE((SELECT MAX(CAST(strftime('%s','now') AS INTEGER) - "
+    " CAST(strftime('%s', created_at) AS INTEGER)) FROM worker_jobs "
+    " WHERE slot = 'nodes' AND kind = 'reclass' AND status = 'pending'), 0), "
+    "COALESCE((SELECT MAX(CAST(strftime('%s','now') AS INTEGER) - "
+    " CAST(strftime('%s', updated_at) AS INTEGER)) FROM notes "
+    " WHERE namespace = 'default' AND deleted_at IS NULL "
+    " AND node_order_at IS NULL AND ((hint_path IS NOT NULL AND confidence >= ?) "
+    " OR (classified_at IS NULL AND summary_status = 'ok' "
+    " AND summary IS NOT NULL AND summary <> ''))), 0)"
+    ") AS oldest_pending_sec"
 )
 
 # Промпт догенерации названия (решение №9): ЗАШИТ в SummaryService.title
@@ -275,6 +312,11 @@ class BackgroundWorker:
         # записывается мгновенно, вектор догоняет фоном (архитектура
         # субстрата §3.3 — без LLM в момент записи).
         self._areas_event = asyncio.Event()
+        # Сигнал «появилось задание после сшивания» (lsb-0012): будит петлю
+        # `nodes` сразу после merge — не ждём часового интервала. Сигнал ставит
+        # та же summary-петля (`process_merge_pending`), DI-нотификатор не нужен:
+        # джоба живёт внутри воркера (arch §3.5).
+        self._nodes_event = asyncio.Event()
         # Мемоизация создания таблицы job-очередей (пул 5): DDL исполняется
         # один раз на экземпляр воркера, а не при каждом обращении к очередям
         # (_create_job/_pending_jobs/_mark_job_done звали _ensure_job_table
@@ -344,6 +386,17 @@ class BackgroundWorker:
         дожидаясь выросшего back-off.
         """
         self._areas_event.set()
+
+    def notify_nodes_pending(self) -> None:
+        """Разбудить петлю `nodes`: появилось задание после сшивания (lsb-0012).
+
+        Вызывается из той же summary-петли после успешного merge
+        (`process_merge_pending` — синхронный код в `asyncio.to_thread`),
+        `asyncio.Event.set()` потокобезопасен. Петля немедленно выходит из
+        ожидания и разбирает `reclass`, не дожидаясь часового интервала
+        `JOB_NODES_INTERVAL_SEC`. DI-нотификатор не нужен: джоба живёт внутри
+        воркера (arch §3.5)."""
+        self._nodes_event.set()
 
     def _is_stopping(self) -> bool:
         """Предикат мягкой остановки для каркасного цикла (`run_loop`)."""
@@ -1079,6 +1132,14 @@ class BackgroundWorker:
             )
             self._mark_job_done(job["id"])
             done += 1
+            # Реклассификация объединённой заметки (lsb-0012, arch §3.5): узел
+            # ранней мог не подойти новому содержанию — ставим задание слоту
+            # `nodes` (объединённая заметка может лежать в любом узле — обход
+            # `default` её не найдёт) и будим его петлю сразу, не дожидаясь
+            # часового интервала. Неудачная постановка/обработка данные не
+            # портит: заметка остаётся в текущем узле, `classified_at` — NULL.
+            self._ensure_job(NODES_JOB, NODES_RECLASS_KIND, older_id)
+            self.notify_nodes_pending()
             # Ранняя заметка обновлена (summary pending) — будим свою же петлю
             # суммаризации, не дожидаясь back-off.
             self.notify_summary_pending()
@@ -1339,7 +1400,13 @@ class BackgroundWorker:
     # --- причёска (Фаза 10, Шаг 4) -------------------------------------------
 
     def _apply_node_order(
-        self, note_id: int, expected_namespace: str, result: Classification
+        self,
+        note_id: int,
+        expected_namespace: str,
+        result: Classification,
+        *,
+        current_namespace: str | None = None,
+        no_hint_reason: str = "low_confidence",
     ) -> tuple[str, str, str | None]:
         """Единственная точка переезда заметки по разметке (lsb-0011-01, arch §3.3).
 
@@ -1355,18 +1422,37 @@ class BackgroundWorker:
         `hint_path`) не пишет в БД вовсе — строгая семантика «отказ = не
         размечено». Возврат `(outcome, reason, target)`: `moved` — переезд;
         `kept` — оставлена (`hint_unknown` — узла нет в реестре,
-        `low_confidence` — уверенность ниже порога, `node_changed` — узел
-        сменён в полёте).
+        `no_hint_reason` — модель узла не предложила, `low_confidence` —
+        уверенность ниже порога, `same_node` — узел тот же, `node_changed` —
+        узел сменён в полёте). Все reason — из словаря arch §3.7.
 
-        Механика одна на два источника (arch §3.3): её переиспользует
-        причёска после суммаризации (вход по полному тексту) и обход
-        `default` (быстрый путь по готовой разметке, без модели).
+        Механика одна на все источники (arch §3.3): её переиспользует
+        причёска после суммаризации (вход по полному тексту), обход `default`
+        (быстрый путь и классификаторный пул) и задание после сшивания.
+
+        `current_namespace` — узел заметки, прочитанный В МОМЕНТ РЕШЕНИЯ
+        (только задание после сшивания, lsb-0012): тогда результат без узла
+        даёт `no_hint_reason` (`result_default` — заметка НЕ понижается,
+        FR-2.4), а уверенный выбор текущего узла — `kept`/`same_node` без
+        лишней пере-векторизации. Для обхода и причёски (`None`) поведение
+        прежнее: `expected_namespace` — `'default'`.
         """
         target = self._auto_move_target(result)
-        move = (
-            target is not None
-            and result.confidence >= self._settings.namespace_auto_move_min_confidence
+        confident = (
+            result.confidence >= self._settings.namespace_auto_move_min_confidence
         )
+        move = target is not None and confident
+        if current_namespace is not None and not result.hint_path:
+            # Результат «общая»: движение «узел → свалка» запрещено (FR-2.4) —
+            # заметка остаётся в узле ранней.
+            target = None
+            move = False
+        elif (
+            current_namespace is not None
+            and confident
+            and target == current_namespace
+        ):
+            move = False  # узел тот же: переезда (и пере-векторизации) нет
         # Маркер разбора ставится в ТОЙ ЖЕ транзакции, что и разметка
         # (lsb-0011-01, §3.6): атомарно, анти-зацикливание не отстаёт от решения.
         columns = [
@@ -1394,9 +1480,11 @@ class BackgroundWorker:
         if target is None:
             return (
                 "kept",
-                "hint_unknown" if result.hint_path else "low_confidence",
-                target,
+                "hint_unknown" if result.hint_path else no_hint_reason,
+                None,
             )
+        if current_namespace is not None and confident and target == current_namespace:
+            return "kept", "same_node", target
         return "kept", "low_confidence", target
 
     def _classify_default_note(self, note_id: int, text: str) -> None:
@@ -1527,42 +1615,141 @@ class BackgroundWorker:
             return None
         return hint
 
-    # --- джоба «порядок в узлах» (lsb-0011-01) ---------------------------
+    # --- джоба «порядок в узлах» (lsb-0011) -----------------------------------
 
     def process_nodes(self, budget: int | None = None) -> int:
-        """Прогон джобы `nodes`: промоция → быстрый пул обхода `default`.
+        """Прогон джобы `nodes`: промоция → задания → обход `default`.
 
-        Порядок прогона (FR-3.1, arch §3.2): (1) промоция — `PromotionService.run()`
-        (создание/слияние листов, ретро-перекладка), отказ не роняет джобу;
-        (2) быстрый пул обхода — остаток бюджета; (3) задания после сшивания
-        появятся в постановке 12. Бюджет — общий на прогон (`JOB_NODES_BATCH`,
-        дефолт 20): не более него обработок (`moved` + `kept`) за прогон;
-        повторные прогоны продолжают backlog.
+        Полный порядок прогона (FR-1.2/FR-2.3/FR-3.3, arch §3.2):
+        (1) промоция — `PromotionService.run()` (создание/слияние листов,
+        ретро-перекладка), отказ не роняет джобу;
+        (2) задания `reclass` после сшивания (lsb-0012) — приоритетный
+        источник: объединённая заметка может лежать в любом узле, обход
+        `default` её не найдёт;
+        (3) быстрый пул обхода — остатком бюджета, переезд БЕЗ вызова модели;
+        (4) классификаторный пул обхода — остатком бюджета, но не более
+        `JOB_NODES_CLASSIFIER_BUDGET` вызовов классификатора за прогон.
+        Бюджет `JOB_NODES_BATCH` (дефолт 20) — ОБЩИЙ на оба источника за
+        прогон: не более него обработок (`moved` + `kept`); повторные прогоны
+        продолжают backlog. Заметка, ждущая модель или суммари, не
+        обрабатывается и маркера не получает — она попадёт в следующий прогон.
 
         Быстрый пул (arch §3.2): default-заметки с готовой разметкой
         (`hint_path` + `confidence` не ниже порога авто-переезда), ещё не
-        разобранные (`node_order_at IS NULL`), свежие первыми — переезд БЕЗ
-        вызова модели. Узел зарегистрирован → переезд (`moved`/`hint_exists`,
-        разметка не меняется); узла нет в реестре → `kept`/`hint_unknown`
-        (лист создаст промоция — узел здесь не создаём). Маркер `node_order_at`
-        ставится при любом исходе быстрого пути (анти-зацикливание, §3.6):
-        оставленная заметка не выедает бюджет повторно до изменения
-        текста/названия (сброс маркера — NoteService.update/merge_pair).
+        разобранные (`node_order_at IS NULL`), свежие первыми. Узел
+        зарегистрирован → переезд (`moved`/`hint_exists`, разметка не
+        меняется); узла нет в реестре → `kept`/`hint_unknown` (лист создаст
+        промоция — узел здесь не создаём).
 
-        Каждая заметка — событие `node_order` (`job='nodes'`,
-        `source='sweep'`, `outcome`, `reason`, `target`, `note_id`).
-        Возврат — число разобранных заметок (0 уводит каркасную петлю к
-        ожиданию интервала).
+        Каждая разобранная заметка — событие `node_order` (`job='nodes'`,
+        `source='sweep'`/`'after_merge'`, `outcome`, `reason`, `target`,
+        `note_id`). Возврат — число разобранных заметок (0 уводит каркасную
+        петлю к ожиданию интервала или сигнала `notify_nodes_pending`).
         """
         limit = self._settings.job_nodes_batch if budget is None else budget
         # (1) Промоция первой: заметка не «переезжает» в узел, который
         # появится в этом же прогоне (FR-3.1). Отказ не роняет джобу (FR-3.2).
         self._run_promotion(NODES_JOB)
-        # (2) Быстрый пул обхода: переезд по готовой разметке, без модели.
+        # (2) Задания после сшивания — приоритетный источник (FR-3.3).
+        done = self._process_reclass_jobs(limit)
+        # (3) Быстрый пул обхода, (4) классификаторный — остатком бюджета.
+        done += self._sweep_fast_marks(limit - done)
+        done += self._sweep_classifier(limit - done)
+        return done
+
+    def _process_reclass_jobs(self, limit: int) -> int:
+        """Обработать партию заданий `reclass` (после сшивания); их число.
+
+        Порядок — по `id` очереди (свежие события не ждут за старыми).
+        Задание, ждущее готовой суммари, остаётся pending и прогрессом не
+        считается: петля уходит в сон по back-off, а не крутится вхолостую.
+        """
+        if limit <= 0:
+            return 0
+        done = 0
+        for job in self._pending_jobs(NODES_JOB, NODES_RECLASS_KIND, limit):
+            if self._process_reclass_job(int(job["note_id"])):
+                self._mark_job_done(job["id"])
+                done += 1
+        return done
+
+    def _process_reclass_job(self, note_id: int) -> bool:
+        """Разобрать одно задание после сшивания; True — задание снято с очереди.
+
+        Читаем заметку и решаем (FR-2.2/FR-2.5 lsb-0012, arch §3.5):
+
+        * заметки нет (удалена оператором) — задание снимаем: решать нечего;
+        * суммари ещё не готова (`summary_status != 'ok'` или пустая) —
+          задание ОСТАЁТСЯ pending и прогрессом не считается (ждёт по
+          back-off), по fallback-усечению решение не принимается, маркер
+          разбора не ставится — событие `node_order`/`summary_pending`;
+        * по готовой суммари — вызов классификатора на `title` + `summary`
+          (двухступенчатость с полным `text` не вводим — arch §3.4) и общая
+          точка переезда `_apply_node_order` с guard-ом по УЗЛУ, ПРОЧИТАННОМУ
+          при решении: операторский/клиентский переезд в полёте фоном не
+          перебивается (`node_changed`). Результат `default` заметку не
+          понижает (`result_default`), тот же узел — `same_node`.
+
+        Без классификатора (тестовый режим) решение не принимается: задание
+        остаётся pending, данные не портятся.
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT title, summary, summary_status, namespace FROM notes "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (note_id,),
+            ).fetchone()
+        if row is None:
+            return True  # заметки нет — задание снимаем
+        summary = row["summary"] or ""
+        if row["summary_status"] != "ok" or not summary.strip():
+            self._log_node_order(
+                note_id, "kept", "summary_pending", None, source="after_merge"
+            )
+            return False  # ждём суммари: задание остаётся pending
+        if self._classifier is None:
+            return False  # тестовый режим без классификатора
+        known = self._namespaces.list_all()["namespaces"]
+        text = f"{row['title']}\n{summary}" if row["title"] else summary
+        try:
+            result = self._classifier.classify(text, known)
+        except ClassificationError:
+            # Отказ классификатора данные не портит (FR-3.1): заметка остаётся
+            # в текущем узле, разметка не пишется, задание — pending.
+            logging.getLogger("app").warning(
+                "nodes: reclass failed — note stays in its node, retry by back-off",
+                extra={
+                    "event": "node_order_failed",
+                    "job": NODES_JOB,
+                    "source": "after_merge",
+                    "note_id": note_id,
+                },
+            )
+            return False
+        outcome, reason, target = self._apply_node_order(
+            note_id,
+            row["namespace"],
+            result,
+            current_namespace=row["namespace"],
+            no_hint_reason="result_default",
+        )
+        self._log_node_order(note_id, outcome, reason, target, source="after_merge")
+        return True
+
+    def _sweep_fast_marks(self, budget: int) -> int:
+        """Быстрый пул обхода `default`: переезд по готовой разметке, без модели.
+
+        Заметки с `hint_path` + `confidence` не ниже порога авто-переезда,
+        ещё не разобранные (`node_order_at IS NULL`), свежие первыми. Маркер
+        `node_order_at` ставится при любом исходе (анти-зацикливание, §3.6):
+        оставленная заметка не выедает бюджет повторно до изменения
+        текста/названия (сброс маркера — NoteService.update/merge_pair).
+        """
+        if budget <= 0:
+            return 0
         threshold = self._settings.namespace_auto_move_min_confidence
         with session(self._settings) as conn:
-            rows = conn.execute(_NODES_SWEEP_SELECT, (threshold, limit)).fetchall()
-        logger = logging.getLogger("app")
+            rows = conn.execute(_NODES_SWEEP_SELECT, (threshold, budget)).fetchall()
         done = 0
         for row in rows:
             note_id = int(row["id"])
@@ -1571,32 +1758,95 @@ class BackgroundWorker:
                 note_id, "default", result
             )
             done += 1
-            logger.info(
-                "nodes: default sweep decided note order",
-                extra={
-                    "event": "node_order",
-                    "job": NODES_JOB,
-                    "source": "sweep",
-                    "note_id": note_id,
-                    "outcome": outcome,
-                    "reason": reason,
-                    "target": target,
-                },
-            )
+            self._log_node_order(note_id, outcome, reason, target)
         return done
+
+    def _sweep_classifier(self, budget: int) -> int:
+        """Классификаторный пул обхода `default`: разметка через модель.
+
+        Заметки без разметки (`classified_at IS NULL`) с ГОТОВОЙ непустой
+        суммари, свежие первыми; вход классификатору — `title` + `summary`
+        (arch §3.4, полный `text` не отдаём). Число вызовов классификатора за
+        прогон ограничено бюджетом `JOB_NODES_CLASSIFIER_BUDGET` и остатком
+        общего бюджета. Отказ классификатора заметку не помечает — она
+        останется кандидатом следующего прогона (FR-3.2).
+        """
+        limit = min(budget, self._settings.job_nodes_classifier_budget)
+        if limit <= 0 or self._classifier is None:
+            return 0
+        with session(self._settings) as conn:
+            rows = conn.execute(_NODES_CLASSIFY_SELECT, (limit,)).fetchall()
+        known = self._namespaces.list_all()["namespaces"]
+        done = 0
+        for row in rows:
+            note_id = int(row["id"])
+            summary = row["summary"] or ""
+            text = f"{row['title']}\n{summary}" if row["title"] else summary
+            try:
+                result = self._classifier.classify(text, known)
+            except ClassificationError:
+                logging.getLogger("app").warning(
+                    "nodes: classify failed — note stays in default, retry later",
+                    extra={
+                        "event": "classify_failed",
+                        "job": NODES_JOB,
+                        "note_id": note_id,
+                    },
+                )
+                continue  # маркер не ставим: заметка снова кандидат обхода
+            outcome, reason, target = self._apply_node_order(
+                note_id,
+                "default",
+                result,
+                no_hint_reason="no_hint_classified",
+            )
+            done += 1
+            self._log_node_order(note_id, outcome, reason, target)
+        return done
+
+    def _log_node_order(
+        self,
+        note_id: int,
+        outcome: str,
+        reason: str,
+        target: str | None,
+        source: str = "sweep",
+    ) -> None:
+        """Событие `node_order` джобы `nodes` (FR-4.2): исход разбора заметки.
+
+        `reason` — из словаря arch §3.7 (`hint_exists`, `hint_unknown`,
+        `low_confidence`, `no_hint_classified`, `summary_pending`, `same_node`,
+        `result_default`, `node_changed`), `source` — источник решения
+        (`sweep` — обход `default`, `after_merge` — задание после сшивания).
+        Имена событий и полей существующие — наблюдаемость джобы не меняется.
+        """
+        logging.getLogger("app").info(
+            "nodes: decided note order",
+            extra={
+                "event": "node_order",
+                "job": NODES_JOB,
+                "source": source,
+                "note_id": note_id,
+                "outcome": outcome,
+                "reason": reason,
+                "target": target,
+            },
+        )
 
     def _nodes_queue_stat(self) -> dict:
         """Снимок очереди `nodes` для `/health.queues` (FR-2.2).
 
-        `pending` — кандидаты быстрого пула обхода (тот же предикат, что у
-        выборки); `oldest_pending_sec` — возраст старейшего (`now -
-        MIN(updated_at)`), `null` — очередь пуста. Только SQL, без обращений к
-        моделям; задания после сшивания добавятся в снимок в постановке 12.
+        `pending` — pending-задания `reclass` после сшивания + кандидаты обоих
+        пулов обхода (быстрый и классификаторный); `oldest_pending_sec` —
+        возраст старейшего из двух источников (задания — `created_at`,
+        обход — `updated_at`), `null` — очередь пуста. Только SQL, без
+        обращений к моделям; снимок работает и у выключенной джобы.
         """
+        self._ensure_job_table()
+        threshold = self._settings.namespace_auto_move_min_confidence
         with session(self._settings) as conn:
             row = conn.execute(
-                _NODES_QUEUE_STAT_SQL,
-                (self._settings.namespace_auto_move_min_confidence,),
+                _NODES_QUEUE_STAT_SQL, (threshold, threshold)
             ).fetchone()
         return queue_snapshot(row["pending"], row["oldest_pending_sec"])
 
@@ -1839,14 +2089,19 @@ def build_expiration_job(worker: BackgroundWorker, settings: Settings) -> JobSpe
 
 
 def build_nodes_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
-    """Джоба `nodes`: обход накопленного `default` (lsb-0011-01).
+    """Джоба `nodes`: обход `default` и реклассификация после сшивания (lsb-0011).
 
-    Форма «по интервалу» (сигнала `notify_*` у обхода нет): прогон — промоция,
-    затем быстрый пул обхода батчем `JOB_NODES_BATCH` (переезд по готовой
-    разметке без вызова моделей), прогресс сбрасывает back-off, пустая
-    выборка — сон на `JOB_NODES_INTERVAL_SEC`. `JOB_NODES_ENABLED=false`
+    Форма «по интервалу + событие» (arch §3.1): пустой прогон — сон на
+    `JOB_NODES_INTERVAL_SEC`, но сигнал `notify_nodes_pending` (задание после
+    сшивания, lsb-0012) будит петлю сразу. Прогон — промоция, задания
+    `reclass`, затем обход `default` (быстрый пул без модели + классификаторный
+    в бюджете `JOB_NODES_CLASSIFIER_BUDGET`). `JOB_NODES_ENABLED=false`
     джобу не запускает, но очередь остаётся видна в `/health` (реестр её
     сохраняет). Синхронный SQL/механика уходят в поток — event loop не занимаем.
+
+    Перепроверку очереди (`queue_empty`) не задаём: заметка, ждущая модель или
+    суммари, — отложенное задание, и петля ДОЛЖНА уйти в сон по back-off, а не
+    крутиться вхолостую (arch §3.2, «отложенное задание — не прогресс»).
     """
     batch = settings.job_nodes_batch
 
@@ -1861,7 +2116,7 @@ def build_nodes_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         enabled=settings.job_nodes_enabled,
         process=process,
         queue_empty=None,
-        wait_event=None,
+        wait_event=worker._nodes_event,
         idle_hook=None,
         queue_stat=worker._nodes_queue_stat,
     )

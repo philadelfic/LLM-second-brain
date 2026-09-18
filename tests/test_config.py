@@ -71,10 +71,11 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "JOB_LINKS_ENABLED": ("job_links_enabled", True),
     "JOB_LINKS_INTERVAL_SEC": ("job_links_interval_sec", 300),
     "JOB_LINKS_BATCH": ("job_links_batch", 100),
-    # lsb-0011-01 (3.1.0): джоба «порядок в узлах» — обход default (FR-1.1/FR-1.2).
+    # lsb-0011-01/02 (3.1.0): джоба «порядок в узлах» — обход default (FR-1.1/FR-1.2).
     "JOB_NODES_ENABLED": ("job_nodes_enabled", True),
     "JOB_NODES_INTERVAL_SEC": ("job_nodes_interval_sec", 3600),
     "JOB_NODES_BATCH": ("job_nodes_batch", 20),
+    "JOB_NODES_CLASSIFIER_BUDGET": ("job_nodes_classifier_budget", 10),
     "DEDUP_SIMILARITY": ("dedup_similarity", 0.92),
     # Фаза 8 (Этап 2.1): фоновый дедуп — косинус-кандидаты.
     "DEDUP_CANDIDATE_TOP_N": ("dedup_candidate_top_n", 3),

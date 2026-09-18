@@ -155,6 +155,9 @@ class Settings(BaseSettings):
     job_nodes_enabled: bool = True
     job_nodes_interval_sec: int = 3600
     job_nodes_batch: int = 20
+    # Бюджет вызовов классификатора за прогон (lsb-0011-02, FR-2.3): ≥ 1 и не
+    # выше общего батча — экономия вызовов моделей (arch §3.2/§3.4, дефолт 10).
+    job_nodes_classifier_budget: int = 10
 
     # --- лимиты (NFR-6: env-переопределяемы, валидируются; см. _validate_ranges) ---
     max_note_chars: int = 35000  # 2000→20000 (Фаза 7) → 35000 (решение О. 2026-08-30)
@@ -350,6 +353,17 @@ class Settings(BaseSettings):
         # батч ≥ 1 (общий бюджет обработок за прогон).
         need_low("job_nodes_interval_sec", self.job_nodes_interval_sec, 30)
         need_low("job_nodes_batch", self.job_nodes_batch, 1)
+        # Бюджет классификатора (lsb-0011-02): ≥ 1 и не выше общего батча —
+        # иначе вызовов модели за прогон больше, чем обработок.
+        need_low(
+            "job_nodes_classifier_budget", self.job_nodes_classifier_budget, 1
+        )
+        if self.job_nodes_classifier_budget > self.job_nodes_batch:
+            errors.append(
+                "  - job_nodes_classifier_budget: бюджет классификатора выше "
+                "общего батча job_nodes_batch — за прогон столько заметок "
+                "не разберётся"
+            )
 
         # --- векторизация / суммаризация ---
         need_low("embedding_dim", self.embedding_dim, 1)

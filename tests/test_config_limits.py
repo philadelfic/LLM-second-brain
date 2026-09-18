@@ -531,7 +531,8 @@ class TestJobLimits:
 
 
 class TestNodesJobLimits:
-    """Джоба обхода `default` `nodes` (lsb-0011-01): интервал ≥ 30, батч ≥ 1."""
+    """Джоба обхода `default` `nodes` (lsb-0011): интервал ≥ 30, батч ≥ 1,
+    бюджет классификатора ≥ 1 и не выше батча."""
 
     def test_nodes_interval_below_thirty_is_fatal(
         self, monkeypatch: pytest.MonkeyPatch
@@ -545,20 +546,41 @@ class TestNodesJobLimits:
         with pytest.raises(ConfigError, match="job_nodes_batch"):
             load_env(monkeypatch, JOB_NODES_BATCH="0")
 
+    def test_nodes_classifier_budget_below_one_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """lsb-0011-02: бюджет вызовов классификатора ≥ 1."""
+        with pytest.raises(ConfigError, match="job_nodes_classifier_budget"):
+            load_env(monkeypatch, JOB_NODES_CLASSIFIER_BUDGET="0")
+
+    def test_nodes_classifier_budget_above_batch_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Бюджет модели не выше общего бюджета обработок за прогон."""
+        with pytest.raises(ConfigError, match="job_nodes_classifier_budget"):
+            load_env(
+                monkeypatch,
+                JOB_NODES_BATCH="5",
+                JOB_NODES_CLASSIFIER_BUDGET="6",
+            )
+
     def test_nodes_job_defaults_and_overrides(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Дефолты §3.2: включена, 3600 с, батч 20; значения переопределяемы."""
+        """Дефолты §3.2: включена, 3600 с, батч 20, бюджет 10; переопределяемы."""
         defaults = load_env(monkeypatch)
         assert defaults.job_nodes_enabled is True
         assert defaults.job_nodes_interval_sec == 3600
         assert defaults.job_nodes_batch == 20
+        assert defaults.job_nodes_classifier_budget == 10
         custom = load_env(
             monkeypatch,
             JOB_NODES_ENABLED="false",
             JOB_NODES_INTERVAL_SEC="45",
             JOB_NODES_BATCH="7",
+            JOB_NODES_CLASSIFIER_BUDGET="5",
         )
         assert custom.job_nodes_enabled is False
         assert custom.job_nodes_interval_sec == 45
         assert custom.job_nodes_batch == 7
+        assert custom.job_nodes_classifier_budget == 5
