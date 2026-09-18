@@ -53,6 +53,11 @@ Bearer и тот же сервисный слой, что у MCP (`user_save`/`u
 `total`/`has_more`/`next_offset`/`next_cursor`. Текстовой подсказки листания
 («+N more») на REST нет — это признак «есть ещё» для модели в MCP-выдаче;
 собственная подсказка сервиса («memory is empty») остаётся как была.
+
+Релиз 3.1.0 (lsb-0010-05): `GET /notes/{id}` несёт связи заметки — `links` из
+ДРУГИХ неймспейсов (элемент {id, title, namespace, chars}, уровень 1 с
+фолбэком на уровень 0, arch §3.5). Новых ручек нет: отдельного просмотра связей
+не вводим (решение О. 2026-09-17).
 """
 
 from __future__ import annotations
@@ -371,16 +376,30 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.get("/notes/{note_id}")
     async def get_note(note_id: int, request: Request) -> dict:
-        """Полный текст одной заметки (одиночный алиас batch memory_get)."""
-        result = await asyncio.to_thread(
-            _services(request).notes.get, [note_id]
-        )
+        """Полный текст одной заметки + связи из ДРУГИХ неймспейсов.
+
+        Одиночный алиас batch memory_get: сервисный контракт полный (`chars` —
+        объём текста), lsb-0010-05 добавляет `links` — элемент {id, title,
+        namespace, chars} (сборка — на уровне транспорта, arch §3.5). Отдельной
+        операторской ручки просмотра связей НЕТ (решение О. 2026-09-17): связи
+        видны в чтении заметки, таблица доступна в БД.
+        """
+        services = _services(request)
+        result = await asyncio.to_thread(services.notes.get, [note_id])
         if not result["notes"]:
             raise HTTPException(
                 status_code=404,
                 detail=result.get("hint", "заметка не найдена"),
             )
-        return result["notes"][0]
+        note = dict(result["notes"][0])
+        # Пустой список — нормальный ответ: без `hint` и без подсказок.
+        # `Services.links` в DI-сборках тестов может быть None (без связей) —
+        # деградируем до пустого списка, как анонс навыков без области (lsb-0007).
+        links = services.links
+        note["links"] = (
+            list(await asyncio.to_thread(links.related, note_id)) if links else []
+        )
+        return note
 
     @rest_router.put("/notes/{note_id}")
     async def update_note(note_id: int, payload: NoteUpdate, request: Request) -> dict:

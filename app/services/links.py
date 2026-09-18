@@ -13,8 +13,10 @@
 партию очереди, `queue_stat` описывает её для `/health`, `purge_orphans` —
 гигиена idle-ветки. Джоба регистрируется в реестре каркаса (`build_links_job`).
 
-Выдача связей (уровень 1 с приоритетом, фолбэк на уровень 0) — постановка 10:
-`related` пока отдаёт уровень 0 как есть.
+Выдача связей (постановка 10, arch §3.5): `related` отдаёт уровень 1
+(таблица `links`) с приоритетом вида и фолбэком на уровень 0, только если после
+отсечений уровня 1 не осталось ни одной связи. Форму компактной выдачи для
+модели собирает транспорт (`mcp.py`), полный контракт — `rest.py`.
 """
 
 from __future__ import annotations
@@ -69,6 +71,23 @@ _QUEUE_STAT_SQL = (
     "CAST(strftime('%s', updated_at) AS INTEGER)) AS oldest_pending_sec "
     "FROM notes "
     "WHERE deleted_at IS NULL AND vector_status = 'ok' AND links_at IS NULL"
+)
+
+# Выдача связей уровня 1 (arch §3.5): связь читается в обе стороны (`note_a`
+# ИЛИ `note_b`), join к `notes`; отсечения — свой неймспейс (связи — признак
+# «между разделами»), soft-deleted и заметки удалённых (неизвестных) узлов.
+# Порядок: приоритет вида (mention → entities → cosine; на пару хранится одна
+# строка с высшим приоритетом) → `score` DESC → свежесть → id DESC; потолок —
+# параметр LIMIT.
+_RELATED_SQL = (
+    "SELECT n.id AS id, n.title AS title, n.namespace AS namespace, "
+    "n.text AS text FROM links l JOIN notes n ON n.id = "
+    "CASE WHEN l.note_a = ? THEN l.note_b ELSE l.note_a END "
+    "WHERE (l.note_a = ? OR l.note_b = ?) AND n.deleted_at IS NULL "
+    "AND n.namespace != ? "
+    "AND n.namespace IN (SELECT path FROM namespaces) "
+    "ORDER BY CASE l.kind WHEN 'mention' THEN 3 WHEN 'entities' THEN 2 "
+    "ELSE 1 END DESC, l.score DESC, n.updated_at DESC, n.id DESC LIMIT ?"
 )
 
 # Стоп-слова значимых слов (ru+en) — константа кода, не env (arch §3.3).
@@ -136,19 +155,21 @@ class LinksService:
         # DI для тестов и общий экземпляр из build_services; иначе — свой.
         self._search = search if search is not None else SearchService(settings)
 
-    # --- уровень 0: выдача «ленивого графа» ---------------------------------
+    # --- выдача связей: уровень 1 с фолбэком на уровень 0 (arch §3.5) -------
 
     def related(self, note_id: int, limit: int | None = None) -> list[dict[str, Any]]:
         """Связанные заметки из ДРУГИХ неймспейсов; `[]` — нормальный ответ.
 
-        Уровень 0 (arch §3.1): пул `LINK_POOL` из KNN по полному вектору заметки
-        (без фильтра неймспейса) → отсечения (сама заметка, свой неймспейс,
-        soft-deleted, заметки удалённых узлов) → потолок `LINK_TOP`. Сортировка —
-        по убыванию близости (порядок `similar_notes`).
+        Приоритет — уровень 1 (arch §3.5): хранимые связи `links` читаются в обе
+        стороны, отсечения при выдаче (свой неймспейс, soft-deleted, заметки
+        удалённых узлов), порядок «приоритет вида → `score` DESC → свежесть →
+        id DESC». Фолбэк на уровень 0 (KNN по вектору заметки, §3.1) — только
+        если после отсечений уровня 1 не осталось ни одной связи. Потолок обеих
+        веток — `LINK_TOP`; `limit` может лишь понизить его (FR-1.1).
 
-        Заметка без готового вектора даёт пустой список без ошибки: отсутствие
-        связей — не ошибка и не повод для `hint` (FR-1.5). `limit` может лишь
-        понизить потолок `LINK_TOP` — выше потолка связей не отдаём (FR-1.1).
+        Нет активной заметки с таким id, пустая таблица связей или заметка без
+        готового вектора — пустой список без ошибки: отсутствие связей — не
+        ошибка и не повод для `hint` (FR-3.3).
         """
         top = (
             self._settings.link_top
@@ -157,6 +178,56 @@ class LinksService:
         )
         if top < 1:
             return []
+        own_namespace = self._namespace_of(note_id)
+        if own_namespace is None:
+            return []  # нет активной заметки (trash / неизвестный id)
+        stored = self._related_level1(note_id, own_namespace, top)
+        if stored:
+            return stored
+        return self._related_level0(note_id, own_namespace, top)
+
+    def _namespace_of(self, note_id: int) -> str | None:
+        """Неймспейс активной заметки; None — заметки нет (trash/неизвестный id)."""
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT namespace FROM notes WHERE id = ? AND deleted_at IS NULL",
+                (note_id,),
+            ).fetchone()
+        return None if row is None else str(row["namespace"])
+
+    def _related_level1(
+        self, note_id: int, own_namespace: str, top: int
+    ) -> list[dict[str, Any]]:
+        """Связи уровня 1 (таблица `links`, arch §3.5) — отсечения и порядок в SQL.
+
+        Чтение в обе стороны (`note_a`/`note_b`) с join к `notes`; отсечения при
+        выдаче: свой неймспейс (связи — признак «между разделами»), soft-deleted,
+        заметки удалённых узлов. Порядок и потолок задаёт `_RELATED_SQL` (LIMIT):
+        на пару хранится одна строка с высшим приоритетом вида, поэтому `mention`
+        выше `entities`, а `entities` выше `cosine`. Пусто — нормальный ответ
+        (таблица пуста или всё отсечено): решает вызывающий (фолбэк уровня 0).
+        """
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                _RELATED_SQL, (note_id, note_id, note_id, own_namespace, top)
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "namespace": row["namespace"],
+                "chars": len(row["text"]),
+            }
+            for row in rows
+        ]
+
+    def _related_level0(
+        self, note_id: int, own_namespace: str, top: int
+    ) -> list[dict[str, Any]]:
+        """Уровень 0 (arch §3.1): пул `LINK_POOL` из KNN по полному вектору заметки
+        (без фильтра неймспейса) → отсечения (свой неймспейс, soft-deleted,
+        заметки удалённых узлов) → потолок `LINK_TOP`. Сортировка — по убыванию
+        близости (порядок `similar_notes`)."""
         candidates = self._search.similar_notes(
             note_id,
             self._settings.link_pool,
@@ -165,13 +236,6 @@ class LinksService:
         if not candidates:
             return []
         with session(self._settings) as conn:
-            source = conn.execute(
-                "SELECT namespace FROM notes WHERE id = ? AND deleted_at IS NULL",
-                (note_id,),
-            ).fetchone()
-            if source is None:
-                return []
-            own_namespace = source["namespace"]
             placeholders = ",".join("?" * len(candidates))
             rows = {
                 row["id"]: row
