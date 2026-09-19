@@ -14,9 +14,11 @@ What makes it different from `e2e_release30.py`:
   fired are printed per stage: a slow model reads as "we waited", not as a
   false FAIL (FR-1.2/FR-1.3);
 * the run is idempotent: probe data is marked by the run prefix (in titles) and
-  by its own namespace, and is removed both at the start (leftovers of a
-  previous run) and at the end (its own); no check depends on leftovers
-  (FR-2.1/FR-2.2);
+  is removed both at the start (leftovers of a previous run) and at the end (its
+  own); the probe NODES carry fixed names and are reused as is — a repeated
+  registration answers with the synonym refusal whose nearest node is the
+  requested path itself, and the harness reads that as "the node is already
+  registered", not as a FAIL; no check depends on leftovers (FR-2.1/FR-2.2);
 * teardown always writes a trace "what was removed / what was left on purpose"
   to `release/3.1.0/acceptance/teardown-<timestamp>.log` — also on an emergency
   exit, so the next run can still be started (FR-3.1/FR-3.2);
@@ -100,6 +102,38 @@ MORE_HINT = re.compile(r"^\+(\d+) more — offset=(\d+)$")
 LINK_ITEM_FIELDS = {"id", "title", "namespace", "chars"}
 UPGRADE_TABLES = ("links",)
 UPGRADE_COLUMNS = ("links_at", "node_order_at")
+
+# --- probe namespaces: FIXED names, reused between runs (techdebt-0036) -------
+# Имена зондов не несут тега прогона: имя вида `e2e31-<run_id>` встроенная
+# антисинонимия приложения (эмбеддер, порог косинуса ОПИСАНИЙ 0.90) считает почти
+# тем же узлом, что зонд прошлого прогона (цифровой суффикс тега для эмбеддера не
+# различает имена), и регистрация мягко отклоняется с `reason=synonym`. Ручки
+# удаления узла в MCP-поверхности нет, поэтому зонд регистрируется однажды и
+# дальше ПЕРЕИСПОЛЬЗУЕТСЯ, а мягкий отказ `nearest == запрошенный путь` харнесс
+# читает как «узел уже зарегистрирован» (см. `node_creation`). Тег прогона живёт
+# только в заголовках заметок — он и обеспечивает идемпотентность по данным.
+# Описания — из намеренно разных тем, без общего шаблона: сравнение идёт против
+# описаний ВСЕХ тематических узлов реестра.
+PROBE_ROOT = "acceptance-probes"
+PROBE_ROOT_DESC = (
+    "Basket of throwaway specimen notes for the release gate — one check "
+    "writes them, the same check erases them."
+)
+PROBE_CHILDREN = (
+    (
+        "acceptance-probes/index-ranking",
+        "Rebuilding the embedding index: the cosine ranking must stay stable "
+        "while the encoder works through the queue one text at a time.",
+    ),
+    (
+        "acceptance-probes/changelog-drafts",
+        "Changelog wording and version bump bookkeeping of a release entry, "
+        "plus the rollout checklist.",
+    ),
+)
+PROBE_PATHS = (PROBE_ROOT, *(path for path, _desc in PROBE_CHILDREN))
+_SYNONYM_HINT = re.compile(r"there is a similar one:\s*(\S+)")
+_ALREADY_REGISTERED = re.compile(r"already registered", re.IGNORECASE)
 
 # --- run configuration (filled in main) --------------------------------------
 CFG: dict[str, Any] = {}
@@ -209,13 +243,32 @@ def note_detail(result: dict) -> str:
     return f"id=None, reason={reason}" if reason else "id=None (the tool gave no hint)"
 
 
-def node_detail(path: str, result: dict) -> str:
-    """Деталь проверки о создании узла: `path`, при мягком отказе — и причина."""
+def node_creation(path: str, result: dict) -> tuple[bool, str]:
+    """Итог идемпотентной регистрации узла-зонда: `(успех, деталь для отчёта)`.
+
+    Успех — узел создан ЭТИМ прогоном ИЛИ уже зарегистрирован (повторный
+    прогон). Повторный прогон получает от антисинонимии приложения (порог
+    косинуса описаний 0.90) мягкий отказ `created=False` с подсказкой
+    `hint='there is a similar one: <nearest>'`; у фиксированного зонда
+    `nearest` равен самому запрошенному пути (описание сравнивается с самим
+    собой) — это и есть «узел на месте». Любой другой отказ (в том числе
+    `nearest` на ЧУЖОЙ узел) — FAIL с причиной и `nearest`: имя и описание зонда
+    надо развести с существующим узлом.
+    """
     if result.get("created") is True:
-        return f"path={result.get('path') or path}"
-    reason = refusal(result)
-    tail = f", reason={reason}" if reason else ", no hint from the tool"
-    return f"path={path}, created={result.get('created')!r}{tail}"
+        return True, f"path={result.get('path') or path}, created now"
+    hint = refusal(result)
+    match = _SYNONYM_HINT.search(hint)
+    nearest = match.group(1).strip() if match else None
+    if nearest is not None and nearest == path:
+        return True, f"path={path}, already registered (nearest={nearest} — itself)"
+    if nearest is not None:
+        return False, (f"reason=synonym, nearest={nearest}, path={path} — another "
+                       "node is nearer than the requested one")
+    if _ALREADY_REGISTERED.search(hint) and path in hint:
+        return True, f"path={path}, already registered (the registry says so)"
+    reason = hint or "no hint from the tool"
+    return False, f"path={path}, created={result.get('created')!r}, reason={reason}"
 
 
 def scenario(n: int, title: str) -> None:
@@ -292,6 +345,8 @@ def write_teardown_trace() -> Path | None:
         f"image: {CFG.get('image') or '(not set)'} | revision: "
         f"{ENV.get('revision') or '(unknown)'} | version: {ENV.get('version') or '(unknown)'}",
         f"run prefix: {CFG.get('prefix')} | identifiers: {RUN}",
+        f"probe nodes: {', '.join(PROBE_PATHS)} (fixed names, left in place on "
+        "purpose — the MCP surface has no node delete handle)",
         f"DB: {CFG.get('db')} ({ENV.get('db_size') or 'size unknown'})",
         "---",
     ]
@@ -688,14 +743,29 @@ async def probe_titles(c: Client, prefix: str) -> list[dict]:
             if prefix in (item.get("title") or "")]
 
 
-async def prepare_leftovers(rest: httpx2.AsyncClient) -> None:
-    """Remove the leftovers of a previous run (idempotency, FR-2.1).
+async def ensure_probe_node(c: Client, path: str, description: str) -> bool:
+    """Зарегистрировать узел-зонд идемпотентно и отчитаться одной проверкой.
 
-    A repeated run must not trip over its own dedup/anti-synonymy, so the probe
-    data of every earlier run (the same prefix) is deleted before the scenarios:
-    probe notes by the title prefix and probe NODES by the path prefix (a
-    leftover node with a similar description would otherwise make the creation of
-    the new probe node be refused with `reason=synonym`, the stage-6 run).
+    Имя и описание зонда ФИКСИРОВАНЫ (PROBE_ROOT/PROBE_CHILDREN), поэтому
+    повторный прогон получает от антисинонимии приложения мягкий отказ с
+    `nearest`, равным запрошенному пути, — это успех («узел уже зарегистрирован»),
+    а не FAIL (см. `node_creation`).
+    """
+    result = await c.call("memory_namespace_create",
+                          {"path": path, "description": description})
+    ok, detail = node_creation(path, result)
+    check(f"probe namespace {path} is registered", ok, detail)
+    return ok
+
+
+async def prepare_leftovers() -> None:
+    """Remove the probe NOTES of a previous run (idempotency, FR-2.1).
+
+    A repeated run must not trip over its own note-level dedup, so the probe notes
+    of every earlier run (matched by the TITLE prefix) are deleted before the
+    scenarios. The probe NODES are never touched: the MCP surface has no node
+    delete handle, while the probe names are FIXED (PROBE_ROOT/PROBE_CHILDREN) —
+    a repeated run simply reuses the nodes already registered (`node_creation`).
     `--no-cleanup` / LSB_KEEP=1 turns this off for diagnostics.
     """
     if CFG["no_cleanup"]:
@@ -722,45 +792,6 @@ async def prepare_leftovers(rest: httpx2.AsyncClient) -> None:
     if removed:
         teardown_note(f"removed {removed} leftover note(s) of a previous run "
                       f"(prefix {CFG['prefix']})")
-    await prepare_namespace_leftovers(rest)
-
-
-async def prepare_namespace_leftovers(rest: httpx2.AsyncClient) -> None:
-    """Убрать узлы-остатки прошлых прогонов (маркер — префикс прогона).
-
-    Идемпотентность (FR-2.1): узел предыдущего прогона с тем же смыслом
-    описания даёт косинус описаний выше порога антисинонимии (lsb-0005-06), и
-    создание нового зонда мягко отклоняется с `reason=synonym` — без этой уборки
-    повторный прогон после аварийного выхода спотыкался бы о собственные
-    остатки. Заметки в узлах к этому моменту уже снесены (по префиксу названия),
-    поэтому узлы удаляются от листьев к корням.
-    """
-    prefix = f"{CFG['prefix']}-"
-    try:
-        response = await rest.get("/namespaces")
-        nodes = (response.json() if response.status_code == 200
-                 else {}).get("namespaces", [])
-    except Exception as exc:  # noqa: BLE001 — уборка не должна ронять прогон
-        pre_warn("namespace leftovers were not read", describe(exc))
-        return
-    stale = sorted(
-        (str(node.get("path")) for node in nodes
-         if str(node.get("path") or "").startswith(prefix)),
-        key=lambda path: path.count("/"), reverse=True,
-    )
-    for path in stale:
-        try:
-            res = await rest.delete(f"/namespaces/{path}")
-        except Exception as exc:  # noqa: BLE001
-            teardown_note(f"leftover namespace {path} was NOT removed ({describe(exc)})")
-            continue
-        if res.status_code in (200, 204, 404):
-            info(f"pre-cleanup: removed leftover namespace {path} "
-                 f"(http {res.status_code})")
-            teardown_note(f"removed leftover namespace {path} (http {res.status_code})")
-        else:
-            teardown_note(f"leftover namespace {path} was left on purpose (http "
-                          f"{res.status_code}) — an operator step is needed")
 
 
 async def cleanup_own_data() -> None:
@@ -787,22 +818,6 @@ async def cleanup_own_data() -> None:
             teardown_note(f"probe notes were NOT removed ({describe(exc)}) — "
                           f"prefix {CFG['prefix']}")
         await c.close()
-
-
-async def cleanup_namespaces(rest: httpx2.AsyncClient) -> None:
-    """Remove the run's probe namespaces (children first, then the root)."""
-    root = RUN["ns"]
-    for path in (*RUN.get("ns_children", []), root):
-        try:
-            r = await rest.delete(f"/namespaces/{path}")
-        except Exception as exc:  # noqa: BLE001
-            teardown_note(f"namespace {path} was NOT removed ({describe(exc)})")
-            continue
-        if r.status_code in (200, 204, 404):
-            teardown_note(f"removed namespace {path} (http {r.status_code})")
-        else:
-            teardown_note(f"namespace {path} was left on purpose (http "
-                          f"{r.status_code}) — an operator step is needed")
 
 
 # --- scenario 0: surface and readiness ---------------------------------------
@@ -947,6 +962,9 @@ async def scenario_1_limits(c: Client, rest: httpx2.AsyncClient) -> None:
 
 async def scenario_2_chars(c: Client, rest: httpx2.AsyncClient) -> int | None:
     scenario(2, "chars is consistent between memory_search / memory_list / memory_get")
+    # Заметкам сценария нужен ЗАРЕГИСТРИРОВАННЫЙ узел (save узлы не создаёт),
+    # а зонд фиксирован и переиспользуется: регистрация идемпотентна.
+    await ensure_probe_node(c, PROBE_ROOT, PROBE_ROOT_DESC)
     text = (f"{RUN['tag']} chars probe: the release acceptance checks the note volume "
             "field across the compact outputs.")
     saved = await c.call("memory_save", {"text": text, "title": RUN["note_chars"],
@@ -1020,52 +1038,21 @@ async def scenario_2_chars(c: Client, rest: httpx2.AsyncClient) -> int | None:
 
 # --- scenario 3: links --------------------------------------------------------
 
-def probe_namespaces(tag: str) -> tuple[tuple[str, str], ...]:
-    """Узлы-зонды сценария 3: (path, description).
-
-    Антисинонимия создания (lsb-0005-06, порог косинуса описаний 0.90) сравнивает
-    именно ОПИСАНИЯ узлов: шаблонные «probe area A/B/C» и «probe nodes» давали
-    косинус ~1 и приложение отказывало в создании (`reason=synonym`, прогон
-    этапа 6). Здесь — два семантически разных описания (своя тема у каждого), без
-    общего шаблона; имена узлов также разные и осмысленные.
-    """
-    return (
-        (f"{tag}/vector-index",
-         f"{tag}: rebuilding the vector index keeps the ranking stable while "
-         "embedding requests wait one by one in the queue."),
-        (f"{tag}/release-notes",
-         f"{tag}: changelog wording and version bump bookkeeping for the release "
-         "tag and its rollout checklist."),
-    )
-
-
 async def scenario_3_links(c: Client, rest: httpx2.AsyncClient) -> int | None:
     scenario(3, "Links: level 0 at once, level 1 after the job, chunk/batch/soft-delete rules")
 
-    probes = probe_namespaces(RUN["tag"])
+    probes = PROBE_CHILDREN
     (ns_a, _desc_a), (ns_b, _desc_b) = probes
-    # Пути зондов — в RUN ДО создания: teardown снесёт и частично созданное.
-    RUN["ns_children"] = [path for path, _desc in probes]
 
-    created = await c.call("memory_namespace_create", {
-        "path": RUN["ns"],
-        "description": f"Acceptance sandbox of run {RUN['tag']}: the probe node "
-                       "tree of the release check; the run teardown removes it.",
-    })
-    check("the run namespace is created (confirmed)", created.get("created") is True,
-          node_detail(RUN["ns"], created))
-    if created.get("created") is not True:
-        # Дальше всё опирается на узлы: без корня дети не создаются, а заметки в них
-        # возвращали бы только вторичные FAIL'ы (id=None) вместо одной причины.
-        return None
-    node_results: list[tuple[str, dict]] = []
+    # Корень зондов регистрируется сценарием 2 (там же лежат его заметки), здесь —
+    # два семантически разных листа: заметки для проверки связей должны лежать в
+    # РАЗНЫХ узлах. Регистрация идемпотентна (повторный прогон переиспользует узлы).
+    nodes_ok = True
     for path, desc in probes:
-        node_results.append((path, await c.call(
-            "memory_namespace_create", {"path": path, "description": desc})))
-        check(f"probe namespace {path} is created",
-              node_results[-1][1].get("created") is True,
-              node_detail(path, node_results[-1][1]))
-    if any(res.get("created") is not True for _path, res in node_results):
+        nodes_ok = await ensure_probe_node(c, path, desc) and nodes_ok
+    if not nodes_ok:
+        # Без узлов заметки в двух разных узлах и заметка-двойник не создаются
+        # (id=None), а проверки связей недостижимы — одна причина вместо града FAIL'ов.
         return None
 
     topic = (f"{RUN['tag']} vector index rebuild keeps the ranking stable while the "
@@ -1542,7 +1529,7 @@ async def scenario_9_regression() -> None:
 
     manual("unit regression",
            f"cd {CFG['repo_dir']} && {CFG['python']} -m pytest -q "
-           "(baseline 1454 passed, 13 skipped, 0 failed)")
+           "(baseline 1463 passed, 13 skipped, 0 failed)")
     if not CFG["run_regression"]:
         skip("unit and E2E regression",
              "run with --run-regression / LSB_RUN_REGRESSION=1 (long)")
@@ -1582,7 +1569,7 @@ async def run_all() -> None:
 
         try:
             teardown_note(f"run started at {time.strftime('%Y-%m-%dT%H:%M:%S%z')}")
-            await prepare_leftovers(rest)
+            await prepare_leftovers()
             await scenario_0_context(c, rest, instructions)
             await scenario_1_limits(c, rest)
             await scenario_2_chars(c, rest)
@@ -1600,10 +1587,14 @@ async def run_all() -> None:
             # cleaned and the next run starts from the same state.
             try:
                 await cleanup_own_data()
-                await cleanup_namespaces(rest)
             except Exception as exc:  # noqa: BLE001 — the trace must survive anyway
                 teardown_note(f"teardown raised {describe(exc)} — check the probe "
                               f"data with prefix {CFG['prefix']} by hand")
+            # Узлы-зонды не сносятся: ручки удаления узла в MCP-поверхности нет,
+            # имена зондов фиксированы — следующий прогон их переиспользует (§FR-2.1).
+            teardown_note(f"probe nodes {', '.join(PROBE_PATHS)} are left on purpose "
+                          f"(fixed names, reused by the next run; no node delete "
+                          f"handle in the MCP surface)")
             ENV["db_size"] = db_size_text()
             path = write_teardown_trace()
             if path is not None:
@@ -1752,7 +1743,7 @@ async def main() -> int:
     tag = f"{CFG['prefix']}-{run_id}"
     RUN.update({
         "tag": tag,
-        "ns": tag,
+        "ns": PROBE_ROOT,
         "note_chars": f"{tag} chars probe",
         "note_long": f"{tag} long chunked probe",
         "note_links_a": f"{tag} links probe A",
@@ -1761,7 +1752,7 @@ async def main() -> int:
         "note_other": f"{tag} unrelated probe",
         "note_outage": f"{tag} outage probe",
         "note_nodes": [f"{tag} nodes probe {i}" for i in range(3)],
-        "ns_children": [],
+        "ns_paths": list(PROBE_PATHS),
         "notes": [],
     })
 
