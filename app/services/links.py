@@ -8,6 +8,12 @@
 `entities` > `cosine`), рассчитанные механически и идемпотентно, без вызовов
 моделей (FR-2, arch §3.2–3.4): косинус — KNN по готовому вектору, значимые
 слова и упоминания по названию — FTS-пул + точная проверка правил в коде.
+Вид пары детерминирован и НЕ равен «последнему пересчёту» (решение гейта 2A):
+на пару — одна строка с высшим приоритетом вида, кандидат заметки объединяется
+с хранимым видом (понижения нет), а пару, которую сама заметка больше не
+находит, подтверждает вторая сторона своими правилами — иначе она остаётся,
+пока сосед ждёт пересчёта (`links_at IS NULL`). Поэтому состав пар и их вид не
+зависят от порядка обхода очереди.
 Маркер `notes.links_at` — очередь расчёта (backfill и инкремент одним
 правилом выборки в джобе `links`, постановка 8): `recompute_batch` разбирает
 партию очереди, `queue_stat` описывает её для `/health`, `purge_orphans` —
@@ -15,8 +21,11 @@
 
 Выдача связей (постановка 10, arch §3.5): `related` отдаёт уровень 1
 (таблица `links`) с приоритетом вида и фолбэком на уровень 0, только если после
-отсечений уровня 1 не осталось ни одной связи. Форму компактной выдачи для
-модели собирает транспорт (`mcp.py`), полный контракт — `rest.py`.
+отсечений уровня 1 не осталось ни одной связи. Уровень 1 отдаётся лишь заметке
+с проставленным маркером: `links_at IS NULL` — связи ещё не рассчитаны (или
+сброшены правкой `text`/`title`), значит хранимые строки устарели — сразу
+фолбэк на уровень 0 (решение гейта 4A). Форму компактной выдачи для модели
+собирает транспорт (`mcp.py`), полный контракт — `rest.py`.
 """
 
 from __future__ import annotations
@@ -30,6 +39,7 @@ from app.config import Settings
 from app.services import jobs
 from app.services.jobs import JobSpec, queue_snapshot
 from app.services.search import SearchService
+from app.storage import vectors
 from app.storage.db import session, transaction
 
 if TYPE_CHECKING:  # только аннотации: рантайм-зависимости на воркер нет
@@ -78,7 +88,8 @@ _QUEUE_STAT_SQL = (
 # «между разделами»), soft-deleted и заметки удалённых (неизвестных) узлов.
 # Порядок: приоритет вида (mention → entities → cosine; на пару хранится одна
 # строка с высшим приоритетом) → `score` DESC → свежесть → id DESC; потолок —
-# параметр LIMIT.
+# параметр LIMIT. Запрос зовётся только когда у заметки проставлен маркер
+# `links_at` (решение гейта 4A): без маркера хранимые строки устарели.
 _RELATED_SQL = (
     "SELECT n.id AS id, n.title AS title, n.namespace AS namespace, "
     "n.text AS text FROM links l JOIN notes n ON n.id = "
@@ -145,6 +156,48 @@ def _prefer(
         found[other_id] = (kind, score)
 
 
+def _merge_kind(
+    stored: tuple[str, float | None] | None,
+    candidate: tuple[str, float | None],
+) -> tuple[str, float | None]:
+    """Вид пары по приоритету (arch §3.2, решение гейта 2A).
+
+    На пару — одна строка, и её вид НЕ понижается пересчётом: объединение
+    существующей и найденной связи — максимум по приоритету
+    (`mention` > `entities` > `cosine`). `score` берётся у победившего вида
+    (у `mention` — NULL); при равном приоритете (вид один и тот же) побеждает
+    свежий кандидат.
+    """
+    if stored is None or _KIND_PRIORITY[candidate[0]] >= _KIND_PRIORITY[stored[0]]:
+        return candidate
+    return stored
+
+
+def _cosine(first: list[float], second: list[float]) -> float:
+    """Косинус двух векторов (0.0 — нулевая норма; нормы не предполагаются)."""
+    dot = sum(a * b for a, b in zip(first, second))
+    norm_first = sum(a * a for a in first) ** 0.5
+    norm_second = sum(b * b for b in second) ** 0.5
+    if norm_first == 0.0 or norm_second == 0.0:
+        return 0.0
+    return dot / (norm_first * norm_second)
+
+
+def _pair_cosine(
+    conn: sqlite3.Connection, note_a: int, note_b: int
+) -> float | None:
+    """Косинус пары по готовым векторам (`app.storage.vectors`); None — вектора нет.
+
+    Слой `vectors` — единственный источник косинуса в проекте (та же метрика,
+    что у KNN); сам домен порогов живёт в конфиге (`LINK_COSINE_THRESHOLD`).
+    """
+    first = vectors.get_vector(conn, note_a)
+    second = vectors.get_vector(conn, note_b)
+    if first is None or second is None:
+        return None
+    return _cosine(first, second)
+
+
 class LinksService:
     """Связи заметок: уровень 0 («ленивый граф») и уровень 1 (таблица `links`)."""
 
@@ -163,9 +216,13 @@ class LinksService:
         Приоритет — уровень 1 (arch §3.5): хранимые связи `links` читаются в обе
         стороны, отсечения при выдаче (свой неймспейс, soft-deleted, заметки
         удалённых узлов), порядок «приоритет вида → `score` DESC → свежесть →
-        id DESC». Фолбэк на уровень 0 (KNN по вектору заметки, §3.1) — только
-        если после отсечений уровня 1 не осталось ни одной связи. Потолок обеих
-        веток — `LINK_TOP`; `limit` может лишь понизить его (FR-1.1).
+        id DESC». Уровень 1 отдаётся лишь заметке с проставленным маркером
+        `links_at`: без маркера связи ещё не рассчитаны (или сброшены правкой
+        `text`/`title`, вектор pending) — хранимые строки устарели, поэтому
+        уровень 1 не отдаётся вовсе (решение гейта 4A). Фолбэк на уровень 0
+        (KNN по вектору заметки, §3.1) — когда после отсечений уровня 1 не
+        осталось ни одной связи или маркера нет. Потолок обеих веток —
+        `LINK_TOP`; `limit` может лишь понизить его (FR-1.1).
 
         Нет активной заметки с таким id, пустая таблица связей или заметка без
         готового вектора — пустой список без ошибки: отсутствие связей — не
@@ -178,22 +235,33 @@ class LinksService:
         )
         if top < 1:
             return []
-        own_namespace = self._namespace_of(note_id)
-        if own_namespace is None:
+        own = self._note_state(note_id)
+        if own is None:
             return []  # нет активной заметки (trash / неизвестный id)
-        stored = self._related_level1(note_id, own_namespace, top)
-        if stored:
-            return stored
+        own_namespace, links_at = own
+        if links_at is not None:
+            stored = self._related_level1(note_id, own_namespace, top)
+            if stored:
+                return stored
         return self._related_level0(note_id, own_namespace, top)
 
-    def _namespace_of(self, note_id: int) -> str | None:
-        """Неймспейс активной заметки; None — заметки нет (trash/неизвестный id)."""
+    def _note_state(self, note_id: int) -> tuple[str, str | None] | None:
+        """Состояние активной заметки для выдачи: `(namespace, links_at)`.
+
+        `None` — активной заметки нет (trash/неизвестный id). Маркер `links_at`
+        читается тем же запросом, что и неймспейс (лишнего чтения на выдачу
+        нет): `None` — связи заметки ещё не рассчитаны — уровень 1 не отдаётся
+        (решение гейта 4A, arch §3.4).
+        """
         with session(self._settings) as conn:
             row = conn.execute(
-                "SELECT namespace FROM notes WHERE id = ? AND deleted_at IS NULL",
+                "SELECT namespace, links_at FROM notes "
+                "WHERE id = ? AND deleted_at IS NULL",
                 (note_id,),
             ).fetchone()
-        return None if row is None else str(row["namespace"])
+        if row is None:
+            return None
+        return str(row["namespace"]), row["links_at"]
 
     def _related_level1(
         self, note_id: int, own_namespace: str, top: int
@@ -204,8 +272,10 @@ class LinksService:
         выдаче: свой неймспейс (связи — признак «между разделами»), soft-deleted,
         заметки удалённых узлов. Порядок и потолок задаёт `_RELATED_SQL` (LIMIT):
         на пару хранится одна строка с высшим приоритетом вида, поэтому `mention`
-        выше `entities`, а `entities` выше `cosine`. Пусто — нормальный ответ
-        (таблица пуста или всё отсечено): решает вызывающий (фолбэк уровня 0).
+        выше `entities`, а `entities` выше `cosine`. Зовётся только для заметки
+        с проставленным маркером `links_at` (см. `_note_state`): без него
+        хранимые строки устарели. Пусто — нормальный ответ (таблица пуста или всё
+        отсечено): решает вызывающий (фолбэк уровня 0).
         """
         with session(self._settings) as conn:
             rows = conn.execute(
@@ -273,8 +343,9 @@ class LinksService:
     def compute_for_note(self, note_id: int) -> int:
         """Пересчитать связи уровня 1 одной заметки; вернуть число строк.
 
-        Одна транзакция (arch §3.3, идемпотентно): удалить все пары заметки →
-        заново собрать кандидатов → вставить в каноническом порядке
+        Одна транзакция (arch §3.3, идемпотентно): собрать кандидатов заметки →
+        свести их с УЖЕ хранимыми парами (вид по приоритету, потеря связи
+        недопустима, решение гейта 2A) → записать в каноническом порядке
         `note_a < note_b` → отметить `notes.links_at`. Повторный расчёт не
         плодит строк: пара — первичный ключ, запись полная (не доливка).
 
@@ -284,6 +355,15 @@ class LinksService:
         `LINK_ENTITIES_MIN_COMMON`), `score` — доля общих слов; `mention` —
         название другой заметки (≥ 3 символов) встречается в её `title`/`text`,
         `score` — NULL. Ни одного вызова модели.
+
+        Вид пары НЕ определяется «последним пересчётом» (решение гейта 2A):
+        кандидат заметки объединяется с хранимым видом по приоритету (понижения
+        нет), а пару, которую сама заметка больше не находит, подтверждает
+        вторая сторона своими правилами (`_neighbour_kind`); если сосед ещё ждёт
+        пересчёта (`links_at IS NULL`) или лежит в корзине — строка не теряется.
+        Пару, которую не подтверждает ни одна сторона и косинус которой можно
+        проверить, удаляем. Так состав пар и их вид не зависят от порядка
+        обхода очереди.
 
         Отсечения при расчёте: сама заметка и soft-deleted (arch §3.3);
         отсечение «своего неймспейса» здесь НЕ делается — оно при выдаче
@@ -300,18 +380,20 @@ class LinksService:
         )
         with session(self._settings) as conn, transaction(conn):
             source = conn.execute(
-                "SELECT id, title, text, summary FROM notes "
+                "SELECT id, title, text, summary, vector_status FROM notes "
                 "WHERE id = ? AND deleted_at IS NULL",
                 (note_id,),
             ).fetchone()
             if source is None:
                 return 0
             found = self._candidate_kinds(conn, source, cosine_pool)
+            existing = self._existing_pairs(conn, note_id)
+            kept = self._resolve_pairs(conn, source, found, existing)
             conn.execute(
                 "DELETE FROM links WHERE note_a = ? OR note_b = ?",
                 (note_id, note_id),
             )
-            for other_id, (kind, score) in sorted(found.items()):
+            for other_id, (kind, score) in sorted(kept.items()):
                 note_a, note_b = sorted((note_id, other_id))
                 conn.execute(
                     "INSERT INTO links (note_a, note_b, kind, score) "
@@ -323,7 +405,108 @@ class LinksService:
                 "strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
                 (note_id,),
             )
-        return len(found)
+        return len(kept)
+
+    def _existing_pairs(
+        self, conn: sqlite3.Connection, note_id: int
+    ) -> dict[int, tuple[str, float | None]]:
+        """Хранимые пары заметки: `{сосед: (kind, score)}` (чтение в обе стороны)."""
+        rows = conn.execute(
+            "SELECT note_a, note_b, kind, score FROM links "
+            "WHERE note_a = ? OR note_b = ?",
+            (note_id, note_id),
+        ).fetchall()
+        return {
+            (row["note_b"] if row["note_a"] == note_id else row["note_a"]): (
+                row["kind"],
+                row["score"],
+            )
+            for row in rows
+        }
+
+    def _resolve_pairs(
+        self,
+        conn: sqlite3.Connection,
+        source: sqlite3.Row,
+        found: dict[int, tuple[str, float | None]],
+        existing: dict[int, tuple[str, float | None]],
+    ) -> dict[int, tuple[str, float | None]]:
+        """Итоговый состав пар заметки: вид по приоритету, потеря недопустима.
+
+        Вид пары — объединение по приоритету (arch §3.2, решение гейта 2A), а не
+        «последний пересчёт»: кандидат заметки сливается с хранимым видом
+        (`_merge_kind`), понижения нет. Пару, которую сама заметка больше не
+        находит, подтверждает вторая сторона своими правилами (`_neighbour_kind`);
+        если сосед ещё ждёт пересчёта (`links_at IS NULL`) или лежит в корзине —
+        строку не теряем (решит его пересчёт, arch §3.2/§3.4). Не подтверждённую
+        никем пару удаляем, но только если косинус пары вообще проверяем: без
+        готового вектора связь не теряется, а ждёт вектора (arch §3.3).
+        """
+        kept: dict[int, tuple[str, float | None]] = {}
+        # (а) пары, которые заметка находит сама — слияние с хранимым видом.
+        for other_id, candidate in found.items():
+            kept[other_id] = _merge_kind(existing.get(other_id), candidate)
+        # (б) пары, которых сама больше не находит — голос второй стороны.
+        for other_id, stored in existing.items():
+            if other_id in kept:
+                continue
+            neighbour = self._neighbour_state(conn, other_id)
+            if neighbour is None:
+                continue  # сосед физически удалён: осиротевшую строку снесёт гигиена
+            if neighbour["links_at"] is None or neighbour["deleted_at"] is not None:
+                kept[other_id] = stored  # сосед ждёт пересчёта / в корзине — не теряем
+                continue
+            voice = self._neighbour_kind(conn, source, neighbour)
+            if voice is not None:
+                kept[other_id] = _merge_kind(stored, voice)
+            elif _pair_cosine(conn, source["id"], other_id) is None:
+                kept[other_id] = stored  # вектор не готов — косинус не проверить
+            # иначе: ни одна сторона не подтверждает — пара удаляется
+        return kept
+
+    def _neighbour_state(
+        self, conn: sqlite3.Connection, other_id: int
+    ) -> sqlite3.Row | None:
+        """Состояние соседа для проверки его правил; None — физически удалён."""
+        return conn.execute(
+            "SELECT id, title, text, summary, vector_status, links_at, deleted_at "
+            "FROM notes WHERE id = ?",
+            (other_id,),
+        ).fetchone()
+
+    def _neighbour_kind(
+        self,
+        conn: sqlite3.Connection,
+        source: sqlite3.Row,
+        neighbour: sqlite3.Row,
+    ) -> tuple[str, float | None] | None:
+        """Вид, которым сосед подтверждает пару с заметкой (те же три правила).
+
+        Проверяем правила соседа (решение гейта 2A): `mention` — название ЭТОЙ
+        заметки (≥ 3 символов) встречается в `title`/`text` соседа; `entities` —
+        ≥ `LINK_ENTITIES_MIN_COMMON` общих значимых слов `title`+`summary`
+        (правило симметрично); `cosine` — оба вектора готовы и косинус не ниже
+        `LINK_COSINE_THRESHOLD`. None — сосед пару не подтверждает.
+        """
+        source_title = (source["title"] or "").strip()
+        if len(source_title) >= _TRIGRAM_MIN_CHARS:
+            haystack = f"{neighbour['title'] or ''}\n{neighbour['text']}".casefold()
+            if source_title.casefold() in haystack:
+                return ("mention", None)
+        source_words = self._significant_words(source["title"], source["summary"])
+        neighbour_words = self._significant_words(
+            neighbour["title"], neighbour["summary"]
+        )
+        common = source_words & neighbour_words
+        if len(common) >= self._settings.link_entities_min_common:
+            score = len(common) / max(len(source_words), len(neighbour_words))
+            return ("entities", score)
+        source_ready = source["vector_status"] == "ok"
+        if source_ready and neighbour["vector_status"] == "ok":
+            cosine = _pair_cosine(conn, source["id"], neighbour["id"])
+            if cosine is not None and cosine >= self._settings.link_cosine_threshold:
+                return ("cosine", cosine)
+        return None
 
     def purge_orphans(self) -> int:
         """Снести строки связей физически удалённых заметок; вернуть число строк.

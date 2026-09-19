@@ -102,6 +102,13 @@ def _links_at(note_id: int) -> str | None:
         ).fetchone()[0]
 
 
+def _clear_links() -> None:
+    """Очистить таблицу `links` и сбросить маркеры — чистый прогон расчёта."""
+    with session(get_settings()) as conn:
+        conn.execute("DELETE FROM links")
+        conn.execute("UPDATE notes SET links_at = NULL")
+
+
 class TestCosine:
     """Вид `cosine`: KNN по вектору заметки, порог LINK_COSINE_THRESHOLD."""
 
@@ -396,7 +403,12 @@ class TestStorage:
     def test_stale_rows_are_replaced(
         self, dim8: Settings, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Строки заметки перезаписываются целиком: устаревшая пара исчезает."""
+        """Строки заметки перезаписываются целиком: устаревшая пара исчезает.
+
+        Сосед уже посчитан (маркер `links_at` проставлен) — судьбу пары решает
+        пересчёт этой заметки. Ждущий сосед (`links_at IS NULL`) пару бы
+        сохранил (решение гейта 2A) — это отдельный сценарий, см. ниже.
+        """
         _seed(
             dim8,
             [
@@ -404,6 +416,7 @@ class TestStorage:
                 (2, "Прочее", "второй текст", "", _vec(0.10), None),
             ],
         )
+        _set_links_at(2, "2026-01-01T00:00:00Z")
         with session(dim8) as conn:
             conn.execute(
                 "INSERT INTO links (note_a, note_b, kind, score) "
@@ -468,6 +481,145 @@ class TestStorage:
         """Несуществующий id — 0 без ошибки и без строк."""
         assert _links(monkeypatch).compute_for_note(999) == 0
         assert _rows() == []
+
+
+class TestDeterministicPairs:
+    """Решение гейта 2A: вид пары объединяется по приоритету, пару не теряем.
+
+    Вид пары — не «последний пересчёт», а максимум по приоритету (mention >
+    entities > cosine); пару, которую сама заметка больше не находит, но
+    подтверждает вторая сторона (или сосед ждёт своего пересчёта), пересчёт
+    не удаляет. Итог не зависит от порядка обхода очереди.
+    """
+
+    def test_kind_is_not_downgraded_on_neighbour_recompute(
+        self, dim8: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Вид пары не понижается при пересчёте второй заметки.
+
+        Заметка 1 находит соседа как `mention` (высший приоритет), а пересчёт
+        заметки 2 дал бы только `entities` — объединение сохраняет `mention`.
+        """
+        _seed(
+            dim8,
+            [
+                (1, "Источник", "см. Проект Альфа", "архитектуры сервера", None, None),
+                (2, "Проект Альфа", "второй текст", "архитектуры сервера", None, None),
+            ],
+        )
+        service = _links(monkeypatch)
+        assert service.compute_for_note(1) == 1
+        assert _rows() == [(1, 2, "mention", None)]
+        assert service.compute_for_note(2) == 1
+        assert _rows() == [(1, 2, "mention", None)]  # не понизился до entities
+
+    def test_pair_confirmed_by_second_side_survives(
+        self, dim8: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Пару, которую подтверждает вторая сторона, пересчёт первой не теряет.
+
+        Пару создаёт заметка 2 (`mention`: её текст содержит название заметки 1);
+        заметка 1 такой связи сама не находит (вектора далеки, общих слов нет),
+        но сосед её подтверждает — пара остаётся.
+        """
+        _seed(
+            dim8,
+            [
+                (1, "Заметка A", "обычный текст про сервер", "", SOURCE, None),
+                (2, "Заметка B", "смотри Заметка A — подробности", "", _vec(0.10), None),
+            ],
+        )
+        service = _links(monkeypatch)
+        assert service.compute_for_note(2) == 1  # пару создаёт вторая сторона
+        assert _rows() == [(1, 2, "mention", None)]
+        assert service.compute_for_note(1) == 1
+        assert _rows() == [(1, 2, "mention", None)]  # подтверждение соседа сохранило
+
+    def test_pair_confirmed_by_nobody_is_deleted(
+        self, dim8: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Устаревшую пару, не подтверждённую ни одной стороной, удаляем."""
+        _seed(
+            dim8,
+            [
+                (1, "Заметка A", "первый отдельный текст", "", SOURCE, None),
+                (2, "Заметка B", "второй отдельный текст", "", _vec(0.10), None),
+            ],
+        )
+        _set_links_at(1, "2026-01-01T00:00:00Z")
+        _set_links_at(2, "2026-01-01T00:00:00Z")  # сосед уже посчитан, не ждёт
+        with session(dim8) as conn:
+            conn.execute(
+                "INSERT INTO links (note_a, note_b, kind, score) "
+                "VALUES (1, 2, 'mention', NULL)"
+            )
+        assert _links(monkeypatch).compute_for_note(1) == 0
+        assert _rows() == []
+
+    def test_pair_is_kept_while_neighbour_waits(
+        self, dim8: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Пару сохраняем, пока сосед ждёт пересчёта (`links_at IS NULL`).
+
+        Судьбу такой пары решит пересчёт соседа; сейчас её терять нельзя.
+        """
+        _seed(
+            dim8,
+            [
+                (1, "Заметка A", "первый отдельный текст", "", SOURCE, None),
+                (2, "Заметка B", "второй отдельный текст", "", _vec(0.10), None),
+            ],
+        )
+        _set_links_at(1, "2026-01-01T00:00:00Z")  # у соседа 2 маркер пуст
+        with session(dim8) as conn:
+            conn.execute(
+                "INSERT INTO links (note_a, note_b, kind, score) "
+                "VALUES (1, 2, 'mention', NULL)"
+            )
+        assert _links(monkeypatch).compute_for_note(1) == 1
+        assert _rows() == [(1, 2, "mention", None)]
+
+    def test_outcome_is_independent_of_recompute_order(
+        self, dim8: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Пересчёт в двух порядках даёт одинаковый вид пары (детерминизм)."""
+        _seed(
+            dim8,
+            [
+                (1, "Источник", "см. Проект Альфа", "архитектуры сервера", None, None),
+                (2, "Проект Альфа", "второй текст", "архитектуры сервера", None, None),
+            ],
+        )
+        service = _links(monkeypatch)
+        service.compute_for_note(1)
+        service.compute_for_note(2)
+        first = _rows()
+        assert [row[2] for row in first] == ["mention"]
+
+        _clear_links()
+        service.compute_for_note(2)
+        service.compute_for_note(1)
+        assert _rows() == first  # порядок обхода очереди не влияет на итог
+
+    def test_repeated_recompute_keeps_a_single_row(
+        self, dim8: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Идемпотентность сохранена: повторный пересчёт не плодит строк.
+
+        Пара проходит и через собственную находку, и через подтверждение соседа.
+        """
+        _seed(
+            dim8,
+            [
+                (1, "Заметка A", "обычный текст про сервер", "", SOURCE, None),
+                (2, "Заметка B", "смотри Заметка A — подробности", "", _vec(0.10), None),
+            ],
+        )
+        service = _links(monkeypatch)
+        for _ in range(2):
+            service.compute_for_note(1)
+            service.compute_for_note(2)
+        assert _rows() == [(1, 2, "mention", None)]
 
 
 class TestPurgeOrphans:

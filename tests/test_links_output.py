@@ -110,13 +110,28 @@ def _links_service(settings: Settings) -> LinksService:
 def _add_link(
     settings: Settings, note_a: int, note_b: int, kind: str, score: float | None = None
 ) -> None:
-    """Строка `links` прямым SQL: вид/score задаются тестом (моделей нет)."""
+    """Строка `links` прямым SQL: вид/score задаются тестом (моделей нет).
+
+    Пара — результат пересчёта, поэтому обоим участникам проставляется маркер
+    `links_at`: без него заметка не отдаёт уровень 1 (решение гейта 4A).
+    """
     first, second = sorted((note_a, note_b))  # канонический порядок пары
     with session(settings) as conn, transaction(conn):
         conn.execute(
             "INSERT INTO links (note_a, note_b, kind, score) VALUES (?, ?, ?, ?)",
             (first, second, kind, score),
         )
+        conn.execute(
+            "UPDATE notes SET links_at = '2026-01-01T00:00:00Z' "
+            "WHERE id IN (?, ?)",
+            (first, second),
+        )
+
+
+def _reset_links_at(settings: Settings, note_id: int) -> None:
+    """Сбросить маркер заметки — как правка `text`/`title` (заметка ждёт расчёта)."""
+    with session(settings) as conn, transaction(conn):
+        conn.execute("UPDATE notes SET links_at = NULL WHERE id = ?", (note_id,))
 
 
 def _touch(settings: Settings, note_id: int, updated_at: str) -> None:
@@ -219,6 +234,36 @@ class TestRelatedLevel1:
         _add_link(settings, 1, 4, "cosine", 0.5)
         assert _ids(settings, 1, limit=2) == [2, 3]
         assert len(_ids(settings, 1, limit=10)) == 3
+
+
+class TestRelatedWaitsForRecompute:
+    """Решение гейта 4A: заметка без маркера `links_at` уровень 1 не отдаёт.
+
+    Маркер сбрасывается правкой `text`/`title` (вектор pending, джоба её ещё не
+    взяла): хранимые строки `links` описывают старый текст — отдавать их модели
+    нельзя, даже если они есть. Фолбэк на уровень 0 — обычный путь.
+    """
+
+    def test_note_without_marker_skips_level1_to_fallback(
+        self, settings: Settings
+    ) -> None:
+        """Маркер есть — уровень 1; маркер сброшен — уровень 1 не отдаётся."""
+        # 9 в уровень 0 не входит (косинус 0.5 за потолком) — результат однозначен.
+        _add_link(settings, 1, 9, "mention")
+        assert _ids(settings, 1, limit=10) == [9]  # уровень 1 как раньше
+
+        _reset_links_at(settings, 1)  # правка text/title сбросила маркер
+        assert _ids(settings, 1, limit=10) == LEVEL0_IDS  # фолбэк, без строки 9
+
+    def test_pending_note_without_marker_gives_empty(
+        self, settings: Settings
+    ) -> None:
+        """Вектор pending и маркер сброшен: фолбэк пуст — `[]`, без ошибки/hint."""
+        _add_link(settings, 8, 2, "mention")
+        assert _ids(settings, 8, limit=10) == [2]  # маркер есть — связь видна
+
+        _reset_links_at(settings, 8)
+        assert _ids(settings, 8, limit=10) == []  # pending-вектор — фолбэк пуст
 
 
 @pytest.fixture
@@ -341,6 +386,24 @@ class TestMCPLinks:
         ).structured_content
         assert got["notes"][0]["id"] == 8
         assert got["links"] == []
+        assert "hint" not in got
+
+    @pytest.mark.asyncio
+    async def test_note_awaiting_recompute_has_no_stale_links(
+        self, settings: Settings, mcp_server
+    ) -> None:
+        """4A: у заметки без маркера устаревшие связи не отдаются модели."""
+        _add_link(settings, 8, 2, "mention")
+        got = (
+            await mcp_server.call_tool("memory_get", {"id": 8})
+        ).structured_content
+        assert [item["id"] for item in got["links"]] == [2]
+
+        _reset_links_at(settings, 8)  # правка заметки — связи ждут пересчёта
+        got = (
+            await mcp_server.call_tool("memory_get", {"id": 8})
+        ).structured_content
+        assert got["links"] == []  # старые строки не утекли в выдачу
         assert "hint" not in got
 
     @pytest.mark.asyncio
