@@ -38,7 +38,8 @@ Scenarios (0-9), per the techdebt-0036-01 spec:
      chunks).
   3. Links: level 0 immediately, level 1 after the job (and it wins over
      level 0), chunk reads carry links, batch reads do not, soft-deleted notes
-     are never served, the own namespace is cut off.
+     are never served, the own namespace is cut off (the twin note kept in the
+     checked node is never served).
   4. Background jobs: models unavailable → `pending` and its age grow
      (`/health.queues`), the `queue_waiting` event appears in the log → models
      are back → jobs finish with NO container restart.
@@ -173,6 +174,48 @@ def manual(name: str, note: str = "") -> None:
     """A step done by the operator (not by the script)."""
     MANUALS.append(name + (f" — {note}" if note else ""))
     print(f"  [MANUAL] {name}" + (f" — {note}" if note else ""))
+
+
+def pre_warn(message: str, detail: str = "") -> None:
+    """Предупреждение ВНЕ сценария (шаг пред-очистки, до сценария 0).
+
+    `warn()` на этом шаге упал бы (KeyError): он пишет счётчики текущего
+    сценария, а сценария ещё нет — поправка по прогону этапа 6.
+    """
+    global WARN
+    WARN += 1
+    WARNINGS.append(f"pre-cleanup: {message}")
+    print(f"  [WARN] {message}" + (f" — {detail}" if detail else ""))
+
+
+def refusal(result: dict) -> str:
+    """Текст мягкого отказа приложения (`hint`/`reason`), иначе — пустая строка.
+
+    Инструменты отдают отказ полем `hint` (и дублируют причину в `reason` лога):
+    без него в отчёте остаётся только `id=None` (дефект прогона этапа 6).
+    """
+    for field in ("hint", "reason"):
+        value = result.get(field)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def note_detail(result: dict) -> str:
+    """Деталь проверки о создании заметки: `id`, при мягком отказе — и причина."""
+    if result.get("id") is not None:
+        return f"id={result['id']}"
+    reason = refusal(result)
+    return f"id=None, reason={reason}" if reason else "id=None (the tool gave no hint)"
+
+
+def node_detail(path: str, result: dict) -> str:
+    """Деталь проверки о создании узла: `path`, при мягком отказе — и причина."""
+    if result.get("created") is True:
+        return f"path={result.get('path') or path}"
+    reason = refusal(result)
+    tail = f", reason={reason}" if reason else ", no hint from the tool"
+    return f"path={path}, created={result.get('created')!r}{tail}"
 
 
 def scenario(n: int, title: str) -> None:
@@ -354,10 +397,18 @@ async def wait_until(predicate: Callable[[], Awaitable[tuple[bool, str]]],
                      poll: float | None = None) -> tuple[bool, str]:
     """Wait for a state to become observable; the guard timeout is `E2E_WAIT_SEC`.
 
-    `predicate` returns (done, detail). The actual wait and whether the guard
-    fired are recorded in WAITS and printed in the report, so a slow model is
-    visible as "we waited N s" while an unreachable one hits the guard.
+    `predicate` is called on every poll — pass the callable itself, never its
+    call result. `predicate` returns (done, detail). The actual wait and whether
+    the guard fired are recorded in WAITS and printed in the report, so a slow
+    model is visible as "we waited N s" while an unreachable one hits the guard.
     """
+    if not callable(predicate):
+        # Вызванная корутина вместо предиката давала TypeError внутри поллинга и
+        # «ждала» до предохранителя (прогон этапа 6): ловим ошибку сразу и внятно.
+        raise TypeError(
+            "wait_until: the predicate must be callable — pass the function "
+            f"itself, not its call result (got {type(predicate).__name__})"
+        )
     timeout = CFG["wait_sec"] if timeout is None else timeout
     poll = CFG["poll_sec"] if poll is None else poll
     started = time.monotonic()
@@ -457,6 +508,29 @@ def contains(haystack: Any, needle: str) -> bool:
     if isinstance(haystack, str):
         return needle in haystack
     return needle in json.dumps(haystack, ensure_ascii=False)
+
+
+async def wait_for_vectors(*ids: int) -> tuple[bool, str]:
+    """Дождаться готовых векторов заметок (наблюдаемое состояние, не пауза).
+
+    Уровень 0 связей — KNN по вектору самой заметки: без готового вектора
+    проверки уровня 0 были бы ложным FAIL. Джоба `links` при этом не ждётся —
+    её требует только уровень 1 (смысл проверки «уровень 0 приходит сразу»).
+    Без БД готовность вектора не наблюдается — проверку делает сам сценарий.
+    """
+    if not ids or not db_ready():
+        return True, "the DB is not reachable — the vector readiness is not observable"
+
+    async def ready() -> tuple[bool, str]:
+        placeholders = ",".join("?" * len(ids))
+        done, _err = db_scalar(
+            f"SELECT COUNT(*) FROM notes WHERE id IN ({placeholders}) "
+            "AND vector_status = 'ok'",
+            tuple(ids),
+        )
+        return done == len(ids), f"vectorized {done}/{len(ids)}"
+
+    return await wait_until(ready, "the probe notes have vectors (level 0 reads them)")
 
 
 # --- /health ------------------------------------------------------------------
@@ -614,11 +688,14 @@ async def probe_titles(c: Client, prefix: str) -> list[dict]:
             if prefix in (item.get("title") or "")]
 
 
-async def prepare_leftovers() -> None:
+async def prepare_leftovers(rest: httpx2.AsyncClient) -> None:
     """Remove the leftovers of a previous run (idempotency, FR-2.1).
 
     A repeated run must not trip over its own dedup/anti-synonymy, so the probe
-    data of every earlier run (the same prefix) is deleted before the scenarios.
+    data of every earlier run (the same prefix) is deleted before the scenarios:
+    probe notes by the title prefix and probe NODES by the path prefix (a
+    leftover node with a similar description would otherwise make the creation of
+    the new probe node be refused with `reason=synonym`, the stage-6 run).
     `--no-cleanup` / LSB_KEEP=1 turns this off for diagnostics.
     """
     if CFG["no_cleanup"]:
@@ -632,7 +709,8 @@ async def prepare_leftovers() -> None:
         try:
             c, _init = await fresh_session(stack)
         except Exception as exc:  # noqa: BLE001 — auxiliary step, not a scenario
-            warn("pre-cleanup was not performed", describe(exc))
+            pre_warn("pre-cleanup was not performed (the MCP session did not open)",
+                     describe(exc))
             teardown_note(f"pre-cleanup failed ({describe(exc)}) — probe notes "
                           f"with prefix {CFG['prefix']} may stay in the base")
             return
@@ -644,6 +722,45 @@ async def prepare_leftovers() -> None:
     if removed:
         teardown_note(f"removed {removed} leftover note(s) of a previous run "
                       f"(prefix {CFG['prefix']})")
+    await prepare_namespace_leftovers(rest)
+
+
+async def prepare_namespace_leftovers(rest: httpx2.AsyncClient) -> None:
+    """Убрать узлы-остатки прошлых прогонов (маркер — префикс прогона).
+
+    Идемпотентность (FR-2.1): узел предыдущего прогона с тем же смыслом
+    описания даёт косинус описаний выше порога антисинонимии (lsb-0005-06), и
+    создание нового зонда мягко отклоняется с `reason=synonym` — без этой уборки
+    повторный прогон после аварийного выхода спотыкался бы о собственные
+    остатки. Заметки в узлах к этому моменту уже снесены (по префиксу названия),
+    поэтому узлы удаляются от листьев к корням.
+    """
+    prefix = f"{CFG['prefix']}-"
+    try:
+        response = await rest.get("/namespaces")
+        nodes = (response.json() if response.status_code == 200
+                 else {}).get("namespaces", [])
+    except Exception as exc:  # noqa: BLE001 — уборка не должна ронять прогон
+        pre_warn("namespace leftovers were not read", describe(exc))
+        return
+    stale = sorted(
+        (str(node.get("path")) for node in nodes
+         if str(node.get("path") or "").startswith(prefix)),
+        key=lambda path: path.count("/"), reverse=True,
+    )
+    for path in stale:
+        try:
+            res = await rest.delete(f"/namespaces/{path}")
+        except Exception as exc:  # noqa: BLE001
+            teardown_note(f"leftover namespace {path} was NOT removed ({describe(exc)})")
+            continue
+        if res.status_code in (200, 204, 404):
+            info(f"pre-cleanup: removed leftover namespace {path} "
+                 f"(http {res.status_code})")
+            teardown_note(f"removed leftover namespace {path} (http {res.status_code})")
+        else:
+            teardown_note(f"leftover namespace {path} was left on purpose (http "
+                          f"{res.status_code}) — an operator step is needed")
 
 
 async def cleanup_own_data() -> None:
@@ -675,7 +792,7 @@ async def cleanup_own_data() -> None:
 async def cleanup_namespaces(rest: httpx2.AsyncClient) -> None:
     """Remove the run's probe namespaces (children first, then the root)."""
     root = RUN["ns"]
-    for path in (f"{root}/a", f"{root}/b", f"{root}/same", root):
+    for path in (*RUN.get("ns_children", []), root):
         try:
             r = await rest.delete(f"/namespaces/{path}")
         except Exception as exc:  # noqa: BLE001
@@ -835,7 +952,7 @@ async def scenario_2_chars(c: Client, rest: httpx2.AsyncClient) -> int | None:
     saved = await c.call("memory_save", {"text": text, "title": RUN["note_chars"],
                                          "namespace": RUN["ns"]})
     nid = saved.get("id")
-    check("probe note for chars is created", nid is not None, f"id={nid}")
+    check("probe note for chars is created", nid is not None, note_detail(saved))
     if nid is None:
         return None
     RUN["notes"].append(nid)
@@ -869,7 +986,7 @@ async def scenario_2_chars(c: Client, rest: httpx2.AsyncClient) -> int | None:
                                          "namespace": RUN["ns"]})
     long_id = saved.get("id")
     check("long probe note for the chunk mode is created", long_id is not None,
-          f"id={long_id}")
+          note_detail(saved))
     if long_id is None:
         return nid
     RUN["notes"].append(long_id)
@@ -903,55 +1020,106 @@ async def scenario_2_chars(c: Client, rest: httpx2.AsyncClient) -> int | None:
 
 # --- scenario 3: links --------------------------------------------------------
 
+def probe_namespaces(tag: str) -> tuple[tuple[str, str], ...]:
+    """Узлы-зонды сценария 3: (path, description).
+
+    Антисинонимия создания (lsb-0005-06, порог косинуса описаний 0.90) сравнивает
+    именно ОПИСАНИЯ узлов: шаблонные «probe area A/B/C» и «probe nodes» давали
+    косинус ~1 и приложение отказывало в создании (`reason=synonym`, прогон
+    этапа 6). Здесь — два семантически разных описания (своя тема у каждого), без
+    общего шаблона; имена узлов также разные и осмысленные.
+    """
+    return (
+        (f"{tag}/vector-index",
+         f"{tag}: rebuilding the vector index keeps the ranking stable while "
+         "embedding requests wait one by one in the queue."),
+        (f"{tag}/release-notes",
+         f"{tag}: changelog wording and version bump bookkeeping for the release "
+         "tag and its rollout checklist."),
+    )
+
+
 async def scenario_3_links(c: Client, rest: httpx2.AsyncClient) -> int | None:
     scenario(3, "Links: level 0 at once, level 1 after the job, chunk/batch/soft-delete rules")
 
-    ns_a, ns_b, ns_same = f"{RUN['ns']}/a", f"{RUN['ns']}/b", f"{RUN['ns']}/same"
+    probes = probe_namespaces(RUN["tag"])
+    (ns_a, _desc_a), (ns_b, _desc_b) = probes
+    # Пути зондов — в RUN ДО создания: teardown снесёт и частично созданное.
+    RUN["ns_children"] = [path for path, _desc in probes]
+
     created = await c.call("memory_namespace_create", {
-        "path": RUN["ns"], "description": f"Acceptance probe nodes of run {RUN['tag']}.",
+        "path": RUN["ns"],
+        "description": f"Acceptance sandbox of run {RUN['tag']}: the probe node "
+                       "tree of the release check; the run teardown removes it.",
     })
     check("the run namespace is created (confirmed)", created.get("created") is True,
-          f"path={created.get('path')}")
-    for path, desc in ((ns_a, f"Acceptance probe area A of run {RUN['tag']}."),
-                       (ns_b, f"Acceptance probe area B of run {RUN['tag']}."),
-                       (ns_same, f"Acceptance probe area C of run {RUN['tag']}.")):
-        res = await c.call("memory_namespace_create", {"path": path, "description": desc})
-        check(f"probe namespace {path} is created", res.get("created") is True,
-              f"status={res.get('status')}")
+          node_detail(RUN["ns"], created))
+    if created.get("created") is not True:
+        # Дальше всё опирается на узлы: без корня дети не создаются, а заметки в них
+        # возвращали бы только вторичные FAIL'ы (id=None) вместо одной причины.
+        return None
+    node_results: list[tuple[str, dict]] = []
+    for path, desc in probes:
+        node_results.append((path, await c.call(
+            "memory_namespace_create", {"path": path, "description": desc})))
+        check(f"probe namespace {path} is created",
+              node_results[-1][1].get("created") is True,
+              node_detail(path, node_results[-1][1]))
+    if any(res.get("created") is not True for _path, res in node_results):
+        return None
 
     topic = (f"{RUN['tag']} vector index rebuild keeps the ranking stable while the "
              "embedding model queues requests one by one.")
     other = f"Another unrelated acceptance note of the same run {RUN['tag']}."
-    same = f"{topic} — the twin note of the same namespace."
+    # Двойник лежит в ТОМ ЖЕ узле, что и проверяемая заметка: именно его должно
+    # отсечь правило «связи — только из других разделов» (уровни 0 и 1). Формулировка
+    # отлична от topic намеренно: дословный дубль в своём узле приложение отклоняет
+    # (дубль легитимен только между узлами), а почти дословный текст (косинус выше
+    # DEDUP_CANDIDATE_SIMILARITY) уводил бы пару в фоновый дедуп — двойник мог бы
+    # быть сведён и удалён, и отсечение «своего» узла стало бы нечем проверять.
+    twin = (f"{RUN['tag']} search quality guard: after the index is rebuilt the "
+            "neighbour order in the answer must stay exactly the same, even when "
+            "the encoder processes queued texts slowly.")
 
     sa = await c.call("memory_save", {"text": topic, "title": RUN["note_links_a"],
                                       "namespace": ns_a})
     sb = await c.call("memory_save", {"text": topic, "title": RUN["note_links_b"],
                                       "namespace": ns_b})
-    ss = await c.call("memory_save", {"text": same, "title": RUN["note_links_same"],
-                                      "namespace": ns_same})
+    ss = await c.call("memory_save", {"text": twin, "title": RUN["note_links_same"],
+                                      "namespace": ns_a})
     so = await c.call("memory_save", {"text": other, "title": RUN["note_other"],
                                       "namespace": ns_b})
-    ids = [x.get("id") for x in (sa, sb, ss, so)]
-    check("the link probe notes are created", all(i is not None for i in ids), f"ids={ids}")
+    saves = (sa, sb, ss, so)
+    ids = [x.get("id") for x in saves]
+    check("the link probe notes are created", all(i is not None for i in ids),
+          ", ".join(note_detail(x) for x in saves))
     if any(i is None for i in ids):
-        return
+        return None
     RUN["notes"].extend(ids)
     na, nb, nsame, nother = ids
 
+    # Уровень 0 читает вектор самой заметки: без готового вектора KNN не вернёт
+    # ничего и проверки уровня 0 были бы ложным FAIL. Джоба `links` здесь НЕ ждётся —
+    # её требует только уровень 1 (смысл проверки — «уровень 0 приходит сразу»).
+    vectors_ok, vectors_detail = await wait_for_vectors(na, nb, nsame)
     got = await c.call("memory_get", {"id": na})
     links = got.get("links", [])
     check("memory_get carries a links field (single read)", "links" in got,
           f"keys={sorted(got)}")
-    check("a related note from another namespace is served at once (level 0)",
-          any(link.get("id") == nb for link in links), f"links={links}")
     check("link items carry {id, title, namespace, chars}",
           all(set(link) == LINK_ITEM_FIELDS for link in links),
           f"fields={[sorted(link) for link in links]}")
-    check("the own namespace is cut off when serving",
-          all(link.get("namespace") != ns_a for link in links),
-          f"namespaces={[link.get('namespace') for link in links]}")
-    check("the note is not linked to itself", all(link.get("id") != na for link in links))
+    if not vectors_ok:
+        skip("level 0 links of the probe notes",
+             f"the vectors are not ready within the guard ({vectors_detail})")
+    else:
+        check("a related note from another namespace is served at once (level 0)",
+              any(link.get("id") == nb for link in links), f"links={links}")
+        check("the own namespace is cut off when serving",
+              all(link.get("namespace") != ns_a for link in links),
+              f"namespaces={[link.get('namespace') for link in links]}")
+        check("the note is not linked to itself",
+              all(link.get("id") != na for link in links))
 
     if not db_ready():
         skip("level 1 after the links job", f"the DB is not reachable ({CFG['db']})")
@@ -991,6 +1159,14 @@ async def scenario_3_links(c: Client, rest: httpx2.AsyncClient) -> int | None:
                       "(level 1 wins over level 0)",
                       bool(links) and all(link.get("id") in stored_ids for link in links),
                       f"served={[link.get('id') for link in links]}, stored={sorted(stored_ids)}")
+                if nsame not in stored_ids:
+                    # Двойник из своего узла должен быть посчитан на уровне 1
+                    # (отсечение «своего» неймспейса делается при выдаче, не при
+                    # расчёте) — иначе отсекать нечего и проверка слабее, чем
+                    # выглядит; это наблюдение, не FAIL.
+                    warn("the twin from the checked node is not a stored level-1 pair",
+                         f"stored={sorted(stored_ids)} — the own-namespace cutoff "
+                         "had nothing to cut off")
                 check("the same-namespace twin is never served as a link",
                       all(link.get("id") != nsame for link in links),
                       f"links={[link.get('id') for link in links]}")
@@ -1046,7 +1222,8 @@ async def scenario_4_models_outage(c: Client, rest: httpx2.AsyncClient) -> None:
                                          "title": RUN["note_outage"],
                                          "namespace": RUN["ns"]})
     nid = saved.get("id")
-    check("the probe note of the outage scenario is created", nid is not None, f"id={nid}")
+    check("the probe note of the outage scenario is created", nid is not None,
+          note_detail(saved))
     if nid is not None:
         RUN["notes"].append(nid)
 
@@ -1111,7 +1288,7 @@ async def scenario_4_models_outage(c: Client, rest: httpx2.AsyncClient) -> None:
                 f"vector_status={row[0]['vector_status']!r}, " \
                 f"summary_status={row[0]['summary_status']!r}"
 
-        ok, detail = await wait_until(note_ready(), "the probe note is vectorized again")
+        ok, detail = await wait_until(note_ready, "the probe note is vectorized again")
         check("the deferred task was executed after the models returned", ok, detail)
     else:
         skip("the deferred task was executed after the models returned",
@@ -1154,6 +1331,7 @@ async def scenario_5_node_order(c: Client, rest: httpx2.AsyncClient) -> None:
     info(f"the default backlog at the start: {left} note(s) with a vector and no marker")
 
     created = []
+    refused = []
     for i in range(3):
         saved = await c.call("memory_save", {
             "text": f"{RUN['tag']} node order probe {i}: the release acceptance checks "
@@ -1162,8 +1340,10 @@ async def scenario_5_node_order(c: Client, rest: httpx2.AsyncClient) -> None:
         })
         if saved.get("id") is not None:
             created.append(saved["id"])
+        else:
+            refused.append(f"probe {i}: {note_detail(saved)}")
     check("the node-order probe notes are created", len(created) == 3,
-          f"ids={created}")
+          f"ids={created}" + (f", refused: {'; '.join(refused)}" if refused else ""))
     RUN["notes"].extend(created)
     if not created:
         return
@@ -1175,7 +1355,7 @@ async def scenario_5_node_order(c: Client, rest: httpx2.AsyncClient) -> None:
             "AND node_order_at IS NOT NULL", tuple(created))
         return done == len(created), f"marked {done}/{len(created)}"
 
-    ok, detail = await wait_until(all_marked(),
+    ok, detail = await wait_until(all_marked,
                                   "the nodes job marked the probe notes (node_order_at)")
     check("the default sweep processes the backlog within the guard", ok, detail)
     if not ok:
@@ -1402,7 +1582,7 @@ async def run_all() -> None:
 
         try:
             teardown_note(f"run started at {time.strftime('%Y-%m-%dT%H:%M:%S%z')}")
-            await prepare_leftovers()
+            await prepare_leftovers(rest)
             await scenario_0_context(c, rest, instructions)
             await scenario_1_limits(c, rest)
             await scenario_2_chars(c, rest)
@@ -1581,6 +1761,7 @@ async def main() -> int:
         "note_other": f"{tag} unrelated probe",
         "note_outage": f"{tag} outage probe",
         "note_nodes": [f"{tag} nodes probe {i}" for i in range(3)],
+        "ns_children": [],
         "notes": [],
     })
 
