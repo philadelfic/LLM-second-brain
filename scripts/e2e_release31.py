@@ -1048,25 +1048,47 @@ async def scenario_4_models_outage(c: Client, rest: httpx2.AsyncClient) -> None:
     if nid is not None:
         RUN["notes"].append(nid)
 
-    ok, detail = await wait_until(
-        legacy_pending_at_least(rest, "pending_vector", 1),
-        "the vector queue holds a pending item", timeout=min(CFG["wait_sec"], 120.0))
-    check("with the models down the task stays pending (nothing is lost)", ok, detail)
+    released = False
+    try:
+        ok, detail = await wait_until(
+            legacy_pending_at_least(rest, "pending_vector", 1),
+            "the vector queue holds a pending item", timeout=min(CFG["wait_sec"], 120.0))
+        check("with the models down the task stays pending (nothing is lost)", ok, detail)
 
-    ok, detail = await wait_until(queue_age_at_least(rest, "vector", 10),
-                                  "the age of the oldest pending item grows")
-    check("the age of the oldest pending item grows (/health.queues)", ok, detail)
+        ok, detail = await wait_until(queue_age_at_least(rest, "vector", 10),
+                                      "the age of the oldest pending item grows")
+        check("the age of the oldest pending item grows (/health.queues)", ok, detail)
 
-    found, detail = await log_has("queue_waiting")
-    if CFG["logs_cmd"]:
-        check("the queue_waiting event is written to the log", found, detail)
-    else:
-        skip("the queue_waiting event in the log",
-             "LSB_LOGS_CMD is not set (no log hook on this contour)")
+        found, detail = await log_has("queue_waiting")
+        if CFG["logs_cmd"]:
+            check("the queue_waiting event is written to the log", found, detail)
+        else:
+            skip("the queue_waiting event in the log",
+                 "LSB_LOGS_CMD is not set (no log hook on this contour)")
 
-    proc = await run_shell(CFG["slot_on_cmd"])
-    check("the model slot is started back by the contour hook", proc.returncode == 0,
-          f"rc={proc.returncode}")
+        proc = await run_shell(CFG["slot_on_cmd"])
+        released = True
+        check("the model slot is started back by the contour hook", proc.returncode == 0,
+              f"rc={proc.returncode}")
+    finally:
+        # The gate is never left closed: a failed check or a broken session in the
+        # middle of the outage would keep the models blocked for the whole run (and
+        # for the next scenarios) — release it on the scenario teardown path.
+        if not released:
+            undo_rc, undo_detail = 0, ""
+            try:
+                undo = await run_shell(CFG["slot_on_cmd"])
+                undo_rc = undo.returncode
+            except Exception as exc:  # noqa: BLE001 — the release must not mask the error
+                undo_rc, undo_detail = None, describe(exc)
+            if undo_rc == 0:
+                teardown_note("model slot was released by the teardown hook (the scenario "
+                              "did not reach its own `on` step)")
+                warn("the scenario left the outage before its own `on` step",
+                     "the model slot was released by the teardown hook")
+            else:
+                warn("the model slot could NOT be released — remove the block by hand",
+                     undo_detail or f"rc={undo_rc}")
 
     ok, detail = await wait_until(queue_empty(rest, "vector"),
                                   "the vector queue is drained after the models are back")
