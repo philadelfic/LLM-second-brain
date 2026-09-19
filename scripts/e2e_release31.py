@@ -1022,11 +1022,13 @@ async def scenario_4_models_outage(c: Client, rest: httpx2.AsyncClient) -> None:
     if not (CFG["slot_off_cmd"] and CFG["slot_on_cmd"]):
         skip("models unavailable → waiting → models back → jobs finished",
              "the contour hook is required: LSB_SLOT_OFF_CMD / LSB_SLOT_ON_CMD "
-             "(the operator stops/starts the model slot; the script must not touch "
-             "the LAN hosts)")
+             "(e.g. scripts/slot_gate.sh off|on all — the default docker mode "
+             "pauses/unpauses the slot proxy containers of the contour, so no "
+             "privileges are needed and no LAN host is touched)")
         manual("scenario 4 (lsb-0014 FR-2.4)",
-               "stop the model slot, run the E2E, start it back: the job must wait "
-               "and finish without a container restart")
+               "set LSB_SLOT_OFF_CMD / LSB_SLOT_ON_CMD to scripts/slot_gate.sh "
+               "off|on all and run the E2E: the job must wait and finish without "
+               "a container restart")
         return
 
     baseline = await health_snapshot(rest)
@@ -1507,9 +1509,11 @@ async def main() -> int:
     parser.add_argument("--restart-cmd", default=os.environ.get("LSB_RESTART_CMD", ""),
                         help="shell command restarting the contour (repeated-start check)")
     parser.add_argument("--slot-off-cmd", default=os.environ.get("LSB_SLOT_OFF_CMD", ""),
-                        help="shell command stopping the model slot (scenario 4)")
+                        help="shell command stopping the model slot (scenario 4, "
+                             "e.g. scripts/slot_gate.sh off all)")
     parser.add_argument("--slot-on-cmd", default=os.environ.get("LSB_SLOT_ON_CMD", ""),
-                        help="shell command starting the model slot back (scenario 4)")
+                        help="shell command starting the model slot back (scenario 4, "
+                             "e.g. scripts/slot_gate.sh on all)")
     parser.add_argument("--expect-version", default=os.environ.get("LSB_EXPECT_VERSION", RELEASE),
                         help="release tag /health.version is compared with")
     parser.add_argument("--nodes-batch", type=int,
