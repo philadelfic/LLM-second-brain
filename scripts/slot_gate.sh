@@ -6,11 +6,15 @@
 # Two interchangeable backends, picked by SLOT_GATE_MODE:
 #
 #   docker (default) — every slot sits behind its own socat proxy container of the
-#     test contour; `off` pauses those containers, `on` unpauses them. The app
-#     keeps talking to the same internal addresses: the requests hang and the models
-#     are unreachable, while the app container itself is NOT touched — no restart,
-#     the MCP session opened before the outage stays alive. No privileges and no
-#     firewall changes. This backend holds nothing but container names and docker
+#     test contour; `off` STOPS those containers (docker stop) and `on` STARTS them
+#     back (docker start). A stopped proxy does not listen at all, so the app gets a
+#     connection refusal at once: the job loop returns from an empty pass and reaches
+#     the waiting branch, so `queue_waiting` shows up within the acceptance window.
+#     `pause` (SLOT_GATE_ACTION=pause) is kept as a fallback, but a paused proxy keeps
+#     the connection hanging until the slot read timeout — the loop may not reach the
+#     waiting branch in time. The app container itself is NOT touched either way — no
+#     restart, the MCP session opened before the outage stays alive. No privileges and
+#     no firewall changes. This backend holds nothing but container names and docker
 #     commands: no LAN addresses, no tokens, no secrets.
 #
 #   iptables — the previous backend, kept as a fallback: DROP rules in the
@@ -26,16 +30,24 @@
 #   scripts/slot_gate.sh status [embedding|summary|judge|all] [--dry-run]
 #
 #   off       — close the gate (the models are unreachable for the test contour)
-#   on        — open the gate (docker: unpause the slot proxies; iptables: remove
-#               exactly the rules installed by `off` — foreign rules in the chain
-#               are never touched)
-#   status    — docker: the state of every slot proxy (running/paused/missing);
-#               iptables: which rules are standing right now
+#   on        — open the gate (docker: start the stopped slot proxies, or unpause
+#               them with SLOT_GATE_ACTION=pause; iptables: remove exactly the rules
+#               installed by `off` — foreign rules in the chain are never touched)
+#   status    — docker: the state of every slot proxy — `running` is on; `exited` /
+#               `created` is off for the default stop action, `paused` is off for the
+#               pause action; `missing` means the contour is not up; iptables: which
+#               rules are standing right now
 #   --dry-run — print the commands only, change nothing (no privileges needed)
 #   --help    — this text
 #
 # Environment:
 #   SLOT_GATE_MODE   docker (default) | iptables — which backend is used
+#   SLOT_GATE_ACTION (docker only) stop (default) | pause — how the docker backend
+#                    closes the gate: stop — `docker stop` the slot proxies (the
+#                    connection is refused at once: this is exactly "the model is
+#                    unavailable" for the job loop); pause — `docker pause`, where a
+#                    request instead hangs until the slot read timeout, so this
+#                    fallback needs a longer acceptance window
 #   SLOT_GATE_PROXY_EMBED_CONTAINER  (docker only) proxy container of the embedding
 #                    slot (default: lsb-test-model-proxy-embed)
 #   SLOT_GATE_PROXY_GEN_CONTAINER    (docker only) proxy container of the summary
@@ -58,6 +70,11 @@
 set -euo pipefail
 
 BACKEND="${SLOT_GATE_MODE:-docker}"
+
+# docker-режим: чем именно закрывается гейт. stop (по умолчанию) — контейнер
+# останавливается: соединение отвергается сразу, петля задания доходит до ветки
+# ожидания. pause — приостановка (запасной путь, соединение висит до таймаута).
+ACTION="${SLOT_GATE_ACTION:-stop}"
 
 # docker-режим: имена прокси-контейнеров слотов (адресов и токенов в файле нет).
 PROXY_EMBED_CONTAINER="${SLOT_GATE_PROXY_EMBED_CONTAINER:-lsb-test-model-proxy-embed}"
@@ -121,6 +138,16 @@ case "$BACKEND" in
     docker|iptables) ;;
     *)
         echo "ERROR: unknown SLOT_GATE_MODE: '$BACKEND' (expected docker|iptables)" >&2
+        usage >&2
+        exit 2 ;;
+esac
+
+# То же и для действия: неизвестное значение — ошибка запуска, а не тихий выбор
+# другого способа выключения (иначе «выключено» означало бы не то, что ждут).
+case "$ACTION" in
+    stop|pause) ;;
+    *)
+        echo "ERROR: unknown SLOT_GATE_ACTION: '$ACTION' (expected stop|pause)" >&2
         usage >&2
         exit 2 ;;
 esac
@@ -201,7 +228,7 @@ ipt_text() {
 }
 
 # =============================================================================
-# Бэкенд по умолчанию: пауза прокси-контейнеров слотов (docker pause/unpause)
+# Бэкенд по умолчанию: выключение прокси-контейнеров слотов (docker stop/start)
 # =============================================================================
 
 # Контейнер-прокси слота: embedding — свой, summary и judge делят один
@@ -212,6 +239,48 @@ proxy_for_slot() {
         summary|judge) printf '%s' "$PROXY_GEN_CONTAINER" ;;
         *)             return 1 ;;
     esac
+}
+
+# Выключающая и включающая подкоманда docker для выбранного действия — единая
+# точка правды: дальше по коду используются только эти функции.
+gate_off_cmd() {
+    if [[ "$ACTION" == "pause" ]]; then printf 'pause'; else printf 'stop'; fi
+}
+
+gate_on_cmd() {
+    if [[ "$ACTION" == "pause" ]]; then printf 'unpause'; else printf 'start'; fi
+}
+
+# Глагол для человекочитаемой строки о выполненном действии.
+verb_of() {
+    case "$1" in
+        stop)    printf 'stopped' ;;
+        start)   printf 'started' ;;
+        pause)   printf 'paused' ;;
+        unpause) printf 'unpaused' ;;
+        *)       printf '%s' "$1" ;;
+    esac
+}
+
+# Обратная подкоманда: откат отменяет ровно то, что сделал этот запуск.
+inverse_of() {
+    case "$1" in
+        stop)    printf 'start' ;;
+        start)   printf 'stop' ;;
+        pause)   printf 'unpause' ;;
+        unpause) printf 'pause' ;;
+    esac
+}
+
+# Контейнер уже выключен? Для stop-режима — остановлен (exited/created),
+# для pause-режима — приостановлен; тогда повторный off — идемпотентный no-op.
+is_off_state() {
+    local state="$1"
+    if [[ "$ACTION" == "pause" ]]; then
+        [[ "$state" == "paused" ]]
+    else
+        [[ "$state" == "exited" || "$state" == "created" ]]
+    fi
 }
 
 DOCKER_ERR=""
@@ -231,7 +300,8 @@ docker_probe() {
     return 0
 }
 
-# Состояние контейнера: running | paused | <иной статус docker> | missing.
+# Состояние контейнера: running | paused | exited | created | <иной статус docker>
+# | missing.
 docker_state() {
     local name="$1" state=""
     if ! state="$(docker inspect --format '{{.State.Status}}' "$name" 2>/dev/null)"; then
@@ -241,12 +311,23 @@ docker_state() {
     printf '%s' "$state"
 }
 
+# Выполнить подкоманду docker для одного контейнера: при сбое — сообщение
+# и возврат 1 (вывод подкоманды при успехе не печатается — он не нужен).
+apply_docker() {
+    local sub="$1" name="$2" out=""
+    if ! out="$(docker "$sub" "$name" 2>&1)"; then
+        echo "ERROR: docker $sub $name failed: ${out}" >&2
+        return 1
+    fi
+    return 0
+}
+
 gate_docker() {
-    local slot name state err entry out
+    local slot name state sub entry err
     local -a pairs=()               # «slot container» по запрошенным слотам
     local -a containers=()          # уникальные контейнеры (порядок появления)
     local -a errors=()
-    local -a changed=()             # контейнеры, изменённые этим запуском
+    local -a changed=()             # «<подкоманда> <контейнер>», изменённые этим запуском
     local -A seen=()
 
     for slot in "${WANTED[@]}"; do
@@ -264,20 +345,21 @@ gate_docker() {
         if docker_probe; then
             for name in "${containers[@]}"; do
                 state="$(docker_state "$name")"
-                case "${MODE}:${state}" in
-                    off:paused|on:running)
-                        echo "note: $name is already in the target state ($state) — a real run would be a no-op" >&2 ;;
-                    off:missing|on:missing)
-                        echo "note: $name is unknown to docker right now — a real run would fail preflight" >&2 ;;
-                esac
+                if [[ "$state" == "missing" ]]; then
+                    echo "note: $name is unknown to docker right now — a real run would fail preflight" >&2
+                elif [[ "$MODE" == "off" ]] && is_off_state "$state"; then
+                    echo "note: $name is already in the target state ($state) — a real run would be a no-op" >&2
+                elif [[ "$MODE" == "on" && "$state" == "running" ]]; then
+                    echo "note: $name is already in the target state ($state) — a real run would be a no-op" >&2
+                fi
             done
         else
             echo "note: ${DOCKER_ERR} — only the commands are printed" >&2
         fi
         for name in "${containers[@]}"; do
             case "$MODE" in
-                off)    echo "would run: docker pause $name" ;;
-                on)     echo "would run: docker unpause $name" ;;
+                off)    echo "would run: docker $(gate_off_cmd) $name" ;;
+                on)     echo "would run: docker $(gate_on_cmd) $name" ;;
                 status) echo "would run: docker inspect --format '{{.State.Status}}' $name   # state probe" ;;
             esac
         done
@@ -286,8 +368,10 @@ gate_docker() {
 
     # --- status: состояние прокси по каждому слоту ---------------------------
     # Печатается по слоту (не по контейнеру): видно, за каким слотом какой прокси.
-    # Приостановленный прокси = слот выключен; отсутствующий — контур не поднят
-    # (это не ошибка: status обязан отвечать и на остановленном контуре).
+    # Выключенный слот = прокси не обслуживает запросы: для stop-режима это exited
+    # или created (контейнер остановлен), для pause-режима — paused; running — слот
+    # включён; отсутствующий контейнер — контур не поднят (это не ошибка: status
+    # обязан отвечать и на остановленном контуре).
     if [[ "$MODE" == "status" ]]; then
         if ! docker_probe; then
             echo "ERROR: ${DOCKER_ERR}" >&2
@@ -299,7 +383,8 @@ gate_docker() {
             state="$(docker_state "$name")"
             case "$state" in
                 running) printf '[on]      %-9s container=%s state=running\n' "$slot" "$name" ;;
-                paused)  printf '[off]     %-9s container=%s state=paused\n' "$slot" "$name" ;;
+                paused|exited|created)
+                         printf '[off]     %-9s container=%s state=%s\n' "$slot" "$name" "$state" ;;
                 missing) printf '[missing] %-9s container=%s state=missing\n' "$slot" "$name" ;;
                 *)       printf '[off]     %-9s container=%s state=%s\n' "$slot" "$name" "$state" ;;
             esac
@@ -309,7 +394,7 @@ gate_docker() {
 
     # --- preflight: сначала всё проверяем, потом применяем --------------------
     # Частичных изменений быть не должно: если хоть один нужный контейнер
-    # отсутствует или не запущен — не трогаем ни один.
+    # отсутствует или в неизвестном состоянии — не трогаем ни один.
     if ! docker_probe; then
         errors+=("$DOCKER_ERR")
     else
@@ -317,10 +402,16 @@ gate_docker() {
             state="$(docker_state "$name")"
             case "$state" in
                 running|paused) : ;;
+                exited|created)
+                    # остановленный контейнер — законное состояние для stop-режима;
+                    # pause-режим такой контейнер переключить не может (это ошибка).
+                    if [[ "$ACTION" == "pause" ]]; then
+                        errors+=("container '$name' is stopped (docker state: $state) — SLOT_GATE_ACTION=pause cannot switch a stopped container; use the default stop action or start the contour first")
+                    fi ;;
                 missing)
                     errors+=("container '$name' is unknown to docker — start the test contour first (docker compose -f docker-compose.test.yml up -d)") ;;
                 *)
-                    errors+=("container '$name' is not running (docker state: $state) — start the test contour first") ;;
+                    errors+=("container '$name' is in a state we cannot switch (docker state: $state) — fix the contour first") ;;
             esac
         done
     fi
@@ -339,54 +430,53 @@ gate_docker() {
         printf 'slot %s: container %s (state: %s)\n' "$slot" "$name" "$(docker_state "$name")"
     done
 
-    # Откат: при сбое посередине возвращаем ровно своё изменение.
+    # Откат: при сбое посередине отменяем ровно свои изменения обратной
+    # подкомандой; чужие состояния не трогаем.
     rollback_docker() {
-        local i name
+        local i entry sub cname inv
         for ((i = ${#changed[@]} - 1; i >= 0; i--)); do
-            name="${changed[$i]}"
-            if [[ "$MODE" == "off" ]]; then
-                echo "rollback: docker unpause $name" >&2
-                docker unpause "$name" >/dev/null 2>&1 || true
-            else
-                echo "rollback: docker pause $name" >&2
-                docker pause "$name" >/dev/null 2>&1 || true
-            fi
+            entry="${changed[$i]}"
+            sub="${entry%% *}"
+            cname="${entry#* }"
+            inv="$(inverse_of "$sub")"
+            echo "rollback: docker $inv $cname" >&2
+            docker "$inv" "$cname" >/dev/null 2>&1 || true
         done
     }
 
-    # --- off / on: идемпотентно (повторный off на паузе — не ошибка) ----------
+    # --- off / on: идемпотентно (повторный off на выключенном — не ошибка) -----
     for name in "${containers[@]}"; do
         state="$(docker_state "$name")"
         if [[ "$MODE" == "off" ]]; then
-            if [[ "$state" == "paused" ]]; then
-                echo "already paused: $name (idempotent no-op)"
+            if is_off_state "$state"; then
+                echo "already off: $name (state=$state, idempotent no-op)"
                 continue
             fi
-            if ! out="$(docker pause "$name" 2>&1)"; then
-                echo "ERROR: failed to pause the container: $name (${out})" >&2
-                rollback_docker
-                echo "ERROR: the change was rolled back — the previous state was restored" >&2
-                exit 4
-            fi
-            changed+=("$name")
-            echo "paused: $name"
+            sub="$(gate_off_cmd)"
         else
             if [[ "$state" == "running" ]]; then
-                echo "already running: $name (idempotent no-op)"
+                echo "already on: $name (state=running, idempotent no-op)"
                 continue
             fi
-            if ! out="$(docker unpause "$name" 2>&1)"; then
-                echo "ERROR: failed to unpause the container: $name (${out})" >&2
-                rollback_docker
-                echo "ERROR: the change was rolled back — the previous state was restored" >&2
-                exit 4
+            if [[ "$state" == "paused" && "$ACTION" == "stop" ]]; then
+                # Остаток от прогона в pause-режиме: контейнер жив, но приостановлен —
+                # снимаем паузу, иначе `docker start` оставил бы его приостановленным.
+                echo "note: $name is paused (left over from SLOT_GATE_ACTION=pause) — unpausing instead of starting"
+                sub="unpause"
+            else
+                sub="$(gate_on_cmd)"
             fi
-            changed+=("$name")
-            echo "unpaused: $name"
         fi
+        if ! apply_docker "$sub" "$name"; then
+            rollback_docker
+            echo "ERROR: the change was rolled back — the previous state was restored" >&2
+            exit 4
+        fi
+        changed+=("$sub $name")
+        echo "$(verb_of "$sub"): $name"
     done
 
-    echo "done: $MODE $TARGET — ${#changed[@]} container(s) changed, ${#containers[@]} container(s) checked"
+    echo "done: $MODE $TARGET (action=$ACTION) — ${#changed[@]} container(s) changed, ${#containers[@]} container(s) checked"
 }
 
 # =============================================================================
