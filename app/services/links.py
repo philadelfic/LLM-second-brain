@@ -21,7 +21,11 @@
 форма — «по интервалу + событие `links`» (решение гейта 1c): интервал
 `JOB_LINKS_INTERVAL_SEC` остаётся страховкой/backfill'ом, а заметка, получившая
 готовый вектор, будит петлю событием `worker._links_event` (notify_links_pending)
-— уровень 1 появляется сразу, не дожидаясь интервала.
+— уровень 1 появляется сразу, не дожидаясь интервала. Перед ожиданием петля
+перепроверяет очередь после `clear()` (`queue_empty`, та же выборка, что
+`recompute_batch`): сигнал, пришедший в окне до `clear()`, работу не теряет, а
+заметка, ждущая вектор (`vector_status='pending'`), в выборку не входит — петля
+спит по back-off, без busy-loop (пул 6, lost wakeup).
 
 Выдача связей (постановка 10, arch §3.5): `related` отдаёт уровень 1
 (таблица `links`) с приоритетом вида и фолбэком на уровень 0, только если после
@@ -549,6 +553,19 @@ class LinksService:
             self.compute_for_note(int(row["id"]))
         return len(rows)
 
+    def queue_empty(self) -> bool:
+        """Пуста ли очередь расчёта связей (дешёвая проверка, пул 6, lost wakeup).
+
+        Петля перед `clear()+wait` перепроверяет саму очередь, а не только
+        событие: notify мог прийти между пустым прогоном и `clear()` — без этой
+        проверки сигнал стирался бы и заметка ждала интервал/back-off (до 15 мин).
+        Выборка — ровно та, что выгребает `recompute_batch`: берётся у
+        `queue_stat` (та же `_QUEUE_STAT_SQL`, предикат не дублируется). Заметка,
+        ждущая вектор, очередь непустой не делает — петля уходит в сон, а не
+        крутится вхолостую. Только SQL, без моделей (FR-2.2).
+        """
+        return int(self.queue_stat()["pending"] or 0) == 0
+
     def queue_stat(self) -> dict[str, int | None]:
         """Снимок очереди расчёта связей для `/health.queues` (FR-2.2).
 
@@ -720,6 +737,16 @@ def build_links_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
     Расчёт связей моделей не зовёт (FR-2.2): косинус — готовый вектор,
     entities/mention — FTS.
 
+    Перепроверка очереди (`queue_empty`) задана — форма закрывает узкую гонку
+    lost wakeup (пул 6): пустой прогон → `idle_hook` → `clear()` события, и
+    сигнал о свежем векторе, пришедший в этом окне, иначе был бы стёрт (`clear()`
+    его не помнит). `queue_empty` смотрит ровно выборку `recompute_batch`
+    (`vector_status='ok' AND links_at IS NULL`): непустая очередь — петля сразу
+    продолжает прогон (без сна), пустая — спит до события/таймаута. Заметка,
+    ждущая вектор (`vector_status='pending'`), в выборку не входит — очередь
+    пуста и петля уходит в сон по back-off: busy-loop'а нет, задание придёт
+    событием от векторизации (`notify_links_pending`).
+
     Сервис собирается над общим эмбеддером воркера (отдельный клиент не
     заводим): расчёт связей кодирование не зовёт, но `LinksService` требует
     `SearchService` для KNN-пула `cosine`.
@@ -739,7 +766,7 @@ def build_links_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         batch=batch,
         enabled=settings.job_links_enabled,
         process=process,
-        queue_empty=None,
+        queue_empty=links.queue_empty,
         wait_event=worker._links_event,
         idle_hook=links.purge_orphans,
         queue_stat=links.queue_stat,

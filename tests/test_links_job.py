@@ -14,6 +14,11 @@ notes_vec может и не быть — расчёт связей моделе
 событием `_links_event` (`notify_links_pending`) — уровень 1 считается сразу, а
 не через интервал. Здесь же проверяется, что при недоступных моделях
 (`EmbeddingError`) сигнала нет и петля уходит в обычное ожидание с back-off.
+
+Перепроверка очереди (`queue_empty`, пул 6, lost wakeup): перед ожиданием петля
+смотрит ту же выборку, что `recompute_batch`, — сигнал, пришедший в окне до
+`clear()`, работу не теряет, а заметка с `vector_status='pending'` очередь
+непустой не делает (петля спит, а не крутится вхолостую).
 """
 
 from __future__ import annotations
@@ -161,6 +166,9 @@ def test_links_job_is_registered(settings: Settings) -> None:
     # Форма «по интервалу + событие `links`» (гейт 1c): готовый вектор заметки
     # будит петлю — событие берётся у воркера (владельца embedding-очереди).
     assert spec.wait_event is worker._links_event
+    # Перепроверка очереди задана (пул 6, lost wakeup) — форма с `queue_empty`:
+    # работа, попавшая в окно до `clear()`, не теряется.
+    assert spec.queue_empty is not None
     assert spec.idle_hook is not None  # гигиена purge_orphans
     assert spec.queue_stat is not None  # снимок очереди для /health
 
@@ -336,6 +344,107 @@ async def test_links_event_wakes_loop_immediately(
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+# --- пул 6: потерянный будильник (lost wakeup) -------------------------------
+
+
+def test_queue_empty_matches_recompute_selection(settings: Settings) -> None:
+    """`queue_empty` смотрит ровно выборку `recompute_batch` (та же логика).
+
+    Очередь непуста только из-за активной заметки с готовым вектором и пустым
+    маркером; посчитанная, удалённая и ждущая вектора — не очередь.
+    """
+    _seed(
+        settings,
+        [
+            (1, "Ждёт расчёта", "текст", "ok", _ts(0)),
+            (2, "Уже посчитана", "текст", "ok", _ts(0)),
+            (3, "Ждёт вектора", "текст", "pending", _ts(0)),
+            (4, "Удалена", "текст", "ok", _ts(0)),
+        ],
+    )
+    with session(settings) as conn:
+        conn.execute("UPDATE notes SET links_at = ? WHERE id = 2", (_ts(0),))
+        conn.execute("UPDATE notes SET deleted_at = ? WHERE id = 4", (_ts(0),))
+    spec = links_spec(make_worker(settings), settings)
+
+    assert spec.queue_empty() is False  # заметка 1 ждёт расчёта
+    assert _run(spec) == 1  # прогон выгребает ровно её
+    assert spec.queue_empty() is True  # очередь опустела вместе с выборкой
+    assert spec.queue_stat()["pending"] == 0
+
+
+@pytest.mark.asyncio
+async def test_lost_wakeup_window_closed(settings: Settings, monkeypatch) -> None:
+    """Работа, появившаяся до `clear()`, не теряется: следующий прогон сразу.
+
+    Окно гонки — `idle_hook` перед `clear()`: заметка получила готовый вектор и
+    `notify_links_pending` уже выставлен (без перепроверки `clear()` стёр бы
+    сигнал, и заметка ждала бы интервал/back-off). Перепроверка очереди после
+    `clear()` видит непустую выборку — петля НЕ уходит в сон, а считает сразу.
+    """
+    _seed(settings, [(1, "Заметка", "текст про встречу", "pending", _ts(0))])
+    worker = make_worker(settings)
+
+    def deliver(self) -> int:
+        # Гигиена idle-ветки: ровно в этом окне приходит сигнал — ДО `clear()`.
+        with session(settings) as conn:
+            conn.execute("UPDATE notes SET vector_status = 'ok' WHERE id = 1")
+        worker.notify_links_pending()
+        return 0
+
+    # Хук подменяется ДО сборки джобы: `JobSpec` хранит связанный метод.
+    monkeypatch.setattr(LinksService, "purge_orphans", deliver)
+    spec = links_spec(worker, settings)
+    slept_early: list[bool] = []  # уснула ли петля до разбора очереди
+
+    async def spy_wait_for(awaitable, timeout=None, *args, **kwargs):
+        awaitable.close()  # корутину event.wait() не ждём — как при таймауте
+        slept_early.append(_links_at(settings, 1) is None)
+        raise asyncio.TimeoutError
+
+    real_wait_for = asyncio.wait_for
+    monkeypatch.setattr(asyncio, "wait_for", spy_wait_for)
+    await real_wait_for(
+        run_loop(
+            spec, lambda: _links_at(settings, 1) is not None, BackoffState(300)
+        ),
+        timeout=2.0,
+    )
+    assert slept_early == []  # ни одного сна: работа разобрана сразу же
+    assert _links_at(settings, 1) is not None  # посчитана сразу, не через интервал
+    assert spec.queue_stat()["pending"] == 0
+
+
+@pytest.mark.asyncio
+async def test_pending_vector_note_does_not_spin_loop(
+    settings: Settings, monkeypatch
+) -> None:
+    """Заметка, ждущая вектор, не крутит петлю вхолостую — она уходит в сон.
+
+    `queue_empty` — та же выборка, что `recompute_batch` (`vector_status='ok'`):
+    pending-заметка очередь непустой не делает, поэтому вместо busy-loop петля
+    спит с back-off, а задание придёт событием от векторизации.
+    """
+    _seed(settings, [(1, "Ждёт вектора", "текст", "pending", _ts(0))])
+    spec = links_spec(make_worker(settings), settings)
+    calls: list[int] = []
+    monkeypatch.setattr(
+        LinksService,
+        "recompute_batch",
+        lambda self, limit: calls.append(limit) or 0,
+    )
+    real_wait_for = asyncio.wait_for  # ожидание теста — до подмены атрибута
+    waits = patch_wait_event_timeout(monkeypatch)  # ожидание мгновенное, пауза записана
+    state = BackoffState(300)
+
+    await real_wait_for(
+        run_loop(spec, lambda: len(waits) >= 2, state), timeout=2.0
+    )
+    assert spec.queue_empty() is True  # pending-вектор в очередь links не входит
+    assert calls == [spec.batch, spec.batch]  # ровно по прогону на каждое ожидание
+    assert waits[:2] == [300.0, 600.0]  # ушла в сон и растит back-off
 
 
 # --- back-off, сон и idle-ветка ----------------------------------------------
