@@ -83,7 +83,12 @@ class Settings(BaseSettings):
     embedding_concurrent_requests: int = 3  # параллельных embed-запросов воркера
 
     # --- суммаризация ---
-    max_summary_chars: int = 200
+    # Лимит длины саммари в символах (решение гейта 3.1.0, 2026-09-19: 150).
+    # Держит обе стороны одной константой: жёсткую страховку МОДЕЛЬНОГО
+    # саммари при сохранении (worker.py, cap_summary — усечение по границе
+    # слова) и fallback-усечение текста заметки в выдачах (emit.py, пока
+    # summary_status != 'ok'). Прежние 200 были только fallback-лимитом.
+    max_summary_chars: int = 150
     summary_think: bool = True  # при false в вызов идёт "think": false
     summary_num_predict: int = 35000  # потолок thinking+content выжимки (решение О. 2026-08-30: 1500→35000)
     merge_num_predict: int = 35000  # отдельный потолок слияния дублей (решение О. 2026-08-30)

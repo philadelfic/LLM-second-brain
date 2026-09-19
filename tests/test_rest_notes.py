@@ -70,7 +70,7 @@ class TestNotesCrud:
         assert len(items) == 1 and response.json()["total"] == 1
         assert "text" not in items[0]
         assert items[0]["title"] == "Рест-длинный"  # Фаза 11 (решение №9)
-        assert len(items[0]["summary"]) == 200  # усечение, не полный текст
+        assert len(items[0]["summary"]) == 150  # усечение, не полный текст
 
     def test_list_pagination_params(self, client: TestClient, token: str) -> None:
         for i in range(1, 6):

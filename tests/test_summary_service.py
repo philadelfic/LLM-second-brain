@@ -143,7 +143,7 @@ def test_messages_system_prompt_has_new_wording(monkeypatch) -> None:
     messages = payload["messages"]
     assert messages[0]["role"] == "system"
     assert "1–2 short, dense sentences" in messages[0]["content"]
-    assert "no more than 30 words" in messages[0]["content"]
+    assert "no more than 150 characters in total" in messages[0]["content"]
     assert "in the language of the note" in messages[0]["content"]
     assert messages[1] == {"role": "user", "content": NOTE}
 
@@ -251,12 +251,14 @@ def test_read_timeout_from_env(monkeypatch) -> None:
     service.close()
 
 
-# --- без среза: обрезка суммари отменена (решение О. 2026-08-30) --------------
+# --- транспарентность: сервис = транспорт, лимит — в точке сохранения -------
 
 
-def test_long_content_not_truncated(monkeypatch) -> None:
-    """Символьной обрезки суммари больше нет: content возвращается полностью,
-    длина контролируется самим промптом («до 30 слов»)."""
+def test_service_returns_content_as_is(monkeypatch) -> None:
+    """Сам сервис content не режет: жёсткий лимит саммари (150 символов,
+    решение гейта 3.1.0) применяется в точке сохранения — воркер зовёт
+    summary.cap_summary (worker.process_summary_pending); здесь проверяется,
+    что транспорт отдаёт ответ модели как есть, без двойной обрезки."""
     settings = make_settings(monkeypatch)
     long_content = "д" * (settings.max_summary_chars + 50)
     service, _ = make_service(settings, [httpx.Response(200, json=ok_body(long_content))])

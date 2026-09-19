@@ -48,9 +48,14 @@ from app.config import ConfigError
 # Редактируемые 3 (seed-if-missing при заданном prompts_dir).
 
 # summary.py::SYSTEM_PROMPT — пересказ заметки.
+# Лимит длины — 150 СИМВОЛОВ (решение гейта 3.1.0, 2026-09-19): прежнее
+# «не более 30 слов» снято, двойного ограничения в промпте нет. Промпт —
+# просьба к модели, страховка от недисциплинированной модели — в коде:
+# усечение по границе слова в точке сохранения (worker.process_summary_pending,
+# summary.cap_summary, лимит settings.max_summary_chars).
 SUMMARY_SYSTEM_PROMPT = (
-    "Summarize the note in 1–2 short, dense sentences, no more than 30 "
-    "words in total. Convey the main idea so that this condensed version "
+    "Summarize the note in 1–2 short, dense sentences — no more than 150 "
+    "characters in total. Convey the main idea so that this condensed version "
     "alone makes the text perfectly clear. No intros, quotes, or "
     "explanations. Respond in the language of the note."
 )
@@ -157,8 +162,9 @@ _PROMPT_FILE_SUFFIX = ".txt"
 
 # Version of the current prompt canon (seed stamp). Bumped on every canon
 # change of the editable prompts; used for auto-migration of untouched
-# legacy seeds (lsbdef-0006).
-SEED_VERSION = "2.2.1"
+# legacy seeds (lsbdef-0006). Текущий канон — 3.1.0 (саммари ≤ 150 символов,
+# решение гейта 2026-09-19).
+SEED_VERSION = "3.1.0"
 
 # Name of the seed-stamp sidecar file in prompts_dir: version + SHA-256 of
 # the seeded content per editable prompt.
@@ -174,6 +180,17 @@ SUMMARY_SYSTEM_PROMPT_V21 = (
     "предложениях, суммарно не длиннее 30 слов. Передай главную мысль "
     "так, чтобы по этому сокращению было предельно понятно, о чём текст. "
     "Без вступлений, кавычек и пояснений. Отвечай на языке заметки."
+)
+
+# EN canon of v2.2.1 (the «no more than 30 words» wording): installs upgraded
+# to 3.1.0 have this text in prompts/summary_system.txt — auto-migration
+# recognizes it as an untouched seed and rewrites it with the current canon
+# (≤ 150 characters, gate decision 2026-09-19).
+SUMMARY_SYSTEM_PROMPT_V221 = (
+    "Summarize the note in 1–2 short, dense sentences, no more than 30 "
+    "words in total. Convey the main idea so that this condensed version "
+    "alone makes the text perfectly clear. No intros, quotes, or "
+    "explanations. Respond in the language of the note."
 )
 
 SUMMARY_MERGE_SYSTEM_PROMPT_V21 = (
@@ -195,7 +212,7 @@ JUDGE_SYSTEM_PROMPT_V21 = (
 # seed_meta.json). A file byte-identical to one of them is treated as an
 # untouched legacy seed and rewritten with the current canon.
 LEGACY_SEEDS: dict[str, tuple[str, ...]] = {
-    "summary_system": (SUMMARY_SYSTEM_PROMPT_V21,),
+    "summary_system": (SUMMARY_SYSTEM_PROMPT_V21, SUMMARY_SYSTEM_PROMPT_V221),
     "summary_merge_system": (SUMMARY_MERGE_SYSTEM_PROMPT_V21,),
     "judge_system": (JUDGE_SYSTEM_PROMPT_V21,),
 }

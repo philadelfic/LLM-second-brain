@@ -80,7 +80,7 @@ independently:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MAX_SUMMARY_CHARS` | `200` | summary length limit |
+| `MAX_SUMMARY_CHARS` | `150` | summary length limit: model summary is capped at a word boundary, the pending-note fallback is the first N characters (gate 3.1.0, 2026-09-19) |
 | `SUMMARY_THINK` | `true` | allow summarizer reasoning (ollama only) |
 | `SUMMARY_NUM_PREDICT` | `35000` | generation cap for the summary |
 | `MERGE_NUM_PREDICT` | `35000` | generation cap for dedup merge |

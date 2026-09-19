@@ -382,6 +382,29 @@ def test_process_summary_fills_pending(settings) -> None:
         assert row["summary_status"] == "ok"
 
 
+def test_process_summary_caps_model_answer_at_limit(settings) -> None:
+    """Ответ модели длиннее лимита сохраняется усечённым (гейт 3.1.0,
+    2026-09-19): в БД — ≤ MAX_SUMMARY_CHARS по границе слова с многоточием,
+    в выдачах — именно оно (готовое), а не fallback-срез текста заметки."""
+    notes = NoteService(settings, FailingEmbedder())
+    saved = notes.save("заметка, ждущая суммаризацию фоновым воркером")
+    long_answer = "Плотный ответ модели по заметке. " * 12  # ~370 символов
+    assert len(long_answer) > settings.max_summary_chars
+    worker = make_worker(settings, HashEmbedder(8), FixedSummarizer(long_answer))
+    assert worker.process_summary_pending() == 1
+    with session(settings) as conn:
+        summary = conn.execute(
+            "SELECT summary FROM notes WHERE id = ?", (saved["id"],)
+        ).fetchone()["summary"]
+    assert len(summary) <= settings.max_summary_chars
+    assert summary.endswith("…")
+    assert long_answer.startswith(summary[:-1])  # префикс ответа, не выдумка
+    assert long_answer[len(summary) - 1].isspace()  # обрезано по границе слова
+    fetched = notes.get([saved["id"]])["notes"][0]
+    assert fetched["summary"] == summary
+    assert fetched["summary_status"] == "ok"
+
+
 def test_process_summary_empty_queue(settings) -> None:
     worker = make_worker(settings, HashEmbedder(8), FixedSummarizer())
     assert worker.process_summary_pending() == 0

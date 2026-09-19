@@ -134,7 +134,7 @@ from app.services.judge import Judge, JudgeError
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
 from app.services.promotion import PromotionService
-from app.services.summary import Summarizer, SummaryError
+from app.services.summary import Summarizer, SummaryError, cap_summary
 from app.storage import area_vectors, chunks, vectors
 from app.storage.db import delete_note_physical, session, transaction
 
@@ -1340,6 +1340,11 @@ class BackgroundWorker:
         Гонка с memory_update (ARCH §4.5): суммари пишется только если текст
         не менялся с момента вычитки (`AND text = ?`) — протухшая выжимка не
         затирает свежую заметку.
+
+        Лимит длины (решение гейта 3.1.0, 2026-09-19): ответ модели сохраняется
+        только после `cap_summary` — жёсткое усечение до MAX_SUMMARY_CHARS по
+        границе слова с многоточием. Это единственная точка записи модельного
+        саммари, поэтому лимит не зависит от дисциплины модели.
         """
         if self._summarizer is None:
             return 0
@@ -1367,6 +1372,10 @@ class BackgroundWorker:
                     },
                 )
                 continue  # отказ: status pending остаётся, повтор по back-off
+            # Страховка длины (решение гейта 3.1.0, 2026-09-19): модель может
+            # не послушать промпт («no more than 150 characters») — в БД уходит
+            # усечённое по границе слова саммари, всегда ≤ MAX_SUMMARY_CHARS.
+            summary = cap_summary(summary, self._settings.max_summary_chars)
             with session(self._settings) as conn, transaction(conn):
                 cursor = conn.execute(
                     "UPDATE notes SET summary = ?, summary_status = 'ok' "

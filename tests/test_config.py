@@ -43,7 +43,7 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "CHUNK_MIN_TARGET": ("chunk_min_target", 200),
     "EMBEDDING_BATCH_SIZE": ("embedding_batch_size", 32),
     "EMBEDDING_CONCURRENT_REQUESTS": ("embedding_concurrent_requests", 3),
-    "MAX_SUMMARY_CHARS": ("max_summary_chars", 200),
+    "MAX_SUMMARY_CHARS": ("max_summary_chars", 150),
     "SNIPPET_CHARS": ("snippet_chars", 120),
     "MAX_GET_BATCH": ("max_get_batch", 20),
     "SUMMARY_THINK": ("summary_think", True),
