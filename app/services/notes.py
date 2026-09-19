@@ -11,7 +11,9 @@ update(), поздний уходит в trash (soft delete). В синхрон�
 мгновенный дословный дедуп по тексту (SQL/FTS, без Ollama): перефразы он не
 ловит — это теперь зона фонового дедупа. Суммаризации в синхронном пути нет (режим «Б», Фаза 4):
 summary всегда fallback-усечение, генерация — фоновым воркером (notifier
-будит его сразу после записи).
+будит его сразу после записи); тем же способом будится и embedding-петля
+(notifier векторизации) — свежая заметка кодируется не после back-off, а сразу
+(gate 2026-09-19).
 
 Контракты ответов сервис-слоя (полные; REST отдаёт их как есть;
 MCP-слой срезает служебные поля — см. Фаза 9):
@@ -158,6 +160,7 @@ class NoteService:
         embedding: Embedder | None = None,
         dedup: DeduplicationService | None = None,
         summary_notifier: Callable[[], None] | None = None,
+        vector_notifier: Callable[[], None] | None = None,
     ) -> None:
         self._settings = settings
         # DI для тестов: HashEmbedder/фейк вместо живого Ollama. С Фазы 8
@@ -172,10 +175,21 @@ class NoteService:
         # Сигнал воркеру суммаризации (main.py): будить петлю сразу при
         # появлении pending summary, а не ждать выросший back-off.
         self._summary_notifier = summary_notifier
+        # Сигнал воркеру векторизации (main.py): будить embedding-петлю сразу
+        # при появлении pending-вектора (save/update/merge_pair), не дожидаясь
+        # выросшего back-off (до 15 мин) — свежая заметка кодируется и
+        # находится поиском немедленно. Событие только ускоряет: задание живёт
+        # в самом статусе заметки (`vector_status='pending'`), контракт
+        # надёжности не меняется.
+        self._vector_notifier = vector_notifier
 
     def set_summary_notifier(self, notifier: Callable[[], None]) -> None:
         """Подключить сигнал пробуждения воркера суммаризации (main.py)."""
         self._summary_notifier = notifier
+
+    def set_vector_notifier(self, notifier: Callable[[], None]) -> None:
+        """Подключить сигнал пробуждения embedding-петли воркера (main.py)."""
+        self._vector_notifier = notifier
 
     # --- FR-4 memory_save (ARCH §4.1) --------------------------------------
 
@@ -257,6 +271,9 @@ class NoteService:
         if duplicate is not None:
             return duplicate_response(duplicate)
         self._notify_summary_pending()
+        # Заметка записана с vector_status='pending' — будим embedding-петлю:
+        # вектор строится сразу, а не после выросшего back-off.
+        self._notify_vector_pending()
         result: dict[str, Any] = {
             "id": note_id,
             "stored": True,
@@ -658,6 +675,10 @@ class NoteService:
                 vectors.drop(conn, note_id)
         if not updated:
             return self._not_found(note_id)
+        if text_changed:
+            # Правка текста вернула заметку в очередь векторизации — будим
+            # embedding-петлю сразу (задание живёт в vector_status='pending').
+            self._notify_vector_pending()
         summary_pending = summary_touched and summary_status == "pending"
         if summary_pending:
             self._notify_summary_pending()
@@ -754,6 +775,9 @@ class NoteService:
                 deleted = cursor.rowcount > 0
         if merged:
             self._notify_summary_pending()
+            # Сшивание переписало текст ранней заметки и вернуло её в очередь
+            # векторизации — будим и embedding-петлю.
+            self._notify_vector_pending()
         return {
             "older_id": older_id,
             "merged": merged,
@@ -858,6 +882,11 @@ class NoteService:
         """Сигнал воркеру: появилась заметка с pending summary (будить сразу)."""
         if self._summary_notifier is not None:
             self._summary_notifier()
+
+    def _notify_vector_pending(self) -> None:
+        """Сигнал воркеру: заметка вернулась в очередь векторизации (pending)."""
+        if self._vector_notifier is not None:
+            self._vector_notifier()
 
     @staticmethod
     def _not_found(note_id: int) -> dict[str, Any]:

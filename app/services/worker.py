@@ -13,7 +13,14 @@ pending-статусов в БД (переживают рестарт, дого�
   зависимостей (решение №10): судья опрашивается только по довекторизованной
   заметке. Тем же моментом будится джоба `links` (`notify_links_pending`,
   решение гейта 1c): уровень 1 связей считается сразу после довекторизации, а
-  не через интервал/back-off.
+  не через интервал/back-off. Форма самой embedding-джобы — «по интервалу +
+  событие `embedding`» (gate 2026-09-19): запись/правка заметки
+  (`memory_save`/`memory_update`), слияние дублей и догенерация названия
+  возвращают заметку в `vector_status='pending'` и будят петлю сигналом
+  `notify_embedding_pending` — свежая заметка векторизуется сразу, а не после
+  выросшего back-off (до 15 мин). Событие только ускоряет: задание живёт в
+  статусе заметки; при недоступных моделях (`EmbeddingError`) сигнала нет и
+  петля честно уходит в ожидание с back-off.
 - **summary-джоба** (`build_summary_job`): title-догенерация (миграция, title IS
   NULL) → summarize → merge (слияние дублей) → классификация → описание узла.
   notify будит эту петлю (save/update).
@@ -273,8 +280,11 @@ class BackgroundWorker:
         # раннего (ре-векторизация/ре-суммаризация своими очередями) и
         # soft delete позднего. Сервис собирается из тех же deps, что и
         # воркер (embedding — DI-фейк в юнит-тестах); save-пути здесь не
-        # используются, notifier не нужен — после слияния воркер будит
-        # свою же суммаризационную петлю (notify_summary_pending).
+        # используются, notifier суммаризации не нужен — после слияния воркер
+        # будит свою же суммаризационную петлю (notify_summary_pending).
+        # Вектор-нотификатор этому сервису подключается ниже, после создания
+        # событий: `merge_pair` возвращает раннюю заметку в очередь
+        # векторизации, и петлю будит её же сигнал (notify_embedding_pending).
         self._notes = NoteService(settings, embedding=embedding)
         # Причёска (Фаза 10, Шаг 4): классификатор default-заметок после
         # суммаризации; None — тестовый режим без классификации.
@@ -303,6 +313,13 @@ class BackgroundWorker:
             ),
         }
         self._stopping = False
+        # Сигнал «появилась заметка с pending-вектором» — будит embedding-петлю
+        # сразу после записи (save/update/merge/title-доген), минуя выросший
+        # back-off: свежая заметка кодируется немедленно, а не через 15 мин
+        # (gate 2026-09-19; прецедент summary-петли). Ставит его NoteService
+        # (DI-нотификатор из main.py) и сам воркер — на путях, где он пишет
+        # заметку (слияние, догенерация названия).
+        self._embedding_event = asyncio.Event()
         # Сигнал «появилась заметка с pending summary» — будит петлю
         # суммаризации немедленно (save/update), минуя выросший back-off.
         self._summary_event = asyncio.Event()
@@ -326,6 +343,11 @@ class BackgroundWorker:
         # модуле (`links.py`), но событие берёт у воркера (общий владелец
         # embedding-очереди; DI-нотификатор не нужен).
         self._links_event = asyncio.Event()
+        # Собственный сервис заметок воркера будит его же embedding-петлю на
+        # путях, где пишет заметку сам воркер (`merge_pair` возвращает раннюю
+        # заметку в очередь векторизации) — DI-нотификатор API-слоя здесь
+        # недоступен (сервис собирается раньше событий).
+        self._notes.set_vector_notifier(self.notify_embedding_pending)
         # Мемоизация создания таблицы job-очередей (пул 5): DDL исполняется
         # один раз на экземпляр воркера, а не при каждом обращении к очередям
         # (_create_job/_pending_jobs/_mark_job_done звали _ensure_job_table
@@ -368,6 +390,21 @@ class BackgroundWorker:
     def stop(self) -> None:
         """Мягкая остановка: петли завершатся после разборки текущей итерации."""
         self._stopping = True
+
+    def notify_embedding_pending(self) -> None:
+        """Разбудить embedding-петлю: заметка вернулась в очередь векторизации.
+
+        Вызывается из save/update/merge (NoteService, поток `asyncio.to_thread`)
+        и из самого воркера (слияние дублей, догенерация названия) —
+        `asyncio.Event.set()` потокобезопасен. Петля немедленно выходит из
+        ожидания и кодирует pending-заметки, не дожидаясь выросшего back-off
+        (до 15 мин). Событие только ускоряет: задание живёт в самом статусе
+        заметки (`vector_status='pending'`) и будет выбрано следующим прогоном.
+        Перепроверки очереди у этой джобы нет (см. `build_embedding_job`): при
+        недоступных моделях (`EmbeddingError`) непустая очередь не гоняет петлю
+        вхолостую — она честно уходит в ожидание по back-off.
+        """
+        self._embedding_event.set()
 
     def notify_summary_pending(self) -> None:
         """Разбудить петлю суммаризации: появилась заметка с pending summary.
@@ -1344,6 +1381,9 @@ class BackgroundWorker:
                     vectors.drop(conn, row["id"])
             if cursor.rowcount:
                 done += 1
+                # Заметка вернулась в очередь векторизации (название входит в
+                # полный вектор) — будим embedding-петлю сразу.
+                self.notify_embedding_pending()
                 logging.getLogger("app").info(
                     "title: generated for migration note",
                     extra={
@@ -2026,7 +2066,10 @@ class BackgroundWorker:
 #
 # Регистрация вместо копии цикла (FR-1.1): каждая джоба описывается `JobSpec`
 # и добавляется в реестр каркаса; цикл, back-off и супервизор итерации — общие
-# (`app/services/jobs.py`). Интервалы существующих петель — как были (FR-1.5):
+# (`app/services/jobs.py`). Формы: «по интервалу» (`expiration`), «по интервалу +
+# событие» (`embedding` — свежая pending-заметка, `nodes` — задание после
+# сшивания) и «по требованию» с перепроверкой очереди (summary, judge, areas,
+# links). Интервалы существующих петель — как были (FR-1.5):
 # PENDING_RETRY_SEC у очередей и фиксированные 300 с у зачистки (новых env эта
 # постановка не заводит). `queue_stat` — снимок своей очереди для
 # `/health.queues` (lsb-0014-03, FR-2.2): у `expiration` очереди нет (`None`).
@@ -2035,10 +2078,21 @@ class BackgroundWorker:
 def build_embedding_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
     """Джоба `embedding`: notes-очередь + чанковая очередь (одна джоба).
 
-    Форма «по интервалу»: сигнала `notify_*` у embedding-петли не было и
-    раньше. Пустой прогон — гигиена `worker_jobs` (`idle_hook`, пул 5) и пауза
-    PENDING_RETRY_SEC с back-off; перепроверка очереди не нужна (задание живёт
-    в статусе заметки и будет выбрано следующим прогоном).
+    Форма «по интервалу + событие `embedding`» (gate 2026-09-19): интервал
+    `PENDING_RETRY_SEC` с back-off остаётся страховкой, а сигнал
+    `notify_embedding_pending` (заметка записана/обновлена/слита — вернулась в
+    `vector_status='pending'`) будит петлю сразу: свежая заметка кодируется
+    немедленно, а не после выросшего back-off (до 15 мин). Пустой прогон —
+    гигиена `worker_jobs` (`idle_hook`, пул 5) и пауза PENDING_RETRY_SEC с
+    back-off.
+
+    Перепроверку очереди (`queue_empty`) НЕ задаём намеренно: очередь
+    векторизации — это и есть ожидание модели (`vector_status='pending'`),
+    поэтому непустая очередь означает «отложенное задание», а не прогресс
+    (arch §3.2) — с ней петля крутилась бы вхолостую в busy-loop при
+    недоступном кодировщике. Задание при этом не теряется: оно живёт в статусе
+    заметки и будет выбрано следующим прогоном, а события `queue_waiting`
+    уход в ожидание с непустой очередью видны в журнале (FR-2.3).
     """
     return JobSpec(
         name=EMBEDDING_JOB,
@@ -2048,7 +2102,7 @@ def build_embedding_job(worker: BackgroundWorker, settings: Settings) -> JobSpec
         enabled=True,
         process=worker._process_embedding,
         queue_empty=None,
-        wait_event=None,
+        wait_event=worker._embedding_event,
         idle_hook=worker._purge_done_jobs,
         queue_stat=worker._vector_queue_stat,
     )

@@ -66,9 +66,11 @@ def test_env(
 def client(test_env: dict[str, str]) -> Iterator[TestClient]:
     """Клиент к приложению, собранному из тестового окружения.
 
-    Notifier суммаризации отключён: REST-тесты проверяют контракты CRUD и
-    pending-счётчики детерминированно (воркер спит на back-off, а не
-    будится сразу при save).
+    Notifier'ы (суммаризации и векторизации) отключены: REST-тесты проверяют
+    контракты CRUD и pending-счётчики детерминированно (воркер спит на
+    back-off, а не будится сразу при save — иначе после save была бы видна
+    первая реальная попытка кодирования и `/health.embedding_ok` флейкал бы;
+    то же у `/health.summarizer_ok`).
 
     Перед стартом приложения снимаем сид skill-создателя (lsb-0007-04):
     свежая БД несёт pending-навык «Create skills», и петля areas воркера
@@ -83,6 +85,9 @@ def client(test_env: dict[str, str]) -> Iterator[TestClient]:
     clear_seeded_skills(settings)  # пустой реестр, маркер на месте
     with TestClient(create_app()) as test_client:
         test_client.app.state.services.notes.set_summary_notifier(None)
+        # Вектор-нотификатор — тем же способом: воркер не будится мгновенно
+        # при save и pending-состояния читаются детерминированно.
+        test_client.app.state.services.notes.set_vector_notifier(None)
         yield test_client
 
 

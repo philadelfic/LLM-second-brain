@@ -16,8 +16,10 @@
 Форма расписания читается из `JobSpec` и бывает трёх видов: «по интервалу»
 (`wait_event is None`), «по интервалу + событие» (`wait_event` без
 `queue_empty`: интервал остаётся страховкой, а событие будит петлю раньше —
-`nodes`) и «по требованию» (`wait_event` + `queue_empty`: после
-`clear()` очередь перепроверяется — пул 6, lost wakeup; так `links`).
+`embedding` (свежая pending-заметка, gate 2026-09-19) и `nodes` (задание после
+сшивания)) и «по требованию» (`wait_event` + `queue_empty`: после
+`clear()` очередь перепроверяется — пул 6, lost wakeup; так `summary`, `judge`,
+`areas`, `links`).
 
 Джоба без очереди и без события (периодический обход, `expiration`)
 обслуживается **фиксированным** интервалом: `backoff_state.fixed=True` —
@@ -222,7 +224,7 @@ async def run_loop(
     перепроверяется **после** `clear()` события (пул 6: работа до clear() видна
     селекту, после — будит событие), и петля ждёт `wait_for(event.wait(),
     timeout=interval)` — событие будит раньше (форма «по интервалу + событие» у
-    `links`/`nodes`), таймаут растит back-off; у формы без события —
+    `embedding`/`nodes`), таймаут растит back-off; у формы без события —
     `sleep(interval)`. Таймаут ожидания — `next_interval()`. `CancelledError`
     пробрасывается (graceful stop); прочее исключение не убивает петлю —
     warning с traceback, пауза, back-off.
