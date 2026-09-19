@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from app import __version__
 from app.config import get_settings
 from app.main import create_app
 from app.transport.auth import BearerAuthMiddleware
@@ -17,27 +18,49 @@ class TestHealth:
         assert response.status_code == 200
         assert response.json() == {
             "status": "ok",
+            "version": __version__,
             "embedding_ok": None,
             "summarizer_ok": None,
             "judge_ok": None,
             "notes_count": 0,
             "pending_vector": 0,
             "pending_summary": 0,
+            "queues": {
+                queue: {"pending": 0, "oldest_pending_sec": None}
+                for queue in ("vector", "summary", "judge", "areas", "links", "nodes")
+            },
         }
 
     def test_contract_fields(self, client: TestClient) -> None:
-        """Ровно 6 полей контракта NFR-4, в Фазе 1 — заготовки значений."""
+        """7 прежних полей NFR-4 + queues (FR-2.7) + version (FR-4.2)."""
         body = client.get("/health").json()
         assert set(body) == {
             "status",
+            "version",
             "embedding_ok",
             "summarizer_ok",
             "judge_ok",
             "notes_count",
             "pending_vector",
             "pending_summary",
+            "queues",
         }
         assert body["status"] == "ok"
+        # techdebt-0036 (FR-4.2): версия — из приложения, не из окружения.
+        assert body["version"] == __version__
+        assert body["version"].count(".") == 2
+        # Каждая наблюдаемая очередь отдаёт pending + возраст старейшего;
+        # expiration очереди не имеет и в объект не попадает.
+        assert set(body["queues"]) == {
+            "vector",
+            "summary",
+            "judge",
+            "areas",
+            "links",
+            "nodes",
+        }
+        for stat in body["queues"].values():
+            assert set(stat) == {"pending", "oldest_pending_sec"}
 
     def test_query_string_does_not_break_openness(self, client: TestClient) -> None:
         assert client.get("/health", params={"verbose": 1}).status_code == 200

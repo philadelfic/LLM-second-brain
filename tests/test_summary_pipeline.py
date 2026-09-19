@@ -89,6 +89,7 @@ def _make_client(
             # 3.0.0: область terms обязательна в контейнере (lsb-0008-02)
             # — фейков в ней нет, эмбеддер общий (запись его не зовёт).
             terms=TermsService(settings, embedding=embedding),
+            links=None,
         )
 
     monkeypatch.setattr("app.main.build_services", builder)

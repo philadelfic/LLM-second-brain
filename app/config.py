@@ -103,6 +103,12 @@ class Settings(BaseSettings):
     # --- поиск ---
     default_top_k: int = 5
     default_list_limit: int = 20
+    # Listing ceilings per surface (lsb-0013, release 3.1.0): the MCP surface
+    # keeps the model context tight (20 records), the REST surface for the
+    # operator is looser (50). The order default ≤ MCP ≤ REST is validated at
+    # startup (see _validate_ranges).
+    list_max_limit_mcp: int = 20
+    list_max_limit_rest: int = 50
     score_threshold: float = 0.50  # калибровка 2026-09-02: 0.35→0.50 (эксперимент на 82 реальных запросах, решение О.)
     dedup_similarity: float = 0.92
     # --- фоновый дедуп (Фаза 8, Этап 2.1): кандидат-предфильтр до сводки ---
@@ -114,6 +120,44 @@ class Settings(BaseSettings):
     judge_num_predict: int = 256  # бюджет вердикта (судье хватает)
     judge_timeout_sec: int = 30  # клиентский таймаут вызова судьи
     rrf_k: int = 60
+
+    # --- связи заметок, уровень 0 (lsb-0010, релиз 3.1.0) ---
+    # LINK_TOP — потолок связей на заметку (FR-1.1); LINK_LAZY_THRESHOLD —
+    # порог косинуса «ленивого графа» (дефолт равен SCORE_THRESHOLD);
+    # LINK_POOL — окно KNN-кандидатов связей (arch §3.1).
+    link_top: int = 3
+    link_lazy_threshold: float = 0.50
+    link_pool: int = 20
+
+    # --- связи заметок, уровень 1: таблица links, расчёт без LLM (lsb-0010-02) ---
+    # LINK_COSINE_THRESHOLD — порог вида `cosine` (выше поискового: связь
+    # должна быть сильнее «просто похоже», FR-2.3); LINK_ENTITIES_MIN_COMMON —
+    # сколько общих значимых слов делают пару связью; LINK_ENTITIES_MIN_WORD_CHARS
+    # — минимальная длина значимого слова (arch §3.3).
+    link_cosine_threshold: float = 0.70
+    link_entities_min_common: int = 2
+    link_entities_min_word_chars: int = 5
+
+    # --- фоновые джобы каркаса (lsb-0014, релиз 3.1.0): расписание из env ---
+    # Джоба расчёта связей `links` (lsb-0010-03, FR-2.2): очередь — служебный
+    # маркер notes.links_at; JOB_LINKS_INTERVAL_SEC — стартовая пауза ожидания
+    # (≥ 30 с), JOB_LINKS_BATCH — сколько заметок разбирается за прогон (≥ 1),
+    # JOB_LINKS_ENABLED — операторский выключатель (false — джоба не стартует,
+    # но её очередь остаётся видна в /health).
+    job_links_enabled: bool = True
+    job_links_interval_sec: int = 300
+    job_links_batch: int = 100
+
+    # Джоба «порядок в узлах» `nodes` (lsb-0011-01, FR-1.1/FR-1.2): обход
+    # накопленного `default` — интервал ≥ 30 с (дефолт 1 час), батч ≥ 1
+    # (общий бюджет обработок за прогон, дефолт 20), выключатель (false —
+    # джоба не стартует, но её очередь остаётся видна в /health).
+    job_nodes_enabled: bool = True
+    job_nodes_interval_sec: int = 3600
+    job_nodes_batch: int = 20
+    # Бюджет вызовов классификатора за прогон (lsb-0011-02, FR-2.3): ≥ 1 и не
+    # выше общего батча — экономия вызовов моделей (arch §3.2/§3.4, дефолт 10).
+    job_nodes_classifier_budget: int = 10
 
     # --- лимиты (NFR-6: env-переопределяемы, валидируются; см. _validate_ranges) ---
     max_note_chars: int = 35000  # 2000→20000 (Фаза 7) → 35000 (решение О. 2026-08-30)
@@ -211,9 +255,9 @@ class Settings(BaseSettings):
         """Диапазоны всех лимитов и полей, влияющих на поведение (NFR-6).
 
         Собираем ВСЕ нарушения сразу — оператор правит окружение за один
-        перезапуск, а не по ошибке на рестарт. Проверка жёстких потолков
-        контрактов NFR-6: top_k ≤ 20, limit ≤ 50 (сам потолок не env — это
-        фиксированный контракт инструментов, env задаёт только умолчания).
+        перезапуск, а не по ошибке на рестарт. The hard contract ceiling stays
+        with top_k ≤ 20; listing ceilings (lsb-0013) are env parameters of the
+        surfaces (MCP ≤ REST) — their order and the default are validated.
         """
         errors: list[str] = []
 
@@ -246,7 +290,23 @@ class Settings(BaseSettings):
         need_low("snippet_chars", self.snippet_chars, 1)
         need_low("max_get_batch", self.max_get_batch, 1)
         need_range("default_top_k", self.default_top_k, 1, 20)
-        need_range("default_list_limit", self.default_list_limit, 1, 50)
+        # Listing limits (lsb-0013): the ceiling is a surface parameter now, so
+        # positivity is checked per field and the order default ≤ MCP ≤ REST is
+        # a relational check right below.
+        need_low("default_list_limit", self.default_list_limit, 1)
+        need_low("list_max_limit_mcp", self.list_max_limit_mcp, 1)
+        need_low("list_max_limit_rest", self.list_max_limit_rest, 1)
+        if self.default_list_limit > self.list_max_limit_mcp:
+            errors.append(
+                "  - default_list_limit: default page size above the MCP "
+                "listing ceiling list_max_limit_mcp — the default page would "
+                "be rejected by the MCP listing"
+            )
+        if self.list_max_limit_mcp > self.list_max_limit_rest:
+            errors.append(
+                "  - list_max_limit_mcp: MCP listing ceiling above the REST one "
+                "list_max_limit_rest — MCP cannot be looser than REST"
+            )
 
         # --- пороги и слияние ---
         need_range("score_threshold", self.score_threshold, 0.0, 1.0)
@@ -265,6 +325,45 @@ class Settings(BaseSettings):
                 "нельзя будет признать дублем"
             )
         need_low("rrf_k", self.rrf_k, 1)
+
+        # --- связи заметок (lsb-0010): потолок и пул ≥ 1, порог 0..1 ---
+        need_low("link_top", self.link_top, 1)
+        need_low("link_pool", self.link_pool, 1)
+        need_range("link_lazy_threshold", self.link_lazy_threshold, 0.0, 1.0)
+        # Уровень 1 (lsb-0010-02): порог связи выше порога «ленивого графа»
+        # (FR-2.3, arch §3.1), иначе связь уровня 1 слабее своего фолбэка.
+        need_range("link_cosine_threshold", self.link_cosine_threshold, 0.0, 1.0)
+        need_low("link_entities_min_common", self.link_entities_min_common, 1)
+        need_low(
+            "link_entities_min_word_chars", self.link_entities_min_word_chars, 1
+        )
+        if self.link_lazy_threshold > self.link_cosine_threshold:
+            errors.append(
+                "  - link_lazy_threshold: порог ленивого уровня выше порога "
+                "связи link_cosine_threshold — связь уровня 1 оказалась бы "
+                "строже фолбэка уровня 0"
+            )
+
+        # --- фоновые джобы каркаса (lsb-0014): расписание из окружения ---
+        # Джоба `links` (lsb-0010-03): интервал ≥ 30 (дёшево, но не в цикле),
+        # батч ≥ 1 (нулевой батч не разобрал бы backfill никогда).
+        need_low("job_links_interval_sec", self.job_links_interval_sec, 30)
+        need_low("job_links_batch", self.job_links_batch, 1)
+        # Джоба `nodes` (lsb-0011-01): обход default — интервал ≥ 30,
+        # батч ≥ 1 (общий бюджет обработок за прогон).
+        need_low("job_nodes_interval_sec", self.job_nodes_interval_sec, 30)
+        need_low("job_nodes_batch", self.job_nodes_batch, 1)
+        # Бюджет классификатора (lsb-0011-02): ≥ 1 и не выше общего батча —
+        # иначе вызовов модели за прогон больше, чем обработок.
+        need_low(
+            "job_nodes_classifier_budget", self.job_nodes_classifier_budget, 1
+        )
+        if self.job_nodes_classifier_budget > self.job_nodes_batch:
+            errors.append(
+                "  - job_nodes_classifier_budget: бюджет классификатора выше "
+                "общего батча job_nodes_batch — за прогон столько заметок "
+                "не разберётся"
+            )
 
         # --- векторизация / суммаризация ---
         need_low("embedding_dim", self.embedding_dim, 1)

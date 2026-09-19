@@ -63,6 +63,22 @@ services:
       EMBEDDING_BATCH_SIZE: "32"             # chunks per worker /api/embed request
       EMBEDDING_CONCURRENT_REQUESTS: "1"     # server = one generation at a time; ollama_slot queue enforces this in code as well
       SCORE_THRESHOLD: "0.50"                # cosine cutoff for search (calibrated for qwen3-embedding:8b — recalibrate after switching)
+      # --- related notes, level 0 (lsb-0010): lazy graph over note vectors ---
+      LINK_TOP: "3"                          # related-notes ceiling per note (FR-1.1)
+      LINK_LAZY_THRESHOLD: "0.50"            # lazy-graph cosine cutoff (default = SCORE_THRESHOLD)
+      LINK_POOL: "20"                        # KNN candidate pool for related notes
+      LINK_COSINE_THRESHOLD: "0.70"           # level-1 cosine link cutoff (FR-2.3)
+      LINK_ENTITIES_MIN_COMMON: "2"           # shared significant words for an entities link
+      LINK_ENTITIES_MIN_WORD_CHARS: "5"       # minimal significant word length (entities rule)
+      # --- background jobs (lsb-0014): links recompute job (lsb-0010-03) ---
+      JOB_LINKS_ENABLED: "true"        # links recompute job on/off (its queue stays visible in /health)
+      JOB_LINKS_INTERVAL_SEC: "300"    # start pause between links runs in seconds (≥30)
+      JOB_LINKS_BATCH: "100"           # notes recomputed per links run (≥1)
+      # --- background jobs (lsb-0014): default sweep job (lsb-0011-01) ---
+      JOB_NODES_ENABLED: "true"        # default sweep job on/off (its queue stays visible in /health)
+      JOB_NODES_INTERVAL_SEC: "3600"   # start pause between nodes runs in seconds (≥30)
+      JOB_NODES_BATCH: "20"            # default notes processed per nodes run (≥1)
+      JOB_NODES_CLASSIFIER_BUDGET: "10"  # classifier calls per nodes run (≥1, ≤ JOB_NODES_BATCH)
       DEDUP_SIMILARITY: "0.92"               # "duplicate" cosine threshold in background dedup (Phase 8)
       DEDUP_CANDIDATE_TOP_N: "3"             # top-N cosine candidates for the dedup judge
       DEDUP_CANDIDATE_SIMILARITY: "0.80"     # lower paraphrase-candidate threshold (≤ DEDUP_SIMILARITY)
@@ -82,6 +98,8 @@ services:
       # --- search ---
       DEFAULT_TOP_K: "5"
       DEFAULT_LIST_LIMIT: "20"
+      LIST_MAX_LIMIT_MCP: "20"          # listing ceiling on the MCP surface (lsb-0013)
+      LIST_MAX_LIMIT_REST: "50"         # listing ceiling on the REST surface (lsb-0013)
       RRF_K: "60"
       MAX_QUERY_CHARS: "512"
       MAX_GET_BATCH: "20"

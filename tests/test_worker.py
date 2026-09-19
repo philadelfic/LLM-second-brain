@@ -1189,3 +1189,52 @@ async def test_judge_loop_rechecks_queue_before_sleep(slow) -> None:
         assert calls["n"] >= 3
     finally:
         asyncio.wait_for = orig_wait_for
+
+
+# --- каркас джоб (lsb-0014-02): поле job в событиях петель --------------------
+
+
+def test_jobs_purged_event_carries_job_embedding(settings, caplog) -> None:
+    """События embedding-джобы несут обязательное поле job (FR-1.4)."""
+    worker = make_worker(settings, HashEmbedder(8))
+    worker._ensure_job_table()
+    _seed_worker_job(settings, 1, "done", _jobs_ts(8))  # старая done → к удалению
+    with caplog.at_level(logging.INFO, logger="app"):
+        worker._purge_done_jobs()
+    purged = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "jobs_purged"
+    ]
+    assert [record.job for record in purged] == ["embedding"]
+
+
+def test_summary_failed_event_carries_job_summary(settings, caplog) -> None:
+    """События summary-джобы несут обязательное поле job (FR-1.4)."""
+    notes = NoteService(settings, FailingEmbedder())
+    notes.save("заметка при отказе суммаризатора в summary-джобе")
+    worker = make_worker(settings, FailingEmbedder(), FailingSummarizer())
+    with caplog.at_level(logging.WARNING, logger="app"):
+        assert worker.process_summary_pending() == 0
+    failed = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "summary_failed"
+    ]
+    assert [record.job for record in failed] == ["summary"]
+
+
+def test_fresh_worker_instance_picks_up_pending(settings) -> None:
+    """Рестарт: pending в БД подхватывает новый экземпляр воркера (FR-1.5).
+
+    Перевод на каркас ничего не держит в памяти процесса: задания живут в
+    статусах заметок и в `worker_jobs` — свежий воркер (как после рестарта
+    контейнера) обслуживает их с нуля, без общего состояния с прежним.
+    """
+    notes = NoteService(settings, FailingEmbedder())
+    notes.save("заметка, ждущая нового экземпляра воркера")
+    first = make_worker(settings, FailingEmbedder())  # отказ кодирования
+    assert first.process_pending() == 0  # задание осталось pending
+    second = make_worker(settings, HashEmbedder(8))  # новый процесс (рестарт)
+    assert second.process_pending() == 1  # подхвачено с нуля
+    assert second.process_judge_pending() == 1  # judge-работа из БД тоже

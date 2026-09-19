@@ -190,12 +190,18 @@ class TestToolsList:
 
     @pytest.mark.asyncio
     async def test_list_schema(self, server_url: str) -> None:
-        """Контракт FR-2: limit 1..50 (дефолт 20), offset ≥ 0."""
+        """Контракт FR-1/FR-2 (lsb-0013-02): limit 1..20 (дефолт 20), offset ≥ 0.
+
+        Верхнюю границу схема НЕ объявляет: её проверяет сервис — иначе
+        limit=50 давал бы schema-error вместо мягкого отказа с hint.
+        """
         async with connect(server_url) as session:
             tools = {t.name: t for t in (await session.list_tools()).tools}
         props = tools["memory_list"].input_schema["properties"]
         assert props["limit"]["default"] == 20  # DEFAULT_LIST_LIMIT
-        assert props["limit"]["maximum"] == 50
+        assert props["limit"]["minimum"] == 1
+        assert props["limit"]["description"] == "Page size (1..20)"
+        assert "maximum" not in props["limit"]
         assert props["offset"]["default"] == 0
         assert props["offset"]["minimum"] == 0
 
@@ -386,7 +392,8 @@ class TestMemoryFlow:
         assert note["text"] == text
         assert note["created_at"].endswith("Z") and note["updated_at"].endswith("Z")
         # Компактный контракт Фазы 9: get — белый список из пяти полей (+namespace Фаза 10).
-        assert set(note) == {"id", "text", "created_at", "updated_at", "namespace", "expires_at"}
+        assert set(note) == {"id", "text", "chars", "created_at", "updated_at", "namespace", "expires_at"}
+        assert note["chars"] == len(text)  # lsb-0010-04: объём полного текста
         assert note["namespace"] == "default"  # save без узла → default (§5.7)
         assert "title" not in note  # Фаза 11: get без названия (там полный текст)
 
@@ -470,8 +477,9 @@ class TestMemoryFlow:
             r for r in found["results"] if r["summary"].startswith(f"{self.marker}")
         )
         assert set(hit) == {
-            "id", "summary", "created_at", "updated_at", "namespace", "title",
+            "id", "summary", "chars", "created_at", "updated_at", "namespace", "title",
         }  # Фаза 11 (решение №9): +title (ключ резервируется — search.py вне пула 5)
+        assert hit["chars"] == len(text)  # lsb-0010-04: chars — полный текст
         assert hit["namespace"] == "default"
         assert "snippet" not in hit
         assert "cosine" not in hit
@@ -492,9 +500,9 @@ class TestMemoryFlow:
         assert listed["items"]  # среди первой страницы есть наша
         for item in listed["items"]:
             assert set(item) == {
-                "id", "summary", "created_at", "updated_at", "namespace", "title",
+                "id", "summary", "chars", "created_at", "updated_at", "namespace", "title",
                 "expires_at",  # lsb-0004-02
-            }  # Фаза 11 (решение №9): +title
+            }  # Фаза 11 (решение №9): +title; lsb-0010-04: +chars
             assert "summary_status" not in item
             assert "author" not in item
 
@@ -527,7 +535,7 @@ class TestMemoryFlow:
             r for r in found["results"] if r["summary"].startswith(f"{self.marker}")
         )
         assert set(hit) == {
-            "id", "summary", "created_at", "updated_at", "namespace", "title",
+            "id", "summary", "chars", "created_at", "updated_at", "namespace", "title",
         }
         assert "score" not in hit
 
@@ -567,7 +575,7 @@ class TestMemoryFlow:
         assert listed["total"] >= 1
         for item in listed["items"]:
             assert set(item) == {
-                "id", "summary", "created_at", "updated_at", "namespace", "title",
+                "id", "summary", "chars", "created_at", "updated_at", "namespace", "title",
                 "expires_at",  # lsb-0004-02
             }
 
@@ -652,13 +660,21 @@ class TestMemoryFlow:
 
     @pytest.mark.asyncio
     async def test_list_beyond_total_gives_page_hint(self, server_url: str) -> None:
-        """offset >= total: пустая страница + каноничный hint сервиса."""
+        """offset >= total: пустая страница + каноничный hint сервиса.
+
+        lsb-0013-02: поля страницы есть всегда, «+N more» к этому hint НЕ
+        добавляется (подсказка на выдачу — ровно одна).
+        """
         async with connect(server_url) as session:
             listed = (await session.call_tool(
                 "memory_list", {"limit": 1, "offset": 10**9}
             )).structured_content
-        assert set(listed) == {"items", "total", "hint"}
+        assert set(listed) == {
+            "items", "total", "has_more", "next_offset", "next_cursor", "hint"
+        }
         assert listed["items"] == []
+        assert listed["has_more"] is False
+        assert listed["next_offset"] is None and listed["next_cursor"] is None
         assert listed["hint"] == (
             "page beyond the memory: offset ≥ total; reduce offset"
         )
@@ -1088,6 +1104,7 @@ class TestNamespaceCreateAntiseonymy:
             promotion=None,
             user_facts=UserFactsService(settings, embedding=HashEmbedder(64)),
             terms=TermsService(settings, embedding=HashEmbedder(64)),
+            links=None,
         )
         return build_mcp(settings, services)
 
@@ -1118,6 +1135,7 @@ class TestNamespaceCreateAntiseonymy:
             promotion=None,
             user_facts=UserFactsService(settings, embedding=FailingEmbedder()),
             terms=TermsService(settings, embedding=FailingEmbedder()),
+            links=None,
         )
         return build_mcp(settings, services)
 

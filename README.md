@@ -31,9 +31,20 @@ records.
   API key.
 - **Hierarchical namespaces**: the store is split into large sections; the map
   is exposed to models via MCP instructions and `memory_namespaces`.
+- **Related notes** (since v3.1): reading a note also returns its `links` —
+  neighbours by meaning or by shared entities, from other namespaces; search,
+  list and read outputs carry `chars`, the size of the full note text.
+- **Listings that page** (since v3.1): `memory_list` and `skills_list` report
+  `total` / `has_more` / `next_offset` / `next_cursor` and a `+N more` hint when
+  a page is capped; the ceiling is tighter on the MCP surface than on REST.
 - **Background worker**: pending vectors, summaries, dedup, classification,
   title generation and the new knowledge areas are processed asynchronously;
-  failures never break CRUD (pending states + back-off retry).
+  scheduled maintenance jobs (related-notes recompute, default-namespace
+  tidy-up) run on their own intervals; failures never break CRUD (pending
+  states + back-off retry).
+- **Observability** (since v3.1): `/health` (no token) reports the running
+  application `version` and `queues` — how many jobs wait in each background
+  queue and how long the oldest has waited.
 - **Backups**: periodic online SQLite snapshots with rotation.
 
 ## Why

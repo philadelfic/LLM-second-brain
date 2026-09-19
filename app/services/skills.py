@@ -45,7 +45,8 @@ lsb-0007-03):
 - save (правка несуществующего id) → {id, updated: False, hint}
 - get    → {id, name, description, example?, steps, text, instruction_template,
             extra?} (example/extra — только когда заданы); не найден → {id, hint}
-- list   → {items: [{id, name, description}], total} (только активные; тел нет)
+- list   → {items: [{id, name, description}], total, has_more, next_offset,
+            next_cursor} (только активные; тел нет; lsb-0013 page fields)
 - search → {results: [{id, name, description, score}], warning?} (тел нет);
             пусто → {results: [], hint, warning?} с дословным hint канона §3.8
 - delete → {id, deleted: True} | {id, deleted: False, hint}
@@ -68,6 +69,7 @@ from typing import Any
 from app.config import Settings
 from app.services.areas import AreaSearch, AreaSearchValidationError, SKILLS_AREA
 from app.services.embedding import Embedder, EmbeddingService
+from app.services.listing import page_fields
 from app.services.search import MAX_TOP_K
 from app.storage.db import (
     INSTRUCTION_TEMPLATE_KEY,
@@ -92,10 +94,6 @@ EXTRA_FIELDS: tuple[str, ...] = (
 
 # Допустимые значения поля `mode` (§3.1): совместное / автономное исполнение.
 SKILL_MODES: tuple[str, ...] = ("collaborative", "autonomous")
-
-# Потолок листинга — фиксированный контракт инструмента (как у заметок):
-# env задаёт только умолчание, потолок не настраивается.
-MAX_LIST_LIMIT = 50
 
 # --- Hint'ы мягких отказов (канон §3.8: «дословные константы в коде») --------
 # Таблица лимитов канона; тексты — английские, модель читает их как подсказку.
@@ -383,17 +381,28 @@ class SkillsService:
             composite["extra"] = extra
         return composite
 
-    def list(self, limit: int | None = None, offset: int = 0) -> dict[str, Any]:
-        """Компактный листинг активных навыков: `{items, total}`, без тел.
+    def list(
+        self,
+        limit: int | None = None,
+        offset: int = 0,
+        max_limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Компактный листинг активных навыков: `{items, total, …}`, без тел.
 
         `items` — только `id`, `name`, `description` (§3.3); архив версий и
-        удалённые записи не видны. Пагинация — контракт REST-зеркала
-        (lsb-0007-05): потолок `MAX_LIST_LIMIT`, `offset ≥ 0`.
+        удалённые записи не видны. Pagination is the shared listing contract
+        (lsb-0013, arch §3.1–3.2): the ceiling is set by the surface
+        (`max_limit`; None → `list_max_limit_rest`, so existing callers keep
+        working), `offset ≥ 0`, and the page fields are computed by
+        `page_fields` — exactly as for notes, with the same limit error text.
         """
+        max_limit = (
+            self._settings.list_max_limit_rest if max_limit is None else max_limit
+        )
         limit = self._settings.default_list_limit if limit is None else limit
-        if not 1 <= limit <= MAX_LIST_LIMIT:
+        if not 1 <= limit <= max_limit:
             raise SkillValidationError(
-                f"limit: expected 1..{MAX_LIST_LIMIT}, got {limit}"
+                f"limit: expected 1..{max_limit}, got {limit}"
             )
         if offset < 0:
             raise SkillValidationError(f"offset: expected ≥ 0, got {offset}")
@@ -418,7 +427,7 @@ class SkillsService:
                 }
                 for row in rows
             ],
-            "total": total,
+            **page_fields(total, offset, len(rows)),
         }
 
     @property
@@ -436,7 +445,7 @@ class SkillsService:
 
         Отдельный метод, а не `list()`: анонсу нужен весь реестр (строки
         `id — name: description`), а листинг-контракт ограничен потолком
-        `MAX_LIST_LIMIT=50` (пагинация REST/MCP — lsb-0007-05). Порядок тот
+        поверхности (lsb-0013: 20 on MCP, 50 on REST). Порядок тот
         же, что у листинга: `updated_at DESC, id DESC`; архив версий и
         удалённые записи не видны. Тела навыков не читаются — только
         компактные поля.

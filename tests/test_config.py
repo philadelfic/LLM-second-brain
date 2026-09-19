@@ -55,7 +55,27 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "DB_PATH": ("db_path", "/data/notes.db"),
     "DEFAULT_TOP_K": ("default_top_k", 5),
     "DEFAULT_LIST_LIMIT": ("default_list_limit", 20),
+    # lsb-0013 (3.1.0): listing ceilings per surface.
+    "LIST_MAX_LIMIT_MCP": ("list_max_limit_mcp", 20),
+    "LIST_MAX_LIMIT_REST": ("list_max_limit_rest", 50),
     "SCORE_THRESHOLD": ("score_threshold", 0.50),
+    # lsb-0010 (3.1.0): связи заметок, уровень 0 («ленивый граф»).
+    "LINK_TOP": ("link_top", 3),
+    "LINK_LAZY_THRESHOLD": ("link_lazy_threshold", 0.50),
+    "LINK_POOL": ("link_pool", 20),
+    # lsb-0010 (3.1.0, постановка 7): связи уровня 1 — пороги расчёта.
+    "LINK_COSINE_THRESHOLD": ("link_cosine_threshold", 0.70),
+    "LINK_ENTITIES_MIN_COMMON": ("link_entities_min_common", 2),
+    "LINK_ENTITIES_MIN_WORD_CHARS": ("link_entities_min_word_chars", 5),
+    # lsb-0010-03 (3.1.0): джоба расчёта связей на каркасе lsb-0014 (FR-1.2).
+    "JOB_LINKS_ENABLED": ("job_links_enabled", True),
+    "JOB_LINKS_INTERVAL_SEC": ("job_links_interval_sec", 300),
+    "JOB_LINKS_BATCH": ("job_links_batch", 100),
+    # lsb-0011-01/02 (3.1.0): джоба «порядок в узлах» — обход default (FR-1.1/FR-1.2).
+    "JOB_NODES_ENABLED": ("job_nodes_enabled", True),
+    "JOB_NODES_INTERVAL_SEC": ("job_nodes_interval_sec", 3600),
+    "JOB_NODES_BATCH": ("job_nodes_batch", 20),
+    "JOB_NODES_CLASSIFIER_BUDGET": ("job_nodes_classifier_budget", 10),
     "DEDUP_SIMILARITY": ("dedup_similarity", 0.92),
     # Фаза 8 (Этап 2.1): фоновый дедуп — косинус-кандидаты.
     "DEDUP_CANDIDATE_TOP_N": ("dedup_candidate_top_n", 3),
@@ -134,11 +154,12 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 78 полей: 6 обязательных + 72 с умолчаниями
-        (25 §8 + 6 чанковых Фазы 7 + 2 фонового дедупа + 3 судьи Фазы 8
-        + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера + 3 ключа
-        + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21 субстрата
-        областей релиза 3.0.0: лимиты/пороги skills/terms/user)."""
+        """В Settings — ровно 87 полей: 6 обязательных + 81 с умолчаниями
+        (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
+        + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
+        + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
+        субстрата областей релиза 3.0.0: лимиты/пороги skills/terms/user;
+        + 3 джобы расчёта связей lsb-0010-03 + 3 джобы обхода default lsb-0011-01)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

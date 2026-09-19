@@ -60,9 +60,19 @@ curl -s http://localhost:8080/health | python -m json.tool
 ```
 
 ```json
-{"status":"ok","embedding_ok":null,"summarizer_ok":null,
- "notes_count":0,"pending_vector":0,"pending_summary":0}
+{"status":"ok","version":"<app version>","embedding_ok":null,"summarizer_ok":null,"judge_ok":null,
+ "notes_count":0,"pending_vector":0,"pending_summary":0,
+ "queues":{"vector":{"pending":0,"oldest_pending_sec":null},
+           "summary":{"pending":0,"oldest_pending_sec":null},
+           "judge":{"pending":0,"oldest_pending_sec":null},
+           "areas":{"pending":0,"oldest_pending_sec":null},
+           "links":{"pending":0,"oldest_pending_sec":null},
+           "nodes":{"pending":0,"oldest_pending_sec":null}}}
 ```
+
+`version` is the running application version (compared with the release tag at
+acceptance). `queues` gives one entry per background queue — `pending` jobs and
+`oldest_pending_sec`, the age of the oldest (`null` when the queue is idle).
 
 `embedding_ok` / `summarizer_ok` / `judge_ok` reflect the outcome of the last
 real attempt (`null` — none yet). On startup the service runs a lightweight
@@ -81,7 +91,9 @@ Requires Open WebUI **v0.6.31+** (native MCP Streamable HTTP support).
    - **Type**: `MCP Streamable HTTP`;
    - **URL**: `http://<host>:8080/mcp` (the `MCP_PATH`, default `/mcp`);
    - **Auth**: `Bearer`; **token** — your `MCP_AUTH_TOKEN`.
-3. Save. The 7 `memory_*` tools appear and are available to all models.
+3. Save. All 21 MCP tools appear and are available to all models: 8
+   `memory_*`, 5 `skills_*`, 5 `user_*` and 3 `terms_*` (the surface is
+   described in the [README](../README.md)).
 4. Test in a chat: "find in memory …" → the model calls `memory_search`.
 
 Other MCP clients connect the same way: URL `http://<host>:8080/mcp`, header
@@ -97,8 +109,8 @@ curl -s http://localhost:8080/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
 ```
 
-`tools/list` returns exactly the 7 `memory_*` tools; without or with a wrong
-token — `401`.
+`tools/list` returns all 21 tools (the same surface as the
+[README](../README.md)); without a token or with a wrong one — `401`.
 
 ## Upgrading
 

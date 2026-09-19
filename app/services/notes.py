@@ -29,8 +29,10 @@ MCP-слой срезает служебные поля — см. Фаза 9):
 - get    → {notes: [...]} (массив даже для одного id; отсутствующие/удалённые
            id пропускаются; пустой результат — мягкий ответ с hint; каждая
            заметка несёт title, Фаза 11 — MCP memory_get его срезает)
-- list   → {items: [...], total} (без полных текстов; каждый item несёт
-           title, Фаза 11) (+hint, если пусто)
+           lsb-0010-04: +chars — объём полного текста в символах (FR-4.1/FR-4.2)
+- list   → {items: [...], total, has_more, next_offset, next_cursor} (без
+           полных текстов; каждый item несёт title, Фаза 11, и chars —
+           lsb-0010-04) (+hint, если пусто) — lsb-0013 page fields
 - update → {id, updated: True, summary_pending: True} | мягкий ответ updated: False
 - delete → {id, deleted: True} | мягкий ответ deleted: False (soft delete)
 
@@ -73,15 +75,17 @@ from app.config import TITLE_MAX_WORDS, Settings
 from app.services.dedup import DeduplicationService, duplicate_response
 from app.services.embedding import Embedder, EmbeddingService
 from app.services.emit import summary_of
+from app.services.jobs import queue_snapshot
+from app.services.listing import page_fields
 from app.services.namespaces import NamespaceService
 from app.services.splitter import split_text
 from app.storage import chunks, expirations, vectors
 from app.storage.db import session, transaction
 
-# Фиксированные верхние границы контрактов (REQUIREMENTS §5.1/NFR-6; env —
-# только для умолчаний: DEFAULT_LIST_LIMIT), поэтому не настраиваются.
-MAX_LIST_LIMIT = 50
-MAX_READ_CHUNKS = 3  # lsb-0003: максимум чанков за один memory_get (решение О. 2026-09-08)
+# Maximum number of chunks per one memory_get call (lsb-0003, decision of O.,
+# 2026-09-08). Listing ceilings (lsb-0013) are env parameters of the surfaces
+# (list_max_limit_mcp / list_max_limit_rest), not module constants.
+MAX_READ_CHUNKS = 3
 
 # Название заметки (Фаза 11, решение №9): клиент-модель называет заметку при
 # записи; отсутствие/невалидность — отказ записи с этим hint (§5.3).
@@ -415,16 +419,27 @@ class NoteService:
         offset: int = 0,
         namespace: str | None = None,
         namespace_exact: bool = False,
+        max_limit: int | None = None,
     ) -> dict[str, Any]:
         """Обзор памяти: краткие содержания по свежести + total (FR-2).
 
         Фаза 10: namespace — фильтр узла/поддерева (None — глобально, как
         раньше); каждый item несёт свой namespace.
+
+        lsb-0013: `max_limit` is the listing ceiling of the calling surface
+        (None → `list_max_limit_rest`, so existing callers keep working; the
+        MCP surface passes `list_max_limit_mcp`), and the limit error text is
+        the single one shared by all listings. Page fields come from the shared
+        `page_fields` helper and are present in every branch of the answer;
+        ordering, filters and `total` are unchanged.
         """
+        max_limit = (
+            self._settings.list_max_limit_rest if max_limit is None else max_limit
+        )
         limit = self._settings.default_list_limit if limit is None else limit
-        if not 1 <= limit <= MAX_LIST_LIMIT:
+        if not 1 <= limit <= max_limit:
             raise NoteValidationError(
-                f"limit: expected 1..{MAX_LIST_LIMIT}, got {limit}"
+                f"limit: expected 1..{max_limit}, got {limit}"
             )
         if offset < 0:
             raise NoteValidationError(f"offset: expected ≥ 0, got {offset}")
@@ -454,6 +469,10 @@ class NoteService:
                 "id": row["id"],
                 "title": row["title"],  # Фаза 11 (решение №9): может быть None (миграция)
                 "summary": summary_of(row, self._settings),
+                # lsb-0010-04 (FR-4.1…FR-4.3): объём ПОЛНОГО текста в символах —
+                # модель решает, хватит ли memory_get или нужен чанк. Текст уже
+                # выбран для summary-fallback — новых чтений из БД нет.
+                "chars": len(row["text"]),
                 "summary_status": row["summary_status"],
                 "author": row["author"],
                 "created_at": row["created_at"],
@@ -463,15 +482,16 @@ class NoteService:
             }
             for row in rows
         ]
+        fields = page_fields(total, offset, len(items))
         if not items and offset == 0:
-            return {"items": [], "total": total, "hint": "memory is empty"}
+            return {"items": [], **fields, "hint": "memory is empty"}
         if not items:
             return {
                 "items": [],
-                "total": total,
+                **fields,
                 "hint": "page beyond the memory: offset ≥ total; reduce offset",
             }
-        return {"items": items, "total": total}
+        return {"items": items, **fields}
 
     # --- FR-5 memory_update (перезапись целиком; векторизация — фон) -------
 
@@ -513,10 +533,15 @@ class NoteService:
 
         Если text НЕ передан (правка только title/summary/namespace):
         vector_status НЕ трогаем, вектор НЕ дропаем, чанки НЕ пересчитываем,
-        разметку причёски НЕ сбрасываем — меняются только запрошенные поля.
+        разметку причёски НЕ сбрасываем — меняются только запрошенные поля
+        (плюс сброс маркера связей при правке title — lsb-0010-02 ниже).
         Если text передан — полный штатный набор сбросов как раньше:
         vector_status='pending', замена чанков, дроп протухшего вектора,
         сброс разметки причёски (v2.1.1, аудит 2026-09-05).
+
+        lsb-0010-02: маркер связей `links_at` сбрасывается при правке `text`
+        ИЛИ `title` (название меняет и вектор, и правила entities/mention) —
+        заметка снова попадает в очередь расчёта связей.
 
         Обратная совместимость: вызов update(note_id, text) без
         title/summary/namespace работает как раньше — текст заменяется,
@@ -574,6 +599,16 @@ class NoteService:
         # Динамический UPDATE: трогаем только запрошенные поля.
         sets: list[str] = []
         params: list[object] = []
+        # lsb-0010-02: правка text или title возвращает заметку в очередь
+        # расчёта связей (маркер links_at). Название меняет и вектор, и правила
+        # entities/mention, поэтому сбрасывается и при правке одного title
+        # (разметка причёски — как раньше, только при text).
+        # lsb-0011-01: там же сбрасывается маркер обхода default
+        # (`node_order_at`) — заметка, разобранная джобой `nodes`, снова
+        # становится кандидатом обхода при изменении текста/названия.
+        if text_changed or note_title is not None:
+            sets.append("links_at = NULL")
+            sets.append("node_order_at = NULL")
         if text_changed:
             sets.append("text = ?")
             params.append(text)
@@ -673,8 +708,11 @@ class NoteService:
         обе операции, либо ни одной (rollback), полусостояние исключено.
 
         Штатный набор update-сбросов (как в update без title): текст, замена
-        чанков, vector_status='pending', сброс summary и разметки причёски,
-        updated_at; **title не трогается** (решение №9), namespace сохраняется
+        чанков, vector_status='pending', сброс summary, разметки причёски,
+        маркера связей links_at и маркера обхода default node_order_at
+        (lsb-0011-01: сшивание делает заметку кандидатом обхода заново);
+        updated_at; **title не трогается** (решение
+        №9), namespace сохраняется
         (ранняя остаётся в своём узле). Guard `deleted_at IS NULL` на обеих
         заметках: операторский soft delete не перебивается.
 
@@ -694,6 +732,8 @@ class NoteService:
                 "vector_status = 'pending', "
                 "summary = '', summary_status = 'pending', "
                 "classified_at = NULL, hint_path = NULL, confidence = NULL, "
+                "links_at = NULL, "
+                "node_order_at = NULL, "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
                 "WHERE id = ? AND deleted_at IS NULL",
                 (merged_text, older_id),
@@ -743,6 +783,39 @@ class NoteService:
             "pending_vector": row["pending_vector"],
             "pending_summary": row["pending_summary"],
         }
+
+    def vector_queue_stat(self) -> dict[str, int | None]:
+        """Снимок очереди векторизации заметок для `/health.queues` (FR-2.2).
+
+        Тот же предикат, что у легаси-счётчика `pending_vector` (числа обязаны
+        совпадать): pending-статус активных заметок, trash не считается.
+        """
+        return self._pending_queue_stat("vector_status")
+
+    def summary_queue_stat(self) -> dict[str, int | None]:
+        """Снимок очереди суммаризации заметок для `/health.queues` (FR-2.2).
+
+        Тот же предикат, что у легаси-счётчика `pending_summary`.
+        """
+        return self._pending_queue_stat("summary_status")
+
+    def _pending_queue_stat(self, status_column: str) -> dict[str, int | None]:
+        """Агрегат очереди заметок: число pending и возраст старейшего (сек).
+
+        `status_column` — только внутренние константы ('vector_status' /
+        'summary_status'), не пользовательский ввод. Возраст считается в SQL
+        по часам БД (`now - updated_at`) — при недоступных моделях pending не
+        убывает, а возраст растёт (FR-2.2/FR-2.4).
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS pending, "
+                "MAX(CAST(strftime('%s','now') AS INTEGER) - "
+                "CAST(strftime('%s', updated_at) AS INTEGER)) "
+                "AS oldest_pending_sec FROM notes "
+                f"WHERE deleted_at IS NULL AND {status_column} = 'pending'"
+            ).fetchone()
+        return queue_snapshot(row["pending"], row["oldest_pending_sec"])
 
     # --- внутренне ---------------------------------------------------------
 
@@ -839,11 +912,16 @@ class NoteService:
         Фаза 10: +namespace (слой ориентирования: модель видит, где лежит).
         Фаза 11 (решение №9): +title (REST-выдача оператору; MCP memory_get
         срезает белым списком — экономия контекста, там полный текст).
-        lsb-0004-02: +expires_at (абсолютный ISO-8601 UTC или None — постоянная)."""
+        lsb-0004-02: +expires_at (абсолютный ISO-8601 UTC или None — постоянная).
+        lsb-0010-04 (FR-4.2): +chars — объём ПОЛНОГО текста в символах (не
+        байты/токены); в режиме без чанков совпадает со значением в
+        memory_search/memory_list. В chunk-режиме верхнеуровневый `chars`
+        ответа — по-прежнему сумма отданных чанков (контракт lsb-0003)."""
         return {
             "id": row["id"],
             "title": row["title"],
             "text": row["text"],
+            "chars": len(row["text"]),  # lsb-0010-04: объём полного текста
             "summary": summary_of(row, self._settings),
             "summary_status": row["summary_status"],
             "author": row["author"],

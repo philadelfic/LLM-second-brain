@@ -4,7 +4,7 @@
 (Фаза 11, решение №10; релиз 3.0.0 — петля областей) — состояния
 pending-статусов в БД (переживают рестарт, догоняются при старте сервиса):
 
-- **embedding-петля** (`_run_embedding`): вектора заметок (`pending_vector` →
+- **embedding-джоба** (`build_embedding_job`): вектора заметок (`pending_vector` →
   batch `embed_texts` → notes_vec, vector_status='ok'; полный вектор — по
   конкатенации title+text, `_embed_input`, lsb-0001 FR-1.1) + чанковая очередь
   (Фаза 7, анти-джоин «нет строки в notes_chunks_vec»). Объединены в одну
@@ -12,13 +12,13 @@ pending-статусов в БД (переживают рестарт, дого�
   вектора каждой заметки создаётся judge-работа (дедуп) — диспетчер
   зависимостей (решение №10): судья опрашивается только по довекторизованной
   заметке.
-- **summary-петля** (`_run_summary`): title-догенерация (миграция, title IS
+- **summary-джоба** (`build_summary_job`): title-догенерация (миграция, title IS
   NULL) → summarize → merge (слияние дублей) → классификация → описание узла.
   notify будит эту петлю (save/update).
-- **judge-петля** (`_run_judge`): судья дедупа (по judge-работам, созданным
+- **judge-джоба** (`build_judge_job`): судья дедупа (по judge-работам, созданным
   embedding-петлёй) + судья структуры (внутри PromotionService, триггер после
   классификации).
-- **петля areas** (`_run_areas`, субстрат 3.0.0): вектора записей областей
+- **джоба areas** (`build_areas_job`, субстрат 3.0.0): вектора записей областей
   skills/terms/user (`vector_status='pending'` → батч `embed_texts` → vec0
   области, 'ok'). Без LLM в момент записи (архитектура субстрата §3.3):
   тексты областей — `AreaSpec.embed_text` (skills `name + description`,
@@ -26,6 +26,24 @@ pending-статусов в БД (переживают рестарт, дого�
   `area_embed_failed`, записи остаются pending, повтор по своему back-off.
   Смена модели/размерности дропает area-vec вместе с notes_vec
   (`db._sync_embedding_meta`) — все записи областей возвращаются в pending.
+
+Петли описаны `JobSpec`-ами и обслуживаются каркасом джоб (lsb-0014-02,
+`app/services/jobs.py`): тела цикла, back-off и супервизор итерации — общие,
+воркер держит работу (`process_*`), перепроверку очереди, сигналы и гигиену.
+Сборщики своих джоб — `build_*_job` в конце модуля (регистрация — строка в
+реестре каркаса). События работ несут обязательное поле `job` (FR-1.4).
+Снимки очередей для `/health.queues` собирает `queues_health` по реестру:
+каждая джоба описывает свою очередь сама (`queue_stat`), `/health` при
+добавлении джобы не правится (lsb-0014-03, FR-2.2).
+
+Джоба `nodes` (lsb-0011) разбирает накопленный `default` и реклассифицирует
+объединённые заметки: (1) промоция, (2) задания `reclass` после сшивания
+(lsb-0012 — приоритетный источник), (3) быстрый пул обхода — переезд по
+готовой разметке (`hint_path` + `confidence`) без вызова моделей,
+(4) классификаторный пул обхода — вызов классификатора в жёстком бюджете
+(`JOB_NODES_CLASSIFIER_BUDGET`) по `title` + готовой суммари. Механика переезда
+одна на все источники и на причёску после суммаризации (`_apply_node_order`).
+Маркер `node_order_at` — анти-зацикливание (ставится при любом исходе разбора).
 
 Job-очереди в БД по слотам (`worker_jobs`): judge-работа (kind='dedup')
 создаётся ТОЛЬКО после готовности вектора заметки; merge-работа (kind='merge')
@@ -52,8 +70,8 @@ Garanties:
 - `process_*` синхронные (выполняются в `asyncio.to_thread` — event loop не
   занимаем); чанковая очередь Фазы 7 — своя async-обработка: кодирование
   подъёмок размножается Semaphore'ом прямо в петле, транзакции записи —
-  короткие в to_thread. `run` — asyncio-таска (все петли под gather),
-  старт/стоп — в lifespan.
+  короткие в to_thread. `run` — asyncio-таска (все джобы реестра под
+  каркасным `run_loop`), старт/стоп — в lifespan.
 
 Запись суммари защищена от гонки с memory_update: между вычиткой текста и
 записью воркер мог получить обновлённый текст — UPDATE ограничен условием
@@ -94,10 +112,24 @@ import json
 import logging
 
 from app.config import TITLE_MAX_WORDS, Settings
+from app.services import jobs
 from app.services.areas import AreaSpec, ALL_AREAS
-from app.services.classifier import ClassificationError, Classifier
+from app.services.classifier import Classification, ClassificationError, Classifier
 from app.services.dedup import DeduplicationService
 from app.services.embedding import Embedder, EmbeddingError
+# Back-off и его потолок перенесены в каркас джоб (lsb-0014, arch §3.3):
+# каркас владеет контрактом надёжности, петли воркера переиспользуют имена.
+# `MAX_INTERVAL_SEC as MAX_INTERVAL_SEC` — явный ре-экспорт: на него по-прежнему
+# ссылаются существующие тесты (tests/test_worker.py).
+from app.services.jobs import MAX_INTERVAL_SEC as MAX_INTERVAL_SEC
+from app.services.jobs import (
+    BackoffState,
+    JobSpec,
+    build_job_specs,
+    next_interval,
+    queue_snapshot,
+    run_loop,
+)
 from app.services.judge import Judge, JudgeError
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
@@ -111,22 +143,85 @@ from app.storage.db import delete_note_physical, session, transaction
 # embedding-петли (_purge_done_jobs), очередь не растёт безгранично.
 WORKER_JOBS_RETENTION_DAYS = 7
 
-# Потолок back-off (REQUIREMENTS §5.3 «max 15 мин»), env не настраивается.
-MAX_INTERVAL_SEC = 15 * 60
-
 # Интервал джобы зачистки просроченных заметок (lsb-0004-02, этап 4):
 # фиксированные 5 минут (решение О. 2026-09-09), без настройки в компоузе.
+# Джоба без очереди и без события: её состояние back-off помечено
+# `fixed=True` — каркас держит паузу 300 с, back-off не растёт (поведение
+# дословно как было, FR-1.5).
 EXPIRATION_CLEANUP_INTERVAL_SEC = 5 * 60
+
+# Имена джоб воркера (каркас lsb-0014): `JobSpec.name`, ключ состояния back-off
+# и обязательное поле `job` в журнале — одна строка на джобу.
+EMBEDDING_JOB = "embedding"
+SUMMARY_JOB = "summary"
+JUDGE_JOB = "judge"
+AREAS_JOB = "areas"
+EXPIRATION_JOB = "expiration"
+# Джоба «порядок в узлах» (lsb-0011-01): обход накопленного `default`.
+NODES_JOB = "nodes"
+
+# Имя работы слота `nodes` после сшивания (lsb-0012, arch §3.5): объединённая
+# заметка может лежать в ЛЮБОМ узле — обход `default` её не найдёт, поэтому
+# реклассификация ставится заданием.
+NODES_RECLASS_KIND = "reclass"
+
+# Единое правило выборки быстрого пула обхода `default` (lsb-0011-01, arch §3.2):
+# активные default-заметки с готовой разметкой (`hint_path` + `confidence` не
+# ниже порога авто-переезда), ещё не разобранные (`node_order_at IS NULL`),
+# свежие первыми — переезд без вызова модели.
+_NODES_SWEEP_SELECT = (
+    "SELECT id, hint_path, confidence FROM notes "
+    "WHERE namespace = 'default' AND deleted_at IS NULL "
+    "AND node_order_at IS NULL AND hint_path IS NOT NULL AND confidence >= ? "
+    "ORDER BY updated_at DESC, id DESC LIMIT ?"
+)
+
+# Классификаторный пул обхода `default` (lsb-0011-02, arch §3.2): активные
+# default-заметки БЕЗ разметки (`classified_at IS NULL`), но с готовой непустой
+# суммари, ещё не разобранные, свежие первыми — вызов классификатора по
+# `title` + `summary` (arch §3.4). Неготовая суммари в пул не попадает: заметка
+# ждёт, маркер не ставится (FR-2.4). Число вызовов ограничивает бюджет
+# `JOB_NODES_CLASSIFIER_BUDGET`.
+_NODES_CLASSIFY_SELECT = (
+    "SELECT id, title, summary FROM notes "
+    "WHERE namespace = 'default' AND deleted_at IS NULL "
+    "AND node_order_at IS NULL AND classified_at IS NULL "
+    "AND summary_status = 'ok' AND summary IS NOT NULL AND summary <> '' "
+    "ORDER BY updated_at DESC, id DESC LIMIT ?"
+)
+
+# Снимок очереди `nodes` для `/health.queues` (FR-2.2): pending-задания
+# `reclass` после сшивания (lsb-0012) + кандидаты обоих пулов обхода (быстрый
+# и классификаторный); возраст старейшего — старейший из двух источников
+# (задания — `created_at`, обход — `updated_at`), `null` — очередь пуста.
+_NODES_QUEUE_STAT_SQL = (
+    "SELECT "
+    "(SELECT COUNT(*) FROM worker_jobs WHERE slot = 'nodes' "
+    " AND kind = 'reclass' AND status = 'pending') "
+    "+ (SELECT COUNT(*) FROM notes WHERE namespace = 'default' "
+    " AND deleted_at IS NULL AND node_order_at IS NULL "
+    " AND hint_path IS NOT NULL AND confidence >= ?) "
+    "+ (SELECT COUNT(*) FROM notes WHERE namespace = 'default' "
+    " AND deleted_at IS NULL AND node_order_at IS NULL "
+    " AND classified_at IS NULL AND summary_status = 'ok' "
+    " AND summary IS NOT NULL AND summary <> '') AS pending, "
+    "MAX("
+    "COALESCE((SELECT MAX(CAST(strftime('%s','now') AS INTEGER) - "
+    " CAST(strftime('%s', created_at) AS INTEGER)) FROM worker_jobs "
+    " WHERE slot = 'nodes' AND kind = 'reclass' AND status = 'pending'), 0), "
+    "COALESCE((SELECT MAX(CAST(strftime('%s','now') AS INTEGER) - "
+    " CAST(strftime('%s', updated_at) AS INTEGER)) FROM notes "
+    " WHERE namespace = 'default' AND deleted_at IS NULL "
+    " AND node_order_at IS NULL AND ((hint_path IS NOT NULL AND confidence >= ?) "
+    " OR (classified_at IS NULL AND summary_status = 'ok' "
+    " AND summary IS NOT NULL AND summary <> ''))), 0)"
+    ") AS oldest_pending_sec"
+)
 
 # Промпт догенерации названия (решение №9): ЗАШИТ в SummaryService.title
 # (follow-up 6b — протокол Summarizer получил метод title; здесь раньше был
 # мёртвый дубль константы, генерация шла с промптом суммаризации).
 # Думающий вызов слота summary, обрезка до TITLE_MAX_WORDS — механика воркера.
-
-
-def next_interval(current: float, start: int) -> float:
-    """Шаг back-off: интервал удваивается, потолок — 15 минут (§3.4)."""
-    return min(max(current * 2.0, float(start)), float(MAX_INTERVAL_SEC))
 
 
 def _embed_input(title: str | None, text: str) -> str:
@@ -141,7 +236,13 @@ def _embed_input(title: str | None, text: str) -> str:
 
 
 class BackgroundWorker:
-    """Единственный фоновый воркер; очереди — pending-статусы в БД + worker_jobs."""
+    """Единственный фоновый воркер; очереди — pending-статусы в БД + worker_jobs.
+
+    Цикл, back-off и супервизор итерации — каркасные (app/services/jobs.py,
+    lsb-0014-02): воркер описывает свои джобы `JobSpec`-ами (сборщики
+    `build_*_job` в конце модуля) и регистрирует их в реестре. События работ
+    несут обязательное поле `job` (имя джобы, которой принадлежит работа).
+    """
 
     def __init__(
         self,
@@ -183,10 +284,22 @@ class BackgroundWorker:
         # после классификации; None — тестовый режим без триггера (в проде
         # DI из build_services: describer + судья структуры).
         self._promoter = promoter
-        self._vector_interval = float(max(settings.pending_retry_sec, 0))
-        self._summary_interval = float(max(settings.pending_retry_sec, 0))
-        self._judge_interval = float(max(settings.pending_retry_sec, 0))
-        self._areas_interval = float(max(settings.pending_retry_sec, 0))
+        # Состояние back-off по джобам (каркас lsb-0014): один объект на джобу,
+        # живёт в воркере — интервал переживает итерации цикла и виден в
+        # диагностике (свойства interval/summary_interval/judge_interval/
+        # areas_interval). Стартовые интервалы — как были: PENDING_RETRY_SEC у
+        # очередей, фиксированные 300 с у зачистки просроченных заметок.
+        # Зачистка — единственная джоба с ФИКСИРОВАННЫМ расписанием
+        # (`fixed=True`): пауза всегда 300 с, back-off не растёт (FR-1.5).
+        self._backoff: dict[str, BackoffState] = {
+            EMBEDDING_JOB: BackoffState(settings.pending_retry_sec),
+            SUMMARY_JOB: BackoffState(settings.pending_retry_sec),
+            JUDGE_JOB: BackoffState(settings.pending_retry_sec),
+            AREAS_JOB: BackoffState(settings.pending_retry_sec),
+            EXPIRATION_JOB: BackoffState(
+                EXPIRATION_CLEANUP_INTERVAL_SEC, fixed=True
+            ),
+        }
         self._stopping = False
         # Сигнал «появилась заметка с pending summary» — будит петлю
         # суммаризации немедленно (save/update), минуя выросший back-off.
@@ -199,6 +312,11 @@ class BackgroundWorker:
         # записывается мгновенно, вектор догоняет фоном (архитектура
         # субстрата §3.3 — без LLM в момент записи).
         self._areas_event = asyncio.Event()
+        # Сигнал «появилось задание после сшивания» (lsb-0012): будит петлю
+        # `nodes` сразу после merge — не ждём часового интервала. Сигнал ставит
+        # та же summary-петля (`process_merge_pending`), DI-нотификатор не нужен:
+        # джоба живёт внутри воркера (arch §3.5).
+        self._nodes_event = asyncio.Event()
         # Мемоизация создания таблицы job-очередей (пул 5): DDL исполняется
         # один раз на экземпляр воркера, а не при каждом обращении к очередям
         # (_create_job/_pending_jobs/_mark_job_done звали _ensure_job_table
@@ -211,32 +329,32 @@ class BackgroundWorker:
 
     @property
     def interval(self) -> float:
-        """Текущий интервал embedding-петли (диагностика, тесты)."""
-        return self._vector_interval
+        """Текущий интервал embedding-джобы (диагностика, тесты)."""
+        return self._backoff[EMBEDDING_JOB].interval
 
     @property
     def summary_interval(self) -> float:
-        """Текущий интервал суммаризационной петли (диагностика, тесты)."""
-        return self._summary_interval
+        """Текущий интервал summary-джобы (диагностика, тесты)."""
+        return self._backoff[SUMMARY_JOB].interval
 
     @property
     def chunk_interval(self) -> float:
         """Интервал чанковой очереди (диагностика, тесты, Фаза 7).
 
-        Чанковая очередь объединена с векторной в embedding-петлю (решение
-        №10) — интервал общий с `interval`.
+        Чанковая очередь объединена с векторной в одну джобу (решение №10) —
+        интервал общий с `interval`.
         """
-        return self._vector_interval
+        return self._backoff[EMBEDDING_JOB].interval
 
     @property
     def judge_interval(self) -> float:
-        """Текущий интервал judge-петли (диагностика, тесты, Фаза 11)."""
-        return self._judge_interval
+        """Текущий интервал judge-джобы (диагностика, тесты, Фаза 11)."""
+        return self._backoff[JUDGE_JOB].interval
 
     @property
     def areas_interval(self) -> float:
-        """Текущий интервал петли areas (диагностика, тесты, субстрат 3.0.0)."""
-        return self._areas_interval
+        """Текущий интервал джобы areas (диагностика, тесты, субстрат 3.0.0)."""
+        return self._backoff[AREAS_JOB].interval
 
     def stop(self) -> None:
         """Мягкая остановка: петли завершатся после разборки текущей итерации."""
@@ -269,212 +387,140 @@ class BackgroundWorker:
         """
         self._areas_event.set()
 
-    async def run(self) -> None:
-        """Все петли очередей (запускается asyncio-таской при старте).
+    def notify_nodes_pending(self) -> None:
+        """Разбудить петлю `nodes`: появилось задание после сшивания (lsb-0012).
 
-        Обработанные партии идут одна за другой (очередь выгребаем сразу);
-        пустой прогон — пауза на текущий интервал петли с удвоением.
-        Петли независимы: back-off и выгребание — раздельные.
-        """
-        await asyncio.gather(
-            self._run_embedding(), self._run_summary(), self._run_judge(),
-            self._run_areas(), self._run_expiration_cleanup(),
+        Вызывается из той же summary-петли после успешного merge
+        (`process_merge_pending` — синхронный код в `asyncio.to_thread`),
+        `asyncio.Event.set()` потокобезопасен. Петля немедленно выходит из
+        ожидания и разбирает `reclass`, не дожидаясь часового интервала
+        `JOB_NODES_INTERVAL_SEC`. DI-нотификатор не нужен: джоба живёт внутри
+        воркера (arch §3.5)."""
+        self._nodes_event.set()
+
+    def _is_stopping(self) -> bool:
+        """Предикат мягкой остановки для каркасного цикла (`run_loop`)."""
+        return self._stopping
+
+    def _job_backoff(self, spec: JobSpec) -> BackoffState:
+        """Состояние back-off джобы (для незарегистрированной — её интервал)."""
+        return self._backoff.setdefault(
+            spec.name, BackoffState(spec.interval_sec)
         )
 
-    async def _run_embedding(self) -> None:
-        while not self._stopping:
-            try:
-                processed = 0
-                processed += await asyncio.to_thread(self.process_pending)
-                processed += await self.process_pending_chunks()
-                if processed:
-                    self._vector_interval = float(
-                        self._settings.pending_retry_sec
-                    )  # успех — сброс
-                    continue
-                # Idle-ветка (пул 5): работ нет — гигиена worker_jobs
-                # (done-старше retention вычищаются) перед сном.
-                await asyncio.to_thread(self._purge_done_jobs)
-                await asyncio.sleep(self._vector_interval)
-                self._vector_interval = next_interval(
-                    self._vector_interval, self._settings.pending_retry_sec
-                )
-            except asyncio.CancelledError:
-                raise  # отмена петли (graceful stop) — не глотать
-            except Exception:
-                # Супервизор петли (пул 4): НЕПРЕДВИДЕННЫЙ сбой итерации
-                # (StorageError при исчерпании busy_timeout, дефект кода,
-                # «громкий» re-raise из _store_chunk_vectors) не убивает
-                # корутину — warning с traceback, пауза и повтор по back-off.
-                logging.getLogger("app").warning(
-                    "worker loop iteration failed — loop continues",
-                    extra={"event": "loop_iteration_failed", "loop": "embedding"},
-                    exc_info=True,
-                )
-                await asyncio.sleep(self._vector_interval)
-                self._vector_interval = next_interval(
-                    self._vector_interval, self._settings.pending_retry_sec
-                )
+    async def run(self) -> None:
+        """Все джобы реестра — единым каркасным циклом (asyncio-таска).
+
+        Джобы собираются `build_job_specs` (реестр `JobSpec`-ов каркаса; свои
+        джобы воркер регистрирует в конце модуля) и обслуживаются `run_loop`.
+        Обработанные партии идут одна за другой (очередь выгребаем сразу);
+        пустой прогон — ожидание сигнала `notify_*` (форма «по требованию») или
+        пауза по back-off. Джобы независимы: интервал и выгребание —
+        раздельные (свой `BackoffState` на джобу).
+        """
+        specs = build_job_specs(self, self._settings)
+        await asyncio.gather(
+            *(
+                run_loop(spec, self._is_stopping, self._job_backoff(spec))
+                for spec in specs
+            )
+        )
+
+    # --- работа джоб (цикл, back-off и супервизор — в каркасе) -----------------
+
+    async def _process_embedding(self) -> int:
+        """Прогон embedding-джобы: notes-очередь (в потоке) + чанковая очередь.
+
+        Обе очереди — одна джоба (решение №10): полные вектора заметок
+        (`process_pending` — синхронный SQL/HTTP, уходит в `to_thread`) и
+        чанковая очередь (`process_pending_chunks` — своя async-обработка с
+        Semaphore внутри). Возвращает число фактически обработанных заданий:
+        0 уводит каркасную петлю в ожидание с back-off (arch §3.2).
+        """
+        processed = await asyncio.to_thread(self.process_pending)
+        processed += await self.process_pending_chunks()
+        return processed
+
+    async def _process_summary(self) -> int:
+        """Прогон summary-джобы: title-доген → summarize → merge (три шага).
+
+        Каждый шаг — синхронный SQL/LLM, уходит в `to_thread`; порядок шагов
+        сохранён (как в исходной петле). Возвращает число обработанных
+        заданий: 0 уводит каркасную петлю к ожиданию сигнала
+        `notify_summary_pending` (форма «по требованию», пул 6) или таймаута.
+        """
+        processed = await asyncio.to_thread(self.process_title_pending)
+        processed += await asyncio.to_thread(self.process_summary_pending)
+        processed += await asyncio.to_thread(self.process_merge_pending)
+        return processed
 
     async def _run_summary(self) -> None:
-        if self._summarizer is None:
-            return  # тестовый режим без суммаризатора: петля не нужна
-        while not self._stopping:
-            try:
-                processed = 0
-                processed += await asyncio.to_thread(self.process_title_pending)
-                processed += await asyncio.to_thread(self.process_summary_pending)
-                processed += await asyncio.to_thread(self.process_merge_pending)
-                if processed:
-                    self._summary_interval = float(self._settings.pending_retry_sec)
-                    continue
-                # Пустой прогон: ждём сигнал «новая заметка» (save/update) или
-                # таймаут back-off. Сигнал будит петлю немедленно — суммаризация
-                # стартует сразу после записи, а не через выросший интервал.
-                # Пул 6 (lost wakeup): перепроверяем очередь ПОСЛЕ clear() —
-                # так окно гонки закрыто полностью: работа, появившаяся до
-                # clear(), видна селекту (продолжаем без сна); появившаяся
-                # после — будит event, который clear() уже не трогает.
-                # (Перепроверка ДО clear оставляла микро-окно «notify между
-                # селектом и clear» — сигнал стирался бы.)
-                if not await asyncio.to_thread(self._summary_queue_empty):
-                    continue
-                self._summary_event.clear()
-                try:
-                    await asyncio.wait_for(
-                        self._summary_event.wait(), timeout=self._summary_interval
-                    )
-                except asyncio.TimeoutError:
-                    self._summary_interval = next_interval(
-                        self._summary_interval, self._settings.pending_retry_sec
-                    )
-            except asyncio.CancelledError:
-                raise  # отмена петли (graceful stop) — не глотать
-            except Exception:
-                # Супервизор петли (пул 4): непредвиденный сбой итерации не
-                # убивает summary-петлю — warning с traceback, пауза, повтор.
-                logging.getLogger("app").warning(
-                    "worker loop iteration failed — loop continues",
-                    extra={"event": "loop_iteration_failed", "loop": "summary"},
-                    exc_info=True,
-                )
-                await asyncio.sleep(self._summary_interval)
-                self._summary_interval = next_interval(
-                    self._summary_interval, self._settings.pending_retry_sec
-                )
+        """Обслуживать summary-джобу каркасным циклом (запуск одной джобы).
+
+        Тело петли живёт в каркасе; метод оставлен для изолированного запуска
+        одной джобы — так тесты пула 6 (lost wakeup) проверяют селект по
+        очереди и `clear()` сигнала без остальных петель.
+        """
+        spec = build_summary_job(self, self._settings)
+        if spec is None:
+            return  # без суммаризатора джоба неприменима (тестовый режим)
+        await run_loop(spec, self._is_stopping, self._backoff[SUMMARY_JOB])
+
+    async def _process_judge(self) -> int:
+        """Прогон judge-джобы: партия judge-работ (дедуп) в `to_thread`.
+
+        0 уводит каркасную петлю к ожиданию сигнала `notify_judge_pending`
+        (форма «по требованию», пул 6) или таймаута интервала.
+        """
+        return await asyncio.to_thread(self.process_judge_pending)
 
     async def _run_judge(self) -> None:
-        while not self._stopping:
-            try:
-                processed = await asyncio.to_thread(self.process_judge_pending)
-                if processed:
-                    self._judge_interval = float(self._settings.pending_retry_sec)
-                    continue
-                # Пустой прогон: ждём сигнал «появилась judge-работа» или таймаут
-                # back-off. Сигнал будит петлю немедленно после довекторизации.
-                # Пул 6 (lost wakeup): перепроверка ПОСЛЕ clear() — окно
-                # «notify между селектом и clear» закрыто (см. комментарий
-                # в _run_summary).
-                if not await asyncio.to_thread(self._judge_queue_empty):
-                    continue
-                self._judge_event.clear()
-                try:
-                    await asyncio.wait_for(
-                        self._judge_event.wait(), timeout=self._judge_interval
-                    )
-                except asyncio.TimeoutError:
-                    self._judge_interval = next_interval(
-                        self._judge_interval, self._settings.pending_retry_sec
-                    )
-            except asyncio.CancelledError:
-                raise  # отмена петли (graceful stop) — не глотать
-            except Exception:
-                # Супервизор петли (пул 4): непредвиденный сбой итерации не
-                # убивает judge-петлю — warning с traceback, пауза, повтор.
-                logging.getLogger("app").warning(
-                    "worker loop iteration failed — loop continues",
-                    extra={"event": "loop_iteration_failed", "loop": "judge"},
-                    exc_info=True,
-                )
-                await asyncio.sleep(self._judge_interval)
-                self._judge_interval = next_interval(
-                    self._judge_interval, self._settings.pending_retry_sec
-                )
+        """Обслуживать judge-джобу каркасным циклом (запуск одной джобы).
 
-    # --- петля areas: вектора записей областей (субстрат 3.0.0) ---------------
-
-    async def _run_areas(self) -> None:
-        """Петля векторизации областей (субстрат 3.0.0, архитектура §3.3).
-
-        Своя очередь, свой интервал/back-off и свой сигнал: отказ векторизации
-        областей не мешает заметкам и наоборот (ARCH §3.4). Пустой прогон —
-        проверка очереди ПОСЛЕ clear() (пул 6, lost wakeup, как в
-        _run_summary/_run_judge) и ожидание сигнала notify_areas_pending() или
-        таймаута интервала. Супервизор петли (пул 4): непредвиденный сбой
-        итерации не убивает петлю — warning с traceback, пауза, повтор.
+        См. `_run_summary`: изоляция одной джобы — для тестов пула 6
+        (lost wakeup) по judge-очереди.
         """
-        while not self._stopping:
-            try:
-                processed = await asyncio.to_thread(self.process_pending_areas)
-                if processed:
-                    self._areas_interval = float(self._settings.pending_retry_sec)
-                    continue
-                if not await asyncio.to_thread(self._areas_queue_empty):
-                    continue
-                self._areas_event.clear()
-                try:
-                    await asyncio.wait_for(
-                        self._areas_event.wait(), timeout=self._areas_interval
-                    )
-                except asyncio.TimeoutError:
-                    self._areas_interval = next_interval(
-                        self._areas_interval, self._settings.pending_retry_sec
-                    )
-            except asyncio.CancelledError:
-                raise  # отмена петли (graceful stop) — не глотать
-            except Exception:
-                logging.getLogger("app").warning(
-                    "worker loop iteration failed — loop continues",
-                    extra={"event": "loop_iteration_failed", "loop": "areas"},
-                    exc_info=True,
-                )
-                await asyncio.sleep(self._areas_interval)
-                self._areas_interval = next_interval(
-                    self._areas_interval, self._settings.pending_retry_sec
-                )
+        spec = build_judge_job(self, self._settings)
+        await run_loop(spec, self._is_stopping, self._backoff[JUDGE_JOB])
+
+    # --- джоба areas: вектора записей областей (субстрат 3.0.0) ---------------
+
+    async def _process_areas(self) -> int:
+        """Прогон джобы areas: партия pending-записей областей в `to_thread`.
+
+        Своя очередь, свой back-off и свой сигнал: отказ векторизации областей
+        не мешает заметкам и наоборот (ARCH §3.4). 0 уводит каркасную петлю к
+        ожиданию `notify_areas_pending` (пул 6) или таймаута интервала.
+        """
+        return await asyncio.to_thread(self.process_pending_areas)
 
     # --- джоба зачистки просроченных заметок (lsb-0004-02, этап 4) -----------
 
-    async def _run_expiration_cleanup(self) -> None:
-        """Петля зачистки просроченных заметок (lsb-0004-02, этап 4).
+    async def _process_expiration(self) -> int:
+        """Прогон джобы expiration: зачистка просроченных заметок.
 
-        Раз в EXPIRATION_CLEANUP_INTERVAL_SEC (фиксированные 5 минут, решение
-        О. 2026-09-09) выгребает note_expirations: заметки с
-        `expires_at <= now()` удаляются ПОЛНОСТЬЮ (notes+chunks+вектора+fts)
-        вместе со строкой из note_expirations. Интервал фиксированный — без
-        back-off (в отличие от очередей pending): зачистка не зависит от
-        внешних сервисов, сбой итерации не ускоряет/замедляет расписание.
-        Супервизор петли (пул 4): непредвиденный сбой итерации не убивает
-        петлю — warning с traceback, пауза на интервал, повтор.
+        Выгребает note_expirations: заметки с `expires_at <= now()` удаляются
+        ПОЛНОСТЬЮ (notes+chunks+вектора+fts) вместе со строкой из
+        note_expirations (`process_expired_notes` в `to_thread`); удалено > 0
+        — событие `expiration_cleanup` с обязательным полем `job`. Джоба
+        обслуживается по ФИКСИРОВАННОМУ расписанию (её состояние back-off —
+        `fixed=True`): пауза всегда EXPIRATION_CLEANUP_INTERVAL_SEC
+        (фиксированные 5 минут, решение О. 2026-09-09), back-off не растёт —
+        зачистка не зависит от внешних сервисов, расписание не
+        ускоряется/замедляется (FR-1.5). Возвращает число удалённых заметок
+        (расписание ведёт интервал, а не прогресс — см. `run_loop`).
         """
-        while not self._stopping:
-            try:
-                deleted = await asyncio.to_thread(self.process_expired_notes)
-                if deleted:
-                    logging.getLogger("app").info(
-                        "expiration cleanup: purged expired notes",
-                        extra={"event": "expiration_cleanup", "count": deleted},
-                    )
-                await asyncio.sleep(EXPIRATION_CLEANUP_INTERVAL_SEC)
-            except asyncio.CancelledError:
-                raise  # отмена петли (graceful stop) — не глотать
-            except Exception:
-                logging.getLogger("app").warning(
-                    "expiration cleanup loop iteration failed — loop continues",
-                    extra={"event": "loop_iteration_failed", "loop": "expiration"},
-                    exc_info=True,
-                )
-                await asyncio.sleep(EXPIRATION_CLEANUP_INTERVAL_SEC)
+        deleted = await asyncio.to_thread(self.process_expired_notes)
+        if deleted:
+            logging.getLogger("app").info(
+                "expiration cleanup: purged expired notes",
+                extra={
+                    "event": "expiration_cleanup",
+                    "job": EXPIRATION_JOB,
+                    "count": deleted,
+                },
+            )
+        return deleted
 
     def process_expired_notes(self) -> int:
         """Удалить просроченные заметки; возвращает число удалённых.
@@ -565,6 +611,7 @@ class BackgroundWorker:
                 "worker_jobs: purged done jobs older than retention window",
                 extra={
                     "event": "jobs_purged",
+                    "job": EMBEDDING_JOB,
                     "count": cursor.rowcount,
                     "retention_days": WORKER_JOBS_RETENTION_DAYS,
                 },
@@ -580,6 +627,27 @@ class BackgroundWorker:
                 "INSERT INTO worker_jobs (slot, kind, note_id, payload) "
                 "VALUES (?, ?, ?, ?)",
                 (slot, kind, note_id, payload),
+            )
+
+    def _ensure_job(
+        self, slot: str, kind: str, note_id: int, payload: str | None = None
+    ) -> None:
+        """Идемпотентно поставить работу в очередь слота (arch §3.5, FR-2.5).
+
+        `INSERT ... WHERE NOT EXISTS (pending с теми же slot/kind/note_id)`:
+        частая правка одной заметки не плодит дубли заданий (нужно джобам,
+        которые ставят работу по событию). Существующий `_create_job`
+        (judge/merge) не трогается: там дедуп не требуется — пара
+        «поздняя ↔ ранняя» и вердикт судьи дают свои инварианты.
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn, transaction(conn):
+            conn.execute(
+                "INSERT INTO worker_jobs (slot, kind, note_id, payload) "
+                "SELECT ?, ?, ?, ? WHERE NOT EXISTS ("
+                "SELECT 1 FROM worker_jobs WHERE slot = ? AND kind = ? "
+                "AND note_id = ? AND status = 'pending')",
+                (slot, kind, note_id, payload, slot, kind, note_id),
             )
 
     def _pending_jobs(
@@ -640,6 +708,80 @@ class BackgroundWorker:
                 "WHERE slot = 'judge' AND kind = 'dedup' AND status = 'pending'"
             ).fetchone()
         return int(row[0]) == 0
+
+    # --- наблюдаемость очередей (lsb-0014-03, FR-2.2) -------------------------
+
+    def queues_health(self) -> dict[str, dict]:
+        """Собрать `/health.queues` по реестру джоб (FR-2.2): только SQL.
+
+        У каждой зарегистрированной джобы с очередью берётся её собственный
+        снимок (`JobSpec.queue_stat`) — `/health` не правится при добавлении
+        джобы. Джоба без очереди (`expiration`) в объект не попадает;
+        обращений к моделям нет (только чтение pending-состояния).
+        """
+        queues: dict[str, dict] = {}
+        for spec in build_job_specs(self, self._settings):
+            if spec.queue is None or spec.queue_stat is None:
+                continue
+            queues[spec.queue] = spec.queue_stat()
+        return queues
+
+    def _vector_queue_stat(self) -> dict:
+        """Снимок очереди векторизации заметок: pending и возраст старейшего.
+
+        Источник — `notes.vector_status='pending'` (тот же предикат, что у
+        легаси-счётчика `pending_vector`); SQL живёт рядом с `health_counts`
+        в NoteService.
+        """
+        return self._notes.vector_queue_stat()
+
+    def _summary_queue_stat(self) -> dict:
+        """Снимок очереди суммаризации заметок (`notes.summary_status`)."""
+        return self._notes.summary_queue_stat()
+
+    def _judge_queue_stat(self) -> dict:
+        """Снимок очереди judge: pending-работы слота в `worker_jobs`.
+
+        Число — `worker_jobs(slot='judge', status='pending')`, возраст
+        старейшего — `now - MIN(created_at)`. Таблица создаётся лениво
+        (`_ensure_job_table`), моделей не зовём.
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS pending, "
+                "MAX(CAST(strftime('%s','now') AS INTEGER) - "
+                "CAST(strftime('%s', created_at) AS INTEGER)) "
+                "AS oldest_pending_sec FROM worker_jobs "
+                "WHERE slot = 'judge' AND status = 'pending'"
+            ).fetchone()
+        return queue_snapshot(row["pending"], row["oldest_pending_sec"])
+
+    def _areas_queue_stat(self) -> dict:
+        """Снимок очереди областей: сумма pending по `ALL_AREAS` (FR-2.2).
+
+        Источник pending — тот же, что у `_areas_queue_empty`: pending-записи
+        активных строк каждой области (skills/terms/user). Суммы складываются,
+        возраст старейшего — максимум `now - updated_at` по областям; пусто —
+        `null`.
+        """
+        pending = 0
+        oldest: int | None = None
+        with session(self._settings) as conn:
+            for spec in ALL_AREAS:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS pending, "
+                    "MAX(CAST(strftime('%s','now') AS INTEGER) - "
+                    "CAST(strftime('%s', updated_at) AS INTEGER)) "
+                    "AS oldest_pending_sec FROM "
+                    f"{spec.table} WHERE vector_status = 'pending' "
+                    "AND deleted_at IS NULL"
+                ).fetchone()
+                pending += int(row["pending"])
+                value = row["oldest_pending_sec"]
+                if value is not None:
+                    oldest = int(value) if oldest is None else max(oldest, int(value))
+        return queue_snapshot(pending, oldest)
 
     # --- синхронная работа (выполняется в to_thread) --------------------------
 
@@ -755,6 +897,7 @@ class BackgroundWorker:
                 "area vectorization failed — records stay pending",
                 extra={
                     "event": "area_embed_failed",
+                    "job": AREAS_JOB,
                     "area": spec.name,
                     "count": len(rows),
                 },
@@ -875,6 +1018,7 @@ class BackgroundWorker:
                         "dedup: judge undecidable — both notes kept, retry queued",
                         extra={
                             "event": "dedup_judge_failed",
+                            "job": JUDGE_JOB,
                             "note_id": note_id,
                             "candidates": [
                                 candidate_id for candidate_id, _ in alive
@@ -970,6 +1114,7 @@ class BackgroundWorker:
                     "dedup: summarizer merge failed — both notes kept, retry queued",
                     extra={
                         "event": "dedup_merge_failed",
+                        "job": SUMMARY_JOB,
                         "older_id": older_id,
                         "note_id": note_id,
                     },
@@ -979,6 +1124,7 @@ class BackgroundWorker:
                 "dedup: duplicate merged into earlier note",
                 extra={
                     "event": "dedup_merged",
+                    "job": SUMMARY_JOB,
                     "older_id": older_id,
                     "note_id": note_id,
                     "cosine": payload.get("cosine"),
@@ -986,6 +1132,14 @@ class BackgroundWorker:
             )
             self._mark_job_done(job["id"])
             done += 1
+            # Реклассификация объединённой заметки (lsb-0012, arch §3.5): узел
+            # ранней мог не подойти новому содержанию — ставим задание слоту
+            # `nodes` (объединённая заметка может лежать в любом узле — обход
+            # `default` её не найдёт) и будим его петлю сразу, не дожидаясь
+            # часового интервала. Неудачная постановка/обработка данные не
+            # портит: заметка остаётся в текущем узле, `classified_at` — NULL.
+            self._ensure_job(NODES_JOB, NODES_RECLASS_KIND, older_id)
+            self.notify_nodes_pending()
             # Ранняя заметка обновлена (summary pending) — будим свою же петлю
             # суммаризации, не дожидаясь back-off.
             self.notify_summary_pending()
@@ -1020,6 +1174,7 @@ class BackgroundWorker:
                 "dedup: cosine candidates found for vectorized note",
                 extra={
                     "event": "dedup_candidates",
+                    "job": JUDGE_JOB,
                     "note_id": note_id,
                     "candidates": older,
                 },
@@ -1072,6 +1227,7 @@ class BackgroundWorker:
                 "dedup: judge verdict for cosine candidate",
                 extra={
                     "event": "dedup_judge",
+                    "job": JUDGE_JOB,
                     "note_id": note_id,
                     "candidate_id": candidate_id,
                     "cosine": cosine_value,
@@ -1120,7 +1276,11 @@ class BackgroundWorker:
             except SummaryError:
                 logging.getLogger("app").warning(
                     "title: generation failed — kept null, retry by back-off",
-                    extra={"event": "title_failed", "note_id": row["id"]},
+                    extra={
+                        "event": "title_failed",
+                        "job": SUMMARY_JOB,
+                        "note_id": row["id"],
+                    },
                 )
                 continue  # отказ: title остаётся NULL, повтор по back-off
             title = self._truncate_title(generated)
@@ -1153,6 +1313,7 @@ class BackgroundWorker:
                     "title: generated for migration note",
                     extra={
                         "event": "title_generated",
+                        "job": SUMMARY_JOB,
                         "note_id": row["id"],
                         "vector_invalidated": stale,
                     },
@@ -1199,7 +1360,11 @@ class BackgroundWorker:
             except SummaryError:
                 logging.getLogger("app").warning(
                     "summary: generation failed — kept pending, retry by back-off",
-                    extra={"event": "summary_failed", "note_id": row["id"]},
+                    extra={
+                        "event": "summary_failed",
+                        "job": SUMMARY_JOB,
+                        "note_id": row["id"],
+                    },
                 )
                 continue  # отказ: status pending остаётся, повтор по back-off
             with session(self._settings) as conn, transaction(conn):
@@ -1223,12 +1388,104 @@ class BackgroundWorker:
                         # дальше, классификация этой — после следующего update.
                         logging.getLogger("app").warning(
                             "classify: internal error — enrichment deferred",
-                            extra={"event": "classify_crashed", "note_id": row["id"]},
+                            extra={
+                                "event": "classify_crashed",
+                                "job": SUMMARY_JOB,
+                                "note_id": row["id"],
+                            },
                             exc_info=True,
                         )
         return done
 
     # --- причёска (Фаза 10, Шаг 4) -------------------------------------------
+
+    def _apply_node_order(
+        self,
+        note_id: int,
+        expected_namespace: str,
+        result: Classification,
+        *,
+        current_namespace: str | None = None,
+        no_hint_reason: str = "low_confidence",
+    ) -> tuple[str, str, str | None]:
+        """Единственная точка переезда заметки по разметке (lsb-0011-01, arch §3.3).
+
+        Один UPDATE: разметка (`hint_path`, `confidence`, `classified_at`) +
+        маркер разбора `node_order_at` + (при переезде) `namespace` и
+        `vector_status='pending'` (пере-кодировка в партицию нового узла —
+        существующий механизм). Guard `namespace = :expected_namespace` и
+        `deleted_at IS NULL`: операторский/клиентский переезд в полёте фоном
+        не перебивается — `rowcount = 0` даёт `kept`/`node_changed`.
+
+        Целевой узел считается ДО транзакции: отказ валидации разметки
+        (`NamespaceValidationError` из `_auto_move_target`, в т.ч. мусорный
+        `hint_path`) не пишет в БД вовсе — строгая семантика «отказ = не
+        размечено». Возврат `(outcome, reason, target)`: `moved` — переезд;
+        `kept` — оставлена (`hint_unknown` — узла нет в реестре,
+        `no_hint_reason` — модель узла не предложила, `low_confidence` —
+        уверенность ниже порога, `same_node` — узел тот же, `node_changed` —
+        узел сменён в полёте). Все reason — из словаря arch §3.7.
+
+        Механика одна на все источники (arch §3.3): её переиспользует
+        причёска после суммаризации (вход по полному тексту), обход `default`
+        (быстрый путь и классификаторный пул) и задание после сшивания.
+
+        `current_namespace` — узел заметки, прочитанный В МОМЕНТ РЕШЕНИЯ
+        (только задание после сшивания, lsb-0012): тогда результат без узла
+        даёт `no_hint_reason` (`result_default` — заметка НЕ понижается,
+        FR-2.4), а уверенный выбор текущего узла — `kept`/`same_node` без
+        лишней пере-векторизации. Для обхода и причёски (`None`) поведение
+        прежнее: `expected_namespace` — `'default'`.
+        """
+        target = self._auto_move_target(result)
+        confident = (
+            result.confidence >= self._settings.namespace_auto_move_min_confidence
+        )
+        move = target is not None and confident
+        if current_namespace is not None and not result.hint_path:
+            # Результат «общая»: движение «узел → свалка» запрещено (FR-2.4) —
+            # заметка остаётся в узле ранней.
+            target = None
+            move = False
+        elif (
+            current_namespace is not None
+            and confident
+            and target == current_namespace
+        ):
+            move = False  # узел тот же: переезда (и пере-векторизации) нет
+        # Маркер разбора ставится в ТОЙ ЖЕ транзакции, что и разметка
+        # (lsb-0011-01, §3.6): атомарно, анти-зацикливание не отстаёт от решения.
+        columns = [
+            "hint_path = ?",
+            "confidence = ?",
+            "classified_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+            "node_order_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+        ]
+        params: list[object] = [result.hint_path, result.confidence]
+        if move:
+            columns.append("namespace = ?")
+            columns.append("vector_status = 'pending'")
+            params.append(target)
+        with session(self._settings) as conn, transaction(conn):
+            cursor = conn.execute(
+                "UPDATE notes SET "
+                + ", ".join(columns)
+                + " WHERE id = ? AND namespace = ? AND deleted_at IS NULL",
+                (*params, note_id, expected_namespace),
+            )
+        if not cursor.rowcount:
+            return "kept", "node_changed", target
+        if move:
+            return "moved", "hint_exists", target
+        if target is None:
+            return (
+                "kept",
+                "hint_unknown" if result.hint_path else no_hint_reason,
+                None,
+            )
+        if current_namespace is not None and confident and target == current_namespace:
+            return "kept", "same_node", target
+        return "kept", "low_confidence", target
 
     def _classify_default_note(self, note_id: int, text: str) -> None:
         """Разметить default-заметку после суммаризации; авто-переезд.
@@ -1255,6 +1512,11 @@ class BackgroundWorker:
         авто-переезда считаем до транзакции — отказ _auto_move_target (в т.ч.
         NamespaceValidationError на мусорном hint) ничего не пишет в БД
         (строгая семантика «отказ классификации = не размечено»).
+
+        lsb-0011-01: сама механика переезда вынесена в общую точку
+        `_apply_node_order` (её же переиспользует обход `default`) — здесь
+        остаётся только вход по полному тексту и триггер промоции; поведение
+        классификации после суммаризации не меняется.
         """
         if self._classifier is None:
             return  # тестовый режим без классификатора
@@ -1264,46 +1526,25 @@ class BackgroundWorker:
         except ClassificationError:
             logging.getLogger("app").warning(
                 "classify: failed — note stays in default, retry on next update",
-                extra={"event": "classify_failed", "note_id": note_id},
+                extra={
+                    "event": "classify_failed",
+                    "job": SUMMARY_JOB,
+                    "note_id": note_id,
+                },
             )
             return
-        # Пул 6: целевой узел авто-переезда ДО транзакции — если он падает
-        # (в т.ч. NamespaceValidationError), БД не пишем вовсе.
-        target = self._auto_move_target(result)
-        move = (
-            target is not None
-            and result.confidence >= self._settings.namespace_auto_move_min_confidence
-        )
-        with session(self._settings) as conn, transaction(conn):
-            # Один UPDATE: разметка + (при переезде) namespace/vector_status.
-            # Guard `namespace = 'default'`: оператор, уложивший заметку в полёте,
-            # фоном не перекладывается (rowcount 0 — переезда не было, нет и
-            # лога classified_moved).
-            columns = [
-                "hint_path = ?",
-                "confidence = ?",
-                "classified_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
-            ]
-            params: list[object] = [
-                result.hint_path,
-                result.confidence,
-            ]
-            if move:
-                columns.append("namespace = ?")
-                columns.append("vector_status = 'pending'")
-                params.append(target)
-            cursor = conn.execute(
-                "UPDATE notes SET "
-                + ", ".join(columns)
-                + " WHERE id = ? AND namespace = 'default' AND deleted_at IS NULL",
-                (*params, note_id),
-            )
+        # Пул 6: переезд — ОДНА общая точка `_apply_node_order` (разметка +
+        # namespace/vector_status одним UPDATE, guard внутри); отказ
+        # вычисления цели (в т.ч. NamespaceValidationError на мусорном hint)
+        # ничего не пишет в БД.
+        outcome, _reason, target = self._apply_node_order(note_id, "default", result)
         # Лог — только при ФАКТИЧЕСКОМ переезде (rowcount+condition).
-        if move and cursor.rowcount:
+        if outcome == "moved":
             logging.getLogger("app").info(
                 "classify: default note auto-moved into existing node",
                 extra={
                     "event": "classified_moved",
+                    "job": SUMMARY_JOB,
                     "note_id": note_id,
                     "namespace": target,
                     "confidence": result.confidence,
@@ -1313,8 +1554,14 @@ class BackgroundWorker:
         # до порога — прогоняем конвейер промоции (авто-создание/слияние).
         self._run_promotion()
 
-    def _run_promotion(self) -> None:
+    def _run_promotion(self, job: str = SUMMARY_JOB) -> None:
         """Триггер домена (Шаг 5) после классификации default-заметки.
+
+        Вызывается причёской (слот summary, `job=summary`) и обходом `nodes`
+        перед подметанием `default` (`job=nodes`, lsb-0011-01): промоция идёт
+        первой, чтобы заметка не «переезжала» в узел, который появится в этом
+        же прогоне. Имя джобы в журнале — параметр (события не переименовываем,
+        меняется лишь значение обязательного поля `job`).
 
         Сбои триггера не роняют воркер: это этап обогащения, а не конвейера
         данных — суммаризация/векторизация важнее структурной автоматики.
@@ -1322,7 +1569,8 @@ class BackgroundWorker:
         PromotionService (кандидат остаётся без вердикта, NFR-3); здесь
         ловится ВСЁ остальное (включая баги) — warning с traceback в логи,
         петли очередей живут. Повтор — следующая классификация default-
-        заметки: группы не теряются, просто дотягивают до порога позже.
+        заметки или следующий прогон обхода: группы не теряются, просто
+        дотягивают до порога позже.
         """
         if self._promoter is None:
             return  # тестовый режим без триггера
@@ -1331,7 +1579,11 @@ class BackgroundWorker:
         except Exception:
             logging.getLogger("app").warning(
                 "promotion: run failed — trigger deferred to next classification",
-                extra={"event": "promotion_failed", "reason": "run"},
+                extra={
+                    "event": "promotion_failed",
+                    "job": job,
+                    "reason": "run",
+                },
                 exc_info=True,
             )
             return
@@ -1340,7 +1592,11 @@ class BackgroundWorker:
             # LogRecord (время создания) — extra его не принимает.
             logging.getLogger("app").info(
                 "promotion: trigger run finished",
-                extra={"event": "promotion_run", "report": report},
+                extra={
+                    "event": "promotion_run",
+                    "job": job,
+                    "report": report,
+                },
             )
 
     def _auto_move_target(self, result) -> str | None:
@@ -1358,6 +1614,241 @@ class BackgroundWorker:
         if not self._namespaces.exists(hint):
             return None
         return hint
+
+    # --- джоба «порядок в узлах» (lsb-0011) -----------------------------------
+
+    def process_nodes(self, budget: int | None = None) -> int:
+        """Прогон джобы `nodes`: промоция → задания → обход `default`.
+
+        Полный порядок прогона (FR-1.2/FR-2.3/FR-3.3, arch §3.2):
+        (1) промоция — `PromotionService.run()` (создание/слияние листов,
+        ретро-перекладка), отказ не роняет джобу;
+        (2) задания `reclass` после сшивания (lsb-0012) — приоритетный
+        источник: объединённая заметка может лежать в любом узле, обход
+        `default` её не найдёт;
+        (3) быстрый пул обхода — остатком бюджета, переезд БЕЗ вызова модели;
+        (4) классификаторный пул обхода — остатком бюджета, но не более
+        `JOB_NODES_CLASSIFIER_BUDGET` вызовов классификатора за прогон.
+        Бюджет `JOB_NODES_BATCH` (дефолт 20) — ОБЩИЙ на оба источника за
+        прогон: не более него обработок (`moved` + `kept`); повторные прогоны
+        продолжают backlog. Заметка, ждущая модель или суммари, не
+        обрабатывается и маркера не получает — она попадёт в следующий прогон.
+
+        Быстрый пул (arch §3.2): default-заметки с готовой разметкой
+        (`hint_path` + `confidence` не ниже порога авто-переезда), ещё не
+        разобранные (`node_order_at IS NULL`), свежие первыми. Узел
+        зарегистрирован → переезд (`moved`/`hint_exists`, разметка не
+        меняется); узла нет в реестре → `kept`/`hint_unknown` (лист создаст
+        промоция — узел здесь не создаём).
+
+        Каждая разобранная заметка — событие `node_order` (`job='nodes'`,
+        `source='sweep'`/`'after_merge'`, `outcome`, `reason`, `target`,
+        `note_id`). Возврат — число разобранных заметок (0 уводит каркасную
+        петлю к ожиданию интервала или сигнала `notify_nodes_pending`).
+        """
+        limit = self._settings.job_nodes_batch if budget is None else budget
+        # (1) Промоция первой: заметка не «переезжает» в узел, который
+        # появится в этом же прогоне (FR-3.1). Отказ не роняет джобу (FR-3.2).
+        self._run_promotion(NODES_JOB)
+        # (2) Задания после сшивания — приоритетный источник (FR-3.3).
+        done = self._process_reclass_jobs(limit)
+        # (3) Быстрый пул обхода, (4) классификаторный — остатком бюджета.
+        done += self._sweep_fast_marks(limit - done)
+        done += self._sweep_classifier(limit - done)
+        return done
+
+    def _process_reclass_jobs(self, limit: int) -> int:
+        """Обработать партию заданий `reclass` (после сшивания); их число.
+
+        Порядок — по `id` очереди (свежие события не ждут за старыми).
+        Задание, ждущее готовой суммари, остаётся pending и прогрессом не
+        считается: петля уходит в сон по back-off, а не крутится вхолостую.
+        """
+        if limit <= 0:
+            return 0
+        done = 0
+        for job in self._pending_jobs(NODES_JOB, NODES_RECLASS_KIND, limit):
+            if self._process_reclass_job(int(job["note_id"])):
+                self._mark_job_done(job["id"])
+                done += 1
+        return done
+
+    def _process_reclass_job(self, note_id: int) -> bool:
+        """Разобрать одно задание после сшивания; True — задание снято с очереди.
+
+        Читаем заметку и решаем (FR-2.2/FR-2.5 lsb-0012, arch §3.5):
+
+        * заметки нет (удалена оператором) — задание снимаем: решать нечего;
+        * суммари ещё не готова (`summary_status != 'ok'` или пустая) —
+          задание ОСТАЁТСЯ pending и прогрессом не считается (ждёт по
+          back-off), по fallback-усечению решение не принимается, маркер
+          разбора не ставится — событие `node_order`/`summary_pending`;
+        * по готовой суммари — вызов классификатора на `title` + `summary`
+          (двухступенчатость с полным `text` не вводим — arch §3.4) и общая
+          точка переезда `_apply_node_order` с guard-ом по УЗЛУ, ПРОЧИТАННОМУ
+          при решении: операторский/клиентский переезд в полёте фоном не
+          перебивается (`node_changed`). Результат `default` заметку не
+          понижает (`result_default`), тот же узел — `same_node`.
+
+        Без классификатора (тестовый режим) решение не принимается: задание
+        остаётся pending, данные не портятся.
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT title, summary, summary_status, namespace FROM notes "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (note_id,),
+            ).fetchone()
+        if row is None:
+            return True  # заметки нет — задание снимаем
+        summary = row["summary"] or ""
+        if row["summary_status"] != "ok" or not summary.strip():
+            self._log_node_order(
+                note_id, "kept", "summary_pending", None, source="after_merge"
+            )
+            return False  # ждём суммари: задание остаётся pending
+        if self._classifier is None:
+            return False  # тестовый режим без классификатора
+        known = self._namespaces.list_all()["namespaces"]
+        text = f"{row['title']}\n{summary}" if row["title"] else summary
+        try:
+            result = self._classifier.classify(text, known)
+        except ClassificationError:
+            # Отказ классификатора данные не портит (FR-3.1): заметка остаётся
+            # в текущем узле, разметка не пишется, задание — pending.
+            logging.getLogger("app").warning(
+                "nodes: reclass failed — note stays in its node, retry by back-off",
+                extra={
+                    "event": "node_order_failed",
+                    "job": NODES_JOB,
+                    "source": "after_merge",
+                    "note_id": note_id,
+                },
+            )
+            return False
+        outcome, reason, target = self._apply_node_order(
+            note_id,
+            row["namespace"],
+            result,
+            current_namespace=row["namespace"],
+            no_hint_reason="result_default",
+        )
+        self._log_node_order(note_id, outcome, reason, target, source="after_merge")
+        return True
+
+    def _sweep_fast_marks(self, budget: int) -> int:
+        """Быстрый пул обхода `default`: переезд по готовой разметке, без модели.
+
+        Заметки с `hint_path` + `confidence` не ниже порога авто-переезда,
+        ещё не разобранные (`node_order_at IS NULL`), свежие первыми. Маркер
+        `node_order_at` ставится при любом исходе (анти-зацикливание, §3.6):
+        оставленная заметка не выедает бюджет повторно до изменения
+        текста/названия (сброс маркера — NoteService.update/merge_pair).
+        """
+        if budget <= 0:
+            return 0
+        threshold = self._settings.namespace_auto_move_min_confidence
+        with session(self._settings) as conn:
+            rows = conn.execute(_NODES_SWEEP_SELECT, (threshold, budget)).fetchall()
+        done = 0
+        for row in rows:
+            note_id = int(row["id"])
+            result = Classification(row["hint_path"], row["confidence"])
+            outcome, reason, target = self._apply_node_order(
+                note_id, "default", result
+            )
+            done += 1
+            self._log_node_order(note_id, outcome, reason, target)
+        return done
+
+    def _sweep_classifier(self, budget: int) -> int:
+        """Классификаторный пул обхода `default`: разметка через модель.
+
+        Заметки без разметки (`classified_at IS NULL`) с ГОТОВОЙ непустой
+        суммари, свежие первыми; вход классификатору — `title` + `summary`
+        (arch §3.4, полный `text` не отдаём). Число вызовов классификатора за
+        прогон ограничено бюджетом `JOB_NODES_CLASSIFIER_BUDGET` и остатком
+        общего бюджета. Отказ классификатора заметку не помечает — она
+        останется кандидатом следующего прогона (FR-3.2).
+        """
+        limit = min(budget, self._settings.job_nodes_classifier_budget)
+        if limit <= 0 or self._classifier is None:
+            return 0
+        with session(self._settings) as conn:
+            rows = conn.execute(_NODES_CLASSIFY_SELECT, (limit,)).fetchall()
+        known = self._namespaces.list_all()["namespaces"]
+        done = 0
+        for row in rows:
+            note_id = int(row["id"])
+            summary = row["summary"] or ""
+            text = f"{row['title']}\n{summary}" if row["title"] else summary
+            try:
+                result = self._classifier.classify(text, known)
+            except ClassificationError:
+                logging.getLogger("app").warning(
+                    "nodes: classify failed — note stays in default, retry later",
+                    extra={
+                        "event": "classify_failed",
+                        "job": NODES_JOB,
+                        "note_id": note_id,
+                    },
+                )
+                continue  # маркер не ставим: заметка снова кандидат обхода
+            outcome, reason, target = self._apply_node_order(
+                note_id,
+                "default",
+                result,
+                no_hint_reason="no_hint_classified",
+            )
+            done += 1
+            self._log_node_order(note_id, outcome, reason, target)
+        return done
+
+    def _log_node_order(
+        self,
+        note_id: int,
+        outcome: str,
+        reason: str,
+        target: str | None,
+        source: str = "sweep",
+    ) -> None:
+        """Событие `node_order` джобы `nodes` (FR-4.2): исход разбора заметки.
+
+        `reason` — из словаря arch §3.7 (`hint_exists`, `hint_unknown`,
+        `low_confidence`, `no_hint_classified`, `summary_pending`, `same_node`,
+        `result_default`, `node_changed`), `source` — источник решения
+        (`sweep` — обход `default`, `after_merge` — задание после сшивания).
+        Имена событий и полей существующие — наблюдаемость джобы не меняется.
+        """
+        logging.getLogger("app").info(
+            "nodes: decided note order",
+            extra={
+                "event": "node_order",
+                "job": NODES_JOB,
+                "source": source,
+                "note_id": note_id,
+                "outcome": outcome,
+                "reason": reason,
+                "target": target,
+            },
+        )
+
+    def _nodes_queue_stat(self) -> dict:
+        """Снимок очереди `nodes` для `/health.queues` (FR-2.2).
+
+        `pending` — pending-задания `reclass` после сшивания + кандидаты обоих
+        пулов обхода (быстрый и классификаторный); `oldest_pending_sec` —
+        возраст старейшего из двух источников (задания — `created_at`,
+        обход — `updated_at`), `null` — очередь пуста. Только SQL, без
+        обращений к моделям; снимок работает и у выключенной джобы.
+        """
+        self._ensure_job_table()
+        threshold = self._settings.namespace_auto_move_min_confidence
+        with session(self._settings) as conn:
+            row = conn.execute(
+                _NODES_QUEUE_STAT_SQL, (threshold, threshold)
+            ).fetchone()
+        return queue_snapshot(row["pending"], row["oldest_pending_sec"])
 
     # --- чанковая очередь (Фаза 7) ---------------------------------------------
 
@@ -1485,3 +1976,161 @@ class BackgroundWorker:
                     ):
                         written += 1
         return written
+
+
+# --- сборщики джоб воркера (каркас lsb-0014-02) -------------------------------
+#
+# Регистрация вместо копии цикла (FR-1.1): каждая джоба описывается `JobSpec`
+# и добавляется в реестр каркаса; цикл, back-off и супервизор итерации — общие
+# (`app/services/jobs.py`). Интервалы существующих петель — как были (FR-1.5):
+# PENDING_RETRY_SEC у очередей и фиксированные 300 с у зачистки (новых env эта
+# постановка не заводит). `queue_stat` — снимок своей очереди для
+# `/health.queues` (lsb-0014-03, FR-2.2): у `expiration` очереди нет (`None`).
+
+
+def build_embedding_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
+    """Джоба `embedding`: notes-очередь + чанковая очередь (одна джоба).
+
+    Форма «по интервалу»: сигнала `notify_*` у embedding-петли не было и
+    раньше. Пустой прогон — гигиена `worker_jobs` (`idle_hook`, пул 5) и пауза
+    PENDING_RETRY_SEC с back-off; перепроверка очереди не нужна (задание живёт
+    в статусе заметки и будет выбрано следующим прогоном).
+    """
+    return JobSpec(
+        name=EMBEDDING_JOB,
+        queue="vector",
+        interval_sec=settings.pending_retry_sec,
+        batch=None,
+        enabled=True,
+        process=worker._process_embedding,
+        queue_empty=None,
+        wait_event=None,
+        idle_hook=worker._purge_done_jobs,
+        queue_stat=worker._vector_queue_stat,
+    )
+
+
+def build_summary_job(
+    worker: BackgroundWorker, settings: Settings
+) -> JobSpec | None:
+    """Джоба `summary`: title-доген → summarize → merge, сигнал `summary`.
+
+    Без суммаризатора (тестовый режим Фазы 3) джоба неприменима — сборщик
+    возвращает None, в реестр она не попадает (петли не было и раньше).
+    """
+    if worker._summarizer is None:
+        return None
+    return JobSpec(
+        name=SUMMARY_JOB,
+        queue="summary",
+        interval_sec=settings.pending_retry_sec,
+        batch=None,
+        enabled=True,
+        process=worker._process_summary,
+        queue_empty=worker._summary_queue_empty,
+        wait_event=worker._summary_event,
+        idle_hook=None,
+        queue_stat=worker._summary_queue_stat,
+    )
+
+
+def build_judge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
+    """Джоба `judge`: партия judge-работ (дедуп), сигнал `judge`."""
+    return JobSpec(
+        name=JUDGE_JOB,
+        queue="judge",
+        interval_sec=settings.pending_retry_sec,
+        batch=None,
+        enabled=True,
+        process=worker._process_judge,
+        queue_empty=worker._judge_queue_empty,
+        wait_event=worker._judge_event,
+        idle_hook=None,
+        queue_stat=worker._judge_queue_stat,
+    )
+
+
+def build_areas_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
+    """Джоба `areas`: вектора записей областей (субстрат 3.0.0), сигнал `areas`."""
+    return JobSpec(
+        name=AREAS_JOB,
+        queue="areas",
+        interval_sec=settings.pending_retry_sec,
+        batch=None,
+        enabled=True,
+        process=worker._process_areas,
+        queue_empty=worker._areas_queue_empty,
+        wait_event=worker._areas_event,
+        idle_hook=None,
+        queue_stat=worker._areas_queue_stat,
+    )
+
+
+def build_expiration_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
+    """Джоба `expiration`: зачистка просроченных заметок (lsb-0004-02, этап 4).
+
+    Очереди нет (зачистка — не pending-состояние) и сигнала нет: джоба
+    описана формой «по интервалу», а её состояние back-off помечено
+    `fixed=True` (создаётся в `__init__`) — пауза всегда 300 с, без back-off
+    (решение О. 2026-09-09; поведение сохранено дословно, FR-1.5).
+    """
+    return JobSpec(
+        name=EXPIRATION_JOB,
+        queue=None,
+        interval_sec=EXPIRATION_CLEANUP_INTERVAL_SEC,
+        batch=None,
+        enabled=True,
+        process=worker._process_expiration,
+        queue_empty=None,
+        wait_event=None,
+        idle_hook=None,
+        queue_stat=None,
+    )
+
+
+def build_nodes_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
+    """Джоба `nodes`: обход `default` и реклассификация после сшивания (lsb-0011).
+
+    Форма «по интервалу + событие» (arch §3.1): пустой прогон — сон на
+    `JOB_NODES_INTERVAL_SEC`, но сигнал `notify_nodes_pending` (задание после
+    сшивания, lsb-0012) будит петлю сразу. Прогон — промоция, задания
+    `reclass`, затем обход `default` (быстрый пул без модели + классификаторный
+    в бюджете `JOB_NODES_CLASSIFIER_BUDGET`). `JOB_NODES_ENABLED=false`
+    джобу не запускает, но очередь остаётся видна в `/health` (реестр её
+    сохраняет). Синхронный SQL/механика уходят в поток — event loop не занимаем.
+
+    Перепроверку очереди (`queue_empty`) не задаём: заметка, ждущая модель или
+    суммари, — отложенное задание, и петля ДОЛЖНА уйти в сон по back-off, а не
+    крутиться вхолостую (arch §3.2, «отложенное задание — не прогресс»).
+    """
+    batch = settings.job_nodes_batch
+
+    async def process() -> int:
+        return await asyncio.to_thread(worker.process_nodes, batch)
+
+    return JobSpec(
+        name=NODES_JOB,
+        queue=NODES_JOB,
+        interval_sec=settings.job_nodes_interval_sec,
+        batch=batch,
+        enabled=settings.job_nodes_enabled,
+        process=process,
+        queue_empty=None,
+        wait_event=worker._nodes_event,
+        idle_hook=None,
+        queue_stat=worker._nodes_queue_stat,
+    )
+
+
+# Регистрация петель воркера в реестре каркаса (FR-1.1): каркас собирает джобы
+# из `JOB_BUILDERS`; свой модуль дописывает свои сборщики после их определения
+# (импорт односторонний — worker → jobs, круга нет). Порядок — как у петель
+# раньше: embedding, summary, judge, areas, expiration, nodes.
+jobs.JOB_BUILDERS += (
+    build_embedding_job,
+    build_summary_job,
+    build_judge_job,
+    build_areas_job,
+    build_expiration_job,
+    build_nodes_job,
+)

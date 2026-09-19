@@ -46,6 +46,21 @@ Bearer и тот же сервисный слой, что у MCP (`user_save`/`u
 дословный hint канона lsb-0008 §3.7, в т.ч. близкий контекст), 404 — запись
 не найдена (в т.ч. удалённая), 409 — новый ключ правки занят другой активной
 записью (субстрат §3.6).
+
+Релиз 3.1.0 (lsb-0013-02): листинги оператора — тот же контракт страницы,
+что и у MCP (arch lsb-0013 §3.4): `GET /notes` и `GET /skills` передают
+сервису потолок поверхности (`list_max_limit_rest`, 50) и несут в ответе
+`total`/`has_more`/`next_offset`/`next_cursor`. Текстовой подсказки листания
+(«+N more») на REST нет — это признак «есть ещё» для модели в MCP-выдаче;
+собственная подсказка сервиса («memory is empty») остаётся как была.
+
+Релиз 3.1.0 (techdebt-0036): `/health` несёт `version` — версию приложения
+(`app.__version__`), согласованную с тегом релиза; поле `queues` сохранено.
+
+Релиз 3.1.0 (lsb-0010-05): `GET /notes/{id}` несёт связи заметки — `links` из
+ДРУГИХ неймспейсов (элемент {id, title, namespace, chars}, уровень 1 с
+фолбэком на уровень 0, arch §3.5). Новых ручек нет: отдельного просмотра связей
+не вводим (решение О. 2026-09-17).
 """
 
 from __future__ import annotations
@@ -55,6 +70,7 @@ import asyncio
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
+from app import __version__
 from app.config import Settings
 from app.services import Services
 from app.services.namespaces import NamespaceError, NamespaceValidationError
@@ -210,16 +226,34 @@ class TermUpdate(TermCreate):
     """
 
 
+class QueueStat(BaseModel):
+    """Снимок одной очереди для /health.queues (FR-2.2).
+
+    `pending` — сколько заданий ждёт в очереди; `oldest_pending_sec` — возраст
+    старейшего задания в секундах (null — очередь пуста).
+    """
+
+    pending: int
+    oldest_pending_sec: int | None
+
+
 class HealthResponse(BaseModel):
-    """Контракт /health (NFR-4): для docker healthcheck и оператора."""
+    """Контракт /health (NFR-4): для docker healthcheck и оператора.
+
+    `version` — версия приложения (FR-4.2, techdebt-0036): источник ровно один
+    — `app.__version__` (§7.1 канона), дублирующего поля в настройках нет.
+    Оператор сверяет её с тегом релиза: «на контуре поднят ровно этот релиз».
+    """
 
     status: str
+    version: str  # techdebt-0036 (FR-4.2): версия приложения
     embedding_ok: bool | None  # Фаза 3
     summarizer_ok: bool | None  # Фаза 4
     judge_ok: bool | None  # Фаза 11: судья дедупа/структуры (слот judge)
     notes_count: int
     pending_vector: int
     pending_summary: int
+    queues: dict[str, QueueStat]  # lsb-0014-03: ожидание по каждой очереди
 
 
 def _services(request: Request) -> Services:
@@ -286,17 +320,27 @@ def build_rest_router(settings: Settings) -> APIRouter:
         проверка при ok даёт True; при недоступности остаётся None — False
         поставит первый реальный отказ, см. app/main.py).
         Счётчики — из БД: активные заметки (trash не обслуживается).
+        `queues` — снимки очередей джоб (FR-2.2, lsb-0014-03): по каждой
+        очереди число ожидающих заданий и возраст старейшего; собираются
+        воркером по реестру, только SQL — обращений к моделям нет.
+        Легаси-поля (`pending_vector`/`pending_summary`) сохранены.
+        `version` — версия приложения (FR-4.2, techdebt-0036): оператор
+        сверяет её с тегом релиза при приёмке.
         """
         services = _services(request)
+        worker = request.app.state.worker  # type: ignore[attr-defined]
         counts = await asyncio.to_thread(services.notes.health_counts)
+        queues = await asyncio.to_thread(worker.queues_health)
         return HealthResponse(
             status="ok",
+            version=__version__,
             embedding_ok=services.embedding.last_attempt_ok,
             summarizer_ok=services.summary.last_attempt_ok,
             judge_ok=services.judge.last_attempt_ok,
             notes_count=counts["notes_count"],
             pending_vector=counts["pending_vector"],
             pending_summary=counts["pending_summary"],
+            queues=queues,
         )
 
     @rest_router.post("/notes", status_code=201)
@@ -326,26 +370,49 @@ def build_rest_router(settings: Settings) -> APIRouter:
         limit: int | None = Query(default=None, ge=1, le=50),
         offset: int = Query(default=0, ge=0),
     ) -> dict:
-        """Обзор памяти: краткие содержания по свежести + total (FR-2)."""
+        """Обзор памяти: страница кратких содержаний + поля пагинации (FR-2).
+
+        lsb-0013-02 (arch §3.4): потолок поверхности (`list_max_limit_rest`,
+        50) проверяет сервис, в ответе — те же поля страницы, что у MCP
+        (`total`/`has_more`/`next_offset`/`next_cursor`); подсказки «+N more»
+        на REST нет — полный контракт оператора.
+        """
         try:
             return await asyncio.to_thread(
-                _services(request).notes.list, limit, offset
+                _services(request).notes.list,
+                limit,
+                offset,
+                max_limit=settings.list_max_limit_rest,
             )
         except NoteValidationError as exc:
             raise _unprocessable(exc) from exc
 
     @rest_router.get("/notes/{note_id}")
     async def get_note(note_id: int, request: Request) -> dict:
-        """Полный текст одной заметки (одиночный алиас batch memory_get)."""
-        result = await asyncio.to_thread(
-            _services(request).notes.get, [note_id]
-        )
+        """Полный текст одной заметки + связи из ДРУГИХ неймспейсов.
+
+        Одиночный алиас batch memory_get: сервисный контракт полный (`chars` —
+        объём текста), lsb-0010-05 добавляет `links` — элемент {id, title,
+        namespace, chars} (сборка — на уровне транспорта, arch §3.5). Отдельной
+        операторской ручки просмотра связей НЕТ (решение О. 2026-09-17): связи
+        видны в чтении заметки, таблица доступна в БД.
+        """
+        services = _services(request)
+        result = await asyncio.to_thread(services.notes.get, [note_id])
         if not result["notes"]:
             raise HTTPException(
                 status_code=404,
                 detail=result.get("hint", "заметка не найдена"),
             )
-        return result["notes"][0]
+        note = dict(result["notes"][0])
+        # Пустой список — нормальный ответ: без `hint` и без подсказок.
+        # `Services.links` в DI-сборках тестов может быть None (без связей) —
+        # деградируем до пустого списка, как анонс навыков без области (lsb-0007).
+        links = services.links
+        note["links"] = (
+            list(await asyncio.to_thread(links.related, note_id)) if links else []
+        )
+        return note
 
     @rest_router.put("/notes/{note_id}")
     async def update_note(note_id: int, payload: NoteUpdate, request: Request) -> dict:
@@ -535,15 +602,23 @@ def build_rest_router(settings: Settings) -> APIRouter:
         собирается тот же композит §3.1, что и у `GET /skills/{id}` (включая
         секцию глобального `instruction_template`). Архив версий и удалённые
         строки в листинг не попадают.
+        lsb-0013-02 (arch §3.4): в сервис уходит потолок поверхности
+        (`list_max_limit_rest`), в ответе — те же поля страницы, что у MCP;
+        подсказки «+N more» на REST нет.
         """
         skills = _skills_service(request)
 
         def _full_listing() -> dict:
             """Сервисные вызовы в одном потоке: листинг + композит по каждому."""
-            listing = skills.list(limit, offset)
+            listing = skills.list(
+                limit, offset, max_limit=settings.list_max_limit_rest
+            )
             return {
                 "items": [skills.get(item["id"]) for item in listing["items"]],
                 "total": listing["total"],
+                "has_more": listing["has_more"],
+                "next_offset": listing["next_offset"],
+                "next_cursor": listing["next_cursor"],
             }
 
         try:

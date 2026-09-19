@@ -16,7 +16,6 @@ from fakes import HashEmbedder
 from app.config import TITLE_MAX_WORDS, get_settings
 from app.services.namespaces import NamespaceError, NamespaceService
 from app.services.notes import (
-    MAX_LIST_LIMIT,
     TITLE_HINT,
     NoteService,
     NoteValidationError,
@@ -131,8 +130,10 @@ class TestGet:
             "id", "title", "text", "summary", "summary_status",
             "author", "created_at", "updated_at", "namespace",  # Фаза 10 + title (Фаза 11)
             "expires_at",  # lsb-0004-02
+            "chars",  # lsb-0010-04 (FR-4.1): объём полного текста в символах
         }
         assert notes[0]["text"] == "Полный текст заметки"
+        assert notes[0]["chars"] == len("Полный текст заметки")  # lsb-0010-04
         assert notes[0]["summary_status"] == "pending"
         assert notes[0]["namespace"] == "default"  # save без namespace → default (Фаза 10)
         assert notes[0]["title"] is None  # легаси-путь save без title (решение №9)
@@ -214,7 +215,9 @@ class TestList:
             "id", "title", "summary", "summary_status", "author",
             "created_at", "updated_at", "namespace",  # Фаза 10 + title (Фаза 11)
             "expires_at",  # lsb-0004-02
+            "chars",  # lsb-0010-04 (FR-4.1): объём полного текста в символах
         }
+        assert item["chars"] == len(long_text(300))  # lsb-0010-04: полный текст
         assert item["author"] == "model-x"
         assert item["namespace"] == "default"  # Фаза 10
         assert item["title"] is None  # легаси-путь save без title (решение №9)
@@ -263,13 +266,14 @@ class TestList:
         assert [item["id"] for item in result["items"]] == [1]
 
     def test_limit_validation(self, service: NoteService) -> None:
+        ceiling = get_settings().list_max_limit_rest  # lsb-0013: surface ceiling
         with pytest.raises(NoteValidationError):
             service.list(limit=0)
         with pytest.raises(NoteValidationError):
-            service.list(limit=MAX_LIST_LIMIT + 1)
+            service.list(limit=ceiling + 1)
         with pytest.raises(NoteValidationError):
             service.list(offset=-1)
-        assert service.list(limit=MAX_LIST_LIMIT)["items"] == []
+        assert service.list(limit=ceiling)["items"] == []
 
 
 class TestUpdate:
