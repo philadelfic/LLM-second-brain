@@ -83,7 +83,7 @@ services:
       DEDUP_CANDIDATE_TOP_N: "3"             # top-N cosine candidates for the dedup judge
       DEDUP_CANDIDATE_SIMILARITY: "0.80"     # lower paraphrase-candidate threshold (≤ DEDUP_SIMILARITY)
       # --- summarization (mode "B") ---
-      MAX_SUMMARY_CHARS: "200"
+      MAX_SUMMARY_CHARS: "150"               # summary length limit: model summary + fallback (gate 2026-09-19)
       SUMMARY_THINK: "true"                  # keep model reasoning; ollama provider only
       SUMMARY_NUM_PREDICT: "35000"           # thinking+content budget for summaries
       MERGE_NUM_PREDICT: "35000"             # separate budget for duplicate merges

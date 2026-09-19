@@ -181,12 +181,12 @@ class TestGet:
         note = service.get([1])["notes"][0]
         assert note["summary"] == "Коротко и ясно"
 
-    def test_fallback_summary_truncated_at_200(self, service: NoteService) -> None:
-        """Fallback: первые MAX_SUMMARY_CHARS=200 символов текста (§5.5)."""
+    def test_fallback_summary_truncated_at_limit(self, service: NoteService) -> None:
+        """Fallback: первые MAX_SUMMARY_CHARS=150 символов текста (§5.5)."""
         service.save(long_text(500))
         note = service.get([1])["notes"][0]
-        assert note["summary"] == long_text(500)[:200]
-        assert len(note["summary"]) == 200
+        assert note["summary"] == long_text(500)[:150]
+        assert len(note["summary"]) == 150
 
     def test_fallback_uses_env_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """MAX_SUMMARY_CHARS — настраиваемое (REQUIREMENTS §8)."""
@@ -221,7 +221,7 @@ class TestList:
         assert item["author"] == "model-x"
         assert item["namespace"] == "default"  # Фаза 10
         assert item["title"] is None  # легаси-путь save без title (решение №9)
-        assert item["summary"] == long_text(300)[:200]  # fallback-усечение
+        assert item["summary"] == long_text(300)[:150]  # fallback-усечение
 
     def test_total_and_pagination(self, service: NoteService) -> None:
         for i in range(1, 26):  # 25 заметок
@@ -295,7 +295,7 @@ class TestUpdate:
         service.save(long_text(250))
         service.update(1, "Совсем другой текст: " + long_text(300))
         note = service.get([1])["notes"][0]
-        assert note["summary"] == note["text"][:200]
+        assert note["summary"] == note["text"][:150]
 
     def test_unknown_id_soft_answer(self, service: NoteService) -> None:
         """FR-5: неизвестный id → «заметка не найдена» без исключения."""

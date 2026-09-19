@@ -48,6 +48,11 @@ CRUD (валидации, статусы, soft delete) — в `app.services.note
   на пару, канонический порядок `note_a < note_b`) + маркер расчёта
   `notes.links_at` — идемпотентная миграция при старте; смена модели или
   размерности эмбеддинга (автореиндексация ниже) очищает и связи.
+- Лимит длины саммари (гейт 3.1.0, 2026-09-19): активные заметки с готовым
+  саммари длиннее MAX_SUMMARY_CHARS помечаются на перегенерацию
+  (`summary_status='pending'`) — текст саммари НЕ портится усечением, его
+  заменяет фоновая джоба `summary`; идемпотентно (после перегенерации
+  повторный старт — no-op), заметки с `summary_status != 'ok'` уже в очереди.
 - Области 3.0.0 (субстрат, ARCH substrate §3.1–3.2): отдельные таблицы,
   FTS5-индексы и vec0-индексы по областям skills/terms/user в той же БД.
   Ни один объект заметок не пересоздаётся; старые записи не мигрируются
@@ -614,6 +619,9 @@ def init_db(settings: Settings) -> None:
             # — идемпотентно; у существующих заметок NULL (первый прогон джобы
             # `nodes` разбирает накопленный default — ретро-прогон, arch §4).
             _migrate_node_order_columns(conn)
+            # Лимит длины саммари (гейт 3.1.0, 2026-09-19): готовые саммари
+            # длиннее MAX_SUMMARY_CHARS → pending (перегенерация фоном).
+            _migrate_summary_length(conn, settings)
             # List-индексы (пул 15): старый idx_notes_namespace заменён
             # (prefix namespace, deleted_at покрыт новым ns-индексом).
             conn.execute("DROP INDEX IF EXISTS idx_notes_namespace")
@@ -832,6 +840,50 @@ def _migrate_link_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE notes ADD COLUMN links_at TEXT")
     conn.execute(_LINKS_DDL)
     conn.execute(_LINKS_INDEX_DDL)
+
+
+def _migrate_summary_length(
+    conn: sqlite3.Connection, settings: Settings
+) -> None:
+    """Миграция гейта 3.1.0 (2026-09-19): саммари длиннее лимита — на перегенерацию.
+
+    Лимит длины саммари снижен до MAX_SUMMARY_CHARS (150): у живой БД уже
+    сохранённые более длинные саммари надо переделать. Хранимый текст здесь
+    НЕ трогается (грубое `substr` запрещено: обрезанная посередине фразы
+    выжимка хуже отсутствия): заметка помечается `summary_status='pending'`,
+    а новую выжимку кладёт фоновая джоба `summary` (`worker.process_summary_pending`
+    — `cap_summary` держит лимит). Пока саммари перегенерируется, выдачи
+    отдают fallback-усечение текста заметки (§5.5) — оно уже ≤ лимита.
+
+    Идемпотентность: после перегенерации саммари ≤ лимита — повторный старт
+    ничего не находит (no-op), штамп в meta не нужен.
+
+    Что не трогаем:
+    - заметки с `summary_status != 'ok'` — они и так в очереди суммаризации
+      (повторная пометка ничего не меняет, статус не переписывается);
+    - trash (`deleted_at IS NOT NULL`) — джоба `summary` его не обслуживает,
+      заметка осталась бы вечно pending; саммари мусорных строк не важно.
+
+    Признака происхождения саммари в схеме нет (модель или явная передача),
+    поэтому явно вписанные длинные саммари тоже уходят на перегенерацию —
+    лимит один на всё поле `summary`.
+    """
+    cursor = conn.execute(
+        "UPDATE notes SET summary_status = 'pending' "
+        "WHERE summary_status = 'ok' AND deleted_at IS NULL "
+        "AND length(summary) > ?",
+        (settings.max_summary_chars,),
+    )
+    if cursor.rowcount:
+        logging.getLogger("app").warning(
+            "summaries above the length limit queued for regeneration",
+            extra={
+                "event": "summary_regen_queued",
+                "notes": cursor.rowcount,
+                "reason": "summary_length",
+                "max_summary_chars": settings.max_summary_chars,
+            },
+        )
 
 
 def _ensure_skills_meta(conn: sqlite3.Connection) -> None:

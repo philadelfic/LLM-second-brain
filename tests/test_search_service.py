@@ -170,7 +170,7 @@ class TestOutput:
         searcher, notes_service = service
         notes_service.save("Сервис TaskFlow " + long_text(250))
         hit = self._first(searcher, 1)
-        expected = ("Сервис TaskFlow " + long_text(250))[:200]
+        expected = ("Сервис TaskFlow " + long_text(250))[:150]
         assert hit["summary"] == expected
         assert hit["summary_status"] == "pending"
 

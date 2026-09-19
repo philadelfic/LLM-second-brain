@@ -14,9 +14,11 @@ What makes it different from `e2e_release30.py`:
   fired are printed per stage: a slow model reads as "we waited", not as a
   false FAIL (FR-1.2/FR-1.3);
 * the run is idempotent: probe data is marked by the run prefix (in titles) and
-  by its own namespace, and is removed both at the start (leftovers of a
-  previous run) and at the end (its own); no check depends on leftovers
-  (FR-2.1/FR-2.2);
+  is removed both at the start (leftovers of a previous run) and at the end (its
+  own); the probe NODES carry fixed names and are reused as is — a repeated
+  registration answers with the synonym refusal whose nearest node is the
+  requested path itself, and the harness reads that as "the node is already
+  registered", not as a FAIL; no check depends on leftovers (FR-2.1/FR-2.2);
 * teardown always writes a trace "what was removed / what was left on purpose"
   to `release/3.1.0/acceptance/teardown-<timestamp>.log` — also on an emergency
   exit, so the next run can still be started (FR-3.1/FR-3.2);
@@ -38,16 +40,22 @@ Scenarios (0-9), per the techdebt-0036-01 spec:
      chunks).
   3. Links: level 0 immediately, level 1 after the job (and it wins over
      level 0), chunk reads carry links, batch reads do not, soft-deleted notes
-     are never served, the own namespace is cut off.
+     are never served, the own namespace is cut off (the twin note kept in the
+     checked node is never served).
   4. Background jobs: models unavailable → `pending` and its age grow
      (`/health.queues`), the `queue_waiting` event appears in the log → models
      are back → jobs finish with NO container restart.
   5. Node order: the accumulated `default` is drained (fast path plus the
-     classifier within its budget), a processed note is not processed twice,
+     classifier within its budget), the sweep does not pass over a note twice
+     (only the markers it set itself, `source=sweep`, are compared; an update
+     by the after-merge path — `source=after_merge` — is allowed and reported),
      the queue goes back to empty.
   6. `/health` = 7 previous fields + `queues` + `version`.
-  7. Context budgets: `memory_search` top_k=5 ≤ 1.2 KB, `memory_list` ≤ 1.5 KB,
-     the links overhead ≤ 0.5 KB.
+  7. Context budgets, measured AFTER the vector/summary queues drain:
+     `memory_search` top_k=5 ≤ 450 B PER ITEM, `memory_list`
+     (detail=summaries) ≤ 500 B PER ITEM, one `memory_list(detail=titles)`
+     page (20 items) ≤ 1.5 KB, the links overhead ≤ 0.5 KB; the actual bytes
+     are printed as a trend, not only the verdict.
   8. Live DB upgrade v3.0.0 → 3.1.0: the `links` table and the
      `links_at`/`node_order_at` columns are there, notes are intact, a repeated
      start is a no-op, and an MCP session comes up again.
@@ -92,13 +100,70 @@ MCP_TOOL_GROUPS = {"memory_": 8, "skills_": 5, "user_": 5, "terms_": 3}
 HEALTH_LEGACY = ("status", "embedding_ok", "summarizer_ok", "judge_ok",
                  "notes_count", "pending_vector", "pending_summary")
 HEALTH_QUEUES = ("vector", "summary", "judge", "areas", "links", "nodes")
-BUDGET_SEARCH = 1200    # bytes of the compact memory_search answer (top_k=5)
-BUDGET_LIST = 1500      # bytes of one memory_list page
-BUDGET_LINKS = 500      # bytes of the links array of one note
+# Бюджеты канона §4.2.6 — НОРМЫ НА ЭЛЕМЕНТ выдачи (решение гейта 2026-09-19):
+# страничные пороги 1.2/1.5 КБ калибровались на мелких заметках и на живой базе
+# недостижимы (элемент ≈110 B фиксированных полей + ~2 байта на символ кириллицы в
+# summary). Страничная норма 1.5 КБ осталась ТОЛЬКО у дешёвой формы
+# `memory_list(detail="titles")` на странице 20 записей; замер бюджетов — ПОСЛЕ
+# дренажа очередей (иначе в него попадают саммари старого лимита — сценарий 7).
+BUDGET_SEARCH_ITEM = 450        # bytes per item of memory_search top_k=5
+BUDGET_LIST_ITEM = 500          # bytes per item of memory_list (detail=summaries)
+BUDGET_LIST_TITLES_PAGE = 1500  # bytes of a memory_list(detail=titles) page (20 items)
+BUDGET_LINKS = 500              # bytes of the links array of one note
 MORE_HINT = re.compile(r"^\+(\d+) more — offset=(\d+)$")
 LINK_ITEM_FIELDS = {"id", "title", "namespace", "chars"}
 UPGRADE_TABLES = ("links",)
 UPGRADE_COLUMNS = ("links_at", "node_order_at")
+
+# --- probe namespaces: FIXED names, reused between runs (techdebt-0036) -------
+# Имена зондов не несут тега прогона: имя вида `e2e31-<run_id>` встроенная
+# антисинонимия приложения (эмбеддер, порог косинуса ОПИСАНИЙ 0.90) считает почти
+# тем же узлом, что зонд прошлого прогона (цифровой суффикс тега для эмбеддера не
+# различает имена), и регистрация мягко отклоняется с `reason=synonym`. Ручки
+# удаления узла в MCP-поверхности нет, поэтому зонд регистрируется однажды и
+# дальше ПЕРЕИСПОЛЬЗУЕТСЯ, а мягкий отказ `nearest == запрошенный путь` харнесс
+# читает как «узел уже зарегистрирован» (см. `node_creation`). Тег прогона живёт
+# только в заголовках заметок — он и обеспечивает идемпотентность по данным.
+# Описания — из намеренно разных тем, без общего шаблона: сравнение идёт против
+# описаний ВСЕХ тематических узлов реестра.
+PROBE_ROOT = "acceptance-probes"
+PROBE_ROOT_DESC = (
+    "Basket of throwaway specimen notes for the release gate — one check "
+    "writes them, the same check erases them."
+)
+PROBE_CHILDREN = (
+    (
+        "acceptance-probes/index-ranking",
+        "Rebuilding the embedding index: the cosine ranking must stay stable "
+        "while the encoder works through the queue one text at a time.",
+    ),
+    (
+        "acceptance-probes/changelog-drafts",
+        "Changelog wording and version bump bookkeeping of a release entry, "
+        "plus the rollout checklist.",
+    ),
+)
+
+# Зонды сценария 5 («порядок в узлах»): имена заметок и тексты — из НАМЕРЕННО
+# разных тем без общей лексики (кулинария / велосипед / астрономия). Тег прогона
+# живёт только в заголовке (идемпотентная уборка) и на семантику не влияет.
+# Почти идентичные тексты фон штатно СШИВАЕТ (`dedup_merged`), и маркер разбора
+# после сшивания обновляется законно (`source=after_merge`) — тогда проверка
+# анти-зацикливания обхода видела бы не двойную обработку, а слияние.
+NODE_ORDER_PROBES = (
+    ("sourdough starter",
+     "Feeding schedule for a sourdough starter: hydration, fermentation time and "
+     "oven spring in a home kitchen."),
+    ("bicycle drivetrain",
+     "Choosing a bicycle drivetrain for steep climbs: cassette range, chainring "
+     "size and gear steps."),
+    ("meteor photography",
+     "Night-sky photography during a meteor shower: tripod stability, exposure "
+     "settings and light pollution."),
+)
+PROBE_PATHS = (PROBE_ROOT, *(path for path, _desc in PROBE_CHILDREN))
+_SYNONYM_HINT = re.compile(r"there is a similar one:\s*(\S+)")
+_ALREADY_REGISTERED = re.compile(r"already registered", re.IGNORECASE)
 
 # --- run configuration (filled in main) --------------------------------------
 CFG: dict[str, Any] = {}
@@ -175,6 +240,67 @@ def manual(name: str, note: str = "") -> None:
     print(f"  [MANUAL] {name}" + (f" — {note}" if note else ""))
 
 
+def pre_warn(message: str, detail: str = "") -> None:
+    """Предупреждение ВНЕ сценария (шаг пред-очистки, до сценария 0).
+
+    `warn()` на этом шаге упал бы (KeyError): он пишет счётчики текущего
+    сценария, а сценария ещё нет — поправка по прогону этапа 6.
+    """
+    global WARN
+    WARN += 1
+    WARNINGS.append(f"pre-cleanup: {message}")
+    print(f"  [WARN] {message}" + (f" — {detail}" if detail else ""))
+
+
+def refusal(result: dict) -> str:
+    """Текст мягкого отказа приложения (`hint`/`reason`), иначе — пустая строка.
+
+    Инструменты отдают отказ полем `hint` (и дублируют причину в `reason` лога):
+    без него в отчёте остаётся только `id=None` (дефект прогона этапа 6).
+    """
+    for field in ("hint", "reason"):
+        value = result.get(field)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def note_detail(result: dict) -> str:
+    """Деталь проверки о создании заметки: `id`, при мягком отказе — и причина."""
+    if result.get("id") is not None:
+        return f"id={result['id']}"
+    reason = refusal(result)
+    return f"id=None, reason={reason}" if reason else "id=None (the tool gave no hint)"
+
+
+def node_creation(path: str, result: dict) -> tuple[bool, str]:
+    """Итог идемпотентной регистрации узла-зонда: `(успех, деталь для отчёта)`.
+
+    Успех — узел создан ЭТИМ прогоном ИЛИ уже зарегистрирован (повторный
+    прогон). Повторный прогон получает от антисинонимии приложения (порог
+    косинуса описаний 0.90) мягкий отказ `created=False` с подсказкой
+    `hint='there is a similar one: <nearest>'`; у фиксированного зонда
+    `nearest` равен самому запрошенному пути (описание сравнивается с самим
+    собой) — это и есть «узел на месте». Любой другой отказ (в том числе
+    `nearest` на ЧУЖОЙ узел) — FAIL с причиной и `nearest`: имя и описание зонда
+    надо развести с существующим узлом.
+    """
+    if result.get("created") is True:
+        return True, f"path={result.get('path') or path}, created now"
+    hint = refusal(result)
+    match = _SYNONYM_HINT.search(hint)
+    nearest = match.group(1).strip() if match else None
+    if nearest is not None and nearest == path:
+        return True, f"path={path}, already registered (nearest={nearest} — itself)"
+    if nearest is not None:
+        return False, (f"reason=synonym, nearest={nearest}, path={path} — another "
+                       "node is nearer than the requested one")
+    if _ALREADY_REGISTERED.search(hint) and path in hint:
+        return True, f"path={path}, already registered (the registry says so)"
+    reason = hint or "no hint from the tool"
+    return False, f"path={path}, created={result.get('created')!r}, reason={reason}"
+
+
 def scenario(n: int, title: str) -> None:
     global SCENARIO
     close_scenario()
@@ -219,6 +345,16 @@ def json_size(obj: Any) -> int:
     return len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
 
 
+def bytes_per_item(size: int, count: int) -> float | None:
+    """Байты на элемент выдачи — норма канона §4.2.6; None, если элементов нет."""
+    return (size / count) if count else None
+
+
+def fmt_bytes(value: float | None) -> str:
+    """Байты для отчёта; None (элементов нет) печатается как `n/a`."""
+    return "n/a" if value is None else f"{value:.1f}"
+
+
 # --- teardown trace (FR-3.1/FR-3.2) -------------------------------------------
 
 def teardown_note(line: str) -> None:
@@ -249,6 +385,8 @@ def write_teardown_trace() -> Path | None:
         f"image: {CFG.get('image') or '(not set)'} | revision: "
         f"{ENV.get('revision') or '(unknown)'} | version: {ENV.get('version') or '(unknown)'}",
         f"run prefix: {CFG.get('prefix')} | identifiers: {RUN}",
+        f"probe nodes: {', '.join(PROBE_PATHS)} (fixed names, left in place on "
+        "purpose — the MCP surface has no node delete handle)",
         f"DB: {CFG.get('db')} ({ENV.get('db_size') or 'size unknown'})",
         "---",
     ]
@@ -354,10 +492,18 @@ async def wait_until(predicate: Callable[[], Awaitable[tuple[bool, str]]],
                      poll: float | None = None) -> tuple[bool, str]:
     """Wait for a state to become observable; the guard timeout is `E2E_WAIT_SEC`.
 
-    `predicate` returns (done, detail). The actual wait and whether the guard
-    fired are recorded in WAITS and printed in the report, so a slow model is
-    visible as "we waited N s" while an unreachable one hits the guard.
+    `predicate` is called on every poll — pass the callable itself, never its
+    call result. `predicate` returns (done, detail). The actual wait and whether
+    the guard fired are recorded in WAITS and printed in the report, so a slow
+    model is visible as "we waited N s" while an unreachable one hits the guard.
     """
+    if not callable(predicate):
+        # Вызванная корутина вместо предиката давала TypeError внутри поллинга и
+        # «ждала» до предохранителя (прогон этапа 6): ловим ошибку сразу и внятно.
+        raise TypeError(
+            "wait_until: the predicate must be callable — pass the function "
+            f"itself, not its call result (got {type(predicate).__name__})"
+        )
     timeout = CFG["wait_sec"] if timeout is None else timeout
     poll = CFG["poll_sec"] if poll is None else poll
     started = time.monotonic()
@@ -452,11 +598,54 @@ def db_cell(table: str, row_id: int, column: str, *,
     return predicate
 
 
+def reclass_note_ids(ids: list[int]) -> set[int]:
+    """Заметки с заданием `nodes`/`reclass` — след сшивания дубликата (lsb-0012).
+
+    `merge_pair` сбрасывает у ранней заметки маркер `node_order_at` (она снова
+    кандидат разбора) и ставит в `worker_jobs` задание `reclass`; по нему видно,
+    что новый маркер законно поставлен путём после сшивания (`source=after_merge`),
+    а не повторным обходом `default` (`source=sweep`). Таблицы `worker_jobs` может
+    ещё не быть (задания не ставились) — тогда следов сшивания нет.
+    """
+    if not ids or not db_ready():
+        return set()
+    placeholders = ",".join("?" * len(ids))
+    rows, _err = db_try(
+        f"SELECT DISTINCT note_id FROM worker_jobs WHERE slot = 'nodes' "
+        f"AND kind = 'reclass' AND note_id IN ({placeholders})",
+        tuple(ids),
+    )
+    return {row["note_id"] for row in rows or []}
+
+
 def contains(haystack: Any, needle: str) -> bool:
     """Is the substring present in an arbitrary value (dict/list → JSON)."""
     if isinstance(haystack, str):
         return needle in haystack
     return needle in json.dumps(haystack, ensure_ascii=False)
+
+
+async def wait_for_vectors(*ids: int) -> tuple[bool, str]:
+    """Дождаться готовых векторов заметок (наблюдаемое состояние, не пауза).
+
+    Уровень 0 связей — KNN по вектору самой заметки: без готового вектора
+    проверки уровня 0 были бы ложным FAIL. Джоба `links` при этом не ждётся —
+    её требует только уровень 1 (смысл проверки «уровень 0 приходит сразу»).
+    Без БД готовность вектора не наблюдается — проверку делает сам сценарий.
+    """
+    if not ids or not db_ready():
+        return True, "the DB is not reachable — the vector readiness is not observable"
+
+    async def ready() -> tuple[bool, str]:
+        placeholders = ",".join("?" * len(ids))
+        done, _err = db_scalar(
+            f"SELECT COUNT(*) FROM notes WHERE id IN ({placeholders}) "
+            "AND vector_status = 'ok'",
+            tuple(ids),
+        )
+        return done == len(ids), f"vectorized {done}/{len(ids)}"
+
+    return await wait_until(ready, "the probe notes have vectors (level 0 reads them)")
 
 
 # --- /health ------------------------------------------------------------------
@@ -614,11 +803,29 @@ async def probe_titles(c: Client, prefix: str) -> list[dict]:
             if prefix in (item.get("title") or "")]
 
 
-async def prepare_leftovers() -> None:
-    """Remove the leftovers of a previous run (idempotency, FR-2.1).
+async def ensure_probe_node(c: Client, path: str, description: str) -> bool:
+    """Зарегистрировать узел-зонд идемпотентно и отчитаться одной проверкой.
 
-    A repeated run must not trip over its own dedup/anti-synonymy, so the probe
-    data of every earlier run (the same prefix) is deleted before the scenarios.
+    Имя и описание зонда ФИКСИРОВАНЫ (PROBE_ROOT/PROBE_CHILDREN), поэтому
+    повторный прогон получает от антисинонимии приложения мягкий отказ с
+    `nearest`, равным запрошенному пути, — это успех («узел уже зарегистрирован»),
+    а не FAIL (см. `node_creation`).
+    """
+    result = await c.call("memory_namespace_create",
+                          {"path": path, "description": description})
+    ok, detail = node_creation(path, result)
+    check(f"probe namespace {path} is registered", ok, detail)
+    return ok
+
+
+async def prepare_leftovers() -> None:
+    """Remove the probe NOTES of a previous run (idempotency, FR-2.1).
+
+    A repeated run must not trip over its own note-level dedup, so the probe notes
+    of every earlier run (matched by the TITLE prefix) are deleted before the
+    scenarios. The probe NODES are never touched: the MCP surface has no node
+    delete handle, while the probe names are FIXED (PROBE_ROOT/PROBE_CHILDREN) —
+    a repeated run simply reuses the nodes already registered (`node_creation`).
     `--no-cleanup` / LSB_KEEP=1 turns this off for diagnostics.
     """
     if CFG["no_cleanup"]:
@@ -632,7 +839,8 @@ async def prepare_leftovers() -> None:
         try:
             c, _init = await fresh_session(stack)
         except Exception as exc:  # noqa: BLE001 — auxiliary step, not a scenario
-            warn("pre-cleanup was not performed", describe(exc))
+            pre_warn("pre-cleanup was not performed (the MCP session did not open)",
+                     describe(exc))
             teardown_note(f"pre-cleanup failed ({describe(exc)}) — probe notes "
                           f"with prefix {CFG['prefix']} may stay in the base")
             return
@@ -670,22 +878,6 @@ async def cleanup_own_data() -> None:
             teardown_note(f"probe notes were NOT removed ({describe(exc)}) — "
                           f"prefix {CFG['prefix']}")
         await c.close()
-
-
-async def cleanup_namespaces(rest: httpx2.AsyncClient) -> None:
-    """Remove the run's probe namespaces (children first, then the root)."""
-    root = RUN["ns"]
-    for path in (f"{root}/a", f"{root}/b", f"{root}/same", root):
-        try:
-            r = await rest.delete(f"/namespaces/{path}")
-        except Exception as exc:  # noqa: BLE001
-            teardown_note(f"namespace {path} was NOT removed ({describe(exc)})")
-            continue
-        if r.status_code in (200, 204, 404):
-            teardown_note(f"removed namespace {path} (http {r.status_code})")
-        else:
-            teardown_note(f"namespace {path} was left on purpose (http "
-                          f"{r.status_code}) — an operator step is needed")
 
 
 # --- scenario 0: surface and readiness ---------------------------------------
@@ -830,12 +1022,15 @@ async def scenario_1_limits(c: Client, rest: httpx2.AsyncClient) -> None:
 
 async def scenario_2_chars(c: Client, rest: httpx2.AsyncClient) -> int | None:
     scenario(2, "chars is consistent between memory_search / memory_list / memory_get")
+    # Заметкам сценария нужен ЗАРЕГИСТРИРОВАННЫЙ узел (save узлы не создаёт),
+    # а зонд фиксирован и переиспользуется: регистрация идемпотентна.
+    await ensure_probe_node(c, PROBE_ROOT, PROBE_ROOT_DESC)
     text = (f"{RUN['tag']} chars probe: the release acceptance checks the note volume "
             "field across the compact outputs.")
     saved = await c.call("memory_save", {"text": text, "title": RUN["note_chars"],
                                          "namespace": RUN["ns"]})
     nid = saved.get("id")
-    check("probe note for chars is created", nid is not None, f"id={nid}")
+    check("probe note for chars is created", nid is not None, note_detail(saved))
     if nid is None:
         return None
     RUN["notes"].append(nid)
@@ -869,7 +1064,7 @@ async def scenario_2_chars(c: Client, rest: httpx2.AsyncClient) -> int | None:
                                          "namespace": RUN["ns"]})
     long_id = saved.get("id")
     check("long probe note for the chunk mode is created", long_id is not None,
-          f"id={long_id}")
+          note_detail(saved))
     if long_id is None:
         return nid
     RUN["notes"].append(long_id)
@@ -906,52 +1101,72 @@ async def scenario_2_chars(c: Client, rest: httpx2.AsyncClient) -> int | None:
 async def scenario_3_links(c: Client, rest: httpx2.AsyncClient) -> int | None:
     scenario(3, "Links: level 0 at once, level 1 after the job, chunk/batch/soft-delete rules")
 
-    ns_a, ns_b, ns_same = f"{RUN['ns']}/a", f"{RUN['ns']}/b", f"{RUN['ns']}/same"
-    created = await c.call("memory_namespace_create", {
-        "path": RUN["ns"], "description": f"Acceptance probe nodes of run {RUN['tag']}.",
-    })
-    check("the run namespace is created (confirmed)", created.get("created") is True,
-          f"path={created.get('path')}")
-    for path, desc in ((ns_a, f"Acceptance probe area A of run {RUN['tag']}."),
-                       (ns_b, f"Acceptance probe area B of run {RUN['tag']}."),
-                       (ns_same, f"Acceptance probe area C of run {RUN['tag']}.")):
-        res = await c.call("memory_namespace_create", {"path": path, "description": desc})
-        check(f"probe namespace {path} is created", res.get("created") is True,
-              f"status={res.get('status')}")
+    probes = PROBE_CHILDREN
+    (ns_a, _desc_a), (ns_b, _desc_b) = probes
+
+    # Корень зондов регистрируется сценарием 2 (там же лежат его заметки), здесь —
+    # два семантически разных листа: заметки для проверки связей должны лежать в
+    # РАЗНЫХ узлах. Регистрация идемпотентна (повторный прогон переиспользует узлы).
+    nodes_ok = True
+    for path, desc in probes:
+        nodes_ok = await ensure_probe_node(c, path, desc) and nodes_ok
+    if not nodes_ok:
+        # Без узлов заметки в двух разных узлах и заметка-двойник не создаются
+        # (id=None), а проверки связей недостижимы — одна причина вместо града FAIL'ов.
+        return None
 
     topic = (f"{RUN['tag']} vector index rebuild keeps the ranking stable while the "
              "embedding model queues requests one by one.")
     other = f"Another unrelated acceptance note of the same run {RUN['tag']}."
-    same = f"{topic} — the twin note of the same namespace."
+    # Двойник лежит в ТОМ ЖЕ узле, что и проверяемая заметка: именно его должно
+    # отсечь правило «связи — только из других разделов» (уровни 0 и 1). Формулировка
+    # отлична от topic намеренно: дословный дубль в своём узле приложение отклоняет
+    # (дубль легитимен только между узлами), а почти дословный текст (косинус выше
+    # DEDUP_CANDIDATE_SIMILARITY) уводил бы пару в фоновый дедуп — двойник мог бы
+    # быть сведён и удалён, и отсечение «своего» узла стало бы нечем проверять.
+    twin = (f"{RUN['tag']} search quality guard: after the index is rebuilt the "
+            "neighbour order in the answer must stay exactly the same, even when "
+            "the encoder processes queued texts slowly.")
 
     sa = await c.call("memory_save", {"text": topic, "title": RUN["note_links_a"],
                                       "namespace": ns_a})
     sb = await c.call("memory_save", {"text": topic, "title": RUN["note_links_b"],
                                       "namespace": ns_b})
-    ss = await c.call("memory_save", {"text": same, "title": RUN["note_links_same"],
-                                      "namespace": ns_same})
+    ss = await c.call("memory_save", {"text": twin, "title": RUN["note_links_same"],
+                                      "namespace": ns_a})
     so = await c.call("memory_save", {"text": other, "title": RUN["note_other"],
                                       "namespace": ns_b})
-    ids = [x.get("id") for x in (sa, sb, ss, so)]
-    check("the link probe notes are created", all(i is not None for i in ids), f"ids={ids}")
+    saves = (sa, sb, ss, so)
+    ids = [x.get("id") for x in saves]
+    check("the link probe notes are created", all(i is not None for i in ids),
+          ", ".join(note_detail(x) for x in saves))
     if any(i is None for i in ids):
-        return
+        return None
     RUN["notes"].extend(ids)
     na, nb, nsame, nother = ids
 
+    # Уровень 0 читает вектор самой заметки: без готового вектора KNN не вернёт
+    # ничего и проверки уровня 0 были бы ложным FAIL. Джоба `links` здесь НЕ ждётся —
+    # её требует только уровень 1 (смысл проверки — «уровень 0 приходит сразу»).
+    vectors_ok, vectors_detail = await wait_for_vectors(na, nb, nsame)
     got = await c.call("memory_get", {"id": na})
     links = got.get("links", [])
     check("memory_get carries a links field (single read)", "links" in got,
           f"keys={sorted(got)}")
-    check("a related note from another namespace is served at once (level 0)",
-          any(link.get("id") == nb for link in links), f"links={links}")
     check("link items carry {id, title, namespace, chars}",
           all(set(link) == LINK_ITEM_FIELDS for link in links),
           f"fields={[sorted(link) for link in links]}")
-    check("the own namespace is cut off when serving",
-          all(link.get("namespace") != ns_a for link in links),
-          f"namespaces={[link.get('namespace') for link in links]}")
-    check("the note is not linked to itself", all(link.get("id") != na for link in links))
+    if not vectors_ok:
+        skip("level 0 links of the probe notes",
+             f"the vectors are not ready within the guard ({vectors_detail})")
+    else:
+        check("a related note from another namespace is served at once (level 0)",
+              any(link.get("id") == nb for link in links), f"links={links}")
+        check("the own namespace is cut off when serving",
+              all(link.get("namespace") != ns_a for link in links),
+              f"namespaces={[link.get('namespace') for link in links]}")
+        check("the note is not linked to itself",
+              all(link.get("id") != na for link in links))
 
     if not db_ready():
         skip("level 1 after the links job", f"the DB is not reachable ({CFG['db']})")
@@ -991,6 +1206,14 @@ async def scenario_3_links(c: Client, rest: httpx2.AsyncClient) -> int | None:
                       "(level 1 wins over level 0)",
                       bool(links) and all(link.get("id") in stored_ids for link in links),
                       f"served={[link.get('id') for link in links]}, stored={sorted(stored_ids)}")
+                if nsame not in stored_ids:
+                    # Двойник из своего узла должен быть посчитан на уровне 1
+                    # (отсечение «своего» неймспейса делается при выдаче, не при
+                    # расчёте) — иначе отсекать нечего и проверка слабее, чем
+                    # выглядит; это наблюдение, не FAIL.
+                    warn("the twin from the checked node is not a stored level-1 pair",
+                         f"stored={sorted(stored_ids)} — the own-namespace cutoff "
+                         "had nothing to cut off")
                 check("the same-namespace twin is never served as a link",
                       all(link.get("id") != nsame for link in links),
                       f"links={[link.get('id') for link in links]}")
@@ -1023,7 +1246,7 @@ async def scenario_4_models_outage(c: Client, rest: httpx2.AsyncClient) -> None:
         skip("models unavailable → waiting → models back → jobs finished",
              "the contour hook is required: LSB_SLOT_OFF_CMD / LSB_SLOT_ON_CMD "
              "(e.g. scripts/slot_gate.sh off|on all — the default docker mode "
-             "pauses/unpauses the slot proxy containers of the contour, so no "
+             "stops/starts the slot proxy containers of the contour, so no "
              "privileges are needed and no LAN host is touched)")
         manual("scenario 4 (lsb-0014 FR-2.4)",
                "set LSB_SLOT_OFF_CMD / LSB_SLOT_ON_CMD to scripts/slot_gate.sh "
@@ -1046,7 +1269,8 @@ async def scenario_4_models_outage(c: Client, rest: httpx2.AsyncClient) -> None:
                                          "title": RUN["note_outage"],
                                          "namespace": RUN["ns"]})
     nid = saved.get("id")
-    check("the probe note of the outage scenario is created", nid is not None, f"id={nid}")
+    check("the probe note of the outage scenario is created", nid is not None,
+          note_detail(saved))
     if nid is not None:
         RUN["notes"].append(nid)
 
@@ -1111,7 +1335,7 @@ async def scenario_4_models_outage(c: Client, rest: httpx2.AsyncClient) -> None:
                 f"vector_status={row[0]['vector_status']!r}, " \
                 f"summary_status={row[0]['summary_status']!r}"
 
-        ok, detail = await wait_until(note_ready(), "the probe note is vectorized again")
+        ok, detail = await wait_until(note_ready, "the probe note is vectorized again")
         check("the deferred task was executed after the models returned", ok, detail)
     else:
         skip("the deferred task was executed after the models returned",
@@ -1154,16 +1378,21 @@ async def scenario_5_node_order(c: Client, rest: httpx2.AsyncClient) -> None:
     info(f"the default backlog at the start: {left} note(s) with a vector and no marker")
 
     created = []
-    for i in range(3):
+    refused = []
+    # Тексты и названия зондов — из разных тем (NODE_ORDER_PROBES): почти
+    # идентичные заметки фон штатно СШИВАЕТ, и проверка анти-зацикливания обхода
+    # превращалась бы в проверку сшивания (маркер законно обновлялся).
+    for i, (_topic, text) in enumerate(NODE_ORDER_PROBES):
         saved = await c.call("memory_save", {
-            "text": f"{RUN['tag']} node order probe {i}: the release acceptance checks "
-                    "that a note left in default is not classified twice.",
+            "text": text,
             "title": RUN["note_nodes"][i],
         })
         if saved.get("id") is not None:
             created.append(saved["id"])
+        else:
+            refused.append(f"probe {i}: {note_detail(saved)}")
     check("the node-order probe notes are created", len(created) == 3,
-          f"ids={created}")
+          f"ids={created}" + (f", refused: {'; '.join(refused)}" if refused else ""))
     RUN["notes"].extend(created)
     if not created:
         return
@@ -1175,7 +1404,7 @@ async def scenario_5_node_order(c: Client, rest: httpx2.AsyncClient) -> None:
             "AND node_order_at IS NOT NULL", tuple(created))
         return done == len(created), f"marked {done}/{len(created)}"
 
-    ok, detail = await wait_until(all_marked(),
+    ok, detail = await wait_until(all_marked,
                                   "the nodes job marked the probe notes (node_order_at)")
     check("the default sweep processes the backlog within the guard", ok, detail)
     if not ok:
@@ -1187,7 +1416,9 @@ async def scenario_5_node_order(c: Client, rest: httpx2.AsyncClient) -> None:
     before, _err = db_try(
         "SELECT id, node_order_at FROM notes WHERE id IN "
         f"({','.join('?' * len(created))})", tuple(created))
-    marks = {row["id"]: row["node_order_at"] for row in before or []}
+    # Маркеры ОБХОДА (`source=sweep`): заметки созданы с `node_order_at IS NULL`,
+    # и первый разбор им ставит подметание `default` — именно эти отметки и сверяем.
+    sweep_marks = {row["id"]: row["node_order_at"] for row in before or []}
 
     ok, detail = await wait_until(queue_empty(rest, "nodes"),
                                   "the nodes queue is drained")
@@ -1197,9 +1428,28 @@ async def scenario_5_node_order(c: Client, rest: httpx2.AsyncClient) -> None:
         "SELECT id, node_order_at FROM notes WHERE id IN "
         f"({','.join('?' * len(created))})", tuple(created))
     after_marks = {row["id"]: row["node_order_at"] for row in after or []}
-    same = all(after_marks.get(nid) == mark for nid, mark in marks.items())
-    check("a processed note is not processed twice (markers are unchanged)", same,
-          f"before={marks}, after={after_marks}")
+    # Анти-зацикливание обхода: разобранная подметанием заметка второй раз той же
+    # джобой не берётся. Маркер может обновиться ЗАКОННО — путём после сшивания
+    # (`source=after_merge`): `merge_pair` сбрасывает маркер и ставит задание
+    # `reclass`, которое перерешает узел (lsb-0012). Это не двойной обход: случай
+    # отмечается отдельной строкой в detail и WARN-отметкой по заметке.
+    merged = reclass_note_ids(created)
+    re_marked = sorted(nid for nid, mark in sweep_marks.items()
+                       if after_marks.get(nid) != mark)
+    after_merge = [nid for nid in re_marked if nid in merged]
+    repeated = [nid for nid in re_marked if nid not in merged]
+    detail = f"source=sweep markers={sweep_marks}, after={after_marks}"
+    if after_merge:
+        detail += ("; updated by the after_merge path (a merge was recorded for "
+                   f"these notes): {after_merge}")
+    if repeated:
+        detail += f"; swept again WITHOUT a merge: {repeated}"
+    check("a note is swept once: only the source=sweep markers are compared "
+          "(an after_merge update is allowed)", not repeated, detail)
+    for nid in after_merge:
+        warn(f"probe note {nid}: the marker was updated by the after_merge path "
+             f"(reclass after a merge), not by a repeated sweep",
+             f"{sweep_marks.get(nid)} → {after_marks.get(nid)}")
 
     budget = CFG["nodes_batch"]
     pending = queue_stat(await health_snapshot(rest), "nodes") or {}
@@ -1255,17 +1505,61 @@ async def scenario_6_health(rest: httpx2.AsyncClient) -> None:
 
 # --- scenario 7: context budgets ---------------------------------------------
 
-async def scenario_7_budgets(c: Client, note_with_links: int | None) -> None:
-    scenario(7, "Context budgets: search ≤ 1.2 KB, list ≤ 1.5 KB, links ≤ 0.5 KB")
+async def scenario_7_budgets(c: Client, rest: httpx2.AsyncClient,
+                             note_with_links: int | None) -> None:
+    scenario(7, "Context budgets (after the queue drain): search ≤ 450 B/item, "
+                "list ≤ 500 B/item, titles page ≤ 1.5 KB, links ≤ 0.5 KB")
 
+    # Бюджеты мерятся ПОСЛЕ дренажа очередей: саммари длиннее 150 символов (лимит
+    # 3.1.0) миграция уводит на перегенерацию, и старые длинные саммари дали бы
+    # завышенный, нерепрезентативный замер (решение гейта 2026-09-19).
+    async def queues_drained() -> tuple[bool, str]:
+        snapshot = await health_snapshot(rest)
+        pending_vector = snapshot.get("pending_vector")
+        pending_summary = snapshot.get("pending_summary")
+        done = pending_vector == 0 and pending_summary == 0
+        return done, f"pending_vector={pending_vector}, pending_summary={pending_summary}"
+
+    ok, detail = await wait_until(
+        queues_drained,
+        "the vector and summary queues are drained (budgets on fresh summaries)")
+    check("the queues are drained before the measurement "
+          "(pending_vector = 0 and pending_summary = 0)", ok, detail)
+
+    # (a) memory_search top_k=5 — норма НА ЭЛЕМЕНТ, не на страницу (§4.2.6).
     res = await c.call("memory_search", {"query": f"{RUN['tag']} release acceptance budget",
                                          "top_k": 5})
+    items = res.get("results") or []
     size = json_size(res)
-    check(f"memory_search top_k=5 fits into {BUDGET_SEARCH} B",
-          size <= BUDGET_SEARCH, f"{size} B")
+    per_item = bytes_per_item(size, len(items))
+    check(f"memory_search top_k=5 fits into {BUDGET_SEARCH_ITEM} B per item",
+          per_item is not None and per_item <= BUDGET_SEARCH_ITEM,
+          f"page {size} B, items {len(items)}, per item {fmt_bytes(per_item)} B")
+    if len(items) < 5:
+        info(f"memory_search returned {len(items)} of the requested 5 item(s): the "
+             "per-item norm is measured on the answer as served")
+
+    # (b) memory_list (detail=summaries) — норма НА ЭЛЕМЕНТ (§4.2.6).
     page = await list_page(c, limit=MCP_LIMIT)
+    items = page.get("items") or []
     size = json_size(page)
-    check(f"one memory_list page fits into {BUDGET_LIST} B", size <= BUDGET_LIST, f"{size} B")
+    per_item = bytes_per_item(size, len(items))
+    check(f"memory_list (detail=summaries) fits into {BUDGET_LIST_ITEM} B per item",
+          per_item is not None and per_item <= BUDGET_LIST_ITEM,
+          f"page {size} B, items {len(items)}, per item {fmt_bytes(per_item)} B")
+
+    # (c) memory_list(detail=titles) — единственная СТРАНИЧНАЯ норма: 1.5 КБ на 20
+    # записей (дешёвая форма без summary).
+    titles_page = await list_page(c, detail="titles", limit=MCP_LIMIT)
+    items = titles_page.get("items") or []
+    size = json_size(titles_page)
+    per_item = bytes_per_item(size, len(items))
+    check(f"one memory_list(detail=titles) page ({MCP_LIMIT} items) fits into "
+          f"{BUDGET_LIST_TITLES_PAGE} B",
+          size <= BUDGET_LIST_TITLES_PAGE,
+          f"page {size} B, items {len(items)}, per item {fmt_bytes(per_item)} B")
+
+    # (d) overhead связей одной заметки — без изменений (≤ 0.5 КБ).
     if note_with_links is None:
         skip("the links overhead of one note",
              "no probe note with links (scenario 3 was incomplete)")
@@ -1362,7 +1656,7 @@ async def scenario_9_regression() -> None:
 
     manual("unit regression",
            f"cd {CFG['repo_dir']} && {CFG['python']} -m pytest -q "
-           "(baseline 1454 passed, 13 skipped, 0 failed)")
+           "(baseline 1463 passed, 13 skipped, 0 failed)")
     if not CFG["run_regression"]:
         skip("unit and E2E regression",
              "run with --run-regression / LSB_RUN_REGRESSION=1 (long)")
@@ -1410,7 +1704,7 @@ async def run_all() -> None:
             await scenario_4_models_outage(c, rest)
             await scenario_5_node_order(c, rest)
             await scenario_6_health(rest)
-            await scenario_7_budgets(c, links_note)
+            await scenario_7_budgets(c, rest, links_note)
             await scenario_8_upgrade(main, rest)
             await scenario_9_regression()
             close_scenario()
@@ -1420,10 +1714,14 @@ async def run_all() -> None:
             # cleaned and the next run starts from the same state.
             try:
                 await cleanup_own_data()
-                await cleanup_namespaces(rest)
             except Exception as exc:  # noqa: BLE001 — the trace must survive anyway
                 teardown_note(f"teardown raised {describe(exc)} — check the probe "
                               f"data with prefix {CFG['prefix']} by hand")
+            # Узлы-зонды не сносятся: ручки удаления узла в MCP-поверхности нет,
+            # имена зондов фиксированы — следующий прогон их переиспользует (§FR-2.1).
+            teardown_note(f"probe nodes {', '.join(PROBE_PATHS)} are left on purpose "
+                          f"(fixed names, reused by the next run; no node delete "
+                          f"handle in the MCP surface)")
             ENV["db_size"] = db_size_text()
             path = write_teardown_trace()
             if path is not None:
@@ -1572,7 +1870,7 @@ async def main() -> int:
     tag = f"{CFG['prefix']}-{run_id}"
     RUN.update({
         "tag": tag,
-        "ns": tag,
+        "ns": PROBE_ROOT,
         "note_chars": f"{tag} chars probe",
         "note_long": f"{tag} long chunked probe",
         "note_links_a": f"{tag} links probe A",
@@ -1580,7 +1878,8 @@ async def main() -> int:
         "note_links_same": f"{tag} links probe same node",
         "note_other": f"{tag} unrelated probe",
         "note_outage": f"{tag} outage probe",
-        "note_nodes": [f"{tag} nodes probe {i}" for i in range(3)],
+        "note_nodes": [f"{tag} {topic}" for topic, _text in NODE_ORDER_PROBES],
+        "ns_paths": list(PROBE_PATHS),
         "notes": [],
     })
 

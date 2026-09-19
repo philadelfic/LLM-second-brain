@@ -46,7 +46,7 @@ LIST_BUDGET_BYTES = 1_500  # memory_list
 
 # Данные замера метрики: 5 атомарных заметок (текст ≤ ~50 символов — одна
 # мысль на запись, название ≤5 слов) — сводка в выдаче идёт fallback-
-# усечением (MAX_SUMMARY_CHARS=200), как у свежей заметки до работы воркера.
+# усечением (MAX_SUMMARY_CHARS=150), как у свежей заметки до работы воркера.
 # Общее слово «релиз» у всех — запрос метрики находит всю пятёрку (поиск
 # идёт FTS-only, внешние LLM недоступны).
 METRIC_TEXTS = [
@@ -140,7 +140,7 @@ class TestMCPChars:
 
         assert hit["chars"] == item["chars"] == note["chars"] == len(text)
         # Объём — именно ПОЛНОГО текста: это не snippet (120 симв.) и не
-        # fallback-summary (200 симв.).
+        # fallback-summary (150 симв.).
         assert len(text) > 120
 
     @pytest.mark.asyncio
