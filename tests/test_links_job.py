@@ -8,17 +8,25 @@ notes_vec может и не быть — расчёт связей моделе
 пометка маркера и порядок разбора проверяются без внешних сервисов.
 
 Выдача связей (уровень 1 в транспорте) — постановка 10: здесь только расчёт.
+
+Форма джобы — «по интервалу + событие `links`» (решение гейта 1c): заметка,
+получившая готовый вектор (`BackgroundWorker.process_pending`), будит петлю
+событием `_links_event` (`notify_links_pending`) — уровень 1 считается сразу, а
+не через интервал. Здесь же проверяется, что при недоступных моделях
+(`EmbeddingError`) сигнала нет и петля уходит в обычное ожидание с back-off.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from fakes import FixedSummarizer, HashEmbedder
+from fakes import FailingEmbedder, FixedSummarizer, HashEmbedder
 
 from app.config import Settings, get_settings
 from app.services.jobs import MAX_INTERVAL_SEC, BackoffState, build_job_specs, run_loop
@@ -111,17 +119,48 @@ def patch_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     return delays
 
 
+def patch_wait_event_timeout(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Мгновенный таймаут ожидания события с записью запрошенных пауз.
+
+    Форма «по интервалу + событие» ждёт `wait_for(event.wait(), timeout)`:
+    реальный таймаут (300 с) тест не переживёт — ожидание подменяется
+    мгновенным `TimeoutError`, пауза записана, петля растит back-off.
+    """
+    delays: list[float] = []
+
+    async def spy(awaitable, timeout=None, *args: object, **kwargs: object):
+        awaitable.close()  # корутину event.wait() не ждём — как при таймауте
+        delays.append(float(timeout))
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(asyncio, "wait_for", spy)
+    return delays
+
+
+async def _wait_until(predicate, timeout: float = 1.0) -> None:
+    """Дождаться условия живого цикла (опрос с yield'ами)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("условие не наступило за отведённое время")
+
+
 # --- регистрация и расписание из окружения -----------------------------------
 
 
 def test_links_job_is_registered(settings: Settings) -> None:
     """Джоба зарегистрирована описанием: очередь, интервал, батч, форма, хуки."""
-    spec = links_spec(make_worker(settings), settings)
+    worker = make_worker(settings)
+    spec = links_spec(worker, settings)
     assert spec.queue == LINKS_JOB
     assert spec.interval_sec == 300 == settings.job_links_interval_sec
     assert spec.batch == 100 == settings.job_links_batch
     assert spec.enabled is True
-    assert spec.wait_event is None  # форма «по интервалу» (сигнала нет)
+    # Форма «по интервалу + событие `links`» (гейт 1c): готовый вектор заметки
+    # будит петлю — событие берётся у воркера (владельца embedding-очереди).
+    assert spec.wait_event is worker._links_event
     assert spec.idle_hook is not None  # гигиена purge_orphans
     assert spec.queue_stat is not None  # снимок очереди для /health
 
@@ -240,6 +279,65 @@ def test_edit_returns_note_to_queue(settings: Settings) -> None:
     assert spec.queue_stat()["pending"] == 0
 
 
+# --- событие `links`: готовый вектор будит петлю (решение гейта 1c) ----------
+
+
+def test_process_pending_wakes_links_event(settings: Settings) -> None:
+    """Готовый вектор заметки будит джобу `links`: уровень 1 считается сразу."""
+    _seed(settings, [(1, "Заметка", "текст про встречу", "pending", _ts(0))])
+    worker = make_worker(settings)
+    assert worker._links_event.is_set() is False  # до довекторизации сигнала нет
+
+    assert worker.process_pending() == 1  # заметка реально получила вектор
+    assert worker._links_event.is_set()  # петля links проснётся немедленно
+
+    spec = links_spec(worker, settings)
+    assert _run(spec) == 1  # уровень 1 рассчитан, маркер проставлен
+    assert _links_at(settings, 1) is not None
+
+
+def test_embedding_error_does_not_wake_links(settings: Settings) -> None:
+    """Отказ кодирования: события нет, задание ждёт готового вектора (back-off)."""
+    _seed(settings, [(1, "Заметка", "текст про встречу", "pending", _ts(0))])
+    worker = BackgroundWorker(settings, FailingEmbedder(), FixedSummarizer("Ф."))
+
+    assert worker.process_pending() == 0  # модели недоступны — статусы не тронуты
+    assert worker._links_event.is_set() is False  # сигнала нет (контракт сохранён)
+    spec = links_spec(worker, settings)
+    assert spec.queue_stat()["pending"] == 0  # очередь links пуста: вектора нет
+    assert _run(spec) == 0  # задание не потеряно — ждёт готового вектора
+    assert _links_at(settings, 1) is None
+
+
+@pytest.mark.asyncio
+async def test_links_event_wakes_loop_immediately(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Сигнал `links` будит петлю немедленно, не дожидаясь интервала (гейт 1c)."""
+    worker = make_worker(settings)
+    spec = links_spec(worker, settings)
+    calls: list[int] = []
+
+    def counting(self, limit: int) -> int:
+        calls.append(limit)
+        return 0
+
+    monkeypatch.setattr(LinksService, "recompute_batch", counting)
+    task = asyncio.create_task(
+        run_loop(spec, lambda: False, BackoffState(spec.interval_sec))
+    )
+    try:
+        await _wait_until(lambda: len(calls) >= 1)
+        await asyncio.sleep(0.05)
+        assert calls == [spec.batch]  # интервал 300 с: сама петля не проснётся
+        worker.notify_links_pending()  # заметка получила готовый вектор
+        await _wait_until(lambda: len(calls) >= 2, timeout=0.5)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 # --- back-off, сон и idle-ветка ----------------------------------------------
 
 
@@ -260,23 +358,30 @@ async def test_progress_resets_backoff(settings: Settings, monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_empty_queue_sleeps_and_runs_idle_hook(
-    settings: Settings, monkeypatch
+async def test_empty_queue_waits_event_and_grows_backoff(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Пустая выборка уводит джобу в сон (не крутится вхолостую) + idle_hook."""
+    """Пустая выборка: гигиена idle-ветки, затем ожидание события с back-off.
+
+    Форма «по интервалу + событие»: без сигнала петля не крутится вхолостую —
+    ждёт `wait_for(event, timeout)` и по таймауту растит интервал (300 → 600).
+    """
     idle: list[int] = []
     monkeypatch.setattr(
         LinksService, "purge_orphans", lambda self: idle.append(1) or 0
     )
-    delays = patch_sleep(monkeypatch)
+    real_wait_for = asyncio.wait_for
+    delays = patch_wait_event_timeout(monkeypatch)
     spec = links_spec(make_worker(settings), settings)
+    state = BackoffState(300)
 
-    await asyncio.wait_for(
-        run_loop(spec, lambda: len(delays) >= 2, BackoffState(300)), timeout=2.0
-    )
-    # Пустые прогоны: пауза интервала джобы с back-off (300 → 600 → …), гигиена
-    # отработала перед каждым сном — вхолостую петля не крутится.
+    task = asyncio.create_task(run_loop(spec, lambda: len(delays) >= 2, state))
+    await real_wait_for(task, timeout=2.0)
+    # Пустые прогоны: гигиена отработала перед каждым ожиданием, таймаут
+    # ожидания растит back-off (300 → 600 → потолок 900) — вхолостую петля не
+    # крутится.
     assert delays[:2] == [300.0, 600.0]
+    assert state.interval == 900.0
     assert idle == [1, 1]
 
 

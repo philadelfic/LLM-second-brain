@@ -17,7 +17,11 @@
 Маркер `notes.links_at` — очередь расчёта (backfill и инкремент одним
 правилом выборки в джобе `links`, постановка 8): `recompute_batch` разбирает
 партию очереди, `queue_stat` описывает её для `/health`, `purge_orphans` —
-гигиена idle-ветки. Джоба регистрируется в реестре каркаса (`build_links_job`).
+гигиена idle-ветки. Джоба регистрируется в реестре каркаса (`build_links_job`);
+форма — «по интервалу + событие `links`» (решение гейта 1c): интервал
+`JOB_LINKS_INTERVAL_SEC` остаётся страховкой/backfill'ом, а заметка, получившая
+готовый вектор, будит петлю событием `worker._links_event` (notify_links_pending)
+— уровень 1 появляется сразу, не дожидаясь интервала.
 
 Выдача связей (постановка 10, arch §3.5): `related` отдаёт уровень 1
 (таблица `links`) с приоритетом вида и фолбэком на уровень 0, только если после
@@ -705,12 +709,16 @@ class LinksService:
 def build_links_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
     """Джоба `links`: фоновый расчёт связей уровня 1, очередь — маркер `links_at`.
 
-    Форма «по интервалу» (сигнала `notify_*` у связей нет): прогон разбирает
+    Форма «по интервалу + событие `links`» (решение гейта 1c): прогон разбирает
     партию `JOB_LINKS_BATCH` из очереди (свежие первыми), прогресс сбрасывает
-    back-off, пустая выборка — гигиена `purge_orphans` (idle_hook) и сон на
-    `JOB_LINKS_INTERVAL_SEC`. `JOB_LINKS_ENABLED=false` джобу не запускает,
-    но очередь остаётся видна в `/health` (реестр её сохраняет). Расчёт связей
-    моделей не зовёт (FR-2.2): косинус — готовый вектор, entities/mention — FTS.
+    back-off, пустая выборка — гигиена `purge_orphans` (idle_hook) и ожидание
+    (`JOB_LINKS_INTERVAL_SEC` с back-off), но сигнал `notify_links_pending`
+    (заметка получила готовый вектор — `process_pending`) будит петлю сразу.
+    Очередь при этом — состояние заметки (`links_at IS NULL`), поэтому событие
+    только ускоряет: задание не теряется. `JOB_LINKS_ENABLED=false` джобу не
+    запускает, но очередь остаётся видна в `/health` (реестр её сохраняет).
+    Расчёт связей моделей не зовёт (FR-2.2): косинус — готовый вектор,
+    entities/mention — FTS.
 
     Сервис собирается над общим эмбеддером воркера (отдельный клиент не
     заводим): расчёт связей кодирование не зовёт, но `LinksService` требует
@@ -732,7 +740,7 @@ def build_links_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         enabled=settings.job_links_enabled,
         process=process,
         queue_empty=None,
-        wait_event=None,
+        wait_event=worker._links_event,
         idle_hook=links.purge_orphans,
         queue_stat=links.queue_stat,
     )

@@ -377,6 +377,9 @@ def test_registry_contains_worker_jobs_and_links(settings) -> None:
     assert specs["links"].batch == settings.job_links_batch
     assert specs["links"].idle_hook is not None  # гигиена purge_orphans
     assert specs["links"].queue_stat is not None
+    # Форма «по интервалу + событие `links`» (решение гейта 1c): готовый вектор
+    # заметки будит петлю — событие берётся у воркера.
+    assert specs["links"].wait_event is not None
     # Джоба обхода default (lsb-0011): своя очередь и расписание из env;
     # форма «по интервалу + событие» — сигнал `nodes` будит петлю сразу после
     # сшивания (lsb-0012).

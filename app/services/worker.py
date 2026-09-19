@@ -11,7 +11,9 @@ pending-статусов в БД (переживают рестарт, дого�
   петлю; Semaphore EMBEDDING_CONCURRENT_REQUESTS остаётся. После готовности
   вектора каждой заметки создаётся judge-работа (дедуп) — диспетчер
   зависимостей (решение №10): судья опрашивается только по довекторизованной
-  заметке.
+  заметке. Тем же моментом будится джоба `links` (`notify_links_pending`,
+  решение гейта 1c): уровень 1 связей считается сразу после довекторизации, а
+  не через интервал/back-off.
 - **summary-джоба** (`build_summary_job`): title-догенерация (миграция, title IS
   NULL) → summarize → merge (слияние дублей) → классификация → описание узла.
   notify будит эту петлю (save/update).
@@ -317,6 +319,13 @@ class BackgroundWorker:
         # та же summary-петля (`process_merge_pending`), DI-нотификатор не нужен:
         # джоба живёт внутри воркера (arch §3.5).
         self._nodes_event = asyncio.Event()
+        # Сигнал «заметка получила готовый вектор» (решение гейта 1c): будит
+        # петлю `links` сразу после довекторизации — уровень 1 связей
+        # появляется немедленно, а не ждёт интервала/back-off. Ставит его
+        # embedding-петля (`process_pending`); джоба `links` описана в своём
+        # модуле (`links.py`), но событие берёт у воркера (общий владелец
+        # embedding-очереди; DI-нотификатор не нужен).
+        self._links_event = asyncio.Event()
         # Мемоизация создания таблицы job-очередей (пул 5): DDL исполняется
         # один раз на экземпляр воркера, а не при каждом обращении к очередям
         # (_create_job/_pending_jobs/_mark_job_done звали _ensure_job_table
@@ -397,6 +406,20 @@ class BackgroundWorker:
         `JOB_NODES_INTERVAL_SEC`. DI-нотификатор не нужен: джоба живёт внутри
         воркера (arch §3.5)."""
         self._nodes_event.set()
+
+    def notify_links_pending(self) -> None:
+        """Разбудить петлю `links`: заметка получила готовый вектор (гейт 1c).
+
+        Вызывается из embedding-петли после фактической довекторизации
+        (`process_pending` — синхронный SQL/HTTP в `asyncio.to_thread`),
+        `asyncio.Event.set()` потокобезопасен. Петля немедленно выходит из
+        ожидания и разбирает очередь расчёта связей (`links_at IS NULL`), не
+        дожидаясь `JOB_LINKS_INTERVAL_SEC`/выросшего back-off. Задание живёт
+        маркером `links_at` в БД — событие только ускоряет (контракт
+        надёжности не меняется); при недоступных моделях (`EmbeddingError`)
+        сигнала нет, очередь `links` пуста и петля ждёт по back-off.
+        """
+        self._links_event.set()
 
     def _is_stopping(self) -> bool:
         """Предикат мягкой остановки для каркасного цикла (`run_loop`)."""
@@ -807,6 +830,12 @@ class BackgroundWorker:
         судья опрашивается только по готовому вектору — диспетчер
         зависимостей. Само сведение дублей — в judge-петле
         (process_judge_pending) и summary-петле (process_merge_pending).
+        Если хотя бы одна заметка батча реально получила вектор, будится и
+        петля `links` (`notify_links_pending`, решение гейта 1c): уровень 1
+        связей считается сразу, а не через интервал — но по тому же маркеру
+        `links_at`, поэтому задание не теряется по построению. Одно событие на
+        батч достаточно. Отказ кодирования (`EmbeddingError`) выходит раньше —
+        события нет, задания ждут готового вектора (back-off).
         """
         batch = (
             limit if limit is not None else self._settings.embedding_batch_size
@@ -851,6 +880,12 @@ class BackgroundWorker:
             # Фаза 11 (решение №10): вектор готов — judge-работа (дедуп)
             # в очередь слота judge; диспетчер зависимостей.
             self._create_job("judge", "dedup", int(row["id"]))
+        if processed:
+            # Заметка батча реально получила вектор — будим `links` (гейт 1c).
+            # Одно событие на батч достаточно; отказ кодирования сюда не
+            # доходит (EmbeddingError выше) — «модели недоступны → задания
+            # ждут» сохраняется.
+            self.notify_links_pending()
         self.notify_judge_pending()
         return processed
 
