@@ -1186,7 +1186,7 @@ async def scenario_4_models_outage(c: Client, rest: httpx2.AsyncClient) -> None:
         skip("models unavailable → waiting → models back → jobs finished",
              "the contour hook is required: LSB_SLOT_OFF_CMD / LSB_SLOT_ON_CMD "
              "(e.g. scripts/slot_gate.sh off|on all — the default docker mode "
-             "pauses/unpauses the slot proxy containers of the contour, so no "
+             "stops/starts the slot proxy containers of the contour, so no "
              "privileges are needed and no LAN host is touched)")
         manual("scenario 4 (lsb-0014 FR-2.4)",
                "set LSB_SLOT_OFF_CMD / LSB_SLOT_ON_CMD to scripts/slot_gate.sh "
