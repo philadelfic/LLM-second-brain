@@ -1285,8 +1285,18 @@ async def scenario_4_models_outage(c: Client, rest: httpx2.AsyncClient) -> None:
                                       "the age of the oldest pending item grows")
         check("the age of the oldest pending item grows (/health.queues)", ok, detail)
 
-        found, detail = await log_has("queue_waiting")
         if CFG["logs_cmd"]:
+            # Ждём по наблюдаемому состоянию, а не одним снимком: слот ещё
+            # выключен, свежая pending-заметка будит embedding-петлю событием
+            # (gate 2026-09-19), поэтому `queue_waiting` появляется
+            # детерминированно — контуру нужно только время на отказ соединения.
+            # Guard — 120 с; фактическое время видно в таблице ожиданий отчёта.
+            guard = min(CFG["wait_sec"], 120.0)
+            found, detail = await wait_until(
+                lambda: log_has("queue_waiting"),
+                "the queue_waiting event appears in the log (slot still off)",
+                timeout=guard,
+            )
             check("the queue_waiting event is written to the log", found, detail)
         else:
             skip("the queue_waiting event in the log",

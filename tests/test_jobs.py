@@ -391,9 +391,12 @@ def test_registry_contains_worker_jobs_and_links(settings) -> None:
     for name in ("embedding", "summary", "judge", "areas"):
         assert specs[name].interval_sec == retry  # как было (FR-1.5)
     assert specs["expiration"].interval_sec == EXPIRATION_CLEANUP_INTERVAL_SEC
-    # Форма «по требованию» — там, где есть сигнал notify_*; у embedding его
-    # не было и раньше (интервал + back-off).
-    assert specs["embedding"].wait_event is None
+    # Форма «по интервалу + событие `embedding`» (gate 2026-09-19): свежая
+    # pending-заметка будит петлю сразу — событие берётся у воркера (владельца
+    # очереди векторизации). Перепроверки очереди нет: очередь векторизации и
+    # есть ожидание модели — с ней петля крутилась бы вхолостую (busy-loop).
+    assert specs["embedding"].wait_event is worker._embedding_event
+    assert specs["embedding"].queue_empty is None
     assert specs["expiration"].wait_event is None
     assert specs["summary"].wait_event is not None
     assert specs["judge"].wait_event is not None
@@ -498,7 +501,8 @@ async def test_queue_waiting_logged_when_waiting_with_pending_queue(
 ) -> None:
     """FR-2.3: уход в ожидание с непустой очередью — событие `queue_waiting`.
 
-    Джоба формы «по интервалу» (как embedding): прогон пуст, своя очередь
+    Джоба формы «по интервалу» (без события, как `expiration`): прогон пуст,
+    своя очередь
     не пуста (`queue_stat`) — «работа есть, но она не выполняется» видно в
     журнале, а не только в `/health`.
     """

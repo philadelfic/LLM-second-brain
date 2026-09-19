@@ -171,6 +171,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Суммаризация стартует сразу при save/update: NoteService сигналит
     # воркеру, тот немедленно догоняет pending_summary (не ждёт back-off).
     services.notes.set_summary_notifier(worker.notify_summary_pending)
+    # Векторизация стартует сразу при save/update: та же запись заметки
+    # (vector_status='pending') сигналит embedding-петле — свежая заметка
+    # кодируется немедленно, а не после выросшего back-off (до 15 мин).
+    # Событие только ускоряет — задание живёт в статусе заметки (gate
+    # 2026-09-19, прецедент summary-нотификатора).
+    services.notes.set_vector_notifier(worker.notify_embedding_pending)
     # Область навыков (3.0.0): save/правка сигналит петле areas — вектора
     # записи догоняются сразу, а не по выросшему back-off (прецедент
     # summary-нотификатора). None — DI-сборка тестов без области навыков.
