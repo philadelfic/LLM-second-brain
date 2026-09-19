@@ -46,11 +46,16 @@ Scenarios (0-9), per the techdebt-0036-01 spec:
      (`/health.queues`), the `queue_waiting` event appears in the log → models
      are back → jobs finish with NO container restart.
   5. Node order: the accumulated `default` is drained (fast path plus the
-     classifier within its budget), a processed note is not processed twice,
+     classifier within its budget), the sweep does not pass over a note twice
+     (only the markers it set itself, `source=sweep`, are compared; an update
+     by the after-merge path — `source=after_merge` — is allowed and reported),
      the queue goes back to empty.
   6. `/health` = 7 previous fields + `queues` + `version`.
-  7. Context budgets: `memory_search` top_k=5 ≤ 1.2 KB, `memory_list` ≤ 1.5 KB,
-     the links overhead ≤ 0.5 KB.
+  7. Context budgets, measured AFTER the vector/summary queues drain:
+     `memory_search` top_k=5 ≤ 450 B PER ITEM, `memory_list`
+     (detail=summaries) ≤ 500 B PER ITEM, one `memory_list(detail=titles)`
+     page (20 items) ≤ 1.5 KB, the links overhead ≤ 0.5 KB; the actual bytes
+     are printed as a trend, not only the verdict.
   8. Live DB upgrade v3.0.0 → 3.1.0: the `links` table and the
      `links_at`/`node_order_at` columns are there, notes are intact, a repeated
      start is a no-op, and an MCP session comes up again.
@@ -95,9 +100,16 @@ MCP_TOOL_GROUPS = {"memory_": 8, "skills_": 5, "user_": 5, "terms_": 3}
 HEALTH_LEGACY = ("status", "embedding_ok", "summarizer_ok", "judge_ok",
                  "notes_count", "pending_vector", "pending_summary")
 HEALTH_QUEUES = ("vector", "summary", "judge", "areas", "links", "nodes")
-BUDGET_SEARCH = 1200    # bytes of the compact memory_search answer (top_k=5)
-BUDGET_LIST = 1500      # bytes of one memory_list page
-BUDGET_LINKS = 500      # bytes of the links array of one note
+# Бюджеты канона §4.2.6 — НОРМЫ НА ЭЛЕМЕНТ выдачи (решение гейта 2026-09-19):
+# страничные пороги 1.2/1.5 КБ калибровались на мелких заметках и на живой базе
+# недостижимы (элемент ≈110 B фиксированных полей + ~2 байта на символ кириллицы в
+# summary). Страничная норма 1.5 КБ осталась ТОЛЬКО у дешёвой формы
+# `memory_list(detail="titles")` на странице 20 записей; замер бюджетов — ПОСЛЕ
+# дренажа очередей (иначе в него попадают саммари старого лимита — сценарий 7).
+BUDGET_SEARCH_ITEM = 450        # bytes per item of memory_search top_k=5
+BUDGET_LIST_ITEM = 500          # bytes per item of memory_list (detail=summaries)
+BUDGET_LIST_TITLES_PAGE = 1500  # bytes of a memory_list(detail=titles) page (20 items)
+BUDGET_LINKS = 500              # bytes of the links array of one note
 MORE_HINT = re.compile(r"^\+(\d+) more — offset=(\d+)$")
 LINK_ITEM_FIELDS = {"id", "title", "namespace", "chars"}
 UPGRADE_TABLES = ("links",)
@@ -130,6 +142,24 @@ PROBE_CHILDREN = (
         "Changelog wording and version bump bookkeeping of a release entry, "
         "plus the rollout checklist.",
     ),
+)
+
+# Зонды сценария 5 («порядок в узлах»): имена заметок и тексты — из НАМЕРЕННО
+# разных тем без общей лексики (кулинария / велосипед / астрономия). Тег прогона
+# живёт только в заголовке (идемпотентная уборка) и на семантику не влияет.
+# Почти идентичные тексты фон штатно СШИВАЕТ (`dedup_merged`), и маркер разбора
+# после сшивания обновляется законно (`source=after_merge`) — тогда проверка
+# анти-зацикливания обхода видела бы не двойную обработку, а слияние.
+NODE_ORDER_PROBES = (
+    ("sourdough starter",
+     "Feeding schedule for a sourdough starter: hydration, fermentation time and "
+     "oven spring in a home kitchen."),
+    ("bicycle drivetrain",
+     "Choosing a bicycle drivetrain for steep climbs: cassette range, chainring "
+     "size and gear steps."),
+    ("meteor photography",
+     "Night-sky photography during a meteor shower: tripod stability, exposure "
+     "settings and light pollution."),
 )
 PROBE_PATHS = (PROBE_ROOT, *(path for path, _desc in PROBE_CHILDREN))
 _SYNONYM_HINT = re.compile(r"there is a similar one:\s*(\S+)")
@@ -313,6 +343,16 @@ def describe(exc: BaseException) -> str:
 def json_size(obj: Any) -> int:
     """Size of the compact answer in bytes (the canon budget metric)."""
     return len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+
+def bytes_per_item(size: int, count: int) -> float | None:
+    """Байты на элемент выдачи — норма канона §4.2.6; None, если элементов нет."""
+    return (size / count) if count else None
+
+
+def fmt_bytes(value: float | None) -> str:
+    """Байты для отчёта; None (элементов нет) печатается как `n/a`."""
+    return "n/a" if value is None else f"{value:.1f}"
 
 
 # --- teardown trace (FR-3.1/FR-3.2) -------------------------------------------
@@ -556,6 +596,26 @@ def db_cell(table: str, row_id: int, column: str, *,
         return value == equals, f"{column}={value!r}"
 
     return predicate
+
+
+def reclass_note_ids(ids: list[int]) -> set[int]:
+    """Заметки с заданием `nodes`/`reclass` — след сшивания дубликата (lsb-0012).
+
+    `merge_pair` сбрасывает у ранней заметки маркер `node_order_at` (она снова
+    кандидат разбора) и ставит в `worker_jobs` задание `reclass`; по нему видно,
+    что новый маркер законно поставлен путём после сшивания (`source=after_merge`),
+    а не повторным обходом `default` (`source=sweep`). Таблицы `worker_jobs` может
+    ещё не быть (задания не ставились) — тогда следов сшивания нет.
+    """
+    if not ids or not db_ready():
+        return set()
+    placeholders = ",".join("?" * len(ids))
+    rows, _err = db_try(
+        f"SELECT DISTINCT note_id FROM worker_jobs WHERE slot = 'nodes' "
+        f"AND kind = 'reclass' AND note_id IN ({placeholders})",
+        tuple(ids),
+    )
+    return {row["note_id"] for row in rows or []}
 
 
 def contains(haystack: Any, needle: str) -> bool:
@@ -1319,10 +1379,12 @@ async def scenario_5_node_order(c: Client, rest: httpx2.AsyncClient) -> None:
 
     created = []
     refused = []
-    for i in range(3):
+    # Тексты и названия зондов — из разных тем (NODE_ORDER_PROBES): почти
+    # идентичные заметки фон штатно СШИВАЕТ, и проверка анти-зацикливания обхода
+    # превращалась бы в проверку сшивания (маркер законно обновлялся).
+    for i, (_topic, text) in enumerate(NODE_ORDER_PROBES):
         saved = await c.call("memory_save", {
-            "text": f"{RUN['tag']} node order probe {i}: the release acceptance checks "
-                    "that a note left in default is not classified twice.",
+            "text": text,
             "title": RUN["note_nodes"][i],
         })
         if saved.get("id") is not None:
@@ -1354,7 +1416,9 @@ async def scenario_5_node_order(c: Client, rest: httpx2.AsyncClient) -> None:
     before, _err = db_try(
         "SELECT id, node_order_at FROM notes WHERE id IN "
         f"({','.join('?' * len(created))})", tuple(created))
-    marks = {row["id"]: row["node_order_at"] for row in before or []}
+    # Маркеры ОБХОДА (`source=sweep`): заметки созданы с `node_order_at IS NULL`,
+    # и первый разбор им ставит подметание `default` — именно эти отметки и сверяем.
+    sweep_marks = {row["id"]: row["node_order_at"] for row in before or []}
 
     ok, detail = await wait_until(queue_empty(rest, "nodes"),
                                   "the nodes queue is drained")
@@ -1364,9 +1428,28 @@ async def scenario_5_node_order(c: Client, rest: httpx2.AsyncClient) -> None:
         "SELECT id, node_order_at FROM notes WHERE id IN "
         f"({','.join('?' * len(created))})", tuple(created))
     after_marks = {row["id"]: row["node_order_at"] for row in after or []}
-    same = all(after_marks.get(nid) == mark for nid, mark in marks.items())
-    check("a processed note is not processed twice (markers are unchanged)", same,
-          f"before={marks}, after={after_marks}")
+    # Анти-зацикливание обхода: разобранная подметанием заметка второй раз той же
+    # джобой не берётся. Маркер может обновиться ЗАКОННО — путём после сшивания
+    # (`source=after_merge`): `merge_pair` сбрасывает маркер и ставит задание
+    # `reclass`, которое перерешает узел (lsb-0012). Это не двойной обход: случай
+    # отмечается отдельной строкой в detail и WARN-отметкой по заметке.
+    merged = reclass_note_ids(created)
+    re_marked = sorted(nid for nid, mark in sweep_marks.items()
+                       if after_marks.get(nid) != mark)
+    after_merge = [nid for nid in re_marked if nid in merged]
+    repeated = [nid for nid in re_marked if nid not in merged]
+    detail = f"source=sweep markers={sweep_marks}, after={after_marks}"
+    if after_merge:
+        detail += ("; updated by the after_merge path (a merge was recorded for "
+                   f"these notes): {after_merge}")
+    if repeated:
+        detail += f"; swept again WITHOUT a merge: {repeated}"
+    check("a note is swept once: only the source=sweep markers are compared "
+          "(an after_merge update is allowed)", not repeated, detail)
+    for nid in after_merge:
+        warn(f"probe note {nid}: the marker was updated by the after_merge path "
+             f"(reclass after a merge), not by a repeated sweep",
+             f"{sweep_marks.get(nid)} → {after_marks.get(nid)}")
 
     budget = CFG["nodes_batch"]
     pending = queue_stat(await health_snapshot(rest), "nodes") or {}
@@ -1422,17 +1505,61 @@ async def scenario_6_health(rest: httpx2.AsyncClient) -> None:
 
 # --- scenario 7: context budgets ---------------------------------------------
 
-async def scenario_7_budgets(c: Client, note_with_links: int | None) -> None:
-    scenario(7, "Context budgets: search ≤ 1.2 KB, list ≤ 1.5 KB, links ≤ 0.5 KB")
+async def scenario_7_budgets(c: Client, rest: httpx2.AsyncClient,
+                             note_with_links: int | None) -> None:
+    scenario(7, "Context budgets (after the queue drain): search ≤ 450 B/item, "
+                "list ≤ 500 B/item, titles page ≤ 1.5 KB, links ≤ 0.5 KB")
 
+    # Бюджеты мерятся ПОСЛЕ дренажа очередей: саммари длиннее 150 символов (лимит
+    # 3.1.0) миграция уводит на перегенерацию, и старые длинные саммари дали бы
+    # завышенный, нерепрезентативный замер (решение гейта 2026-09-19).
+    async def queues_drained() -> tuple[bool, str]:
+        snapshot = await health_snapshot(rest)
+        pending_vector = snapshot.get("pending_vector")
+        pending_summary = snapshot.get("pending_summary")
+        done = pending_vector == 0 and pending_summary == 0
+        return done, f"pending_vector={pending_vector}, pending_summary={pending_summary}"
+
+    ok, detail = await wait_until(
+        queues_drained,
+        "the vector and summary queues are drained (budgets on fresh summaries)")
+    check("the queues are drained before the measurement "
+          "(pending_vector = 0 and pending_summary = 0)", ok, detail)
+
+    # (a) memory_search top_k=5 — норма НА ЭЛЕМЕНТ, не на страницу (§4.2.6).
     res = await c.call("memory_search", {"query": f"{RUN['tag']} release acceptance budget",
                                          "top_k": 5})
+    items = res.get("results") or []
     size = json_size(res)
-    check(f"memory_search top_k=5 fits into {BUDGET_SEARCH} B",
-          size <= BUDGET_SEARCH, f"{size} B")
+    per_item = bytes_per_item(size, len(items))
+    check(f"memory_search top_k=5 fits into {BUDGET_SEARCH_ITEM} B per item",
+          per_item is not None and per_item <= BUDGET_SEARCH_ITEM,
+          f"page {size} B, items {len(items)}, per item {fmt_bytes(per_item)} B")
+    if len(items) < 5:
+        info(f"memory_search returned {len(items)} of the requested 5 item(s): the "
+             "per-item norm is measured on the answer as served")
+
+    # (b) memory_list (detail=summaries) — норма НА ЭЛЕМЕНТ (§4.2.6).
     page = await list_page(c, limit=MCP_LIMIT)
+    items = page.get("items") or []
     size = json_size(page)
-    check(f"one memory_list page fits into {BUDGET_LIST} B", size <= BUDGET_LIST, f"{size} B")
+    per_item = bytes_per_item(size, len(items))
+    check(f"memory_list (detail=summaries) fits into {BUDGET_LIST_ITEM} B per item",
+          per_item is not None and per_item <= BUDGET_LIST_ITEM,
+          f"page {size} B, items {len(items)}, per item {fmt_bytes(per_item)} B")
+
+    # (c) memory_list(detail=titles) — единственная СТРАНИЧНАЯ норма: 1.5 КБ на 20
+    # записей (дешёвая форма без summary).
+    titles_page = await list_page(c, detail="titles", limit=MCP_LIMIT)
+    items = titles_page.get("items") or []
+    size = json_size(titles_page)
+    per_item = bytes_per_item(size, len(items))
+    check(f"one memory_list(detail=titles) page ({MCP_LIMIT} items) fits into "
+          f"{BUDGET_LIST_TITLES_PAGE} B",
+          size <= BUDGET_LIST_TITLES_PAGE,
+          f"page {size} B, items {len(items)}, per item {fmt_bytes(per_item)} B")
+
+    # (d) overhead связей одной заметки — без изменений (≤ 0.5 КБ).
     if note_with_links is None:
         skip("the links overhead of one note",
              "no probe note with links (scenario 3 was incomplete)")
@@ -1577,7 +1704,7 @@ async def run_all() -> None:
             await scenario_4_models_outage(c, rest)
             await scenario_5_node_order(c, rest)
             await scenario_6_health(rest)
-            await scenario_7_budgets(c, links_note)
+            await scenario_7_budgets(c, rest, links_note)
             await scenario_8_upgrade(main, rest)
             await scenario_9_regression()
             close_scenario()
@@ -1751,7 +1878,7 @@ async def main() -> int:
         "note_links_same": f"{tag} links probe same node",
         "note_other": f"{tag} unrelated probe",
         "note_outage": f"{tag} outage probe",
-        "note_nodes": [f"{tag} nodes probe {i}" for i in range(3)],
+        "note_nodes": [f"{tag} {topic}" for topic, _text in NODE_ORDER_PROBES],
         "ns_paths": list(PROBE_PATHS),
         "notes": [],
     })
