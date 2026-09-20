@@ -12,6 +12,11 @@ Checks all features of release 2.2 "Making life easier for models" in one scenar
   H. lsb-0006 — soft refusals return EN hints (no cyrillic).
   I. lsb-0005 — anti-synonymy on node creation (EN hint "there is a similar one").
 
+Idempotency (techdebt-0036, item 2): a repeated run reuses the already registered
+probe nodes `e2e22*` (`node_creation`) and removes the probe notes of previous runs
+before the scenarios (`cleanup_previous_run`). The probe NODES are never deleted —
+the MCP surface has no node delete handle.
+
 Run: inside the lsb-test container (docker exec), URL http://localhost:8080/mcp.
 """
 from __future__ import annotations
@@ -33,6 +38,19 @@ TOKEN = os.environ["MCP_AUTH_TOKEN"]  # Bearer token from the container env (sec
 
 CYRILLIC = re.compile(r"[\u0400-\u04FF]")
 
+# --- идемпотентность повторного прогона (techdebt-0036, item 2) ---------------
+# Узлы-зонды `e2e22*` переиспользуются: ручки удаления узла в MCP-поверхности
+# нет, поэтому повторный прогон получает от антисинонимии приложения мягкий
+# отказ с `nearest`, равным самому запрошенному пути, — это успех
+# (`node_creation`), а не FAIL. Заметки-зонды прошлого прогона, наоборот,
+# убирает пред-очистка (`cleanup_previous_run`): повторный `memory_save` того же
+# текста получает отказ дедупа `stored=False` и возвращает id СТАРОЙ заметки,
+# из-за чего проверка TTL упиралась в заметку прошлого прогона с уже снятым
+# `expires_at`.
+RUN_FAMILY = re.compile(r"^e2e22r?\d*(?:/|$)")
+_SYNONYM_HINT = re.compile(r"there is a similar one:\s*(\S+)")
+_ALREADY_REGISTERED = re.compile(r"already registered", re.IGNORECASE)
+
 PASS = 0
 FAIL = 0
 FAILURES: list[str] = []
@@ -47,6 +65,51 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         FAIL += 1
         FAILURES.append(name)
         print(f"  [FAIL] {name}" + (f" — {detail}" if detail else ""))
+
+
+def refusal(result: dict) -> str:
+    """Текст мягкого отказа приложения (`hint`, иначе `reason`), иначе — пусто."""
+    for field in ("hint", "reason"):
+        value = result.get(field)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def node_creation(path: str, result: dict) -> tuple[bool, str]:
+    """Итог идемпотентной регистрации узла-зонда: `(успех, деталь для отчёта)`.
+
+    Успех — узел создан ЭТИМ прогоном (`created=True`, статус `confirmed`) ЛИБО
+    уже зарегистрирован (повторный прогон). Имя и описание зонда фиксированы,
+    поэтому антисинонимия приложения (порог косинуса описаний 0.90) отдаёт
+    мягкий отказ `created=False` с подсказкой `hint='there is a similar one:
+    <nearest>'`, где `nearest` равен самому запрошенному пути (описание
+    сравнивается с самим собой) — это и есть «узел на месте». Любой другой
+    отказ (в том числе `nearest` на ЧУЖОЙ узел) — FAIL с причиной и `nearest`:
+    имя/описание зонда надо развести с существующим узлом.
+    """
+    if result.get("created") is True:
+        if result.get("status") != "confirmed":
+            return False, f"path={path}, created but status={result.get('status')!r}"
+        return True, f"path={result.get('path') or path}, created now (confirmed)"
+    hint = refusal(result)
+    match = _SYNONYM_HINT.search(hint)
+    nearest = match.group(1).strip() if match else None
+    if nearest is not None and nearest == path:
+        return True, f"path={path}, already registered (nearest={nearest} — itself)"
+    if nearest is not None:
+        return False, (f"reason=synonym, nearest={nearest}, path={path} — another "
+                       "node is nearer than the requested one")
+    if _ALREADY_REGISTERED.search(hint) and path in hint:
+        return True, f"path={path}, already registered (the registry says so)"
+    reason = hint or "no hint from the tool"
+    return False, f"path={path}, created={result.get('created')!r}, reason={reason}"
+
+
+def check_node_creation(label: str, path: str, result: dict) -> None:
+    """Проверка регистрации узла-зонда по идемпотентным правилам `node_creation`."""
+    ok, detail = node_creation(path, result)
+    check(label, ok, detail)
 
 
 def extract(result) -> dict:
@@ -77,12 +140,47 @@ async def get_note(c: Client, note_id: int) -> dict | None:
     return notes[0] if notes else None
 
 
+async def list_notes(c: Client, *, detail: str = "summaries",
+                     max_pages: int = 25) -> list[dict]:
+    """Walk all memory_list pages: the MCP listing ceiling is 20 since 3.1.0.
+
+    `limit=50` is a soft refusal now (lsb-0013 FR-2.1), and one `limit=20` page
+    would stop seeing our own note once the base grows past a page. Pages are
+    followed by `next_offset` until `has_more` is false, bounded by `max_pages`.
+    """
+    items: list[dict] = []
+    offset = 0
+    for _ in range(max_pages):
+        page = await c.call("memory_list",
+                            {"limit": 20, "offset": offset, "detail": detail})
+        items.extend(page.get("items", []))
+        nxt = page.get("next_offset")
+        if not page.get("has_more") or not isinstance(nxt, int):
+            break
+        offset = nxt
+    return items
+
+
 async def get_list_item(c: Client, note_id: int) -> dict | None:
-    r = await c.call("memory_list", {"limit": 50, "detail": "summaries"})
-    for i in r.get("items", []):
+    for i in await list_notes(c):
         if i.get("id") == note_id:
             return i
     return None
+
+
+async def cleanup_previous_run(c: Client) -> None:
+    """Пред-очистка заметок-зондов прошлых прогонов (идемпотентность, item 2).
+
+    Удаляются только заметки в узлах семейства зондов (`RUN_FAMILY`): узлы и
+    чужие данные не трогаем. Без очистки повторный `memory_save` упирается в
+    дедуп заметки прошлого прогона и возвращает её же id.
+    """
+    removed = 0
+    for item in await list_notes(c, detail="titles"):
+        if RUN_FAMILY.match(item.get("namespace") or ""):
+            res = await c.call("memory_delete", {"id": item["id"]})
+            removed += int(bool(res.get("deleted")))
+    print(f"  [pre] leftover probe notes of previous runs removed: {removed}")
 
 
 async def wait_chunked(c: Client, note_id: int, timeout: float = 180.0) -> int:
@@ -101,23 +199,22 @@ async def wait_chunked(c: Client, note_id: int, timeout: float = 180.0) -> int:
 
 async def scenario(c: Client, prefix: str) -> None:
     print("=== E2E release 2.2 (end-to-end) ===\n")
+    await cleanup_previous_run(c)
 
     # ---------- A. lsb-0005: namespace tree up to depth 3 ----------
     print("[A] lsb-0005: building the namespace tree (depth 3)")
     r = await c.call("memory_namespace_create", {
         "path": prefix, "description": "Project knowledge base for release 2.2 E2E.",
     })
-    check("root created (confirmed)",
-          r.get("created") is True and r.get("status") == "confirmed",
-          f"status={r.get('status')}")
+    check_node_creation("root registered (confirmed)", prefix, r)
     r = await c.call("memory_namespace_create", {
         "path": f"{prefix}/backend", "description": "Backend subsystem of the project.",
     })
-    check("subdomain created (depth 2)", r.get("created") is True)
+    check_node_creation("subdomain registered (depth 2)", f"{prefix}/backend", r)
     r = await c.call("memory_namespace_create", {
         "path": f"{prefix}/backend/api", "description": "API layer of the backend subsystem.",
     })
-    check("sub-subdomain created (depth 3)", r.get("created") is True)
+    check_node_creation("sub-subdomain registered (depth 3)", f"{prefix}/backend/api", r)
 
     # ---------- B. lsb-0005: save into a depth-3 node ----------
     print("\n[B] lsb-0005: save into a depth-3 node")
@@ -128,9 +225,9 @@ async def scenario(c: Client, prefix: str) -> None:
     })
     nid_auth = s.get("id")
     check("note saved into the depth-3 node", nid_auth is not None, f"id={nid_auth}")
-    li = await c.call("memory_list", {"limit": 50, "detail": "summaries"})
+    li_items = await list_notes(c)
     found = any(i.get("id") == nid_auth and i.get("namespace") == f"{prefix}/backend/api"
-                for i in li.get("items", []))
+                for i in li_items)
     check("list: namespace = <prefix>/backend/api", found)
 
     # ---------- long note for chunk reading ----------
@@ -165,12 +262,12 @@ async def scenario(c: Client, prefix: str) -> None:
 
     # ---------- D. lsb-0001: unified listing ----------
     print("\n[D] lsb-0001: unified listing (detail=titles / summaries)")
-    r = await c.call("memory_list", {"limit": 50, "detail": "titles"})
+    r = await c.call("memory_list", {"limit": 20, "detail": "titles"})
     items = r.get("items", [])
     check("detail=titles: compact output (id/title/namespace)",
           all(set(i) >= {"id", "title", "namespace"} for i in items),
           f"n={len(items)}")
-    r = await c.call("memory_list", {"limit": 50, "detail": "summaries"})
+    r = await c.call("memory_list", {"limit": 20, "detail": "summaries"})
     items = r.get("items", [])
     check("detail=summaries: full output (summary present)",
           all("summary" in i for i in items), f"n={len(items)}")

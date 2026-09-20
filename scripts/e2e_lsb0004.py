@@ -64,14 +64,36 @@ class Client:
         return extract(res)
 
 
+async def list_notes(c: Client, *, detail: str = "summaries",
+                     max_pages: int = 25) -> list[dict]:
+    """Walk all memory_list pages: the MCP listing ceiling is 20 since 3.1.0.
+
+    The old single call with `limit=50` is a soft refusal now (lsb-0013 FR-2.1),
+    and a bare `limit=20` page would stop seeing our own note once the base
+    grows past one page. Pages are followed by `next_offset` until `has_more`
+    is false, bounded by `max_pages` (the check itself is unchanged: we look
+    for our note among ALL records, as before).
+    """
+    items: list[dict] = []
+    offset = 0
+    for _ in range(max_pages):
+        page = await c.call("memory_list",
+                            {"limit": 20, "offset": offset, "detail": detail})
+        items.extend(page.get("items", []))
+        nxt = page.get("next_offset")
+        if not page.get("has_more") or not isinstance(nxt, int):
+            break
+        offset = nxt
+    return items
+
+
 async def wait_summary(c: Client, note_id: int, *, not_equal: str | None = None,
                        timeout: float = 150.0) -> str | None:
     """Wait until the note summary becomes non-empty (and != not_equal)."""
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
-        r = await c.call("memory_list", {"limit": 50, "detail": "summaries"})
-        for item in r.get("items", []):
+        for item in await list_notes(c):
             if item.get("id") == note_id:
                 last = item.get("summary")
                 if last and (not_equal is None or last != not_equal):
@@ -87,8 +109,7 @@ async def get_note(c: Client, note_id: int) -> dict | None:
 
 
 async def list_find(c: Client, note_id: int) -> dict | None:
-    r = await c.call("memory_list", {"limit": 50, "detail": "summaries"})
-    for item in r.get("items", []):
+    for item in await list_notes(c):
         if item.get("id") == note_id:
             return item
     return None

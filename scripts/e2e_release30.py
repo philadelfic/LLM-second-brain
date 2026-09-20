@@ -394,6 +394,28 @@ def contains(haystack: Any, needle: str) -> bool:
     return needle in json.dumps(haystack, ensure_ascii=False)
 
 
+async def list_notes(c: Client, *, detail: str = "summaries",
+                     max_pages: int = 25) -> list[dict]:
+    """Все страницы memory_list: с 3.1.0 потолок MCP-листинга равен 20.
+
+    `limit=50` на MCP — мягкий отказ (lsb-0013 FR-2.1), а одна страница
+    `limit=20` перестала бы видеть записи глубже первой (проверка «токен не
+    виден в листинге» должна смотреть ВСЕ записи, как раньше с limit=50).
+    Страницы идут по `next_offset`, пока `has_more`; ограничение — max_pages.
+    """
+    items: list[dict] = []
+    offset = 0
+    for _ in range(max_pages):
+        page = await c.call("memory_list",
+                            {"limit": 20, "offset": offset, "detail": detail})
+        items.extend(page.get("items", []))
+        nxt = page.get("next_offset")
+        if not page.get("has_more") or not isinstance(nxt, int):
+            break
+        offset = nxt
+    return items
+
+
 async def health_snapshot(rest: httpx2.AsyncClient) -> dict:
     try:
         r = await rest.get("/health")
@@ -635,9 +657,8 @@ async def scenario_2_isolation(c: Client) -> None:
         hits = res.get("results", [])
         check(f"{area} не виден в memory_search",
               not any(contains(hit, token) for hit in hits), f"n={len(hits)}")
-        res = await c.call("memory_list", {"limit": 50, "detail": "summaries"})
         check(f"{area} не виден в memory_list",
-              not any(contains(item, token) for item in res.get("items", [])))
+              not any(contains(item, token) for item in await list_notes(c)))
 
     # области не видят друг друга
     res = await c.call("skills_search", {"query": fact_tok, "top_k": 20})

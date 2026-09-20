@@ -150,7 +150,9 @@ class TestFormLimits:
     def test_rejected_form_creates_nothing(self, service: SkillsService) -> None:
         with pytest.raises(SkillValidationError):
             service.save(**form(name="x" * 66))
-        assert service.list() == {"items": [], "total": 0}
+        listed = service.list()
+        assert listed["items"] == []
+        assert listed["total"] == 0
 
 
 class TestExtra:
@@ -254,21 +256,19 @@ class TestList:
         service.save(**form())
         service.save(**form(name="Rollback the service"))
         listed = service.list()
-        assert listed == {
-            "items": [
-                {
-                    "id": 2,
-                    "name": "Rollback the service",
-                    "description": "How to deploy this service",
-                },
-                {
-                    "id": 1,
-                    "name": "Deploy the service",
-                    "description": "How to deploy this service",
-                },
-            ],
-            "total": 2,
-        }
+        assert listed["items"] == [
+            {
+                "id": 2,
+                "name": "Rollback the service",
+                "description": "How to deploy this service",
+            },
+            {
+                "id": 1,
+                "name": "Deploy the service",
+                "description": "How to deploy this service",
+            },
+        ]
+        assert listed["total"] == 2
 
     def test_pagination_contract(self, service: SkillsService) -> None:
         service.save(**form())
@@ -372,7 +372,9 @@ class TestDelete:
     def test_delete_hides_from_list_and_get(self, service: SkillsService) -> None:
         service.save(**form())
         assert service.delete(1) == {"id": 1, "deleted": True}
-        assert service.list() == {"items": [], "total": 0}
+        listed = service.list()
+        assert listed["items"] == []
+        assert listed["total"] == 0
         assert service.get(1) == {"id": 1, "hint": HINT_NOT_FOUND}
         row = _row("skills", 1)
         assert row is not None  # строка жива (trash)

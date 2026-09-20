@@ -89,7 +89,28 @@ class TestRangeLimits:
     def test_default_list_limit_bounds_are_valid(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        assert load_env(monkeypatch, DEFAULT_LIST_LIMIT="50").default_list_limit == 50
+        # lsb-0013: the default is bounded by the MCP ceiling; 50 is valid
+        # once the MCP surface is raised to 50 (order default ≤ MCP ≤ REST).
+        assert load_env(monkeypatch, DEFAULT_LIST_LIMIT="20").default_list_limit == 20
+        assert (
+            load_env(
+                monkeypatch, DEFAULT_LIST_LIMIT="50", LIST_MAX_LIMIT_MCP="50"
+            ).default_list_limit
+            == 50
+        )
+
+    def test_listing_ceiling_order_is_validated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """lsb-0013: default ≤ MCP ≤ REST, otherwise startup is fatal."""
+        with pytest.raises(ConfigError, match="default_list_limit"):
+            load_env(monkeypatch, DEFAULT_LIST_LIMIT="30")  # above MCP 20
+        with pytest.raises(ConfigError, match="list_max_limit_mcp"):
+            load_env(monkeypatch, LIST_MAX_LIMIT_MCP="60")  # above REST 50
+        with pytest.raises(ConfigError, match="list_max_limit_rest"):
+            load_env(monkeypatch, LIST_MAX_LIMIT_REST="0")
+        with pytest.raises(ConfigError, match="list_max_limit_mcp"):
+            load_env(monkeypatch, LIST_MAX_LIMIT_MCP="0")
 
     def test_port_out_of_range_is_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
         with pytest.raises(ConfigError, match="port"):
@@ -401,3 +422,165 @@ class TestErrorReport:
         assert "default_top_k" in message
         assert "backup_keep" in message
         assert "port" in message
+
+
+class TestLinkLimits:
+    """Связи заметок (lsb-0010): потолок/пул ≥ 1, пороги 0..1 (уровень 0),
+    пороги и правила уровня 1 (lsb-0010-02)."""
+
+    @pytest.mark.parametrize("bad_value", ["0", "-1"])
+    def test_link_top_below_one_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, bad_value: str
+    ) -> None:
+        with pytest.raises(ConfigError, match="link_top"):
+            load_env(monkeypatch, LINK_TOP=bad_value)
+
+    @pytest.mark.parametrize("bad_value", ["0", "-1"])
+    def test_link_pool_below_one_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, bad_value: str
+    ) -> None:
+        with pytest.raises(ConfigError, match="link_pool"):
+            load_env(monkeypatch, LINK_POOL=bad_value)
+
+    @pytest.mark.parametrize("bad_value", ["1.5", "-0.1"])
+    def test_link_lazy_threshold_out_of_range_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, bad_value: str
+    ) -> None:
+        with pytest.raises(ConfigError, match="link_lazy_threshold"):
+            load_env(monkeypatch, LINK_LAZY_THRESHOLD=bad_value)
+
+    def test_link_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Дефолты §3.1: потолок 3, порог = SCORE_THRESHOLD (0.50), пул 20."""
+        settings = load_env(monkeypatch)
+        assert settings.link_top == 3
+        assert settings.link_lazy_threshold == 0.50
+        assert settings.link_lazy_threshold == settings.score_threshold
+        assert settings.link_pool == 20
+
+    @pytest.mark.parametrize("bad_value", ["1.5", "-0.1"])
+    def test_link_cosine_threshold_out_of_range_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, bad_value: str
+    ) -> None:
+        """Уровень 1 (lsb-0010-02): порог косинуса — доля 0..1."""
+        with pytest.raises(ConfigError, match="link_cosine_threshold"):
+            load_env(monkeypatch, LINK_COSINE_THRESHOLD=bad_value)
+
+    @pytest.mark.parametrize(
+        ("env_name", "bad_value"),
+        [("LINK_ENTITIES_MIN_COMMON", "0"), ("LINK_ENTITIES_MIN_WORD_CHARS", "0")],
+    )
+    def test_link_entities_below_one_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, env_name: str, bad_value: str
+    ) -> None:
+        """Правило `entities`: число общих слов и длина значимого слова ≥ 1."""
+        with pytest.raises(ConfigError, match=env_name.lower()):
+            load_env(monkeypatch, **{env_name: bad_value})
+
+    def test_lazy_above_cosine_is_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Ленивый порог не выше порога связи: иначе фолбэк строже ядра."""
+        with pytest.raises(ConfigError, match="link_lazy_threshold"):
+            load_env(
+                monkeypatch, LINK_LAZY_THRESHOLD="0.80", LINK_COSINE_THRESHOLD="0.60"
+            )
+
+    def test_level1_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Дефолты уровня 1 (FR-2.3, arch §3.3): порог 0.70, слова 2 и 5."""
+        settings = load_env(monkeypatch)
+        assert settings.link_cosine_threshold == 0.70
+        assert settings.link_cosine_threshold > settings.link_lazy_threshold
+        assert settings.link_entities_min_common == 2
+        assert settings.link_entities_min_word_chars == 5
+
+
+class TestJobLimits:
+    """Фоновые джобы каркаса (lsb-0014): расписание из окружения (FR-1.2).
+
+    Джоба расчёта связей `links` (lsb-0010-03, FR-2.2): интервал ≥ 30,
+    батч ≥ 1 (нулевой батч не разобрал бы backfill никогда).
+    """
+
+    def test_links_interval_below_thirty_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with pytest.raises(ConfigError, match="job_links_interval_sec"):
+            load_env(monkeypatch, JOB_LINKS_INTERVAL_SEC="29")
+
+    def test_links_batch_below_one_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with pytest.raises(ConfigError, match="job_links_batch"):
+            load_env(monkeypatch, JOB_LINKS_BATCH="0")
+
+    def test_links_job_defaults_and_overrides(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Дефолты §3.6: включена, 300 с, батч 100; значения переопределяемы."""
+        defaults = load_env(monkeypatch)
+        assert defaults.job_links_enabled is True
+        assert defaults.job_links_interval_sec == 300
+        assert defaults.job_links_batch == 100
+        custom = load_env(
+            monkeypatch,
+            JOB_LINKS_ENABLED="false",
+            JOB_LINKS_INTERVAL_SEC="45",
+            JOB_LINKS_BATCH="7",
+        )
+        assert custom.job_links_enabled is False
+        assert custom.job_links_interval_sec == 45
+        assert custom.job_links_batch == 7
+
+
+class TestNodesJobLimits:
+    """Джоба обхода `default` `nodes` (lsb-0011): интервал ≥ 30, батч ≥ 1,
+    бюджет классификатора ≥ 1 и не выше батча."""
+
+    def test_nodes_interval_below_thirty_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with pytest.raises(ConfigError, match="job_nodes_interval_sec"):
+            load_env(monkeypatch, JOB_NODES_INTERVAL_SEC="29")
+
+    def test_nodes_batch_below_one_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with pytest.raises(ConfigError, match="job_nodes_batch"):
+            load_env(monkeypatch, JOB_NODES_BATCH="0")
+
+    def test_nodes_classifier_budget_below_one_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """lsb-0011-02: бюджет вызовов классификатора ≥ 1."""
+        with pytest.raises(ConfigError, match="job_nodes_classifier_budget"):
+            load_env(monkeypatch, JOB_NODES_CLASSIFIER_BUDGET="0")
+
+    def test_nodes_classifier_budget_above_batch_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Бюджет модели не выше общего бюджета обработок за прогон."""
+        with pytest.raises(ConfigError, match="job_nodes_classifier_budget"):
+            load_env(
+                monkeypatch,
+                JOB_NODES_BATCH="5",
+                JOB_NODES_CLASSIFIER_BUDGET="6",
+            )
+
+    def test_nodes_job_defaults_and_overrides(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Дефолты §3.2: включена, 3600 с, батч 20, бюджет 10; переопределяемы."""
+        defaults = load_env(monkeypatch)
+        assert defaults.job_nodes_enabled is True
+        assert defaults.job_nodes_interval_sec == 3600
+        assert defaults.job_nodes_batch == 20
+        assert defaults.job_nodes_classifier_budget == 10
+        custom = load_env(
+            monkeypatch,
+            JOB_NODES_ENABLED="false",
+            JOB_NODES_INTERVAL_SEC="45",
+            JOB_NODES_BATCH="7",
+            JOB_NODES_CLASSIFIER_BUDGET="5",
+        )
+        assert custom.job_nodes_enabled is False
+        assert custom.job_nodes_interval_sec == 45
+        assert custom.job_nodes_batch == 7
+        assert custom.job_nodes_classifier_budget == 5

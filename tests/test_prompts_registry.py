@@ -24,7 +24,9 @@ from app.services import prompts as prompts_mod
 from app.services.prompts import (
     EDITABLE_PROMPTS,
     JUDGE_SYSTEM_PROMPT_V21,
+    SUMMARY_SYSTEM_PROMPT,
     SUMMARY_SYSTEM_PROMPT_V21,
+    SUMMARY_SYSTEM_PROMPT_V221,
     PromptRegistry,
 )
 
@@ -337,3 +339,55 @@ class TestSeedAutoMigration:
         PromptRegistry(prompts_dir=tmp_path)  # second start
         after = (tmp_path / "judge_system.txt").read_text(encoding="utf-8")
         assert after == before == PromptRegistry().judge_system
+
+    # --- канон саммари 3.1.0: лимит 150 символов (гейт 2026-09-19) ---------
+
+    def test_prev_en_seed_migrated_to_char_limit_canon(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """Контур на прежнем EN-каноне («30 words», без seed_meta.json —
+        например, промпты скопированы из старого инсталла) → файл заменён
+        текущим каноном с лимитом 150 символов (lsbdef-0006)."""
+        (tmp_path / "summary_system.txt").write_text(
+            SUMMARY_SYSTEM_PROMPT_V221, encoding="utf-8"
+        )
+        registry = PromptRegistry(prompts_dir=tmp_path)
+        assert registry.summary_system == PromptRegistry().summary_system
+        assert "no more than 150 characters in total" in registry.summary_system
+        assert _read(tmp_path, "summary_system") == registry.summary_system
+
+    def test_stamped_prev_canon_migrated_on_version_bump(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """Реальный апгрейд до 3.1.0: файл засеян прошлым каноном и НЕ правлен
+        (hash и версия 2.2.1 в seed_meta.json) → при смене SEED_VERSION
+        заменён текущим каноном, штамп обновлён."""
+        (tmp_path / "summary_system.txt").write_text(
+            SUMMARY_SYSTEM_PROMPT_V221, encoding="utf-8"
+        )
+        meta = {
+            "seed_version": "2.2.1",
+            "files": {
+                "summary_system": PromptRegistry._hash(SUMMARY_SYSTEM_PROMPT_V221)
+            },
+        }
+        (tmp_path / "seed_meta.json").write_text(
+            json.dumps(meta), encoding="utf-8"
+        )
+        registry = PromptRegistry(prompts_dir=tmp_path)
+        assert registry.summary_system == SUMMARY_SYSTEM_PROMPT
+        assert "30 words" not in registry.summary_system
+        assert _read(tmp_path, "summary_system") == SUMMARY_SYSTEM_PROMPT
+        stamped = json.loads((tmp_path / "seed_meta.json").read_text(encoding="utf-8"))
+        assert stamped["seed_version"] == prompts_mod.SEED_VERSION
+
+    def test_operator_edited_summary_prompt_kept(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """Операторская правка summary_system не совпадает ни с одним известным
+        сидом — авто-миграция её не трогает (ни под канон 3.1.0)."""
+        custom = "Мой пересказ: одно предложение, без воды."
+        (tmp_path / "summary_system.txt").write_text(custom, encoding="utf-8")
+        registry = PromptRegistry(prompts_dir=tmp_path)
+        assert registry.summary_system == custom
+        assert _read(tmp_path, "summary_system") == custom

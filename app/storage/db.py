@@ -44,6 +44,15 @@ CRUD (валидации, статусы, soft delete) — в `app.services.note
 - На старте FTS-индекс сверяется с `notes` (оператор имеет прямой доступ к
   файлу БД, REQUIREMENTS §4); рассинхрон лечится rebuild'ом, прочие ошибки
   целостности — фатальны (StorageError).
+- Связи заметок (lsb-0010-02, релиз 3.1.0): таблица `links` (одна строка
+  на пару, канонический порядок `note_a < note_b`) + маркер расчёта
+  `notes.links_at` — идемпотентная миграция при старте; смена модели или
+  размерности эмбеддинга (автореиндексация ниже) очищает и связи.
+- Лимит длины саммари (гейт 3.1.0, 2026-09-19): активные заметки с готовым
+  саммари длиннее MAX_SUMMARY_CHARS помечаются на перегенерацию
+  (`summary_status='pending'`) — текст саммари НЕ портится усечением, его
+  заменяет фоновая джоба `summary`; идемпотентно (после перегенерации
+  повторный старт — no-op), заметки с `summary_status != 'ok'` уже в очереди.
 - Области 3.0.0 (субстрат, ARCH substrate §3.1–3.2): отдельные таблицы,
   FTS5-индексы и vec0-индексы по областям skills/terms/user в той же БД.
   Ни один объект заметок не пересоздаётся; старые записи не мигрируются
@@ -112,7 +121,9 @@ CREATE TABLE IF NOT EXISTS notes (
   classified_at  TEXT    NULL,
   hint_path      TEXT    NULL,
   confidence     REAL    NULL,
-  expires_at     TEXT    NULL
+  expires_at     TEXT    NULL,
+  links_at       TEXT    NULL,
+  node_order_at  TEXT    NULL
 )
 """
 
@@ -172,6 +183,27 @@ CREATE TABLE IF NOT EXISTS note_expirations (
   expires_at TEXT    NOT NULL
 )
 """
+
+# Связи заметок, уровень 1 (lsb-0010-02, arch §3.2): одна строка на пару
+# заметок; пара хранится в каноническом порядке `note_a < note_b` (связь
+# симметрична, чтение — в обе стороны), `kind` — вид связи с приоритетом
+# mention > entities > cosine, `score` — косинус/доля общих слов (NULL для
+# mention). Строки пишет только расчёт (`LinksService.compute_for_note`) —
+# одна транзакция на заметку: удалить пары → вставить заново.
+_LINKS_DDL = """
+CREATE TABLE IF NOT EXISTS links (
+  note_a     INTEGER NOT NULL,          -- меньший id пары
+  note_b     INTEGER NOT NULL,          -- больший id пары
+  kind       TEXT    NOT NULL,          -- 'mention' | 'entities' | 'cosine'
+  score      REAL,                      -- косинус / доля общих слов / NULL
+  created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  PRIMARY KEY (note_a, note_b)
+)
+"""
+
+# Индекс обратной стороны пары: выдача и пересчёт ищут связи заметки в обе
+# стороны (`note_a = ? OR note_b = ?`), PRIMARY KEY покрывает только note_a.
+_LINKS_INDEX_DDL = "CREATE INDEX IF NOT EXISTS idx_links_b ON links(note_b)"
 
 # Вектора (Фаза 3): физическая схема в `app.storage.vectors` (размерность и
 # cosine-метрика — там же); в init_db — создание/сверка при старте. Модель
@@ -579,6 +611,17 @@ def init_db(settings: Settings) -> None:
             # Временное хранение (lsb-0004-02): колонка notes.expires_at +
             # очередь удаления note_expirations (идемпотентно).
             _migrate_expiration_columns(conn)
+            # Связи заметок (lsb-0010-02): таблица links + индекс + маркер
+            # notes.links_at — идемпотентно, до ветки автореиндексации
+            # (та очищает связи при смене модели/размерности).
+            _migrate_link_columns(conn)
+            # Порядок в узлах (lsb-0011-01): служебный маркер notes.node_order_at
+            # — идемпотентно; у существующих заметок NULL (первый прогон джобы
+            # `nodes` разбирает накопленный default — ретро-прогон, arch §4).
+            _migrate_node_order_columns(conn)
+            # Лимит длины саммари (гейт 3.1.0, 2026-09-19): готовые саммари
+            # длиннее MAX_SUMMARY_CHARS → pending (перегенерация фоном).
+            _migrate_summary_length(conn, settings)
             # List-индексы (пул 15): старый idx_notes_namespace заменён
             # (prefix namespace, deleted_at покрыт новым ns-индексом).
             conn.execute("DROP INDEX IF EXISTS idx_notes_namespace")
@@ -767,6 +810,80 @@ def _migrate_expiration_columns(conn: sqlite3.Connection) -> None:
     if "expires_at" not in columns:
         conn.execute("ALTER TABLE notes ADD COLUMN expires_at TEXT")
     conn.execute(_NOTE_EXPIRATIONS_DDL)
+
+
+def _migrate_node_order_columns(conn: sqlite3.Connection) -> None:
+    """Нулевая миграция lsb-0011-01 поверх живых БД: маркер notes.node_order_at.
+
+    Свежие БД получают колонку из _NOTES_DDL; унаследованные — ALTER TABLE
+    ADD COLUMN (node_order_at NULL у всех заметок: первый прогон джобы `nodes`
+    естественно разбирает накопленный `default` — ретро-прогон). Маркер
+    служебный: в выдачи MCP/REST не выходит, warning'ом не является.
+    Идемпотентно: повторный запуск (рестарт сервиса) — no-op.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
+    if "node_order_at" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN node_order_at TEXT")
+
+
+def _migrate_link_columns(conn: sqlite3.Connection) -> None:
+    """Нулевая миграция lsb-0010-02 поверх живых БД: таблица links, индекс
+    idx_links_b и маркер расчёта notes.links_at.
+
+    Свежие БД получают колонку из _NOTES_DDL и таблицу из _LINKS_DDL;
+    унаследованные — ALTER TABLE ADD COLUMN (links_at NULL у всех заметок:
+    первый прогон джобы `links` естественно делает backfill, arch §3.4) +
+    CREATE TABLE/INDEX IF NOT EXISTS. Идемпотентно: повторный запуск — no-op.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
+    if "links_at" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN links_at TEXT")
+    conn.execute(_LINKS_DDL)
+    conn.execute(_LINKS_INDEX_DDL)
+
+
+def _migrate_summary_length(
+    conn: sqlite3.Connection, settings: Settings
+) -> None:
+    """Миграция гейта 3.1.0 (2026-09-19): саммари длиннее лимита — на перегенерацию.
+
+    Лимит длины саммари снижен до MAX_SUMMARY_CHARS (150): у живой БД уже
+    сохранённые более длинные саммари надо переделать. Хранимый текст здесь
+    НЕ трогается (грубое `substr` запрещено: обрезанная посередине фразы
+    выжимка хуже отсутствия): заметка помечается `summary_status='pending'`,
+    а новую выжимку кладёт фоновая джоба `summary` (`worker.process_summary_pending`
+    — `cap_summary` держит лимит). Пока саммари перегенерируется, выдачи
+    отдают fallback-усечение текста заметки (§5.5) — оно уже ≤ лимита.
+
+    Идемпотентность: после перегенерации саммари ≤ лимита — повторный старт
+    ничего не находит (no-op), штамп в meta не нужен.
+
+    Что не трогаем:
+    - заметки с `summary_status != 'ok'` — они и так в очереди суммаризации
+      (повторная пометка ничего не меняет, статус не переписывается);
+    - trash (`deleted_at IS NOT NULL`) — джоба `summary` его не обслуживает,
+      заметка осталась бы вечно pending; саммари мусорных строк не важно.
+
+    Признака происхождения саммари в схеме нет (модель или явная передача),
+    поэтому явно вписанные длинные саммари тоже уходят на перегенерацию —
+    лимит один на всё поле `summary`.
+    """
+    cursor = conn.execute(
+        "UPDATE notes SET summary_status = 'pending' "
+        "WHERE summary_status = 'ok' AND deleted_at IS NULL "
+        "AND length(summary) > ?",
+        (settings.max_summary_chars,),
+    )
+    if cursor.rowcount:
+        logging.getLogger("app").warning(
+            "summaries above the length limit queued for regeneration",
+            extra={
+                "event": "summary_regen_queued",
+                "notes": cursor.rowcount,
+                "reason": "summary_length",
+                "max_summary_chars": settings.max_summary_chars,
+            },
+        )
 
 
 def _ensure_skills_meta(conn: sqlite3.Connection) -> None:
@@ -1148,6 +1265,12 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
         vectors.create_vec_table(conn, settings.embedding_dim)
         # Вектора полных текстов невалидны — все заметки (вкл. trash) в очередь.
         conn.execute("UPDATE notes SET vector_status = 'pending'")
+        # Связи уровня 1 (lsb-0010-02, arch §3.4): косинус считается по этим
+        # векторам, «значимые слова»/упоминания — по тексту, но связи другой
+        # модели невалидны целиком — таблица очищается, маркеры сброшены
+        # (расчёт догонит воркер после до-векторизации).
+        conn.execute("UPDATE notes SET links_at = NULL")
+        conn.execute("DELETE FROM links")
         # Области 3.0.0: вектора другой модели несовместимы — area-vec
         # дропаются и пересоздаются, все записи областей → pending.
         _reset_area_vectors(conn, settings)

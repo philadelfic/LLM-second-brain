@@ -22,6 +22,9 @@
 Выдача FR-1: summary/snippet, без полного текста (memory_get адресно).
 Фаза 11 (решение №9): +title — реальное значение notes.title (None остаётся
 только у миграционных заметок без названия).
+lsb-0010-04 (FR-4.1/FR-4.2): +chars — объём ПОЛНОГО текста заметки в
+символах (не snippet/summary); значение для одной заметки совпадает с
+memory_list/memory_get без чанков.
 Snippet — из ЛУЧШЕГО чанка (первые SNIPPET_CHARS символов чанка): модель видит
 релевантный фрагмент длинной заметки, а не её начало; у fallback-кандидатов —
 из полного текста, как в Фазе 3. Ties (равный rrf_score) — по updated_at DESC,
@@ -262,6 +265,61 @@ class SearchService:
             return {"results": [], "hint": HINT_NO_RESULTS_TITLE}
         return {"results": results}
 
+    def similar_notes(
+        self, note_id: int, pool: int, threshold: float
+    ) -> list[tuple[int, float]]:
+        """KNN по ПОЛНОМУ вектору заметки (notes_vec) — кандидаты связей §3.1.
+
+        Отличие от `search`: вход — не текст запроса, а вектор самой заметки;
+        фильтра неймспейса НЕТ (`ns_filter=None`) — связи ищутся по всей базе,
+        а отсечение «своего раздела» делает выдача (LinksService, arch §3.5).
+        Отсечения здесь: сама заметка, soft-deleted, `cosine < threshold`
+        (порог включительный: кандидат ровно на пороге остаётся).
+
+        Заметка без готового вектора (`vector_status != 'ok'` или нет строки
+        notes_vec) даёт пустой список, без ошибки (FR-1.5): связей просто нет.
+        Возврат — [(note_id, cosine)] по убыванию близости, не больше `pool`.
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT vector_status, deleted_at FROM notes WHERE id = ?",
+                (note_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["deleted_at"] is not None
+                or row["vector_status"] != "ok"
+            ):
+                return []
+            vector = vectors.get_vector(conn, note_id)
+            if vector is None:
+                return []
+            # Окно KNN расширяем на trash-векторы (vec0 их не знает — то же
+            # пост-отсечение, что в search) и на саму заметку: после фильтра
+            # вернём до `pool` активных кандидатов.
+            trash = conn.execute(
+                "SELECT COUNT(*) FROM notes_vec WHERE note_id IN "
+                "(SELECT id FROM notes WHERE deleted_at IS NOT NULL)"
+            ).fetchone()[0]
+            hits = vectors.knn(conn, vector, pool + trash + 1)
+            if not hits:
+                return []
+            placeholders = ",".join("?" * len(hits))
+            active = {
+                hit[0]
+                for hit in conn.execute(
+                    "SELECT id FROM notes WHERE deleted_at IS NULL "
+                    f"AND id IN ({placeholders})",
+                    [hit_id for hit_id, _ in hits],
+                )
+            }
+        results = [
+            (hit_id, cosine)
+            for hit_id, cosine in hits
+            if hit_id != note_id and hit_id in active and cosine >= threshold
+        ]
+        return results[:pool]
+
     # --- источники кандидатов ------------------------------------------------
 
     def _vector_candidates(
@@ -485,10 +543,14 @@ class SearchService:
         Фаза 11 (решение №9, follow-up 5b): +title — реальное значение
         notes.title (None только у миграционных заметок без названия);
         REST /search отдаёт выдачу как есть, MCP-слой берёт то же поле.
+        lsb-0010-04 (FR-4.2): +chars — объём ПОЛНОГО текста заметки в
+        символах (не snippet/summary); текст уже в выборке (snippet-fallback)
+        — новых чтений нет. То же значение, что в memory_list/memory_get.
         """
         return {
             "id": row["id"],
             "title": row["title"],
+            "chars": len(row["text"]),  # lsb-0010-04: объём полного текста
             "summary": summary_of(row, self._settings),
             "snippet": snippet(snippet_source or row["text"], self._settings),
             "summary_status": row["summary_status"],

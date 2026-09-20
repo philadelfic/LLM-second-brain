@@ -382,6 +382,29 @@ def test_process_summary_fills_pending(settings) -> None:
         assert row["summary_status"] == "ok"
 
 
+def test_process_summary_caps_model_answer_at_limit(settings) -> None:
+    """Ответ модели длиннее лимита сохраняется усечённым (гейт 3.1.0,
+    2026-09-19): в БД — ≤ MAX_SUMMARY_CHARS по границе слова с многоточием,
+    в выдачах — именно оно (готовое), а не fallback-срез текста заметки."""
+    notes = NoteService(settings, FailingEmbedder())
+    saved = notes.save("заметка, ждущая суммаризацию фоновым воркером")
+    long_answer = "Плотный ответ модели по заметке. " * 12  # ~370 символов
+    assert len(long_answer) > settings.max_summary_chars
+    worker = make_worker(settings, HashEmbedder(8), FixedSummarizer(long_answer))
+    assert worker.process_summary_pending() == 1
+    with session(settings) as conn:
+        summary = conn.execute(
+            "SELECT summary FROM notes WHERE id = ?", (saved["id"],)
+        ).fetchone()["summary"]
+    assert len(summary) <= settings.max_summary_chars
+    assert summary.endswith("…")
+    assert long_answer.startswith(summary[:-1])  # префикс ответа, не выдумка
+    assert long_answer[len(summary) - 1].isspace()  # обрезано по границе слова
+    fetched = notes.get([saved["id"]])["notes"][0]
+    assert fetched["summary"] == summary
+    assert fetched["summary_status"] == "ok"
+
+
 def test_process_summary_empty_queue(settings) -> None:
     worker = make_worker(settings, HashEmbedder(8), FixedSummarizer())
     assert worker.process_summary_pending() == 0
@@ -1189,3 +1212,52 @@ async def test_judge_loop_rechecks_queue_before_sleep(slow) -> None:
         assert calls["n"] >= 3
     finally:
         asyncio.wait_for = orig_wait_for
+
+
+# --- каркас джоб (lsb-0014-02): поле job в событиях петель --------------------
+
+
+def test_jobs_purged_event_carries_job_embedding(settings, caplog) -> None:
+    """События embedding-джобы несут обязательное поле job (FR-1.4)."""
+    worker = make_worker(settings, HashEmbedder(8))
+    worker._ensure_job_table()
+    _seed_worker_job(settings, 1, "done", _jobs_ts(8))  # старая done → к удалению
+    with caplog.at_level(logging.INFO, logger="app"):
+        worker._purge_done_jobs()
+    purged = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "jobs_purged"
+    ]
+    assert [record.job for record in purged] == ["embedding"]
+
+
+def test_summary_failed_event_carries_job_summary(settings, caplog) -> None:
+    """События summary-джобы несут обязательное поле job (FR-1.4)."""
+    notes = NoteService(settings, FailingEmbedder())
+    notes.save("заметка при отказе суммаризатора в summary-джобе")
+    worker = make_worker(settings, FailingEmbedder(), FailingSummarizer())
+    with caplog.at_level(logging.WARNING, logger="app"):
+        assert worker.process_summary_pending() == 0
+    failed = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "summary_failed"
+    ]
+    assert [record.job for record in failed] == ["summary"]
+
+
+def test_fresh_worker_instance_picks_up_pending(settings) -> None:
+    """Рестарт: pending в БД подхватывает новый экземпляр воркера (FR-1.5).
+
+    Перевод на каркас ничего не держит в памяти процесса: задания живут в
+    статусах заметок и в `worker_jobs` — свежий воркер (как после рестарта
+    контейнера) обслуживает их с нуля, без общего состояния с прежним.
+    """
+    notes = NoteService(settings, FailingEmbedder())
+    notes.save("заметка, ждущая нового экземпляра воркера")
+    first = make_worker(settings, FailingEmbedder())  # отказ кодирования
+    assert first.process_pending() == 0  # задание осталось pending
+    second = make_worker(settings, HashEmbedder(8))  # новый процесс (рестарт)
+    assert second.process_pending() == 1  # подхвачено с нуля
+    assert second.process_judge_pending() == 1  # judge-работа из БД тоже

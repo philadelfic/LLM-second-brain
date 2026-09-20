@@ -518,3 +518,26 @@ def test_judge_picks_second_candidate_after_first_rejects(dim8) -> None:
     assert rows[1]["text"] == "слитый текст"  # ранняя (id=2) обновлена
     assert rows[1]["vector_status"] == "pending"  # ре-векторизация — фон
     assert rows[2]["deleted_at"] is not None  # свежая (id=3) — trash
+
+
+def test_dedup_judge_failed_event_carries_job_judge(dim8, caplog) -> None:
+    """События judge-джобы несут обязательное поле job (FR-1.4)."""
+    notes = NoteService(dim8, FailingEmbedder())
+    notes.save("первая заметка judge-джобы")
+    notes.save("вторая заметка judge-джобы")
+    worker = BackgroundWorker(
+        dim8,
+        HashEmbedder(8),
+        FixedSummarizer("С."),
+        RecordingDedup(candidates=[(1, 0.94)]),
+        judge=ScriptedJudge([True], fail=True),
+    )
+    with caplog.at_level(logging.WARNING, logger="app"):
+        assert worker.process_pending() == 2
+        assert worker.process_judge_pending() == 1  # судья отказал — pending
+    events = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "dedup_judge_failed"
+    ]
+    assert [record.job for record in events] == ["judge"]

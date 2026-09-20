@@ -80,7 +80,7 @@ independently:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MAX_SUMMARY_CHARS` | `200` | summary length limit |
+| `MAX_SUMMARY_CHARS` | `150` | summary length limit: model summary is capped at a word boundary, the pending-note fallback is the first N characters (gate 3.1.0, 2026-09-19) |
 | `SUMMARY_THINK` | `true` | allow summarizer reasoning (ollama only) |
 | `SUMMARY_NUM_PREDICT` | `35000` | generation cap for the summary |
 | `MERGE_NUM_PREDICT` | `35000` | generation cap for dedup merge |
@@ -119,6 +119,51 @@ independently:
 | `SNIPPET_CHARS` | `120` | snippet length in search output |
 | `MAX_GET_BATCH` | `20` | max ids in one `memory_get` |
 
+### Listings (v3.1)
+
+The MCP listings (`memory_list`, `skills_list`) cap a page at the MCP ceiling;
+the REST listings of notes and skills use the REST ceiling. The default page
+size must not exceed the MCP ceiling, and the MCP ceiling must not exceed the
+REST one (validated at startup).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LIST_MAX_LIMIT_MCP` | `20` | page ceiling on the MCP surface |
+| `LIST_MAX_LIMIT_REST` | `50` | page ceiling on the REST surface |
+
+### Related notes (v3.1)
+
+Note links are computed without LLM calls: level 0 is a lazy graph over note
+vectors, level 1 uses a stronger cosine cut plus a shared-entities rule.
+Reading a note returns its `links`; the `links` job below keeps them up to
+date.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LINK_TOP` | `3` | related-notes ceiling per note |
+| `LINK_LAZY_THRESHOLD` | `0.50` | lazy-graph cosine cutoff (level 0) |
+| `LINK_POOL` | `20` | KNN candidate pool for related notes |
+| `LINK_COSINE_THRESHOLD` | `0.70` | level-1 cosine link cutoff (must be ≥ `LINK_LAZY_THRESHOLD`) |
+| `LINK_ENTITIES_MIN_COMMON` | `2` | shared significant words for an entities link |
+| `LINK_ENTITIES_MIN_WORD_CHARS` | `5` | minimal length of a significant word |
+
+### Background jobs (v3.1)
+
+The `links` job recomputes related notes for notes not yet processed or stale;
+the `nodes` job sweeps the accumulated `default` namespace and reclassifies
+notes after a merge. A disabled job does not start, but its queue stays
+visible in `/health`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `JOB_LINKS_ENABLED` | `true` | recompute related notes (queue stays visible when off) |
+| `JOB_LINKS_INTERVAL_SEC` | `300` | start pause between runs, seconds (≥ 30) |
+| `JOB_LINKS_BATCH` | `100` | notes recomputed per run (≥ 1) |
+| `JOB_NODES_ENABLED` | `true` | sweep the `default` namespace (queue stays visible when off) |
+| `JOB_NODES_INTERVAL_SEC` | `3600` | start pause between runs, seconds (≥ 30) |
+| `JOB_NODES_BATCH` | `20` | default notes processed per run (≥ 1) |
+| `JOB_NODES_CLASSIFIER_BUDGET` | `10` | classifier calls per run (≥ 1 and ≤ `JOB_NODES_BATCH`) |
+
 ### Background / observability / backup
 
 | Variable | Default | Meaning |
@@ -129,6 +174,10 @@ independently:
 | `BACKUP_DIR` | `/data/backups` | backup snapshot directory |
 | `BACKUP_INTERVAL_SEC` | `86400` | snapshot interval (daily) |
 | `BACKUP_KEEP` | `7` | snapshots kept (rotation) |
+
+`/health` (no token) also reports `version` and `queues`: for each background
+queue, the number of `pending` jobs and `oldest_pending_sec` — the age of the
+oldest one (`null` when the queue is idle).
 
 ### Namespaces (Phase 10)
 

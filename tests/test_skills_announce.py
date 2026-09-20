@@ -94,6 +94,7 @@ def _services(settings, embedding, skills: bool = True) -> Services:
         skills=SkillsService(settings, embedding=embedding) if skills else None,
         user_facts=UserFactsService(settings, embedding=embedding),
         terms=TermsService(settings, embedding=embedding),
+        links=None,
     )
 
 

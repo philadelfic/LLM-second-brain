@@ -137,7 +137,9 @@ class TestOutput:
         assert set(hit) == {
             "id", "title", "summary", "snippet", "summary_status", "rrf_score",
             "cosine", "created_at", "updated_at", "author", "namespace",  # Фаза 10 + title (Фаза 11)
+            "chars",  # lsb-0010-04 (FR-4.1): объём полного текста в символах
         }
+        assert hit["chars"] == len("Сервис TaskFlow общается")  # не snippet/summary
         assert hit["title"] is None  # легаси-путь save без title (решение №9)
         assert hit["author"] == "gpt"
         assert hit["namespace"] == "default"  # Фаза 10: save без namespace → default
@@ -168,7 +170,7 @@ class TestOutput:
         searcher, notes_service = service
         notes_service.save("Сервис TaskFlow " + long_text(250))
         hit = self._first(searcher, 1)
-        expected = ("Сервис TaskFlow " + long_text(250))[:200]
+        expected = ("Сервис TaskFlow " + long_text(250))[:150]
         assert hit["summary"] == expected
         assert hit["summary_status"] == "pending"
 

@@ -156,6 +156,7 @@ def _services(settings, embedding) -> Services:
         promotion=None,
         user_facts=UserFactsService(settings, embedding=embedding),
         terms=TermsService(settings, embedding=embedding),
+        links=None,
     )
 
 
@@ -472,6 +473,7 @@ class TestOtherOutputsRegression:
         assert set(found["results"][0]) == {
             "id",
             "summary",
+            "chars",
             "created_at",
             "updated_at",
             "namespace",

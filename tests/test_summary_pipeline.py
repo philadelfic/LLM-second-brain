@@ -49,7 +49,7 @@ NOTE_TEXT = (
     "вынесены в отдельный трекер; повтор ежемесячно, во второй вторник."
 )
 
-assert len(NOTE_TEXT) > 200  # fallback-усечение по MAX_SUMMARY_CHARS видно
+assert len(NOTE_TEXT) > 150  # fallback-усечение по MAX_SUMMARY_CHARS видно
 
 
 def _make_client(
@@ -89,6 +89,7 @@ def _make_client(
             # 3.0.0: область terms обязательна в контейнере (lsb-0008-02)
             # — фейков в ней нет, эмбеддер общий (запись его не зовёт).
             terms=TermsService(settings, embedding=embedding),
+            links=None,
         )
 
     monkeypatch.setattr("app.main.build_services", builder)
@@ -169,7 +170,7 @@ def test_save_returns_immediately_in_mode_b(paused_app, token) -> None:
     ).json()
     assert note["summary_status"] == "pending"
     # fallback-усечение до готовности: первые MAX_SUMMARY_CHARS символов
-    assert note["summary"] == NOTE_TEXT[:200]
+    assert note["summary"] == NOTE_TEXT[:150]
     assert note["summary"] != ""
     body = _health(paused_app)
     assert body["pending_summary"] == 1  # заметка стоит в очереди на суммаризацию
@@ -211,7 +212,7 @@ def test_worker_backfills_summary_and_health(ok_app, token) -> None:
     note = ok_app.get("/notes/1", headers={"Authorization": f"Bearer {token}"}).json()
     assert note["summary_status"] == "ok"
     assert note["summary"] == "Ретроспектива 12 сентября в 14:00."
-    assert len(note["summary"]) <= 200
+    assert len(note["summary"]) <= 150
 
 
 def test_summary_visible_in_get_list_search(ok_app, token) -> None:
@@ -291,7 +292,7 @@ def test_failure_keeps_fallback_and_pending(dead_app, token) -> None:
         "/notes/1", headers={"Authorization": f"Bearer {token}"}
     ).json()
     assert note["summary_status"] == "pending"
-    assert note["summary"] == NOTE_TEXT[:200]  # fallback-усечение
+    assert note["summary"] == NOTE_TEXT[:150]  # fallback-усечение
     assert note["summary"] != ""
 
 
