@@ -8,6 +8,9 @@ Covers the single E2E for the lsb-0005 feature:
   D. save into a non-existent node → error + hint about memory_namespace_create.
   E. default has no nesting: default/x → refusal.
 
+Idempotency (techdebt-0036, item 2): a repeated run reuses the already registered
+probe nodes `e2e5*` (`node_creation`) — the MCP surface has no node delete handle.
+
 Run: inside the lsb-test container (docker exec), URL http://localhost:8080/mcp.
 """
 from __future__ import annotations
@@ -15,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 
 import httpx2
@@ -28,6 +32,14 @@ PASS = 0
 FAIL = 0
 FAILURES: list[str] = []
 
+# --- идемпотентность повторного прогона (techdebt-0036, item 2) ---------------
+# Узлы-зонды `e2e5*` переиспользуются: ручки удаления узла в MCP-поверхности
+# нет, поэтому повторный прогон получает от антисинонимии приложения мягкий
+# отказ с `nearest`, равным самому запрошенному пути, — это успех
+# (`node_creation`), а не FAIL.
+_SYNONYM_HINT = re.compile(r"there is a similar one:\s*(\S+)")
+_ALREADY_REGISTERED = re.compile(r"already registered", re.IGNORECASE)
+
 
 def check(name: str, ok: bool, detail: str = "") -> None:
     global PASS, FAIL
@@ -38,6 +50,51 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         FAIL += 1
         FAILURES.append(name)
         print(f"  [FAIL] {name}" + (f" — {detail}" if detail else ""))
+
+
+def refusal(result: dict) -> str:
+    """Текст мягкого отказа приложения (`hint`, иначе `reason`), иначе — пусто."""
+    for field in ("hint", "reason"):
+        value = result.get(field)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def node_creation(path: str, result: dict) -> tuple[bool, str]:
+    """Итог идемпотентной регистрации узла-зонда: `(успех, деталь для отчёта)`.
+
+    Успех — узел создан ЭТИМ прогоном (`created=True`, статус `confirmed`) ЛИБО
+    уже зарегистрирован (повторный прогон). Имя и описание зонда фиксированы,
+    поэтому антисинонимия приложения (порог косинуса описаний 0.90) отдаёт
+    мягкий отказ `created=False` с подсказкой `hint='there is a similar one:
+    <nearest>'`, где `nearest` равен самому запрошенному пути (описание
+    сравнивается с самим собой) — это и есть «узел на месте». Любой другой
+    отказ (в том числе `nearest` на ЧУЖОЙ узел) — FAIL с причиной и `nearest`:
+    имя/описание зонда надо развести с существующим узлом.
+    """
+    if result.get("created") is True:
+        if result.get("status") != "confirmed":
+            return False, f"path={path}, created but status={result.get('status')!r}"
+        return True, f"path={result.get('path') or path}, created now (confirmed)"
+    hint = refusal(result)
+    match = _SYNONYM_HINT.search(hint)
+    nearest = match.group(1).strip() if match else None
+    if nearest is not None and nearest == path:
+        return True, f"path={path}, already registered (nearest={nearest} — itself)"
+    if nearest is not None:
+        return False, (f"reason=synonym, nearest={nearest}, path={path} — another "
+                       "node is nearer than the requested one")
+    if _ALREADY_REGISTERED.search(hint) and path in hint:
+        return True, f"path={path}, already registered (the registry says so)"
+    reason = hint or "no hint from the tool"
+    return False, f"path={path}, created={result.get('created')!r}, reason={reason}"
+
+
+def check_node_creation(label: str, path: str, result: dict) -> None:
+    """Проверка регистрации узла-зонда по идемпотентным правилам `node_creation`."""
+    ok, detail = node_creation(path, result)
+    check(label, ok, detail)
 
 
 def extract(result) -> dict:
@@ -62,6 +119,21 @@ class Client:
         return extract(res)
 
 
+async def node_confirmed(c: Client, path: str) -> tuple[bool, str]:
+    """Статус узла в реестре: `(подтверждён, деталь)` по карте `memory_namespaces`.
+
+    Нужно потому, что `memory_namespace_create` на уже существующем узле отдаёт
+    мягкий отказ без поля `status` (см. `node_creation`), а проверка «root has
+    status confirmed» должна оставаться содержательной и на повторном прогоне.
+    """
+    r = await c.call("memory_namespaces", {})
+    for node in r.get("namespaces", []):
+        if node.get("path") == path:
+            return (node.get("status") == "confirmed",
+                    f"path={path}, status={node.get('status')}")
+    return False, f"path={path} is missing from the registry (memory_namespaces)"
+
+
 async def main() -> int:
     global PASS, FAIL
     # lsbdef-0005: MCP timeouts (30s connect/write/pool, 300s read) instead of
@@ -83,22 +155,20 @@ async def main() -> int:
                 r = await c.call("memory_namespace_create", {
                     "path": "e2e5", "description": "E2E test domain for lsb-0005.",
                 })
-                check("root e2e5 created (confirmed)", r.get("created") is True,
-                      f"path={r.get('path')} status={r.get('status')}")
-                check("root has status confirmed", r.get("status") == "confirmed",
-                      f"status={r.get('status')}")
+                check_node_creation("root e2e5 registered (confirmed)", "e2e5", r)
+                ok, detail = await node_confirmed(c, "e2e5")
+                check("root has status confirmed", ok, detail)
 
                 r = await c.call("memory_namespace_create", {
                     "path": "e2e5/sub", "description": "E2E subdomain under e2e5.",
                 })
-                check("subdomain e2e5/sub created (depth 2)", r.get("created") is True,
-                      f"path={r.get('path')}")
+                check_node_creation("subdomain e2e5/sub registered (depth 2)", "e2e5/sub", r)
 
                 r = await c.call("memory_namespace_create", {
                     "path": "e2e5/sub/deep", "description": "E2E deep subdomain depth 3.",
                 })
-                check("sub-subdomain e2e5/sub/deep created (depth 3)", r.get("created") is True,
-                      f"path={r.get('path')}")
+                check_node_creation("sub-subdomain e2e5/sub/deep registered (depth 3)",
+                                    "e2e5/sub/deep", r)
 
                 # ---------- E: default has no nesting ----------
                 print("\n[E] default has no nesting")
