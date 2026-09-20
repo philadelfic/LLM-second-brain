@@ -52,7 +52,9 @@ Scenarios (0-9), per the techdebt-0036-01 spec:
      after the sweep the `nodes` queue keeps NO sweep work (candidates of both
      pools = 0); a pending `reclass` job whose merged note still waits for a
      summary is allowed and printed in detail, while a job whose note already
-     has a ready summary is a real hang and fails the scenario.
+     has a ready summary is a real hang and fails the scenario. The verdict
+     reads ONLY `worker_jobs` rows of the `nodes` slot (ids are global across
+     slots: a pending judge/dedup job must never be taken for a nodes one).
   6. `/health` = 7 previous fields + `queues` + `version`.
   7. Context budgets, measured AFTER the vector/summary queues drain:
      `memory_search` top_k=5 ≤ 450 B PER ITEM, `memory_list`
@@ -628,10 +630,12 @@ def reclass_note_ids(ids: list[int]) -> set[int]:
     return {row["note_id"] for row in rows or []}
 
 
-def reclass_pending_state() -> tuple[list[int], list[tuple[int, Any]], str]:
+def reclass_pending_state() -> tuple[list[tuple[int, int]],
+                                     list[tuple[int, int, Any]], str]:
     """Pending-задания `nodes`/`reclass` и их судьба на момент проверки.
 
-    Возвращает `(берущиеся, ждущие, текст ошибки)`:
+    Возвращает `(берущиеся, ждущие, текст ошибки)`; элементы — `(job_id,
+    note_id)` и `(job_id, note_id, summary_status)`:
 
     * **берущиеся** — у заметки ГОТОВАЯ непустая суммари либо заметки нет в живых
       (корзина/удалена): такое задание прогон снимает сам, значит его `pending` —
@@ -641,7 +645,15 @@ def reclass_pending_state() -> tuple[list[int], list[tuple[int, Any]], str]:
       pending и ЖДЁТ модель — это «работа есть, но она ждёт модель», а не
       залипание (заметка и так видна в очереди `summary`).
 
-    Предикат тот же, что у джобы (`_NODES_RECLASS_TAKEABLE` в
+    `worker_jobs.id` СКВОЗНОЙ по всем слотам (`judge/dedup`, `summary/merge` и
+    т.д.), поэтому по номеру строки слот не определяется: вердикт строится
+    ТОЛЬКО по строкам слота `nodes` — отбор делает SQL (`slot = 'nodes'`),
+    и та же пара (slot, kind) ПОВТОРНО сверяется по полям самой строки в Python
+    (страховка: чужое pending-задание, например `judge/dedup`, в «залипание» не
+    попадает). В detail печатается и номер строки очереди, и номер заметки
+    (`job N/note M`) — иначе сквозной id читается неоднозначно.
+
+    Предикат готовности заметки тот же, что у джобы (`_NODES_RECLASS_TAKEABLE` в
     `app/services/worker.py`): иначе харнесс и контур разошлись бы в оценке
     одного состояния. Таблицы `worker_jobs` может ещё не быть (задания не
     ставились) — тогда возвращается ошибка чтения, а не «залипание».
@@ -649,7 +661,8 @@ def reclass_pending_state() -> tuple[list[int], list[tuple[int, Any]], str]:
     if not db_ready():
         return [], [], f"the DB is not reachable ({CFG['db']})"
     rows, err = db_try(
-        "SELECT j.note_id AS note_id, n.id AS note_exists, n.deleted_at AS deleted_at, "
+        "SELECT j.id AS job_id, j.slot AS slot, j.kind AS kind, "
+        "j.note_id AS note_id, n.id AS note_exists, n.deleted_at AS deleted_at, "
         "n.summary_status AS summary_status, n.summary AS summary "
         "FROM worker_jobs j LEFT JOIN notes n ON n.id = j.note_id "
         "WHERE j.slot = 'nodes' AND j.kind = 'reclass' AND j.status = 'pending' "
@@ -657,16 +670,21 @@ def reclass_pending_state() -> tuple[list[int], list[tuple[int, Any]], str]:
     )
     if rows is None:
         return [], [], err
-    takeable: list[int] = []
-    waiting: list[tuple[int, Any]] = []
+    takeable: list[tuple[int, int]] = []
+    waiting: list[tuple[int, int, Any]] = []
     for row in rows:
+        # Строки чужих слотов в вердикт не берём, даже если SQL-фильтр однажды
+        # ослабят: решение — только по строкам слота `nodes`.
+        if row["slot"] != "nodes" or row["kind"] != "reclass":
+            continue
+        job_id, note_id = int(row["job_id"]), int(row["note_id"])
         ready = (row["note_exists"] is None or row["deleted_at"] is not None
                  or (row["summary_status"] == "ok"
                      and (row["summary"] or "").strip() != ""))
         if ready:
-            takeable.append(row["note_id"])
+            takeable.append((job_id, note_id))
         else:
-            waiting.append((row["note_id"], row["summary_status"]))
+            waiting.append((job_id, note_id, row["summary_status"]))
     return takeable, waiting, ""
 
 
@@ -1507,14 +1525,17 @@ async def scenario_5_node_order(c: Client, rest: httpx2.AsyncClient) -> None:
         if jobs_err:
             return False, detail + f"; worker_jobs is not readable ({jobs_err})"
         if takeable:
-            detail += ("; pending reclass jobs that COULD be processed but are not "
-                       f"(a real hang): {takeable}")
+            detail += ("; pending `nodes` jobs that COULD be processed but are not "
+                       "(a real hang): "
+                       + ", ".join(f"job {jid}/note {nid}"
+                                   for jid, nid in takeable))
         if waiting:
-            detail += ("; pending reclass jobs waiting for a summary (allowed — the "
+            detail += ("; pending `nodes` jobs waiting for a summary (allowed — the "
                        "job waits for the model, the note is visible in the "
                        "`summary` queue): "
-                       + ", ".join(f"{nid} (summary_status={status!r})"
-                                   for nid, status in waiting))
+                       + ", ".join(
+                           f"job {jid}/note {nid} (summary_status={status!r})"
+                           for jid, nid, status in waiting))
         return (not fast and not classified and not takeable), detail
 
     ok, detail = await wait_until(
@@ -1527,9 +1548,10 @@ async def scenario_5_node_order(c: Client, rest: httpx2.AsyncClient) -> None:
     if waiting:
         # «Работа есть, но ждёт модель»: задания перечисляются отдельной строкой
         # детали и WARN-отметкой, сценарий из-за них не валится.
-        warn("pending reclass jobs wait for the summary of the merged note (the job "
+        warn("pending `nodes` jobs wait for the summary of the merged note (the job "
              "is not taken on purpose, the note is visible in the `summary` queue)",
-             ", ".join(f"{nid}: summary_status={status!r}" for nid, status in waiting))
+             ", ".join(f"job {jid}/note {nid}: summary_status={status!r}"
+                       for jid, nid, status in waiting))
 
     after, _err = db_try(
         "SELECT id, node_order_at FROM notes WHERE id IN "
