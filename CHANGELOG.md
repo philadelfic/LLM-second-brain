@@ -5,6 +5,40 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-09-20
+
+Release 3.1.0 — "Navigation and self-organization": the system starts to know its own space — reading a note returns a compact list of related notes from other namespaces, the `default` pile is sorted out in the background, a note merged by dedup is re-classified and re-homed, and every listing is bounded so a page no longer pulls more context than it needs. None of it adds an LLM call to the write path.
+
+### Added
+
+- **Note links** (lsb-0010): `memory_get` carries `links` — related notes from OTHER namespaces in the shape `{id, title, namespace, chars}`, at most 3. Level 0 is a lazy graph: a KNN query over the note's own vector, without any namespace filter. Level 1 is the persisted `links` table — one row per symmetric pair with `kind` (`mention` / `entities` / `cosine`) and `score` — recomputed incrementally without a single LLM call and backfilled once for an existing database by a background job. The note's own namespace is cut at output time, so a move between namespaces never invalidates a row.
+- **Text volume in outputs** (lsb-0010): `memory_search`, `memory_list` and `memory_get` return `chars` — the size of the note text in characters. In chunk mode `chars` keeps its previous meaning (the sum of the chunks returned).
+- **Listing pagination** (lsb-0013): one contract for the only two listings in the system — `memory_list` and `skills_list` — carries `total`, `has_more`, `next_offset` and `next_cursor` (reserved and `null` for now), plus exactly one soft "+N more — offset=K" hint. `skills_list` gains `limit` / `offset`; the MCP default and ceiling are 20 items and the operator REST ceiling is 50.
+- **Background jobs framework** (lsb-0014): a job is now a registry entry (`JobSpec`: name, queue, interval or on-demand form, enabled flag, batch size, `process`, `queue_empty`, `wait_event`, `idle_hook`) served by one shared loop — a new job is a registration, not a copy of a loop. The five existing loops (`embedding`, `summary`, `judge`, `areas`, `expiration`) moved onto it with unchanged behaviour, and `links` and `nodes` were built on top. Every journal event carries a mandatory `job` field in one shape (`event` / `job` / `note_id` / `outcome` / `reason` / `target`), and a job can be woken by an event instead of waiting out its interval.
+- **Queue observability** (lsb-0014): `/health` gains `queues` — `pending` and `oldest_pending_sec` for each observable queue — and a job that falls asleep on a non-empty queue emits `queue_waiting`, so a stuck queue is visible in the journal. A queue counts only the work its job can actually take in the next run.
+- **Node self-organization** (lsb-0011, lsb-0012): the `nodes` job sweeps `default` for notes that fit an existing domain and re-classifies a note merged by dedup so the merged note can be re-homed. Both sources share one budget (20 items per run), and the internal markers `links_at` / `node_order_at` keep the sweep from looping.
+- **Version in `/health`** (techdebt-0036): the endpoint reports the application version taken from the package, so a running image can be matched against its release tag.
+
+### Changed
+
+- **Summary limit is now 150 characters** (was "up to 30 words"): the prompt and the hard cut at the save point both measure characters, and the fallback excerpt is cut to the same 150. Summaries already stored and longer than the limit are regenerated in the background at startup rather than truncated in place.
+- **MCP surface**: still **21 tools** with the same names and the same contracts; only the outputs of `memory_get` / `memory_search` / `memory_list` / `skills_list` are enriched with the fields above.
+- **Configuration**: new environment variables for the job switches (enable / interval / batch per job), the link thresholds and pool sizes, and the MCP/REST listing ceilings and default — all validated at startup.
+- **Documentation**: README, INSTALL and CONFIG brought in line with the 21-tool surface.
+- **Acceptance pipeline** (techdebt-0036): the release image carries a label with its git commit, the E2E run is idempotent (probes are created and cleaned up by marker) and waits on observable state — `/health` counters and queue ages — instead of fixed sleeps, and a slot check refuses a run while the model proxies are unavailable.
+
+### Fixed
+
+- **A link kind could be downgraded on recompute**: a pair keeps the strongest kind by priority (`mention` / `entities` / `cosine`) and is never lowered by a later pass, and level 1 is not served for a note whose links have not been recomputed yet.
+- **Queue counters counted work a job could not take**: `pending` now counts only tasks the job can pick up in the next run — a reclassification task waiting for its summary no longer keeps the queue looking busy.
+- **Lost wakeup after a queue clear**: the `links` and `nodes` jobs re-check their processable queue after clearing, closing a window where a newly pending item could sleep until the next interval.
+- **A finished summary did not wake the node-order job**: the post-merge reclassification task is woken as soon as its summary is ready, so a merged note no longer waits out a full interval.
+- **A fresh pending note did not wake the embedding loop**: the loop is notified on insert instead of waiting out its interval.
+
+### Upgrade
+
+- Drop-in: start the new image over the existing database. Migrations are idempotent and run at startup from any earlier version (the `links` table and the `links_at` / `node_order_at` markers); notes, namespaces, areas and their indexes are untouched. Links are backfilled in the background, and summaries longer than 150 characters are regenerated in the background. Reverting is a matter of restoring the pre-upgrade database snapshot.
+
 ## [3.0.0] - 2026-09-11
 
 Release 3.0.0 — "Skills and knowledge": three new knowledge areas (procedural skills, terminology, facts about the user) on a shared isolated substrate — one database, separate tables and indexes per area — with MCP tools, operator REST mirrors and background vectorization.
