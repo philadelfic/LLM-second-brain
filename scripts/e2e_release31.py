@@ -49,7 +49,10 @@ Scenarios (0-9), per the techdebt-0036-01 spec:
      classifier within its budget), the sweep does not pass over a note twice
      (only the markers it set itself, `source=sweep`, are compared; an update
      by the after-merge path — `source=after_merge` — is allowed and reported),
-     the queue goes back to empty.
+     after the sweep the `nodes` queue keeps NO sweep work (candidates of both
+     pools = 0); a pending `reclass` job whose merged note still waits for a
+     summary is allowed and printed in detail, while a job whose note already
+     has a ready summary is a real hang and fails the scenario.
   6. `/health` = 7 previous fields + `queues` + `version`.
   7. Context budgets, measured AFTER the vector/summary queues drain:
      `memory_search` top_k=5 ≤ 450 B PER ITEM, `memory_list`
@@ -112,6 +115,11 @@ BUDGET_SEARCH_ITEM = 450        # bytes per item of memory_search top_k=5
 BUDGET_LIST_ITEM = 500          # bytes per item of memory_list (detail=summaries)
 BUDGET_LIST_TITLES_ITEM = 100   # bytes per item of memory_list (detail=titles)
 BUDGET_LINKS = 500              # bytes of the links array of one note
+# Порог авто-переезда контура (`NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE`, по умолчанию
+# 0.80 — docs/CONFIG.md): этим порогом задан предикат быстрого пула обхода
+# `default`. Переопределяется флагом `--auto-move-min-confidence` / переменной
+# среды, чтобы предикат сценария 5 не разошёлся с настройкой контура.
+AUTO_MOVE_MIN_CONFIDENCE = 0.80
 MORE_HINT = re.compile(r"^\+(\d+) more — offset=(\d+)$")
 LINK_ITEM_FIELDS = {"id", "title", "namespace", "chars"}
 UPGRADE_TABLES = ("links",)
@@ -618,6 +626,48 @@ def reclass_note_ids(ids: list[int]) -> set[int]:
         tuple(ids),
     )
     return {row["note_id"] for row in rows or []}
+
+
+def reclass_pending_state() -> tuple[list[int], list[tuple[int, Any]], str]:
+    """Pending-задания `nodes`/`reclass` и их судьба на момент проверки.
+
+    Возвращает `(берущиеся, ждущие, текст ошибки)`:
+
+    * **берущиеся** — у заметки ГОТОВАЯ непустая суммари либо заметки нет в живых
+      (корзина/удалена): такое задание прогон снимает сам, значит его `pending` —
+      настоящее залипание;
+    * **ждущие** — заметка жива, но суммари ещё не готова (`summary_status != 'ok'`
+      или пустая): по контракту 3.1.0 задание после сшивания дубликата остаётся
+      pending и ЖДЁТ модель — это «работа есть, но она ждёт модель», а не
+      залипание (заметка и так видна в очереди `summary`).
+
+    Предикат тот же, что у джобы (`_NODES_RECLASS_TAKEABLE` в
+    `app/services/worker.py`): иначе харнесс и контур разошлись бы в оценке
+    одного состояния. Таблицы `worker_jobs` может ещё не быть (задания не
+    ставились) — тогда возвращается ошибка чтения, а не «залипание».
+    """
+    if not db_ready():
+        return [], [], f"the DB is not reachable ({CFG['db']})"
+    rows, err = db_try(
+        "SELECT j.note_id AS note_id, n.id AS note_exists, n.deleted_at AS deleted_at, "
+        "n.summary_status AS summary_status, n.summary AS summary "
+        "FROM worker_jobs j LEFT JOIN notes n ON n.id = j.note_id "
+        "WHERE j.slot = 'nodes' AND j.kind = 'reclass' AND j.status = 'pending' "
+        "ORDER BY j.id"
+    )
+    if rows is None:
+        return [], [], err
+    takeable: list[int] = []
+    waiting: list[tuple[int, Any]] = []
+    for row in rows:
+        ready = (row["note_exists"] is None or row["deleted_at"] is not None
+                 or (row["summary_status"] == "ok"
+                     and (row["summary"] or "").strip() != ""))
+        if ready:
+            takeable.append(row["note_id"])
+        else:
+            waiting.append((row["note_id"], row["summary_status"]))
+    return takeable, waiting, ""
 
 
 def contains(haystack: Any, needle: str) -> bool:
@@ -1432,9 +1482,54 @@ async def scenario_5_node_order(c: Client, rest: httpx2.AsyncClient) -> None:
     # и первый разбор им ставит подметание `default` — именно эти отметки и сверяем.
     sweep_marks = {row["id"]: row["node_order_at"] for row in before or []}
 
-    ok, detail = await wait_until(queue_empty(rest, "nodes"),
-                                  "the nodes queue is drained")
-    check("the nodes queue goes back to empty (/health.queues)", ok, detail)
+    # Работа ОБХОДА исчерпана. Проверяется по БД (оба пула кандидатов + pending
+    # задания `reclass`) и только по НАБЛЮДАЕМОМУ состоянию: ожидание с тем же
+    # guard-ом, что у соседних проверок, фактические значения — в detail.
+    # `/health.queues.nodes` источником вердикта тут не годится: её счётчик
+    # намеренно НЕ считает задание, ждущее суммари (решение гейта 2026-09-19), и по
+    # нему «обход домёл» неотличимо от «счётчик работу не берёт».
+    threshold = CFG["auto_move_min_confidence"]
+
+    async def sweep_work_exhausted() -> tuple[bool, str]:
+        fast, fast_err = db_scalar(
+            "SELECT COUNT(*) FROM notes WHERE namespace = 'default' "
+            "AND deleted_at IS NULL AND node_order_at IS NULL "
+            "AND hint_path IS NOT NULL AND confidence >= ?", (threshold,))
+        classified, class_err = db_scalar(
+            "SELECT COUNT(*) FROM notes WHERE namespace = 'default' "
+            "AND deleted_at IS NULL AND node_order_at IS NULL "
+            "AND classified_at IS NULL AND summary_status = 'ok' "
+            "AND summary <> ''")
+        if fast_err or class_err:
+            return False, f"the DB is not readable: {fast_err or class_err}"
+        takeable, waiting, jobs_err = reclass_pending_state()
+        detail = (f"fast-pool candidates={fast}, classifier-pool candidates={classified}")
+        if jobs_err:
+            return False, detail + f"; worker_jobs is not readable ({jobs_err})"
+        if takeable:
+            detail += ("; pending reclass jobs that COULD be processed but are not "
+                       f"(a real hang): {takeable}")
+        if waiting:
+            detail += ("; pending reclass jobs waiting for a summary (allowed — the "
+                       "job waits for the model, the note is visible in the "
+                       "`summary` queue): "
+                       + ", ".join(f"{nid} (summary_status={status!r})"
+                                   for nid, status in waiting))
+        return (not fast and not classified and not takeable), detail
+
+    ok, detail = await wait_until(
+        sweep_work_exhausted,
+        "the sweep work in `nodes` is exhausted (both candidate pools are empty)")
+    check("after the sweep the `nodes` queue keeps no sweep work: fast-pool and "
+          "classifier-pool candidates = 0 (a reclass job waiting for a summary is "
+          "allowed, a takeable one is a FAIL)", ok, detail)
+    _takeable, waiting, _err = reclass_pending_state()
+    if waiting:
+        # «Работа есть, но ждёт модель»: задания перечисляются отдельной строкой
+        # детали и WARN-отметкой, сценарий из-за них не валится.
+        warn("pending reclass jobs wait for the summary of the merged note (the job "
+             "is not taken on purpose, the note is visible in the `summary` queue)",
+             ", ".join(f"{nid}: summary_status={status!r}" for nid, status in waiting))
 
     after, _err = db_try(
         "SELECT id, node_order_at FROM notes WHERE id IN "
@@ -1828,6 +1923,13 @@ async def main() -> int:
     parser.add_argument("--nodes-batch", type=int,
                         default=int(os.environ.get("JOB_NODES_BATCH", "20")),
                         help="nodes job batch budget of the contour")
+    parser.add_argument("--auto-move-min-confidence", type=float,
+                        default=float(os.environ.get(
+                            "NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE",
+                            str(AUTO_MOVE_MIN_CONFIDENCE))),
+                        help="auto-move confidence threshold of the contour "
+                             "(NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE) — the scenario 5 "
+                             "fast-pool predicate uses it")
     parser.add_argument("--run-regression", action="store_true",
                         default=os.environ.get("LSB_RUN_REGRESSION", "") == "1",
                         help="run the unit regression and the existing E2E scripts (long)")
@@ -1871,6 +1973,7 @@ async def main() -> int:
         "slot_on_cmd": args.slot_on_cmd,
         "expect_version": args.expect_version,
         "nodes_batch": args.nodes_batch,
+        "auto_move_min_confidence": args.auto_move_min_confidence,
         "run_regression": args.run_regression,
         "python": args.python,
         "repo_dir": args.repo_dir or str(Path(__file__).resolve().parents[1]),
