@@ -788,15 +788,126 @@ async def test_nodes_event_wakes_loop_immediately(
 # --- снимок очереди (FR-2.2) -------------------------------------------------
 
 def test_queue_stat_sums_jobs_and_sweep_pools(settings: Settings) -> None:
-    """Снимок: задания + кандидаты обоих пулов; возраст — старейший источник."""
+    """Снимок: берущиеся задания + кандидаты обоих пулов; возраст — старейший.
+
+    Задание, ждущее суммари, в счётчик не входит (решение гейта 2026-09-19):
+    джоба его не берёт, заметка видна в очереди `summary` — см.
+    `test_queue_stat_skips_reclass_job_waiting_for_summary`.
+    """
     NamespaceService(settings).create("work", "Рабочие заметки.")
     _seed(settings, [(1, "готовая разметка", "work", 0.95, _ts(300))])  # быстрый пул
     _seed_unmarked(settings, [(2, "без разметки", "default", "ok")])  # классификаторный
     _seed_unmarked(settings, [(3, "ждёт суммари", "default", "pending")])  # не кандидат
+    _seed_unmarked(settings, [(4, "объединена", "work", "ok")])  # готова к решению
     worker = make_worker(settings)
-    _enqueue_reclass(worker, 3)  # задание после сшивания
+    _enqueue_reclass(worker, 3)  # задание ждёт суммари — не работа прогона
+    _enqueue_reclass(worker, 4)  # задание с готовой суммари — работа прогона
     spec = nodes_spec(worker, settings)
 
     stat = spec.queue_stat()
-    assert stat["pending"] == 3  # 1 задание + 2 кандидата обхода
+    assert stat["pending"] == 3  # 1 берущееся задание + 2 кандидата обхода
     assert stat["oldest_pending_sec"] == pytest.approx(300, abs=5)
+
+
+def test_queue_stat_ignores_classified_note_without_hint(settings: Settings) -> None:
+    """Заметка с `classified_at`, но без `hint_path` — не работа обхода (ноль).
+
+    Живая база после апгрейда на 3.1.0: заметки размечены причёской ДО
+    появления маркера `node_order_at` (у них он пуст), `hint_path` пуст,
+    `classified_at` проставлен. Обход такую заметку не берёт: быстрый пул
+    требует `hint_path IS NOT NULL`, классификаторный — `classified_at IS NULL`.
+    Очередь обязана возвращаться в ноль (FAIL приёмки 3.1.0, гейт 2026-09-19).
+    """
+    _seed_unmarked(settings, [(1, "размечена причёской", "default", "ok")])
+    with session(settings) as conn, transaction(conn):
+        conn.execute(
+            "UPDATE notes SET classified_at = ?, hint_path = NULL, "
+            "confidence = 0.9 WHERE id = 1",
+            (_ts(60),),
+        )
+    spec = nodes_spec(make_worker(settings), settings)
+
+    assert spec.queue_stat() == {"pending": 0, "oldest_pending_sec": None}
+
+
+def test_queue_stat_counts_both_pools_and_drains_after_run(
+    settings: Settings,
+) -> None:
+    """Оба пула в счётчике — и после прогона очередь снова пуста.
+
+    Быстрый пул: `hint_path` + `confidence` не ниже порога авто-переезда;
+    классификаторный: разметки нет, но есть готовая непустая суммари.
+    """
+    NamespaceService(settings).create("work", "Рабочие заметки.")
+    _seed(settings, [(1, "готовая разметка", "work", 0.95, _ts(10))])
+    _seed_unmarked(settings, [(2, "без разметки", "default", "ok")])
+    classifier = FixedClassifier(Classification("work", 0.95))
+    spec = nodes_spec(make_worker(settings, classifier=classifier), settings)
+
+    assert spec.queue_stat()["pending"] == 2
+    assert spec.queue_stat()["oldest_pending_sec"] is not None
+
+    assert _run(spec) == 2  # оба кандидата взяты одним прогоном
+    assert spec.queue_stat() == {"pending": 0, "oldest_pending_sec": None}
+
+
+def _age_jobs(settings: Settings, seconds_ago: int) -> None:
+    """Удревнить задания слота `nodes`: возраст снимка берётся по `created_at`."""
+    with session(settings) as conn, transaction(conn):
+        conn.execute(
+            "UPDATE worker_jobs SET created_at = ?, updated_at = ? "
+            "WHERE slot = ? AND status = 'pending'",
+            (_ts(seconds_ago), _ts(seconds_ago), NODES_JOB),
+        )
+
+
+def test_queue_stat_oldest_is_earliest_source(settings: Settings) -> None:
+    """Возраст старейшего — минимальный timestamp по источникам снимка."""
+    NamespaceService(settings).create("work", "Рабочие заметки.")
+    _seed(settings, [(1, "готовая разметка", "work", 0.95, _ts(20))])  # свежий кандидат
+    _seed_unmarked(settings, [(2, "объединена", "work", "ok")])
+    worker = make_worker(settings)
+    _enqueue_reclass(worker, 2)
+    _age_jobs(settings, 400)  # задание ждёт дольше кандидата
+    spec = nodes_spec(worker, settings)
+
+    assert spec.queue_stat()["pending"] == 2
+    assert spec.queue_stat()["oldest_pending_sec"] == pytest.approx(400, abs=5)
+
+
+def test_queue_stat_skips_reclass_job_waiting_for_summary(
+    settings: Settings,
+) -> None:
+    """Задание `reclass`, ждущее суммари, — НЕ работа прогона (arch §3.5).
+
+    Джоба `nodes` узел решить не может: задание остаётся pending и прогрессом
+    не считается — значит, и очередь его не считает: иначе счётчик показывает
+    работу, которой у джобы нет (FAIL приёмки 3.1.0: `pending=1` держался 7
+    минут, пока объединённая заметка ждала суммари). Сама заметка видна в
+    очереди `summary`; как только суммари готова — задание входит в счётчик.
+    """
+    NamespaceService(settings).create("work", "Рабочие заметки.")
+    _seed_unmarked(settings, [(1, "ждёт суммари", "work", "pending")])
+    worker = make_worker(settings)
+    _enqueue_reclass(worker, 1)
+    spec = nodes_spec(worker, settings)
+
+    assert spec.queue_stat() == {"pending": 0, "oldest_pending_sec": None}
+
+    with session(settings) as conn, transaction(conn):
+        conn.execute(
+            "UPDATE notes SET summary_status = 'ok', "
+            "summary = 'Готовая сводка' WHERE id = 1"
+        )
+    assert spec.queue_stat()["pending"] == 1
+
+
+def test_queue_stat_counts_reclass_job_without_live_note(
+    settings: Settings,
+) -> None:
+    """Задание `reclass` без живой заметки берётся и снимается сразу — в счётчике."""
+    worker = make_worker(settings)
+    _enqueue_reclass(worker, 999)  # заметки нет — решать нечего
+    spec = nodes_spec(worker, settings)
+
+    assert spec.queue_stat()["pending"] == 1
