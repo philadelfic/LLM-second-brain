@@ -28,7 +28,13 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from fakes import FailingEmbedder, FixedClassifier, FixedSummarizer, HashEmbedder
+from fakes import (
+    FailingEmbedder,
+    FailingSummarizer,
+    FixedClassifier,
+    FixedSummarizer,
+    HashEmbedder,
+)
 
 from app.config import Settings, get_settings
 from app.services.classifier import Classification
@@ -804,6 +810,129 @@ async def test_nodes_event_wakes_loop_immediately(
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+# --- событие `nodes`: готовая суммари будит петлю (gate 2026-09-20) ----------
+
+
+def test_summary_ready_wakes_nodes_event(settings: Settings) -> None:
+    """Готовая суммари поднимает ждущее задание `reclass` — и будит петлю.
+
+    Сценарий приёмки 3.1.0 (сценарий 5): задание поставлено сшиванием, когда
+    выжимка объединённой заметки ещё не готова, — оно законно ждёт и работой не
+    считается. Доведённая до `ok` суммари (`process_summary_pending`) делает
+    задание берущимся И сразу даёт сигнал `notify_nodes_pending` — без него
+    петля ждала бы конца паузы back-off.
+    """
+    NamespaceService(settings).create("work", "Рабочие заметки.")
+    _seed_unmarked(settings, [(1, "объединённая заметка", "work", "pending")])
+    classifier = FixedClassifier(Classification("work", 0.9))
+    worker = make_worker(settings, classifier=classifier)
+    _enqueue_reclass(worker, 1)
+    spec = nodes_spec(worker, settings)
+    assert spec.queue_empty() is True  # ждущее суммари задание — не работа
+
+    assert worker.process_summary_pending() == 1  # заметка доведена до 'ok'
+    assert worker._nodes_event.is_set()  # сигнал готовности суммари
+    assert spec.queue_empty() is False  # задание стало берущимся
+    assert _run(spec) == 1
+    assert classifier.calls != []  # решение принято по готовой выжимке
+    assert [job["status"] for job in _jobs(settings)] == ["done"]
+
+
+def test_summary_failure_does_not_wake_nodes(settings: Settings) -> None:
+    """Отказ суммаризации: сигнала нет, задание `reclass` ждёт по back-off (NFR-3)."""
+    NamespaceService(settings).create("work", "Рабочие заметки.")
+    _seed_unmarked(settings, [(1, "объединённая заметка", "work", "pending")])
+    worker = BackgroundWorker(settings, HashEmbedder(DIM), FailingSummarizer())
+    _enqueue_reclass(worker, 1)
+    spec = nodes_spec(worker, settings)
+
+    assert worker.process_summary_pending() == 0  # модели недоступны, статус pending
+    assert worker._nodes_event.is_set() is False  # петлю `nodes` не будили
+    assert spec.queue_empty() is True  # задание по-прежнему ждёт выжимку
+    assert spec.queue_stat()["pending"] == 0  # и работой не считается
+    assert [job["status"] for job in _jobs(settings)] == ["pending"]
+
+
+def test_summary_run_without_work_does_not_wake_nodes(settings: Settings) -> None:
+    """Пустой прогон summary-джобы петлю `nodes` не будит (не на каждый прогон)."""
+    _seed_unmarked(settings, [(1, "объединённая заметка", "work", "ok")])
+    worker = make_worker(settings)
+    _enqueue_reclass(worker, 1)
+
+    assert worker.process_summary_pending() == 0  # очередь суммари пуста
+    assert worker._nodes_event.is_set() is False  # сигнала нет
+
+
+def test_merge_summary_ready_wakes_nodes_event(settings: Settings) -> None:
+    """Полный путь: сшивание ставит `reclass`, готовая выжимка будит петлю.
+
+    События второго воркера чисты — проверить можно именно сигнал готовности
+    суммари (в первом воркере событие выставлено ещe сшиванием).
+    """
+    notes = NoteService(settings, FailingEmbedder())
+    notes.save("первая отложенная заметка")
+    notes.save("вторая отложенная заметка")
+    summarizer = FixedSummarizer("Фикс.", merged="Объединённый текст.")
+    merger = BackgroundWorker(settings, HashEmbedder(DIM), summarizer)
+    assert merger.process_pending() == 2
+    assert merger.process_judge_pending() == 2
+    assert merger.process_merge_pending() == 1  # сшивание состоялось
+    assert [job["status"] for job in _jobs(settings)] == ["pending"]  # ждёт выжимки
+
+    worker = BackgroundWorker(settings, HashEmbedder(DIM), summarizer)
+    assert worker._nodes_event.is_set() is False
+    assert worker.process_summary_pending() == 1  # выжимка объединённой -> 'ok'
+    assert worker._nodes_event.is_set()  # петля `nodes` разбудена
+
+
+@pytest.mark.asyncio
+async def test_summary_ready_wakes_nodes_loop_immediately(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Готовая суммари будит петлю `nodes` немедленно — задание не ждёт интервала.
+
+    Петля уже ушла в сон по back-off с ждущим заданием `reclass` (интервал суток:
+    сама она не проснётся). Фоновая джоба `summary` доводит выжимку до 'ok' — и
+    тем же действием будит `nodes`, поэтому задание разбирается сразу, а не в
+    конце паузы (в приёмочном контуре база 60 с, рост до 15 мин — то самое
+    залипание из сценария 5).
+    """
+    NamespaceService(settings).create("work", "Рабочие заметки.")
+    _seed_unmarked(settings, [(1, "объединённая заметка", "work", "pending")])
+    classifier = FixedClassifier(Classification("work", 0.9))
+    worker = make_worker(settings, classifier=classifier)
+    _enqueue_reclass(worker, 1)
+    spec = nodes_spec(worker, settings)
+    real_process = worker.process_nodes  # bound-метод до подмены
+    calls: list[int] = []
+
+    def counting(budget: int | None = None) -> int:
+        calls.append(1)
+        return real_process(budget)
+
+    monkeypatch.setattr(worker, "process_nodes", counting)
+    task = asyncio.create_task(
+        run_loop(spec, lambda: False, BackoffState(spec.interval_sec))
+    )
+    try:
+        await _wait_until(lambda: len(calls) >= 1)
+        await asyncio.sleep(0.05)
+        assert calls == [1]  # интервал 3600 с: петля спит, задание ждёт суммари
+        assert [job["status"] for job in _jobs(settings)] == ["pending"]
+
+        assert worker.process_summary_pending() == 1  # выжимка готова — сигнал
+        await _wait_until(
+            lambda: [job["status"] for job in _jobs(settings)] == ["done"],
+            timeout=0.5,
+        )
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    assert classifier.calls != []  # задание разобрано: классификатор спрошен
+    assert _row(settings, 1)["node_order_at"] is not None  # разбор состоялся
 
 
 # --- снимок очереди (FR-2.2) -------------------------------------------------
