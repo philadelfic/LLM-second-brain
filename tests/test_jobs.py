@@ -381,12 +381,14 @@ def test_registry_contains_worker_jobs_and_links(settings) -> None:
     # заметки будит петлю — событие берётся у воркера.
     assert specs["links"].wait_event is not None
     # Джоба обхода default (lsb-0011): своя очередь и расписание из env;
-    # форма «по интервалу + событие» — сигнал `nodes` будит петлю сразу после
-    # сшивания (lsb-0012).
+    # форма «по интервалу + событие + перепроверка очереди» — сигнал `nodes`
+    # будит петлю сразу после сшивания (lsb-0012), а `queue_empty` закрывает
+    # окно lost wakeup (с 2026-09-20).
     assert specs["nodes"].queue == "nodes"
     assert specs["nodes"].interval_sec == settings.job_nodes_interval_sec
     assert specs["nodes"].batch == settings.job_nodes_batch
     assert specs["nodes"].wait_event is not None
+    assert specs["nodes"].queue_empty is not None
     assert specs["nodes"].queue_stat is not None
     for name in ("embedding", "summary", "judge", "areas"):
         assert specs[name].interval_sec == retry  # как было (FR-1.5)

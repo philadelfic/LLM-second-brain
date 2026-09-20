@@ -91,6 +91,24 @@ async def _wait_until(predicate, timeout: float = 1.0) -> None:
     raise AssertionError("условие не наступило за отведённое время")
 
 
+def patch_wait_event_timeout(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Мгновенный таймаут ожидания события с записью запрошенных пауз.
+
+    Форма «по интервалу + событие» ждёт `wait_for(event.wait(), timeout)`:
+    реальный таймаут (3600 с) тест не переживёт — ожидание подменяется
+    мгновенным `TimeoutError`, пауза записана, петля растит back-off.
+    """
+    delays: list[float] = []
+
+    async def spy(awaitable, timeout=None, *args: object, **kwargs: object):
+        awaitable.close()  # корутину event.wait() не ждём — как при таймауте
+        delays.append(float(timeout))
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(asyncio, "wait_for", spy)
+    return delays
+
+
 def _seed(settings: Settings, rows: list[tuple]) -> None:
     """default-заметки прямым SQL: (id, text, hint_path, confidence, updated_at)."""
     with session(settings) as conn, transaction(conn):
@@ -163,9 +181,12 @@ def test_nodes_job_is_registered(settings: Settings) -> None:
     assert spec.interval_sec == 3600 == settings.job_nodes_interval_sec
     assert spec.batch == 20 == settings.job_nodes_batch
     assert spec.enabled is True
-    # Форма «по интервалу + событие» (lsb-0012): сигнал `nodes` будит петлю
-    # сразу после сшивания.
+    # Форма «по интервалу + событие `nodes` + перепроверка очереди» (lsb-0012,
+    # пул 6 с 2026-09-20): сигнал `nodes` будит петлю сразу после сшивания, а
+    # `queue_empty` закрывает окно lost wakeup — берущееся задание не ждёт
+    # интервала.
     assert spec.wait_event is not None
+    assert spec.queue_empty is not None
     assert spec.queue_stat is not None  # снимок очереди для /health
     assert settings.job_nodes_classifier_budget == 10  # бюджет модели
 
@@ -911,3 +932,140 @@ def test_queue_stat_counts_reclass_job_without_live_note(
     spec = nodes_spec(worker, settings)
 
     assert spec.queue_stat()["pending"] == 1
+
+
+# --- пул 6: потерянный будильник (lost wakeup) -------------------------------
+
+
+def test_queue_empty_false_for_fast_pool_candidate(settings: Settings) -> None:
+    """Кандидат быстрого пула — работа: перепроверка очереди не даёт уснуть."""
+    NamespaceService(settings).create("work", "Рабочие заметки.")
+    _seed(settings, [(1, "готовая разметка", "work", 0.95, _ts(0))])
+    spec = nodes_spec(make_worker(settings), settings)
+
+    assert spec.queue_empty() is False  # переезд без модели — джоба берёт сейчас
+    assert _run(spec) == 1
+    assert spec.queue_empty() is True  # очередь опустела вместе с выборкой
+
+
+def test_queue_empty_false_for_classifier_pool_candidate(settings: Settings) -> None:
+    """Кандидат классификаторного пула — работа при готовой непустой суммари."""
+    NamespaceService(settings).create("work", "Рабочие заметки.")
+    _seed_unmarked(settings, [(1, "без разметки", "default", "ok")])
+    classifier = FixedClassifier(Classification("work", 0.95))
+    spec = nodes_spec(make_worker(settings, classifier=classifier), settings)
+
+    assert spec.queue_empty() is False
+    assert _run(spec) == 1
+    assert spec.queue_empty() is True
+
+
+def test_queue_empty_false_for_takeable_reclass_job(settings: Settings) -> None:
+    """Берущееся задание `reclass` (готовая непустая суммари) — работа.
+
+    Именно это задание висело pending >300 с на приёмке 3.1.0 (сценарий 5):
+    с перепроверкой очереди сигнал после сшивания задание не теряет.
+    """
+    NamespaceService(settings).create("work", "Рабочие заметки.")
+    _seed_unmarked(settings, [(1, "объединённая заметка", "work", "ok")])
+    classifier = FixedClassifier(Classification("work", 0.9))
+    worker = make_worker(settings, classifier=classifier)
+    _enqueue_reclass(worker, 1)
+    spec = nodes_spec(worker, settings)
+
+    assert spec.queue_empty() is False
+    assert _run(spec) == 1
+    assert [job["status"] for job in _jobs(settings)] == ["done"]
+    assert spec.queue_empty() is True
+
+
+@pytest.mark.asyncio
+async def test_pending_reclass_waiting_for_summary_does_not_spin_loop(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Задание, чья заметка ждёт суммари, работой НЕ считается: петля спит.
+
+    `queue_empty` берёт тот же источник, что `queue_stat` (arch §3.7): ждущее
+    суммари задание очередь непустой не делает (сама заметка видна в очереди
+    `summary`) — вместо busy-loop петля уходит в ожидание события и растит
+    back-off, а задание догонит следующий пробой. Классификатор не зовём: у
+    джобы нет работы.
+    """
+    monkeypatch.setenv("JOB_NODES_INTERVAL_SEC", "60")  # интервал приёмки 3.1.0
+    get_settings.cache_clear()
+    overridden = get_settings()
+    NamespaceService(overridden).create("work", "Рабочие заметки.")
+    _seed_unmarked(overridden, [(1, "объединённая заметка", "work", "pending")])
+    classifier = FixedClassifier(Classification("work", 0.9))
+    worker = make_worker(overridden, classifier=classifier)
+    _enqueue_reclass(worker, 1)
+    spec = nodes_spec(worker, overridden)
+    real_wait_for = asyncio.wait_for  # ожидание теста — до подмены атрибута
+    delays = patch_wait_event_timeout(monkeypatch)  # ждём мгновенно, пауза записана
+    state = BackoffState(60)
+
+    await real_wait_for(run_loop(spec, lambda: len(delays) >= 2, state), timeout=2.0)
+    assert spec.queue_empty() is True  # ждущее суммари задание — не очередь
+    assert [job["status"] for job in _jobs(overridden)] == ["pending"]  # ждёт модель
+    assert classifier.calls == []  # работы нет — модель не звали
+    assert delays[:2] == [60.0, 120.0]  # ушла в сон и растит back-off
+
+
+@pytest.mark.asyncio
+async def test_lost_wakeup_window_closed(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Работа, появившаяся до `clear()`, не теряется: задание берётся сразу.
+
+    Окно гонки — между пустым прогоном и `clear()` события: объединённая заметка
+    получает готовую суммари, и сигнал `notify_nodes_pending` уже выставлен (без
+    перепроверки очереди `clear()` стёр бы сигнал, и задание ждало бы
+    интервал/back-off — сценарий 5 приёмки 3.1.0). Перепроверка `queue_empty`
+    после `clear()` видит берущееся задание — петля НЕ уходит в сон, а разбирает
+    его сразу же.
+    """
+    NamespaceService(settings).create("work", "Рабочие заметки.")
+    _seed_unmarked(settings, [(1, "объединённая заметка", "work", "pending")])
+    classifier = FixedClassifier(Classification("work", 0.9))
+    worker = make_worker(settings, classifier=classifier)
+    _enqueue_reclass(worker, 1)
+    spec = nodes_spec(worker, settings)
+    assert spec.queue_empty() is True  # суммари ещё не готова — работа ждёт модель
+
+    real_process = worker.process_nodes  # bound-метод до подмены
+    calls: list[int] = []
+
+    def deliver(budget: int | None = None) -> int:
+        # Сигнал приходит ровно в окне: прогон вернул 0, а `clear()` ещё впереди.
+        calls.append(1)
+        if len(calls) == 1:
+            with session(settings) as conn, transaction(conn):
+                conn.execute(
+                    "UPDATE notes SET summary_status = 'ok', "
+                    "summary = 'Готовая сводка' WHERE id = 1"
+                )
+            worker.notify_nodes_pending()  # сшивание выставило сигнал
+            return 0
+        return real_process(budget)
+
+    monkeypatch.setattr(worker, "process_nodes", deliver)
+    slept_early: list[bool] = []  # уснула ли петля до разбора очереди
+
+    async def spy_wait_for(awaitable, timeout=None, *args: object, **kwargs: object):
+        awaitable.close()  # корутину event.wait() не ждём — как при таймауте
+        slept_early.append(_jobs(settings)[0]["status"] == "pending")
+        raise asyncio.TimeoutError
+
+    real_wait_for = asyncio.wait_for
+    monkeypatch.setattr(asyncio, "wait_for", spy_wait_for)
+    await real_wait_for(
+        run_loop(
+            spec,
+            lambda: _jobs(settings)[0]["status"] == "done",
+            BackoffState(spec.interval_sec),
+        ),
+        timeout=2.0,
+    )
+    assert slept_early == []  # ни одного сна: задание разобрано сразу же
+    assert _jobs(settings)[0]["status"] == "done"
+    assert spec.queue_empty() is True
