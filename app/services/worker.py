@@ -1998,6 +1998,22 @@ class BackgroundWorker:
             ).fetchone()
         return queue_snapshot(row["pending"], row["oldest_pending_sec"])
 
+    def _nodes_queue_empty(self) -> bool:
+        """Пуста ли очередь `nodes` (дешёвая перепроверка, пул 6, lost wakeup).
+
+        Петля перед `clear()+wait` перепроверяет саму очередь, а не только
+        событие: сигнал `notify_nodes_pending` (задание после сшивания),
+        пришедший между пустым прогоном и `clear()`, иначе был бы стёрт —
+        берущееся задание ждало бы интервал/back-off (до 15 мин). Источник —
+        ровно тот же, что у `queue_stat` (arch §3.7): берущиеся задания
+        `reclass` + кандидаты обоих пулов обхода `default`. Заметка/задание,
+        ждущее суммари, очередь непустой НЕ делает: джоба его не возьмёт, а
+        сама заметка видна в очереди `summary` — иначе петля крутилась бы
+        вхолостую (busy-loop) вместо back-off. Только SQL, без обращений к
+        моделям (FR-2.2).
+        """
+        return int(self._nodes_queue_stat()["pending"] or 0) == 0
+
     # --- чанковая очередь (Фаза 7) ---------------------------------------------
 
     async def process_pending_chunks(self, limit: int | None = None) -> int:
@@ -2131,9 +2147,10 @@ class BackgroundWorker:
 # Регистрация вместо копии цикла (FR-1.1): каждая джоба описывается `JobSpec`
 # и добавляется в реестр каркаса; цикл, back-off и супервизор итерации — общие
 # (`app/services/jobs.py`). Формы: «по интервалу» (`expiration`), «по интервалу +
-# событие» (`embedding` — свежая pending-заметка, `nodes` — задание после
-# сшивания) и «по требованию» с перепроверкой очереди (summary, judge, areas,
-# links). Интервалы существующих петель — как были (FR-1.5):
+# событие» (`embedding` — свежая pending-заметка) и «по требованию» с
+# перепроверкой очереди (summary, judge, areas, links и `nodes` — задание после
+# сшивания; перепроверка `nodes` с 2026-09-20). Интервалы существующих петель —
+# как были (FR-1.5):
 # PENDING_RETRY_SEC у очередей и фиксированные 300 с у зачистки (новых env эта
 # постановка не заводит). `queue_stat` — снимок своей очереди для
 # `/health.queues` (lsb-0014-03, FR-2.2): у `expiration` очереди нет (`None`).
@@ -2253,17 +2270,21 @@ def build_expiration_job(worker: BackgroundWorker, settings: Settings) -> JobSpe
 def build_nodes_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
     """Джоба `nodes`: обход `default` и реклассификация после сшивания (lsb-0011).
 
-    Форма «по интервалу + событие» (arch §3.1): пустой прогон — сон на
-    `JOB_NODES_INTERVAL_SEC`, но сигнал `notify_nodes_pending` (задание после
-    сшивания, lsb-0012) будит петлю сразу. Прогон — промоция, задания
+    Форма «по интервалу + событие `nodes` + перепроверка очереди» (arch §3.1):
+    пустой прогон — сон на `JOB_NODES_INTERVAL_SEC`, сигнал `notify_nodes_pending`
+    (задание после сшивания, lsb-0012) будит петлю сразу, а `queue_empty`
+    закрывает гонку lost wakeup (пул 6): перед `clear()+wait` очередь
+    перепроверяется (см. `_nodes_queue_empty`). Прогон — промоция, задания
     `reclass`, затем обход `default` (быстрый пул без модели + классификаторный
     в бюджете `JOB_NODES_CLASSIFIER_BUDGET`). `JOB_NODES_ENABLED=false`
     джобу не запускает, но очередь остаётся видна в `/health` (реестр её
     сохраняет). Синхронный SQL/механика уходят в поток — event loop не занимаем.
 
-    Перепроверку очереди (`queue_empty`) не задаём: заметка, ждущая модель или
-    суммари, — отложенное задание, и петля ДОЛЖНА уйти в сон по back-off, а не
-    крутиться вхолостую (arch §3.2, «отложенное задание — не прогресс»).
+    Перепроверка (`queue_empty`) считает работой ровно то, что джоба может взять
+    сейчас (берущееся задание `reclass` либо кандидат пула) и заставляет петлю
+    продолжить прогон без сна; заметка/задание, ждущее модель или суммари, — не
+    работа, и петля уходит в сон по back-off (busy-loop'а нет, arch §3.2,
+    «отложенное задание — не прогресс»).
     """
     batch = settings.job_nodes_batch
 
@@ -2277,7 +2298,7 @@ def build_nodes_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         batch=batch,
         enabled=settings.job_nodes_enabled,
         process=process,
-        queue_empty=None,
+        queue_empty=worker._nodes_queue_empty,
         wait_event=worker._nodes_event,
         idle_hook=None,
         queue_stat=worker._nodes_queue_stat,
