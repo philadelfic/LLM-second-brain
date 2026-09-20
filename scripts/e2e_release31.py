@@ -127,6 +127,27 @@ LINK_ITEM_FIELDS = {"id", "title", "namespace", "chars"}
 UPGRADE_TABLES = ("links",)
 UPGRADE_COLUMNS = ("links_at", "node_order_at")
 
+# Пул заметок-филлеров сценария 1: он доводит листинг ровно до ВТОРОЙ страницы
+# (лимит MCP — 20 записей), иначе подсказку «+N more» проверять нечем. Тексты —
+# короткие, уникальные и из РАЗНЫХ тем: почти идентичные тексты фон штатно
+# сшивает (дедуп-кандидат по косинусу ≥ DEDUP_CANDIDATE_SIMILARITY ~0.80), и пул
+# «усыхал» бы между созданием и проверкой подсказки. Тег прогона живёт в
+# ЗАГОЛОВКЕ (`{tag} filler N`) — по нему филлеры снимает и пред-очистка
+# следующего прогона, и teardown этого (та же механика, что у прочих зондов).
+PAGINATION_FILLERS = 10
+FILLER_TEXTS = (
+    "Sourdough starter feeding schedule for a home kitchen: hydration and timing.",
+    "Choosing a bicycle drivetrain for steep mountain climbs and gear steps.",
+    "Night-sky photography settings during a meteor shower and light pollution.",
+    "Monthly budget planning for a small research team and its travel costs.",
+    "Watering rules for container tomatoes through a hot dry summer.",
+    "A short packing list for a two-day railway trip in winter.",
+    "Tuning the action height and intonation of a classical guitar.",
+    "Home espresso grind size against brew pressure and extraction time.",
+    "Reading a tide table before a sea kayak launch from a rocky shore.",
+    "Storing winter tyres so the rubber keeps its shape and grip.",
+)
+
 # --- probe namespaces: FIXED names, reused between runs (techdebt-0036) -------
 # Имена зондов не несут тега прогона: имя вида `e2e31-<run_id>` встроенная
 # антисинонимия приложения (эмбеддер, порог косинуса ОПИСАНИЙ 0.90) считает почти
@@ -888,6 +909,43 @@ async def ensure_probe_node(c: Client, path: str, description: str) -> bool:
     return ok
 
 
+async def ensure_pagination_fillers(c: Client, count: int) -> list[int]:
+    """Создать пул заметок-филлеров: довести листинг до ВТОРОЙ страницы.
+
+    База контура умещается в одну страницу (лимит MCP — 20 записей), и подсказку
+    «+N more» нечем проверить. Филлеры носят тег прогона в ЗАГОЛОВКЕ
+    (`{tag} filler N`) — по нему их снимает и пред-очистка следующего прогона
+    (та же выборка по префиксу), и teardown этого. Узел прогона регистрируется
+    здесь идемпотентно: `memory_save` узлы не создаёт, а сценарий 1 выполняется
+    РАНЬШЕ сценария 2 (где этот узел регистрируется для своих зондов).
+    """
+    await ensure_probe_node(c, RUN["ns"], PROBE_ROOT_DESC)
+    ids: list[int] = []
+    refused: list[str] = []
+    for i in range(1, count + 1):
+        # Тег прогона внутри текста держит филлеры уникальными и при
+        # `--no-cleanup` (дословный дубль иначе вернул бы чужой id).
+        res = await c.call("memory_save", {
+            "text": f"{FILLER_TEXTS[(i - 1) % len(FILLER_TEXTS)]} "
+                    f"(pagination filler {i} of the {RUN['tag']} run)",
+            "title": f"{RUN['tag']} filler {i}",
+            "namespace": RUN["ns"],
+        })
+        if res.get("id") is not None:
+            ids.append(res["id"])
+        else:
+            refused.append(f"filler {i}: {note_detail(res)}")
+    RUN["fillers"] = ids
+    RUN["notes"].extend(ids)
+    check(f"the pagination filler pool of {count} note(s) is created",
+          len(ids) == count,
+          f"ids={ids}" + (f", refused: {'; '.join(refused)}" if refused else ""))
+    teardown_note(f"pagination filler notes of this run: {len(ids)}/{count} "
+                  f"(titles «{RUN['tag']} filler 1..{count}», ids: {ids}) — "
+                  f"removed by the same run-prefix match")
+    return ids
+
+
 async def prepare_leftovers() -> None:
     """Remove the probe NOTES of a previous run (idempotency, FR-2.1).
 
@@ -1013,6 +1071,23 @@ async def scenario_0_context(c: Client, rest: httpx2.AsyncClient,
 async def scenario_1_limits(c: Client, rest: httpx2.AsyncClient) -> None:
     scenario(1, "Listing limits and pagination (MCP 20, soft refusal at 50, REST up to 50)")
 
+    # База контура умещается в одну страницу (лимит MCP — 20 записей): без
+    # остатка подсказку «+N more» нечем проверить. Пул филлеров этого же прогона
+    # доводит листинг до второй страницы; guard ожидания тот же, что у соседних
+    # проверок — если база не расширилась, SKIP ниже остаётся.
+    await ensure_pagination_fillers(c, PAGINATION_FILLERS)
+
+    async def second_page_visible() -> tuple[bool, str]:
+        probe = await list_page(c)
+        done = bool(probe.get("has_more")) and isinstance(probe.get("next_offset"), int)
+        return done, (f"total={probe.get('total')}, has_more={probe.get('has_more')}, "
+                      f"next_offset={probe.get('next_offset')}")
+
+    widened, widen_detail = await wait_until(
+        second_page_visible, "the listing answers with a second page (has_more=true)")
+    if not widened:
+        info(f"the filler pool did not widen the listing: {widen_detail}")
+
     page = await list_page(c)  # default page
     items = page.get("items", [])
     check("memory_list default page holds at most 20 records", len(items) <= MCP_LIMIT,
@@ -1045,7 +1120,8 @@ async def scenario_1_limits(c: Client, rest: httpx2.AsyncClient) -> None:
               and not ({i["id"] for i in second["items"]} & {i["id"] for i in items}),
               f"n={len(second.get('items', []))}")
     else:
-        skip("the '+N more' hint", "the base has one page of notes — no remainder")
+        skip("the '+N more' hint",
+             f"the base still fits one page — no remainder ({widen_detail})")
 
     refusal = await list_page(c, limit=REST_LIMIT)
     check("memory_list limit=50 is a soft refusal (no schema error)",
@@ -1145,8 +1221,20 @@ async def scenario_2_chars(c: Client, rest: httpx2.AsyncClient) -> int | None:
         return nid
 
     async def chunked() -> tuple[bool, str]:
-        chunk, _err = db_scalar("SELECT total_chunks FROM notes WHERE id = ?", (long_id,))
-        return bool(chunk and chunk > 1), f"total_chunks={chunk}"
+        # Готовность нарезки читается по таблице чанков: колонки `total_chunks`
+        # в `notes` НЕТ (схема держит чанки отдельно — `notes_chunks(note_id,
+        # idx, text, tokens)`, `pragma table_info(notes)`), поэтому прежний
+        # SELECT total_chunks FROM notes всегда давал None («no such column»)
+        # и проверка уходила в SKIP. Нарезано = строк по `note_id` больше одной.
+        # Чанковые ВЕКТОРА здесь не нужны: `memory_get(chunk=0)` читает сами
+        # строки `notes_chunks` (вектор требуется только режиму `query`, а без
+        # строк ручка отдаёт весь текст как чанк 0) — нарезка пишется в той же
+        # транзакции, что и `memory_save`.
+        rows, err = db_scalar(
+            "SELECT COUNT(*) FROM notes_chunks WHERE note_id = ?", (long_id,))
+        if err:
+            return False, err
+        return bool(rows and rows > 1), f"notes_chunks rows={rows}"
 
     ok, detail = await wait_until(chunked, "the long note is split into chunks")
     if not ok:
@@ -2016,6 +2104,7 @@ async def main() -> int:
         "note_outage": f"{tag} outage probe",
         "note_nodes": [f"{tag} {topic}" for topic, _text in NODE_ORDER_PROBES],
         "ns_paths": list(PROBE_PATHS),
+        "fillers": [],
         "notes": [],
     })
 
