@@ -199,33 +199,86 @@ _NODES_CLASSIFY_SELECT = (
     "ORDER BY updated_at DESC, id DESC LIMIT ?"
 )
 
-# Снимок очереди `nodes` для `/health.queues` (FR-2.2): pending-задания
-# `reclass` после сшивания (lsb-0012) + кандидаты обоих пулов обхода (быстрый
-# и классификаторный); возраст старейшего — старейший из двух источников
-# (задания — `created_at`, обход — `updated_at`), `null` — очередь пуста.
-_NODES_QUEUE_STAT_SQL = (
-    "SELECT "
-    "(SELECT COUNT(*) FROM worker_jobs WHERE slot = 'nodes' "
-    " AND kind = 'reclass' AND status = 'pending') "
-    "+ (SELECT COUNT(*) FROM notes WHERE namespace = 'default' "
-    " AND deleted_at IS NULL AND node_order_at IS NULL "
-    " AND hint_path IS NOT NULL AND confidence >= ?) "
-    "+ (SELECT COUNT(*) FROM notes WHERE namespace = 'default' "
-    " AND deleted_at IS NULL AND node_order_at IS NULL "
-    " AND classified_at IS NULL AND summary_status = 'ok' "
-    " AND summary IS NOT NULL AND summary <> '') AS pending, "
-    "MAX("
-    "COALESCE((SELECT MAX(CAST(strftime('%s','now') AS INTEGER) - "
-    " CAST(strftime('%s', created_at) AS INTEGER)) FROM worker_jobs "
-    " WHERE slot = 'nodes' AND kind = 'reclass' AND status = 'pending'), 0), "
-    "COALESCE((SELECT MAX(CAST(strftime('%s','now') AS INTEGER) - "
-    " CAST(strftime('%s', updated_at) AS INTEGER)) FROM notes "
-    " WHERE namespace = 'default' AND deleted_at IS NULL "
-    " AND node_order_at IS NULL AND ((hint_path IS NOT NULL AND confidence >= ?) "
-    " OR (classified_at IS NULL AND summary_status = 'ok' "
-    " AND summary IS NOT NULL AND summary <> ''))), 0)"
-    ") AS oldest_pending_sec"
+# Предикат «задание `reclass` берётся в ЭТОМ прогоне» (lsb-0012, arch §3.5):
+# `_process_reclass_job` снимает задание, если заметки нет или она в корзине
+# (решать нечего), и решает его по ГОТОВОЙ непустой суммари; задание, ждущее
+# суммари, остаётся pending и прогрессом не считается. Снимок очереди считает
+# только берущиеся задания: ждущее суммари — не работа прогона (сама заметка
+# видна в очереди `summary`), иначе счётчик показывает работу, которой у джобы
+# нет (FAIL приёмки 3.1.0, решение гейта 2026-09-19: `pending=1` держался 7
+# минут — столько объединённая заметка ждала суммари).
+_NODES_RECLASS_TAKEABLE = (
+    "(n.id IS NULL OR n.deleted_at IS NOT NULL "
+    "OR (n.summary_status = 'ok' AND trim(coalesce(n.summary, '')) <> ''))"
 )
+
+
+def _nodes_queue_stat_sql() -> str:
+    """SQL снимка очереди `nodes` под ФАКТИЧЕСКИЕ пулы прогона (FR-2.2).
+
+    `pending` — ровно та работа, которую `process_nodes` может взять в этом
+    прогоне, и ничего больше:
+    (1) задания `reclass` после сшивания (lsb-0012), которые решаются сейчас
+    (`_NODES_RECLASS_TAKEABLE`);
+    (2) кандидаты быстрого пула обхода `default` — предикат тот же, что у
+    `_NODES_SWEEP_SELECT` (переезд по готовой разметке, без модели);
+    (3) кандидаты классификаторного пула — предикат тот же, что у
+    `_NODES_CLASSIFY_SELECT` (готовая непустая суммари, разметки ещё нет).
+    `oldest_pending_sec` — возраст старейшего ИЗ ПОСЧИТАННЫХ источников
+    (задания — `created_at`, кандидаты — `updated_at`), `null` — очередь
+    пуста. Только SQL, без обращений к моделям; снимок работает и у
+    выключенной джобы. Параметр `:threshold` — порог авто-переезда
+    (`NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE`).
+    """
+    reclass_jobs = (
+        "SELECT COUNT(*) FROM worker_jobs j "
+        "LEFT JOIN notes n ON n.id = j.note_id "
+        "WHERE j.slot = 'nodes' AND j.kind = 'reclass' "
+        f"AND j.status = 'pending' AND {_NODES_RECLASS_TAKEABLE}"
+    )
+    reclass_age = (
+        "SELECT MAX(CAST(strftime('%s','now') AS INTEGER) "
+        "- CAST(strftime('%s', j.created_at) AS INTEGER)) "
+        "FROM worker_jobs j LEFT JOIN notes n ON n.id = j.note_id "
+        "WHERE j.slot = 'nodes' AND j.kind = 'reclass' "
+        f"AND j.status = 'pending' AND {_NODES_RECLASS_TAKEABLE}"
+    )
+    fast_pool = (
+        "SELECT COUNT(*) FROM notes WHERE namespace = 'default' "
+        "AND deleted_at IS NULL AND node_order_at IS NULL "
+        "AND hint_path IS NOT NULL AND confidence >= :threshold"
+    )
+    fast_age = (
+        "SELECT MAX(CAST(strftime('%s','now') AS INTEGER) "
+        "- CAST(strftime('%s', updated_at) AS INTEGER)) FROM notes "
+        "WHERE namespace = 'default' AND deleted_at IS NULL "
+        "AND node_order_at IS NULL AND hint_path IS NOT NULL "
+        "AND confidence >= :threshold"
+    )
+    classifier_pool = (
+        "SELECT COUNT(*) FROM notes WHERE namespace = 'default' "
+        "AND deleted_at IS NULL AND node_order_at IS NULL "
+        "AND classified_at IS NULL AND summary_status = 'ok' "
+        "AND summary IS NOT NULL AND summary <> ''"
+    )
+    classifier_age = (
+        "SELECT MAX(CAST(strftime('%s','now') AS INTEGER) "
+        "- CAST(strftime('%s', updated_at) AS INTEGER)) FROM notes "
+        "WHERE namespace = 'default' AND deleted_at IS NULL "
+        "AND node_order_at IS NULL AND classified_at IS NULL "
+        "AND summary_status = 'ok' AND summary IS NOT NULL "
+        "AND summary <> ''"
+    )
+    return (
+        "SELECT "
+        f"({reclass_jobs}) + ({fast_pool}) + ({classifier_pool}) AS pending, "
+        "MAX("
+        f"COALESCE(({reclass_age}), 0), "
+        f"COALESCE(({fast_age}), 0), "
+        f"COALESCE(({classifier_age}), 0)"
+        ") AS oldest_pending_sec"
+    )
+
 
 # Промпт догенерации названия (решение №9): ЗАШИТ в SummaryService.title
 # (follow-up 6b — протокол Summarizer получил метод title; здесь раньше был
@@ -1920,17 +1973,28 @@ class BackgroundWorker:
     def _nodes_queue_stat(self) -> dict:
         """Снимок очереди `nodes` для `/health.queues` (FR-2.2).
 
-        `pending` — pending-задания `reclass` после сшивания + кандидаты обоих
-        пулов обхода (быстрый и классификаторный); `oldest_pending_sec` —
-        возраст старейшего из двух источников (задания — `created_at`,
-        обход — `updated_at`), `null` — очередь пуста. Только SQL, без
-        обращений к моделям; снимок работает и у выключенной джобы.
+        Считает РОВНО работу, которую прогон `process_nodes` может взять в этом
+        прогоне: (1) решаемые задания `reclass` после сшивания — заметка с
+        готовой суммари либо её нет в живых (такое задание снимается сразу);
+        ждущее суммари задание НЕ считается — джоба его не берёт, а сама
+        заметка видна в очереди `summary`; (2) кандидаты быстрого пула обхода
+        `default`; (3) кандидаты классификаторного пула. Иначе счётчик
+        показывал бы работу, которой у джобы нет (FAIL приёмки 3.1.0, решение
+        гейта 2026-09-19).
+
+        `oldest_pending_sec` — возраст старейшего ИЗ ПОСЧИТАННЫХ источников
+        (задания — `created_at`, кандидаты — `updated_at`), `null` — очередь
+        пуста. Только SQL, без обращений к моделям; снимок работает и у
+        выключенной джобы (`SQL` собирается в `_nodes_queue_stat_sql`).
         """
         self._ensure_job_table()
-        threshold = self._settings.namespace_auto_move_min_confidence
         with session(self._settings) as conn:
             row = conn.execute(
-                _NODES_QUEUE_STAT_SQL, (threshold, threshold)
+                _nodes_queue_stat_sql(),
+                {
+                    "threshold":
+                        self._settings.namespace_auto_move_min_confidence
+                },
             ).fetchone()
         return queue_snapshot(row["pending"], row["oldest_pending_sec"])
 

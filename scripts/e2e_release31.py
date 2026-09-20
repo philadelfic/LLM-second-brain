@@ -53,8 +53,9 @@ Scenarios (0-9), per the techdebt-0036-01 spec:
   6. `/health` = 7 previous fields + `queues` + `version`.
   7. Context budgets, measured AFTER the vector/summary queues drain:
      `memory_search` top_k=5 ≤ 450 B PER ITEM, `memory_list`
-     (detail=summaries) ≤ 500 B PER ITEM, one `memory_list(detail=titles)`
-     page (20 items) ≤ 1.5 KB, the links overhead ≤ 0.5 KB; the actual bytes
+     (detail=summaries) ≤ 500 B PER ITEM, `memory_list(detail=titles)`
+     ≤ 100 B PER ITEM (page and per-item bytes are printed too), the links
+     overhead ≤ 0.5 KB; the actual bytes
      are printed as a trend, not only the verdict.
   8. Live DB upgrade v3.0.0 → 3.1.0: the `links` table and the
      `links_at`/`node_order_at` columns are there, notes are intact, a repeated
@@ -101,14 +102,15 @@ HEALTH_LEGACY = ("status", "embedding_ok", "summarizer_ok", "judge_ok",
                  "notes_count", "pending_vector", "pending_summary")
 HEALTH_QUEUES = ("vector", "summary", "judge", "areas", "links", "nodes")
 # Бюджеты канона §4.2.6 — НОРМЫ НА ЭЛЕМЕНТ выдачи (решение гейта 2026-09-19):
-# страничные пороги 1.2/1.5 КБ калибровались на мелких заметках и на живой базе
-# недостижимы (элемент ≈110 B фиксированных полей + ~2 байта на символ кириллицы в
-# summary). Страничная норма 1.5 КБ осталась ТОЛЬКО у дешёвой формы
-# `memory_list(detail="titles")` на странице 20 записей; замер бюджетов — ПОСЛЕ
+# Норма везде НА ЭЛЕМЕНТ (решение гейта 2026-09-19): элемент страницы растёт
+# вместе с `limit`, поэтому страничная норма 1.5 КБ у дешёвой формы
+# `memory_list(detail="titles")` снята как нерепрезентативная. Измерено на
+# живой базе: 1717 B на 20 записей = 85.8 B на элемент (элемент ≈110 B
+# фиксированных полей и почти нет summary) — отсюда порог 100 B; замер — ПОСЛЕ
 # дренажа очередей (иначе в него попадают саммари старого лимита — сценарий 7).
 BUDGET_SEARCH_ITEM = 450        # bytes per item of memory_search top_k=5
 BUDGET_LIST_ITEM = 500          # bytes per item of memory_list (detail=summaries)
-BUDGET_LIST_TITLES_PAGE = 1500  # bytes of a memory_list(detail=titles) page (20 items)
+BUDGET_LIST_TITLES_ITEM = 100   # bytes per item of memory_list (detail=titles)
 BUDGET_LINKS = 500              # bytes of the links array of one note
 MORE_HINT = re.compile(r"^\+(\d+) more — offset=(\d+)$")
 LINK_ITEM_FIELDS = {"id", "title", "namespace", "chars"}
@@ -1518,7 +1520,7 @@ async def scenario_6_health(rest: httpx2.AsyncClient) -> None:
 async def scenario_7_budgets(c: Client, rest: httpx2.AsyncClient,
                              note_with_links: int | None) -> None:
     scenario(7, "Context budgets (after the queue drain): search ≤ 450 B/item, "
-                "list ≤ 500 B/item, titles page ≤ 1.5 KB, links ≤ 0.5 KB")
+                "list ≤ 500 B/item, titles ≤ 100 B/item, links ≤ 0.5 KB")
 
     # Бюджеты мерятся ПОСЛЕ дренажа очередей: саммари длиннее 150 символов (лимит
     # 3.1.0) миграция уводит на перегенерацию, и старые длинные саммари дали бы
@@ -1558,15 +1560,14 @@ async def scenario_7_budgets(c: Client, rest: httpx2.AsyncClient,
           per_item is not None and per_item <= BUDGET_LIST_ITEM,
           f"page {size} B, items {len(items)}, per item {fmt_bytes(per_item)} B")
 
-    # (c) memory_list(detail=titles) — единственная СТРАНИЧНАЯ норма: 1.5 КБ на 20
-    # записей (дешёвая форма без summary).
+    # (c) memory_list(detail=titles) — норма НА ЭЛЕМЕНТ (§4.2.6), как у остальных
+    # форм: дешёвая форма без summary, элемент почти целиком фиксированные поля.
     titles_page = await list_page(c, detail="titles", limit=MCP_LIMIT)
     items = titles_page.get("items") or []
     size = json_size(titles_page)
     per_item = bytes_per_item(size, len(items))
-    check(f"one memory_list(detail=titles) page ({MCP_LIMIT} items) fits into "
-          f"{BUDGET_LIST_TITLES_PAGE} B",
-          size <= BUDGET_LIST_TITLES_PAGE,
+    check(f"memory_list (detail=titles) fits into {BUDGET_LIST_TITLES_ITEM} B per item",
+          per_item is not None and per_item <= BUDGET_LIST_TITLES_ITEM,
           f"page {size} B, items {len(items)}, per item {fmt_bytes(per_item)} B")
 
     # (d) overhead связей одной заметки — без изменений (≤ 0.5 КБ).
