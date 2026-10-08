@@ -65,6 +65,7 @@ CRUD (валидации, статусы, soft delete) — в `app.services.note
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sqlite3
@@ -381,6 +382,29 @@ _TERMS_ACTIVE_KEY_INDEX_DDL = (
     "ON terms(term_norm, context_norm) WHERE deleted_at IS NULL"
 )
 
+# История версий (№41, релиз 3.2.0, substrate-versioning §5.1): одна общая
+# таблица на все сущности, PK `(entity, entity_id, version)` — покрывает
+# lookup по записи и обратный порядок (от новых к старым). Индексов сверх PK
+# НЕ заводится (решение §5.1). `version=1` — baseline (`snapshot` заполнен,
+# `delta` NULL); `version≥2` — дельта, кроме перебазированной после prune.
+_RECORD_VERSIONS_DDL = """
+CREATE TABLE IF NOT EXISTS record_versions (
+  entity       TEXT    NOT NULL,                     -- 'note'|'skill'|'skill_template'|'term'|'user_fact'
+  entity_id    INTEGER NOT NULL,                     -- id строки живой таблицы; для skill_template — 0
+  version      INTEGER NOT NULL,                     -- 1..N, baseline = 1
+  event        TEXT    NOT NULL DEFAULT 'content'
+               CHECK(event IN ('baseline','content','delete','restore','rollback')),
+  source       TEXT    NOT NULL,                     -- 'mcp'|'rest'|'job:<имя>'|'merge'|'migration'
+  session      TEXT    NULL,                         -- идентификатор вызова/агента, не имя человека
+  changed      TEXT    NOT NULL DEFAULT '[]',        -- JSON-массив имён изменившихся полей
+  snapshot     TEXT    NULL,                         -- JSON-объект: поля целиком (baseline / после prune)
+  delta        TEXT    NULL,                         -- JSON-объект: поле → значение/строки (§5.2)
+  restore_from INTEGER NULL,                         -- откат: номер восстановленной версии
+  created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  PRIMARY KEY (entity, entity_id, version)
+)
+"""
+
 
 def _area_fts_ddl(table: str, fts_table: str, columns: tuple[str, ...]) -> str:
     """DDL FTS5-индекса области: внешний контент, trigram (как notes_fts)."""
@@ -654,6 +678,12 @@ def init_db(settings: Settings) -> None:
             # Сид skill-создателя (lsb-0007 §3.6/§3.8): сразу после шаблона,
             # идемпотентно, с маркером в skills_meta (удалённый — не воскреснет).
             _ensure_creator_skill(conn)
+            # История версий (№41, 3.2.0, substrate-versioning §5.1/§5.4): таблица
+            # record_versions, baseline существующих записей и перенос архива
+            # skill_versions в общую форму — идемпотентно, ПОСЛЕ сидов областей
+            # (сид навыка получает baseline) и ДО сверки эмбеддинга: история —
+            # про контент, векторных таблиц не адресует вовсе.
+            _migrate_history_schema(conn, settings)
             # Вектора (Фаза 3 + решение 2026-08-29; Фаза 7: + вектора чанков):
             # создание при первом старте; при несовпадении зафиксированной
             # конфигурации (модель/размерность) с env — полная автореиндексация
@@ -936,6 +966,185 @@ def _ensure_creator_skill(conn: sqlite3.Connection) -> None:
         "ON CONFLICT(key) DO NOTHING",
         (CREATOR_SKILL_SEED_KEY, CREATOR_SKILL_SEED_VALUE),
     )
+
+
+# --- история версий (№41, релиз 3.2.0) --------------------------------------
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    """Существует ли объект-таблица в БД (идемпотентность шагов по наличию)."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _history_projection(entity: str, row: sqlite3.Row, fields: tuple[str, ...]) -> dict:
+    """Проекция записи для истории (§5.3): поля как есть, `extra` — объектом.
+
+    `extra` навыка в живой таблице — JSON-текст полей класса; в версии он живёт
+    распарсенным объектом (одна форма у baseline и дельт), пусто — `None`.
+    """
+    projection: dict = {}
+    for field in fields:
+        value = row[field]
+        if entity == "skill" and field == "extra":
+            value = None if not value else json.loads(value)
+        projection[field] = value
+    return projection
+
+
+def _insert_baseline(
+    conn: sqlite3.Connection, entity: str, entity_id: int, projection: dict
+) -> None:
+    """`INSERT … WHERE NOT EXISTS`: baseline только там, где истории ещё нет.
+
+    Само-лечаще: строка, появившаяся после baseline-миграции, добирает baseline
+    при следующем старте; повторный проход — no-op (§5.4).
+    """
+    conn.execute(
+        "INSERT INTO record_versions (entity, entity_id, version, event, source, "
+        "changed, snapshot) SELECT ?, ?, 1, 'baseline', 'migration', '[]', ? "
+        "WHERE NOT EXISTS (SELECT 1 FROM record_versions WHERE entity = ? "
+        "AND entity_id = ?)",
+        (entity, entity_id, json.dumps(projection, ensure_ascii=False), entity, entity_id),
+    )
+
+
+def _backfill_history_baseline(conn: sqlite3.Connection) -> None:
+    """Baseline всех существующих записей: `version=1` = текущее содержимое.
+
+    Проекция собирается в Python (`json.dumps`) — без зависимости от SQLite
+    json1; проход по каждой сущности отдельный, `WHERE NOT EXISTS` держит
+    идемпотентность (FR-8.1/FR-8.2, §5.4). Записи в trash тоже получают
+    baseline: история — операторская, мягкое удаление её не отменяет.
+    """
+    from app.services.history import (
+        CONTENT_FIELDS,
+        ENTITY_NOTE,
+        ENTITY_SKILL,
+        ENTITY_SKILL_TEMPLATE,
+        ENTITY_TERM,
+        ENTITY_USER_FACT,
+    )
+
+    entity_tables = {
+        ENTITY_NOTE: "notes",
+        ENTITY_SKILL: "skills",
+        ENTITY_TERM: "terms",
+        ENTITY_USER_FACT: "user_facts",
+    }
+    for entity, table in entity_tables.items():
+        fields = CONTENT_FIELDS[entity]
+        columns = ", ".join(("id", *fields))
+        for row in conn.execute(f"SELECT {columns} FROM {table}").fetchall():
+            _insert_baseline(
+                conn,
+                entity,
+                int(row["id"]),
+                _history_projection(entity, row, fields),
+            )
+    # Глобальный шаблон навыков — отдельная сущность истории (id 0, ключ
+    # skills_meta.instruction_template, §5.3).
+    template = conn.execute(
+        "SELECT value FROM skills_meta WHERE key = ?", (INSTRUCTION_TEMPLATE_KEY,)
+    ).fetchone()
+    if template is not None:
+        _insert_baseline(
+            conn, ENTITY_SKILL_TEMPLATE, 0, {"instruction_template": template["value"]}
+        )
+
+
+def _merge_skill_versions(conn: sqlite3.Connection, settings: Settings) -> None:
+    """Перенести архив `skill_versions` в общую форму истории (§5.4, §13.7).
+
+    Цепочка `1..N`: v1 — самая ранняя архивная копия целиком (`snapshot`,
+    `event='baseline'`, `source='migration'`), промежуточные — дельты,
+    посчитанные из архивных копий на месте переноса, vN — текущая строка
+    `skills` (дельта от предыдущей). Номера — из `skill_versions.version` и
+    `skills.version`; недостающие звенья не выдумываются — дельта считается
+    между соседними ИМЕЮЩИМИСЯ версиями. Перенос идёт одной транзакцией
+    вызывающего; таблица `skill_versions` остаётся legacy-слепком (§13.7) и
+    кодом больше не читается. Навык, у которого история уже есть, пропускается:
+    шаг идемпотентен; таблицы нет — no-op.
+    """
+    from app.services.history import CONTENT_FIELDS, ENTITY_SKILL, encode_delta
+
+    if not _table_exists(conn, "skill_versions"):
+        return
+    fields = CONTENT_FIELDS[ENTITY_SKILL]
+    skill_ids = [
+        int(row[0])
+        for row in conn.execute("SELECT DISTINCT skill_id FROM skill_versions")
+    ]
+    for skill_id in skill_ids:
+        has_history = conn.execute(
+            "SELECT 1 FROM record_versions WHERE entity = ? AND entity_id = ? LIMIT 1",
+            (ENTITY_SKILL, skill_id),
+        ).fetchone()
+        if has_history is not None:
+            continue
+        chain: dict[int, dict] = {}
+        for row in conn.execute(
+            "SELECT * FROM skill_versions WHERE skill_id = ? ORDER BY version",
+            (skill_id,),
+        ).fetchall():
+            chain[int(row["version"])] = _history_projection(ENTITY_SKILL, row, fields)
+        live = conn.execute("SELECT * FROM skills WHERE id = ?", (skill_id,)).fetchone()
+        if live is not None:
+            chain[int(live["version"])] = _history_projection(ENTITY_SKILL, live, fields)
+        if not chain:
+            continue
+        previous: dict | None = None
+        for version in sorted(chain):
+            current = chain[version]
+            if previous is None:
+                conn.execute(
+                    "INSERT INTO record_versions (entity, entity_id, version, event, "
+                    "source, changed, snapshot) VALUES (?, ?, ?, 'baseline', "
+                    "'migration', '[]', ?)",
+                    (
+                        ENTITY_SKILL,
+                        skill_id,
+                        version,
+                        json.dumps(current, ensure_ascii=False),
+                    ),
+                )
+            else:
+                delta, changed = encode_delta(
+                    previous, current, inline_max=settings.history_delta_inline_max
+                )
+                conn.execute(
+                    "INSERT INTO record_versions (entity, entity_id, version, event, "
+                    "source, changed, delta) VALUES (?, ?, ?, 'content', "
+                    "'migration', ?, ?)",
+                    (
+                        ENTITY_SKILL,
+                        skill_id,
+                        version,
+                        json.dumps(changed, ensure_ascii=False),
+                        json.dumps(delta, ensure_ascii=False),
+                    ),
+                )
+            previous = current
+
+
+def _migrate_history_schema(conn: sqlite3.Connection, settings: Settings) -> None:
+    """Схема истории + baseline существующих записей + перенос skill_versions.
+
+    Шаги постановки no41-01: (а) `CREATE TABLE IF NOT EXISTS record_versions`
+    (§5.1 — точно как в архитектуре, без индексов сверх PK); (б) перенос архива
+    навыков в общую форму; (в) baseline всех существующих записей. Порядок
+    «перенос → бэкфилл» обязателен: у навыка с архивом baseline — самая ранняя
+    архивная копия, а не текущая строка (иначе v1 был бы перезаписан текущим
+    содержимым и цепочка архива стала бы недостижима). Всё одной транзакцией,
+    идемпотентно и применимо с любой предыдущей версии.
+    """
+    with transaction(conn):
+        conn.execute(_RECORD_VERSIONS_DDL)
+        _merge_skill_versions(conn, settings)
+        _backfill_history_baseline(conn)
 
 
 def _ensure_default_namespace(conn: sqlite3.Connection) -> None:

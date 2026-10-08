@@ -171,6 +171,19 @@ class Settings(BaseSettings):
     # --- фоновые операции ---
     pending_retry_sec: int = 30  # стартовый интервал до-векторизации/досуммаризации
 
+    # --- история версий (№41, релиз 3.2.0) ---
+    # HISTORY_ENABLED — выключатель слоя истории (kill switch): false —
+    # версии не пишутся, чтение отдаёт пусто. HISTORY_MAX_VERSIONS — потолок
+    # версий на запись (0 — хранить всё, дефолт FR-10.1); HISTORY_RETENTION_DAYS
+    # — срок хранения версий в сутках (0 — без ограничения). При >0 prune
+    # вычищает старейшие версии и перебазирует самую раннюю сохраняемую в
+    # полный snapshot (§13.8). HISTORY_DELTA_INLINE_MAX — порог «поле целиком ↔
+    # построчная дельта» в символах (§5.2).
+    history_enabled: bool = True
+    history_max_versions: int = 0
+    history_retention_days: int = 0
+    history_delta_inline_max: int = 2048
+
     # --- прочее ---
     log_level: str = "INFO"
     author_default: str = "unknown"
@@ -393,6 +406,13 @@ class Settings(BaseSettings):
 
         # --- фоновые операции (0 допускается: у юнит-тестов — режим без пауз) ---
         need_low("pending_retry_sec", self.pending_retry_sec, 0)
+
+        # --- история версий (№41): 0 — «без ограничения» для потолка версий и
+        # срока хранения (дефолт — хранить всё); порог дельты ≥ 1 (иначе
+        # построчное кодирование длинных полей не включилось бы никогда).
+        need_low("history_max_versions", self.history_max_versions, 0)
+        need_low("history_retention_days", self.history_retention_days, 0)
+        need_low("history_delta_inline_max", self.history_delta_inline_max, 1)
 
         # --- backup (NFR-3) ---
         need_low("backup_interval_sec", self.backup_interval_sec, 1)

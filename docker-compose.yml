@@ -95,6 +95,11 @@ services:
       DB_PATH: "/data/notes.db"
       MAX_NOTE_CHARS: "35000"                # max note length
       PENDING_RETRY_SEC: "30"                # background worker start interval (×2 → 15 min)
+      # --- version history (No41, release 3.2.0): record_versions layer ---
+      HISTORY_ENABLED: "true"           # kill switch: false — no versions are written, history reads come back empty
+      HISTORY_MAX_VERSIONS: "0"         # versions kept per record (0 — keep everything; >0 — prune with re-base)
+      HISTORY_RETENTION_DAYS: "0"       # version retention in days (0 — unlimited; >0 — prune with re-base)
+      HISTORY_DELTA_INLINE_MAX: "2048"  # threshold "full value ↔ line delta", chars (≥1)
       # --- search ---
       DEFAULT_TOP_K: "5"
       DEFAULT_LIST_LIMIT: "20"
