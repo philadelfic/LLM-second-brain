@@ -153,6 +153,7 @@ from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
 from app.services.promotion import PromotionService
 from app.services.slot_breaker import SlotBreaker
+from app.services.slot_budget import slot_config_fingerprint
 from app.services.slot_outcome import SlotOutcome, outcome_of
 from app.services.summary import Summarizer, SummaryError, cap_summary
 from app.services.terms import TermsService
@@ -242,7 +243,9 @@ def _call_log_fields(meta: ChatMeta) -> dict[str, object]:
 
 # meta-ключ отпечатка конфигурации слотов (№39, arch §6.8/§13.3): смена
 # конфигурации слота — часть «причины» внимания, поэтому старт со сменой
-# отпечатка снимает `attention_at` у всех заданий.
+# отпечатка снимает `attention_at` у всех заданий. Состав отпечатка живёт в
+# `slot_budget.slot_config_fingerprint` (lsbdef0008-02): модель, тип, бюджет,
+# контекст, запас, потолок и параметры decision — одной реализацией на систему.
 SLOT_CONFIG_META_KEY = "slot_config_fingerprint"
 
 # Единое правило выборки быстрого пула обхода `default` (lsb-0011-01, arch §3.2):
@@ -1213,34 +1216,22 @@ class BackgroundWorker:
                         released += 1
         return released
 
-    def _slot_config_fingerprint(self) -> str:
-        """Отпечаток конфигурации слотов (arch §6.8/§13.3): провайдер + модель.
-
-        Смена любого слагаемого — «причина ушла»: пары, замороженные на
-        нетранзиентном исходе, могли быть заморожены именно конфигурацией
-        слота (например, сменённой моделью судьи).
-        """
-        settings = self._settings
-        return "|".join(
-            str(part)
-            for part in (
-                settings.summary_provider,
-                settings.summary_model,
-                settings.summary_num_predict,
-                settings.judge_provider,
-                settings.judge_model,
-                settings.judge_num_predict,
-            )
-        )
-
     def _startup_attention_reset(self) -> int:
         """Стартовая сверка отпечатка конфигурации слотов (arch §6.8/§13.3).
 
-        Отпечаток читается из `meta` (`SLOT_CONFIG_META_KEY`); отличается от
-        текущего или `SLOT_ATTENTION_RESET_ON_START` — внимание снимается у
-        всех заданий; отпечаток перезаписывается. Возвращает число снятых.
+        Сравниваем текущий отпечаток (`slot_budget.slot_config_fingerprint`,
+        lsbdef0008-02: модель/тип/бюджет/контекст/запас/потолок + параметры
+        decision) с записанным в `meta` (`SLOT_CONFIG_META_KEY`). Отпечатка нет
+        или он отличается — «причина ушла»: внимание снимается у заданий всех
+        слотов (событие блока 2 `job_attention_released`, `reason="startup"`),
+        отпечаток перезаписывается. Тот же отпечаток — ничего не снимаем.
+
+        `SLOT_ATTENTION_RESET_ON_START=false` отключает шаг целиком: оператор
+        запретил снятие, читать и переписывать отпечаток не нужно.
         """
-        fingerprint = self._slot_config_fingerprint()
+        if not self._settings.slot_attention_reset_on_start:
+            return 0
+        fingerprint = slot_config_fingerprint(self._settings)
         with session(self._settings) as conn:
             row = conn.execute(
                 "SELECT value FROM meta WHERE key = ?",
@@ -1248,7 +1239,7 @@ class BackgroundWorker:
             ).fetchone()
         stored = row["value"] if row is not None else None
         released = 0
-        if stored != fingerprint or self._settings.slot_attention_reset_on_start:
+        if stored != fingerprint:
             released = self._reset_attention_for_slot("*", "startup")
         with session(self._settings) as conn, transaction(conn):
             conn.execute(

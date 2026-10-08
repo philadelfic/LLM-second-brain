@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Acceptance E2E of release 3.2.0 (test contour, MCP + REST).
 
-Spec: `release/3.2.0/staging_for_development/no39-03-observability-and-acceptance.md`;
+Spec: `release/3.2.0/staging_for_development/no39-03-observability-and-acceptance.md`
+(scenario 8 — `.../lsbdef0008-02-attention-release-and-acceptance.md`);
 requirements — `release/3.2.0/documents/req/no39-queue-unavailable-requirements.md`
 (FR-1.1…FR-7.2, lsbdef-0008 FR-1.3/FR-2.4); architecture — §6.9, §7.2, §7.4,
 §13.9, §13.13 of `release/3.2.0/documents/arch/jobs-and-terms-architecture.md`.
@@ -63,6 +64,9 @@ Scenarios (this base version):
      `--run-regression` (otherwise MANUAL).
   7. TODO of the future blocks (slots/budget/decision, memory handles, assistant
      logs, backups) — placeholders for the follow-up postановки.
+  8. lsbdef-0008 (defect): reasoning eats the budget → truncation → the pair
+     lands in attention → the budget is raised → BOTH queues drain by themselves
+     (no manual step), numbers before/after into `release/3.2.0/ACCEPTANCE.md`.
 
 Run (normally inside the test container):
     MCP_AUTH_TOKEN=... python scripts/e2e_release32.py
@@ -562,6 +566,37 @@ def db_size_text() -> str:
         return "unknown (DB is not reachable)"
     size = Path(CFG["db"]).stat().st_size
     return f"{size} B ({size / 1048576:.1f} MiB)"
+
+
+# ==== harness: acceptance report (`release/3.2.0/ACCEPTANCE.md`) ================
+def acceptance_path() -> Path:
+    """The acceptance report of the release (release/ is not versioned)."""
+    return Path(CFG["repo_dir"]) / "release" / RELEASE / "ACCEPTANCE.md"
+
+
+def write_acceptance_block(block: str, lines: list[str]) -> str:
+    """Write/replace the block of ONE postановка in `ACCEPTANCE.md` (idempotent).
+
+    The block is fenced with HTML markers `<!-- <block>:start -->` /
+    `<!-- <block>:end -->`: a repeated run of the scenario REPLACES its own block
+    instead of appending a second copy, so the second run of the E2E leaves the
+    report byte-identical (идемпотентность прогона). The numbers live outside the
+    code: the file is the evidence, the script only fills it.
+    """
+    path = acceptance_path()
+    start, end = f"<!-- {block}:start -->", f"<!-- {block}:end -->"
+    section = "\n".join([start, *lines, end])
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    if start in text and end in text:
+        head, rest = text.split(start, 1)
+        tail = rest.split(end, 1)[1]
+        text = head + section + tail
+    else:
+        head = text.rstrip() + "\n\n" if text.strip() else ""
+        text = head + section + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return str(path)
 
 
 # ==== probe data: marking, leftovers, teardown =================================
@@ -1076,9 +1111,10 @@ async def future_block_todo() -> None:
     """
     scenario(7, "TODO: scenarios of the future 3.2.0 blocks (placeholders)")
     # TODO(3.2.0 future blocks) — slots / output budget / decision:
-    manual("slots: output budget, finish_reason/usage, the `decision` slot",
-           "block №49 / lsbdef-0008 / LSBN-F-12 — add a `scenario_8_slots_budget()` "
-           "here (see the §6 TODO block of this docstring)")
+    manual("slots: the `decision` slot and its observability (LSBN-F-12)",
+           "the budget/finish_reason part of this placeholder is claimed by "
+           "`scenario_8_budget_raise_release()` (lsbdef0008-02); the decision "
+           "slot adds its own `scenario_*` here")
     # TODO(3.2.0 future blocks) — memory handles surface:
     manual("memory handles: search/list/get contract, budgets, pagination",
            "add a `scenario_9_memory_handles()` here")
@@ -1090,6 +1126,236 @@ async def future_block_todo() -> None:
            "add a `scenario_11_backups()` here")
     warn("the future-block section is a base placeholder — claimed by the "
          "follow-up postановки", "see the TODO(3.2.0 future blocks) comments")
+
+
+# ==== scenarios: 8. budget raise releases the attention =========================
+async def log_text() -> str:
+    """Contour log via the operator hook (empty string — no hook / unreadable)."""
+    if not CFG["logs_cmd"]:
+        return ""
+    try:
+        proc = await run_shell(CFG["logs_cmd"], timeout=120.0)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def log_lines(text: str, *needles: str) -> list[str]:
+    """Log lines carrying EVERY needle (an event and its own field on one line)."""
+    return [line for line in text.splitlines() if all(n in line for n in needles)]
+
+
+def db_count(sql: str, params: tuple = ()) -> int | None:
+    """One integer out of the contour DB (`COUNT(*) AS c`); None — not readable."""
+    rows, _err = db_try(sql, params)
+    return int(rows[0]["c"]) if rows else None
+
+
+def queue_numbers(snapshot: dict, queue: str) -> dict[str, Any]:
+    """The per-queue numbers the acceptance report records (FR-5.2)."""
+    stat = queue_stat(snapshot, queue) or {}
+    return {key: stat.get(key) for key in ("pending", "waiting", "attention")}
+
+
+def own_pending_summaries() -> int | None:
+    """Probe notes of this run still waiting for a summary (matched by the tag)."""
+    return db_count(
+        "SELECT COUNT(*) AS c FROM notes WHERE deleted_at IS NULL "
+        "AND summary_status = 'pending' AND title LIKE ?",
+        (f"%{RUN['tag']}%",),
+    )
+
+
+def own_summaries_ready(count: int) -> Callable[[], Awaitable[tuple[bool, str]]]:
+    """Predicate: every probe note of this run got its summary (FR-5.1)."""
+
+    async def predicate() -> tuple[bool, str]:
+        ready = db_count(
+            "SELECT COUNT(*) AS c FROM notes WHERE deleted_at IS NULL "
+            "AND summary_status = 'ok' AND title LIKE ?",
+            (f"%{RUN['tag']}%",),
+        )
+        return (ready is not None and ready >= count), \
+            f"probe notes with summary_status='ok': {ready} of {count}"
+
+    return predicate
+
+
+async def judge_attention(rest: httpx2.AsyncClient) -> tuple[bool, str]:
+    """Predicate: the judge queue shows a pair waiting for a human (no busy-loop)."""
+    snapshot = await health_snapshot(rest)
+    stat = queue_stat(snapshot, "judge")
+    if stat is None:
+        return False, "the judge queue is not reported by /health"
+    try:
+        answer = await rest.get("/jobs/attention")
+        jobs = (answer.json() if answer.status_code == 200 else {}).get("jobs") or []
+    except Exception as exc:  # noqa: BLE001 — a transient error is not the answer
+        return False, describe(exc)
+    attention = stat.get("attention") or 0
+    return bool(attention and jobs), (
+        f"judge: pending={stat.get('pending')}, waiting={stat.get('waiting')}, "
+        f"attention={attention}, GET /jobs/attention={len(jobs)}"
+    )
+
+
+async def scenario_8_budget_raise_release(c: Client, rest: httpx2.AsyncClient) -> None:
+    """lsbdef-0008: reasoning eats the budget → truncation → attention → the
+    budget is raised → the queues drain WITHOUT a manual step (FR-2.3/FR-5.1)."""
+    scenario(8, "Reasoning eats the budget → truncation → attention → the budget is "
+                "raised → the queues drain by themselves")
+    if not (CFG["budget_break_cmd"] and CFG["budget_fix_cmd"]):
+        skip("the budget-raise release branch (a changed slot config releases the "
+             "attention)",
+             "the contour hook is required: LSB_BUDGET_BREAK_CMD / LSB_BUDGET_FIX_CMD "
+             "(a fake slot answering done_reason=length on an empty content, then a "
+             "restart with a raised budget and a working slot)")
+        manual("scenario 8 (lsbdef-0008 FR-2.3/FR-5.1/FR-5.2)",
+               "point LSB_BUDGET_BREAK_CMD at a contour restart with SUMMARY_MODEL_TYPE="
+               "reasoning, a small SUMMARY_NUM_PREDICT and a fake slot returning an "
+               "empty content with done_reason=length, and LSB_BUDGET_FIX_CMD at a "
+               "restart with SUMMARY_NUM_PREDICT=0 / SUMMARY_CONTEXT_TOKENS set and a "
+               "working slot: the notes waiting for a summary must get it and the "
+               "judge queue must drain by itself")
+        return
+
+    proc = await run_shell(CFG["budget_break_cmd"])
+    check("the contour is switched to the broken slot configuration (reasoning + a "
+          "tight budget)", proc.returncode == 0, f"rc={proc.returncode}")
+    if proc.returncode != 0:
+        return
+    teardown_note("the contour was switched to the broken slot configuration and fixed "
+                  "back by the scenario hook")
+    fixed = False
+    try:
+        # Push work into both queues: the probe note needs a summary, its dedup
+        # hand-off needs a judge verdict (a hand-off pair is what freezes here).
+        probe_ids = [await save_probe_note(c, RUN["note_budget_break"]),
+                     await save_probe_note(c, RUN["note_budget_break_2"])]
+        probes = len([item for item in probe_ids if item is not None])
+
+        ok, detail = await wait_until(queue_has_work(rest, "summary"),
+                                      "[budget] notes without a summary pile up "
+                                      "(the answer is cut, not lost)",
+                                      timeout=min(CFG["wait_sec"], 240.0))
+        check("[budget] while the budget is tight the summary queue grows", ok, detail)
+
+        ok, detail = await wait_until(judge_attention(rest),
+                                      "[budget] the judge pair lands in attention "
+                                      "(/health.queues + GET /jobs/attention)")
+        check("[budget] the hopeless pair waits for a human, not burning calls",
+              ok, detail)
+
+        snapshot_before = await health_snapshot(rest)
+        before = {
+            "queues": {queue: queue_numbers(snapshot_before, queue)
+                       for queue in ("summary", "judge")},
+            "slots_attention": {
+                slot: (slot_stat(snapshot_before, slot) or {}).get("attention")
+                for slot in SLOTS},
+            "own_pending_summaries": own_pending_summaries(),
+        }
+        info(f"[budget] before the fix: {json.dumps(before, ensure_ascii=False)}")
+
+        proc = await run_shell(CFG["budget_fix_cmd"])
+        fixed = True
+        check("the contour is restarted with the raised budget and a working slot",
+              proc.returncode == 0, f"rc={proc.returncode}")
+        if proc.returncode != 0:
+            return
+        teardown_note("the contour was restarted with the raised budget by the hook")
+
+        ok, detail = await wait_until(
+            own_summaries_ready(probes),
+            "[budget] the notes that waited for a summary get it without manual steps")
+        check("[budget] the waiting notes are summarised after the budget is raised",
+              ok, detail)
+
+        ok, detail = await wait_until(queue_drained(rest, "judge"),
+                                      "[budget] the judge queue drains by itself")
+        check("[budget] the judge queue is drained without a manual step", ok, detail)
+
+        snapshot_after = await health_snapshot(rest)
+        after = {
+            "queues": {queue: queue_numbers(snapshot_after, queue)
+                       for queue in ("summary", "judge")},
+            "slots_attention": {
+                slot: (slot_stat(snapshot_after, slot) or {}).get("attention")
+                for slot in SLOTS},
+            "own_pending_summaries": own_pending_summaries(),
+        }
+        judge_after = after["queues"]["judge"]
+        check("[budget] the judge queue keeps no pending/waiting/attention item",
+              all((judge_after.get(key) or 0) == 0
+                  for key in ("pending", "waiting", "attention")),
+              f"{judge_after}")
+
+        text = await log_text()
+        released = log_lines(text, "job_attention_released", "startup")
+        if text:
+            check("[budget] the startup release is written: job_attention_released "
+                  "with reason=\"startup\"", bool(released),
+                  f"{len(released)} startup release line(s)")
+        else:
+            skip("[budget] the startup release event in the log",
+                 "LSB_LOGS_CMD is not set (no log hook on this contour)")
+        refusals = len(log_lines(text, '"outcome": "truncated"'))
+        info(f"[budget] refusals (outcome=truncated) over the observation window: "
+             f"{refusals}")
+
+        path = write_acceptance_block("lsbdef0008-02", _acceptance_lines(before, after,
+                                                                          refusals,
+                                                                          len(released)))
+        info(f"[budget] the acceptance numbers are written to {path}")
+    finally:
+        if not fixed:
+            undo = await run_shell(CFG["budget_fix_cmd"])
+            if undo.returncode == 0:
+                teardown_note("the contour was fixed back by the teardown hook")
+                warn("[budget] the scenario left before its own fix step",
+                     "the contour was fixed back by the teardown hook")
+            else:
+                warn("[budget] the contour could NOT be fixed back — restore the slot "
+                     "configuration by hand", f"rc={undo.returncode}")
+
+
+def _acceptance_lines(before: dict, after: dict, refusals: int,
+                      releases: int) -> list[str]:
+    """Markdown block of the lsbdef-0008 acceptance: the numbers before/after."""
+    def stamp(numbers: dict) -> str:
+        return " / ".join(
+            f"{numbers.get(key) if numbers.get(key) is not None else '?'}"
+            for key in ("pending", "waiting", "attention")
+        )
+
+    def slots(numbers: dict) -> str:
+        return ", ".join(f"{slot}:{numbers.get(slot)}" for slot in SLOTS)
+
+    return [
+        "### Дефект lsbdef-0008 — разгрузка ожидавших (lsbdef0008-02)",
+        "",
+        f"Контур: {CFG['base_url']} · прогон: {time.strftime('%Y-%m-%dT%H:%M:%S%z')} · "
+        f"тег проб: {RUN['tag']}",
+        "",
+        "| Метрика | до (бюджет тесный) | после (бюджет поднят) |",
+        "|---|---|---|",
+        f"| Заметки прогона без выжимки (`summary_status='pending'`) | "
+        f"{before['own_pending_summaries']} | {after['own_pending_summaries']} |",
+        f"| Очередь `summary`: `pending/waiting/attention` | "
+        f"{stamp(before['queues']['summary'])} | {stamp(after['queues']['summary'])} |",
+        f"| Очередь `judge`: `pending/waiting/attention` | "
+        f"{stamp(before['queues']['judge'])} | {stamp(after['queues']['judge'])} |",
+        f"| Внимание по слотам (`/health.slots`) | {slots(before['slots_attention'])} | "
+        f"{slots(after['slots_attention'])} |",
+        f"| Отказы слота (`outcome=truncated`) за окно наблюдения | — | {refusals} |",
+        f"| `job_attention_released` с `reason=\"startup\"` | — | {releases} |",
+        "",
+        "Причина переключения видна без отладочного прогона (FR-5.2): смена "
+        "отпечатка конфигурации слота (`SUMMARY_MODEL_TYPE`/`SUMMARY_NUM_PREDICT`/"
+        "`SUMMARY_CONTEXT_TOKENS`/`SLOT_MAX_OUTPUT_TOKENS`/`SLOT_PROMPT_RESERVE_TOKENS`/"
+        "`DECISION_*`) на старте снимает `attention_at` у всех заданий — заметки "
+        "получают выжимки и очередь судьи разгружается без ручных действий.",
+    ]
 
 
 # ==== run ======================================================================
@@ -1116,6 +1382,7 @@ async def run_all() -> None:
             await scenario_4_attention_pair(rest)
             await scenario_5_restart_inside_outage(rest)
             await scenario_6_regression()
+            await scenario_8_budget_raise_release(c, rest)
             await future_block_todo()
             close_scenario()
         finally:
@@ -1229,6 +1496,14 @@ async def main() -> int:
     parser.add_argument("--offcontract-fix-cmd",
                         default=os.environ.get("LSB_JUDGE_OFFCONTRACT_FIX_CMD", ""),
                         help="shell command fixing the judge back (scenario 4)")
+    parser.add_argument("--budget-break-cmd",
+                        default=os.environ.get("LSB_BUDGET_BREAK_CMD", ""),
+                        help="shell command restarting the contour with a tight budget "
+                             "and a fake slot cutting the answer (scenario 8)")
+    parser.add_argument("--budget-fix-cmd",
+                        default=os.environ.get("LSB_BUDGET_FIX_CMD", ""),
+                        help="shell command restarting the contour with the raised "
+                             "budget / a working slot (scenario 8)")
     parser.add_argument("--expect-version", default=os.environ.get("LSB_EXPECT_VERSION", RELEASE),
                         help="release tag /health.version is compared with")
     parser.add_argument("--run-regression", action="store_true",
@@ -1277,6 +1552,8 @@ async def main() -> int:
         "auth_slot": args.auth_slot,
         "offcontract_cmd": args.offcontract_cmd,
         "offcontract_fix_cmd": args.offcontract_fix_cmd,
+        "budget_break_cmd": args.budget_break_cmd,
+        "budget_fix_cmd": args.budget_fix_cmd,
         "expect_version": args.expect_version,
         "run_regression": args.run_regression,
         "python": args.python,
@@ -1292,6 +1569,8 @@ async def main() -> int:
         "note_outage_embedding": f"{tag} outage probe embedding",
         "note_outage_summary": f"{tag} outage probe summary",
         "note_outage_judge": f"{tag} outage probe judge",
+        "note_budget_break": f"{tag} budget probe note one",
+        "note_budget_break_2": f"{tag} budget probe note two",
         "notes": [],
     })
 

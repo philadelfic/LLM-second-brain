@@ -26,6 +26,7 @@ from fakes import (
 from app.config import Settings, get_settings
 from app.services.judge import JudgeResult
 from app.services.notes import NoteService
+from app.services.slot_budget import slot_config_fingerprint
 from app.services.slot_outcome import SlotOutcome
 from app.services.worker import SLOT_CONFIG_META_KEY, BackgroundWorker
 from app.storage.db import init_db, session, transaction
@@ -336,4 +337,4 @@ def test_startup_resets_on_config_change(tmp_path, monkeypatch) -> None:
         stored = conn.execute(
             "SELECT value FROM meta WHERE key = ?", (SLOT_CONFIG_META_KEY,)
         ).fetchone()
-    assert stored["value"] == worker._slot_config_fingerprint()
+    assert stored["value"] == slot_config_fingerprint(settings)
