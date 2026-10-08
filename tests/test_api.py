@@ -26,6 +26,7 @@ class TestHealth:
             "embedding_ok": None,
             "summarizer_ok": None,
             "judge_ok": None,
+            "decision_ok": None,
             "notes_count": 0,
             "pending_vector": 0,
             "pending_summary": 0,
@@ -44,13 +45,24 @@ class TestHealth:
                     "last_budget_source": None,
                     "last_had_thinking": None,
                 }
-                for slot in ("embedding", "summary", "judge")
+                for slot in ("embedding", "summary", "judge", "decision")
             },
             "areas": {
                 name: {"enabled": True, "pending": 0}
                 for name in ("skills", "terms", "user")
             },
             "warnings": {"by_kind": {}, "total": 0},
+            "decision": {
+                "enabled": False,
+                "ok": None,
+                "answers": 0,
+                "fallbacks": 0,
+                "by_reason": {
+                    "unavailable": 0,
+                    "unsupported": 0,
+                    "low_confidence": 0,
+                },
+            },
         }
 
     def test_contract_fields(self, client: TestClient) -> None:
@@ -62,6 +74,7 @@ class TestHealth:
             "embedding_ok",
             "summarizer_ok",
             "judge_ok",
+            "decision_ok",
             "notes_count",
             "pending_vector",
             "pending_summary",
@@ -69,6 +82,7 @@ class TestHealth:
             "slots",
             "areas",
             "warnings",
+            "decision",
         }
         assert body["status"] == "ok"
         # techdebt-0036 (FR-4.2): версия — из приложения, не из окружения.
@@ -90,7 +104,7 @@ class TestHealth:
             assert set(stat) == {"pending", "oldest_pending_sec", "waiting", "attention"}
         # №39 (arch §7.2): /health.slots — по каждому слоту исход и пауза.
         # №50 (lsbdef-0008): плюс диагностика последнего вызова слота.
-        assert set(body["slots"]) == {"embedding", "summary", "judge"}
+        assert set(body["slots"]) == {"embedding", "summary", "judge", "decision"}
         for stat in body["slots"].values():
             assert set(stat) == {
                 "ok",

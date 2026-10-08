@@ -227,16 +227,33 @@ class DecisionService:
             return []
         return list(self._registry.decision_questions.get(group, ()))
 
-    def probe(self) -> DecisionCheck:
-        """Пробный стук слота: `check_decision()`, успех снимает разрыв (§6.4)."""
+    def probe(self, operation: str | None = None) -> DecisionCheck:
+        """Пробный стук слота: `check_decision()`, успех снимает разрыв (§6.4).
+
+        Пишет события разрыва блока 2 (`slot_probe`/`slot_resumed`/
+        `slot_paused`, §7.2): разрыв decision живёт ЗДЕСЬ, воркер его не видит
+        (§13.8), поэтому журналит сам сервис — формат событий тот же.
+        `operation` — имя джобы для поля `job` (нет — сам слот).
+        """
         if self._llm is None:
             return DECISION_CHECK_UNSUPPORTED
+        job = operation or SLOT_DECISION
         result = self._llm.check_decision()
+        self._log_slot_event("slot_probe", job, result=result)
         outcome = _outcome_of_check(result)
         if outcome is None:
             self._breaker.note_success()
-        else:
-            self._breaker.note_failure(outcome)
+            self._log_slot_event(
+                "slot_resumed", job, after_sec=self._settings.slot_pause_sec
+            )
+        elif self._breaker.note_failure(outcome):
+            self._log_slot_event(
+                "slot_paused",
+                job,
+                level=logging.WARNING,
+                outcome=outcome.value,
+                paused_until=self._breaker.snapshot()["paused_until"],
+            )
         return result
 
     # --- решение -------------------------------------------------------------
@@ -288,7 +305,7 @@ class DecisionService:
                 "unavailable", operation=operation, detail=detail, ids=ids
             )
             raise DecisionUnavailable(detail, reason="unavailable")
-        if self._breaker.probe_due() and self.probe() != DECISION_CHECK_OK:
+        if self._breaker.probe_due() and self.probe(operation) != DECISION_CHECK_OK:
             detail = "пробный стук decision-слота не прошёл — слот в паузе"
             self._fallback(
                 "unavailable", operation=operation, detail=detail, ids=ids
@@ -300,7 +317,14 @@ class DecisionService:
             parsed = self._llm.decide(state, payload)
         except LLMError as exc:
             outcome = self._outcome_of_error(exc)
-            self._breaker.note_failure(outcome)
+            if self._breaker.note_failure(outcome):
+                self._log_slot_event(
+                    "slot_paused",
+                    operation,
+                    level=logging.WARNING,
+                    outcome=outcome.value,
+                    paused_until=self._breaker.snapshot()["paused_until"],
+                )
             reason = (
                 "unsupported"
                 if outcome is SlotOutcome.OFF_CONTRACT
@@ -478,3 +502,22 @@ class DecisionService:
             if value is not None:
                 payload[key] = value
         logging.getLogger("app").info(event, extra=payload)
+
+    @staticmethod
+    def _log_slot_event(
+        event: str, job: str, *, level: int = logging.INFO, **fields: object
+    ) -> None:
+        """Событие разрыва/стука decision-слота (блок 2, §7.2): `slot`=decision.
+
+        Формат тот же, что у воркера (`event`/`slot`/`job` + поля по факту),
+        чтобы разрыв decision читался оператором наравне с прочими слотами.
+        """
+        payload: dict[str, object] = {
+            "event": event,
+            "slot": SLOT_DECISION,
+            "job": job,
+        }
+        for key, value in fields.items():
+            if value is not None:
+                payload[key] = value
+        logging.getLogger("app").log(level, "decision slot event", extra=payload)

@@ -322,6 +322,9 @@ class HealthResponse(BaseModel):
     embedding_ok: bool | None  # Фаза 3
     summarizer_ok: bool | None  # Фаза 4
     judge_ok: bool | None  # Фаза 11: судья дедупа/структуры (слот judge)
+    # LSBN-F-12 (arch §7.1): умеет ли decision-слот (None — выключен или
+    # проверки не было; False — стартовая проверка/вызов погасили слот).
+    decision_ok: bool | None
     notes_count: int
     pending_vector: int
     pending_summary: int
@@ -335,10 +338,46 @@ class HealthResponse(BaseModel):
     # №12 (no12-02, §7.1/§7.2): агрегаты открытых предупреждений — {by_kind,
     # total} по общей таблице `warnings` (память и термины). Только SQL.
     warnings: dict[str, Any]
+    # LSBN-F-12 (arch §7.1): агрегаты decision-слота — {enabled, ok, answers,
+    # fallbacks, by_reason:{unavailable,unsupported,low_confidence}} из памяти
+    # процесса (вероятности наружу не отдаются — только журнал).
+    decision: dict[str, Any]
 
 
 def _services(request: Request) -> Services:
     return request.app.state.services  # type: ignore[no-any-return]
+
+
+def _decision_health(services: Services) -> tuple[bool | None, dict[str, Any]]:
+    """Снимок decision-слота для /health (LSBN-F-12, arch §7.1/§7.3).
+
+    `decision_ok` — умеет ли слот (None — выключен/не собран); `decision` —
+    агрегаты `{enabled, ok, answers, fallbacks, by_reason}` из памяти сервиса
+    (вероятности наружу не отдаются, только журнал). Модели не зовём: только
+    чтение счётчиков (`DecisionService.snapshot()`); пустой слот — форма
+    «выключен» с нулевыми счётчиками.
+    """
+    service = services.decision
+    if service is None:
+        return None, {
+            "enabled": False,
+            "ok": None,
+            "answers": 0,
+            "fallbacks": 0,
+            "by_reason": {
+                "unavailable": 0,
+                "unsupported": 0,
+                "low_confidence": 0,
+            },
+        }
+    snapshot = service.snapshot()
+    return snapshot["ok"], {
+        "enabled": snapshot["enabled"],
+        "ok": snapshot["ok"],
+        "answers": snapshot["answers"],
+        "fallbacks": snapshot["fallbacks"],
+        "by_reason": snapshot["by_reason"],
+    }
 
 
 def _skills_service(request: Request) -> SkillsService:
@@ -448,12 +487,17 @@ def build_rest_router(settings: Settings) -> APIRouter:
             warnings: dict[str, Any] = {"by_kind": {}, "total": 0}
         else:
             warnings = await asyncio.to_thread(services.warnings.counts)
+        # LSBN-F-12 (arch §7.1): `decision_ok` и блок `decision` — из памяти
+        # сервиса (§7.3): сколько решений принято, сколько переключений и по
+        # каким причинам. Модели не зовём (только снимок счётчиков).
+        decision_ok, decision = _decision_health(services)
         return HealthResponse(
             status="ok",
             version=__version__,
             embedding_ok=services.embedding.last_attempt_ok,
             summarizer_ok=services.summary.last_attempt_ok,
             judge_ok=services.judge.last_attempt_ok,
+            decision_ok=decision_ok,
             notes_count=counts["notes_count"],
             pending_vector=counts["pending_vector"],
             pending_summary=counts["pending_summary"],
@@ -461,6 +505,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
             slots=slots,
             areas=areas,
             warnings=warnings,
+            decision=decision,
         )
 
     @rest_router.post("/notes", status_code=201)

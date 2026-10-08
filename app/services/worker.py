@@ -132,6 +132,7 @@ from app.services import history
 from app.services import jobs
 from app.services.areas import AreaSpec, ALL_AREAS, enabled_areas
 from app.services.classifier import Classification, ClassificationError, Classifier
+from app.services.decision import SLOT_DECISION, DecisionService
 from app.services.dedup import DeduplicationService
 from app.services.embedding import Embedder, EmbeddingError
 # Back-off и его потолок перенесены в каркас джоб (lsb-0014, arch §3.3):
@@ -390,6 +391,7 @@ class BackgroundWorker:
         classifier: Classifier | None = None,
         promoter: PromotionService | None = None,
         terms: TermsService | None = None,
+        decision: DecisionService | None = None,
     ) -> None:
         self._settings = settings
         self._embedding = embedding
@@ -399,6 +401,10 @@ class BackgroundWorker:
         # косинус-кандидату (judge-петля, Этап 3.2). None — тестовый режим:
         # воркер сводит по косинус-фоллбеку Этапа 2.2.
         self._judge = judge
+        # LSBN-F-12: decision-слот (None — выключен, поведение v3.1.0). Разрыв
+        # decision живёт ВНУТРИ сервиса (§13.8), воркер его не ведёт — берём
+        # только снимок для `/health.slots.decision`.
+        self._decision = decision
         # Фоновый дедуп (Фаза 8, Этап 2): поиск косинус-кандидатов против
         # ранних заметок. DI для тестов.
         self._dedup = (
@@ -702,7 +708,47 @@ class BackgroundWorker:
             snapshot["last_budget_source"] = meta.budget_source if meta else None
             snapshot["last_had_thinking"] = meta.had_thinking if meta else None
             health[name] = snapshot
+        health[SLOT_DECISION] = self._decision_slot_health(attention)
         return health
+
+    def _decision_slot_health(self, attention: dict[str, int]) -> dict:
+        """Слот `decision` для `/health.slots` (LSBN-F-12, §7.1): только память.
+
+        Состояние берётся из `services.decision.snapshot()` (разрыв живёт в
+        сервисе, §13.8): `ok`, `last_outcome`, `paused_until`; `attention` — по
+        таблице заданий (своей очереди у decision нет — 0); четыре поля
+        диагностики последнего вызова — `None` (у decision нет `last_meta`).
+        Слот выключен/не собран — форма «выключен» (§7.1).
+        """
+        service = self._decision
+        if service is None:
+            return self._decision_disabled_stat()
+        snapshot = service.snapshot()
+        if not snapshot["enabled"]:
+            return self._decision_disabled_stat()
+        breaker = snapshot["breaker"]
+        return {
+            "ok": snapshot["ok"],
+            "last_outcome": breaker["last_outcome"],
+            "paused_until": breaker["paused_until"],
+            "attention": attention.get(SLOT_DECISION, 0),
+            "enabled": True,
+            "last_finish_reason": None,
+            "last_budget": None,
+            "last_budget_source": None,
+            "last_had_thinking": None,
+        }
+
+    @staticmethod
+    def _decision_disabled_stat() -> dict:
+        """Форма выключенного decision-слота в `/health.slots` (§7.1)."""
+        return {
+            "ok": None,
+            "last_outcome": None,
+            "paused_until": None,
+            "attention": 0,
+            "enabled": False,
+        }
 
     def _probe_slot(self, slot: str) -> str:
         """Один дешёвый пробный вызов слота (без генерации, №39 §6.2).

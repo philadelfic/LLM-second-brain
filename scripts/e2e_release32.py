@@ -109,7 +109,7 @@ HEALTH_LEGACY = ("status", "embedding_ok", "summarizer_ok", "judge_ok",
 HEALTH_QUEUES = ("vector", "summary", "judge", "areas", "links", "nodes",
                  "warnings", "terms-normalize")
 # №39: the slots the acceptance walks one by one (arch §13.13).
-SLOTS = ("embedding", "summary", "judge")
+SLOTS = ("embedding", "summary", "judge", "decision")
 # Queue that belongs to each slot for the "queue grows while the slot is down".
 SLOT_QUEUE = {"embedding": "vector", "summary": "summary", "judge": "judge"}
 
@@ -1114,7 +1114,7 @@ async def future_block_todo() -> None:
     manual("slots: the `decision` slot and its observability (LSBN-F-12)",
            "the budget/finish_reason part of this placeholder is claimed by "
            "`scenario_8_budget_raise_release()` (lsbdef0008-02); the decision "
-           "slot adds its own `scenario_*` here")
+           "slot is claimed by `scenario_9_decision_fallback()` (f12-03)")
     # TODO(3.2.0 future blocks) — memory handles surface:
     manual("memory handles: search/list/get contract, budgets, pagination",
            "add a `scenario_9_memory_handles()` here")
@@ -1358,6 +1358,208 @@ def _acceptance_lines(before: dict, after: dict, refusals: int,
     ]
 
 
+# ==== scenarios: 9. decision slot and the three fallback reasons ===============
+def _decision_stat(snapshot: dict) -> dict:
+    """`/health.decision` out of a `/health` snapshot (empty — not reported)."""
+    value = snapshot.get("decision")
+    return value if isinstance(value, dict) else {}
+
+
+def _decision_reached(rest: httpx2.AsyncClient, reason: str | None = None,
+                      ) -> Callable[[], Awaitable[tuple[bool, str]]]:
+    """Predicate: the decision slot took a decision (or counted a fallback reason)."""
+
+    async def predicate() -> tuple[bool, str]:
+        snapshot = await health_snapshot(rest)
+        stat = _decision_stat(snapshot)
+        by_reason = stat.get("by_reason") or {}
+        if reason is None:
+            taken = (stat.get("answers") or 0) >= 1 and not any(by_reason.values())
+            return bool(taken), f"decision: {stat}"
+        return bool(by_reason.get(reason, 0) >= 1), f"decision: {stat}"
+
+    return predicate
+
+
+def _avg_duration(text: str) -> float | None:
+    """Average `duration_ms` of the `decision_answer` log lines (None — no lines)."""
+    values: list[float] = []
+    for line in log_lines(text, "decision_answer", "duration_ms"):
+        try:
+            value = json.loads(line).get("duration_ms")
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+    return sum(values) / len(values) if values else None
+
+
+async def scenario_9_decision_fallback(c: Client, rest: httpx2.AsyncClient) -> None:
+    """LSBN-F-12 FR-7: the slot decides, then falls back over three reasons
+    (unsupported / unavailable / low_confidence) with /health honest at every step."""
+    scenario(9, "The decision slot decides, then falls back over three reasons "
+                "(unsupported / unavailable / low_confidence) without losing jobs")
+    hooks = ("decision_on_cmd", "decision_unsupported_cmd", "decision_off_cmd",
+             "decision_low_confidence_cmd")
+    if not all(CFG.get(name) for name in hooks):
+        skip("the decision slot and the three fallback reasons",
+             "contour hooks are required: " + ", ".join(hooks))
+        manual("scenario 9 (LSBN-F-12 FR-7.1/FR-7.2/FR-7.3)",
+               "point the hooks at contour restarts: LSB_DECISION_ON_CMD "
+               "(DECISION_ENABLED=true + a model able to /v1/systemone), "
+               "LSB_DECISION_UNSUPPORTED_CMD (a model without /v1/systemone), "
+               "LSB_DECISION_OFF_CMD (the slot off + DECISION_FALLBACK=false), "
+               "LSB_DECISION_LOW_CONFIDENCE_CMD (a threshold+zone catching the "
+               "probability), LSB_DECISION_RESTORE_CMD (the baseline back): "
+               "/health must stay honest at every step")
+        return
+
+    async def restart(hook: str, state: str) -> bool:
+        proc = await run_shell(CFG[hook])
+        check(f"the contour is switched: {state}", proc.returncode == 0,
+              f"rc={proc.returncode}")
+        if proc.returncode == 0:
+            teardown_note(f"the contour was switched by the scenario hook ({state})")
+        return proc.returncode == 0
+
+    numbers: dict[str, Any] = {}
+    try:
+        # 1. decision on: the slot takes decisions; the queue drains.
+        if not await restart("decision_on_cmd",
+                             "DECISION_ENABLED=true + a working decision model"):
+            return
+        await save_probe_note(c, RUN["note_decision"])
+        ok, detail = await wait_until(
+            _decision_reached(rest),
+            "[decision] the slot takes decisions (/health.decision.answers grows)",
+            timeout=min(CFG["wait_sec"], 240.0))
+        check("[decision] judge/classifier decide through the slot", ok, detail)
+        ok, detail = await wait_until(queue_drained(rest, "judge"),
+                                      "[decision] the judge queue drains with the slot on")
+        check("[decision] the judge queue drains while the slot decides", ok, detail)
+        numbers["before"] = _decision_stat(await health_snapshot(rest))
+        text = await log_text()
+        if text:
+            answered = log_lines(text, "decision_answer", "duration_ms")
+            check("[decision] the journal carries decision_answer (probability + "
+                  "duration_ms)", bool(answered), f"{len(answered)} line(s)")
+            numbers["duration_avg"] = _avg_duration(text)
+        else:
+            skip("[decision] the decision_answer event in the log",
+                 "LSB_LOGS_CMD is not set (no log hook on this contour)")
+
+        # 2. unsupported: the model has no /v1/systemone → generative path, no stuck queue.
+        if not await restart("decision_unsupported_cmd",
+                             "a model without /v1/systemone"):
+            return
+        await save_probe_note(c, RUN["note_decision_unsupported"])
+        ok, detail = await wait_until(
+            _decision_reached(rest, "unsupported"),
+            "[decision] reason=unsupported is counted", timeout=min(CFG["wait_sec"], 240.0))
+        check("[decision] unsupported fallback is visible in /health.decision.by_reason",
+              ok, detail)
+        ok, detail = await wait_until(queue_drained(rest, "judge"),
+                                      "[decision] the queue drains on the generative path")
+        check("[decision] the queue does not get stuck under unsupported", ok, detail)
+
+        # 3. unavailable (the slot off) with DECISION_FALLBACK=false: the job waits
+        #    by contract №39 and drains after the slot returns (no manual step).
+        if not await restart("decision_off_cmd",
+                             "the slot off + DECISION_FALLBACK=false"):
+            return
+        await save_probe_note(c, RUN["note_decision_unavailable"])
+        ok, detail = await wait_until(
+            queue_has_work(rest, "judge"),
+            "[decision] the job waits (contract №39, no lost work)",
+            timeout=min(CFG["wait_sec"], 240.0))
+        check("[decision] under unavailable + DECISION_FALLBACK=false the job waits",
+              ok, detail)
+        numbers["waiting"] = queue_numbers(await health_snapshot(rest), "judge")
+        if not await restart("decision_on_cmd", "the slot back to the baseline"):
+            return
+        ok, detail = await wait_until(queue_drained(rest, "judge"),
+                                      "[decision] the queue drains after the slot returns")
+        check("[decision] the waiting job drains after the slot returns", ok, detail)
+
+        # 4. low_confidence: the probability lands in the uncertainty band → the
+        #    generative path takes the decision.
+        if not await restart("decision_low_confidence_cmd",
+                             "a threshold+zone catching the probability"):
+            return
+        await save_probe_note(c, RUN["note_decision_low_confidence"])
+        ok, detail = await wait_until(
+            _decision_reached(rest, "low_confidence"),
+            "[decision] reason=low_confidence is counted",
+            timeout=min(CFG["wait_sec"], 240.0))
+        check("[decision] low_confidence fallback is visible in "
+              "/health.decision.by_reason", ok, detail)
+
+        # 5. /health is honest at every step: decision_ok and slots.decision present.
+        snapshot = await health_snapshot(rest)
+        check("[decision] /health answers with decision_ok and slots.decision",
+              snapshot.get("status") == "ok" and "decision_ok" in snapshot
+              and "decision" in (snapshot.get("slots") or {}),
+              f"status={snapshot.get('status')}")
+        numbers["after"] = _decision_stat(snapshot)
+        reasons = set((numbers["after"].get("by_reason") or {}))
+        check("[decision] exactly the three contract reasons are counted",
+              bool(reasons) and reasons <= {"unavailable", "unsupported", "low_confidence"},
+              f"{sorted(reasons)}")
+
+        # 6. the acceptance numbers (the double run replaces the block, not appends).
+        path = write_acceptance_block("f12-03", _decision_acceptance_lines(numbers))
+        info(f"[decision] the acceptance numbers are written to {path}")
+    finally:
+        if CFG.get("decision_restore_cmd"):
+            undo = await run_shell(CFG["decision_restore_cmd"])
+            if undo.returncode == 0:
+                teardown_note("the contour was restored to the baseline by the scenario hook")
+            else:
+                warn("[decision] the contour could NOT be restored — put the baseline "
+                     "slot config back by hand", f"rc={undo.returncode}")
+
+
+def _decision_acceptance_lines(numbers: dict) -> list[str]:
+    """Markdown block of the f12-03 acceptance: the decision share and the reasons."""
+    after = numbers.get("after") or {}
+    by_reason = after.get("by_reason") or {}
+
+    def share(count: int | None) -> str:
+        answers = after.get("answers") or 0
+        falls = after.get("fallbacks") or 0
+        total = answers + falls
+        if not total or count is None:
+            return "—"
+        return f"{count} ({count / total * 100:.0f}%)"
+
+    return [
+        "### Decision-слот: наблюдаемость и переключение (f12-03)",
+        "",
+        f"Контур: {CFG['base_url']} · прогон: {time.strftime('%Y-%m-%dT%H:%M:%S%z')} · "
+        f"тег проб: {RUN['tag']}",
+        "",
+        "| Метрика | значение |",
+        "|---|---|",
+        f"| Принятых решений decision (`/health.decision.answers`) | "
+        f"{after.get('answers')} |",
+        f"| Всего переключений (`/health.decision.fallbacks`) | "
+        f"{after.get('fallbacks')} |",
+        f"| Доля решений decision-слотом | {share(after.get('answers'))} |",
+        f"| Переключения `unavailable` | {share(by_reason.get('unavailable'))} |",
+        f"| Переключения `unsupported` | {share(by_reason.get('unsupported'))} |",
+        f"| Переключения `low_confidence` | {share(by_reason.get('low_confidence'))} |",
+        f"| Средняя длительность решения (`duration_ms`, журнал) | "
+        f"{numbers.get('duration_avg')} |",
+        f"| Ожидание очереди `judge` при `unavailable` + `DECISION_FALLBACK=false` | "
+        f"{numbers.get('waiting')} |",
+        "",
+        "Прогон идемпотентен: повторный запуск заменяет этот блок (маркеры "
+        "`<!-- f12-03:start -->`/`<!-- f12-03:end -->`), числа берутся из "
+        "`/health.decision` (счётчики памяти процесса), вероятности остаются "
+        "только в журнале (`decision_answer`) — в БД их нет (FR-3.3).",
+    ]
+
+
 # ==== run ======================================================================
 async def run_all() -> None:
     async with AsyncExitStack() as stack:
@@ -1383,6 +1585,7 @@ async def run_all() -> None:
             await scenario_5_restart_inside_outage(rest)
             await scenario_6_regression()
             await scenario_8_budget_raise_release(c, rest)
+            await scenario_9_decision_fallback(c, rest)
             await future_block_todo()
             close_scenario()
         finally:
@@ -1504,6 +1707,27 @@ async def main() -> int:
                         default=os.environ.get("LSB_BUDGET_FIX_CMD", ""),
                         help="shell command restarting the contour with the raised "
                              "budget / a working slot (scenario 8)")
+    parser.add_argument("--decision-on-cmd",
+                        default=os.environ.get("LSB_DECISION_ON_CMD", ""),
+                        help="shell command restarting the contour with "
+                             "DECISION_ENABLED=true and a working decision model "
+                             "(scenario 9)")
+    parser.add_argument("--decision-unsupported-cmd",
+                        default=os.environ.get("LSB_DECISION_UNSUPPORTED_CMD", ""),
+                        help="shell command restarting the contour with a decision "
+                             "model without /v1/systemone (scenario 9)")
+    parser.add_argument("--decision-off-cmd",
+                        default=os.environ.get("LSB_DECISION_OFF_CMD", ""),
+                        help="shell command restarting the contour with the slot off "
+                             "and DECISION_FALLBACK=false (scenario 9)")
+    parser.add_argument("--decision-low-confidence-cmd",
+                        default=os.environ.get("LSB_DECISION_LOW_CONFIDENCE_CMD", ""),
+                        help="shell command restarting the contour with a "
+                             "threshold+zone catching the probability (scenario 9)")
+    parser.add_argument("--decision-restore-cmd",
+                        default=os.environ.get("LSB_DECISION_RESTORE_CMD", ""),
+                        help="shell command restoring the baseline slot config "
+                             "(scenario 9 teardown)")
     parser.add_argument("--expect-version", default=os.environ.get("LSB_EXPECT_VERSION", RELEASE),
                         help="release tag /health.version is compared with")
     parser.add_argument("--run-regression", action="store_true",
@@ -1554,6 +1778,11 @@ async def main() -> int:
         "offcontract_fix_cmd": args.offcontract_fix_cmd,
         "budget_break_cmd": args.budget_break_cmd,
         "budget_fix_cmd": args.budget_fix_cmd,
+        "decision_on_cmd": args.decision_on_cmd,
+        "decision_unsupported_cmd": args.decision_unsupported_cmd,
+        "decision_off_cmd": args.decision_off_cmd,
+        "decision_low_confidence_cmd": args.decision_low_confidence_cmd,
+        "decision_restore_cmd": args.decision_restore_cmd,
         "expect_version": args.expect_version,
         "run_regression": args.run_regression,
         "python": args.python,
@@ -1571,6 +1800,10 @@ async def main() -> int:
         "note_outage_judge": f"{tag} outage probe judge",
         "note_budget_break": f"{tag} budget probe note one",
         "note_budget_break_2": f"{tag} budget probe note two",
+        "note_decision": f"{tag} decision probe note",
+        "note_decision_unsupported": f"{tag} decision unsupported probe",
+        "note_decision_unavailable": f"{tag} decision unavailable probe",
+        "note_decision_low_confidence": f"{tag} decision low-confidence probe",
         "notes": [],
     })
 

@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from app.services.llm_client import ChatMeta, ChatResult
 from app.services.slot_outcome import SlotOutcome
 
-SLOTS = ("embedding", "summary", "judge")
+SLOTS = ("embedding", "summary", "judge", "decision")
 
 
 def make_meta(**over: object) -> ChatMeta:

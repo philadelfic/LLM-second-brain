@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import logging
 
+import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from app.config import get_settings
 from app.services.decision import SLOT_DECISION
@@ -29,6 +31,8 @@ from test_judge_decision import (
     JUDGE_QUESTION,
     TEXT_CANDIDATE,
     TEXT_NEW,
+    chat_body,
+    decision_settings,
     make_judge,
     noul,
 )
@@ -116,3 +120,80 @@ def test_no_probabilities_in_db(monkeypatch, caplog) -> None:
     names = {f"{table}.{column}" for table, columns in after.items() for column in columns}
     assert not [name for name in names if "decision" in name.lower()]
     assert not [name for name in names if "probab" in name.lower()]
+
+
+# --- контракт событий (f12-03: наблюдаемость и тесты) -------------------------
+
+
+def test_decision_check_fields(monkeypatch, caplog) -> None:
+    """Событие стартовой проверки `decision_check` несёт `model` и `result`."""
+    from app.main import create_app
+    from app.services.llm_client import LLMClient
+
+    monkeypatch.setattr(LLMClient, "check_decision", lambda self: "unsupported")
+    settings = decision_settings(monkeypatch)
+    app = create_app(settings)
+    with caplog.at_level(logging.WARNING, logger="app"):
+        with TestClient(app):
+            pass
+    records = events(caplog, "decision_check")
+    assert records, "ожидалось событие decision_check"
+    assert records[0].slot == SLOT_DECISION
+    assert records[0].model == "decision-test"
+    assert records[0].result == "unsupported"
+
+
+def test_decision_answer_fields(monkeypatch, caplog) -> None:
+    """`decision_answer`: operation/threshold/duration_ms/answers; вероятности — там."""
+    settings = decision_settings(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="app"):
+        run_judge_decision(settings, caplog)
+    (record,) = events(caplog, "decision_answer")
+    assert record.operation == "judge"
+    assert record.threshold == pytest.approx(0.5)
+    assert isinstance(record.duration_ms, int)
+    assert record.answers[JUDGE_QUESTION]["probability"] == pytest.approx(0.95)
+
+
+def test_decision_fallback_reason_enum(monkeypatch, caplog) -> None:
+    """`reason` переключения — ровно три значения; иных нет (§13.6/FR-4.2)."""
+    settings = decision_settings(monkeypatch)
+    allowed = {"unavailable", "unsupported", "low_confidence"}
+    with caplog.at_level(logging.INFO, logger="app"):
+        judge, decider, decision, generative = make_judge(
+            settings, [noul(0.5)], [chat_body("**DUPLICATE**")]
+        )
+        judge.judge(TEXT_NEW, TEXT_CANDIDATE)  # low_confidence
+        judge_bad, _, _, _ = make_judge(
+            settings,
+            [httpx.Response(401, json={"error": "unauthorized"})],
+            [chat_body()],
+        )
+        judge_bad.judge(TEXT_NEW, TEXT_CANDIDATE)  # unavailable
+    reasons = {record.reason for record in events(caplog, "decision_fallback")}
+    assert reasons and reasons <= allowed
+    assert set(decider.snapshot()["by_reason"]) == allowed
+
+
+def test_decision_paused_events(monkeypatch, caplog) -> None:
+    """Разрыв decision пишет `slot_paused`/`slot_probe`/`slot_resumed` (блок 2)."""
+    settings = decision_settings(monkeypatch)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr("app.services.slot_breaker.time.time", lambda: clock["t"])
+    judge, decider, decision, generative = make_judge(
+        settings, [httpx.Response(401, text="nope"), noul(0.95)], [chat_body()]
+    )
+    with caplog.at_level(logging.INFO, logger="app"):
+        judge.judge(TEXT_NEW, TEXT_CANDIDATE)  # 401 → auth → разрыв открыт
+        paused = events(caplog, "slot_paused")
+        assert paused and paused[0].slot == SLOT_DECISION
+        assert paused[0].job == "judge"
+        assert paused[0].outcome == "auth"
+        # Пауза истекла: стук проходит, разрыв снимается.
+        clock["t"] += settings.slot_pause_sec + 1
+        judge.judge(TEXT_NEW, TEXT_CANDIDATE)
+    probes = events(caplog, "slot_probe")
+    resumed = events(caplog, "slot_resumed")
+    assert probes and probes[0].slot == SLOT_DECISION
+    assert probes[0].result == "ok"
+    assert resumed and resumed[0].slot == SLOT_DECISION
