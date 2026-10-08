@@ -287,6 +287,10 @@ def _skills_announce(services: Services) -> str:
         # DI-сборки тестов без области навыков (Services.skills опционален).
         return ""
     settings = skills.settings
+    if not settings.area_skills_enabled:
+        # №40 (FR-2.4): анонс гасится ПО ФЛАГУ области (а не по None-сервису) —
+        # выключенная область не упоминается в текстах, которые видит агент.
+        return ""
     try:
         items = skills.announce_items()
     except Exception:
@@ -1109,8 +1113,13 @@ def _compact_history_get(result: dict[str, Any]) -> dict[str, Any]:
 
 def build_mcp(settings: Settings, services: Services) -> MCPServer:
     """Собрать MCP-сервер: инструкции (§5.1, база + карта неймспейсов) +
-    23 инструмента (8 `memory_*` + 5 `skills_*` + 5 `user_*` + 3 `terms_*`
+    до 23 инструментов (8 `memory_*` + 5 `skills_*` + 5 `user_*` + 3 `terms_*`
     + 2 `history_*`) над сервисами.
+
+    Блоки ручек области (skills/user/terms) регистрируются только при её
+    включённом флаге `AREA_*_ENABLED` (№40, FR-2.1): выключенная область в
+    поверхность не попадает вовсе, поэтому число инструментов зависит от env.
+    Общие `memory_*`/`history_*` и ядровая память гейту не подлежат.
 
     Сигнатуры и ограничения параметров — контракты REQUIREMENTS §5.1/§5.7;
     значения по умолчанию (DEFAULT_TOP_K, DEFAULT_LIST_LIMIT) — из env.
@@ -1723,199 +1732,200 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
     # сервисе (её обязан звать и REST POST /skills), транспорт лишь отдаёт
     # `{created: False, hint}` как есть: `_compact_skill_save`.
 
-    @mcp.tool(name="skills_search", description=TOOL_DESCRIPTIONS["skills_search"])
-    async def skills_search(
-        query: Annotated[
-            str,
-            Field(
-                description="Task wording: what you are about to do",
-                min_length=1,
-                max_length=settings.max_query_chars,
-            ),
-        ],
-        top_k: Annotated[
-            int,
-            Field(description="Number of results", ge=1, le=20),
-        ] = settings.default_top_k,
-    ) -> dict[str, Any]:
-        started = time.perf_counter()
-        try:
-            result = await asyncio.to_thread(services.skills.search, query, top_k)
-        except SkillValidationError as exc:
-            # Мягкий отказ (fail + hint): запрос/top_k вне домена области.
+    if settings.area_skills_enabled:
+        @mcp.tool(name="skills_search", description=TOOL_DESCRIPTIONS["skills_search"])
+        async def skills_search(
+            query: Annotated[
+                str,
+                Field(
+                    description="Task wording: what you are about to do",
+                    min_length=1,
+                    max_length=settings.max_query_chars,
+                ),
+            ],
+            top_k: Annotated[
+                int,
+                Field(description="Number of results", ge=1, le=20),
+            ] = settings.default_top_k,
+        ) -> dict[str, Any]:
+            started = time.perf_counter()
+            try:
+                result = await asyncio.to_thread(services.skills.search, query, top_k)
+            except SkillValidationError as exc:
+                # Мягкий отказ (fail + hint): запрос/top_k вне домена области.
+                log_tool_call(
+                    "skills_search",
+                    started,
+                    failed=True,
+                    reason=str(exc),
+                    query=preview(query),
+                )
+                return {"results": [], "hint": str(exc)}
+            # Пустой результат — валидный исход пробы (hint канона в выдаче),
+            # не fail: событие несёт число хитов и признак FTS-only деградации.
             log_tool_call(
                 "skills_search",
                 started,
-                failed=True,
-                reason=str(exc),
+                results=len(result["results"]),
+                top_k=top_k,
                 query=preview(query),
+                fts_only=bool(result.get("warning")),
             )
-            return {"results": [], "hint": str(exc)}
-        # Пустой результат — валидный исход пробы (hint канона в выдаче),
-        # не fail: событие несёт число хитов и признак FTS-only деградации.
-        log_tool_call(
-            "skills_search",
-            started,
-            results=len(result["results"]),
-            top_k=top_k,
-            query=preview(query),
-            fts_only=bool(result.get("warning")),
-        )
-        return _compact_skill_search(result)
+            return _compact_skill_search(result)
 
-    @mcp.tool(name="skills_list", description=TOOL_DESCRIPTIONS["skills_list"])
-    async def skills_list(
-        limit: Annotated[
-            int,
-            # Потолок проверяет СЕРВИС — как у memory_list (lsb-0013-02).
-            Field(description="Page size (1..20)", ge=1),
-        ] = settings.default_list_limit,
-        offset: Annotated[
-            int,
-            Field(description="Page offset", ge=0),
-        ] = 0,
-    ) -> dict[str, Any]:
-        # lsb-0013-02 (FR-1.3): параметры страницы — дефолт/потолок и поведение
-        # те же, что у memory_list (один сервисный контракт листинга).
-        started = time.perf_counter()
-        try:
-            result = await asyncio.to_thread(
-                services.skills.list,
-                limit,
-                offset,
-                max_limit=settings.list_max_limit_mcp,
-            )
-        except SkillValidationError as exc:
-            # Мягкий отказ: лимит вне потолка поверхности — единый текст сервиса.
+        @mcp.tool(name="skills_list", description=TOOL_DESCRIPTIONS["skills_list"])
+        async def skills_list(
+            limit: Annotated[
+                int,
+                # Потолок проверяет СЕРВИС — как у memory_list (lsb-0013-02).
+                Field(description="Page size (1..20)", ge=1),
+            ] = settings.default_list_limit,
+            offset: Annotated[
+                int,
+                Field(description="Page offset", ge=0),
+            ] = 0,
+        ) -> dict[str, Any]:
+            # lsb-0013-02 (FR-1.3): параметры страницы — дефолт/потолок и поведение
+            # те же, что у memory_list (один сервисный контракт листинга).
+            started = time.perf_counter()
+            try:
+                result = await asyncio.to_thread(
+                    services.skills.list,
+                    limit,
+                    offset,
+                    max_limit=settings.list_max_limit_mcp,
+                )
+            except SkillValidationError as exc:
+                # Мягкий отказ: лимит вне потолка поверхности — единый текст сервиса.
+                log_tool_call(
+                    "skills_list",
+                    started,
+                    failed=True,
+                    reason=str(exc),
+                    limit=limit,
+                    offset=offset,
+                )
+                return {"items": [], "total": 0, "hint": str(exc)}
             log_tool_call(
                 "skills_list",
                 started,
-                failed=True,
-                reason=str(exc),
+                results=len(result["items"]),
                 limit=limit,
                 offset=offset,
             )
-            return {"items": [], "total": 0, "hint": str(exc)}
-        log_tool_call(
-            "skills_list",
-            started,
-            results=len(result["items"]),
-            limit=limit,
-            offset=offset,
-        )
-        return _compact_skill_list(result)
+            return _compact_skill_list(result)
 
-    @mcp.tool(name="skills_get", description=TOOL_DESCRIPTIONS["skills_get"])
-    async def skills_get(
-        id: Annotated[int, Field(description="Skill id")],
-    ) -> dict[str, Any]:
-        started = time.perf_counter()
-        result = await asyncio.to_thread(services.skills.get, id)
-        if "hint" in result:
-            # Мягкий отказ: навыка нет (мягко — возможно, удалён).
-            log_tool_call(
-                "skills_get", started, failed=True, reason=result["hint"], id=id
-            )
-        else:
-            log_tool_call("skills_get", started, results=1, id=id)
-        return _compact_skill_get(result)
+        @mcp.tool(name="skills_get", description=TOOL_DESCRIPTIONS["skills_get"])
+        async def skills_get(
+            id: Annotated[int, Field(description="Skill id")],
+        ) -> dict[str, Any]:
+            started = time.perf_counter()
+            result = await asyncio.to_thread(services.skills.get, id)
+            if "hint" in result:
+                # Мягкий отказ: навыка нет (мягко — возможно, удалён).
+                log_tool_call(
+                    "skills_get", started, failed=True, reason=result["hint"], id=id
+                )
+            else:
+                log_tool_call("skills_get", started, results=1, id=id)
+            return _compact_skill_get(result)
 
-    @mcp.tool(name="skills_save", description=TOOL_DESCRIPTIONS["skills_save"])
-    async def skills_save(
-        name: Annotated[
-            str,
-            Field(description="Skill name: ≤65 characters (≤5 words recommended)"),
-        ],
-        description: Annotated[
-            str,
-            Field(description="What it does: ≤250 characters"),
-        ],
-        steps: Annotated[
-            str,
-            Field(description="The order: what after what: ≤500 characters"),
-        ],
-        text: Annotated[
-            str,
-            Field(description="What exactly each step does: ≤4000 characters"),
-        ],
-        id: Annotated[
-            int | None,
-            Field(description="Skill id to update; omitted — create a new skill"),
-        ] = None,
-        example: Annotated[
-            str | None,
-            Field(description="Optional example: ≤1000 characters"),
-        ] = None,
-        extra: Annotated[
-            dict[str, str] | None,
-            Field(
-                description="Optional class fields (trigger, mode, preconditions, "
-                "fallbacks, invariant, exceptions, guardrails, references, "
-                "output_contract, behavior_contract; each ≤500 characters, "
-                "together ≤2000) — only when this skill class needs them",
-            ),
-        ] = None,
-    ) -> dict[str, Any]:
-        # Лимиты формы валидирует СЕРВИС (не схема — как title у заметок):
-        # нарушение → SkillValidationError с дословным hint канона §3.8.
-        # Приватность (NFR-4): в лог идут длины, не содержимое.
-        started = time.perf_counter()
-        sizes = {
-            "name_chars": len(name),
-            "description_chars": len(description),
-            "steps_chars": len(steps),
-            "text_chars": len(text),
-        }
-        try:
-            result = await asyncio.to_thread(
-                services.skills.save,
-                id=id,
-                name=name,
-                description=description,
-                steps=steps,
-                text=text,
-                example=example,
-                extra=extra,
-            )
-        except SkillValidationError as exc:
-            log_tool_call(
-                "skills_save", started, failed=True, reason=str(exc), id=id, **sizes
-            )
-            if id is None:
-                return {"created": False, "hint": str(exc)}
-            return {"id": id, "updated": False, "hint": str(exc)}
-        if result.get("created") or result.get("updated"):
-            log_tool_call(
-                "skills_save",
-                started,
-                results=1,
-                id=result["id"],
-                version=result["version"],
-                **sizes,
-            )
-        else:
-            # Мягкий отказ сервиса: дубль (антисинонимия) или правка
-            # несуществующего id — навык не записан, hint ведёт к решению.
-            log_tool_call(
-                "skills_save", started, failed=True, reason=result["hint"],
-                id=id, **sizes,
-            )
-        return _compact_skill_save(result)
+        @mcp.tool(name="skills_save", description=TOOL_DESCRIPTIONS["skills_save"])
+        async def skills_save(
+            name: Annotated[
+                str,
+                Field(description="Skill name: ≤65 characters (≤5 words recommended)"),
+            ],
+            description: Annotated[
+                str,
+                Field(description="What it does: ≤250 characters"),
+            ],
+            steps: Annotated[
+                str,
+                Field(description="The order: what after what: ≤500 characters"),
+            ],
+            text: Annotated[
+                str,
+                Field(description="What exactly each step does: ≤4000 characters"),
+            ],
+            id: Annotated[
+                int | None,
+                Field(description="Skill id to update; omitted — create a new skill"),
+            ] = None,
+            example: Annotated[
+                str | None,
+                Field(description="Optional example: ≤1000 characters"),
+            ] = None,
+            extra: Annotated[
+                dict[str, str] | None,
+                Field(
+                    description="Optional class fields (trigger, mode, preconditions, "
+                    "fallbacks, invariant, exceptions, guardrails, references, "
+                    "output_contract, behavior_contract; each ≤500 characters, "
+                    "together ≤2000) — only when this skill class needs them",
+                ),
+            ] = None,
+        ) -> dict[str, Any]:
+            # Лимиты формы валидирует СЕРВИС (не схема — как title у заметок):
+            # нарушение → SkillValidationError с дословным hint канона §3.8.
+            # Приватность (NFR-4): в лог идут длины, не содержимое.
+            started = time.perf_counter()
+            sizes = {
+                "name_chars": len(name),
+                "description_chars": len(description),
+                "steps_chars": len(steps),
+                "text_chars": len(text),
+            }
+            try:
+                result = await asyncio.to_thread(
+                    services.skills.save,
+                    id=id,
+                    name=name,
+                    description=description,
+                    steps=steps,
+                    text=text,
+                    example=example,
+                    extra=extra,
+                )
+            except SkillValidationError as exc:
+                log_tool_call(
+                    "skills_save", started, failed=True, reason=str(exc), id=id, **sizes
+                )
+                if id is None:
+                    return {"created": False, "hint": str(exc)}
+                return {"id": id, "updated": False, "hint": str(exc)}
+            if result.get("created") or result.get("updated"):
+                log_tool_call(
+                    "skills_save",
+                    started,
+                    results=1,
+                    id=result["id"],
+                    version=result["version"],
+                    **sizes,
+                )
+            else:
+                # Мягкий отказ сервиса: дубль (антисинонимия) или правка
+                # несуществующего id — навык не записан, hint ведёт к решению.
+                log_tool_call(
+                    "skills_save", started, failed=True, reason=result["hint"],
+                    id=id, **sizes,
+                )
+            return _compact_skill_save(result)
 
-    @mcp.tool(name="skills_delete", description=TOOL_DESCRIPTIONS["skills_delete"])
-    async def skills_delete(
-        id: Annotated[int, Field(description="Skill id")],
-    ) -> dict[str, Any]:
-        started = time.perf_counter()
-        result = await asyncio.to_thread(services.skills.delete, id)
-        if result.get("deleted"):
-            log_tool_call("skills_delete", started, id=id, deleted=True)
-        else:
-            # Повторный/несуществующий id — мягкий отказ с hint канона.
-            log_tool_call(
-                "skills_delete", started, failed=True, reason=result["hint"], id=id
-            )
-        return _compact_skill_delete(result)
+        @mcp.tool(name="skills_delete", description=TOOL_DESCRIPTIONS["skills_delete"])
+        async def skills_delete(
+            id: Annotated[int, Field(description="Skill id")],
+        ) -> dict[str, Any]:
+            started = time.perf_counter()
+            result = await asyncio.to_thread(services.skills.delete, id)
+            if result.get("deleted"):
+                log_tool_call("skills_delete", started, id=id, deleted=True)
+            else:
+                # Повторный/несуществующий id — мягкий отказ с hint канона.
+                log_tool_call(
+                    "skills_delete", started, failed=True, reason=result["hint"], id=id
+                )
+            return _compact_skill_delete(result)
 
     # --- область «user» (lsb-0009-02, arch §3.3/§3.7) ----------------------
     # Тонкие обёртки над `UserFactsService` (один код с REST-зеркалами
@@ -1926,158 +1936,159 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
     # вместо схемного отказа. Инъекции при init НЕТ: блока «user» в инструкциях
     # не появляется (FR-6, arch §2) — гарантированный канал лишь описания.
 
-    @mcp.tool(name="user_search", description=TOOL_DESCRIPTIONS["user_search"])
-    async def user_search(
-        query: Annotated[
-            str,
-            Field(
-                description="Topic wording: the user's preferences or "
-                "arrangements the answer depends on",
-                min_length=1,
-                max_length=settings.max_query_chars,
-            ),
-        ],
-        top_k: Annotated[
-            int,
-            Field(description="Number of results", ge=1, le=20),
-        ] = settings.default_top_k,
-    ) -> dict[str, Any]:
-        started = time.perf_counter()
-        try:
-            result = await asyncio.to_thread(services.user_facts.search, query, top_k)
-        except UserFactValidationError as exc:
-            # Мягкий отказ (fail + hint): запрос/top_k вне домена области.
+    if settings.area_user_facts_enabled:
+        @mcp.tool(name="user_search", description=TOOL_DESCRIPTIONS["user_search"])
+        async def user_search(
+            query: Annotated[
+                str,
+                Field(
+                    description="Topic wording: the user's preferences or "
+                    "arrangements the answer depends on",
+                    min_length=1,
+                    max_length=settings.max_query_chars,
+                ),
+            ],
+            top_k: Annotated[
+                int,
+                Field(description="Number of results", ge=1, le=20),
+            ] = settings.default_top_k,
+        ) -> dict[str, Any]:
+            started = time.perf_counter()
+            try:
+                result = await asyncio.to_thread(services.user_facts.search, query, top_k)
+            except UserFactValidationError as exc:
+                # Мягкий отказ (fail + hint): запрос/top_k вне домена области.
+                log_tool_call(
+                    "user_search",
+                    started,
+                    failed=True,
+                    reason=str(exc),
+                    query=preview(query),
+                )
+                return {"results": [], "hint": str(exc)}
+            # Пустой результат — валидный исход пробы (hint канона в выдаче),
+            # не fail: событие несёт число хитов и признак FTS-only деградации.
             log_tool_call(
                 "user_search",
                 started,
-                failed=True,
-                reason=str(exc),
+                results=len(result["results"]),
+                top_k=top_k,
                 query=preview(query),
+                fts_only=bool(result.get("warning")),
             )
-            return {"results": [], "hint": str(exc)}
-        # Пустой результат — валидный исход пробы (hint канона в выдаче),
-        # не fail: событие несёт число хитов и признак FTS-only деградации.
-        log_tool_call(
-            "user_search",
-            started,
-            results=len(result["results"]),
-            top_k=top_k,
-            query=preview(query),
-            fts_only=bool(result.get("warning")),
-        )
-        return _compact_user_search(result)
+            return _compact_user_search(result)
 
-    @mcp.tool(name="user_save", description=TOOL_DESCRIPTIONS["user_save"])
-    async def user_save(
-        name: Annotated[
-            str,
-            Field(description="Fact name: ≤5 words (like a note title)"),
-        ],
-        body: Annotated[
-            str,
-            Field(description="Fact body: ≤1200 characters; one fact per record"),
-        ],
-    ) -> dict[str, Any]:
-        # Лимиты формы валидирует СЕРВИС (не схема — как title у заметок):
-        # нарушение → UserFactValidationError с дословным hint канона §3.7.
-        # Приватность (NFR-4): в лог идут длины, не содержимое.
-        started = time.perf_counter()
-        sizes = {"name_chars": len(name), "body_chars": len(body)}
-        try:
-            result = await asyncio.to_thread(
-                services.user_facts.save, name=name, body=body
-            )
-        except UserFactValidationError as exc:
-            log_tool_call(
-                "user_save", started, failed=True, reason=str(exc), **sizes
-            )
-            return {"stored": False, "hint": str(exc)}
-        if result.get("stored"):
-            log_tool_call(
-                "user_save", started, results=1, id=result["id"], **sizes
-            )
-        else:
-            # Мягкий отказ дедупа (сильное совпадение): записи нет, hint ведёт
-            # к правке существующего факта либо к отдельной записи.
-            log_tool_call(
-                "user_save", started, failed=True, reason=result["hint"], **sizes
-            )
-        return _compact_user_save(result)
+        @mcp.tool(name="user_save", description=TOOL_DESCRIPTIONS["user_save"])
+        async def user_save(
+            name: Annotated[
+                str,
+                Field(description="Fact name: ≤5 words (like a note title)"),
+            ],
+            body: Annotated[
+                str,
+                Field(description="Fact body: ≤1200 characters; one fact per record"),
+            ],
+        ) -> dict[str, Any]:
+            # Лимиты формы валидирует СЕРВИС (не схема — как title у заметок):
+            # нарушение → UserFactValidationError с дословным hint канона §3.7.
+            # Приватность (NFR-4): в лог идут длины, не содержимое.
+            started = time.perf_counter()
+            sizes = {"name_chars": len(name), "body_chars": len(body)}
+            try:
+                result = await asyncio.to_thread(
+                    services.user_facts.save, name=name, body=body
+                )
+            except UserFactValidationError as exc:
+                log_tool_call(
+                    "user_save", started, failed=True, reason=str(exc), **sizes
+                )
+                return {"stored": False, "hint": str(exc)}
+            if result.get("stored"):
+                log_tool_call(
+                    "user_save", started, results=1, id=result["id"], **sizes
+                )
+            else:
+                # Мягкий отказ дедупа (сильное совпадение): записи нет, hint ведёт
+                # к правке существующего факта либо к отдельной записи.
+                log_tool_call(
+                    "user_save", started, failed=True, reason=result["hint"], **sizes
+                )
+            return _compact_user_save(result)
 
-    @mcp.tool(name="user_update", description=TOOL_DESCRIPTIONS["user_update"])
-    async def user_update(
-        id: Annotated[int, Field(description="Fact id")],
-        name: Annotated[
-            str | None,
-            Field(
-                description="New name: ≤5 words (like a note title); not passed "
-                "— the current one stays",
-                json_schema_extra={"default": None},
-            ),
-        ] = _UNSET_NAME,
-        body: Annotated[
-            str | None,
-            Field(
-                description="New body: ≤1200 characters; not passed — the "
-                "current one stays",
-                json_schema_extra={"default": None},
-            ),
-        ] = _UNSET_BODY,
-    ) -> dict[str, Any]:
-        # Сентинелы «не передано» (прецедент lsb-0004/`memory_update`): дефолты
-        # параметров — JSON-серизуемые строки; схема показывает null, поэтому
-        # модель либо не передаёт поле, либо передаёт значение (null в
-        # обязательном поле — мягкий отказ сервиса).
-        started = time.perf_counter()
-        try:
-            result = await asyncio.to_thread(
-                services.user_facts.update, id, name=name, body=body
-            )
-        except UserFactValidationError as exc:
-            log_tool_call(
-                "user_update", started, failed=True, reason=str(exc), id=id
-            )
-            return {"id": id, "changed": False, "hint": str(exc)}
-        if "hint" in result:
-            # Не найден/удалён — мягкий отказ с hint канона §3.7.
-            log_tool_call(
-                "user_update", started, failed=True, reason=result["hint"], id=id
-            )
-        else:
-            log_tool_call(
-                "user_update", started, id=id, changed=bool(result.get("changed"))
-            )
-        return _compact_user_update(result)
+        @mcp.tool(name="user_update", description=TOOL_DESCRIPTIONS["user_update"])
+        async def user_update(
+            id: Annotated[int, Field(description="Fact id")],
+            name: Annotated[
+                str | None,
+                Field(
+                    description="New name: ≤5 words (like a note title); not passed "
+                    "— the current one stays",
+                    json_schema_extra={"default": None},
+                ),
+            ] = _UNSET_NAME,
+            body: Annotated[
+                str | None,
+                Field(
+                    description="New body: ≤1200 characters; not passed — the "
+                    "current one stays",
+                    json_schema_extra={"default": None},
+                ),
+            ] = _UNSET_BODY,
+        ) -> dict[str, Any]:
+            # Сентинелы «не передано» (прецедент lsb-0004/`memory_update`): дефолты
+            # параметров — JSON-серизуемые строки; схема показывает null, поэтому
+            # модель либо не передаёт поле, либо передаёт значение (null в
+            # обязательном поле — мягкий отказ сервиса).
+            started = time.perf_counter()
+            try:
+                result = await asyncio.to_thread(
+                    services.user_facts.update, id, name=name, body=body
+                )
+            except UserFactValidationError as exc:
+                log_tool_call(
+                    "user_update", started, failed=True, reason=str(exc), id=id
+                )
+                return {"id": id, "changed": False, "hint": str(exc)}
+            if "hint" in result:
+                # Не найден/удалён — мягкий отказ с hint канона §3.7.
+                log_tool_call(
+                    "user_update", started, failed=True, reason=result["hint"], id=id
+                )
+            else:
+                log_tool_call(
+                    "user_update", started, id=id, changed=bool(result.get("changed"))
+                )
+            return _compact_user_update(result)
 
-    @mcp.tool(name="user_delete", description=TOOL_DESCRIPTIONS["user_delete"])
-    async def user_delete(
-        id: Annotated[int, Field(description="Fact id")],
-    ) -> dict[str, Any]:
-        started = time.perf_counter()
-        result = await asyncio.to_thread(services.user_facts.delete, id)
-        if result.get("deleted"):
-            log_tool_call("user_delete", started, id=id, deleted=True)
-        else:
-            # Повторный/несуществующий id — мягкий отказ с hint канона §3.7.
-            log_tool_call(
-                "user_delete", started, failed=True, reason=result["hint"], id=id
-            )
-        return _compact_user_delete(result)
+        @mcp.tool(name="user_delete", description=TOOL_DESCRIPTIONS["user_delete"])
+        async def user_delete(
+            id: Annotated[int, Field(description="Fact id")],
+        ) -> dict[str, Any]:
+            started = time.perf_counter()
+            result = await asyncio.to_thread(services.user_facts.delete, id)
+            if result.get("deleted"):
+                log_tool_call("user_delete", started, id=id, deleted=True)
+            else:
+                # Повторный/несуществующий id — мягкий отказ с hint канона §3.7.
+                log_tool_call(
+                    "user_delete", started, failed=True, reason=result["hint"], id=id
+                )
+            return _compact_user_delete(result)
 
-    @mcp.tool(name="user_get", description=TOOL_DESCRIPTIONS["user_get"])
-    async def user_get(
-        id: Annotated[int, Field(description="Fact id")],
-    ) -> dict[str, Any]:
-        started = time.perf_counter()
-        result = await asyncio.to_thread(services.user_facts.get, id)
-        if "hint" in result:
-            # Мягкий отказ: факта нет (мягко — возможно, удалён).
-            log_tool_call(
-                "user_get", started, failed=True, reason=result["hint"], id=id
-            )
-        else:
-            log_tool_call("user_get", started, results=1, id=id)
-        return _compact_user_get(result)
+        @mcp.tool(name="user_get", description=TOOL_DESCRIPTIONS["user_get"])
+        async def user_get(
+            id: Annotated[int, Field(description="Fact id")],
+        ) -> dict[str, Any]:
+            started = time.perf_counter()
+            result = await asyncio.to_thread(services.user_facts.get, id)
+            if "hint" in result:
+                # Мягкий отказ: факта нет (мягко — возможно, удалён).
+                log_tool_call(
+                    "user_get", started, failed=True, reason=result["hint"], id=id
+                )
+            else:
+                log_tool_call("user_get", started, results=1, id=id)
+            return _compact_user_get(result)
 
     # --- область terms (lsb-0008-02, arch §3.4–3.5) -------------------------
     # Тонкие обёртки над `TermsService` (один код с REST-зеркалами §3.6):
@@ -2087,108 +2098,109 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
     # контексту разговора живут в описаниях инструментов. Инъекции при init
     # НЕТ: блока «terms» в инструкциях не появляется (arch §2).
 
-    @mcp.tool(name="terms_search", description=TOOL_DESCRIPTIONS["terms_search"])
-    async def terms_search(
-        query: Annotated[
-            str,
-            Field(
-                description="Term or abbreviation to look up; all senses are "
-                "returned",
-                min_length=1,
-                max_length=settings.max_query_chars,
-            ),
-        ],
-        top_k: Annotated[
-            int,
-            Field(description="Number of results", ge=1, le=20),
-        ] = settings.default_top_k,
-    ) -> dict[str, Any]:
-        started = time.perf_counter()
-        try:
-            result = await asyncio.to_thread(services.terms.search, query, top_k)
-        except TermValidationError as exc:
-            # Мягкий отказ (fail + hint): запрос/top_k вне домена области.
+    if settings.area_terms_enabled:
+        @mcp.tool(name="terms_search", description=TOOL_DESCRIPTIONS["terms_search"])
+        async def terms_search(
+            query: Annotated[
+                str,
+                Field(
+                    description="Term or abbreviation to look up; all senses are "
+                    "returned",
+                    min_length=1,
+                    max_length=settings.max_query_chars,
+                ),
+            ],
+            top_k: Annotated[
+                int,
+                Field(description="Number of results", ge=1, le=20),
+            ] = settings.default_top_k,
+        ) -> dict[str, Any]:
+            started = time.perf_counter()
+            try:
+                result = await asyncio.to_thread(services.terms.search, query, top_k)
+            except TermValidationError as exc:
+                # Мягкий отказ (fail + hint): запрос/top_k вне домена области.
+                log_tool_call(
+                    "terms_search",
+                    started,
+                    failed=True,
+                    reason=str(exc),
+                    query=preview(query),
+                )
+                return {"senses": [], "exact": False, "hint": str(exc)}
+            # Пустой результат — валидный исход пробы (hint канона в выдаче),
+            # не fail: событие несёт число смыслов и признак FTS-only деградации.
             log_tool_call(
                 "terms_search",
                 started,
-                failed=True,
-                reason=str(exc),
+                results=len(result["senses"]),
+                top_k=top_k,
                 query=preview(query),
+                fts_only=bool(result.get("warning")),
             )
-            return {"senses": [], "exact": False, "hint": str(exc)}
-        # Пустой результат — валидный исход пробы (hint канона в выдаче),
-        # не fail: событие несёт число смыслов и признак FTS-only деградации.
-        log_tool_call(
-            "terms_search",
-            started,
-            results=len(result["senses"]),
-            top_k=top_k,
-            query=preview(query),
-            fts_only=bool(result.get("warning")),
-        )
-        return _compact_term_search(result)
+            return _compact_term_search(result)
 
-    @mcp.tool(name="terms_save", description=TOOL_DESCRIPTIONS["terms_save"])
-    async def terms_save(
-        term: Annotated[
-            str,
-            Field(description="Term: ≤100 characters"),
-        ],
-        context: Annotated[
-            str,
-            Field(
-                description="Context: ≤40 characters; always required — even "
-                "for a single sense"
-            ),
-        ],
-        definition: Annotated[
-            str,
-            Field(description="Definition: ≤350 characters"),
-        ],
-    ) -> dict[str, Any]:
-        # Лимиты формы валидирует СЕРВИС (не схема — как title у заметок):
-        # нарушение → TermValidationError с дословным hint канона §3.7, запись
-        # при этом НЕ идёт. Приватность (NFR-4): в лог идут длины, не текст.
-        started = time.perf_counter()
-        sizes = {
-            "term_chars": len(term),
-            "context_chars": len(context),
-            "definition_chars": len(definition),
-        }
-        try:
-            result = await asyncio.to_thread(
-                services.terms.save, term, context, definition
-            )
-        except TermValidationError as exc:
-            log_tool_call(
-                "terms_save", started, failed=True, reason=str(exc), **sizes
-            )
-            return {"created": False, "hint": str(exc)}
-        if result.get("created") or result.get("updated"):
-            log_tool_call(
-                "terms_save", started, results=1, id=result["id"], **sizes
-            )
-        else:
-            # Мягкий отказ близкого контекста: записи нет, hint ведёт к
-            # существующему контексту (§3.5, «подсказка ДО записи»).
-            log_tool_call(
-                "terms_save", started, failed=True, reason=result["hint"], **sizes
-            )
-        return _compact_term_save(result)
+        @mcp.tool(name="terms_save", description=TOOL_DESCRIPTIONS["terms_save"])
+        async def terms_save(
+            term: Annotated[
+                str,
+                Field(description="Term: ≤100 characters"),
+            ],
+            context: Annotated[
+                str,
+                Field(
+                    description="Context: ≤40 characters; always required — even "
+                    "for a single sense"
+                ),
+            ],
+            definition: Annotated[
+                str,
+                Field(description="Definition: ≤350 characters"),
+            ],
+        ) -> dict[str, Any]:
+            # Лимиты формы валидирует СЕРВИС (не схема — как title у заметок):
+            # нарушение → TermValidationError с дословным hint канона §3.7, запись
+            # при этом НЕ идёт. Приватность (NFR-4): в лог идут длины, не текст.
+            started = time.perf_counter()
+            sizes = {
+                "term_chars": len(term),
+                "context_chars": len(context),
+                "definition_chars": len(definition),
+            }
+            try:
+                result = await asyncio.to_thread(
+                    services.terms.save, term, context, definition
+                )
+            except TermValidationError as exc:
+                log_tool_call(
+                    "terms_save", started, failed=True, reason=str(exc), **sizes
+                )
+                return {"created": False, "hint": str(exc)}
+            if result.get("created") or result.get("updated"):
+                log_tool_call(
+                    "terms_save", started, results=1, id=result["id"], **sizes
+                )
+            else:
+                # Мягкий отказ близкого контекста: записи нет, hint ведёт к
+                # существующему контексту (§3.5, «подсказка ДО записи»).
+                log_tool_call(
+                    "terms_save", started, failed=True, reason=result["hint"], **sizes
+                )
+            return _compact_term_save(result)
 
-    @mcp.tool(name="terms_get", description=TOOL_DESCRIPTIONS["terms_get"])
-    async def terms_get(
-        id: Annotated[int, Field(description="Term record id")],
-    ) -> dict[str, Any]:
-        started = time.perf_counter()
-        result = await asyncio.to_thread(services.terms.get, id)
-        if "hint" in result:
-            # Мягкий отказ: записи нет (мягко — возможно, удалена).
-            log_tool_call(
-                "terms_get", started, failed=True, reason=result["hint"], id=id
-            )
-        else:
-            log_tool_call("terms_get", started, results=1, id=id)
-        return _compact_term_get(result)
+        @mcp.tool(name="terms_get", description=TOOL_DESCRIPTIONS["terms_get"])
+        async def terms_get(
+            id: Annotated[int, Field(description="Term record id")],
+        ) -> dict[str, Any]:
+            started = time.perf_counter()
+            result = await asyncio.to_thread(services.terms.get, id)
+            if "hint" in result:
+                # Мягкий отказ: записи нет (мягко — возможно, удалена).
+                log_tool_call(
+                    "terms_get", started, failed=True, reason=result["hint"], id=id
+                )
+            else:
+                log_tool_call("terms_get", started, results=1, id=id)
+            return _compact_term_get(result)
 
     return mcp

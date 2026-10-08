@@ -100,6 +100,10 @@ services:
       HISTORY_MAX_VERSIONS: "0"         # versions kept per record (0 — keep everything; >0 — prune with re-base)
       HISTORY_RETENTION_DAYS: "0"       # version retention in days (0 — unlimited; >0 — prune with re-base)
       HISTORY_DELTA_INLINE_MAX: "2048"  # threshold "full value ↔ line delta", chars (≥1)
+      # --- area flags (No40, release 3.2.0): skills/terms/user-facts surfaces ---
+      AREA_SKILLS_ENABLED: "true"       # skills area on/off; its queue stays visible in /health.areas
+      AREA_TERMS_ENABLED: "true"        # terms area on/off; its queue stays visible in /health.areas
+      AREA_USER_FACTS_ENABLED: "true"   # user-facts area on/off; its queue stays visible in /health.areas
       # --- search ---
       DEFAULT_TOP_K: "5"
       DEFAULT_LIST_LIMIT: "20"

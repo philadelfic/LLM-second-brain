@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from fastapi.testclient import TestClient
 
 from app import __version__
 from app.config import get_settings
 from app.main import create_app
+from app.storage.db import init_db, session, transaction
 from app.transport.auth import BearerAuthMiddleware
+from fakes import clear_seeded_skills
 
 
 class TestHealth:
@@ -29,10 +33,14 @@ class TestHealth:
                 queue: {"pending": 0, "oldest_pending_sec": None}
                 for queue in ("vector", "summary", "judge", "areas", "links", "nodes")
             },
+            "areas": {
+                name: {"enabled": True, "pending": 0}
+                for name in ("skills", "terms", "user")
+            },
         }
 
     def test_contract_fields(self, client: TestClient) -> None:
-        """7 прежних полей NFR-4 + queues (FR-2.7) + version (FR-4.2)."""
+        """Прежние поля NFR-4 + queues (FR-2.7) + version + areas (№40)."""
         body = client.get("/health").json()
         assert set(body) == {
             "status",
@@ -44,6 +52,7 @@ class TestHealth:
             "pending_vector",
             "pending_summary",
             "queues",
+            "areas",
         }
         assert body["status"] == "ok"
         # techdebt-0036 (FR-4.2): версия — из приложения, не из окружения.
@@ -61,9 +70,60 @@ class TestHealth:
         }
         for stat in body["queues"].values():
             assert set(stat) == {"pending", "oldest_pending_sec"}
+        # №40 (FR-4.3): /health.areas — по всем областям {enabled, pending}.
+        assert set(body["areas"]) == {"skills", "terms", "user"}
+        for stat in body["areas"].values():
+            assert set(stat) == {"enabled", "pending"}
 
     def test_query_string_does_not_break_openness(self, client: TestClient) -> None:
         assert client.get("/health", params={"verbose": 1}).status_code == 200
+
+    def test_health_areas(self, client: TestClient) -> None:
+        """Дефолт: все области включены, очередей нет (№40, FR-4.3)."""
+        assert client.get("/health").json()["areas"] == {
+            "skills": {"enabled": True, "pending": 0},
+            "terms": {"enabled": True, "pending": 0},
+            "user": {"enabled": True, "pending": 0},
+        }
+
+    def test_health_areas_pending_visible_when_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Выключенная область: enabled=false, но её накопление pending видно."""
+        monkeypatch.setenv("AREA_TERMS_ENABLED", "false")
+        get_settings.cache_clear()
+        settings = get_settings()
+        init_db(settings)
+        clear_seeded_skills(settings)
+        with session(settings) as conn, transaction(conn):
+            conn.execute(
+                "INSERT INTO terms (term, term_norm, context, context_norm, definition) "
+                "VALUES ('ГЗ', 'гз', 'студенты МГУ', 'студенты мгу', 'госэкзамен')"
+            )
+        with TestClient(create_app(settings)) as area_client:
+            body = area_client.get("/health").json()
+        assert body["areas"]["terms"] == {"enabled": False, "pending": 1}
+        assert body["areas"]["skills"] == {"enabled": True, "pending": 0}
+
+    def test_startup_areas_event(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Событие старта `areas_enabled` несёт состав включённых областей."""
+        monkeypatch.setenv("AREA_TERMS_ENABLED", "false")
+        get_settings.cache_clear()
+        settings = get_settings()
+        with caplog.at_level(logging.INFO, logger="app"):
+            with TestClient(create_app(settings)):
+                pass
+        events = {
+            getattr(record, "event", None): record for record in caplog.records
+        }
+        assert "areas_enabled" in events
+        assert events["areas_enabled"].areas == {  # type: ignore[attr-defined]
+            "skills": True,
+            "terms": False,
+            "user_facts": True,
+        }
 
 
 class TestBearerMiddleware:

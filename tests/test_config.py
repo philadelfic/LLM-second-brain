@@ -133,6 +133,11 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "HISTORY_MAX_VERSIONS": ("history_max_versions", 0),
     "HISTORY_RETENTION_DAYS": ("history_retention_days", 0),
     "HISTORY_DELTA_INLINE_MAX": ("history_delta_inline_max", 2048),
+    # Релиз 3.2.0, флаги областей №40 (постановка no40-01): операторские
+    # выключатели области, дефолт «включено» (FR-1.1/FR-1.2).
+    "AREA_SKILLS_ENABLED": ("area_skills_enabled", True),
+    "AREA_TERMS_ENABLED": ("area_terms_enabled", True),
+    "AREA_USER_FACTS_ENABLED": ("area_user_facts_enabled", True),
 }
 
 
@@ -160,13 +165,14 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 97 полей: 6 обязательных + 91 с умолчаниями
+        """В Settings — ровно 100 полей: 6 обязательных + 94 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
         субстрата областей релиза 3.0.0: лимиты/пороги skills/terms/user;
         + 3 джобы расчёта связей lsb-0010-03 + 3 джобы обхода default lsb-0011-01
-        + 4 истории версий №41 релиза 3.2.0: HISTORY_*)."""
+        + 4 истории версий №41 релиза 3.2.0: HISTORY_*; + 3 флага областей №40
+        релиза 3.2.0: AREA_*_ENABLED)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

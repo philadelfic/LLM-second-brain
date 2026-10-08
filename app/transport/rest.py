@@ -296,6 +296,9 @@ class HealthResponse(BaseModel):
     pending_vector: int
     pending_summary: int
     queues: dict[str, QueueStat]  # lsb-0014-03: ожидание по каждой очереди
+    # №40 (FR-4.3): по каждой области {enabled, pending} — по ВСЕМ областям,
+    # включая выключенные (их накопление видно). Собирает воркер, только SQL.
+    areas: dict[str, dict]
 
 
 def _services(request: Request) -> Services:
@@ -385,6 +388,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
         worker = request.app.state.worker  # type: ignore[attr-defined]
         counts = await asyncio.to_thread(services.notes.health_counts)
         queues = await asyncio.to_thread(worker.queues_health)
+        areas = await asyncio.to_thread(worker.areas_health)
         return HealthResponse(
             status="ok",
             version=__version__,
@@ -395,6 +399,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
             pending_vector=counts["pending_vector"],
             pending_summary=counts["pending_summary"],
             queues=queues,
+            areas=areas,
         )
 
     @rest_router.post("/notes", status_code=201)

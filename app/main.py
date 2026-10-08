@@ -184,14 +184,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         services.skills.set_areas_notifier(worker.notify_areas_pending)
     # Область «user» (3.0.0, lsb-0009): запись/правка/удаление факта будит
     # петлю areas тем же сигналом — вектора записи догоняются сразу, а не по
-    # выросшему back-off (прецедент области навыков). Сервис обязателен в
-    # контейнере — проверки на None не требуется.
-    services.user_facts.set_areas_notifier(worker.notify_areas_pending)
+    # выросшему back-off (прецедент области навыков). Проверка на None — как
+    # у области навыков: поле может быть пустым в DI-сборках тестов (№40).
+    if services.user_facts is not None:
+        services.user_facts.set_areas_notifier(worker.notify_areas_pending)
     # Область terms (3.0.0, lsb-0008): запись/правка/удаление термина будит
     # петлю areas тем же сигналом — вектора записи догоняются сразу, а не по
-    # выросшему back-off (прецедент областей навыков и «user»). Сервис
-    # обязателен в контейнере — проверки на None не требуется.
-    services.terms.set_areas_notifier(worker.notify_areas_pending)
+    # выросшему back-off (прецедент областей навыков и «user»). Проверка на
+    # None — симметрично прочим областям (№40).
+    if services.terms is not None:
+        services.terms.set_areas_notifier(worker.notify_areas_pending)
     # Внутренний маршрут MCP-сервера — ровно MCP_PATH. host="0.0.0.0" — не
     # localhost, поэтому SDK не включает DNS-rebinding protection (сервис
     # живёт в LAN за Bearer-токеном; Open WebUI ходит с не-localhost Host).
@@ -221,6 +223,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "port": settings.port,
                 "mcp_path": settings.mcp_path,
                 "db_path": settings.db_path,
+            },
+        )
+        # №40 (FR-4.3): состав включённых областей — из журнала старта видно,
+        # какие области активны (диагностика не гадает). Флаг гейтит только
+        # поверхность/фон; данные и REST остаются доступны и у выключенной.
+        logging.getLogger("app").info(
+            "areas enabled",
+            extra={
+                "event": "areas_enabled",
+                "areas": {
+                    "skills": settings.area_skills_enabled,
+                    "terms": settings.area_terms_enabled,
+                    "user_facts": settings.area_user_facts_enabled,
+                },
             },
         )
         # Жизненный цикл MCP-сессий Streamable HTTP = жизни процесса.

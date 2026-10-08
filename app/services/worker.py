@@ -129,7 +129,7 @@ import logging
 from app.config import TITLE_MAX_WORDS, Settings
 from app.services import history
 from app.services import jobs
-from app.services.areas import AreaSpec, ALL_AREAS
+from app.services.areas import AreaSpec, ALL_AREAS, enabled_areas
 from app.services.classifier import Classification, ClassificationError, Classifier
 from app.services.dedup import DeduplicationService
 from app.services.embedding import Embedder, EmbeddingError
@@ -892,17 +892,19 @@ class BackgroundWorker:
         return queue_snapshot(row["pending"], row["oldest_pending_sec"])
 
     def _areas_queue_stat(self) -> dict:
-        """Снимок очереди областей: сумма pending по `ALL_AREAS` (FR-2.2).
+        """Снимок очереди областей: сумма pending по ВКЛЮЧЁННЫМ областям (FR-2.5).
 
         Источник pending — тот же, что у `_areas_queue_empty`: pending-записи
-        активных строк каждой области (skills/terms/user). Суммы складываются,
-        возраст старейшего — максимум `now - updated_at` по областям; пусто —
-        `null`.
+        активных строк включённых областей (`enabled_areas`, №40) — выключенная
+        область фоном не забирается и в общий счётчик не входит. Суммы
+        складываются, возраст старейшего — максимум `now - updated_at` по
+        областям; пусто — `null`. Накопление выключенной области видно
+        отдельно в `/health.areas` (`areas_health`).
         """
         pending = 0
         oldest: int | None = None
         with session(self._settings) as conn:
-            for spec in ALL_AREAS:
+            for spec in enabled_areas(self._settings):
                 row = conn.execute(
                     "SELECT COUNT(*) AS pending, "
                     "MAX(CAST(strftime('%s','now') AS INTEGER) - "
@@ -916,6 +918,30 @@ class BackgroundWorker:
                 if value is not None:
                     oldest = int(value) if oldest is None else max(oldest, int(value))
         return queue_snapshot(pending, oldest)
+
+    def areas_health(self) -> dict[str, dict]:
+        """`/health.areas` (FR-4.3, №40): по ВСЕМ областям `{enabled, pending}`.
+
+        Отдаётся по `ALL_AREAS`, а не по `enabled_areas`: накопление у
+        выключенной области должно быть видно (прецедент `JOB_*_ENABLED`:
+        «очередь остаётся видна в /health»). `pending` — тот же SQL, что у
+        `_areas_queue_stat`, но БЕЗ суммирования (по области); обращений к
+        моделям нет — только чтение pending-состояния.
+        """
+        enabled = {spec.name for spec in enabled_areas(self._settings)}
+        health: dict[str, dict] = {}
+        with session(self._settings) as conn:
+            for spec in ALL_AREAS:
+                row = conn.execute(
+                    f"SELECT COUNT(*) FROM {spec.table} "
+                    "WHERE vector_status = 'pending' "
+                    "AND deleted_at IS NULL"
+                ).fetchone()
+                health[spec.name] = {
+                    "enabled": spec.name in enabled,
+                    "pending": int(row[0]),
+                }
+        return health
 
     # --- синхронная работа (выполняется в to_thread) --------------------------
 
@@ -1018,7 +1044,7 @@ class BackgroundWorker:
             limit if limit is not None else self._settings.embedding_batch_size
         )
         processed = 0
-        for spec in ALL_AREAS:
+        for spec in enabled_areas(self._settings):
             processed += self._process_area_batch(spec, batch)
         return processed
 
@@ -1075,12 +1101,12 @@ class BackgroundWorker:
     def _areas_queue_empty(self) -> bool:
         """Пуста ли очередь областей (дешёвый SELECT, пул 6, lost wakeup).
 
-        pending-записи считаются по всем областям реестра (ALL_AREAS) —
-        та же очередь, что выгребает process_pending_areas.
+        pending-записи считаются по включённым областям реестра (`enabled_areas`,
+        №40) — та же очередь, что выгребает process_pending_areas.
         """
         pending = 0
         with session(self._settings) as conn:
-            for spec in ALL_AREAS:
+            for spec in enabled_areas(self._settings):
                 pending += int(
                     conn.execute(
                         f"SELECT COUNT(*) FROM {spec.table} "

@@ -184,6 +184,19 @@ class Settings(BaseSettings):
     history_retention_days: int = 0
     history_delta_inline_max: int = 2048
 
+    # --- флаги областей (№40, релиз 3.2.0) ----------------------------------
+    # AREA_*_ENABLED — операторский выключатель области (дефолт «включено»,
+    # FR-1.1/FR-1.2): выключенная область не отдаёт MCP-ручки, её раздел и
+    # анонс не вшиваются в инструкцию, петля `areas` её не обрабатывает; при
+    # этом сервис области собирается всегда и операторский REST остаётся
+    # полным (решение владельца 2026-10-08: данные выключенной области
+    # доступны REST и слою истории). Невалидное значение — pydantic
+    # ValidationError → ConfigError → фатальный старт со перечислением ВСЕХ
+    # нарушений (FR-1.3, NFR-6), а не молчаливое выключение.
+    area_skills_enabled: bool = True
+    area_terms_enabled: bool = True
+    area_user_facts_enabled: bool = True
+
     # --- прочее ---
     log_level: str = "INFO"
     author_default: str = "unknown"
