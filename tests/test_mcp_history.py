@@ -232,3 +232,54 @@ class TestHistoryGate:
             {"entity": "note", "id": note_id, "version": 1},
         )
         assert "fields" not in single and single["hint"] == HINT_HISTORY_OFF
+
+
+def _mcp_with_areas(monkeypatch: pytest.MonkeyPatch, **flags: str):
+    """In-process MCP при заданных флагах областей (env → настройки)."""
+    monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
+    for name, value in flags.items():
+        monkeypatch.setenv(name, value)
+    get_settings.cache_clear()
+    settings = get_settings()
+    init_db(settings)
+    clear_seeded_skills(settings)
+    return build_mcp(settings, _services(settings, HashEmbedder(DIM)))
+
+
+@pytest.mark.asyncio
+async def test_history_tool_entity_gated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """№40 (§7.1/§13.10): сущность выключенной области — «неизвестная».
+
+    Допустимый словарь `entity` выводится из флагов: `note` — всегда,
+    `skill`/`term`/`user_fact` — по флагу своей области. Запрос по сущности
+    выключенной области неотличим от опечатки: мягкий `{…, hint}`, и подсказка
+    НЕ раскрывает выключенную область. Ядровые `memory_*` гейту не подлежат.
+    """
+    mcp = _mcp_with_areas(monkeypatch, AREA_TERMS_ENABLED="false")
+    # Ядровая сущность работает при любых флагах.
+    note_id = await _save_note(mcp, unique("gated note"))
+    listing = await _call(mcp, "history_list", {"entity": "note", "id": note_id})
+    assert listing["total"] == 1 and "hint" not in listing
+
+    # Сущность выключенной области — как неизвестная: hint без раскрытия.
+    for name, args in (
+        ("history_list", {"entity": "term", "id": 1}),
+        ("history_get", {"entity": "term", "id": 1, "version": 1}),
+    ):
+        out = await _call(mcp, name, args)
+        assert "hint" in out, out
+        assert out.get("versions", []) == [] and "fields" not in out
+        assert "term" not in out["hint"]
+
+    # Включённые области не задеты: их сущности «известны» (пустая выдача без
+    # подсказки про неизвестную сущность; записи для id=1 нет).
+    for entity in ("skill", "user_fact"):
+        out = await _call(mcp, "history_list", {"entity": entity, "id": 1})
+        assert out["versions"] == [] and "hint" not in out, out
+
+    # Схема `entity` тоже собирается от флагов — выключенной области в ней нет.
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    props = tools["history_list"].input_schema["properties"]
+    description = props["entity"]["description"]
+    assert "note" in description and "skill" in description
+    assert "term" not in description

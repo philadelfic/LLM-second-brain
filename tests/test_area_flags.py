@@ -12,6 +12,7 @@ MCP, раздел/анонс в инструкции и фоновую петл�
 from __future__ import annotations
 
 import asyncio
+import itertools
 
 import pytest
 from fastapi.testclient import TestClient
@@ -103,3 +104,64 @@ class TestInvalidFlag:
         message = str(exc.value)
         assert "area_user_facts_enabled" in message
         assert "area_terms_enabled" in message
+
+
+# Флаги областей (порядок — как в реестре) и ядро агентской поверхности:
+# 8 ручек памяти + 2 общие ручки истории (№41). Ядро гейту области не подлежит.
+_FLAG_NAMES = (
+    "AREA_SKILLS_ENABLED",
+    "AREA_TERMS_ENABLED",
+    "AREA_USER_FACTS_ENABLED",
+)
+_CORE_TOOLS = frozenset(
+    {
+        "memory_search",
+        "memory_list",
+        "memory_get",
+        "memory_save",
+        "memory_update",
+        "memory_delete",
+        "memory_namespaces",
+        "memory_namespace_create",
+        "history_list",
+        "history_get",
+    }
+)
+
+
+def _areas_in_surface(names: set[str]) -> set[str]:
+    """Области, чьи ручки фактически зарегистрированы (определяем по префиксу)."""
+    return {
+        spec.name
+        for spec in ALL_AREAS
+        if any(name.startswith(f"{spec.name}_") for name in names)
+    }
+
+
+def test_surface_consistency(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FR-4.1/FR-4.2: состав агентской поверхности детерминированно выводится из флагов.
+
+    Для ВСЕХ комбинаций флагов: области, чьи ручки зарегистрированы, совпадают
+    с реестром `enabled_areas` (ни лишних, ни пропавших), ядро неизменно,
+    сервисы областей собраны всегда (решение 2026-10-08 — сборка от флага не
+    зависит), а та же конфигурация даёт тот же состав.
+    """
+    for combo in itertools.product(("true", "false"), repeat=len(_FLAG_NAMES)):
+        flags = dict(zip(_FLAG_NAMES, combo))
+        settings = _settings(monkeypatch, **flags)
+        services = build_services(settings)
+        # Сервис собран всегда: операторский REST и история данных не теряют.
+        assert services.skills is not None
+        assert services.terms is not None
+        assert services.user_facts is not None
+
+        names = _tool_names(build_mcp(settings, services))
+        enabled = {spec.name for spec in enabled_areas(settings)}
+        assert _areas_in_surface(names) == enabled, flags
+        assert _CORE_TOOLS <= names, flags
+        # Лишних ручек нет: всё вне ядра принадлежит ВКЛЮЧЁННОЙ области.
+        prefixes = tuple(f"{area}_" for area in enabled)
+        assert all(name.startswith(prefixes) for name in names - _CORE_TOOLS), flags
+        # Детерминизм: та же конфигурация → тот же состав поверхности.
+        rebuilt = _tool_names(build_mcp(settings, build_services(settings)))
+        assert rebuilt == names, flags

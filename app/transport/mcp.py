@@ -131,6 +131,13 @@ lsb-0010-05 (релиз 3.1.0, задача №44): при одиночном ч
 сущность/версию, без исключения. Откат из MCP недоступен (решение О.,
 §13.6). При `HISTORY_ENABLED=false` оба инструмента отдают пусто + hint
 «history is off» (§8) — ошибкой это не считается.
+
+№40, no40-02 (релиз 3.2.0, §7.1/§13.10): допустимый словарь `entity` ручек
+истории выводится из флагов областей (`history_entities_mcp`) — сущность
+выключенной области для агента НЕИЗВЕСТНА: мягкий hint без раскрытия, что
+область существует, и без её имени в подсказке/схеме параметра; ядровая `note`
+доступна всегда. Операторский REST при выключенной области остаётся полным
+(§13.10) — флаги областей гейтят только агентскую поверхность и фон.
 """
 
 import asyncio
@@ -1061,22 +1068,44 @@ def _compact_term_get(result: dict[str, Any]) -> dict[str, Any]:
 
 # №41 (FR-5.3, §7.1, §13.14): история из MCP — одна общая пара инструментов
 # (`history_list`/`history_get`) с параметром `entity` вместо ручек на каждую
-# область: поверхность растёт на 2, а не на 8. Агентской поверхности доступны
-# четыре сущности (шаблон инструкции навыка агент не читает). `session` версии —
+# область: поверхность растёт на 2, а не на 8. `session` версии —
 # идентификатор вызова/агента, в выдачу не идёт (§13.4); тела версий отдаёт
 # только `history_get` (FR-5.1). Неизвестная сущность — мягкий hint, без
-# исключения (сущности выключенных областей отсекает no40-02, §13.10).
-_HISTORY_ENTITIES_MCP = (
-    history.ENTITY_NOTE,
-    history.ENTITY_SKILL,
-    history.ENTITY_TERM,
-    history.ENTITY_USER_FACT,
+# исключения.
+#
+# №40, no40-02 (§7.1/§13.10): допустимый для АГЕНТА словарь сущностей выводится
+# из флагов областей — сущность выключенной области обрабатывается как
+# НЕИЗВЕСТНАЯ (мягкий hint без раскрытия, что область существует). `note` —
+# ядровая память, есть всегда; `skill`/`term`/`user_fact` — по флагу своей
+# области. Шаблон инструкции навыка (`skill_template`) агенту не отдаётся и при
+# включённой области.
+_HISTORY_ENTITIES_BY_AREA = (
+    ("area_skills_enabled", history.ENTITY_SKILL),
+    ("area_terms_enabled", history.ENTITY_TERM),
+    ("area_user_facts_enabled", history.ENTITY_USER_FACT),
 )
-HINT_UNKNOWN_HISTORY_ENTITY = (
-    "unknown entity; available: "
-    + ", ".join(_HISTORY_ENTITIES_MCP)
-    + " — history_list shows the available versions"
-)
+
+
+def history_entities_mcp(settings: Settings) -> tuple[str, ...]:
+    """Сущности истории, доступные агенту, — от флагов областей (№40, §13.10)."""
+    return (history.ENTITY_NOTE,) + tuple(
+        entity
+        for flag, entity in _HISTORY_ENTITIES_BY_AREA
+        if getattr(settings, flag)
+    )
+
+
+def _unknown_history_entity_hint(entities: tuple[str, ...]) -> str:
+    """Hint «сущность неизвестна»: перечислены ТОЛЬКО допустимые агенту сущности.
+
+    Выключенная область не упоминается (FR-2.1, §7.1): её сущность для агента
+    неотличима от опечатки.
+    """
+    return (
+        "unknown entity; available: "
+        + ", ".join(entities)
+        + " — history_list shows the available versions"
+    )
 
 # Белые списки версий: метаданные + «что изменилось» (FR-5.1). Без `session`
 # (§13.4) и без тел.
@@ -1653,12 +1682,15 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
     # слой истории, что пишут все пути правки. Обычные выдачи историю не несут
     # (FR-5.5). `entity` вне допустимых (в т.ч. выключенная область, no40-02) —
     # мягкий hint без раскрытия; при `HISTORY_ENABLED=false` — пусто + hint (§8).
+    # Словарь сущностей и схема `entity` собираются от флагов (№40, no40-02):
+    # выключенная область не видна агенту ни выдачей, ни подсказкой, ни схемой.
+    history_entities = history_entities_mcp(settings)
+    history_hint = _unknown_history_entity_hint(history_entities)
+    history_entity_help = " | ".join(history_entities)
 
     @mcp.tool(name="history_list", description=TOOL_DESCRIPTIONS["history_list"])
     async def history_list(
-        entity: Annotated[
-            str, Field(description="note | skill | term | user_fact")
-        ],
+        entity: Annotated[str, Field(description=history_entity_help)],
         id: Annotated[int, Field(description="Record id")],
         limit: Annotated[
             int,
@@ -1668,7 +1700,7 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
         offset: Annotated[int, Field(description="Page offset", ge=0)] = 0,
     ) -> dict[str, Any]:
         started = time.perf_counter()
-        if entity not in _HISTORY_ENTITIES_MCP:
+        if entity not in history_entities:
             # Мягкий отказ (fail + hint): сущность неизвестна (или её область
             # выключена) — что область существует, не раскрываем.
             log_tool_call(
@@ -1681,7 +1713,7 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
                 "versions": [],
                 "has_more": False,
                 "total": 0,
-                "hint": HINT_UNKNOWN_HISTORY_ENTITY,
+                "hint": history_hint,
             }
         result = await asyncio.to_thread(
             history.read_versions, entity, id, settings, limit=limit, offset=offset
@@ -1694,14 +1726,12 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
 
     @mcp.tool(name="history_get", description=TOOL_DESCRIPTIONS["history_get"])
     async def history_get(
-        entity: Annotated[
-            str, Field(description="note | skill | term | user_fact")
-        ],
+        entity: Annotated[str, Field(description=history_entity_help)],
         id: Annotated[int, Field(description="Record id")],
         version: Annotated[int, Field(description="Version number", ge=1)],
     ) -> dict[str, Any]:
         started = time.perf_counter()
-        if entity not in _HISTORY_ENTITIES_MCP:
+        if entity not in history_entities:
             log_tool_call(
                 "history_get", started, failed=True,
                 reason="unknown entity", entity=entity, id=id,
@@ -1710,7 +1740,7 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
                 "entity": entity,
                 "id": id,
                 "version": version,
-                "hint": HINT_UNKNOWN_HISTORY_ENTITY,
+                "hint": history_hint,
             }
         result = await asyncio.to_thread(
             history.read_version, entity, id, version, settings
