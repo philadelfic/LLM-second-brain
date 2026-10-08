@@ -58,6 +58,8 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     # lsb-0013 (3.1.0): listing ceilings per surface.
     "LIST_MAX_LIMIT_MCP": ("list_max_limit_mcp", 20),
     "LIST_MAX_LIMIT_REST": ("list_max_limit_rest", 50),
+    "WARNINGS_MAX_LIMIT_MCP": ("warnings_max_limit_mcp", 20),
+    "WARNINGS_MAX_LIMIT_REST": ("warnings_max_limit_rest", 50),
     "SCORE_THRESHOLD": ("score_threshold", 0.50),
     # lsb-0010 (3.1.0): связи заметок, уровень 0 («ленивый граф»).
     "LINK_TOP": ("link_top", 3),
@@ -180,7 +182,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 111 полей: 6 обязательных + 105 с умолчаниями
+        """В Settings — ровно 113 полей: 6 обязательных + 107 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
@@ -190,7 +192,7 @@ class TestCompleteness:
         релиза 3.2.0: AREA_*_ENABLED; + 5 настроек слота №39 релиза 3.2.0:
         SLOT_* — пауза/стук/хинт, предел попыток пары и стартовый сброс;
         + 6 настроек джобы предупреждений №12 релиза 3.2.0: JOB_WARNINGS_*
-        и WARNINGS_*)."""
+        и WARNINGS_* + 2 потолка страницы предупреждений: WARNINGS_MAX_LIMIT_*)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

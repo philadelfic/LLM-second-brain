@@ -166,6 +166,7 @@ from app.services.notes import (
 )
 from app.services.skills import SkillValidationError
 from app.services.terms import TermValidationError
+from app.services.warnings import WarningsValidationError
 from app.services.user_facts import (
     _UNSET_BODY,
     _UNSET_NAME,
@@ -648,6 +649,16 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     ),
     "terms_get": (
         "Read one term record by id: term, context, definition."
+    ),
+    # №12 (no12-02, §7.1/§13.4): ОДНА точка чтения предупреждений на систему —
+    # предупреждения памяти и терминов пишут в общую таблицу. Ответ компактный
+    # и с пагинацией; чтение не зовёт модель.
+    "warnings_list": (
+        "Read the warnings of the memory (notes placed in the wrong node, "
+        "suggested nodes that do not exist yet, term contexts). Compact and "
+        "paginated (kind, subject, message, payload, time — no record bodies). "
+        "Read them when a note or a term looks out of place; reading never "
+        "calls a model."
     ),
     # №41 (FR-5.3, §7.1, §13.14): два ОБЩИХ инструмента чтения истории —
     # по явному запросу, компактно, без тел (FR-5.1); в обычные выдачи
@@ -1212,14 +1223,44 @@ def _compact_history_get(result: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# №12 (no12-02, §7.1): элемент выдачи предупреждений — белый список; тел
+# заметок/терминов и служебных `status`/`resolved_at` нет (бюджет F-11).
+def _compact_warning(row: dict[str, Any]) -> dict[str, Any]:
+    """Строка предупреждения → компактная форма: `subject` — объект {type, id}."""
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "subject": {"type": row["subject_type"], "id": row["subject_id"]},
+        "message": row["message"],
+        "payload": row["payload"],
+        "created_at": row["created_at"],
+    }
+
+
+def _compact_warnings(result: dict[str, Any]) -> dict[str, Any]:
+    """warnings_list: {warnings: [...], total, has_more, next_offset, hint?}.
+
+    Поля страницы переносим из сервисного `page_fields` (arch §3.1–3.2), но
+    `next_cursor` (залог keyset) агенту не нужен — форма §7.1 его не несёт;
+    `hint` — только при мягком отказе.
+    """
+    out: dict[str, Any] = {
+        "warnings": [_compact_warning(row) for row in result["warnings"]],
+        "total": result["total"],
+        "has_more": result["has_more"],
+        "next_offset": result["next_offset"],
+    }
+    return _with_hint(out, result)
+
+
 def build_mcp(
     settings: Settings,
     services: Services,
     worker: "BackgroundWorker | None" = None,
 ) -> MCPServer:
     """Собрать MCP-сервер: инструкции (§5.1, база + карта неймспейсов) +
-    до 23 инструментов (8 `memory_*` + 5 `skills_*` + 5 `user_*` + 3 `terms_*`
-    + 2 `history_*`) над сервисами.
+    до 24 инструментов (8 `memory_*` + 1 `warnings_list` + 5 `skills_*` +
+    5 `user_*` + 3 `terms_*` + 2 `history_*`) над сервисами.
 
     Блоки ручек области (skills/user/terms) регистрируются только при её
     включённом флаге `AREA_*_ENABLED` (№40, FR-2.1): выключенная область в
@@ -1758,6 +1799,82 @@ def build_mcp(
             node=result["path"],
         )
         return _compact_namespace_create(result)
+
+    # --- предупреждения: единая точка чтения (№12, no12-02, §7.1) ----------
+    # Регистрация БЕЗУСЛОВНАЯ: предупреждения памяти — ядро; предупреждения
+    # терминов (№32) появятся в той же таблице сами. Чтение — только SQL.
+    @mcp.tool(name="warnings_list", description=TOOL_DESCRIPTIONS["warnings_list"])
+    async def warnings_list(
+        kind: Annotated[
+            str | None,
+            Field(description="Warning kind filter (e.g. note_misplaced)"),
+        ] = None,
+        subject_type: Annotated[
+            str | None,
+            Field(description="Subject type filter (note | term)"),
+        ] = None,
+        subject_id: Annotated[
+            int | None,
+            Field(description="Subject id filter"),
+        ] = None,
+        status: Annotated[
+            str,
+            Field(description="Warning status: open (default) | dismissed"),
+        ] = "open",
+        limit: Annotated[
+            int,
+            # Верхнюю границу проверяет СЕРВИС (у схемы — только ge=1), иначе
+            # limit=50 давал бы schema-error вместо мягкого отказа (lsb-0013).
+            Field(description="Page size (1..20)", ge=1),
+        ] = settings.default_list_limit,
+        offset: Annotated[
+            int,
+            Field(description="Page offset", ge=0),
+        ] = 0,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        service = services.warnings
+        if service is None:
+            log_tool_call(
+                "warnings_list", started, failed=True, reason="surface unavailable"
+            )
+            return {
+                "warnings": [],
+                "total": 0,
+                "hint": "warnings surface is not available",
+            }
+        try:
+            result = await asyncio.to_thread(
+                service.list,
+                kind=kind,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                status=status,
+                limit=limit,
+                offset=offset,
+                max_limit=settings.warnings_max_limit_mcp,
+            )
+        except WarningsValidationError as exc:
+            # Мягкий отказ (fail + hint): лимит вне потолка поверхности.
+            log_tool_call(
+                "warnings_list",
+                started,
+                failed=True,
+                reason=str(exc),
+                limit=limit,
+                offset=offset,
+            )
+            return {"warnings": [], "total": 0, "hint": str(exc)}
+        log_tool_call(
+            "warnings_list",
+            started,
+            results=len(result["warnings"]),
+            limit=limit,
+            offset=offset,
+            kind=kind,
+            status=status,
+        )
+        return _compact_warnings(result)
 
     # --- история версий: чтение из MCP (№41, §7.1, §13.14) ------------------
     # Два ОБЩИХ инструмента по явному запросу; сервисы не нужны — читает тот же

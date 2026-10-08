@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel
@@ -89,6 +90,7 @@ from app.services.terms import (
     TermsService,
 )
 from app.services.user_facts import UserFactValidationError, UserFactsService
+from app.services.warnings import WarningsService, WarningsValidationError
 
 # Сущности с историей (§5.3): оператору доступны ВСЕ, включая глобальный
 # шаблон навыков — флагов областей на этой поверхности нет (§13.10: REST
@@ -299,6 +301,9 @@ class HealthResponse(BaseModel):
     # №40 (FR-4.3): по каждой области {enabled, pending} — по ВСЕМ областям,
     # включая выключенные (их накопление видно). Собирает воркер, только SQL.
     areas: dict[str, dict]
+    # №12 (no12-02, §7.1/§7.2): агрегаты открытых предупреждений — {by_kind,
+    # total} по общей таблице `warnings` (память и термины). Только SQL.
+    warnings: dict[str, Any]
 
 
 def _services(request: Request) -> Services:
@@ -326,6 +331,21 @@ def _user_facts_service(request: Request) -> UserFactsService:
     выдача (REST — полные контракты полей).
     """
     return _services(request).user_facts
+
+
+def _warnings_service(request: Request) -> WarningsService:
+    """Сервис общей поверхности предупреждений (№12, no12-02) — для /warnings.
+
+    `Services.warnings` опционален только ради старых DI-сборок; приложение
+    (`create_app`/`build_services`) всегда его кладёт — его недоступность
+    означала бы ошибку сборки, отвечаем 503, а не падаем трейсбеком.
+    """
+    service = _services(request).warnings
+    if service is None:
+        raise HTTPException(
+            status_code=503, detail="warnings surface is not available"
+        )
+    return service
 
 
 def _terms_service(request: Request) -> TermsService:
@@ -389,6 +409,11 @@ def build_rest_router(settings: Settings) -> APIRouter:
         counts = await asyncio.to_thread(services.notes.health_counts)
         queues = await asyncio.to_thread(worker.queues_health)
         areas = await asyncio.to_thread(worker.areas_health)
+        # №12 (no12-02): агрегаты открытых предупреждений — только SQL.
+        if services.warnings is None:
+            warnings: dict[str, Any] = {"by_kind": {}, "total": 0}
+        else:
+            warnings = await asyncio.to_thread(services.warnings.counts)
         return HealthResponse(
             status="ok",
             version=__version__,
@@ -400,6 +425,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
             pending_summary=counts["pending_summary"],
             queues=queues,
             areas=areas,
+            warnings=warnings,
         )
 
     @rest_router.post("/notes", status_code=201)
@@ -1234,6 +1260,64 @@ def build_rest_router(settings: Settings) -> APIRouter:
             "version": versions[0]["version"] if versions else payload.version,
             "restored_from": payload.version,
             "revectorized": True,
+        }
+
+    # --- предупреждения: единая поверхность (№12, no12-02, §7.1) -----------
+    # Одна точка чтения на систему: те же фильтры, что у MCP `warnings_list`,
+    # но ПОЛНЫЙ контракт (без MCP-среза) и потолок `WARNINGS_MAX_LIMIT_REST`.
+    # Чтение — только SQL, без модели (§13.4); снятие — человеком.
+
+    @rest_router.get("/warnings")
+    async def list_warnings(
+        request: Request,
+        kind: str | None = Query(default=None),
+        subject_type: str | None = Query(default=None),
+        subject_id: int | None = Query(default=None),
+        status: str = Query(default="open"),
+        limit: int | None = Query(
+            default=None, ge=1, le=settings.warnings_max_limit_rest
+        ),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        """Листинг предупреждений оператора: полный контракт + поля страницы.
+
+        Потолок поверхности проверяет и схема (`le`), и сервис (единый текст
+        отказа, прецедент lsb-0013); лимит по умолчанию — `DEFAULT_LIST_LIMIT`.
+        """
+        try:
+            return await asyncio.to_thread(
+                _warnings_service(request).list,
+                kind=kind,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                status=status,
+                limit=(
+                    settings.default_list_limit if limit is None else limit
+                ),
+                offset=offset,
+                max_limit=settings.warnings_max_limit_rest,
+            )
+        except WarningsValidationError as exc:
+            raise _unprocessable(exc) from exc
+
+    @rest_router.post("/warnings/{warning_id}/dismiss")
+    async def dismiss_warning(warning_id: int, request: Request) -> dict:
+        """Снять предупреждение человеком: `{id, status, resolved_at}`.
+
+        Нет такой записи / уже снята — 404 (мягкий ответ сервиса ведёт к нему).
+        """
+        result = await asyncio.to_thread(
+            _warnings_service(request).dismiss, warning_id
+        )
+        if not result.get("dismissed"):
+            raise HTTPException(
+                status_code=404,
+                detail=result.get("hint", "warning not found"),
+            )
+        return {
+            "id": result["id"],
+            "status": result["status"],
+            "resolved_at": result["resolved_at"],
         }
 
     # --- очередь заданий: состояние «требует вмешательства» (№39, no39-02) ----

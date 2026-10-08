@@ -114,6 +114,10 @@ class Settings(BaseSettings):
     # startup (see _validate_ranges).
     list_max_limit_mcp: int = 20
     list_max_limit_rest: int = 50
+    # №12 (no12-02, 3.2.0): потолки страницы предупреждений по поверхностям
+    # (§7.1): агентский MCP — 20, операторский REST — 50.
+    warnings_max_limit_mcp: int = 20
+    warnings_max_limit_rest: int = 50
     score_threshold: float = 0.50  # калибровка 2026-09-02: 0.35→0.50 (эксперимент на 82 реальных запросах, решение О.)
     dedup_similarity: float = 0.92
     # --- фоновый дедуп (Фаза 8, Этап 2.1): кандидат-предфильтр до сводки ---
@@ -361,6 +365,9 @@ class Settings(BaseSettings):
         need_low("default_list_limit", self.default_list_limit, 1)
         need_low("list_max_limit_mcp", self.list_max_limit_mcp, 1)
         need_low("list_max_limit_rest", self.list_max_limit_rest, 1)
+        # Джоба `warnings` (№12, 3.2.0): потолки страницы предупреждений (§7.1).
+        need_low("warnings_max_limit_mcp", self.warnings_max_limit_mcp, 1)
+        need_low("warnings_max_limit_rest", self.warnings_max_limit_rest, 1)
         if self.default_list_limit > self.list_max_limit_mcp:
             errors.append(
                 "  - default_list_limit: default page size above the MCP "

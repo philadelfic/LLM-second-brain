@@ -137,6 +137,8 @@ SKILL_TOOL_NAMES = frozenset(
 TERMS_TOOL_NAMES = frozenset({"terms_search", "terms_save", "terms_get"})
 # №41 (3.2.0): пара общих инструментов чтения истории (§13.14).
 HISTORY_TOOL_NAMES = frozenset({"history_list", "history_get"})
+# №12 (no12-02): одна точка чтения предупреждений — ядро поверхности.
+WARNINGS_TOOL_NAMES = frozenset({"warnings_list"})
 
 FACT_NAME = "Moscow timezone"
 FACT_BODY = "Oleg is in Moscow, Europe/Moscow is the default for weather and time"
@@ -217,10 +219,11 @@ class TestToolRegistry:
         names = {tool.name for tool in await mcp_user.list_tools()}
         assert set(CANON_TOOL_DESCRIPTIONS) <= names
         assert names - set(CANON_TOOL_DESCRIPTIONS) == (
-            MEMORY_TOOL_NAMES | SKILL_TOOL_NAMES | TERMS_TOOL_NAMES | HISTORY_TOOL_NAMES
+            MEMORY_TOOL_NAMES | SKILL_TOOL_NAMES | TERMS_TOOL_NAMES
+            | HISTORY_TOOL_NAMES | WARNINGS_TOOL_NAMES
         )
         assert set(TOOL_NAMES) == names
-        assert len(names) == 23
+        assert len(names) == 24
 
     @pytest.mark.asyncio
     async def test_tool_descriptions_are_canon_verbatim(self, mcp_user) -> None:

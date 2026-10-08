@@ -106,6 +106,11 @@ class Services:
     # тестов, созданных до появления области (их Services(...) без skills
     # остаются валидны); в проде build_services всегда кладёт сервис.
     skills: SkillsService | None = None
+    # 3.2.0 (№12, no12-01/no12-02): состояние общей поверхности предупреждений
+    # `warnings` — читается MCP `warnings_list`, REST `/warnings` и
+    # `/health.warnings`. Классификатор при сборке не нужен (чтение — только
+    # SQL); опционально ради старых DI-сборок, как `skills`.
+    warnings: WarningsService | None = None
 
 
 def build_services(
@@ -187,4 +192,7 @@ def build_services(
         # триграммная, arch lsb-0008 §3.5; точка сборки гибридного поиска).
         terms=TermsService(settings, embedding=embedding),
         links=links,
+        # 3.2.0 (№12): общая поверхность предупреждений (no12-02) — только SQL,
+        # классификатор не нужен (пишет джоба `warnings`, №12 FR-3.2/§13.4).
+        warnings=WarningsService(settings, classifier=None, namespaces=namespaces),
     )

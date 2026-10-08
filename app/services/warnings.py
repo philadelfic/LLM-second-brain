@@ -40,6 +40,7 @@ from app.config import Settings
 from app.services import jobs
 from app.services.classifier import ClassificationError
 from app.services.jobs import JobSpec, queue_snapshot
+from app.services.listing import page_fields
 from app.services.slot_outcome import outcome_of
 from app.storage.db import session, transaction
 
@@ -92,6 +93,14 @@ _LIST_COLUMNS = (
     "id, kind, subject_type, subject_id, message, payload, status, "
     "created_at, updated_at, resolved_at"
 )
+
+
+class WarningsValidationError(ValueError):
+    """Форма листинга предупреждений нарушена (`limit`/`offset`).
+
+    Мягкий отказ: транспорт отвечает `hint` (MCP) либо 422 с текстом (REST),
+    прецедент lsb-0013 — общий с листингами памяти.
+    """
 
 
 class WarningsService:
@@ -289,9 +298,21 @@ class WarningsService:
         offset: int = 0,
         max_limit: int = 50,
     ) -> dict:
-        """Листинг предупреждений — только SQL, без моделей (FR-3.2, §13.4)."""
-        limit = max(1, min(int(limit), int(max_limit)))
-        offset = max(0, int(offset))
+        """Листинг предупреждений — только SQL, без моделей (FR-3.2, §13.4).
+
+        Форма общая с листингами памяти: поля страницы считает общий хелпер
+        `page_fields` (прецедент `NoteService.list`). `limit` вне
+        1..`max_limit` (и отрицательный `offset`) — `WarningsValidationError`:
+        транспорт отвечает мягко (прецедент lsb-0013), а не молча режет.
+        """
+        limit = int(limit)
+        offset = int(offset)
+        if not 1 <= limit <= max_limit:
+            raise WarningsValidationError(
+                f"limit: expected 1..{max_limit}, got {limit}"
+            )
+        if offset < 0:
+            raise WarningsValidationError(f"offset: expected ≥ 0, got {offset}")
         where: list[str] = []
         params: list[object] = []
         for column, value in (
@@ -316,13 +337,7 @@ class WarningsService:
                 [*params, limit, offset],
             ).fetchall()
         warnings = [self._list_dict(row) for row in rows]
-        next_offset = offset + len(warnings)
-        return {
-            "warnings": warnings,
-            "total": total,
-            "has_more": next_offset < total,
-            "next_offset": next_offset if next_offset < total else None,
-        }
+        return {"warnings": warnings, **page_fields(total, offset, len(warnings))}
 
     def counts(self) -> dict:
         """Агрегаты для `/health.warnings`: открытые по видам + total (§7.1)."""

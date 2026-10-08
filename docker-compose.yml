@@ -122,6 +122,8 @@ services:
       DEFAULT_LIST_LIMIT: "20"
       LIST_MAX_LIMIT_MCP: "20"          # listing ceiling on the MCP surface (lsb-0013)
       LIST_MAX_LIMIT_REST: "50"         # listing ceiling on the REST surface (lsb-0013)
+      WARNINGS_MAX_LIMIT_MCP: "20"      # warnings page ceiling on the MCP surface (no12-02, §7.1)
+      WARNINGS_MAX_LIMIT_REST: "50"     # warnings page ceiling on the REST surface (no12-02, §7.1)
       RRF_K: "60"
       MAX_QUERY_CHARS: "512"
       MAX_GET_BATCH: "20"

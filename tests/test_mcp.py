@@ -156,12 +156,12 @@ class TestHandshake:
 
 class TestToolsList:
     @pytest.mark.asyncio
-    async def test_twenty_three_tools(self, server_url: str) -> None:
-        """lsb-0008-02 + №41: поверхность = 8 ручек заметок/узлов + 5 навыков +
-        5 user + 3 terms + 2 общих ручки чтения истории."""
+    async def test_twenty_four_tools(self, server_url: str) -> None:
+        """№12 (no12-02): поверхность = 8 ручек заметок/узлов + 1 предупреждения
+        + 5 навыков + 5 user + 3 terms + 2 общих ручки чтения истории."""
         async with connect(server_url) as session:
             tools = await session.list_tools()
-        assert len(tools.tools) == 23
+        assert len(tools.tools) == 24
         assert {tool.name for tool in tools.tools} == TOOL_NAMES
 
     @pytest.mark.asyncio

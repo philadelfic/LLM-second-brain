@@ -37,6 +37,7 @@ class TestHealth:
                 name: {"enabled": True, "pending": 0}
                 for name in ("skills", "terms", "user")
             },
+            "warnings": {"by_kind": {}, "total": 0},
         }
 
     def test_contract_fields(self, client: TestClient) -> None:
@@ -53,6 +54,7 @@ class TestHealth:
             "pending_summary",
             "queues",
             "areas",
+            "warnings",
         }
         assert body["status"] == "ok"
         # techdebt-0036 (FR-4.2): версия — из приложения, не из окружения.
@@ -75,6 +77,8 @@ class TestHealth:
         assert set(body["areas"]) == {"skills", "terms", "user"}
         for stat in body["areas"].values():
             assert set(stat) == {"enabled", "pending"}
+        # №12 (no12-02): /health.warnings — {by_kind, total} (только SQL).
+        assert body["warnings"] == {"by_kind": {}, "total": 0}
 
     def test_query_string_does_not_break_openness(self, client: TestClient) -> None:
         assert client.get("/health", params={"verbose": 1}).status_code == 200

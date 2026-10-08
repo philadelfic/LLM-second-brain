@@ -107,7 +107,8 @@ class TestInvalidFlag:
 
 
 # Флаги областей (порядок — как в реестре) и ядро агентской поверхности:
-# 8 ручек памяти + 2 общие ручки истории (№41). Ядро гейту области не подлежит.
+# 8 ручек памяти + 2 общие ручки истории (№41) + 1 предупреждения (№12).
+# Ядро гейту области не подлежит.
 _FLAG_NAMES = (
     "AREA_SKILLS_ENABLED",
     "AREA_TERMS_ENABLED",
@@ -125,6 +126,7 @@ _CORE_TOOLS = frozenset(
         "memory_namespace_create",
         "history_list",
         "history_get",
+        "warnings_list",
     }
 )
 
