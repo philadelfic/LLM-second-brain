@@ -428,6 +428,7 @@ class TestCompactOutputs:
             "updated_at",
             "namespace",
             "expires_at",
+            "comment",  # no24-01 (3.2.0)
         }
         listed = (await mcp_notes.call_tool("memory_list", {})).structured_content
         assert set(listed["items"][0]) == {

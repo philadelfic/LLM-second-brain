@@ -2665,7 +2665,7 @@ class BackgroundWorker:
                 # Источник — из `bind_origin` тела джобы (`job:<name>`);
                 # служебные `hint_path`/`confidence` в проекцию не входят.
                 row = conn.execute(
-                    "SELECT text, title, namespace, expires_at FROM notes "
+                    "SELECT text, title, namespace, expires_at, comment FROM notes "
                     "WHERE id = ?",
                     (note_id,),
                 ).fetchone()

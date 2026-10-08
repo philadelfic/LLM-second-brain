@@ -95,6 +95,8 @@ MAX_READ_CHUNKS = 3
 # Название заметки (Фаза 11, решение №9): клиент-модель называет заметку при
 # записи; отсутствие/невалидность — отказ записи с этим hint (§5.3).
 TITLE_HINT = "set a title ≤5 words"
+# no24-01 (3.2.0): канонический текст отказа пометки (доменный лимит 250).
+COMMENT_HINT = "comment: up to 250 characters"
 
 # Сентинел «title не передан»: прямой вызов NoteService.save без транспорта
 # (миграция, скрипты, тесты) — легаси-путь, заметка пишется с title=NULL
@@ -121,6 +123,12 @@ _UNSET_SUMMARY: str = "__LSB_UNSET_SUMMARY__"
 # pydantic не ругается на несеризуемый дефолт (NFR-4). Сравнение в сервисе —
 # по идентичности (is), коллизия с реальным TTL невозможна.
 _UNSET_EXPIRES_AT: str = "__LSB_UNSET_EXPIRES_AT__"
+# Сентинел `comment` (no24-01, 3.2.0): «не передано» = оставить (update) /
+# пусто (save), null или пустая строка = сбросить. JSON-серизуемая строка (как
+# _UNSET_SUMMARY/_UNSET_EXPIRES_AT): дефолт параметра MCP-инструмента, pydantic
+# не ругается на несеризуемый дефолт (NFR-4). Сравнение в сервисе — по
+# идентичности (is), коллизия с реальной пометкой невозможна.
+_UNSET_COMMENT: str = "__LSB_UNSET_COMMENT__"
 
 
 def is_valid_title(title: str | None) -> bool:
@@ -150,6 +158,16 @@ class TitleValidationError(NoteValidationError):
     узле): REST ловит родительский NoteValidationError → 422, MCP-транспорт
     ловит TitleValidationError → fail + hint с TITLE_HINT. Заметка НЕ
     создаётся.
+    """
+
+
+class CommentValidationError(NoteValidationError):
+    """Нарушение контракта пометки (no24-01, 3.2.0): комментарий длиннее
+    COMMENT_MAX_CHARS (250) символов.
+
+    Мягкий отказ (как TitleValidationError): REST ловит родительский
+    NoteValidationError → 422, MCP-транспорт → fail + hint. Заметка (в том
+    числе прежний комментарий) НЕ меняется — частичной записи нет (FR-5.8).
     """
 
 
@@ -233,6 +251,7 @@ class NoteService:
         namespace: str | None = None,
         title: str | None = _UNSET_TITLE,
         expires_at: str | None = _UNSET_EXPIRES_AT,
+        comment: str | None = _UNSET_COMMENT,
     ) -> dict[str, Any]:
         """Валидация (текст, title) → дословный дедуп → INSERT транзакцией.
 
@@ -267,6 +286,11 @@ class NoteService:
         """
         self._validate_text(text)
         note_title = self._validated_save_title(title)
+        # no24-01 (3.2.0): пометка — необязательна (решение О. 2026-10-08):
+        # значение 1..COMMENT_MAX_CHARS → записать, сентинел/null/пусто → NULL.
+        comment_value = (
+            None if comment is _UNSET_COMMENT else self._checked_comment(comment)
+        )
         ns = self._namespaces.validate_placement(
             namespace if namespace is not None else DEFAULT_NAMESPACE
         )
@@ -303,7 +327,7 @@ class NoteService:
                     )
                 note_id = self._insert(
                     conn, text, author, vector_status="pending", namespace=ns,
-                    title=note_title, expires_at=expires_value,
+                    title=note_title, expires_at=expires_value, comment=comment_value,
                 )
                 if expires_value is not None:
                     # TTL задан: синхронизируем очередь удаления (одна запись
@@ -313,7 +337,7 @@ class NoteService:
                 # №41 (§13.5): baseline-версия пишется ТОЙ ЖЕ транзакцией, что и
                 # INSERT, — состояния «заметка есть, истории нет» не бывает.
                 row = conn.execute(
-                    "SELECT text, title, namespace, expires_at FROM notes "
+                    "SELECT text, title, namespace, expires_at, comment FROM notes "
                     "WHERE id = ?",
                     (note_id,),
                 ).fetchone()
@@ -409,19 +433,23 @@ class NoteService:
         namespace: str = "default",
         title: str | None = None,
         expires_at: str | None = None,
+        comment: str | None = None,
     ) -> int:
         """INSERT строки заметки (внутри открытой транзакции).
 
         title (решение №9) — проверен/нормализован вызывающим (_validated_save_title);
         None — легаси-путь миграции (название догенерирует воркер).
         expires_at (lsb-0004-02) — абсолютный ISO-8601 UTC (распарсен
-        вызывающим); None — постоянная заметка (без TTL)."""
+        вызывающим); None — постоянная заметка (без TTL).
+        comment (no24-01) — проверен/нормализован вызывающим (_checked_comment);
+        None — комментария нет."""
         cursor = conn.execute(
-            "INSERT INTO notes (text, title, author, vector_status, namespace, "
-            "expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO notes (text, title, comment, author, vector_status, "
+            "namespace, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 text,
                 title,
+                comment,
                 author if author else self._settings.author_default,
                 vector_status,
                 namespace,
@@ -650,6 +678,7 @@ class NoteService:
         title: str | None = None,
         summary: str | None = _UNSET_SUMMARY,
         expires_at: str | None = _UNSET_EXPIRES_AT,
+        comment: str | None = _UNSET_COMMENT,
     ) -> dict[str, Any]:
         """UPDATE заметки по контракту lsb-0004-01 (решение О. 2026-09-09):
         «не передано» = оставить, null = сбросить. text опционален — можно
@@ -698,6 +727,12 @@ class NoteService:
         if text_changed:
             self._validate_text(text)
         note_title = None if title is None else self._checked_title(title)
+        # no24-01 (3.2.0): пометка правится ОТДЕЛЬНЫМ путём (сентинел-семантика
+        # как у summary/expires_at): не передан → оставить (колонку не трогаем);
+        # значение 1..COMMENT_MAX_CHARS → записать; None/пусто/пробелы → сброс
+        # (NULL). Проверка — ДО любой записи: мягкий отказ без частичной записи.
+        comment_touched = comment is not _UNSET_COMMENT
+        comment_value = self._checked_comment(comment) if comment_touched else None
         # Быстрая проверка до записи: несуществующий id не трогаем.
         with session(self._settings) as conn:
             row = conn.execute(
@@ -766,6 +801,12 @@ class NoteService:
         if note_title is not None:
             sets.append("title = ?")
             params.append(note_title)
+        if comment_touched:
+            # Только комментарий (и updated_at): text/title/summary/
+            # summary_status/vector_status/разметка/links_at/node_order_at,
+            # чанки и notes_vec НЕ трогаются (no24-01, FR-5.3).
+            sets.append("comment = ?")
+            params.append(comment_value)
         sets.append("namespace = ?")
         params.append(ns)
         if summary_touched:
@@ -808,7 +849,7 @@ class NoteService:
                 # читается после UPDATE. `summary` входит только при ЯВНОЙ
                 # передаче (§13.3): авто-перегенерация версий не создаёт.
                 row = conn.execute(
-                    "SELECT text, title, namespace, expires_at, summary "
+                    "SELECT text, title, namespace, expires_at, comment, summary "
                     "FROM notes WHERE id = ?",
                     (note_id,),
                 ).fetchone()
@@ -933,7 +974,7 @@ class NoteService:
                 # Выжившая: контент-версия с источником `merge`; поглощённая:
                 # версия-событие удаления (история читается и после soft delete).
                 older_row = conn.execute(
-                    "SELECT text, title, namespace, expires_at FROM notes "
+                    "SELECT text, title, namespace, expires_at, comment FROM notes "
                     "WHERE id = ?",
                     (older_id,),
                 ).fetchone()
@@ -1112,6 +1153,23 @@ class NoteService:
         assert title is not None  # is_valid_title отсёк None — для типизации
         return title.strip()
 
+    def _checked_comment(self, comment: str | None) -> str | None:
+        """Пометка заметки (no24-01): None/пусто/пробелы → None (сброс), иначе
+        нормализованное значение (краевые пробелы сняты). Длина после strip —
+        1..COMMENT_MAX_CHARS (250); иначе CommentValidationError — мягкий
+        отказ, заметка не меняется."""
+        if comment is None:
+            return None
+        stripped = comment.strip()
+        if not stripped:
+            return None
+        if not 1 <= len(stripped) <= self._settings.comment_max_chars:
+            raise CommentValidationError(
+                f"comment: up to {self._settings.comment_max_chars} characters, "
+                f"got {len(stripped)}"
+            )
+        return stripped
+
     def _validate_text(self, text: str) -> None:
         """1..MAX_NOTE_CHARS — доменное правило REQUIREMENTS FR-4/FR-5."""
         if not 1 <= len(text) <= self._settings.max_note_chars:
@@ -1142,4 +1200,5 @@ class NoteService:
             "updated_at": row["updated_at"],
             "namespace": row["namespace"],
             "expires_at": row["expires_at"],
+            "comment": row["comment"],  # no24-01 (3.2.0): пометка заметки
         }

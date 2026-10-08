@@ -152,6 +152,7 @@ def test_baseline_idempotent() -> None:
         "title": "первая",
         "namespace": "default",
         "expires_at": None,
+        "comment": None,  # no24-01 (3.2.0)
     }
 
     init_db(settings)  # рестарт сервиса — no-op
@@ -181,6 +182,7 @@ def test_baseline_selfheal_missing_row() -> None:
         "title": "третья",
         "namespace": "default",
         "expires_at": None,
+        "comment": None,  # no24-01 (3.2.0)
     }
 
 

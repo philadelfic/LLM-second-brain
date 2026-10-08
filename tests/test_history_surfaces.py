@@ -152,6 +152,7 @@ def test_rest_read_version_content(client: TestClient, token: str) -> None:
         "title": "History note",
         "namespace": "default",
         "expires_at": None,
+        "comment": None,  # no24-01 (3.2.0): контентное поле версионирования
     }
     missing = client.get(
         f"/history/note/{note_id}/99", headers=_headers(token)

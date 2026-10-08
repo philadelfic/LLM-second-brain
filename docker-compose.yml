@@ -140,6 +140,7 @@ services:
       # --- storage ---
       DB_PATH: "/data/notes.db"
       MAX_NOTE_CHARS: "35000"                # max note length
+      COMMENT_MAX_CHARS: "250"               # no24-01 (3.2.0): max comment length of a note (a remark, not knowledge)
       PENDING_RETRY_SEC: "30"                # background worker start interval (×2 → 15 min)
       # --- slot breaks (No39, release 3.2.0): pause with a probe + human hint ---
       SLOT_PAUSE_SEC: "900"          # pause of a broken slot = back-off ceiling (≥30); one probe per pause

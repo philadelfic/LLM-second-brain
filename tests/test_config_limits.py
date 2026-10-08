@@ -153,6 +153,14 @@ class TestRangeLimits:
         with pytest.raises(ConfigError, match="memory_similar_limit"):
             load_env(monkeypatch, MEMORY_SIMILAR_LIMIT="4")
 
+    def test_comment_max_chars_invalid_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """no24-01: COMMENT_MAX_CHARS — доменный лимит пометки; 0 фатален."""
+        with pytest.raises(ConfigError, match="comment_max_chars"):
+            load_env(monkeypatch, COMMENT_MAX_CHARS="0")
+        with pytest.raises(ConfigError, match="comment_max_chars"):
+            load_env(monkeypatch, COMMENT_MAX_CHARS="-5")
+        assert load_env(monkeypatch, COMMENT_MAX_CHARS="250").comment_max_chars == 250
+
     def test_dedup_candidate_range_is_fatal(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

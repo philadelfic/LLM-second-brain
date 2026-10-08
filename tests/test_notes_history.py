@@ -66,7 +66,8 @@ def _fields(entity: str, entity_id: int, version: int) -> dict[str, Any] | None:
 def _live_projection(note_id: int) -> dict[str, Any]:
     with session(get_settings()) as conn:
         row = conn.execute(
-            "SELECT text, title, namespace, expires_at FROM notes WHERE id = ?",
+            "SELECT text, title, namespace, expires_at, comment FROM notes "
+            "WHERE id = ?",
             (note_id,),
         ).fetchone()
     return history.note_projection(row)
@@ -282,3 +283,32 @@ def test_mcp_middleware_binds_origin() -> None:
     asyncio.run(refresher(_Ctx(None, "req-42"), call_next))
     assert seen["origin"] == ("mcp", "req-42")
     assert _mcp_session(_Ctx(None, None)) is None
+
+
+def test_comment_edit_writes_one_content_version(service: NoteService) -> None:
+    """no24-01 (3.2.0): правка `comment` — ровно ОДНА контент-версия.
+
+    `changed == ['comment']`, `source`/`session` — из `bind_origin` (§13.4),
+    text-версии не плодятся (повторное значение версии не создаёт).
+    """
+    note_id = _save(service, unique("История: комментарий"))
+    baseline = len(_versions(ENTITY_NOTE, note_id))
+
+    with bind_origin("mcp", session="owui"):
+        assert service.update(
+            note_id, comment="пригодится к задаче X"
+        )["updated"] is True
+
+    rows = _versions(ENTITY_NOTE, note_id)
+    assert len(rows) == baseline + 1  # text-версии не плодятся
+    version = rows[-1]
+    assert version["event"] == "content"
+    assert json.loads(version["changed"]) == ["comment"]
+    assert version["source"] == "mcp" and version["session"] == "owui"
+    fields = _fields(ENTITY_NOTE, note_id, int(version["version"]))
+    assert fields["comment"] == "пригодится к задаче X"
+    assert fields["text"].startswith("История: комментарий")  # текст не тронут
+
+    with bind_origin("mcp", session="owui"):
+        service.update(note_id, comment="пригодится к задаче X")  # без изменения
+    assert len(_versions(ENTITY_NOTE, note_id)) == baseline + 1

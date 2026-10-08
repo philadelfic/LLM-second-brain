@@ -144,6 +144,38 @@ class TestNotesCrud:
         )
         assert put.status_code == 422
 
+    def test_rest_put_comment_presence(self, client: TestClient, token: str) -> None:
+        """no24-01: `comment` в PUT — по `model_fields_set` (опущено/null/лимит)."""
+        self._create(client, token, "Рест: пометка", title="Рест-пометка")
+        headers = {"Authorization": f"Bearer {token}"}
+        # поле опущено → комментарий не трогается
+        only_text = client.put(
+            "/notes/1", json={"text": "Рест: пометка"}, headers=headers
+        )
+        assert only_text.status_code == 200
+        assert client.get("/notes/1", headers=headers).json()["comment"] is None
+        # поле передано (без text — правка только пометки) → записано
+        written = client.put(
+            "/notes/1", json={"comment": "пригодится к задаче X"}, headers=headers
+        )
+        assert written.status_code == 200
+        assert written.json()["updated"] is True
+        note = client.get("/notes/1", headers=headers).json()
+        assert note["comment"] == "пригодится к задаче X"
+        assert note["text"] == "Рест: пометка"  # текст не перезаписан
+        # null → сброс
+        cleared = client.put("/notes/1", json={"comment": None}, headers=headers)
+        assert cleared.status_code == 200
+        assert client.get("/notes/1", headers=headers).json()["comment"] is None
+        # >250 → 422; прежняя пометка цела
+        client.put("/notes/1", json={"comment": "пометка"}, headers=headers)
+        too_long = client.put(
+            "/notes/1", json={"comment": "х" * 251}, headers=headers
+        )
+        assert too_long.status_code == 422
+        assert "250" in too_long.json()["detail"]
+        assert client.get("/notes/1", headers=headers).json()["comment"] == "пометка"
+
 
 class TestTitleRest:
     """Фаза 11 (решение №9, follow-up 5b): title в REST — валидация переданного

@@ -17,6 +17,7 @@ from app.config import TITLE_MAX_WORDS, get_settings
 from app.services.namespaces import NamespaceError, NamespaceService
 from app.services.notes import (
     TITLE_HINT,
+    CommentValidationError,
     NoteService,
     NoteValidationError,
     TitleValidationError,
@@ -135,6 +136,7 @@ class TestGet:
             "author", "created_at", "updated_at", "namespace",  # Фаза 10 + title (Фаза 11)
             "expires_at",  # lsb-0004-02
             "chars",  # lsb-0010-04 (FR-4.1): объём полного текста в символах
+            "comment",  # no24-01 (3.2.0): пометка заметки (может быть None)
         }
         assert notes[0]["text"] == "Полный текст заметки"
         assert notes[0]["chars"] == len("Полный текст заметки")  # lsb-0010-04
@@ -1017,3 +1019,129 @@ class TestExpiresAtDelete:
         assert _expiration_row(nid) is not None
         assert service.delete(nid)["deleted"] is True
         assert _expiration_row(nid) is None  # должно быть снято при удалении
+
+
+class TestComment:
+    """no24-01 (3.2.0): поле `comment` — отдельный путь правки, «не знание».
+
+    Комментарий пишется (`save`) и правится/сбрасывается (`update`) отдельным
+    путём: `text`/`title`/`summary`/`summary_status`/`vector_status`/разметка/
+    `links_at`/`node_order_at`, чанки и `notes_vec` не трогаются; в
+    суммаризацию, дедуп, векторизацию и связи пометка не входит. Версии
+    истории — tests/test_notes_history.py.
+    """
+
+    # Поля, которые правка комментария НЕ трогает (включая служебные).
+    _UNTOUCHED = (
+        "text", "title", "summary", "summary_status", "vector_status",
+        "classified_at", "hint_path", "confidence", "links_at", "node_order_at",
+    )
+
+    @staticmethod
+    def _processed(service: NoteService, text: str, title: str) -> int:
+        """«Готовая» заметка: вектор, выжимка, разметка причёски и связи."""
+        nid = service.save(text, title=title)["id"]
+        with session(get_settings()) as conn:
+            conn.execute(
+                "UPDATE notes SET vector_status='ready', summary='выжимка', "
+                "summary_status='ok', classified_at='2026-10-08T00:00:00Z', "
+                "hint_path='work/deploy', confidence=0.9, "
+                "links_at='2026-10-08T00:00:00Z', "
+                "node_order_at='2026-10-08T00:00:00Z' WHERE id=?",
+                (nid,),
+            )
+        return nid
+
+    @staticmethod
+    def _note(nid: int) -> dict:
+        with session(get_settings()) as conn:
+            return dict(
+                conn.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()
+            )
+
+    def test_save_with_comment(self, service: NoteService) -> None:
+        """save принимает `comment` сразу (решение О. 2026-10-08)."""
+        saved = service.save(
+            unique("Заметка с пометкой"), title="Пометка", comment="пригодится"
+        )
+        assert saved["stored"] is True
+        assert self._note(saved["id"])["comment"] == "пригодится"
+        other = service.save(unique("Заметка без пометки"), title="Без пометки")
+        assert self._note(other["id"])["comment"] is None  # не передан — пусто
+
+    def test_update_comment_only_touches_comment(self, service: NoteService) -> None:
+        """Правка только комментария: меняются `comment` и `updated_at`."""
+        nid = self._processed(service, long_text(9000), "Комментарий заметки")
+        with session(get_settings()) as conn:
+            vectors.upsert(
+                conn, nid, HashEmbedder(get_settings().embedding_dim).embed("вектор")
+            )
+            chunks_before = [row[1] for row in chunks.get_note_chunks(conn, nid)]
+        _set_updated_at(nid, "2000-01-01T00:00:00Z")
+        before = self._note(nid)
+
+        assert service.update(nid, comment="пригодится к задаче X") == {
+            "id": nid, "updated": True, "summary_pending": False,
+        }
+
+        after = self._note(nid)
+        assert after["comment"] == "пригодится к задаче X"
+        assert after["updated_at"] != before["updated_at"]  # updated_at обновлён
+        for field in self._UNTOUCHED:
+            assert after[field] == before[field], field
+        with session(get_settings()) as conn:
+            assert [row[1] for row in chunks.get_note_chunks(conn, nid)] == chunks_before
+            assert vectors.get_vector(conn, nid) is not None  # вектор не дропнут
+
+    def test_update_comment_not_passed_keeps(self, service: NoteService) -> None:
+        """`comment` не передан (сентинел) → прежний комментарий остаётся."""
+        nid = service.save(unique("Заметка с комментарием"), title="Комментарий")["id"]
+        service.update(nid, comment="почему записал")
+        assert service.update(nid, text=unique("Текст переписан"))["updated"] is True
+        assert self._note(nid)["comment"] == "почему записал"
+
+    def test_update_comment_null_and_empty_clears(self, service: NoteService) -> None:
+        """`comment=None`/пустая строка/пробелы → сброс (NULL)."""
+        nid = service.save(unique("Заметка на сброс"), title="Сброс")["id"]
+        for reset in (None, "", "   "):
+            service.update(nid, comment="пометка")
+            assert self._note(nid)["comment"] == "пометка"
+            service.update(nid, comment=reset)
+            assert self._note(nid)["comment"] is None
+
+    def test_update_comment_whitespace_stripped(self, service: NoteService) -> None:
+        """Краевые пробелы снимаются; граница 250 символов принимается."""
+        nid = service.save(unique("Заметка с пробелами"), title="Пробелы")["id"]
+        service.update(nid, comment="  пометка  ")
+        assert self._note(nid)["comment"] == "пометка"
+        service.update(nid, comment="х" * 250)
+        assert len(self._note(nid)["comment"]) == 250
+
+    def test_update_comment_too_long_is_soft_refusal(self, service: NoteService) -> None:
+        """251 символ → CommentValidationError; частичной записи нет."""
+        nid = self._processed(service, "текст для лимита", "Лимит комментария")
+        service.update(nid, comment="ок")
+        before = self._note(nid)
+        with pytest.raises(CommentValidationError) as exc:
+            service.update(
+                nid,
+                comment="х" * 251,
+                text="этот текст тоже не должен записаться",
+            )
+        assert str(exc.value) == "comment: up to 250 characters, got 251"
+        assert self._note(nid)["comment"] == "ок"
+        assert self._note(nid)["text"] == before["text"]  # частичной записи нет
+
+    def test_full_note_returns_comment(self, service: NoteService) -> None:
+        """Чтение заметки несёт `comment` (None — комментария нет)."""
+        nid = service.save(unique("Заметка о комментарии"), title="Чтение")["id"]
+        assert service.get([nid])["notes"][0]["comment"] is None
+        service.update(nid, comment="видно в чтении")
+        assert service.get([nid])["notes"][0]["comment"] == "видно в чтении"
+
+    def test_dedup_ignores_comment(self, service: NoteService) -> None:
+        """Комментарий не участвует в дедупе: дословный дубль текста отсечён."""
+        text = unique("Заметка для дедупа с пометкой")
+        first = service.save(text, title="Дедуп", comment="с пометкой")
+        second = service.save(text, title="Дедуп")
+        assert second["duplicated"] is True and second["id"] == first["id"]

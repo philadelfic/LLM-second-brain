@@ -402,7 +402,7 @@ class TestMemoryFlow:
         assert note["text"] == text
         assert note["created_at"].endswith("Z") and note["updated_at"].endswith("Z")
         # Компактный контракт Фазы 9: get — белый список из пяти полей (+namespace Фаза 10).
-        assert set(note) == {"id", "text", "chars", "created_at", "updated_at", "namespace", "expires_at"}
+        assert set(note) == {"id", "text", "chars", "created_at", "updated_at", "namespace", "expires_at", "comment"}
         assert note["chars"] == len(text)  # lsb-0010-04: объём полного текста
         assert note["namespace"] == "default"  # save без узла → default (§5.7)
         assert "title" not in note  # Фаза 11: get без названия (там полный текст)
@@ -836,6 +836,100 @@ class TestTitleMCP:
                 "memory_get", {"ids": [note_id]}
             )).structured_content
         assert "title" not in got["notes"][0]
+
+
+class TestCommentMCP:
+    """no24-01 (3.2.0): `comment` — правка/запись/чтение, вне листингов и поиска."""
+
+    marker = f"commentmarker-{uuid.uuid4().hex[:8]}"
+
+    @pytest.mark.asyncio
+    async def test_memory_update_comment_and_get(self, server_url: str) -> None:
+        """memory_update с comment → {id, updated}; memory_get несёт comment."""
+        text = f"{self.marker}: заметка для комментария"
+        async with connect(server_url) as session:
+            note_id = await _saved_id(session, text, title="Комментарий MCP")
+            updated = (await session.call_tool(
+                "memory_update", {"id": note_id, "comment": "пригодится к задаче X"}
+            )).structured_content
+            assert updated == {"id": note_id, "updated": True}
+            got = (await session.call_tool(
+                "memory_get", {"ids": [note_id]}
+            )).structured_content
+        note = got["notes"][0]
+        assert note["comment"] == "пригодится к задаче X"
+        assert note["text"] == text  # text не перезаписан
+
+    @pytest.mark.asyncio
+    async def test_memory_save_comment_and_get(self, server_url: str) -> None:
+        """memory_save принимает comment сразу (решение О. 2026-10-08)."""
+        text = f"{self.marker}: заметка с пометкой при записи"
+        async with connect(server_url) as session:
+            saved = (await session.call_tool("memory_save", {
+                "text": text, "title": "Пометка при записи", "comment": "почему записал",
+            })).structured_content
+            assert saved["stored"] is True
+            got = (await session.call_tool(
+                "memory_get", {"ids": [saved["id"]]}
+            )).structured_content
+        assert got["notes"][0]["comment"] == "почему записал"
+
+    @pytest.mark.asyncio
+    async def test_memory_update_comment_too_long_hint(self, server_url: str) -> None:
+        """251 символ → мягкий отказ {id, updated: False, hint}, без исключения."""
+        async with connect(server_url) as session:
+            note_id = await _saved_id(session, f"{self.marker}: лимит пометки")
+            upd = (await session.call_tool("memory_update", {
+                "id": note_id, "comment": "х" * 251,
+            })).structured_content
+            got = (await session.call_tool(
+                "memory_get", {"ids": [note_id]}
+            )).structured_content
+        assert upd == {
+            "id": note_id, "updated": False,
+            "hint": "comment: up to 250 characters, got 251",
+        }
+        assert got["notes"][0]["comment"] is None  # заметка не тронута
+
+    @pytest.mark.asyncio
+    async def test_memory_get_has_no_comment_in_chunk_mode(self, server_url: str) -> None:
+        """Chunk-режим memory_get комментарий не отдаёт (там чанки)."""
+        text = f"{self.marker}: " + ("длинный текст для чанков " * 60)
+        async with connect(server_url) as session:
+            note_id = await _saved_id(session, text, title="Чанк и комментарий")
+            await session.call_tool(
+                "memory_update", {"id": note_id, "comment": "не в чанках"}
+            )
+            got = (await session.call_tool(
+                "memory_get", {"id": note_id, "chunk": 0}
+            )).structured_content
+        assert got["chunks"]
+        assert "comment" not in got
+        assert all("comment" not in chunk for chunk in got["chunks"])
+
+    @pytest.mark.asyncio
+    async def test_memory_list_and_search_have_no_comment(self, server_url: str) -> None:
+        """Листинг (summaries/titles) и смысловой поиск пометку не несут."""
+        text = f"{self.marker}: заметка для листинга"
+        async with connect(server_url) as session:
+            note_id = await _saved_id(session, text, title="Листинг и пометка")
+            await session.call_tool(
+                "memory_update", {"id": note_id, "comment": "в листинг не идёт"}
+            )
+            listed = (await session.call_tool(
+                "memory_list", {"limit": 5}
+            )).structured_content
+            titled = (await session.call_tool(
+                "memory_list", {"limit": 5, "detail": "titles"}
+            )).structured_content
+            found = (await session.call_tool(
+                "memory_search", {"query": self.marker}
+            )).structured_content
+        assert listed["items"] and titled["items"]
+        for item in listed["items"] + titled["items"]:
+            assert "comment" not in item
+        for hit in found["results"]:
+            assert "comment" not in hit
 
 
 class TestNamespaceMCP:

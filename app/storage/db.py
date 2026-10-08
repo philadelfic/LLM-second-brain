@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS notes (
   id             INTEGER PRIMARY KEY,
   text           TEXT    NOT NULL CHECK(length(text) BETWEEN 1 AND {max_note_chars}),
   title          TEXT    NULL,
+  comment        TEXT    NULL,
   summary        TEXT    NOT NULL DEFAULT '',
   author         TEXT    NOT NULL DEFAULT 'unknown',
   vector_status  TEXT    NOT NULL DEFAULT 'pending',
@@ -661,6 +662,9 @@ def init_db(settings: Settings) -> None:
             # ДО title-миграции FTS: к моменту _sync_fts_title_index колонка
             # title уже существует — перелив индекса читает notes.title.
             _migrate_title_column(conn)
+            # Пометка заметки (№24, 3.2.0): notes.comment TEXT (nullable).
+            # Колонка нужна до вставок/чтений сервиса; FTS пометок — no24-02.
+            _migrate_comment_column(conn)
             # Неймспейсы (Фаза 10): колонки notes + реестр + дефолт-узел.
             _migrate_namespace_columns(conn)
             _migrate_classification_columns(conn)
@@ -760,6 +764,19 @@ def _migrate_title_column(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
     if "title" not in columns:
         conn.execute("ALTER TABLE notes ADD COLUMN title TEXT")
+
+
+def _migrate_comment_column(conn: sqlite3.Connection) -> None:
+    """Нулевая миграция №24 (3.2.0): notes.comment TEXT (nullable).
+
+    Свежие БД получают колонку из _NOTES_DDL; унаследованные — ALTER TABLE
+    ADD COLUMN (идемпотентно, применимо с любой предыдущей версии; NULL =
+    комментария нет). Лимит 250 в схеме НЕ CHECK — валидация доменная
+    (CommentValidationError), как у `title`.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
+    if "comment" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN comment TEXT")
 
 
 # Индексы list-выдач (фаза 2, пул 15; замер 50k: LIST p95 204 мс):

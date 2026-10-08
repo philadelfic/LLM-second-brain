@@ -228,6 +228,9 @@ class Settings(BaseSettings):
     # --- лимиты (NFR-6: env-переопределяемы, валидируются; см. _validate_ranges) ---
     max_note_chars: int = 35000  # 2000→20000 (Фаза 7) → 35000 (решение О. 2026-08-30)
     max_query_chars: int = 512
+    # no24-01 (3.2.0): лимит пометки заметки `comment` (доменная валидация,
+    # не CHECK схемы; мягкий отказ CommentValidationError).
+    comment_max_chars: int = 250
 
     # --- фоновые операции ---
     pending_retry_sec: int = 30  # стартовый интервал до-векторизации/досуммаризации
@@ -459,6 +462,7 @@ class Settings(BaseSettings):
         need_low("max_note_chars", self.max_note_chars, 1)
         need_low("max_query_chars", self.max_query_chars, 1)
         need_low("max_summary_chars", self.max_summary_chars, 1)
+        need_low("comment_max_chars", self.comment_max_chars, 1)
         need_low("snippet_chars", self.snippet_chars, 1)
         need_low("max_get_batch", self.max_get_batch, 1)
         need_range("default_top_k", self.default_top_k, 1, 20)

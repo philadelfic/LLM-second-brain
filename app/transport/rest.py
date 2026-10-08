@@ -78,7 +78,11 @@ from app.services import Services
 from app.services import history
 from app.services.freshness import FreshnessValidationError
 from app.services.namespaces import NamespaceError, NamespaceValidationError
-from app.services.notes import NoteValidationError
+from app.services.notes import (
+    _UNSET_COMMENT,
+    _UNSET_TEXT,
+    NoteValidationError,
+)
 from app.services.search import SearchValidationError
 from app.services.skills import (
     HINT_NOT_FOUND as HINT_SKILL_NOT_FOUND,
@@ -127,11 +131,14 @@ class NoteCreate(BaseModel):
     (не передан) или невалидный (пустой/длиннее TITLE_MAX_WORDS слов) →
     422 «задай title ≤5 слов», заметка НЕ создаётся; контракт един
     с MCP memory_save (сентинел-легаси save(text) — только сервис-слой).
+    no24-01 (3.2.0): необязательный `comment` (≤250) — пометка, известная
+    уже в момент записи (решение О. 2026-10-08).
     """
 
     text: str
     title: str | None = None
     author: str | None = None
+    comment: str | None = None  # no24-01 (3.2.0): пометка заметки (≤250)
 
 
 class NamespaceCreate(BaseModel):
@@ -168,10 +175,15 @@ class NoteUpdate(BaseModel):
 
     Фаза 11 (решение №9): `title` опционален — передан и валиден →
     перезапись, не передан → прежний остаётся (merge-путь не затирает).
+    no24-01 (3.2.0): `comment` — пометка заметки (≤250); наличие поля
+    определяется `model_fields_set` (опущено → сентинел `_UNSET_COMMENT` =
+    не трогаем, `null`/`""` → сброс). `text` тоже опционален: опущен или
+    `null` → текст не перезаписывается (правка только пометки).
     """
 
-    text: str
+    text: str | None = None
     title: str | None = None
+    comment: str | None = None
 
 
 class SkillCreate(BaseModel):
@@ -526,6 +538,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
                 payload.text,
                 payload.author,
                 title=payload.title,
+                comment=payload.comment,
             )
         except NoteValidationError as exc:
             raise _unprocessable(exc) from exc
@@ -586,13 +599,25 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.put("/notes/{note_id}")
     async def update_note(note_id: int, payload: NoteUpdate, request: Request) -> dict:
-        """Перезаписать заметку целиком (FR-5)."""
+        """Перезаписать заметку целиком (FR-5).
+
+        no24-01 (3.2.0): `comment` — по `model_fields_set` (опущено → сентинел
+        `_UNSET_COMMENT` = не трогаем, `null`/`""` → сброс); `text` не передан
+        (или `null`) → сентинел `_UNSET_TEXT` — правка только пометки, текст
+        не перезаписывается (контракт сервиса lsb-0004-01). ``CommentValidationError``
+        → 422 существующим `except NoteValidationError`.
+        """
         try:
             result = await asyncio.to_thread(
                 _services(request).notes.update,
                 note_id,
-                payload.text,
+                payload.text if payload.text is not None else _UNSET_TEXT,
                 title=payload.title,
+                comment=(
+                    payload.comment
+                    if "comment" in payload.model_fields_set
+                    else _UNSET_COMMENT
+                ),
             )
         except NoteValidationError as exc:
             raise _unprocessable(exc) from exc

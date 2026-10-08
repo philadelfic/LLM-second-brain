@@ -1134,7 +1134,9 @@ async def future_block_todo() -> None:
     # TODO(3.2.0 future blocks) — memory handles surface:
     manual("memory handles: search/list/get contract, budgets, pagination",
            "the node hint of `save` (№28) is claimed by "
-           "`scenario_10_node_hint()`; the rest of the surface is claimed by "
+           "`scenario_10_node_hint()`; the freshness filter (№29) — by "
+           "`scenario_11_freshness()`; the note `comment` field (№24) — by "
+           "`scenario_12_comment()`; the rest of the surface is claimed by "
            "the follow-up postановки")
     # TODO(3.2.0 future blocks) — assistant logs:
     manual("assistant logs: event names, masking, no secrets in the log",
@@ -1763,6 +1765,99 @@ async def scenario_11_freshness(c: Client, rest: httpx2.AsyncClient) -> None:
           f"http {r_bad.status_code}")
 
 
+# ==== scenarios: 12. the note `comment` field (№24) ============================
+async def scenario_12_comment(c: Client, rest: httpx2.AsyncClient) -> None:
+    """№24 (FR-5.1…FR-5.8): у заметки есть необязательное поле `comment` —
+    ОТДЕЛЬНЫЙ путь правки: ставится и сбрасывается через `memory_update`,
+    читается в `memory_get` и REST `GET /notes/{id}`, НЕ попадает в листинг и
+    смысловой поиск; превышение лимита (250) — мягкий отказ без частичной
+    записи; правка даёт ровно одну контурную версию с `changed == ['comment']`;
+    текст, объём и дедуп заметки при этом не меняются.
+    """
+    scenario(12, "№24: the note `comment` field — edit path, reading, versions")
+
+    text = f"{RUN['tag']} заметка с пометкой про TaskFlow деплой"
+    title = f"{RUN['tag']} заметка с пометкой"
+    saved = await c.call("memory_save", {"text": text, "title": title})
+    note_id = saved.get("id")
+    if note_id is None:
+        skip("the `comment` field checks",
+             f"the probe note was not created: {note_detail(saved)}")
+        return
+    RUN["notes"].append(note_id)
+
+    before = await c.call("memory_get", {"ids": [note_id]})
+    before_note = (before.get("notes") or [{}])[0]
+
+    comment = "пригодится к задаче TaskFlow"
+    updated = await c.call("memory_update", {"id": note_id, "comment": comment})
+    check("memory_update sets the comment in its own right (FR-5.3): "
+          "`{id, updated: true}`",
+          updated.get("id") == note_id and updated.get("updated") is True,
+          f"answer={updated}")
+
+    got = await c.call("memory_get", {"ids": [note_id]})
+    note = (got.get("notes") or [{}])[0]
+    check("memory_get returns the comment (FR-5.5: full read only)",
+          note.get("comment") == comment, f"comment={note.get('comment')!r}")
+    check("the comment edit leaves the text and its size untouched (FR-5.4)",
+          note.get("text") == before_note.get("text")
+          and note.get("chars") == before_note.get("chars"),
+          f"chars={note.get('chars')}, before={before_note.get('chars')}")
+
+    listed = await c.call("memory_list", {"limit": 20})
+    item = next((i for i in listed.get("items", []) if i.get("id") == note_id), None)
+    titled = await c.call("memory_list", {"limit": 20, "detail": "titles"})
+    title_item = next((i for i in titled.get("items", []) if i.get("id") == note_id),
+                      None)
+    found = await c.call("memory_search", {"query": "TaskFlow деплой"})
+    check("the listing (summaries) carries no `comment` (FR-5.5, budget F-11)",
+          item is not None and "comment" not in item, f"item={item}")
+    check("the compact titles listing carries no `comment`",
+          title_item is not None and "comment" not in title_item,
+          f"item={title_item}")
+    check("the semantic search carries no `comment` (FR-5.7: the comment is not "
+          "knowledge)",
+          all("comment" not in hit for hit in found.get("results", [])),
+          f"hits={len(found.get('results', []))}")
+
+    too_long = await c.call("memory_update", {"id": note_id, "comment": "х" * 251})
+    after_refusal = await c.call("memory_get", {"ids": [note_id]})
+    kept = ((after_refusal.get("notes") or [{}])[0]).get("comment")
+    check("a comment longer than 250 chars is a soft refusal with a hint (FR-5.8)",
+          too_long.get("updated") is False and "250" in (too_long.get("hint") or ""),
+          f"answer={too_long}")
+    check("the refused edit writes nothing (no partial write)",
+          kept == comment, f"comment={kept!r}")
+
+    history = await rest.get(f"/history/note/{note_id}")
+    versions = history.json().get("versions") if history.status_code == 200 else None
+    changed_comment = [v for v in (versions or [])
+                      if (v.get("changed") or []) == ["comment"]]
+    check("the comment edit is versioned as ONE content version "
+          "(`changed == ['comment']`, FR-5.6 / №41)",
+          len(changed_comment) == 1,
+          f"http {history.status_code}, versions={versions}")
+
+    r = await rest.get(f"/notes/{note_id}")
+    rest_comment = r.json().get("comment") if r.status_code == 200 else None
+    check("REST GET /notes/{id} exposes the comment (FR-5.5)",
+          r.status_code == 200 and rest_comment == comment,
+          f"http {r.status_code}, comment={rest_comment!r}")
+    cleared = await rest.put(f"/notes/{note_id}", json={"comment": None})
+    r_after = await rest.get(f"/notes/{note_id}")
+    after_comment = r_after.json().get("comment") if r_after.status_code == 200 else "?"
+    check("REST PUT /notes/{id} clears the comment with `null` while the note "
+          "keeps its text (FR-5.4)",
+          cleared.status_code == 200 and after_comment is None
+          and r_after.json().get("text") == text,
+          f"http {cleared.status_code}, comment={after_comment!r}")
+
+    duplicate = await c.call("memory_save", {"text": text, "title": title})
+    check("dedup of the note is unaffected by its comment (FR-5.4)",
+          duplicate.get("duplicated") is True, f"answer={duplicate}")
+
+
 # ==== run ======================================================================
 async def run_all() -> None:
     async with AsyncExitStack() as stack:
@@ -1791,6 +1886,7 @@ async def run_all() -> None:
             await scenario_9_decision_fallback(c, rest)
             await scenario_10_node_hint(c, rest)
             await scenario_11_freshness(c, rest)
+            await scenario_12_comment(c, rest)
             await future_block_todo()
             close_scenario()
         finally:

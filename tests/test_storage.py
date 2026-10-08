@@ -36,6 +36,8 @@ class TestSchemaCreated:
         confidence + expires_at (lsb-0004-02) + links_at (lsb-0010-02 — маркер
         расчёта связей уровня 1) + node_order_at (lsb-0011-01 — маркер обхода
         default) + warnings_at (№12, 3.2.0 — маркер проверки джобой `warnings`).
+        no24-01 (3.2.0): + comment — пометка заметки (доменный лимит 250, не
+        CHECK схемы).
         lsb-0005-04: пара
         domain_hint/subdomain_hint снята со схемы — груминг переведён на
         единый hint_path."""
@@ -49,6 +51,7 @@ class TestSchemaCreated:
             "summary_status", "created_at", "updated_at", "deleted_at",
             "namespace", "classified_at", "hint_path", "confidence",
             "expires_at", "links_at", "node_order_at", "warnings_at",
+            "comment",  # no24-01 (3.2.0): пометка заметки (NULL = нет)
         }
         # DDL-умолчания: summary пуст, статусы pending, author unknown.
         assert columns["summary"]["dflt_value"] == "''"

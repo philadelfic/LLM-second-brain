@@ -124,6 +124,7 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "RRF_K": ("rrf_k", 60),
     "MAX_NOTE_CHARS": ("max_note_chars", 35000),
     "MAX_QUERY_CHARS": ("max_query_chars", 512),
+    "COMMENT_MAX_CHARS": ("comment_max_chars", 250),  # no24-01 (3.2.0)
     "PENDING_RETRY_SEC": ("pending_retry_sec", 30),
     "LOG_LEVEL": ("log_level", "INFO"),
     "AUTHOR_DEFAULT": ("author_default", "unknown"),
@@ -220,7 +221,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 137 полей: 6 обязательных + 131 с умолчаниями
+        """В Settings — ровно 138 полей: 6 обязательных + 132 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
@@ -234,7 +235,8 @@ class TestCompleteness:
         + 5 настроек джобы нормализации терминов №32 релиза 3.2.0: JOB_TERMS_*
         + 10 настроек decision-слота LSBN-F-12 релиза 3.2.0: DECISION_*;
         + 4 настройки подсказки узла №28 релиза 3.2.0: MEMORY_NODE_HINT_*
-        + 5 настроек подсказки «похожее» №30 релиза 3.2.0: MEMORY_SIMILAR_*)."""
+        + 5 настроек подсказки «похожее» №30 релиза 3.2.0: MEMORY_SIMILAR_*
+        + 1 лимит пометки заметки №24 релиза 3.2.0: COMMENT_MAX_CHARS)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

@@ -49,7 +49,7 @@ ENTITY_USER_FACT = "user_fact"
 # не создают (FR-4.2). Производная (авто) `summary` заметки тоже вне проекции:
 # в версию попадает только явно переданная выжимка (§13.3).
 CONTENT_FIELDS: dict[str, tuple[str, ...]] = {
-    ENTITY_NOTE: ("text", "title", "namespace", "expires_at"),
+    ENTITY_NOTE: ("text", "title", "namespace", "expires_at", "comment"),
     ENTITY_SKILL: ("name", "description", "example", "steps", "text", "extra"),
     ENTITY_SKILL_TEMPLATE: ("instruction_template",),
     ENTITY_TERM: ("term", "context", "definition"),
@@ -62,7 +62,8 @@ def note_projection(
 ) -> dict[str, Any]:
     """Проекция заметки по §5.3 — одна точка правды для save/update/merge.
 
-    Контент: `text`/`title`/`namespace`/`expires_at`. `summary` входит только
+    Контент: `text`/`title`/`namespace`/`expires_at`/`comment` (пометка —
+    контентное поле версионирования №24, FR-5.6). `summary` входит только
     при ЯВНОЙ передаче (`explicit_summary=True`) — авто-перегенерация воркером
     версий не создаёт (§13.3). Служебные поля (`vector_status`,
     `summary_status`, `links_at`, `node_order_at`, `classified_at`) в проекцию
@@ -73,6 +74,7 @@ def note_projection(
         "title": row["title"],
         "namespace": row["namespace"],
         "expires_at": row["expires_at"],
+        "comment": row["comment"],
     }
     if explicit_summary:
         fields["summary"] = row["summary"]
@@ -625,7 +627,8 @@ def entity_fields(
     with session(settings) as conn:
         if entity == ENTITY_NOTE:
             row = conn.execute(
-                "SELECT text, title, namespace, expires_at, summary, deleted_at "
+                "SELECT text, title, namespace, expires_at, comment, summary, "
+                "deleted_at "
                 "FROM notes WHERE id = ?",
                 (entity_id,),
             ).fetchone()
