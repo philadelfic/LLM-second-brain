@@ -189,6 +189,11 @@ class NoteService:
         # узкая инъекция (`WarningsService.resolve_for_subject`), без
         # циклических импортов; в юнит-тестах может отсутствовать.
         self._warnings_resolver: Callable[..., int] | None = None
+        # №30 (3.2.0): подсказка «похожее» при записи (arch §13.4) — узкая
+        # инъекция `SearchService.similar_by_text` (FTS+Dice, без модели),
+        # без импорта search в notes (нет цикла); в юнит-тестах может
+        # отсутствовать — тогда поля `similar` в ответе нет.
+        self._similar_finder: Callable[..., list[dict[str, Any]]] | None = None
 
     def set_summary_notifier(self, notifier: Callable[[], None]) -> None:
         """Подключить сигнал пробуждения воркера суммаризации (main.py)."""
@@ -206,6 +211,18 @@ class NoteService:
         предупреждение заметки в ТОЙ ЖЕ транзакции.
         """
         self._warnings_resolver = resolver
+
+    def set_similar_finder(
+        self, finder: Callable[..., list[dict[str, Any]]] | None
+    ) -> None:
+        """Подключить поиск похожих при save (№30, build_services).
+
+        `finder(text, title, *, exclude_ids, limit, pool, threshold, text_chars)`
+        — обычно `SearchService.similar_by_text`: FTS-кандидаты + Dice
+        значимых слов, БЕЗ вызова модели (§13.4). `None` (по умолчанию) —
+        подсказка выключена.
+        """
+        self._similar_finder = finder
 
     # --- FR-4 memory_save (ARCH §4.1) --------------------------------------
 
@@ -269,6 +286,7 @@ class NoteService:
         # ответ duplicate_response после её закрытия.
         duplicate = None
         foreign_hint = None
+        foreign_id: int | None = None
         with session(self._settings) as conn, transaction(conn):
             duplicate = self._dedup.find_by_text(text, namespace=ns, conn=conn)
             if duplicate is None:
@@ -278,6 +296,7 @@ class NoteService:
                 # ориентированию: hint в ответе.
                 foreign = self._dedup.find_by_text(text, namespace=None, conn=conn)
                 if foreign is not None:
+                    foreign_id = int(foreign["id"])
                     foreign_hint = (
                         f"a similar one exists in «{foreign['namespace']}»; writing here is not "
                         "blocked — cross-node duplicates are legitimate"
@@ -325,6 +344,35 @@ class NoteService:
                     "save hint failed",
                     extra={"event": "save_hint_failed", "hint": "namespace"},
                 )
+        # №30 (3.2.0): подсказка «похожее» — 1–2 ближайших по тексту заметки
+        # (FTS+Dice, БЕЗ модели) для решения «дополнить или создать» (arch
+        # §13.4). Считается ТОЛЬКО на успешной записи (не при duplicated);
+        # свежая заметка уже в индексе — исключаем её id и id чужого
+        # дословного дубля (он уже дан `hint`-ом — не дублируем сигнал).
+        # Сбой поиска запись НЕ роняет: поле не добавляется, событие в лог.
+        if self._settings.memory_similar_enabled and self._similar_finder is not None:
+            try:
+                similar = self._similar_finder(
+                    text,
+                    note_title,
+                    exclude_ids=frozenset(
+                        candidate_id
+                        for candidate_id in (note_id, foreign_id)
+                        if candidate_id is not None
+                    ),
+                    limit=self._settings.memory_similar_limit,
+                    pool=self._settings.memory_similar_pool,
+                    threshold=self._settings.memory_similar_threshold,
+                    text_chars=self._settings.memory_similar_text_chars,
+                )
+            except Exception:  # noqa: BLE001 — подсказка не роняет запись
+                logging.getLogger("app").warning(
+                    "save hint failed",
+                    extra={"event": "save_hint_failed", "hint": "similar"},
+                )
+            else:
+                if similar:
+                    result["similar"] = similar
         return result
 
     def _namespace_hint(self, title: str | None, text: str) -> str:

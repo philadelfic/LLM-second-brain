@@ -705,6 +705,25 @@ class TestMemoryFlow:
         assert [note["text"] for note in notes] == [first_text, second_text]
         assert "hint" not in got  # успешный ответ — без hint (Фаза 9)
 
+    @pytest.mark.asyncio
+    async def test_memory_save_similar_in_response(self, server_url: str) -> None:
+        """№30: save доносит `similar` с id лексически близкой заметки рядом с
+        id/stored/summary_pending; сама заметка при этом создана."""
+        first_text = f"{self.marker}: реестр зарплат СУБО и чек-лист деплоя"
+        second_text = f"{self.marker}: реестр зарплат СУБО, чек-лист деплоя и контакты"
+        async with connect(server_url) as session:
+            first = (await session.call_tool(
+                "memory_save", {"text": first_text, "title": "СУБО реестр"}
+            )).structured_content
+            assert first["stored"] is True
+            second = (await session.call_tool(
+                "memory_save", {"text": second_text, "title": "СУБО реестр"}
+            )).structured_content
+        assert second["stored"] is True
+        assert second["id"] != first["id"]
+        assert {"id", "stored", "summary_pending"} <= set(second)
+        assert first["id"] in [item["id"] for item in second["similar"]]
+
 
 class TestTitleMCP:
     """Фаза 11 (решение №9): title в save/update и выдачах — по живому серверу.

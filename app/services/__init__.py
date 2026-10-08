@@ -179,8 +179,12 @@ def build_services(
         judge=StructureJudgeService(settings, llm=llm_judge, registry=registry),
         namespaces=namespaces,
     )
+    # №30 (3.2.0): save получает подсказку «похожее» — той же точкой поиска,
+    # что и гибрид (FTS+Dice, без модели); контейнер кладёт тот же notes.
+    notes = NoteService(settings, embedding, dedup)
+    notes.set_similar_finder(search.similar_by_text)
     return Services(
-        notes=NoteService(settings, embedding, dedup),
+        notes=notes,
         search=search,
         embedding=embedding,
         dedup=dedup,

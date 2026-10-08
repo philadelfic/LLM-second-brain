@@ -146,6 +146,12 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "MEMORY_NODE_HINT_MIN_SCORE": ("memory_node_hint_min_score", 2.0),
     "MEMORY_NODE_HINT_MAX_NODES": ("memory_node_hint_max_nodes", 2),
     "MEMORY_NODE_HINT_TEXT_CHARS": ("memory_node_hint_text_chars", 200),
+    # №30 (3.2.0): подсказка «похожее» при save (MEMORY_SIMILAR_*).
+    "MEMORY_SIMILAR_ENABLED": ("memory_similar_enabled", True),
+    "MEMORY_SIMILAR_LIMIT": ("memory_similar_limit", 2),
+    "MEMORY_SIMILAR_POOL": ("memory_similar_pool", 5),
+    "MEMORY_SIMILAR_THRESHOLD": ("memory_similar_threshold", 0.30),
+    "MEMORY_SIMILAR_TEXT_CHARS": ("memory_similar_text_chars", 500),
     # Релиз 3.0.0, субстрат областей (постановка 00): лимиты формы и пороги
     # сходства skills/terms/user — из контрактов фич lsb-0007/0008/0009.
     "SKILL_NAME_MAX_CHARS": ("skill_name_max_chars", 65),
@@ -214,7 +220,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 132 поля: 6 обязательных + 126 с умолчаниями
+        """В Settings — ровно 137 полей: 6 обязательных + 131 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
@@ -227,7 +233,8 @@ class TestCompleteness:
         и WARNINGS_* + 2 потолка страницы предупреждений: WARNINGS_MAX_LIMIT_*
         + 5 настроек джобы нормализации терминов №32 релиза 3.2.0: JOB_TERMS_*
         + 10 настроек decision-слота LSBN-F-12 релиза 3.2.0: DECISION_*;
-        + 4 настройки подсказки узла №28 релиза 3.2.0: MEMORY_NODE_HINT_*)."""
+        + 4 настройки подсказки узла №28 релиза 3.2.0: MEMORY_NODE_HINT_*
+        + 5 настроек подсказки «похожее» №30 релиза 3.2.0: MEMORY_SIMILAR_*)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

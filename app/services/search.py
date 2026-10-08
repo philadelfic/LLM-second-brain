@@ -50,7 +50,7 @@ from app.services.embedding import Embedder, EmbeddingError, EmbeddingService
 from app.services.emit import snippet, summary_of
 from app.services.freshness import parse_updated_after
 from app.services.namespaces import NamespaceError, NamespaceService
-from app.services.ranking import fuse_rrf, match_expression
+from app.services.ranking import fuse_rrf, match_expression, significant_tokens
 from app.storage import chunks, vectors
 from app.storage.db import session
 
@@ -341,6 +341,67 @@ class SearchService:
             if hit_id != note_id and hit_id in active and cosine >= threshold
         ]
         return results[:pool]
+
+    def similar_by_text(
+        self,
+        text: str,
+        title: str | None,
+        *,
+        exclude_ids: frozenset[int] = frozenset(),
+        limit: int,
+        pool: int,
+        threshold: float,
+        text_chars: int,
+    ) -> list[dict[str, Any]]:
+        """Подсказка «похожее» при записи (№30, arch §6.4/§8/§13.4).
+
+        БЕЗ эмбеддинга и вызовов моделей: вектор свежей заметки ещё не
+        построен (вектор на пути записи запрещён). Кандидаты — из уже
+        существующего FTS-индекса `notes_fts` (как в `DedupService`,
+        `CROSS JOIN` форсит внешний цикл по FTS), близость — **Dice** по
+        множествам значимых слов (`ranking.significant_tokens`) заголовка и
+        первых `text_chars` символов текста; остаются `score >= threshold`
+        (порог включительный), порядок — score DESC, тай-брейк id DESC, не
+        больше `limit`. Возврат — `[{"id", "title", "namespace"}]` (пустой
+        список — нормальный ответ: похожих нет). `exclude_ids` отсекает саму
+        свежую заметку и id чужих дословных дублей; сбой поиска — на совести
+        вызывающего (save оборачивает в try/except), здесь ошибки не глушатся.
+        """
+        head = " ".join(filter(None, [title, text[:text_chars]]))
+        expression = match_expression(head)
+        if expression is None:  # все слова короче 3 символов — trigram слеп
+            return []
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT n.id, n.title, n.namespace, n.text "
+                "FROM notes_fts "
+                "CROSS JOIN notes n ON n.id = notes_fts.rowid "
+                "WHERE notes_fts MATCH ? AND n.deleted_at IS NULL "
+                "ORDER BY bm25(notes_fts, ?, 1.0), n.updated_at DESC, n.id DESC "
+                "LIMIT ?",
+                (expression, TITLE_FTS_WEIGHT, pool),
+            ).fetchall()
+        head_tokens = set(significant_tokens(head))
+        scored: list[tuple[float, int, str | None, str]] = []
+        for row in rows:
+            if row["id"] in exclude_ids:
+                continue
+            candidate = " ".join(
+                filter(None, [row["title"], (row["text"] or "")[:text_chars]])
+            )
+            candidate_tokens = set(significant_tokens(candidate))
+            if not head_tokens or not candidate_tokens:
+                continue
+            dice = 2 * len(head_tokens & candidate_tokens) / (
+                len(head_tokens) + len(candidate_tokens)
+            )
+            if dice >= threshold:
+                scored.append((dice, row["id"], row["title"], row["namespace"]))
+        scored.sort(key=lambda item: (-item[0], -item[1]))
+        return [
+            {"id": note_id, "title": cand_title, "namespace": namespace}
+            for _, note_id, cand_title, namespace in scored[:limit]
+        ]
 
     # --- источники кандидатов ------------------------------------------------
 

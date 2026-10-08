@@ -512,7 +512,9 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "memory_update. Pass `namespace` from the map if confident about the "
         "domain; omitted — falls into `default` and the reply carries "
         "`namespace_hint`: a node from the map that matches the note (or "
-        "says none matched) — it never moves the note."
+        "says none matched) — it never moves the note. The reply may also "
+        "carry `similar`: the 1–2 nearest notes by text (`id`, `title`, "
+        "`namespace`) — refine one via memory_update or keep yours."
     ),
     "memory_update": (
         "Updates a note by contract lsb-0004-01: «not passed» = keep, null = "
@@ -854,6 +856,10 @@ def _compact_save(result: dict[str, Any]) -> dict[str, Any]:
     # (дедуп чужого узла), тоже только если есть.
     if "namespace_hint" in result:
         out["namespace_hint"] = result["namespace_hint"]
+    # №30 (3.2.0): подсказка «похожее» — 1–2 ближайших заметки
+    # (id/title/namespace) рядом с id/stored; копируется только если есть.
+    if result.get("similar"):
+        out["similar"] = result["similar"]
     return _with_hint(out, result)
 
 

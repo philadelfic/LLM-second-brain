@@ -137,6 +137,22 @@ class TestRangeLimits:
         with pytest.raises(ConfigError, match="memory_node_hint_min_score"):
             load_env(monkeypatch, MEMORY_NODE_HINT_MIN_SCORE="-0.1")
 
+    def test_similar_params_invalid_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """№30: пул меньше лимита и порог > 1 — оба нарушения в один отчёт
+        (NFR-6); потолок подсказок 1..3."""
+        with pytest.raises(ConfigError) as exc:
+            load_env(
+                monkeypatch,
+                MEMORY_SIMILAR_POOL="1",
+                MEMORY_SIMILAR_LIMIT="2",
+                MEMORY_SIMILAR_THRESHOLD="1.5",
+            )
+        message = str(exc.value)
+        assert "memory_similar_pool" in message
+        assert "memory_similar_threshold" in message
+        with pytest.raises(ConfigError, match="memory_similar_limit"):
+            load_env(monkeypatch, MEMORY_SIMILAR_LIMIT="4")
+
     def test_dedup_candidate_range_is_fatal(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

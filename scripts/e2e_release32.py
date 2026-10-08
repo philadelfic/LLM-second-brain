@@ -1588,7 +1588,11 @@ NODE_HINT_DESCRIPTION = "Отчёты по релизам, реестр зарп
 async def scenario_10_node_hint(c: Client, rest: httpx2.AsyncClient) -> None:
     """№28 (FR-1.1…FR-1.6): запись через MCP БЕЗ `namespace` лежит в `default`,
     а ответ несёт `namespace_hint` с существующим узлом карты; запись с явным
-    узлом подсказки не несёт; окно вызова `save` не содержит работы слотов."""
+    узлом подсказки не несёт; окно вызова `save` не содержит работы слотов.
+
+    №30 (FR-3): пересказ уже записанной заметки приходит с `similar` (id
+    ранней) и всё равно сохраняется (её id новый); заметка без похожих поля
+    не несёт; окно `save` остаётся локальным (без работы слотов)."""
     scenario(10, "№28: node hint on save without namespace — the note stays in "
                  "`default`, the answer points at a node, no model call on write")
 
@@ -1651,6 +1655,34 @@ async def scenario_10_node_hint(c: Client, rest: httpx2.AsyncClient) -> None:
     check("an explicit `namespace` gives no `namespace_hint` (FR-1.5)",
           explicit.get("stored") is True and "namespace_hint" not in explicit,
           note_detail(explicit))
+
+    started = time.monotonic()
+    paraphrase = await c.call("memory_save", {
+        "text": "Реестр зарплат СУБО: доступы, контакты поддержки и чек-лист деплоя.",
+        "title": f"{RUN['tag']} реестр зарплат СУБО",
+    })
+    similar_latency = time.monotonic() - started
+    if paraphrase.get("id") is not None:
+        RUN["notes"].append(paraphrase["id"])
+    similar_ids = [item.get("id") for item in paraphrase.get("similar", [])]
+    check("a paraphrase of an existing note is stored anyway and carries "
+          "`similar` with the earlier note id (№30, FR-3)",
+          paraphrase.get("stored") is True
+          and paraphrase.get("id") != saved.get("id")
+          and saved.get("id") in similar_ids,
+          note_detail(paraphrase))
+    check("the `similar` hint is a local FTS read — the save window stays fast "
+          "(no slot work, №30/FR-1.6)",
+          similar_latency < 3.0, f"memory_save took {similar_latency * 1000:.0f} ms")
+    lonely = await c.call("memory_save", {
+        "text": f"{RUN['tag']}qzvx zblorpt",
+        "title": f"{RUN['tag']}qzvx",
+    })
+    if lonely.get("id") is not None:
+        RUN["notes"].append(lonely["id"])
+    check("a note with nothing similar carries no `similar` field (№30, FR-3.4)",
+          lonely.get("stored") is True and "similar" not in lonely,
+          note_detail(lonely))
     snapshot = await health_snapshot(rest)
     check("the contour stays healthy after the writes (the hint is a map read, "
           "not a job)", snapshot.get("status") == "ok",

@@ -325,6 +325,16 @@ class Settings(BaseSettings):
     memory_node_hint_min_score: float = 2.0
     memory_node_hint_max_nodes: int = 2
     memory_node_hint_text_chars: int = 200
+    # Подсказка «похожее» при save (№30, релиз 3.2.0; arch §6.4/§8/§13.4):
+    # кандидаты из FTS-индекса `notes_fts` + Dice по значимым словам заголовка
+    # и первых `MEMORY_SIMILAR_TEXT_CHARS` символов текста — БЕЗ вызова модели
+    # (вектор свежей заметки ещё не построен). Подсказка не блокирует запись
+    # и не роняет её при сбое поиска; `LIMIT` 1..3; `POOL` ≥ `LIMIT`.
+    memory_similar_enabled: bool = True
+    memory_similar_limit: int = 2
+    memory_similar_pool: int = 5
+    memory_similar_threshold: float = 0.30
+    memory_similar_text_chars: int = 500
     # Судья структуры (Фаза 10): отдельный флаг think — дедуп-судья остаётся
     # думающим (решение Фазы 8), судья структуры бездумный (E2E Шага 7:
     # думающий «залипал» на парах-близнецах, голодая суммаризацию; вердикт
@@ -709,6 +719,22 @@ class Settings(BaseSettings):
                 f"{self.memory_node_hint_max_nodes}"
             )
         need_low("memory_node_hint_text_chars", self.memory_node_hint_text_chars, 1)
+        # №30: лимит/пул/текст ≥ 1, порог 0..1; потолок подсказок 1..3 (arch
+        # §6.4 — ответ ≤2, допускаем 3 с запасом) и пул не меньше лимита.
+        need_low("memory_similar_limit", self.memory_similar_limit, 1)
+        need_low("memory_similar_pool", self.memory_similar_pool, 1)
+        need_low("memory_similar_text_chars", self.memory_similar_text_chars, 1)
+        need_range("memory_similar_threshold", self.memory_similar_threshold, 0.0, 1.0)
+        if self.memory_similar_limit > 3:
+            errors.append(
+                "  - memory_similar_limit: больше 3 — ответ раздувается "
+                f"(arch §6.4), получено {self.memory_similar_limit}"
+            )
+        if self.memory_similar_pool < self.memory_similar_limit:
+            errors.append(
+                "  - memory_similar_pool: меньше memory_similar_limit — "
+                f"кандидатов меньше, чем подсказок, получено {self.memory_similar_pool}"
+            )
 
         # --- области 3.0.0 (субстрат: skills / terms / user) ---
         for field in (
