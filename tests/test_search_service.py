@@ -12,9 +12,10 @@ import pytest
 from fakes import HashEmbedder
 
 from app.config import get_settings
+from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
 from app.services.search import MAX_TOP_K, SearchService, SearchValidationError
-from app.storage.db import init_db
+from app.storage.db import init_db, session, transaction
 
 
 def _searcher(settings=None) -> SearchService:
@@ -244,3 +245,43 @@ class TestEmptyAndValidation:
             notes_service.save(unique(f"TaskFlow число {i}"))
         result = _searcher().search("TaskFlow")
         assert len(result["results"]) == 2
+
+
+class TestSearchFreshness:
+    """no29-01: включающая граница свежести в гибридном поиске."""
+
+    @staticmethod
+    def _set_updated_at(note_id: int, stamp: str) -> None:
+        """Прямая правка updated_at (триггер FTS — UPDATE OF text,title — не срабатывает)."""
+        with session(get_settings()) as conn, transaction(conn):
+            conn.execute(
+                "UPDATE notes SET updated_at = ? WHERE id = ?", (stamp, note_id)
+            )
+
+    def test_search_updated_after_excludes_older(self, service) -> None:
+        """Релевантная, но старая заметка не проходит фильтр свежести."""
+        searcher, notes_service = service
+        notes_service.save(unique("TaskFlow деплой на свежем сервере"))
+        notes_service.save(unique("TaskFlow деплой на старом сервере"))
+        self._set_updated_at(1, "2026-01-01T00:00:00Z")
+        self._set_updated_at(2, "2026-03-01T00:00:00Z")
+        hits = searcher.search(
+            "TaskFlow деплой", updated_after="2026-02-01T00:00:00Z"
+        )["results"]
+        assert [r["id"] for r in hits] == [2]
+
+    def test_search_updated_after_inclusive_and_namespace(self, service) -> None:
+        """Граница включающая; фильтр сочетается с namespace/namespace_exact."""
+        searcher, notes_service = service
+        NamespaceService(get_settings()).create("work", "Work notes.")
+        notes_service.save(unique("TaskFlow деплой в рабочем узле"), namespace="work")
+        notes_service.save(unique("TaskFlow деплой в корневом узле"))
+        self._set_updated_at(1, "2026-02-01T00:00:00Z")
+        self._set_updated_at(2, "2026-02-01T00:00:00Z")
+        hits = searcher.search(
+            "TaskFlow деплой",
+            namespace="work",
+            namespace_exact=True,
+            updated_after="2026-02-01T00:00:00Z",
+        )["results"]
+        assert [r["id"] for r in hits] == [1]

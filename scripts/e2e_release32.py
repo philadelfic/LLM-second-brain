@@ -568,6 +568,22 @@ def db_size_text() -> str:
     return f"{size} B ({size / 1048576:.1f} MiB)"
 
 
+def db_write(sql: str, params: tuple = ()) -> str:
+    """Write to the contour DB (the e2e contour owns its DB file); "" on success.
+
+    Used by scenario 11 to force a deterministic `updated_at` of a probe note
+    (the freshness window must not depend on wall-clock seconds).
+    """
+    if not db_ready():
+        return f"DB is not reachable ({CFG['db']})"
+    try:
+        with sqlite3.connect(CFG["db"]) as conn:
+            conn.execute(sql, params)
+        return ""
+    except sqlite3.Error as exc:
+        return f"sqlite: {exc}"
+
+
 # ==== harness: acceptance report (`release/3.2.0/ACCEPTANCE.md`) ================
 def acceptance_path() -> Path:
     """The acceptance report of the release (release/ is not versioned)."""
@@ -1641,6 +1657,80 @@ async def scenario_10_node_hint(c: Client, rest: httpx2.AsyncClient) -> None:
           f"status={snapshot.get('status')!r}")
 
 
+# ==== scenarios: 11. freshness filter (№29) ===================================
+FRESHNESS_BOUNDARY = "2001-01-01T00:00:00Z"
+FRESHNESS_OLD = "2000-01-01T00:00:00Z"
+
+
+async def scenario_11_freshness(c: Client, rest: httpx2.AsyncClient) -> None:
+    """№29 (FR-2.1…FR-2.7): `updated_after` — рабочий срез памяти: поиск и
+    листинг отдают только записи за окно (граница включающая), старая
+    релевантная не проходит, невалидное значение даёт hint; та же ручка на
+    REST-поверхности оператора работает так же."""
+    scenario(11, "№29: freshness filter `updated_after` — search/list, MCP + REST")
+
+    fresh = await c.call("memory_save", {
+        "text": f"{RUN['tag']} свежая заметка про TaskFlow деплой",
+        "title": f"{RUN['tag']} свежая заметка",
+    })
+    old = await c.call("memory_save", {
+        "text": f"{RUN['tag']} старая заметка про TaskFlow деплой",
+        "title": f"{RUN['tag']} старая заметка",
+    })
+    for saved in (fresh, old):
+        if saved.get("id") is not None:
+            RUN["notes"].append(saved["id"])
+    if fresh.get("id") is None or old.get("id") is None:
+        skip("freshness filter checks",
+             f"the probe notes were not created: {note_detail(fresh)} / {note_detail(old)}")
+        return
+
+    # Детерминированное окно: старую заметку отодвигаем за границу, свежую
+    # ставим ровно НА границу (проверяется включающая семантика `>=`).
+    err = db_write("UPDATE notes SET updated_at = ? WHERE id = ?",
+                   (FRESHNESS_OLD, old["id"]))
+    if err:
+        skip("freshness filter checks", f"the DB is not writable: {err}")
+        return
+    db_write("UPDATE notes SET updated_at = ? WHERE id = ?",
+             (FRESHNESS_BOUNDARY, fresh["id"]))
+
+    listed = await c.call("memory_list", {
+        "limit": 20, "updated_after": FRESHNESS_BOUNDARY})
+    ids = [item["id"] for item in listed.get("items", [])]
+    check("memory_list with `updated_after` keeps the fresh note (inclusive "
+          "boundary) and drops the old one",
+          fresh["id"] in ids and old["id"] not in ids,
+          f"ids={ids}, fresh={fresh['id']}, old={old['id']}")
+    unfiltered = await c.call("memory_list", {"limit": 20})
+    check("the listing `total` follows the freshness filter (exactly the stale "
+          "note is excluded)",
+          unfiltered.get("total") == listed.get("total", -1) + 1,
+          f"filtered={listed.get('total')}, all={unfiltered.get('total')}")
+
+    found = await c.call("memory_search", {
+        "query": "TaskFlow деплой", "updated_after": FRESHNESS_BOUNDARY})
+    hit_ids = [r["id"] for r in found.get("results", [])]
+    check("memory_search with `updated_after` drops the relevant but old note",
+          fresh["id"] in hit_ids and old["id"] not in hit_ids, f"ids={hit_ids}")
+
+    bad = await c.call("memory_list", {"updated_after": "за неделю"})
+    check("an invalid `updated_after` gives a soft refusal with a hint",
+          bad.get("items") == [] and "updated_after" in (bad.get("hint") or ""),
+          f"hint={bad.get('hint')!r}")
+
+    r = await rest.get("/notes", params={"updated_after": FRESHNESS_BOUNDARY})
+    rest_ids = ([item["id"] for item in (r.json().get("items") or [])]
+                if r.status_code == 200 else [])
+    check("the REST surface filters GET /notes the same way",
+          r.status_code == 200 and fresh["id"] in rest_ids and old["id"] not in rest_ids,
+          f"http {r.status_code}, ids={rest_ids}")
+    r_bad = await rest.get("/notes", params={"updated_after": "за неделю"})
+    check("REST answers an invalid `updated_after` with 422 (soft refusal, hint)",
+          r_bad.status_code == 422 and "updated_after" in str(r_bad.json().get("detail")),
+          f"http {r_bad.status_code}")
+
+
 # ==== run ======================================================================
 async def run_all() -> None:
     async with AsyncExitStack() as stack:
@@ -1668,6 +1758,7 @@ async def run_all() -> None:
             await scenario_8_budget_raise_release(c, rest)
             await scenario_9_decision_fallback(c, rest)
             await scenario_10_node_hint(c, rest)
+            await scenario_11_freshness(c, rest)
             await future_block_todo()
             close_scenario()
         finally:

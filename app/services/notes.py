@@ -79,6 +79,7 @@ from app.services import history
 from app.services.dedup import DeduplicationService, duplicate_response
 from app.services.embedding import Embedder, EmbeddingService
 from app.services.emit import summary_of
+from app.services.freshness import parse_updated_after
 from app.services.jobs import queue_snapshot
 from app.services.listing import page_fields
 from app.services.namespaces import NamespaceService
@@ -505,6 +506,7 @@ class NoteService:
         namespace: str | None = None,
         namespace_exact: bool = False,
         max_limit: int | None = None,
+        updated_after: str | None = None,
     ) -> dict[str, Any]:
         """Обзор памяти: краткие содержания по свежести + total (FR-2).
 
@@ -517,6 +519,11 @@ class NoteService:
         the single one shared by all listings. Page fields come from the shared
         `page_fields` helper and are present in every branch of the answer;
         ordering, filters and `total` are unchanged.
+
+        no29-01: `updated_after` (ISO-8601 UTC, граница включающая) сужает и
+        страницу, и `total` одним и тем же условием `updated_at >= ?`; порядок
+        `updated_at DESC, id DESC` не меняется. Невалидное значение —
+        FreshnessValidationError (транспорт даёт 422 / мягкий отказ с hint).
         """
         max_limit = (
             self._settings.list_max_limit_rest if max_limit is None else max_limit
@@ -536,18 +543,25 @@ class NoteService:
         else:
             ns_clause = ""
             ns_params = []
+        if updated_after is not None:
+            fresh_clause = " AND updated_at >= ?"
+            fresh_params: list[object] = [parse_updated_after(updated_after)]
+        else:
+            fresh_clause = ""
+            fresh_params = []
         with session(self._settings) as conn:
             rows = conn.execute(
                 "SELECT id, title, namespace, summary, summary_status, author, "
                 "created_at, updated_at, expires_at, text "
                 "FROM notes WHERE deleted_at IS NULL"
-                f"{ns_clause} "
+                f"{ns_clause}{fresh_clause} "
                 "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
-                [*ns_params, limit, offset],
+                [*ns_params, *fresh_params, limit, offset],
             ).fetchall()
             total = conn.execute(
-                f"SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL{ns_clause}",
-                ns_params,
+                f"SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL"
+                f"{ns_clause}{fresh_clause}",
+                [*ns_params, *fresh_params],
             ).fetchone()[0]
         items = [
             {

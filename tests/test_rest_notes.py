@@ -7,6 +7,8 @@ REST — внутренняя поверхность оператора: те ж
 
 from __future__ import annotations
 
+import sqlite3
+
 from fastapi.testclient import TestClient
 
 
@@ -307,3 +309,61 @@ class TestHealthCounters:
         client.delete("/notes/1", headers={"Authorization": f"Bearer {token}"})
         assert health()["notes_count"] == 0
         assert health()["pending_vector"] == 0  # trash не в счётчиках
+
+
+class TestFreshnessFilter:
+    """no29-01: `updated_after` на REST-поверхности оператора (GET /notes, /search)."""
+
+    def _create(self, client: TestClient, token: str, text: str, title: str) -> dict:
+        response = client.post(
+            "/notes", json={"text": text, "title": title},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 201, response.text
+        return response.json()
+
+    def _set_updated_at(self, db_path: str, note_id: int, stamp: str) -> None:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE notes SET updated_at = ? WHERE id = ?", (stamp, note_id)
+            )
+
+    def test_rest_search_and_list_updated_after(
+        self, client: TestClient, token: str, test_env: dict[str, str]
+    ) -> None:
+        first = self._create(
+            client, token, "Рест: свежая заметка про TaskFlow деплой", "Рест-свежая"
+        )
+        second = self._create(
+            client, token, "Рест: старая заметка про TaskFlow деплой", "Рест-старая"
+        )
+        db = test_env["DB_PATH"]
+        self._set_updated_at(db, second["id"], "2026-01-01T00:00:00Z")
+        self._set_updated_at(db, first["id"], "2026-03-01T00:00:00Z")
+        headers = {"Authorization": f"Bearer {token}"}
+        boundary = "2026-02-01T00:00:00Z"
+
+        listed = client.get(
+            "/notes", params={"updated_after": boundary}, headers=headers
+        ).json()
+        assert [item["id"] for item in listed["items"]] == [first["id"]]
+        assert listed["total"] == 1
+
+        found = client.get(
+            "/search",
+            params={"q": "TaskFlow деплой", "updated_after": boundary},
+            headers=headers,
+        ).json()
+        assert [r["id"] for r in found["results"]] == [first["id"]]
+
+        bad_list = client.get(
+            "/notes", params={"updated_after": "за неделю"}, headers=headers
+        )
+        assert bad_list.status_code == 422
+        assert "updated_after" in bad_list.json()["detail"]
+        bad_search = client.get(
+            "/search", params={"q": "TaskFlow", "updated_after": "xx"},
+            headers=headers,
+        )
+        assert bad_search.status_code == 422
+        assert "updated_after" in bad_search.json()["detail"]

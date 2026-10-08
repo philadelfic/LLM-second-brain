@@ -156,6 +156,7 @@ from app.config import Settings
 from app.observability import log_tool_call, preview
 from app.services import Services
 from app.services import history
+from app.services.freshness import FreshnessValidationError, parse_updated_after
 from app.services.namespaces import NamespaceError, NamespaceValidationError
 from app.services.notes import (
     _UNSET_EXPIRES_AT,
@@ -476,14 +477,18 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "not invent what might be saved — search first. If confident about the "
         "domain, pass `namespace` (node or subtree from the map); otherwise "
         "search globally and narrow down. Search mode — parameter `mode`: "
-        "`semantic` (default, by meaning) or `title` (by title substring)."
+        "`semantic` (default, by meaning) or `title` (by title substring). "
+        "Freshness — parameter `updated_after` (ISO-8601 UTC, inclusive): only "
+        "notes changed at or after that moment."
     ),
     "memory_list": (
         "Browse the memory: notes (brief summaries, newest first) with offset "
         "pagination. Use it to orient across topics; does not read all notes in "
         "full. Pass `namespace` to limit the overview to a node/subtree. Output "
         "form — parameter `detail`: `summaries` (default, with brief summaries) "
-        "or `titles` (compact: id, title, namespace)."
+        "or `titles` (compact: id, title, namespace). Freshness — parameter "
+        "`updated_after` (ISO-8601 UTC, inclusive): only notes changed at or "
+        "after that moment."
     ),
     "memory_get": (
         "Read a note. Full text: pass ids (list) or id — read everything you "
@@ -811,6 +816,13 @@ HINT_INVALID_MODE = (
 )
 HINT_INVALID_DETAIL = (
     "unknown list form; available: summaries (default), titles"
+)
+# no29-01: невалидное значение свежести — мягкий отказ (fail + hint); текст
+# совпадает с FreshnessValidationError (один и тот же для сервисов и обоих
+# транспортов). Принимается только абсолютная ISO-8601 UTC.
+HINT_INVALID_UPDATED_AFTER = (
+    "unknown updated_after; expected ISO-8601 UTC: "
+    "YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ"
 )
 
 
@@ -1324,6 +1336,14 @@ def build_mcp(
                 "(by title substring)",
             ),
         ] = "semantic",
+        updated_after: Annotated[
+            str | None,
+            Field(
+                description="Only notes changed at or after this moment "
+                "(ISO-8601 UTC: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ); "
+                "omitted — no freshness filter",
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         started = time.perf_counter()
         if mode not in SEARCH_MODES:
@@ -1338,6 +1358,24 @@ def build_mcp(
                 query=preview(query),
             )
             return {"results": [], "hint": HINT_INVALID_MODE}
+        # no29-01: невалидное значение свежести — мягкий отказ с хинтом (как
+        # mode/detail), сразу после проверки mode.
+        try:
+            fresh = (
+                parse_updated_after(updated_after)
+                if updated_after is not None
+                else None
+            )
+        except FreshnessValidationError:
+            log_tool_call(
+                "memory_search",
+                started,
+                failed=True,
+                reason="invalid updated_after",
+                namespace=namespace,
+                query=preview(query),
+            )
+            return {"results": [], "hint": HINT_INVALID_UPDATED_AFTER}
         try:
             if mode == "title":
                 # lsb-0001-02: title-режим поверх SearchService.search_title
@@ -1348,10 +1386,16 @@ def build_mcp(
                     top_k,
                     namespace,
                     namespace_exact,
+                    fresh,
                 )
             else:
                 result = await asyncio.to_thread(
-                    services.search.search, query, top_k, namespace, namespace_exact
+                    services.search.search,
+                    query,
+                    top_k,
+                    namespace,
+                    namespace_exact,
+                    fresh,
                 )
         except (NamespaceError, NamespaceValidationError) as exc:
             # NFR-4: отказ инструмента наблюдаем — failed + латентность;
@@ -1410,6 +1454,14 @@ def build_mcp(
                 "or titles (compact: id, title, namespace)",
             ),
         ] = "summaries",
+        updated_after: Annotated[
+            str | None,
+            Field(
+                description="Only notes changed at or after this moment "
+                "(ISO-8601 UTC: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ); "
+                "omitted — no freshness filter",
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         started = time.perf_counter()
         if detail not in LIST_DETAILS:
@@ -1423,6 +1475,23 @@ def build_mcp(
                 namespace=namespace,
             )
             return {"items": [], "total": 0, "hint": HINT_INVALID_DETAIL}
+        # no29-01: невалидное значение свежести — мягкий отказ с хинтом (как
+        # detail), сразу после проверки detail.
+        try:
+            fresh = (
+                parse_updated_after(updated_after)
+                if updated_after is not None
+                else None
+            )
+        except FreshnessValidationError:
+            log_tool_call(
+                "memory_list",
+                started,
+                failed=True,
+                reason="invalid updated_after",
+                namespace=namespace,
+            )
+            return {"items": [], "total": 0, "hint": HINT_INVALID_UPDATED_AFTER}
         try:
             result = await asyncio.to_thread(
                 services.notes.list,
@@ -1432,6 +1501,7 @@ def build_mcp(
                 namespace_exact,
                 # Потолок поверхности передаёт транспорт (arch §3.2).
                 max_limit=settings.list_max_limit_mcp,
+                updated_after=fresh,
             )
         except (NamespaceError, NamespaceValidationError) as exc:
             log_tool_call(

@@ -76,6 +76,7 @@ from app import __version__
 from app.config import Settings
 from app.services import Services
 from app.services import history
+from app.services.freshness import FreshnessValidationError
 from app.services.namespaces import NamespaceError, NamespaceValidationError
 from app.services.notes import NoteValidationError
 from app.services.search import SearchValidationError
@@ -534,13 +535,16 @@ def build_rest_router(settings: Settings) -> APIRouter:
         request: Request,
         limit: int | None = Query(default=None, ge=1, le=50),
         offset: int = Query(default=0, ge=0),
+        updated_after: str | None = Query(default=None),
     ) -> dict:
         """Обзор памяти: страница кратких содержаний + поля пагинации (FR-2).
 
         lsb-0013-02 (arch §3.4): потолок поверхности (`list_max_limit_rest`,
         50) проверяет сервис, в ответе — те же поля страницы, что у MCP
         (`total`/`has_more`/`next_offset`/`next_cursor`); подсказки «+N more»
-        на REST нет — полный контракт оператора.
+        на REST нет — полный контракт оператора. no29-01: `updated_after`
+        (ISO-8601 UTC, включающая граница) фильтрует страницу и `total`;
+        невалидное значение → 422 с текстом-hint.
         """
         try:
             return await asyncio.to_thread(
@@ -548,8 +552,9 @@ def build_rest_router(settings: Settings) -> APIRouter:
                 limit,
                 offset,
                 max_limit=settings.list_max_limit_rest,
+                updated_after=updated_after,
             )
-        except NoteValidationError as exc:
+        except (NoteValidationError, FreshnessValidationError) as exc:
             raise _unprocessable(exc) from exc
 
     @rest_router.get("/notes/{note_id}")
@@ -614,13 +619,19 @@ def build_rest_router(settings: Settings) -> APIRouter:
         request: Request,
         q: str = Query(..., min_length=1, max_length=settings.max_query_chars),
         top_k: int | None = Query(default=None, ge=1, le=20),
+        updated_after: str | None = Query(default=None),
     ) -> dict:
-        """Поиск (Фаза 3 — гибрид vec0+FTS, выдача FR-1; offline → FTS-only)."""
+        """Поиск (Фаза 3 — гибрид vec0+FTS, выдача FR-1; offline → FTS-only).
+
+        no29-01: `updated_after` (ISO-8601 UTC, включающая граница) сужает
+        гибрид до свежих заметок; невалидное значение → 422 с текстом-hint.
+        """
         try:
             return await asyncio.to_thread(
-                _services(request).search.search, q, top_k
+                _services(request).search.search, q, top_k, None, False,
+                updated_after,
             )
-        except SearchValidationError as exc:
+        except (SearchValidationError, FreshnessValidationError) as exc:
             raise _unprocessable(exc) from exc
 
     # --- неймспейсы: операторские ручки структуры (Фаза 10, Шаг 6) ----------

@@ -29,6 +29,7 @@ from mcp.client.streamable_http import (
 
 from app.services.dedup import DEDUP_HINT
 from app.transport.mcp import (
+    HINT_INVALID_UPDATED_AFTER,
     SERVER_INSTRUCTIONS,
     SERVER_NAME,
     TOOL_DESCRIPTIONS,
@@ -1411,3 +1412,33 @@ class TestInstructionsBudget:
         # бюджет §2: грубая оценка токенов ≈ длина/4; ~10 узлов — далеко
         # до ~1300 (база сама по себе ~300 токенов).
         assert len(instructions.encode("utf-8")) / 4 <= 1300
+
+
+class TestFreshnessMCP:
+    """no29-01: невалидное `updated_after` — мягкий отказ с хинтом (fail+hint)."""
+
+    @pytest.mark.asyncio
+    async def test_memory_search_invalid_updated_after_hint(
+        self, server_url: str
+    ) -> None:
+        """Оба режима: без исключения, с единственным хинтом свежести."""
+        async with connect(server_url) as session:
+            for mode in ("semantic", "title"):
+                found = (await session.call_tool(
+                    "memory_search",
+                    {"query": "что-то", "mode": mode, "updated_after": "за неделю"},
+                )).structured_content
+                assert found["results"] == []
+                assert found["hint"] == HINT_INVALID_UPDATED_AFTER
+
+    @pytest.mark.asyncio
+    async def test_memory_list_invalid_updated_after_hint(
+        self, server_url: str
+    ) -> None:
+        """Листинг: пустая выдача с хинтом (как неизвестный detail)."""
+        async with connect(server_url) as session:
+            listed = (await session.call_tool(
+                "memory_list", {"updated_after": "xx"}
+            )).structured_content
+        assert listed["items"] == [] and listed["total"] == 0
+        assert listed["hint"] == HINT_INVALID_UPDATED_AFTER
