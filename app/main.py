@@ -29,7 +29,7 @@ from fastapi import FastAPI
 from app import __version__
 from app.config import ConfigError, Settings, get_settings
 from app.observability import setup_logging
-from app.services import Services, build_services
+from app.services import Services, WarningsService, build_services
 from app.services.llm_client import CHECK_AUTH_FAILED, CHECK_OK, LLMClient
 from app.services.worker import BackgroundWorker
 from app.storage.db import StorageError, init_db
@@ -176,6 +176,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Событие только ускоряет — задание живёт в статусе заметки (gate
     # 2026-09-19, прецедент summary-нотификатора).
     services.notes.set_vector_notifier(worker.notify_embedding_pending)
+    # №12 (3.2.0): правка заметки инвалидирует её предупреждение — в той же
+    # транзакции (FR-4.4). Снятию классификатор не нужен (только SQL), поэтому
+    # сервис собирается без него — узкая инъекция без циклических импортов.
+    services.notes.set_warnings_resolver(
+        WarningsService(
+            settings, classifier=None, namespaces=worker._namespaces
+        ).resolve_for_subject
+    )
     # Область навыков (3.0.0): save/правка сигналит петле areas — вектора
     # записи догоняются сразу, а не по выросшему back-off (прецедент
     # summary-нотификатора). None — DI-сборка тестов без области навыков.

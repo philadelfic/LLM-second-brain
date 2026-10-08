@@ -79,6 +79,13 @@ services:
       JOB_NODES_INTERVAL_SEC: "3600"   # start pause between nodes runs in seconds (≥30)
       JOB_NODES_BATCH: "20"            # default notes processed per nodes run (≥1)
       JOB_NODES_CLASSIFIER_BUDGET: "10"  # classifier calls per nodes run (≥1, ≤ JOB_NODES_BATCH)
+      # --- background jobs (lsb-0014): warnings job (№12) ---
+      JOB_WARNINGS_ENABLED: "true"     # misplaced-note warnings job on/off (its queue stays visible in /health)
+      JOB_WARNINGS_INTERVAL_SEC: "3600"  # start pause between warnings runs in seconds (≥30)
+      JOB_WARNINGS_BATCH: "20"         # placed notes checked per warnings run (≥1)
+      JOB_WARNINGS_CLASSIFIER_BUDGET: "10"  # classifier calls per warnings run (≥1, ≤ JOB_WARNINGS_BATCH)
+      WARNINGS_MIN_CONFIDENCE: "0.80"  # confidence threshold for "note is misplaced" (0..1)
+      WARNINGS_LEVEL_STRICT: "false"   # treat a parent/child node mismatch as a warning too
       DEDUP_SIMILARITY: "0.92"               # "duplicate" cosine threshold in background dedup (Phase 8)
       DEDUP_CANDIDATE_TOP_N: "3"             # top-N cosine candidates for the dedup judge
       DEDUP_CANDIDATE_SIMILARITY: "0.80"     # lower paraphrase-candidate threshold (≤ DEDUP_SIMILARITY)

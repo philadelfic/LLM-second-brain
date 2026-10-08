@@ -35,7 +35,8 @@ class TestSchemaCreated:
         9 базовых + namespace/classified_at + разметка причёски hint_path/
         confidence + expires_at (lsb-0004-02) + links_at (lsb-0010-02 — маркер
         расчёта связей уровня 1) + node_order_at (lsb-0011-01 — маркер обхода
-        default). lsb-0005-04: пара
+        default) + warnings_at (№12, 3.2.0 — маркер проверки джобой `warnings`).
+        lsb-0005-04: пара
         domain_hint/subdomain_hint снята со схемы — груминг переведён на
         единый hint_path."""
         init_db(get_settings())
@@ -47,7 +48,7 @@ class TestSchemaCreated:
             "id", "text", "title", "summary", "author", "vector_status",
             "summary_status", "created_at", "updated_at", "deleted_at",
             "namespace", "classified_at", "hint_path", "confidence",
-            "expires_at", "links_at", "node_order_at",
+            "expires_at", "links_at", "node_order_at", "warnings_at",
         }
         # DDL-умолчания: summary пуст, статусы pending, author unknown.
         assert columns["summary"]["dflt_value"] == "''"
@@ -60,6 +61,7 @@ class TestSchemaCreated:
         assert columns["expires_at"]["notnull"] == 0  # lsb-0004-02: NULL = постоянная
         assert columns["links_at"]["notnull"] == 0  # lsb-0010-02: NULL = связи не считаны
         assert columns["node_order_at"]["notnull"] == 0  # lsb-0011-01: NULL = обход не разбирал
+        assert columns["warnings_at"]["notnull"] == 0  # №12: NULL = предупреждения не проверены
 
     def test_fts_external_content_trigram(self) -> None:
         """notes_fts — FTS5 внешний контент с trigram-токенизатором."""

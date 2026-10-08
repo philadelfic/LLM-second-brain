@@ -39,6 +39,7 @@ from app.services.skills import SkillsService
 from app.services.summary import SummaryService
 from app.services.terms import TermsService
 from app.services.user_facts import UserFactsService
+from app.services.warnings import WarningsService
 
 __all__ = [
     "BackupService",
@@ -58,6 +59,7 @@ __all__ = [
     "SummaryService",
     "TermsService",
     "UserFactsService",
+    "WarningsService",
     "build_services",
 ]
 

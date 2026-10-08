@@ -124,7 +124,8 @@ CREATE TABLE IF NOT EXISTS notes (
   confidence     REAL    NULL,
   expires_at     TEXT    NULL,
   links_at       TEXT    NULL,
-  node_order_at  TEXT    NULL
+  node_order_at  TEXT    NULL,
+  warnings_at    TEXT    NULL
 )
 """
 
@@ -205,6 +206,41 @@ CREATE TABLE IF NOT EXISTS links (
 # Индекс обратной стороны пары: выдача и пересчёт ищут связи заметки в обе
 # стороны (`note_a = ? OR note_b = ?`), PRIMARY KEY покрывает только note_a.
 _LINKS_INDEX_DDL = "CREATE INDEX IF NOT EXISTS idx_links_b ON links(note_b)"
+
+# Таблица предупреждений (№12 + №32, arch §5.1): ОДНА общая поверхность
+# предупреждений памяти и терминов, читаемая без вызова модели. Субстрат
+# (прецедент общей `meta`): доступ по ключу `(subject_type, subject_id)`,
+# SQL изоляции областей её не адресует. Не более одного ОТКРЫТОГО
+# предупреждения на (субъект, вид) — повторный прогон джобы обновляет
+# `updated_at`/`payload`, а не плодит строки (§13.7).
+_WARNINGS_DDL = """
+CREATE TABLE IF NOT EXISTS warnings (
+  id           INTEGER PRIMARY KEY,
+  kind         TEXT    NOT NULL,
+  subject_type TEXT    NOT NULL,
+  subject_id   INTEGER NOT NULL,
+  message      TEXT    NOT NULL,
+  payload      TEXT    NOT NULL DEFAULT '{}',
+  status       TEXT    NOT NULL DEFAULT 'open' CHECK(status IN ('open','dismissed')),
+  created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  resolved_at  TEXT    NULL
+)
+"""
+
+# Частичный уникальный индекс: не более одного ОТКРЫТОГО предупреждения на
+# (субъект, вид) — идемпотентность upsert'а (§5.1, §13.7).
+_WARNINGS_UNIQUE_INDEX_DDL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_warnings_open_unique "
+    "ON warnings(subject_type, subject_id, kind) "
+    "WHERE status = 'open' AND resolved_at IS NULL"
+)
+
+# Рабочий индекс листинга/агрегатов (/health.warnings, GET /warnings).
+_WARNINGS_STATUS_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_warnings_status_kind "
+    "ON warnings(status, kind, id)"
+)
 
 # Вектора (Фаза 3): физическая схема в `app.storage.vectors` (размерность и
 # cosine-метрика — там же); в init_db — создание/сверка при старте. Модель
@@ -643,6 +679,10 @@ def init_db(settings: Settings) -> None:
             # — идемпотентно; у существующих заметок NULL (первый прогон джобы
             # `nodes` разбирает накопленный default — ретро-прогон, arch §4).
             _migrate_node_order_columns(conn)
+            # Предупреждения (№12, 3.2.0): служебный маркер notes.warnings_at
+            # — идемпотентно; у существующих заметок NULL (первый прогон
+            # джобы `warnings` проверяет накопленное).
+            _migrate_warnings_columns(conn)
             # Лимит длины саммари (гейт 3.1.0, 2026-09-19): готовые саммари
             # длиннее MAX_SUMMARY_CHARS → pending (перегенерация фоном).
             _migrate_summary_length(conn, settings)
@@ -672,6 +712,10 @@ def init_db(settings: Settings) -> None:
             # до сверки модели/размерности: её ветка дропает area-vec и
             # пересоздаёт их под текущую размерность (_reset_area_vectors).
             _create_area_schema(conn, settings)
+            # Предупреждения (№12/№32): общая таблица `warnings` + индексы —
+            # субстрат, ни на что не влияет, моделей не трогает; ДО сверки
+            # эмбеддинга (arch §5.4).
+            _migrate_warnings_schema(conn)
             # Сид глобального шаблона навыков (lsb-0007 §3.8): сразу после
             # создания skills_meta, идемпотентно, существующее не трогаем.
             _ensure_skills_meta(conn)
@@ -854,6 +898,33 @@ def _migrate_node_order_columns(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
     if "node_order_at" not in columns:
         conn.execute("ALTER TABLE notes ADD COLUMN node_order_at TEXT")
+
+
+def _migrate_warnings_columns(conn: sqlite3.Connection) -> None:
+    """Нулевая миграция №12 (3.2.0) поверх живых БД: маркер notes.warnings_at.
+
+    Свежие БД получают колонку из `_NOTES_DDL`; унаследованные — ALTER TABLE
+    ADD COLUMN (warnings_at NULL у всех заметок: первый прогон джобы `warnings`
+    естественно проверяет их). Маркер — служебный (планирование обхода):
+    версий не создаёт, в выдачи MCP/REST не выходит, предупреждение в заметке
+    НЕ хранится (только строка в `warnings`, arch §5.3). Идемпотентно:
+    повторный запуск (рестарт сервиса) — no-op.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
+    if "warnings_at" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN warnings_at TEXT")
+
+
+def _migrate_warnings_schema(conn: sqlite3.Connection) -> None:
+    """Нулевая миграция №12 (3.2.0): таблица `warnings` + оба индекса (§5.1).
+
+    Общая поверхность предупреждений памяти и терминов (№12 + №32).
+    CREATE TABLE/INDEX IF NOT EXISTS — идемпотентно, повторный старт no-op;
+    моделей и прочих таблиц не касается (arch §5.4).
+    """
+    conn.execute(_WARNINGS_DDL)
+    conn.execute(_WARNINGS_UNIQUE_INDEX_DDL)
+    conn.execute(_WARNINGS_STATUS_INDEX_DDL)
 
 
 def _migrate_link_columns(conn: sqlite3.Connection) -> None:

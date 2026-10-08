@@ -183,6 +183,10 @@ class NoteService:
         # в самом статусе заметки (`vector_status='pending'`), контракт
         # надёжности не меняется.
         self._vector_notifier = vector_notifier
+        # №12 (3.2.0): снятие предупреждений заметки при правке (FR-4.4) —
+        # узкая инъекция (`WarningsService.resolve_for_subject`), без
+        # циклических импортов; в юнит-тестах может отсутствовать.
+        self._warnings_resolver: Callable[..., int] | None = None
 
     def set_summary_notifier(self, notifier: Callable[[], None]) -> None:
         """Подключить сигнал пробуждения воркера суммаризации (main.py)."""
@@ -191,6 +195,15 @@ class NoteService:
     def set_vector_notifier(self, notifier: Callable[[], None]) -> None:
         """Подключить сигнал пробуждения embedding-петли воркера (main.py)."""
         self._vector_notifier = notifier
+
+    def set_warnings_resolver(self, resolver: Callable[..., int]) -> None:
+        """Подключить снятие предупреждений заметки при правке (№12, main.py).
+
+        `resolver(subject_type, subject_id, *, conn)` — обычно
+        `WarningsService.resolve_for_subject`: правка инвалидирует открытое
+        предупреждение заметки в ТОЙ ЖЕ транзакции.
+        """
+        self._warnings_resolver = resolver
 
     # --- FR-4 memory_save (ARCH §4.1) --------------------------------------
 
@@ -701,6 +714,10 @@ class NoteService:
                         row, explicit_summary=summary is not _UNSET_SUMMARY
                     ),
                 )
+                # №12 (FR-4.4): правка заметки инвалидирует её предупреждения
+                # — в ТОЙ ЖЕ транзакции (предупреждение не переживёт откат).
+                if self._warnings_resolver is not None:
+                    self._warnings_resolver("note", note_id, conn=conn)
         if not updated:
             return self._not_found(note_id)
         if text_changed:
@@ -829,6 +846,11 @@ class NoteService:
                         "delete",
                         source="merge",
                     )
+                # №12 (FR-4.4): сшивание инвалидирует предупреждения ОБЕИХ
+                # заметок — в ТОЙ ЖЕ транзакции (правка пары).
+                if self._warnings_resolver is not None:
+                    self._warnings_resolver("note", older_id, conn=conn)
+                    self._warnings_resolver("note", newer_id, conn=conn)
         if merged:
             self._notify_summary_pending()
             # Сшивание переписало текст ранней заметки и вернуло её в очередь

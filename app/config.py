@@ -164,6 +164,21 @@ class Settings(BaseSettings):
     # выше общего батча — экономия вызовов моделей (arch §3.2/§3.4, дефолт 10).
     job_nodes_classifier_budget: int = 10
 
+    # Джоба «предупреждения» `warnings` (№12, релиз 3.2.0; arch §6.5/§8):
+    # обход РАЗМЕЩЁННЫХ заметок (не `default` либо уже разобранных `nodes`) и
+    # подсветка расхождения с разметкой классификатора — БЕЗ автоматического
+    # переноса (§13.5). Интервал ≥ 30 с (дефолт 1 час), батч ≥ 1 (дефолт 20),
+    # бюджет вызовов классификатора за прогон ≥ 1 и ≤ батча (дефолт 10),
+    # порог уверенности 0..1 (дефолт 0.80), строгий уровень «родитель/ребёнок»
+    # (дефолт false — мелкий шум не подсвечиваем); выключатель (false — джоба
+    # не стартует, но её очередь остаётся видна в /health).
+    job_warnings_enabled: bool = True
+    job_warnings_interval_sec: int = 3600
+    job_warnings_batch: int = 20
+    job_warnings_classifier_budget: int = 10
+    warnings_min_confidence: float = 0.80
+    warnings_level_strict: bool = False
+
     # --- лимиты (NFR-6: env-переопределяемы, валидируются; см. _validate_ranges) ---
     max_note_chars: int = 35000  # 2000→20000 (Фаза 7) → 35000 (решение О. 2026-08-30)
     max_query_chars: int = 512
@@ -414,6 +429,23 @@ class Settings(BaseSettings):
                 "общего батча job_nodes_batch — за прогон столько заметок "
                 "не разберётся"
             )
+
+        # Джоба `warnings` (№12, 3.2.0): интервал ≥ 30, батч ≥ 1, бюджет
+        # классификатора ≥ 1 и не выше батча, порог уверенности 0..1.
+        need_low("job_warnings_interval_sec", self.job_warnings_interval_sec, 30)
+        need_low("job_warnings_batch", self.job_warnings_batch, 1)
+        need_low(
+            "job_warnings_classifier_budget", self.job_warnings_classifier_budget, 1
+        )
+        if self.job_warnings_classifier_budget > self.job_warnings_batch:
+            errors.append(
+                "  - job_warnings_classifier_budget: бюджет классификатора выше "
+                "общего батча job_warnings_batch — за прогон столько заметок "
+                "не разберётся"
+            )
+        need_range(
+            "warnings_min_confidence", self.warnings_min_confidence, 0.0, 1.0
+        )
 
         # --- векторизация / суммаризация ---
         need_low("embedding_dim", self.embedding_dim, 1)
