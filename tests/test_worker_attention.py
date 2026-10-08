@@ -20,9 +20,11 @@ from fakes import (
     HashEmbedder,
     RecordingDedup,
     ScriptedJudge,
+    fake_meta,
 )
 
 from app.config import Settings, get_settings
+from app.services.judge import JudgeResult
 from app.services.notes import NoteService
 from app.services.slot_outcome import SlotOutcome
 from app.services.worker import SLOT_CONFIG_META_KEY, BackgroundWorker
@@ -147,10 +149,10 @@ class ProbeJudge:
         self.probe_calls += 1
         return self._result
 
-    def judge(self, text_new: str, text_candidate: str) -> bool:
+    def judge(self, text_new: str, text_candidate: str) -> JudgeResult:
         self.judge_calls.append((text_new, text_candidate))
         self.last_attempt_ok = True
-        return False
+        return JudgeResult(verdict=False, meta=fake_meta("judge", "judge"))
 
     def close(self) -> None:
         return None

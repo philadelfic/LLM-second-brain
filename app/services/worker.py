@@ -148,7 +148,7 @@ from app.services.jobs import (
     run_loop,
 )
 from app.services.judge import Judge, JudgeError
-from app.services.llm_client import CHECK_AUTH_FAILED, CHECK_OK
+from app.services.llm_client import CHECK_AUTH_FAILED, CHECK_OK, ChatMeta
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
 from app.services.promotion import PromotionService
@@ -209,6 +209,36 @@ _SLOT_JOB_NAMES = {
     SLOT_JUDGE: JUDGE_JOB,
     NODES_JOB: NODES_JOB,
 }
+
+
+def _call_meta_fields(meta: ChatMeta) -> dict[str, object]:
+    """Поля вызова для события отказа (§7.2): цифры/признаки, без секретов."""
+    return {
+        "operation": meta.operation,
+        "model_type": meta.model_type,
+        "budget": meta.budget,
+        "budget_source": meta.budget_source,
+        "prompt_tokens": meta.prompt_tokens,
+        "completion_tokens": meta.completion_tokens,
+        "reasoning_tokens": meta.reasoning_tokens,
+        "had_thinking": meta.had_thinking,
+        "finish_reason": meta.finish_reason,
+        "duration_ms": meta.duration_ms,
+    }
+
+
+def _call_log_fields(meta: ChatMeta) -> dict[str, object]:
+    """Полный набор полей успешного вызова `slot_call` (№49, §7.2)."""
+    fields = _call_meta_fields(meta)
+    fields.update(
+        {
+            "provider": meta.provider,
+            "model": meta.model,
+            "thinking_chars": meta.thinking_chars,
+            "truncated": meta.truncated,
+        }
+    )
+    return fields
 
 # meta-ключ отпечатка конфигурации слотов (№39, arch §6.8/§13.3): смена
 # конфигурации слота — часть «причины» внимания, поэтому старт со сменой
@@ -748,13 +778,16 @@ class BackgroundWorker:
         older_id: int | None = None,
         candidate_id: int | None = None,
         detail: str | None = None,
+        meta: ChatMeta | None = None,
         **extra: object,
     ) -> None:
         """Единая точка отказа слота (№39, arch §6.7): событие + исход в журнал.
 
         Поля события: `event`, `job`, `slot`, `outcome` (значение строки),
         `detail` (фрагмент ≤160 симв.; секреты маскируются 4 симв. + `***`),
-        `note_id`/`older_id`/`candidate_id` по факту. Отказ фиксируется и у
+        `note_id`/`older_id`/`candidate_id` по факту. №49: если вызов модели
+        состоялся (отказ после ответа — `meta` у ошибки), событие дополняется
+        полями вызова (§7.2) — второй записи нет. Отказ фиксируется и у
         разрыва слота: открылся — пишется `slot_paused`. Вызывающий сохраняет
         прежнее поведение (работа остаётся pending, `continue`).
         """
@@ -774,6 +807,8 @@ class BackgroundWorker:
         ):
             if value is not None:
                 fields[key] = value
+        if meta is not None:
+            fields.update(_call_meta_fields(meta))
         fields.update(extra)
         logging.getLogger("app").warning(message, extra=fields)
         self._note_slot_outcome(job, slot, outcome)
@@ -793,6 +828,35 @@ class BackgroundWorker:
             if value is not None:
                 payload[key] = value
         logging.getLogger("app").log(level, event, extra=payload)
+
+    def _log_slot_call(
+        self,
+        job: str,
+        slot: str,
+        meta: ChatMeta | None,
+        *,
+        note_id: int | None = None,
+        older_id: int | None = None,
+        candidate_id: int | None = None,
+    ) -> None:
+        """Успешный вызов чата слота — событие `slot_call` (№49, §7.2).
+
+        Одно событие на вызов: бюджет и его источник, счётчики, факт и объём
+        размышления, причина завершения, обрезка, длительность. Без метаданных
+        (тестовый двойник/слот без `chat_result`) событие не пишется — живой
+        сервис их всегда отдаёт (№49 FR-3.1).
+        """
+        if meta is None:
+            return
+        fields = _call_log_fields(meta)
+        for key, value in (
+            ("note_id", note_id),
+            ("older_id", older_id),
+            ("candidate_id", candidate_id),
+        ):
+            if value is not None:
+                fields[key] = value
+        self._log_slot_event("slot_call", slot, job, level=logging.INFO, **fields)
 
     def _mask_detail(self, detail: str | None) -> str | None:
         """Фрагмент причины ≤160 симв. с маскировкой секретов (4 симв. + ***).
@@ -2011,6 +2075,7 @@ class BackgroundWorker:
                         candidates=[
                             candidate_id for candidate_id, _ in alive
                         ],
+                        meta=getattr(exc, "meta", None),
                     )
                     self._note_attempt(
                         job["id"],
@@ -2112,8 +2177,15 @@ class BackgroundWorker:
                 payload["newer_updated_at"] = newer["updated_at"]
                 self._set_job_payload(job["id"], payload)
             try:
-                merged = self._summarizer.merge(older["text"], newer["text"])
-                outcome = self._notes.merge_pair(older_id, merged, note_id)
+                merge_result = self._summarizer.merge(older["text"], newer["text"])
+                self._log_slot_call(
+                    SUMMARY_JOB,
+                    SLOT_SUMMARY,
+                    merge_result.meta,
+                    older_id=older_id,
+                    note_id=note_id,
+                )
+                outcome = self._notes.merge_pair(older_id, merge_result.text, note_id)
                 if not outcome["merged"]:
                     # Ранняя исчезла (оператор удалил) между вычиткой и
                     # сведением — слияние не состоялось, работа снимается;
@@ -2132,6 +2204,7 @@ class BackgroundWorker:
                     older_id=older_id,
                     note_id=note_id,
                     detail=str(exc),
+                    meta=getattr(exc, "meta", None),
                 )
                 self._note_attempt(
                     job["id"],
@@ -2239,8 +2312,15 @@ class BackgroundWorker:
                 None,
             )
         for candidate_id, cosine_value in candidates:
-            verdict = self._judge.judge(
+            result = self._judge.judge(
                 by_id[note_id]["text"], by_id[candidate_id]["text"]
+            )
+            self._log_slot_call(
+                JUDGE_JOB,
+                SLOT_JUDGE,
+                result.meta,
+                note_id=note_id,
+                candidate_id=candidate_id,
             )
             logging.getLogger("app").info(
                 "dedup: judge verdict for cosine candidate",
@@ -2250,10 +2330,10 @@ class BackgroundWorker:
                     "note_id": note_id,
                     "candidate_id": candidate_id,
                     "cosine": cosine_value,
-                    "verdict": verdict,
+                    "verdict": result.verdict,
                 },
             )
-            if verdict:
+            if result.verdict:
                 return (candidate_id, cosine_value)
         return None
 
@@ -2301,9 +2381,13 @@ class BackgroundWorker:
                     message="title: generation failed — kept null, retry by back-off",
                     note_id=row["id"],
                     detail=str(exc),
+                    meta=getattr(exc, "meta", None),
                 )
                 continue  # отказ: title остаётся NULL, повтор по back-off
-            title = self._truncate_title(generated)
+            self._log_slot_call(
+                SUMMARY_JOB, SLOT_SUMMARY, generated.meta, note_id=row["id"]
+            )
+            title = self._truncate_title(generated.text)
             if not title:
                 continue
             with session(self._settings) as conn, transaction(conn):
@@ -2393,7 +2477,7 @@ class BackgroundWorker:
         done = 0
         for row in rows:
             try:
-                summary = self._summarizer.summarize(row["text"])
+                summary_result = self._summarizer.summarize(row["text"])
             except SummaryError as exc:
                 self._log_slot_failure(
                     SUMMARY_JOB,
@@ -2403,12 +2487,18 @@ class BackgroundWorker:
                     message="summary: generation failed — kept pending, retry by back-off",
                     note_id=row["id"],
                     detail=str(exc),
+                    meta=getattr(exc, "meta", None),
                 )
                 continue  # отказ: status pending остаётся, повтор по back-off
+            self._log_slot_call(
+                SUMMARY_JOB, SLOT_SUMMARY, summary_result.meta, note_id=row["id"]
+            )
             # Страховка длины (решение гейта 3.1.0, 2026-09-19): модель может
             # не послушать промпт («no more than 150 characters») — в БД уходит
             # усечённое по границе слова саммари, всегда ≤ MAX_SUMMARY_CHARS.
-            summary = cap_summary(summary, self._settings.max_summary_chars)
+            summary = cap_summary(
+                summary_result.text, self._settings.max_summary_chars
+            )
             with session(self._settings) as conn, transaction(conn):
                 cursor = conn.execute(
                     "UPDATE notes SET summary = ?, summary_status = 'ok' "
@@ -2593,8 +2683,12 @@ class BackgroundWorker:
                 message="classify: failed — note stays in default, retry on next update",
                 note_id=note_id,
                 detail=str(exc),
+                meta=getattr(exc, "meta", None),
             )
             return
+        self._log_slot_call(
+            SUMMARY_JOB, SLOT_SUMMARY, result.meta, note_id=note_id
+        )
         # Пул 6: переезд — ОДНА общая точка `_apply_node_order` (разметка +
         # namespace/vector_status одним UPDATE, guard внутри); отказ
         # вычисления цели (в т.ч. NamespaceValidationError на мусорном hint)
@@ -2797,8 +2891,12 @@ class BackgroundWorker:
                 note_id=note_id,
                 detail=str(exc),
                 source="after_merge",
+                meta=getattr(exc, "meta", None),
             )
             return False
+        self._log_slot_call(
+            NODES_JOB, SLOT_SUMMARY, result.meta, note_id=note_id
+        )
         outcome, reason, target = self._apply_node_order(
             note_id,
             row["namespace"],
@@ -2866,8 +2964,12 @@ class BackgroundWorker:
                     message="nodes: classify failed — note stays in default, retry later",
                     note_id=note_id,
                     detail=str(exc),
+                    meta=getattr(exc, "meta", None),
                 )
                 continue  # маркер не ставим: заметка снова кандидат обхода
+            self._log_slot_call(
+                NODES_JOB, SLOT_SUMMARY, result.meta, note_id=note_id
+            )
             outcome, reason, target = self._apply_node_order(
                 note_id,
                 "default",

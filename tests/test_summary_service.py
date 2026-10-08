@@ -90,8 +90,8 @@ NOTE = (
 def test_summarize_returns_content(monkeypatch) -> None:
     settings = make_settings(monkeypatch)
     service, _ = make_service(settings, [httpx.Response(200, json=ok_body())])
-    summary = service.summarize(NOTE)
-    assert summary == "Краткое содержание одним предложением."
+    result = service.summarize(NOTE)
+    assert result.text == "Краткое содержание одним предложением."
     assert service.last_attempt_ok is True
     service.close()
 
@@ -108,8 +108,8 @@ def test_thinking_field_is_discarded(monkeypatch) -> None:
     settings = make_settings(monkeypatch)
     service, _ = make_service(settings, [httpx.Response(200, json=ok_body())])
     summary = service.summarize(NOTE)
-    assert "рассуждаем" not in summary
-    assert summary == ok_body()["message"]["content"]
+    assert "рассуждаем" not in summary.text
+    assert summary.text == ok_body()["message"]["content"]
 
 
 def test_content_stripped(monkeypatch) -> None:
@@ -118,7 +118,7 @@ def test_content_stripped(monkeypatch) -> None:
     service, _ = make_service(
         settings, [httpx.Response(200, json=ok_body("  предложение. \n"))]
     )
-    assert service.summarize(NOTE) == "предложение."
+    assert service.summarize(NOTE).text == "предложение."
 
 
 # --- контраст запроса (ARCH §4.7) --------------------------------------------
@@ -154,8 +154,10 @@ def test_stream_disabled_and_generation_params(monkeypatch) -> None:
     service.summarize(NOTE)
     payload = last_payload(recorder)
     assert payload["stream"] is False
-    assert payload["num_predict"] == settings.summary_num_predict
-    assert payload["num_predict"] == settings.summary_num_predict == 35000  # потолок после решения О. 2026-08-30
+    # №49: дефолт кода — авто (0); при неизвестном контексте действует прежний
+    # потолок v3.1.0 (legacy 35000) — поведение не изменилось.
+    assert settings.summary_num_predict == 0
+    assert payload["num_predict"] == 35000
     assert payload["temperature"] == 0.1
     assert "keep_alive" not in payload  # решение №6: моделью управляет сервер
 
@@ -177,7 +179,7 @@ def test_ollama_payload_bytes_minus_keep_alive(monkeypatch) -> None:
             {"role": "user", "content": NOTE},
         ],
         "stream": False,
-        "num_predict": settings.summary_num_predict,
+        "num_predict": 35000,  # №49: legacy-потолок (контекст неизвестен)
         "temperature": 0.1,
     }
     assert recorder.requests[0].read() == json.dumps(
@@ -199,7 +201,7 @@ def test_think_false_payload_bytes_minus_keep_alive(monkeypatch) -> None:
             {"role": "user", "content": NOTE},
         ],
         "stream": False,
-        "num_predict": settings.summary_num_predict,
+        "num_predict": 35000,  # №49: legacy-потолок (контекст неизвестен)
         "temperature": 0.1,
         "think": False,
     }
@@ -262,7 +264,7 @@ def test_service_returns_content_as_is(monkeypatch) -> None:
     settings = make_settings(monkeypatch)
     long_content = "д" * (settings.max_summary_chars + 50)
     service, _ = make_service(settings, [httpx.Response(200, json=ok_body(long_content))])
-    assert service.summarize(NOTE) == long_content
+    assert service.summarize(NOTE).text == long_content
     service.close()
 
 
@@ -368,7 +370,7 @@ def test_merge_returns_content(monkeypatch) -> None:
         [httpx.Response(200, json=ok_body("Молоко и хлеб куплены по дороге домой."))],
     )
     merged = service.merge(TEXT_A, TEXT_B)
-    assert merged == "Молоко и хлеб куплены по дороге домой."
+    assert merged.text == "Молоко и хлеб куплены по дороге домой."
     assert service.last_attempt_ok is True
     service.close()
 
@@ -398,7 +400,9 @@ def test_merge_system_prompt_and_marked_texts(monkeypatch) -> None:
     # остальное — как у summarize, только num_predict свой (MERGE_NUM_PREDICT)
     assert payload["model"] == settings.summary_model
     assert payload["stream"] is False
-    assert payload["num_predict"] == settings.merge_num_predict == 35000
+    assert settings.merge_num_predict == 0  # №49: дефолт кода — авто
+    # при неизвестном контексте действует legacy-потолок слияния (35000)
+    assert payload["num_predict"] == 35000
     service.close()
 
 
@@ -409,7 +413,7 @@ def test_merge_result_truncated_to_max_note_chars(monkeypatch) -> None:
     long_content = "ф" * (settings.max_note_chars + 70)
     service, _ = make_service(settings, [httpx.Response(200, json=ok_body(long_content))])
     merged = service.merge(TEXT_A, TEXT_B)
-    assert len(merged) == settings.max_note_chars == 35000
+    assert len(merged.text) == settings.max_note_chars == 35000
     service.close()
 
 

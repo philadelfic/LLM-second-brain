@@ -61,12 +61,13 @@ JUDGE_NUM_PREDICT (прод 1024: замер ~1200 токенов, done_reason=s
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
 import httpx
 
 from app.config import Settings
-from app.services.llm_client import LLMClient, LLMError, SlotSpec
+from app.services.llm_client import ChatMeta, LLMClient, LLMError, SlotSpec
 from app.services.prompts import PromptRegistry
 from app.services.slot_outcome import SlotOutcome, classify_llm_error
 
@@ -84,9 +85,22 @@ class JudgeError(RuntimeError):
         message: str,
         *,
         outcome: SlotOutcome = SlotOutcome.OFF_CONTRACT,
+        meta: ChatMeta | None = None,
     ) -> None:
         super().__init__(message)
         self.outcome = outcome
+        # Метаданные состоявшегося вызова (№49): отказ после ответа модели
+        # (вердикт не распознан) несёт их воркеру — отказ в журнале виден
+        # теми же полями вызова, что и успех (§7.2).
+        self.meta = meta
+
+
+@dataclass(frozen=True)
+class JudgeResult:
+    """Результат судьи вместе с метаданными вызова (№49, §6.3)."""
+
+    verdict: bool
+    meta: ChatMeta
 
 
 class Judge(Protocol):
@@ -96,8 +110,12 @@ class Judge(Protocol):
     (tests/fakes.py) — воркер зависит от протокола, а не от класса клиента.
     """
 
-    def judge(self, text_new: str, text_candidate: str) -> bool:
-        """Вердикт по паре текстов: True — дубль, False — не дубль."""
+    def judge(self, text_new: str, text_candidate: str) -> JudgeResult:
+        """Вердикт по паре текстов: True — дубль, False — не дубль.
+
+        Невозможность дать вердикт — отказ (безопаснее «не сводить»): воркер
+        оставит обе заметки и повторит по back-off (NFR-3).
+        """
         ...
 
     def probe(self) -> str:
@@ -146,12 +164,13 @@ class JudgeService:
         if not text_candidate or not text_candidate.strip():
             raise ValueError("judge: пустая заметка недопустима")
         try:
-            content = self._llm.chat(
+            result = self._llm.chat_result(
                 self._prompts.judge_system,
                 self._prompts.judge_user.format(
                     text_new=text_new, text_candidate=text_candidate
                 ),
-                num_predict=self._settings.judge_num_predict,
+                num_predict=self._settings.judge_num_predict or None,
+                operation="judge",
             )
         except LLMError as exc:
             # Текст клиента сохраняется: HTTP-статус, адрес слота, hint
@@ -160,12 +179,13 @@ class JudgeService:
             self.last_attempt_ok = False  # деградация станет видна в /health
             raise JudgeError(str(exc), outcome=classify_llm_error(exc)) from exc
         try:
-            verdict = self._verdict(content)
-        except JudgeError:
+            verdict = self._verdict(result.content)
+        except JudgeError as exc:
             self.last_attempt_ok = False  # нераспознанный вердикт — тоже отказ
-            raise
+            # Вызов состоялся — метаданные уходят воркеру вместе с отказом.
+            raise JudgeError(str(exc), outcome=exc.outcome, meta=result.meta) from exc
         self.last_attempt_ok = True
-        return verdict
+        return JudgeResult(verdict=verdict, meta=result.meta)
 
     def close(self) -> None:
         """Закрыть HTTP-пул (чистое завершение процесса)."""

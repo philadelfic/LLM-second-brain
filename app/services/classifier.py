@@ -50,13 +50,15 @@ from typing import Any, Protocol
 import httpx
 
 from app.config import Settings
-from app.services.llm_client import LLMClient, LLMError, SlotSpec
+from app.services.llm_client import ChatMeta, LLMClient, LLMError, SlotSpec
 from app.services.namespaces import NamespaceService, NamespaceValidationError
 from app.services.prompts import PromptRegistry
 from app.services.slot_outcome import SlotOutcome, classify_llm_error
 
 # Параметры вызова, не настраиваемые env (ARCH §4.7): маленький бюджет
-# JSON-разметки; think:false — явный запрет рассуждений (быстрее).
+# JSON-разметки; think:false — явный запрет рассуждений (быстрее). №49: это
+# legacy-потолок классификатора ("classify" в slot_budget.LEGACY_OUTPUT_BUDGET),
+# действующий при неизвестном контексте; при заявленном — авто-бюджет.
 CLASSIFIER_NUM_PREDICT = 768
 
 
@@ -73,9 +75,13 @@ class ClassificationError(RuntimeError):
         message: str,
         *,
         outcome: SlotOutcome = SlotOutcome.OFF_CONTRACT,
+        meta: ChatMeta | None = None,
     ) -> None:
         super().__init__(message)
         self.outcome = outcome
+        # Метаданные состоявшегося вызова (№49): отказ после ответа модели
+        # (разметка не разобрана) несёт их воркеру.
+        self.meta = meta
 
 
 @dataclass(frozen=True)
@@ -84,6 +90,7 @@ class Classification:
 
     hint_path: str | None  # полный путь 1..3 слага или null (общая)
     confidence: float  # 0..1
+    meta: ChatMeta | None = None  # №49: метаданные вызова (заполняет сервис)
 
 
 class Classifier(Protocol):
@@ -134,11 +141,15 @@ class ClassificationService:
         if not text or not text.strip():
             raise ValueError("classify: пустой текст заметки")
         try:
-            content = self._llm.chat(
+            chat = self._llm.chat_result(
                 self._prompts.classifier_system,
                 self._user_message(text, known_nodes),
-                num_predict=CLASSIFIER_NUM_PREDICT,
+                # №49: num_predict=None — авто-бюджет «сколько влезет»; при
+                # неизвестном контексте действует legacy-потолок
+                # CLASSIFIER_NUM_PREDICT ("classify" = 768).
+                num_predict=None,
                 think=False,  # JSON-разметка без рассуждений (быстрее)
+                operation="classify",
             )
         except LLMError as exc:
             # Текст клиента сохраняется (HTTP-статус/hint ключа, решение №4).
@@ -148,12 +159,19 @@ class ClassificationService:
                 str(exc), outcome=classify_llm_error(exc)
             ) from exc
         try:
-            result = self._parse(content)
-        except ClassificationError:
+            result = self._parse(chat.content)
+        except ClassificationError as exc:
             self.last_attempt_ok = False  # некорректная разметка — тоже отказ
-            raise
+            # Вызов состоялся — метаданные уходят воркеру вместе с отказом.
+            raise ClassificationError(
+                str(exc), outcome=exc.outcome, meta=chat.meta
+            ) from exc
         self.last_attempt_ok = True
-        return result
+        return Classification(
+            hint_path=result.hint_path,
+            confidence=result.confidence,
+            meta=chat.meta,
+        )
 
     def close(self) -> None:
         """Закрыть HTTP-пул (чистое завершение процесса)."""

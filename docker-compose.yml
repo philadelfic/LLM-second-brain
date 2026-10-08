@@ -46,8 +46,9 @@ services:
       JUDGE_API_KEY: "CHANGE_ME"               # optional; required for the openai provider
       JUDGE_MODEL: "ornith:35b"                # dedup judge model
       JUDGE_THINK: "true"              # thinking judge: think:false produced false positives on long notes (E2E); ollama provider only
-      JUDGE_NUM_PREDICT: "1024"        # thinking+verdict budget (measured ~1200 tokens, done_reason=stop)
+      JUDGE_NUM_PREDICT: "0"           # 0 = as much as fits (auto budget from JUDGE_CONTEXT_TOKENS); explicit values keep the old caps (1024)
       JUDGE_TIMEOUT_SEC: "300"         # thinking judge: long pair 46 s, worst live call ~121 s (E2E) — 300 s with margin
+      JUDGE_CONTEXT_TOKENS: "0"        # the model's context window; 0 = unknown → previous per-operation caps
       # --- editable prompts (Phase 11): the directory is mounted at
       #     ./prompts:/app/prompts; with PROMPTS_DIR set, 3 files
       #     (summary_system, summary_merge_system, judge_system) are created
@@ -98,9 +99,12 @@ services:
       # --- summarization (mode "B") ---
       MAX_SUMMARY_CHARS: "150"               # summary length limit: model summary + fallback (gate 2026-09-19)
       SUMMARY_THINK: "true"                  # keep model reasoning; ollama provider only
-      SUMMARY_NUM_PREDICT: "35000"           # thinking+content budget for summaries
-      MERGE_NUM_PREDICT: "35000"             # separate budget for duplicate merges
+      SUMMARY_NUM_PREDICT: "0"               # 0 = as much as fits (auto budget from SUMMARY_CONTEXT_TOKENS); explicit 35000 keeps the old cap
+      MERGE_NUM_PREDICT: "0"                 # 0 = as much as fits; explicit 35000 keeps the old merge cap
       SUMMARY_TIMEOUT_SEC: "750"             # 12.5 min margin for merging 35k-char notes
+      SUMMARY_CONTEXT_TOKENS: "0"            # the model's context window; 0 = unknown → previous per-operation caps
+      SLOT_PROMPT_RESERVE_TOKENS: "512"      # prompt-chat-template + tokenizer-drift reserve for the auto budget
+      SLOT_MAX_OUTPUT_TOKENS: "32768"        # defensive ceiling of the auto output budget (explicit budgets are never clamped)
       # --- HTTP/MCP ---
       PORT: "8080"
       MCP_PATH: "/mcp"

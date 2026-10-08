@@ -47,8 +47,9 @@ v2.1: каждый из трёх слотов (embedding, summary, judge) пол
   auth_failed; сеть/таймаут/5xx/404/мусор → unreachable (WARN + деградация,
   не фатально); модель не в списке → model_missing.
 - reasoning-поля ответа (`message.thinking` у ollama; `reasoning_content`/
-  `reasoning` у openai) игнорируются в принципе: читается только content;
-  пустой content — отказ вызова (§5.5) с признаком `empty` (№39 §6.3).
+  `reasoning` у openai) читаются только в метаданные вызова (№49 §13.3):
+  content остаётся единственным содержимым ответа; пустой content — отказ
+  вызова (§5.5) с признаком `empty` (№39 §6.3).
 - №39 §6.3: `LLMError` несёт признаки `timeout`/`empty`/`truncated` —
   таймаут и транспорт различаются, пустой ответ не смешивается с
   недоступностью; исход вызова (SlotOutcome) читает сервисный слой.
@@ -60,6 +61,7 @@ v2.1: каждый из трёх слотов (embedding, summary, judge) пол
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -68,6 +70,8 @@ import httpx
 
 from app.config import Settings
 from app.services.ollama_gate import ollama_slot
+from app.services.slot_budget import resolve_output_budget
+from app.services.splitter import count_tokens
 
 # Провайдеры LLM-слотов (Фаза 11, решение №1).
 PROVIDER_OLLAMA = "ollama"
@@ -101,6 +105,11 @@ _RETRIABLE = (httpx.TimeoutException, httpx.TransportError)
 
 # Кусок тела ответа в тексте ошибки (логи не захламляем).
 _ERROR_BODY_CHARS = 120
+
+
+def _as_int(value: Any) -> int | None:
+    """Счётчик из ответа как int; отсутствие/чужой тип/bool → None (защита)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 # Исходы стартовой проверки (решение №5): ok — слот готов; auth_failed —
 # 401/403 (фатально, решает main.py); unreachable — сеть/таймаут/5xx/404/
@@ -173,6 +182,12 @@ class SlotSpec:
     api_key: str
     read_timeout: float
     think: bool | None = None
+    # №49 (§6.2): заявленный контекст модели (0 — неизвестен; тогда бюджет
+    # деградирует к прежнему потолку), защитный потолок авто-бюджета и запас
+    # на chat-template/служебные поля/рассинхрон токенизатора.
+    context_tokens: int = 0
+    max_output_tokens: int = 32768
+    prompt_reserve_tokens: int = 512
 
     @classmethod
     def for_embedding(cls, settings: Settings) -> SlotSpec:
@@ -197,6 +212,9 @@ class SlotSpec:
             api_key=settings.summary_api_key,
             read_timeout=float(settings.summary_timeout_sec),
             think=settings.summary_think,
+            context_tokens=settings.summary_context_tokens,
+            max_output_tokens=settings.slot_max_output_tokens,
+            prompt_reserve_tokens=settings.slot_prompt_reserve_tokens,
         )
 
     @classmethod
@@ -210,7 +228,47 @@ class SlotSpec:
             api_key=settings.judge_api_key,
             read_timeout=float(settings.judge_timeout_sec),
             think=settings.judge_think,
+            context_tokens=settings.judge_context_tokens,
+            max_output_tokens=settings.slot_max_output_tokens,
+            prompt_reserve_tokens=settings.slot_prompt_reserve_tokens,
         )
+
+
+@dataclass(frozen=True)
+class ChatMeta:
+    """Метаданные одного вызова чата слота (№49, arch §6.2/§13.3).
+
+    Заполняются ТОЛЬКО клиентом: `budget`/`budget_source` — политика бюджета
+    вывода (`slot_budget.resolve_output_budget`), счётчики и причина завершения
+    — из ответа провайдера, `truncated` — обрезка по лимиту вывода
+    (`finish_reason`/`done_reason == "length"`). `model_type` берётся из
+    `spec.model_type` (поле спека вводит no49-02; до неё — дефолт
+    `"generation"`). Секретов и тел промптов/ответов здесь нет (FR-3.4).
+    """
+
+    slot: str
+    provider: str
+    model: str
+    operation: str | None
+    model_type: str
+    budget: int
+    budget_source: str  # explicit | context | legacy
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    reasoning_tokens: int | None
+    had_thinking: bool
+    thinking_chars: int
+    finish_reason: str | None
+    truncated: bool
+    duration_ms: int
+
+
+@dataclass(frozen=True)
+class ChatResult:
+    """Результат вызова чата: content вместе с метаданными вызова (§6.2)."""
+
+    content: str
+    meta: ChatMeta
 
 
 class LLMClient:
@@ -246,24 +304,39 @@ class LLMClient:
 
     # --- публичное API -------------------------------------------------------
 
-    def chat(
+    def chat_result(
         self,
         system_prompt: str,
         user_text: str,
         *,
-        num_predict: int,
+        num_predict: int | None = None,
         think: bool | None = None,
-    ) -> str:
-        """Одна генерация: system+user, non-stream; возвращает content.
+        operation: str | None = None,
+    ) -> ChatResult:
+        """Одна генерация: system+user, non-stream; возвращает content + метаданные.
 
-        num_predict — бюджет вывода (обязателен: вызывающий передаёт свой
-        per-операцию потолок — summary_num_predict / merge_num_predict /
-        judge_num_predict). think=None — флаг из spec (слота); bool —
+        num_predict — явный бюджет оператора (None — политика «сколько влезет»:
+        из заявленного контекста слота минус промпт и запас, зажатая защитным
+        потолком; при неизвестном контексте — прежний потолок операции).
+        `operation` — имя операции для деградации (`summary`/`title`/`merge`/
+        `judge`/`classify`). think=None — флаг из spec (слота); bool —
         переопределение (судья структуры: NAMESPACE_JUDGE_THINK).
-        Пустой content — отказ (§5.5); reasoning-поля отбрасываются.
+        Пустой content — отказ (§5.5); reasoning-поля идут только в метаданные.
         Любой отказ — LLMError/LLMAuthError.
         """
         think_flag = self.spec.think if think is None else think
+        # Операция по умолчанию — имя слота: клиент вызывается и без явной
+        # операции (юниты, простые вызовы), а деградация бюджета требует ключа.
+        operation = operation or self.spec.name
+        prompt_tokens = count_tokens(system_prompt) + count_tokens(user_text)
+        budget, budget_source = resolve_output_budget(
+            operation=operation,
+            prompt_tokens=prompt_tokens,
+            explicit=num_predict,
+            context_tokens=self.spec.context_tokens,
+            reserve_tokens=self.spec.prompt_reserve_tokens,
+            defensive_cap=self.spec.max_output_tokens,
+        )
         if self.spec.provider == PROVIDER_OPENAI:
             path = "/v1/chat/completions"
             payload = {
@@ -272,14 +345,66 @@ class LLMClient:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_text},
                 ],
-                "max_tokens": num_predict,
+                "max_tokens": budget,
                 "temperature": TEMPERATURE,
             }
         else:
             path = "/api/chat"
-            payload = self._ollama_chat_payload(system_prompt, user_text, num_predict, think_flag)
+            payload = self._ollama_chat_payload(
+                system_prompt, user_text, budget, think_flag
+            )
+        started = time.monotonic()
         data = self._request_json("POST", path, payload)
-        return self._parse_chat_content(data, path)
+        duration_ms = int((time.monotonic() - started) * 1000)
+        content = self._parse_chat_content(data, path)
+        finish_reason, truncated = self._read_finish_reason(data, self.spec.provider)
+        (
+            prompt_count,
+            completion_count,
+            reasoning_count,
+            had_thinking,
+            thinking_chars,
+        ) = self._read_usage(data, self.spec.provider)
+        meta = ChatMeta(
+            slot=self.spec.name,
+            provider=self.spec.provider,
+            model=self.spec.model,
+            operation=operation,
+            model_type=getattr(self.spec, "model_type", "generation"),
+            budget=budget,
+            budget_source=budget_source,
+            prompt_tokens=prompt_count,
+            completion_tokens=completion_count,
+            reasoning_tokens=reasoning_count,
+            had_thinking=had_thinking,
+            thinking_chars=thinking_chars,
+            finish_reason=finish_reason,
+            truncated=truncated,
+            duration_ms=duration_ms,
+        )
+        return ChatResult(content=content, meta=meta)
+
+    def chat(
+        self,
+        system_prompt: str,
+        user_text: str,
+        *,
+        num_predict: int | None = None,
+        think: bool | None = None,
+        operation: str | None = None,
+    ) -> str:
+        """Обёртка над `chat_result(...)` — совместимость: возвращает content.
+
+        Юнит-тесты и фейки продолжают работать с прежним строковым результатом;
+        `num_predict` теперь необязателен (None — политика «сколько влезет»).
+        """
+        return self.chat_result(
+            system_prompt,
+            user_text,
+            num_predict=num_predict,
+            think=think,
+            operation=operation,
+        ).content
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         """Закодировать batch текстов; порядок результата = порядку входа.
@@ -419,6 +544,85 @@ class LLMClient:
         if not self.spec.api_key.strip():
             return prefix + f"задай {slot_env} в docker-compose и перезапусти"
         return prefix + "ключ отклонён API"
+
+    @staticmethod
+    def _read_finish_reason(data: Any, provider: str) -> tuple[str | None, bool]:
+        """Причина завершения и признак обрезки (§13.3).
+
+        ollama — `done_reason` (поля `finish_reason` у ollama НЕТ); openai —
+        `choices[0].finish_reason`. `"length"` — обрезка по лимиту вывода
+        (`truncated=True`); иначе/отсутствие поля — `(None, False)` — обрезка
+        невыяснена, старый/незнакомый сервер вызов не роняет.
+        """
+        reason: str | None = None
+        if isinstance(data, dict):
+            if provider == PROVIDER_OPENAI:
+                choices = data.get("choices")
+                if (
+                    isinstance(choices, list)
+                    and choices
+                    and isinstance(choices[0], dict)
+                ):
+                    value = choices[0].get("finish_reason")
+                    reason = value if isinstance(value, str) else None
+            else:
+                value = data.get("done_reason")
+                reason = value if isinstance(value, str) else None
+        return reason, reason == "length"
+
+    @staticmethod
+    def _read_usage(
+        data: Any, provider: str
+    ) -> tuple[int | None, int | None, int | None, bool, int]:
+        """Счётчики и факт размышления ответа (§13.3).
+
+        → `(prompt_tokens, completion_tokens, reasoning_tokens,
+        had_thinking, thinking_chars)`. ollama: `prompt_eval_count`,
+        `eval_count`, `reasoning_tokens=None` (счётчика токенов размышления
+        у ollama НЕТ), `message.thinking` → факт/длина текста. openai:
+        `usage.prompt_tokens`, `usage.completion_tokens`,
+        `usage.completion_tokens_details.reasoning_tokens` (если сервер отдаёт),
+        текст размышления — `message.reasoning_content` и `message.reasoning`
+        (у Selectel — `reasoning`). Все чтения — с защитой: отсутствующее поле
+        не роняет вызов, остаётся `None`.
+        """
+        prompt: int | None = None
+        completion: int | None = None
+        reasoning: int | None = None
+        thinking: str | None = None
+        if isinstance(data, dict):
+            if provider == PROVIDER_OPENAI:
+                usage = data.get("usage")
+                if isinstance(usage, dict):
+                    prompt = _as_int(usage.get("prompt_tokens"))
+                    completion = _as_int(usage.get("completion_tokens"))
+                    details = usage.get("completion_tokens_details")
+                    if isinstance(details, dict):
+                        reasoning = _as_int(details.get("reasoning_tokens"))
+                choices = data.get("choices")
+                message = (
+                    choices[0].get("message")
+                    if isinstance(choices, list)
+                    and choices
+                    and isinstance(choices[0], dict)
+                    else None
+                )
+                if isinstance(message, dict):
+                    for key in ("reasoning_content", "reasoning"):
+                        value = message.get(key)
+                        if isinstance(value, str) and value:
+                            thinking = value
+                            break
+            else:
+                prompt = _as_int(data.get("prompt_eval_count"))
+                completion = _as_int(data.get("eval_count"))
+                message = data.get("message")
+                if isinstance(message, dict):
+                    value = message.get("thinking")
+                    if isinstance(value, str) and value:
+                        thinking = value
+        had_thinking = bool(thinking)
+        return prompt, completion, reasoning, had_thinking, len(thinking or "")
 
     def _parse_chat_content(self, data: Any, path: str) -> str:
         """Извлечь content ответа чата; малформация/пустота — отказ (§5.5).

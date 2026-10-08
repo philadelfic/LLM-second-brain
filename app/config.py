@@ -90,9 +90,18 @@ class Settings(BaseSettings):
     # summary_status != 'ok'). Прежние 200 были только fallback-лимитом.
     max_summary_chars: int = 150
     summary_think: bool = True  # при false в вызов идёт "think": false
-    summary_num_predict: int = 35000  # потолок thinking+content выжимки (решение О. 2026-08-30: 1500→35000)
-    merge_num_predict: int = 35000  # отдельный потолок слияния дублей (решение О. 2026-08-30)
+    # №49 (3.2.0): 0 = «сколько влезет» (авто-бюджет из заявленного контекста
+    # модели минус промпт и запас, зажат защитным потолком); прежние 35000 —
+    # явный потолок оператора и деградация при неизвестном контексте.
+    summary_num_predict: int = 0
+    merge_num_predict: int = 0  # отдельный потолок слияния дублей (решение О. 2026-08-30)
     summary_timeout_sec: int = 60  # клиентский таймаут вызова
+    # Заявленный контекст модели слота summary (0 — неизвестен → прежние
+    # потолки без падения); запас на chat-template/служебные поля и защитный
+    # потолок авто-бюджета — общие для генеративных слотов.
+    summary_context_tokens: int = 0
+    slot_prompt_reserve_tokens: int = 512
+    slot_max_output_tokens: int = 32768
 
     # --- выдача ---
     snippet_chars: int = 120
@@ -126,8 +135,10 @@ class Settings(BaseSettings):
     # --- LLM-судья дедупа (Фаза 8, Этап 3.1; Фаза 11 — блок переименован в judge_*):
     # ornith-1.5:35b, think:false ---
     judge_think: bool = False  # при false в вызов идёт "think": false
-    judge_num_predict: int = 256  # бюджет вердикта (судье хватает)
+    # №49: 0 = авто-бюджет; 256 — прежний потолок (legacy при неизвестном контексте).
+    judge_num_predict: int = 0
     judge_timeout_sec: int = 30  # клиентский таймаут вызова судьи
+    judge_context_tokens: int = 0  # заявленный контекст модели judge (0 — неизвестен)
     rrf_k: int = 60
 
     # --- связи заметок, уровень 0 (lsb-0010, релиз 3.1.0) ---
@@ -483,13 +494,30 @@ class Settings(BaseSettings):
 
         # --- векторизация / суммаризация ---
         need_low("embedding_dim", self.embedding_dim, 1)
-        need_low("summary_num_predict", self.summary_num_predict, 1)
-        need_low("merge_num_predict", self.merge_num_predict, 1)
+        # №49: бюджет 0 — «сколько влезет» (авто), поэтому минимум 0; контексты
+        # 0 — неизвестен (деградация); запас/потолок ≥ 1; запас обязан быть
+        # меньше заявленного контекста (иначе он съедает весь контекст).
+        need_low("summary_num_predict", self.summary_num_predict, 0)
+        need_low("merge_num_predict", self.merge_num_predict, 0)
+        need_low("summary_context_tokens", self.summary_context_tokens, 0)
         need_low("summary_timeout_sec", self.summary_timeout_sec, 1)
-        # LLM-судья дедупа (Фаза 8, Этап 3.1; Фаза 11 — judge_*): бюджет и
-        # таймаут ≥ 1 (NFR-6).
-        need_low("judge_num_predict", self.judge_num_predict, 1)
+        # LLM-судья дедупа (Фаза 8, Этап 3.1; Фаза 11 — judge_*): бюджет 0 =
+        # авто, контекст 0 — неизвестен, таймаут ≥ 1 (NFR-6).
+        need_low("judge_num_predict", self.judge_num_predict, 0)
+        need_low("judge_context_tokens", self.judge_context_tokens, 0)
+        need_low("slot_prompt_reserve_tokens", self.slot_prompt_reserve_tokens, 1)
+        need_low("slot_max_output_tokens", self.slot_max_output_tokens, 1)
         need_low("judge_timeout_sec", self.judge_timeout_sec, 1)
+        for context_field, context in (
+            ("summary_context_tokens", self.summary_context_tokens),
+            ("judge_context_tokens", self.judge_context_tokens),
+        ):
+            if context > 0 and self.slot_prompt_reserve_tokens >= context:
+                errors.append(
+                    "  - slot_prompt_reserve_tokens: запас "
+                    f"{self.slot_prompt_reserve_tokens} не меньше контекста "
+                    f"{context_field} ({context}) — авто-бюджет всегда упирался бы в минимум"
+                )
 
         # --- чанковая индексация (Фаза 7) ---
         if self.text_splitter.strip().lower() != "tiktoken":
