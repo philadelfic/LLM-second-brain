@@ -15,8 +15,10 @@
 
 `DecisionService.decide` не бросает чужих исключений: любая причина переключения
 — `DecisionUnavailable` с полем `reason` (и `answer`, когда решение разобрано,
-но отвергнуто по уверенности). Вероятности в БД не хранятся (FR-3.3) — только
-счётчики в памяти процесса (`snapshot()`).
+но отвергнуто по уверенности). В БД вероятности не хранятся (FR-3.3) — только
+журнал (`decision_answer`/`decision_fallback`, пишет сам сервис: он единственный
+знает вопрос, вероятность и причину, §7.2/§13.6) и счётчики в памяти процесса
+(`snapshot()`).
 
 Разрыв decision живёт ЗДЕСЬ, а не в воркере (arch §13.8): вызов решения
 происходит внутри сервиса, воркер его не видит; «одна точка разрыва на слот»
@@ -25,6 +27,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping
@@ -244,39 +247,53 @@ class DecisionService:
         questions: list[DecisionQuestion],
         *,
         operation: str,
+        note_id: int | None = None,
+        older_id: int | None = None,
+        candidate_id: int | None = None,
     ) -> DecisionResult:
         """Спросить решение одним вызовом; иначе — `DecisionUnavailable` (§6.4).
 
         Порядок: выключенный слот → потолок меток → разрыв слота (без вызова);
         затем один `POST /v1/systemone` со всеми вопросами, разбор ответа,
-        проверка порога/зоны по каждому вопросу.
+        проверка порога/зоны по каждому вопросу. Оба пути видны в журнале:
+        `decision_answer` (вероятности и длительность) и `decision_fallback`
+        (причина переключения) — вероятности живут ТОЛЬКО там (FR-3.3).
         """
+        ids: dict[str, object] = {
+            "note_id": note_id,
+            "older_id": older_id,
+            "candidate_id": candidate_id,
+        }
         if not self.can_decide():
-            raise DecisionUnavailable(
-                "decision-слот выключен или погашен — решения идут генеративным путём",
-                reason="unsupported",
+            detail = (
+                "decision-слот выключен или погашен — решения идут "
+                "генеративным путём"
             )
+            self._fallback(
+                "unsupported", operation=operation, detail=detail, ids=ids
+            )
+            raise DecisionUnavailable(detail, reason="unsupported")
         assert self._llm is not None  # can_decide() гарантирует клиента
         if any(len(q.labels) > self._settings.decision_max_labels for q in questions):
             # Потолок вариантов (arch §8): список узлов больше лимита модели.
-            self._fallback("unsupported")
-            raise DecisionUnavailable(
-                "вариантов в choice-вопросе больше DECISION_MAX_LABELS",
-                reason="unsupported",
+            detail = "вариантов в choice-вопросе больше DECISION_MAX_LABELS"
+            self._fallback(
+                "unsupported", operation=operation, detail=detail, ids=ids
             )
+            raise DecisionUnavailable(detail, reason="unsupported")
         if self._breaker.is_paused():
             # Разрыв открыт и стук не наступил — экономим вызов (§6.4).
-            self._fallback("unavailable")
-            raise DecisionUnavailable(
-                "разрыв decision-слота открыт — вызов пропущен",
-                reason="unavailable",
+            detail = "разрыв decision-слота открыт — вызов пропущен"
+            self._fallback(
+                "unavailable", operation=operation, detail=detail, ids=ids
             )
+            raise DecisionUnavailable(detail, reason="unavailable")
         if self._breaker.probe_due() and self.probe() != DECISION_CHECK_OK:
-            self._fallback("unavailable")
-            raise DecisionUnavailable(
-                "пробный стук decision-слота не прошёл — слот в паузе",
-                reason="unavailable",
+            detail = "пробный стук decision-слота не прошёл — слот в паузе"
+            self._fallback(
+                "unavailable", operation=operation, detail=detail, ids=ids
             )
+            raise DecisionUnavailable(detail, reason="unavailable")
         payload = [self._question_payload(q) for q in questions]
         started = time.monotonic()
         try:
@@ -289,7 +306,9 @@ class DecisionService:
                 if outcome is SlotOutcome.OFF_CONTRACT
                 else "unavailable"
             )
-            self._fallback(reason)
+            self._fallback(
+                reason, operation=operation, detail=str(exc), ids=ids
+            )
             raise DecisionUnavailable(str(exc), reason=reason) from exc
         duration_ms = int((time.monotonic() - started) * 1000)
         answers = {
@@ -299,22 +318,30 @@ class DecisionService:
             answer = answers.get(question.name)
             if answer is None:
                 self._breaker.note_failure(SlotOutcome.OFF_CONTRACT)
-                self._fallback("unsupported")
-                raise DecisionUnavailable(
-                    f"в ответе нет решения вопроса «{question.name}»",
-                    reason="unsupported",
+                detail = f"в ответе нет решения вопроса «{question.name}»"
+                self._fallback(
+                    "unsupported", operation=operation, detail=detail, ids=ids
                 )
+                raise DecisionUnavailable(detail, reason="unsupported")
             if not self._accepted(answer, question):
-                self._fallback("low_confidence")
-                raise DecisionUnavailable(
-                    f"уверенность вопроса «{question.name}» в зоне неопределённости",
-                    reason="low_confidence",
+                detail = (
+                    f"уверенность вопроса «{question.name}» в зоне "
+                    "неопределённости"
+                )
+                self._fallback(
+                    "low_confidence",
+                    operation=operation,
+                    detail=detail,
                     answer=answer,
+                    ids=ids,
+                )
+                raise DecisionUnavailable(
+                    detail, reason="low_confidence", answer=answer
                 )
         self._answers += 1
-        return DecisionResult(
-            answers=answers, meta=self._meta(operation, duration_ms)
-        )
+        meta = self._meta(operation, duration_ms)
+        self._log_answer(operation, questions, answers, meta, ids=ids)
+        return DecisionResult(answers=answers, meta=meta)
 
     # --- внутреннее ----------------------------------------------------------
 
@@ -380,7 +407,74 @@ class DecisionService:
             duration_ms=duration_ms,
         )
 
-    def _fallback(self, reason: str) -> None:
-        """Учесть переключение: счётчики `by_reason` и `fallbacks` (§7.3/FR-6.3)."""
+    def _fallback(
+        self,
+        reason: str,
+        *,
+        operation: str,
+        detail: str | None = None,
+        answer: DecisionAnswer | None = None,
+        ids: Mapping[str, object] | None = None,
+    ) -> None:
+        """Учесть переключение: счётчики (§7.3/FR-6.3) + событие журнала.
+
+        Журнал пишет сам `DecisionService` (arch §7.2/§13.6): он единственный
+        знает вопрос, вероятность и причину переключения. В событие уходят
+        только цифры и фрагмент `detail` — тел ответов там нет (§7.2).
+        """
         self._fallbacks += 1
         self._by_reason[reason] = self._by_reason.get(reason, 0) + 1
+        fields: dict[str, object] = {
+            "operation": operation,
+            "reason": reason,
+            "probability": answer.probability if answer is not None else None,
+            "confidence": answer.confidence if answer is not None else None,
+            "detail": detail,
+        }
+        if ids:
+            fields.update(ids)
+        self._log("decision_fallback", fields)
+
+    def _log_answer(
+        self,
+        operation: str,
+        questions: list[DecisionQuestion],
+        answers: dict[str, DecisionAnswer],
+        meta: ChatMeta,
+        *,
+        ids: Mapping[str, object] | None = None,
+    ) -> None:
+        """Событие `decision_answer` (§7.2): вероятности — ТОЛЬКО в журнале.
+
+        Поля: `slot`, `operation`, имена вопросов, ответы (`kind`/`label`/
+        `probability`/`confidence`), порог, модель и `duration_ms`. В БД
+        вероятности не пишутся вовсе (FR-3.3).
+        """
+        fields: dict[str, object] = {
+            "operation": operation,
+            "questions": [question.name for question in questions],
+            "answers": {
+                name: {
+                    "kind": answer.kind,
+                    "label": answer.label,
+                    "probability": answer.probability,
+                    "confidence": answer.confidence,
+                }
+                for name, answer in answers.items()
+            },
+            "threshold": self._settings.decision_threshold,
+            "model": meta.model,
+            "duration_ms": meta.duration_ms,
+        }
+        if ids:
+            fields.update(ids)
+        self._log("decision_answer", fields)
+
+    @staticmethod
+    def _log(event: str, fields: Mapping[str, object]) -> None:
+        """JSON-событие журнала: `event` + `slot` + поля по факту (None — мимо)."""
+        payload: dict[str, object] = {"event": event, "slot": SLOT_DECISION}
+        for key, value in fields.items():
+            if value is not None:
+                payload[key] = value
+        logging.getLogger("app").info(event, extra=payload)

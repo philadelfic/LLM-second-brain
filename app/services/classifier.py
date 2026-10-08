@@ -44,12 +44,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 import httpx
 
 from app.config import Settings
+from app.services.decision import DecisionService, DecisionUnavailable
 from app.services.llm_client import ChatMeta, LLMClient, LLMError, SlotSpec
 from app.services.namespaces import NamespaceService, NamespaceValidationError
 from app.services.prompts import PromptRegistry
@@ -60,6 +61,10 @@ from app.services.slot_outcome import SlotOutcome, classify_llm_error
 # legacy-потолок классификатора ("classify" в slot_budget.LEGACY_OUTPUT_BUDGET),
 # действующий при неизвестном контексте; при заявленном — авто-бюджет.
 CLASSIFIER_NUM_PREDICT = 768
+
+# Резервная метка decision-вопроса разметки (реестр, arch §6.4): «общая»
+# заметка, не привязанная к узлу, → `hint_path is None`.
+GENERIC_LABEL = "generic"
 
 
 class ClassificationError(RuntimeError):
@@ -121,9 +126,12 @@ class ClassificationService:
         *,
         llm: LLMClient | None = None,
         registry: PromptRegistry | None = None,
+        decider: DecisionService | None = None,
     ) -> None:
         self._settings = settings
         self._prompts = registry if registry is not None else PromptRegistry()
+        # LSBN-F-12: decision-слот (None — выключен, поведение v3.1.0).
+        self._decider = decider
         # DI сборки (общий клиент слота summary) или свой клиент с
         # transport-инъекцией для юнит-тестов (MockTransport).
         self._llm = (
@@ -141,9 +149,83 @@ class ClassificationService:
     def classify(
         self, text: str, known_nodes: list[dict[str, Any]]
     ) -> Classification:
-        """Разметить текст; любой отказ — ClassificationError."""
+        """Разметить текст: decision-слот, иначе генеративный путь (§6.4/§13.6).
+
+        Внешний контракт (`hint_path` 1..3 слага или null, `confidence` 0..1)
+        не меняется (FR-5.3): три причины переключения
+        (`unavailable`/`unsupported`/`low_confidence`) и невалидная метка
+        уводят на прежний генеративный путь, а при `DECISION_FALLBACK=false`
+        отказ `UNAVAILABLE` ждёт по контракту №39 (вердикт не выдумывается).
+        """
         if not text or not text.strip():
             raise ValueError("classify: пустой текст заметки")
+        if self._decider is not None:
+            try:
+                return self._classify_decision(text, known_nodes)
+            except DecisionUnavailable as exc:
+                if not self._settings.decision_fallback:
+                    self.last_attempt_ok = False
+                    raise ClassificationError(
+                        str(exc), outcome=SlotOutcome.UNAVAILABLE
+                    ) from exc
+        return self._classify_generative(text, known_nodes)
+
+    def _classify_decision(
+        self, text: str, known_nodes: list[dict[str, Any]]
+    ) -> Classification:
+        """Решение decision-слота: метка → `hint_path`, вероятность → `confidence`.
+
+        Вопрос — из реестра (`decider.questions_for("classify")`); метки
+        подставляются на каждый вызов: пути известных узлов + резервная
+        `generic` (→ `hint_path is None`), состояние — заметка + узлы
+        (`path: description`, как сегодня). Этот же вопрос обслуживает джобу
+        `warnings` («заметка не на своём месте»): она ходит через тот же
+        `classify` (arch §13.6, FR-8.4).
+        """
+        assert self._decider is not None
+        questions = self._decider.questions_for("classify")
+        if not questions:
+            raise DecisionUnavailable(
+                "в реестре нет вопроса разметки узла", reason="unsupported"
+            )
+        labels = [node["path"] for node in known_nodes] + [GENERIC_LABEL]
+        question = replace(questions[0], labels=tuple(labels))
+        result = self._decider.decide(
+            self._user_message(text, known_nodes), [question], operation="classify"
+        )
+        answer = result.answers.get(question.name)
+        if answer is None or answer.label is None:
+            raise DecisionUnavailable(
+                f"в ответе нет метки вопроса «{question.name}»",
+                reason="unsupported",
+            )
+        hint_path: str | None = None
+        if answer.label != GENERIC_LABEL:
+            # Путь валидируется тем же `validate_path`, что и в `_parse`
+            # (слаги латиница-цифры-дефис, 1..3 сегмента, не под default/...).
+            try:
+                hint_path = NamespaceService(self._settings).validate_path(
+                    answer.label
+                )
+            except NamespaceValidationError as exc:
+                raise DecisionUnavailable(
+                    f"hint_path: {exc}", reason="unsupported"
+                ) from exc
+        confidence = (
+            answer.probability
+            if answer.probability is not None
+            else float(answer.confidence or 0.0)
+        )
+        self.last_attempt_ok = True
+        self.last_meta = result.meta
+        return Classification(
+            hint_path=hint_path, confidence=confidence, meta=result.meta
+        )
+
+    def _classify_generative(
+        self, text: str, known_nodes: list[dict[str, Any]]
+    ) -> Classification:
+        """Прежний генеративный путь (JSON-разметка слота summary)."""
         try:
             chat = self._llm.chat_result(
                 self._prompts.classifier_system,

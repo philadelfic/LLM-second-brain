@@ -67,6 +67,7 @@ from typing import Protocol
 import httpx
 
 from app.config import Settings
+from app.services.decision import DecisionService, DecisionUnavailable
 from app.services.llm_client import ChatMeta, LLMClient, LLMError, SlotSpec
 from app.services.prompts import PromptRegistry
 from app.services.slot_outcome import SlotOutcome, classify_llm_error
@@ -140,9 +141,12 @@ class JudgeService:
         *,
         llm: LLMClient | None = None,
         registry: PromptRegistry | None = None,
+        decider: DecisionService | None = None,
     ) -> None:
         self._settings = settings
         self._prompts = registry if registry is not None else PromptRegistry()
+        # LSBN-F-12: decision-слот (None — выключен, поведение v3.1.0).
+        self._decider = decider
         # DI сборки (общий клиент слота judge) или свой клиент с
         # transport-инъекцией для юнит-тестов (MockTransport).
         self._llm = (
@@ -156,16 +160,65 @@ class JudgeService:
         # без чтения журнала (None — вызова ещё не было).
         self.last_meta: ChatMeta | None = None
 
-    def judge(self, text_new: str, text_candidate: str) -> bool:
-        """Спросить судью про пару текстов; True — «ДУБЛЬ», False — «НЕ ДУБЛЬ».
+    def judge(self, text_new: str, text_candidate: str) -> JudgeResult:
+        """Вердикт по паре: decision-слот, иначе генеративный путь (§6.3/§13.6).
 
-        Любой отказ — JudgeError: воркер оставит пару нетронутой и повторит
-        по back-off (NFR-3) — лучше обе заметки, чем ошибочное сведение.
+        Решение может прийти от decision-слота (state — боевой `judge_user`,
+        один `noul`-вопрос реестра); три причины переключения
+        (`unavailable`/`unsupported`/`low_confidence`) уводят на прежний
+        генеративный путь, а при `DECISION_FALLBACK=false` — в отказ
+        `UNAVAILABLE` (контракт №39: задание ждёт, вердикт не выдумывается).
+        Внешний контракт (`JudgeResult.verdict: bool`) не меняется (FR-5.3).
         """
         if not text_new or not text_new.strip():
             raise ValueError("judge: пустая заметка недопустима")
         if not text_candidate or not text_candidate.strip():
             raise ValueError("judge: пустая заметка недопустима")
+        if self._decider is not None:
+            try:
+                return self._judge_decision(text_new, text_candidate)
+            except DecisionUnavailable as exc:
+                if not self._settings.decision_fallback:
+                    # Контракт №39: генеративный вердикт не берём — задание ждёт.
+                    self.last_attempt_ok = False
+                    raise JudgeError(
+                        str(exc), outcome=SlotOutcome.UNAVAILABLE
+                    ) from exc
+        return self._judge_generative(text_new, text_candidate)
+
+    def _judge_decision(
+        self, text_new: str, text_candidate: str
+    ) -> JudgeResult:
+        """Решение decision-слота: `label == "true"` → вердикт «ДУБЛЬ».
+
+        Журнал (`decision_answer`/`decision_fallback`) — внутри `DecisionService`
+        (arch §7.2/§13.6): потребитель не знает, каким типом слота получено
+        решение (FR-5.3).
+        """
+        assert self._decider is not None
+        questions = self._decider.questions_for("judge")
+        if not questions:
+            raise DecisionUnavailable(
+                "в реестре нет вопроса судьи дедупа", reason="unsupported"
+            )
+        state = self._prompts.judge_user.format(
+            text_new=text_new, text_candidate=text_candidate
+        )
+        result = self._decider.decide(state, questions, operation="judge")
+        answer = result.answers.get(questions[0].name)
+        if answer is None or answer.label is None:
+            raise DecisionUnavailable(
+                f"в ответе нет вердикта вопроса «{questions[0].name}»",
+                reason="unsupported",
+            )
+        self.last_attempt_ok = True
+        self.last_meta = result.meta
+        return JudgeResult(verdict=answer.label == "true", meta=result.meta)
+
+    def _judge_generative(
+        self, text_new: str, text_candidate: str
+    ) -> JudgeResult:
+        """Прежний генеративный путь (маркеры `**DUPLICATE**`/`**NOT DUPLICATE**`)."""
         try:
             result = self._llm.chat_result(
                 self._prompts.judge_system,

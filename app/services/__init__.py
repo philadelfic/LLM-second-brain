@@ -192,11 +192,18 @@ def build_services(
         judge=(
             judge
             if judge is not None
-            else JudgeService(settings, llm=llm_judge, registry=registry)
+            else JudgeService(
+                settings, llm=llm_judge, registry=registry, decider=decision
+            )
         ),
         backup=BackupService(settings, namespaces=namespaces),
         namespaces=namespaces,
-        classifier=ClassificationService(settings, llm=llm_summary, registry=registry),
+        # LSBN-F-12: судья и классификатор получают decision-сервис как
+        # `decider` (выключенный слот — None, поведение v3.1.0); вероятности
+        # решений видны только в журнале (пишет сам DecisionService).
+        classifier=ClassificationService(
+            settings, llm=llm_summary, registry=registry, decider=decision
+        ),
         promotion=promotion,
         llm_embedding=llm_embedding,
         llm_summary=llm_summary,
