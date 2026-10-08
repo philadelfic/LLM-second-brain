@@ -43,6 +43,28 @@ MAX_DESCRIPTION_CHARS = 500  # грубая защита от простыней
 _SEGMENT_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SENTENCE_SPLIT_RE = re.compile(r"[.!?]+(?:\s|$)")
 
+# Подсказка узла при save без namespace (№28, релиз 3.2.0; arch §13.1):
+# значимое слово — ≥ _NODE_HINT_MIN_TOKEN символов; совпадение — равенство
+# либо общий префикс ≥ _STEM_MIN символов (дешёвая основа русской морфологии:
+# «сервер»/«сервера»). Вес сегмента пути выше веса слова описания: пути —
+# латинские слаги, основной сигнал идёт из русских описаний.
+_NODE_HINT_MIN_TOKEN = 4
+_STEM_MIN = 4
+_NODE_HINT_PATH_WEIGHT = 3.0
+_NODE_HINT_DESCRIPTION_WEIGHT = 2.0
+_WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
+
+
+def _node_hint_words(text: str) -> set[str]:
+    """Слова текста (нижний регистр), длиной ≥ _STEM_MIN — база сравнения."""
+    return {word.lower() for word in _WORD_RE.findall(text) if len(word) >= _STEM_MIN}
+
+
+def _node_hint_match(token: str, words: set[str]) -> bool:
+    """Слово совпало: равенство либо общий префикс ≥ _STEM_MIN символов."""
+    head = token[:_STEM_MIN]
+    return any(token == word or head == word[:_STEM_MIN] for word in words)
+
 
 class NamespaceError(RuntimeError):
     """Операционная ошибка реестра: узел уже существует / не найден / конфликт."""
@@ -216,6 +238,55 @@ class NamespaceService:
         if exact:
             return [normalized]
         return self.subtree_nodes(normalized)
+
+    def suggest(
+        self, terms: str, *, limit: int = 2, min_score: float = 2.0
+    ) -> list[dict[str, Any]]:
+        """Кандидаты-узлы карты под слова заметки (подсказка №28, arch §13.1).
+
+        Сравниваем значимые слова `terms` (≥ _NODE_HINT_MIN_TOKEN) с сегментами
+        путей (вес 3.0) и словами описаний (вес 2.0); совпадение — равенство
+        либо общий префикс ≥ _STEM_MIN («сервер»/«сервера»). Скор узла — сумма
+        по совпавшим словам (слово учитывается один раз, максимум веса);
+        возврат — топ по score вниз (тай-брейк — path), не больше `limit`,
+        только score ≥ min_score. Это ЧТЕНИЕ карты (один SELECT без
+        счётчиков): без модели, эмбеддера и записи; сбой чтения — пустой
+        список, а не исключение (подсказка не имеет права ронять save).
+        """
+        tokens = list(dict.fromkeys(_node_hint_words(terms)))
+        if not tokens:
+            return []
+        try:
+            with session(self._settings) as conn:
+                rows = conn.execute(
+                    "SELECT path, description FROM namespaces"
+                ).fetchall()
+        except Exception:  # noqa: BLE001 — подсказка не роняет запись
+            logging.getLogger("app").warning(
+                "node hint map unavailable",
+                extra={"event": "node_hint_unavailable"},
+            )
+            return []
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            path_words = {segment.lower() for segment in row["path"].split("/")}
+            description_words = _node_hint_words(row["description"])
+            score = 0.0
+            for token in tokens:
+                if _node_hint_match(token, path_words):
+                    score += _NODE_HINT_PATH_WEIGHT
+                elif _node_hint_match(token, description_words):
+                    score += _NODE_HINT_DESCRIPTION_WEIGHT
+            if score >= min_score:
+                candidates.append(
+                    {
+                        "path": row["path"],
+                        "description": row["description"],
+                        "score": score,
+                    }
+                )
+        candidates.sort(key=lambda node: (-node["score"], node["path"]))
+        return candidates[:limit]
 
     # --- запись ---------------------------------------------------------------
 

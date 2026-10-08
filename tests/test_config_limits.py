@@ -122,6 +122,21 @@ class TestRangeLimits:
         with pytest.raises(ConfigError, match="dedup_similarity"):
             load_env(monkeypatch, DEDUP_SIMILARITY="-0.1")
 
+    def test_node_hint_invalid_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """№28: потолок узлов 1..2 (FR-1.1) и текст для сравнения ≥1 — оба
+        нарушения собираются в один отчёт (NFR-6)."""
+        with pytest.raises(ConfigError) as exc:
+            load_env(
+                monkeypatch,
+                MEMORY_NODE_HINT_MAX_NODES="5",
+                MEMORY_NODE_HINT_TEXT_CHARS="0",
+            )
+        message = str(exc.value)
+        assert "memory_node_hint_max_nodes" in message
+        assert "memory_node_hint_text_chars" in message
+        with pytest.raises(ConfigError, match="memory_node_hint_min_score"):
+            load_env(monkeypatch, MEMORY_NODE_HINT_MIN_SCORE="-0.1")
+
     def test_dedup_candidate_range_is_fatal(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

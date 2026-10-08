@@ -1117,7 +1117,9 @@ async def future_block_todo() -> None:
            "slot is claimed by `scenario_9_decision_fallback()` (f12-03)")
     # TODO(3.2.0 future blocks) — memory handles surface:
     manual("memory handles: search/list/get contract, budgets, pagination",
-           "add a `scenario_9_memory_handles()` here")
+           "the node hint of `save` (№28) is claimed by "
+           "`scenario_10_node_hint()`; the rest of the surface is claimed by "
+           "the follow-up postановки")
     # TODO(3.2.0 future blocks) — assistant logs:
     manual("assistant logs: event names, masking, no secrets in the log",
            "add a `scenario_10_logs()` here")
@@ -1560,6 +1562,85 @@ def _decision_acceptance_lines(numbers: dict) -> list[str]:
     ]
 
 
+# ==== scenarios: 10. №28 node hint on save without namespace ====================
+# Узел-кандидат подсказки — постоянный путь (повторные прогоны не плодят узлы),
+# описание — с редкими словами темы, чтобы совпадение слов было очевидным.
+NODE_HINT_PATH = "e2e-node-hint"
+NODE_HINT_DESCRIPTION = "Отчёты по релизам, реестр зарплат СУБО и доступы"
+
+
+async def scenario_10_node_hint(c: Client, rest: httpx2.AsyncClient) -> None:
+    """№28 (FR-1.1…FR-1.6): запись через MCP БЕЗ `namespace` лежит в `default`,
+    а ответ несёт `namespace_hint` с существующим узлом карты; запись с явным
+    узлом подсказки не несёт; окно вызова `save` не содержит работы слотов."""
+    scenario(10, "№28: node hint on save without namespace — the note stays in "
+                 "`default`, the answer points at a node, no model call on write")
+
+    created = await c.call("memory_namespace_create", {
+        "path": NODE_HINT_PATH, "description": NODE_HINT_DESCRIPTION})
+    if created.get("created"):
+        teardown_note(f"scenario 10 created the map node {NODE_HINT_PATH} "
+                      "(it stays in the registry — the map is operator-owned)")
+    else:
+        listed = await c.call("memory_namespaces", {})
+        present = any(node.get("path") == NODE_HINT_PATH
+                      for node in listed.get("namespaces", []))
+        check(f"the map node {NODE_HINT_PATH} is registered", present, refusal(created))
+
+    started = time.monotonic()
+    saved = await c.call("memory_save", {
+        "text": "Реестр зарплат СУБО: доступы и контакты поддержки.",
+        "title": f"{RUN['tag']} реестр зарплат СУБО",
+    })
+    latency = time.monotonic() - started
+    if saved.get("id") is not None:
+        RUN["notes"].append(saved["id"])
+    check("save without `namespace` stores the note", saved.get("stored") is True,
+          note_detail(saved))
+    hint = saved.get("namespace_hint")
+    check("the answer carries `namespace_hint` pointing at the node matched by "
+          "the note words (FR-1.1/FR-1.3)",
+          isinstance(hint, str) and NODE_HINT_PATH in hint, f"namespace_hint={hint!r}")
+    if saved.get("id") is not None:
+        got = await c.call("memory_get", {"ids": [saved["id"]]})
+        note = (got.get("notes") or [{}])[0]
+        check("the note lies in `default` — the hint does not move it (FR-1.2)",
+              note.get("namespace") == "default",
+              f"namespace={note.get('namespace')!r}")
+    else:
+        skip("the note namespace check", "the note was not created")
+    check("the save window carries no slot work (latency of the tool, FR-1.6)",
+          latency < 3.0, f"memory_save took {latency * 1000:.0f} ms")
+    text = await log_text()
+    if text:
+        lines = log_lines(text, "tool_call", "memory_save")
+        ms = None
+        if lines:
+            matched = re.search(r'"latency_ms":\s*([0-9.]+)', lines[-1])
+            ms = float(matched.group(1)) if matched else None
+        check("the journal confirms the write stayed local (memory_save latency, "
+              "no slot event in the window)",
+              ms is not None and ms < 3000.0, f"latency_ms={ms}")
+    else:
+        skip("the journal check of the save window (no slot work on write)",
+             "LSB_LOGS_CMD is not set (no log hook on this contour)")
+
+    explicit = await c.call("memory_save", {
+        "text": f"{RUN['tag']} явная укладка в узел: подсказка не нужна.",
+        "title": f"{RUN['tag']} явная укладка",
+        "namespace": NODE_HINT_PATH,
+    })
+    if explicit.get("id") is not None:
+        RUN["notes"].append(explicit["id"])
+    check("an explicit `namespace` gives no `namespace_hint` (FR-1.5)",
+          explicit.get("stored") is True and "namespace_hint" not in explicit,
+          note_detail(explicit))
+    snapshot = await health_snapshot(rest)
+    check("the contour stays healthy after the writes (the hint is a map read, "
+          "not a job)", snapshot.get("status") == "ok",
+          f"status={snapshot.get('status')!r}")
+
+
 # ==== run ======================================================================
 async def run_all() -> None:
     async with AsyncExitStack() as stack:
@@ -1586,6 +1667,7 @@ async def run_all() -> None:
             await scenario_6_regression()
             await scenario_8_budget_raise_release(c, rest)
             await scenario_9_decision_fallback(c, rest)
+            await scenario_10_node_hint(c, rest)
             await future_block_todo()
             close_scenario()
         finally:

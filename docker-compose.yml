@@ -109,6 +109,11 @@ services:
       JOB_TERMS_BATCH: "50"           # term groups processed per terms-normalize run (≥1)
       JOB_TERMS_CLUSTER_SIMILARITY: "0.75"  # context clustering threshold, single-linkage (0..1)
       JOB_TERMS_CONTEXTS_EXCESS: "5"  # contexts-per-term excess warning threshold (≥2)
+      # --- node hint on save without namespace (№28): map read, no model call ---
+      MEMORY_NODE_HINT_ENABLED: "true"     # node hint on save without namespace (its absence hides the field)
+      MEMORY_NODE_HINT_MIN_SCORE: "2.0"    # node selection threshold (2.0 = one matching significant word)
+      MEMORY_NODE_HINT_MAX_NODES: "2"      # how many nodes at most in the hint (1..2)
+      MEMORY_NODE_HINT_TEXT_CHARS: "200"   # text characters compared alongside the title (≥1)
       DEDUP_SIMILARITY: "0.92"               # "duplicate" cosine threshold in background dedup (Phase 8)
       DEDUP_CANDIDATE_TOP_N: "3"             # top-N cosine candidates for the dedup judge
       DEDUP_CANDIDATE_SIMILARITY: "0.80"     # lower paraphrase-candidate threshold (≤ DEDUP_SIMILARITY)

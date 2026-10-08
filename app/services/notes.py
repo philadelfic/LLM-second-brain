@@ -69,6 +69,7 @@ update, каскад + самолечение сирот при физическ
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Callable
 from typing import Any
@@ -83,7 +84,7 @@ from app.services.listing import page_fields
 from app.services.namespaces import NamespaceService
 from app.services.splitter import split_text
 from app.storage import chunks, expirations, vectors
-from app.storage.db import session, transaction
+from app.storage.db import DEFAULT_NAMESPACE, session, transaction
 
 # Maximum number of chunks per one memory_get call (lsb-0003, decision of O.,
 # 2026-09-08). Listing ceilings (lsb-0013) are env parameters of the surfaces
@@ -211,7 +212,7 @@ class NoteService:
         self,
         text: str,
         author: str | None = None,
-        namespace: str = "default",
+        namespace: str | None = None,
         title: str | None = _UNSET_TITLE,
         expires_at: str | None = _UNSET_EXPIRES_AT,
     ) -> dict[str, Any]:
@@ -236,14 +237,21 @@ class NoteService:
         Фаза 10 (§5.7): `namespace` — целевой узел записи (только
         зарегистрированный; не указан — `default`); незарегистрированный
         узел — NamespaceError (транспорт Шага 3 обернёт в fail + hint).
-        Дедуп при save — в пределах этого же неймспейса (меж-узловые
+        №28 (3.2.0, arch §13.1/§13.2): `None` = «не передан» — узел
+        `default`, и после успешной вставки ответ несёт короткую подсказку
+        `namespace_hint` (по карте узлов и словам заметки, БЕЗ вызова модели).
+        Подсказка не двигает заметку и не блокирует запись; явный `namespace`
+        подсказок не даёт. Дедуп при save — в пределах этого же неймспейса
+        (меж-узловые
         дубли легитимны): дословный дубль в своём узле блокирует запись
         (duplicated); дубль в ЧУЖОМ узле запись не блокирует — ответ
         получает hint «похожее есть в <ns>» (US-8, слой ориентирования).
         """
         self._validate_text(text)
         note_title = self._validated_save_title(title)
-        ns = self._namespaces.validate_placement(namespace)
+        ns = self._namespaces.validate_placement(
+            namespace if namespace is not None else DEFAULT_NAMESPACE
+        )
         # expires_at (lsb-0004-02): передан → распарсить в абсолютный ISO-8601
         # UTC (TTLValidationError — мягкий отказ ДО записи); не передан
         # (сентинел) → None — постоянная заметка, в note_expirations не пишем.
@@ -305,7 +313,43 @@ class NoteService:
         }
         if foreign_hint is not None:
             result["hint"] = foreign_hint  # слой ориентирования, не warning
+        # №28: запись без `namespace` — короткая подсказка узла (только когда
+        # узел не указан и выключатель включён). Сбой подсказки запись не
+        # роняет: поле просто не добавляется, событие — в лог (§13.2).
+        if namespace is None and self._settings.memory_node_hint_enabled:
+            try:
+                result["namespace_hint"] = self._namespace_hint(note_title, text)
+            except Exception:  # noqa: BLE001 — подсказка не роняет запись
+                logging.getLogger("app").warning(
+                    "save hint failed",
+                    extra={"event": "save_hint_failed", "hint": "namespace"},
+                )
         return result
+
+    def _namespace_hint(self, title: str | None, text: str) -> str:
+        """Подсказка узла для записи без `namespace` (№28, arch §13.1/§13.2).
+
+        Сравниваем слова заголовка и первых `memory_node_hint_text_chars`
+        символов текста с картой узлов (`NamespaceService.suggest`); при
+        непустом списке — «saved to `default`; looks like «a» / «b»», иначе —
+        явное «no node matched — see memory_namespaces» (FR-1.4). Строка
+        короткая (бюджет F-11, ≤ ~120 символов), заметку не двигает.
+        """
+        terms = " ".join(
+            filter(
+                None,
+                [title, text[: self._settings.memory_node_hint_text_chars]],
+            )
+        )
+        candidates = self._namespaces.suggest(
+            terms,
+            limit=self._settings.memory_node_hint_max_nodes,
+            min_score=self._settings.memory_node_hint_min_score,
+        )
+        if candidates:
+            paths = " / ".join(f"«{candidate['path']}»" for candidate in candidates)
+            return f"saved to `default`; looks like {paths}"
+        return "saved to `default`; no node matched — see memory_namespaces"
 
     def _insert(
         self,

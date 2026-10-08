@@ -29,7 +29,13 @@ class TestNotesCrud:
         result = self._create(client, token, "Рест: заметка о деплое", title="Рест-деплой")
         # Фаза 8: векторизация всегда фоновая — pending это штатное состояние
         # новой заметки, а не деградация, поэтому warning в контракте нет.
-        assert result == {"id": 1, "stored": True, "summary_pending": True}
+        # №28: ответ несёт `namespace_hint` — полный контракт сервиса (REST
+        # `namespace` не принимает, заметка уходит в `default`).
+        assert {"id", "stored", "summary_pending"} <= set(result)
+        assert result["id"] == 1
+        assert result["stored"] is True
+        assert result["summary_pending"] is True
+        assert "namespace_hint" in result
 
     def test_create_duplicate_rejected_by_text_fallback(
         self, client: TestClient, token: str

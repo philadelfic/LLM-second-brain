@@ -414,7 +414,8 @@ class TestCompactOutputs:
                 "memory_save", {"text": "регресс выдач заметок", "title": "Регресс"}
             )
         ).structured_content
-        assert set(saved) == {"id", "stored", "summary_pending"}
+        # №28: save без `namespace` добавляет `namespace_hint` — поля-скелет те же.
+        assert {"id", "stored", "summary_pending"} <= set(saved)
         note_id = saved["id"]
         got = (
             await mcp_notes.call_tool("memory_get", {"ids": [note_id]})

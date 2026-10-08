@@ -505,7 +505,9 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "creating a copy. If you get stored=false — a nearly identical note "
         "already exists: take its id from the response and refine it via "
         "memory_update. Pass `namespace` from the map if confident about the "
-        "domain; omitted — falls into default."
+        "domain; omitted — falls into `default` and the reply carries "
+        "`namespace_hint`: a node from the map that matches the note (or "
+        "says none matched) — it never moves the note."
     ),
     "memory_update": (
         "Updates a note by contract lsb-0004-01: «not passed» = keep, null = "
@@ -835,7 +837,12 @@ def _compact_save(result: dict[str, Any]) -> dict[str, Any]:
     # где уже лежит дословный дубль (запись не блокирует — меж-узловые
     # дубли легитимны). Копируется только если есть — белый список не
     # растёт для обычного ответа.
-    return _with_hint(_pick(result, ("id", "stored", "summary_pending")), result)
+    out = _pick(result, ("id", "stored", "summary_pending"))
+    # №28 (3.2.0): подсказка узла при записи без `namespace` — рядом с `hint`
+    # (дедуп чужого узла), тоже только если есть.
+    if "namespace_hint" in result:
+        out["namespace_hint"] = result["namespace_hint"]
+    return _with_hint(out, result)
 
 
 def _compact_update(result: dict[str, Any]) -> dict[str, Any]:
@@ -1577,12 +1584,12 @@ def build_mcp(
             ),
         ] = None,
         namespace: Annotated[
-            str,
+            str | None,
             Field(
                 description="Hierarchy node from the map (existing); omitted — default. "
                 "save does not create nodes.",
             ),
-        ] = "default",
+        ] = None,
         expires_at: Annotated[
             str | None,
             Field(

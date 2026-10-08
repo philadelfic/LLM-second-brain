@@ -473,7 +473,7 @@ class TestOtherOutputsRegression:
             "memory_save",
             {"text": "Regression note for the terms-area pool.", "title": "Regression note"},
         )
-        assert set(note) == {"id", "stored", "summary_pending"}
+        assert {"id", "stored", "summary_pending"} <= set(note)  # №28: + namespace_hint
         found = await _call(mcp_full, "memory_search", {"query": "regression"})
         assert set(found["results"][0]) == {
             "id",

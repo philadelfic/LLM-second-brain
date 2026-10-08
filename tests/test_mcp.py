@@ -241,7 +241,7 @@ class TestToolsList:
         namespace_exact; delete без namespace (по id)."""
         async with connect(server_url) as session:
             tools = {t.name: t for t in (await session.list_tools()).tools}
-        assert tools["memory_save"].input_schema["properties"]["namespace"]["default"] == "default"
+        assert tools["memory_save"].input_schema["properties"]["namespace"]["default"] is None
         assert tools["memory_update"].input_schema["properties"]["namespace"]["default"] is None
         srch = tools["memory_search"].input_schema["properties"]
         assert srch["namespace"]["default"] is None
@@ -251,6 +251,15 @@ class TestToolsList:
         assert lst["namespace_exact"]["default"] is False
         assert "namespace" not in tools["memory_delete"].input_schema["properties"]
         assert "namespace" not in tools["memory_get"].input_schema["properties"]
+
+    @pytest.mark.asyncio
+    async def test_memory_save_default_namespace_in_schema(self, server_url: str) -> None:
+        """№28: дефолт `namespace` в схеме save — None (не «default»):
+        «не передан» отличим от явного узла и даёт подсказку узла."""
+        async with connect(server_url) as session:
+            tools = {t.name: t for t in (await session.list_tools()).tools}
+        namespace = tools["memory_save"].input_schema["properties"]["namespace"]
+        assert namespace["default"] is None
 
     @pytest.mark.asyncio
     async def test_search_schema_mode(self, server_url: str) -> None:
@@ -904,6 +913,27 @@ class TestNamespaceMCP:
             )).structured_content
         assert upd["updated"] is True
         assert got["notes"][0]["namespace"] == "work"
+
+    @pytest.mark.asyncio
+    async def test_memory_save_namespace_hint_in_response(
+        self, ns_url: str, ns_db: str
+    ) -> None:
+        """№28: save без namespace несёт `namespace_hint` рядом с id/stored,
+        а дедуп-`hint` чужого узла при этом сохраняется."""
+        _register_namespace(ns_db, "noding", "Реестр зарплат СУБО и доступы")
+        text = f"{self.marker}: реестр зарплат СУБО"
+        async with connect(ns_url) as session:
+            first = (await session.call_tool(
+                "memory_save", {"text": text, "title": "СУБО реестр",
+                                "namespace": "noding"}
+            )).structured_content
+            assert first["stored"] is True
+            saved = (await session.call_tool(
+                "memory_save", {"text": text, "title": "СУБО реестр"}
+            )).structured_content
+        assert {"id", "stored", "summary_pending"} <= set(saved)
+        assert "noding" in saved["namespace_hint"]
+        assert "noding" in saved["hint"]
 
     @pytest.mark.asyncio
     async def test_save_foreign_duplicate_gives_hint(self, ns_url: str, ns_db: str) -> None:

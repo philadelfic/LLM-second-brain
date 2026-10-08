@@ -64,10 +64,14 @@ def _set_updated_at(note_id: int, stamp: str) -> None:
 
 class TestSave:
     def test_response_contract(self, service: NoteService) -> None:
-        """FR-4 шаг 4: {id, stored: true, summary_pending: true}."""
-        assert service.save("Заметка о сервисе") == {
-            "id": 1, "stored": True, "summary_pending": True,
-        }
+        """FR-4 шаг 4: {id, stored: true, summary_pending: true} + №28 — запись
+        без namespace несёт `namespace_hint` (слой ориентирования)."""
+        saved = service.save("Заметка о сервисе")
+        assert {"id", "stored", "summary_pending"} <= set(saved)
+        assert saved["id"] == 1
+        assert saved["stored"] is True
+        assert saved["summary_pending"] is True
+        assert "namespace_hint" in saved
         assert service.save("Вторая заметка")["id"] == 2
 
     def test_statuses_and_defaults_in_db(self, service: NoteService) -> None:

@@ -315,6 +315,16 @@ class Settings(BaseSettings):
     namespace_auto_max_per_day: int = 3  # лимит авто-созданных узлов в сутки (защита от шторма)
     namespace_max_leaves_per_domain: int = 12  # потолок листов в корне
     namespace_groom_min_notes: int = 2  # груминг: узел с меньшим числом заметок — кандидат на слияние
+    # Подсказка узла при save без `namespace` (№28, релиз 3.2.0; arch §6.2/§8):
+    # сравнение слов заголовка и первых `MEMORY_NODE_HINT_TEXT_CHARS` символов
+    # текста с сегментами путей (вес 3.0) и словами описаний (вес 2.0) — БЕЗ
+    # вызова модели; подсказка только ориентирует: заметку не двигает и запись
+    # не блокирует (§13.2). `MIN_SCORE` 2.0 = «≥1 совпавшее значимое слово»;
+    # `MAX_NODES` 1..2 (FR-1.1); выключатель гасит поле целиком.
+    memory_node_hint_enabled: bool = True
+    memory_node_hint_min_score: float = 2.0
+    memory_node_hint_max_nodes: int = 2
+    memory_node_hint_text_chars: int = 200
     # Судья структуры (Фаза 10): отдельный флаг think — дедуп-судья остаётся
     # думающим (решение Фазы 8), судья структуры бездумный (E2E Шага 7:
     # думающий «залипал» на парах-близнецах, голодая суммаризацию; вердикт
@@ -686,6 +696,19 @@ class Settings(BaseSettings):
             "namespace_max_leaves_per_domain", self.namespace_max_leaves_per_domain, 1
         )
         need_low("namespace_groom_min_notes", self.namespace_groom_min_notes, 0)
+        # №28: порог отбора ≥ 0 (2.0 — дефолт), потолок узлов 1..2 (FR-1.1),
+        # текст для сравнения — хотя бы один символ.
+        need_range(
+            "memory_node_hint_min_score", self.memory_node_hint_min_score, 0.0, 1e6
+        )
+        need_low("memory_node_hint_max_nodes", self.memory_node_hint_max_nodes, 1)
+        if self.memory_node_hint_max_nodes > 2:
+            errors.append(
+                "  - memory_node_hint_max_nodes: больше 2 узлов — ответ раздувается "
+                "(FR-1.1, arch §13.1), получено "
+                f"{self.memory_node_hint_max_nodes}"
+            )
+        need_low("memory_node_hint_text_chars", self.memory_node_hint_text_chars, 1)
 
         # --- области 3.0.0 (субстрат: skills / terms / user) ---
         for field in (
