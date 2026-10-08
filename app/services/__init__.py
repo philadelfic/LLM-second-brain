@@ -38,6 +38,10 @@ from app.services.search import SearchService
 from app.services.skills import SkillsService
 from app.services.summary import SummaryService
 from app.services.terms import TermsService
+# №32 (3.2.0): импорт модуля регистрирует джобу `terms-normalize` в реестре
+# каркаса (`jobs.JOB_BUILDERS`) — как `warnings` строкой выше (импорт
+# односторонний: terms_normalize → jobs).
+from app.services.terms_normalize import TermsNormalizerService
 from app.services.user_facts import UserFactsService
 from app.services.warnings import WarningsService
 
@@ -57,6 +61,7 @@ __all__ = [
     "Services",
     "SkillsService",
     "SummaryService",
+    "TermsNormalizerService",
     "TermsService",
     "UserFactsService",
     "WarningsService",

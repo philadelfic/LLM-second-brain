@@ -166,6 +166,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         judge=services.judge,
         classifier=services.classifier,
         promoter=services.promotion,
+        terms=services.terms,
     )
     # Суммаризация стартует сразу при save/update: NoteService сигналит
     # воркеру, тот немедленно догоняет pending_summary (не ждёт back-off).

@@ -86,6 +86,12 @@ services:
       JOB_WARNINGS_CLASSIFIER_BUDGET: "10"  # classifier calls per warnings run (≥1, ≤ JOB_WARNINGS_BATCH)
       WARNINGS_MIN_CONFIDENCE: "0.80"  # confidence threshold for "note is misplaced" (0..1)
       WARNINGS_LEVEL_STRICT: "false"   # treat a parent/child node mismatch as a warning too
+      # --- background jobs (lsb-0014): terms-normalize job (№32) ---
+      JOB_TERMS_ENABLED: "true"       # terms-normalize job on/off (also gated by AREA_TERMS_ENABLED)
+      JOB_TERMS_INTERVAL_SEC: "1800"  # start pause between terms-normalize runs in seconds (≥30)
+      JOB_TERMS_BATCH: "50"           # term groups processed per terms-normalize run (≥1)
+      JOB_TERMS_CLUSTER_SIMILARITY: "0.75"  # context clustering threshold, single-linkage (0..1)
+      JOB_TERMS_CONTEXTS_EXCESS: "5"  # contexts-per-term excess warning threshold (≥2)
       DEDUP_SIMILARITY: "0.92"               # "duplicate" cosine threshold in background dedup (Phase 8)
       DEDUP_CANDIDATE_TOP_N: "3"             # top-N cosine candidates for the dedup judge
       DEDUP_CANDIDATE_SIMILARITY: "0.80"     # lower paraphrase-candidate threshold (≤ DEDUP_SIMILARITY)

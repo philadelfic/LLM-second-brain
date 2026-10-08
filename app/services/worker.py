@@ -155,6 +155,7 @@ from app.services.promotion import PromotionService
 from app.services.slot_breaker import SlotBreaker
 from app.services.slot_outcome import SlotOutcome, outcome_of
 from app.services.summary import Summarizer, SummaryError, cap_summary
+from app.services.terms import TermsService
 from app.storage import area_vectors, chunks, vectors
 from app.storage.db import delete_note_physical, session, transaction
 
@@ -355,6 +356,7 @@ class BackgroundWorker:
         judge: Judge | None = None,
         classifier: Classifier | None = None,
         promoter: PromotionService | None = None,
+        terms: TermsService | None = None,
     ) -> None:
         self._settings = settings
         self._embedding = embedding
@@ -385,6 +387,10 @@ class BackgroundWorker:
         # Реестр неймспейсов: известные узлы для классификатора и проверка
         # целевого узла авто-переезда.
         self._namespaces = NamespaceService(settings)
+        # Область terms (3.0.0, lsb-0008; 3.2.0 — джоба `terms-normalize`):
+        # тот же экземпляр, что у транспорта/петли areas (DI из build_services).
+        # None — DI-сборка без области: сборщик джобы не регистрируется (§6.6).
+        self._terms = terms
         # Триггер домена (Фаза 10, Шаг 5): авто-создание листов из hint-групп
         # после классификации; None — тестовый режим без триггера (в проде
         # DI из build_services: describer + судья структуры).

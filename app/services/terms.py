@@ -467,6 +467,34 @@ class TermsService:
 
     # --- внутреннее: подсказки и близость контекста -------------------------
 
+    def group(self, term_norm: str) -> list[dict[str, Any]]:
+        """Активные строки группы термина — читающий хелпер джобы `terms-normalize`.
+
+        Возвращает `[{id, term, context, definition, context_norm, updated_at}]`
+        только по активным строкам (`deleted_at IS NULL`), порядок — по id.
+        Только SQL: запись джоба ведёт существующими `update`/`delete`, их
+        поведение и контракты не меняются (№32 FR-9.1). Листинга у области не
+        появляется — ручка живёт только внутри фоновой джобы.
+        """
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT id, term, context, definition, context_norm, updated_at "
+                "FROM terms WHERE term_norm = ? AND deleted_at IS NULL "
+                "ORDER BY id",
+                (term_norm,),
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "term": str(row["term"]),
+                "context": str(row["context"]),
+                "definition": str(row["definition"]),
+                "context_norm": str(row["context_norm"]),
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
     @staticmethod
     def _projection_row(conn: sqlite3.Connection, term_id: int) -> sqlite3.Row:
         """Строка проекции термина после записи — одна форма baseline/дельты."""

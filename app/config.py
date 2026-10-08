@@ -183,6 +183,19 @@ class Settings(BaseSettings):
     warnings_min_confidence: float = 0.80
     warnings_level_strict: bool = False
 
+    # Джоба `terms-normalize` (№32, релиз 3.2.0; arch §6.6/§8): кластеры
+    # контекстов термина + каноничное написание, без LLM. Интервал ≥ 30 с
+    # (дефолт 1800), батч (терминов за прогон) ≥ 1 (дефолт 50), порог
+    # кластеризации single-linkage 0..1 (дефолт 0.75, отдельно от
+    # `term_context_similarity`, чтобы тюнинг фона не ослаблял мягкий отказ на
+    # записи), порог переизбытка контекстов ≥ 2 (дефолт 5). Выключатель; джоба
+    # подчиняется ещё и `AREA_TERMS_ENABLED` (№40).
+    job_terms_enabled: bool = True
+    job_terms_interval_sec: int = 1800
+    job_terms_batch: int = 50
+    job_terms_cluster_similarity: float = 0.75
+    job_terms_contexts_excess: int = 5
+
     # --- лимиты (NFR-6: env-переопределяемы, валидируются; см. _validate_ranges) ---
     max_note_chars: int = 35000  # 2000→20000 (Фаза 7) → 35000 (решение О. 2026-08-30)
     max_query_chars: int = 512
@@ -452,6 +465,20 @@ class Settings(BaseSettings):
             )
         need_range(
             "warnings_min_confidence", self.warnings_min_confidence, 0.0, 1.0
+        )
+
+        # Джоба `terms-normalize` (№32, 3.2.0): интервал ≥ 30, батч ≥ 1, порог
+        # кластеризации 0..1, порог переизбытка контекстов ≥ 2.
+        need_low("job_terms_interval_sec", self.job_terms_interval_sec, 30)
+        need_low("job_terms_batch", self.job_terms_batch, 1)
+        need_low(
+            "job_terms_contexts_excess", self.job_terms_contexts_excess, 2
+        )
+        need_range(
+            "job_terms_cluster_similarity",
+            self.job_terms_cluster_similarity,
+            0.0,
+            1.0,
         )
 
         # --- векторизация / суммаризация ---

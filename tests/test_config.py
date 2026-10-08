@@ -86,6 +86,13 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "JOB_WARNINGS_CLASSIFIER_BUDGET": ("job_warnings_classifier_budget", 10),
     "WARNINGS_MIN_CONFIDENCE": ("warnings_min_confidence", 0.80),
     "WARNINGS_LEVEL_STRICT": ("warnings_level_strict", False),
+    # Релиз 3.2.0, джоба нормализации контекстов терминов №32 (постановка
+    # no32-01): интервал/батч, порог кластеризации и порог переизбытка.
+    "JOB_TERMS_ENABLED": ("job_terms_enabled", True),
+    "JOB_TERMS_INTERVAL_SEC": ("job_terms_interval_sec", 1800),
+    "JOB_TERMS_BATCH": ("job_terms_batch", 50),
+    "JOB_TERMS_CLUSTER_SIMILARITY": ("job_terms_cluster_similarity", 0.75),
+    "JOB_TERMS_CONTEXTS_EXCESS": ("job_terms_contexts_excess", 5),
     "DEDUP_SIMILARITY": ("dedup_similarity", 0.92),
     # Фаза 8 (Этап 2.1): фоновый дедуп — косинус-кандидаты.
     "DEDUP_CANDIDATE_TOP_N": ("dedup_candidate_top_n", 3),
@@ -182,7 +189,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 113 полей: 6 обязательных + 107 с умолчаниями
+        """В Settings — ровно 118 полей: 6 обязательных + 112 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
@@ -192,7 +199,8 @@ class TestCompleteness:
         релиза 3.2.0: AREA_*_ENABLED; + 5 настроек слота №39 релиза 3.2.0:
         SLOT_* — пауза/стук/хинт, предел попыток пары и стартовый сброс;
         + 6 настроек джобы предупреждений №12 релиза 3.2.0: JOB_WARNINGS_*
-        и WARNINGS_* + 2 потолка страницы предупреждений: WARNINGS_MAX_LIMIT_*)."""
+        и WARNINGS_* + 2 потолка страницы предупреждений: WARNINGS_MAX_LIMIT_*
+        + 5 настроек джобы нормализации терминов №32 релиза 3.2.0: JOB_TERMS_*)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected
