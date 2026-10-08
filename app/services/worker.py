@@ -626,6 +626,40 @@ class BackgroundWorker:
         """
         return {name: breaker.snapshot() for name, breaker in self._breakers.items()}
 
+    def slots_health(self) -> dict[str, dict]:
+        """Снимок слотов для `/health.slots` (№39, arch §7.2): только SQL/память.
+
+        По каждому слоту (`embedding`/`summary`/`judge`) — снимок разрыва
+        (`SlotBreaker.snapshot`: `last_outcome`, `paused_until` и др.), исход
+        последней попытки (`ok` — прецедент `embedding_ok`/`summarizer_ok`/
+        `judge_ok`) и число заданий слота в внимании (`attention`, no39-02).
+        Модели НЕ вызываются: только состояние в памяти и SQL по `worker_jobs`
+        (сбор `/health` не должен будить слоты).
+        """
+        attention: dict[str, int] = {}
+        try:
+            self._ensure_job_table()
+            with session(self._settings) as conn:
+                rows = conn.execute(
+                    "SELECT slot, COUNT(*) AS c FROM worker_jobs "
+                    "WHERE attention_at IS NOT NULL GROUP BY slot"
+                ).fetchall()
+            attention = {rows[i]["slot"]: int(rows[i]["c"]) for i in range(len(rows))}
+        except Exception:  # noqa: BLE001 — наблюдаемость не роняет /health
+            attention = {}
+        services = {
+            SLOT_EMBEDDING: self._embedding,
+            SLOT_SUMMARY: self._summarizer,
+            SLOT_JUDGE: self._judge,
+        }
+        health: dict[str, dict] = {}
+        for name in SLOT_NAMES:
+            snapshot = dict(self._breakers[name].snapshot())
+            snapshot["ok"] = getattr(services.get(name), "last_attempt_ok", None)
+            snapshot["attention"] = attention.get(name, 0)
+            health[name] = snapshot
+        return health
+
     def _probe_slot(self, slot: str) -> str:
         """Один дешёвый пробный вызов слота (без генерации, №39 §6.2).
 
@@ -1467,6 +1501,11 @@ class BackgroundWorker:
         после него стёр бы сигнал (пауза до интервала на непустой очереди).
         Очередь пуста — только если нет title-догена (title IS NULL),
         pending суммаризации и pending merge-работ (все в summary-слоте).
+
+        №39 (arch §6.9/§13.9): считаем только БЕРУЩЕЕСЯ сейчас — merge-работы
+        без внимания (`attention_at IS NULL`). Замороженное задание
+        (`attention_at`, no39-02) петлю брать не может, а если бы очередь
+        считала его непустой — петля крутилась бы вхолостую (busy-loop).
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
@@ -1474,23 +1513,31 @@ class BackgroundWorker:
                 "SELECT (SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL "
                 "  AND (title IS NULL OR summary_status = 'pending')) "
                 "+ (SELECT COUNT(*) FROM worker_jobs "
-                "  WHERE slot = 'summary' AND status = 'pending') AS c"
+                "  WHERE slot = 'summary' AND status = 'pending' "
+                "  AND attention_at IS NULL) AS c"
             ).fetchone()
-        return int(row["c"]) == 0
+        # №39 (arch §6.9): при открытом разрыве слота петля партию не берёт —
+        # очередь для неё пуста (иначе отложенное задание гонит busy-loop).
+        return int(row["c"]) == 0 or self._breakers[SLOT_SUMMARY].is_paused()
 
     def _judge_queue_empty(self) -> bool:
         """Пуста ли judge-очередь (дешёвый SELECT, пул 6, lost wakeup).
 
         Считает pending dedup-работы judge-слота — ту же очередь, что
-        выгребает process_judge_pending в этой петле.
+        выгребает process_judge_pending в этой петле. №39 (arch §6.9/§13.9):
+        замороженное задание (`attention_at`, no39-02) не считается — петля
+        его не берёт, и очередь для неё пуста (busy-loop'а нет).
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
             row = conn.execute(
                 "SELECT COUNT(*) FROM worker_jobs "
-                "WHERE slot = 'judge' AND kind = 'dedup' AND status = 'pending'"
+                "WHERE slot = 'judge' AND kind = 'dedup' AND status = 'pending' "
+                "AND attention_at IS NULL"
             ).fetchone()
-        return int(row[0]) == 0
+        # №39 (arch §6.9): при открытом разрыве судьи партия не берётся —
+        # очередь для петли пуста (busy-loop'а нет).
+        return int(row[0]) == 0 or self._breakers[SLOT_JUDGE].is_paused()
 
     # --- наблюдаемость очередей (lsb-0014-03, FR-2.2) -------------------------
 
@@ -1509,36 +1556,117 @@ class BackgroundWorker:
             queues[spec.queue] = spec.queue_stat()
         return queues
 
+    def _gated_queue_stat(self, slot: str, stat: dict) -> dict:
+        """Снимок очереди с учётом разрыва слота (№39, arch §6.9).
+
+        Разрыв слота открыт (`SlotBreaker.is_paused`) — петля партию не берёт,
+        поэтому вся текущая работа из `pending` уезжает в `waiting`
+        (`pending=0`), а `oldest_pending_sec`/`attention` сохраняются: ожидание
+        видно в `/health.queues`, но петля не крутится вхолостую. Иначе —
+        снимок нормализуется как есть (возраст и внимание не пересчитываются).
+        """
+        pending = int(stat.get("pending", 0) or 0)
+        waiting = int(stat.get("waiting", 0) or 0)
+        attention = int(stat.get("attention", 0) or 0)
+        breaker = self._breakers.get(slot)
+        if breaker is not None and breaker.is_paused():
+            return queue_snapshot(
+                0,
+                stat.get("oldest_pending_sec"),
+                waiting=waiting + pending,
+                attention=attention,
+            )
+        return queue_snapshot(
+            pending,
+            stat.get("oldest_pending_sec"),
+            waiting=waiting,
+            attention=attention,
+        )
+
     def _vector_queue_stat(self) -> dict:
         """Снимок очереди векторизации заметок: pending и возраст старейшего.
 
         Источник — `notes.vector_status='pending'` (тот же предикат, что у
         легаси-счётчика `pending_vector`); SQL живёт рядом с `health_counts`
-        в NoteService.
+        в NoteService. №39 (arch §6.9): при открытом разрыве embedding очередь
+        ждёт слот — `_gated_queue_stat` (работа едет в `waiting`).
         """
-        return self._notes.vector_queue_stat()
+        return self._gated_queue_stat(
+            SLOT_EMBEDDING, self._notes.vector_queue_stat()
+        )
 
     def _summary_queue_stat(self) -> dict:
-        """Снимок очереди суммаризации заметок (`notes.summary_status`)."""
-        return self._notes.summary_queue_stat()
+        """Снимок очереди суммаризации (№39, arch §6.9).
 
-    def _judge_queue_stat(self) -> dict:
-        """Снимок очереди judge: pending-работы слота в `worker_jobs`.
-
-        Число — `worker_jobs(slot='judge', status='pending')`, возраст
-        старейшего — `now - MIN(created_at)`. Таблица создаётся лениво
-        (`_ensure_job_table`), моделей не зовём.
+        `pending` — работа, которую петля может взять СЕЙЧАС: заметки
+        (title-доген + pending суммаризации) плюс pending merge-работы слота
+        summary БЕЗ внимания. `attention` — pending merge-работы с вниманием
+        (no39-02, ждут человека), `waiting = attention`: у слота summary
+        отложено именно замороженное. `oldest_pending_sec` — максимум возраста
+        по обоим источникам; при открытом разрыве слота — `_gated_queue_stat`.
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
             row = conn.execute(
-                "SELECT COUNT(*) AS pending, "
-                "MAX(CAST(strftime('%s','now') AS INTEGER) - "
-                "CAST(strftime('%s', created_at) AS INTEGER)) "
-                "AS oldest_pending_sec FROM worker_jobs "
-                "WHERE slot = 'judge' AND status = 'pending'"
+                "SELECT "
+                "(SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL "
+                "  AND (title IS NULL OR summary_status = 'pending')) "
+                "+ (SELECT COUNT(*) FROM worker_jobs WHERE slot = 'summary' "
+                "  AND status = 'pending' AND attention_at IS NULL) AS pending, "
+                "(SELECT COUNT(*) FROM worker_jobs WHERE slot = 'summary' "
+                "  AND status = 'pending' AND attention_at IS NOT NULL) "
+                "AS attention, "
+                "MAX("
+                "COALESCE((SELECT MAX(CAST(strftime('%s','now') AS INTEGER) - "
+                "  CAST(strftime('%s', updated_at) AS INTEGER)) FROM notes "
+                "  WHERE deleted_at IS NULL AND (title IS NULL OR "
+                "  summary_status = 'pending')), 0), "
+                "COALESCE((SELECT MAX(CAST(strftime('%s','now') AS INTEGER) - "
+                "  CAST(strftime('%s', created_at) AS INTEGER)) FROM worker_jobs "
+                "  WHERE slot = 'summary' AND status = 'pending'), 0)"
+                ") AS oldest_pending_sec"
             ).fetchone()
-        return queue_snapshot(row["pending"], row["oldest_pending_sec"])
+        attention = int(row["attention"])
+        stat = queue_snapshot(
+            row["pending"],
+            row["oldest_pending_sec"],
+            waiting=attention,
+            attention=attention,
+        )
+        return self._gated_queue_stat(SLOT_SUMMARY, stat)
+
+    def _judge_queue_stat(self) -> dict:
+        """Снимок очереди judge (№39, arch §6.9).
+
+        `pending` — dedup-работы слота judge БЕЗ внимания (берущееся сейчас,
+        драйвер `_judge_queue_empty`); `attention` — с вниманием (no39-02),
+        `waiting = attention`: у судьи отложено именно замороженное. Возраст —
+        `now - MIN(created_at)` по берущемуся. При открытом разрыве judge —
+        `_gated_queue_stat`. Таблица создаётся лениво (`_ensure_job_table`),
+        моделей не зовём.
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT "
+                "COALESCE(SUM(status = 'pending' AND attention_at IS NULL), 0) "
+                "AS pending, "
+                "COALESCE(SUM(status = 'pending' AND attention_at IS NOT NULL), 0) "
+                "AS attention, "
+                "MAX(CASE WHEN status = 'pending' AND attention_at IS NULL "
+                "  THEN CAST(strftime('%s','now') AS INTEGER) - "
+                "  CAST(strftime('%s', created_at) AS INTEGER) END) "
+                "AS oldest_pending_sec "
+                "FROM worker_jobs WHERE slot = 'judge'"
+            ).fetchone()
+        attention = int(row["attention"])
+        stat = queue_snapshot(
+            row["pending"],
+            row["oldest_pending_sec"],
+            waiting=attention,
+            attention=attention,
+        )
+        return self._gated_queue_stat(SLOT_JUDGE, stat)
 
     def _areas_queue_stat(self) -> dict:
         """Снимок очереди областей: сумма pending по ВКЛЮЧЁННЫМ областям (FR-2.5).
@@ -1566,7 +1694,10 @@ class BackgroundWorker:
                 value = row["oldest_pending_sec"]
                 if value is not None:
                     oldest = int(value) if oldest is None else max(oldest, int(value))
-        return queue_snapshot(pending, oldest)
+        stat = queue_snapshot(pending, oldest)
+        # №39 (arch §6.9): петля `areas` кодирует тем же слотом embedding —
+        # разрыв слота означает, что очередь ждёт его.
+        return self._gated_queue_stat(SLOT_EMBEDDING, stat)
 
     def areas_health(self) -> dict[str, dict]:
         """`/health.areas` (FR-4.3, №40): по ВСЕМ областям `{enabled, pending}`.
@@ -1765,7 +1896,9 @@ class BackgroundWorker:
                         "AND deleted_at IS NULL"
                     ).fetchone()[0]
                 )
-        return pending == 0
+        # №39 (arch §6.9): области кодируются слотом embedding — при его
+        # разрыве партия не берётся, очередь для петли пуста (busy-loop'а нет).
+        return pending == 0 or self._breakers[SLOT_EMBEDDING].is_paused()
 
     # --- judge-петля: судья дедупа (Фаза 8, Этап 3.2; Фаза 11, решение №10) ---
 
@@ -2800,7 +2933,10 @@ class BackgroundWorker:
                         self._settings.namespace_auto_move_min_confidence
                 },
             ).fetchone()
-        return queue_snapshot(row["pending"], row["oldest_pending_sec"])
+        stat = queue_snapshot(row["pending"], row["oldest_pending_sec"])
+        # №39 (arch §6.9): классификатор обхода `nodes` ходит в слот summary —
+        # при его разрыве очередь ждёт слот (работа едет в `waiting`).
+        return self._gated_queue_stat(SLOT_SUMMARY, stat)
 
     def _nodes_queue_empty(self) -> bool:
         """Пуста ли очередь `nodes` (дешёвая перепроверка, пул 6, lost wakeup).

@@ -271,14 +271,35 @@ class HistoryRollback(BaseModel):
 
 
 class QueueStat(BaseModel):
-    """Снимок одной очереди для /health.queues (FR-2.2).
+    """Снимок одной очереди для /health.queues (FR-2.2, №39 arch §7.2).
 
-    `pending` — сколько заданий ждёт в очереди; `oldest_pending_sec` — возраст
-    старейшего задания в секундах (null — очередь пуста).
+    `pending` — сколько заданий берётся СЕЙЧАС; `oldest_pending_sec` — возраст
+    старейшего берущегося задания в секундах (null — очередь пуста);
+    `waiting` — отложено из-за слота/готовности (№39); `attention` —
+    подмножество `waiting`, ждущее человека (no39-02).
     """
 
     pending: int
     oldest_pending_sec: int | None
+    waiting: int = 0
+    attention: int = 0
+
+
+class SlotStat(BaseModel):
+    """Снимок одного слота для /health.slots (№39, arch §7.2).
+
+    `ok` — исход последней попытки слота (прецедент `embedding_ok`/
+    `summarizer_ok`/`judge_ok`; None — попыток не было); `last_outcome` —
+    исход последнего отказа (словарь `SlotOutcome`); `paused_until` —
+    ISO-8601 UTC, пока разрыв открыт (null — слот работает); `attention` —
+    число заданий слота, ждущих человека (no39-02). Собирается воркером,
+    только SQL/память — моделей не зовём.
+    """
+
+    ok: bool | None
+    last_outcome: str | None
+    paused_until: str | None
+    attention: int
 
 
 class HealthResponse(BaseModel):
@@ -298,6 +319,9 @@ class HealthResponse(BaseModel):
     pending_vector: int
     pending_summary: int
     queues: dict[str, QueueStat]  # lsb-0014-03: ожидание по каждой очереди
+    # №39 (arch §7.2): по слоту {ok, last_outcome, paused_until, attention} —
+    # причина и пауза разрыва слота, число заданий в внимании. Только SQL/память.
+    slots: dict[str, SlotStat]
     # №40 (FR-4.3): по каждой области {enabled, pending} — по ВСЕМ областям,
     # включая выключенные (их накопление видно). Собирает воркер, только SQL.
     areas: dict[str, dict]
@@ -408,6 +432,9 @@ def build_rest_router(settings: Settings) -> APIRouter:
         worker = request.app.state.worker  # type: ignore[attr-defined]
         counts = await asyncio.to_thread(services.notes.health_counts)
         queues = await asyncio.to_thread(worker.queues_health)
+        # №39 (arch §7.2): снимок слотов — причина и пауза разрыва (только
+        # SQL/память, модели не вызываются).
+        slots = await asyncio.to_thread(worker.slots_health)
         areas = await asyncio.to_thread(worker.areas_health)
         # №12 (no12-02): агрегаты открытых предупреждений — только SQL.
         if services.warnings is None:
@@ -424,6 +451,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
             pending_vector=counts["pending_vector"],
             pending_summary=counts["pending_summary"],
             queues=queues,
+            slots=slots,
             areas=areas,
             warnings=warnings,
         )

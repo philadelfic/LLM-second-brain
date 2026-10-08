@@ -30,8 +30,12 @@ class TestHealth:
             "pending_vector": 0,
             "pending_summary": 0,
             "queues": {
-                queue: {"pending": 0, "oldest_pending_sec": None}
+                queue: {"pending": 0, "oldest_pending_sec": None, "waiting": 0, "attention": 0}
                 for queue in ("vector", "summary", "judge", "areas", "links", "nodes", "warnings", "terms-normalize")
+            },
+            "slots": {
+                slot: {"ok": None, "last_outcome": None, "paused_until": None, "attention": 0}
+                for slot in ("embedding", "summary", "judge")
             },
             "areas": {
                 name: {"enabled": True, "pending": 0}
@@ -53,6 +57,7 @@ class TestHealth:
             "pending_vector",
             "pending_summary",
             "queues",
+            "slots",
             "areas",
             "warnings",
         }
@@ -73,7 +78,11 @@ class TestHealth:
             "terms-normalize",
         }
         for stat in body["queues"].values():
-            assert set(stat) == {"pending", "oldest_pending_sec"}
+            assert set(stat) == {"pending", "oldest_pending_sec", "waiting", "attention"}
+        # №39 (arch §7.2): /health.slots — по каждому слоту исход и пауза.
+        assert set(body["slots"]) == {"embedding", "summary", "judge"}
+        for stat in body["slots"].values():
+            assert set(stat) == {"ok", "last_outcome", "paused_until", "attention"}
         # №40 (FR-4.3): /health.areas — по всем областям {enabled, pending}.
         assert set(body["areas"]) == {"skills", "terms", "user"}
         for stat in body["areas"].values():

@@ -61,20 +61,39 @@ def next_interval(current: float, start: int) -> float:
 
 
 def queue_snapshot(
-    pending: int | None, oldest_pending_sec: int | None
+    pending: int | None,
+    oldest_pending_sec: int | None,
+    *,
+    waiting: int = 0,
+    attention: int = 0,
 ) -> dict[str, int | None]:
-    """Снимок очереди для `/health.queues` (FR-2.2): число и возраст старейшего.
+    """Снимок очереди для `/health.queues` (FR-2.2, №39 arch §6.9/§7.2).
 
     Единая форма для всех джоб: `{"pending": int, "oldest_pending_sec":
-    int | null}`. Возраст — секунды, посчитанные в SQL (`now - MIN(ts)`),
-    поэтому его отдаёт вызывающая сторона уже числом; `null` — очередь пуста
-    (у неё нет «старейшего» задания). Защита от расхождения часов и
-    неожиданного NULL у непустой очереди — `max(0, ...)`/`null`.
+    int | null, "waiting": int, "attention": int}`. Возраст — секунды,
+    посчитанные в SQL (`now - MIN(ts)`), поэтому его отдаёт вызывающая сторона
+    уже числом; `null` — очередь пуста (у неё нет «старейшего» задания).
+    Защита от расхождения часов и неожиданного NULL у непустой очереди —
+    `max(0, ...)`/`null`.
+
+    `waiting`/`attention` — обратно совместимое расширение №39: `pending` —
+    работа, которую петля может взять **сейчас**; `waiting` — отложено слотом
+    или готовностью зависимого слота (ожидание модели видно без опроса
+    журнала); `attention` — подмножество `waiting`, ждущее человека (no39-02).
+    Старый вызов `queue_snapshot(n, age)` остаётся валидным: счётчики просто
+    нулевые.
     """
     count = int(pending or 0)
     if count == 0 or oldest_pending_sec is None:
-        return {"pending": count, "oldest_pending_sec": None}
-    return {"pending": count, "oldest_pending_sec": max(0, int(oldest_pending_sec))}
+        oldest = None
+    else:
+        oldest = max(0, int(oldest_pending_sec))
+    return {
+        "pending": count,
+        "oldest_pending_sec": oldest,
+        "waiting": int(waiting or 0),
+        "attention": int(attention or 0),
+    }
 
 
 @dataclass(frozen=True)
@@ -202,13 +221,17 @@ async def _log_queue_waiting(spec: JobSpec) -> None:
         return
     stat = await _call_hook(spec.queue_stat)
     pending = int(stat.get("pending", 0) or 0)
-    if pending <= 0:
+    waiting = int(stat.get("waiting", 0) or 0)
+    # №39 (arch §6.9): ожидание отложенного задания — тоже видимая работа, хотя
+    # петлю в busy-loop оно не гонит (драйвер `queue_empty` считает берущееся).
+    if pending + waiting <= 0:
         return
     log_job(
         spec,
         "queue_waiting",
         queue=spec.queue,
         pending=pending,
+        waiting=waiting,
         oldest_pending_sec=stat.get("oldest_pending_sec"),
     )
 

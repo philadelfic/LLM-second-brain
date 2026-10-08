@@ -437,7 +437,9 @@ def test_queue_stat_matches_direct_sql(settings: Settings) -> None:
 def test_queue_stat_empty_is_null(settings: Settings) -> None:
     """Пустая очередь: pending 0, oldest_pending_sec — null."""
     spec = nodes_spec(make_worker(settings), settings)
-    assert spec.queue_stat() == {"pending": 0, "oldest_pending_sec": None}
+    assert spec.queue_stat() == {
+        "pending": 0, "oldest_pending_sec": None, "waiting": 0, "attention": 0
+    }
 
 
 @pytest.mark.asyncio
@@ -977,7 +979,9 @@ def test_queue_stat_ignores_classified_note_without_hint(settings: Settings) -> 
         )
     spec = nodes_spec(make_worker(settings), settings)
 
-    assert spec.queue_stat() == {"pending": 0, "oldest_pending_sec": None}
+    assert spec.queue_stat() == {
+        "pending": 0, "oldest_pending_sec": None, "waiting": 0, "attention": 0
+    }
 
 
 def test_queue_stat_counts_both_pools_and_drains_after_run(
@@ -998,7 +1002,9 @@ def test_queue_stat_counts_both_pools_and_drains_after_run(
     assert spec.queue_stat()["oldest_pending_sec"] is not None
 
     assert _run(spec) == 2  # оба кандидата взяты одним прогоном
-    assert spec.queue_stat() == {"pending": 0, "oldest_pending_sec": None}
+    assert spec.queue_stat() == {
+        "pending": 0, "oldest_pending_sec": None, "waiting": 0, "attention": 0
+    }
 
 
 def _age_jobs(settings: Settings, seconds_ago: int) -> None:
@@ -1042,7 +1048,9 @@ def test_queue_stat_skips_reclass_job_waiting_for_summary(
     _enqueue_reclass(worker, 1)
     spec = nodes_spec(worker, settings)
 
-    assert spec.queue_stat() == {"pending": 0, "oldest_pending_sec": None}
+    assert spec.queue_stat() == {
+        "pending": 0, "oldest_pending_sec": None, "waiting": 0, "attention": 0
+    }
 
     with session(settings) as conn, transaction(conn):
         conn.execute(
