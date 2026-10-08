@@ -66,13 +66,15 @@ Bearer и тот же сервисный слой, что у MCP (`user_save`/`u
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
 from app import __version__
 from app.config import Settings
 from app.services import Services
+from app.services import history
 from app.services.namespaces import NamespaceError, NamespaceValidationError
 from app.services.notes import NoteValidationError
 from app.services.search import SearchValidationError
@@ -304,9 +306,21 @@ def _conflict(exc: NamespaceError) -> HTTPException:
     return HTTPException(status_code=409, detail=str(exc))
 
 
+async def _bind_rest_origin(request: Request) -> AsyncIterator[None]:
+    """Обвязать REST-запрос источником версий (§13.4, №41).
+
+    `source='rest'`, сессия — заголовок `X-LSB-Session` (не передан → NULL:
+    человекоподобный идентификатор не придумываем). Зависимость роутера
+    держит contextvar на время обработки запроса; `asyncio.to_thread` сервисов
+    контекст пробрасывает — версии правок оператора несут источник `rest`.
+    """
+    with history.bind_origin("rest", session=request.headers.get("X-LSB-Session")):
+        yield
+
+
 def build_rest_router(settings: Settings) -> APIRouter:
     """Собрать роутер; умолчания пагинации — из настроек окружения."""
-    rest_router = APIRouter()
+    rest_router = APIRouter(dependencies=[Depends(_bind_rest_origin)])
 
     @rest_router.get("/health", response_model=HealthResponse)
     async def health(request: Request) -> HealthResponse:

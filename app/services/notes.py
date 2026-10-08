@@ -74,6 +74,7 @@ from collections.abc import Callable
 from typing import Any
 
 from app.config import TITLE_MAX_WORDS, Settings
+from app.services import history
 from app.services.dedup import DeduplicationService, duplicate_response
 from app.services.embedding import Embedder, EmbeddingService
 from app.services.emit import summary_of
@@ -268,6 +269,16 @@ class NoteService:
                     # на заметку, PK note_id).
                     expirations.upsert(conn, note_id, expires_value)
                 self._store_chunks(conn, note_id, chunks_data, None)
+                # №41 (§13.5): baseline-версия пишется ТОЙ ЖЕ транзакцией, что и
+                # INSERT, — состояния «заметка есть, истории нет» не бывает.
+                row = conn.execute(
+                    "SELECT text, title, namespace, expires_at FROM notes "
+                    "WHERE id = ?",
+                    (note_id,),
+                ).fetchone()
+                history.record_initial(
+                    conn, history.ENTITY_NOTE, note_id, history.note_projection(row)
+                )
         if duplicate is not None:
             return duplicate_response(duplicate)
         self._notify_summary_pending()
@@ -673,6 +684,23 @@ class NoteService:
                 # участвует только в FTS-поиске (ARCH §3.3), старый вектор по
                 # прежнему тексту не кормит ни векторный поиск, ни косинус-дедуп.
                 vectors.drop(conn, note_id)
+            if updated:
+                # №41 (§13.5): версия-правка — ТОЙ ЖЕ транзакцией, проекция
+                # читается после UPDATE. `summary` входит только при ЯВНОЙ
+                # передаче (§13.3): авто-перегенерация версий не создаёт.
+                row = conn.execute(
+                    "SELECT text, title, namespace, expires_at, summary "
+                    "FROM notes WHERE id = ?",
+                    (note_id,),
+                ).fetchone()
+                history.record_change(
+                    conn,
+                    history.ENTITY_NOTE,
+                    note_id,
+                    history.note_projection(
+                        row, explicit_summary=summary is not _UNSET_SUMMARY
+                    ),
+                )
         if not updated:
             return self._not_found(note_id)
         if text_changed:
@@ -706,6 +734,11 @@ class NoteService:
                 # Только если soft delete сматчился: снимаем TTL-строку той же
                 # транзакцией (идемпотентно — отсутствующей строки нет).
                 expirations.delete(conn, note_id)
+                # №41 (FR-6.1): мягкое удаление — версия-событие в той же
+                # транзакции; повторное/несуществующее удаление версии не даёт.
+                history.record_event(
+                    conn, history.ENTITY_NOTE, note_id, "delete"
+                )
         if not deleted:
             return {
                 "id": note_id,
@@ -773,6 +806,29 @@ class NoteService:
                     (newer_id,),
                 )
                 deleted = cursor.rowcount > 0
+                # №41 (FR-7.1, §13.5): обе записи — в ТОЙ ЖЕ транзакции.
+                # Выжившая: контент-версия с источником `merge`; поглощённая:
+                # версия-событие удаления (история читается и после soft delete).
+                older_row = conn.execute(
+                    "SELECT text, title, namespace, expires_at FROM notes "
+                    "WHERE id = ?",
+                    (older_id,),
+                ).fetchone()
+                history.record_change(
+                    conn,
+                    history.ENTITY_NOTE,
+                    older_id,
+                    history.note_projection(older_row),
+                    source="merge",
+                )
+                if deleted:
+                    history.record_event(
+                        conn,
+                        history.ENTITY_NOTE,
+                        newer_id,
+                        "delete",
+                        source="merge",
+                    )
         if merged:
             self._notify_summary_pending()
             # Сшивание переписало текст ранней заметки и вернуло её в очередь

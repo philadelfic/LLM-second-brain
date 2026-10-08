@@ -127,6 +127,7 @@ import json
 import logging
 
 from app.config import TITLE_MAX_WORDS, Settings
+from app.services import history
 from app.services import jobs
 from app.services.areas import AreaSpec, ALL_AREAS
 from app.services.classifier import Classification, ClassificationError, Classifier
@@ -565,8 +566,9 @@ class BackgroundWorker:
         Semaphore внутри). Возвращает число фактически обработанных заданий:
         0 уводит каркасную петлю в ожидание с back-off (arch §3.2).
         """
-        processed = await asyncio.to_thread(self.process_pending)
-        processed += await self.process_pending_chunks()
+        with history.bind_origin(f"job:{EMBEDDING_JOB}"):
+            processed = await asyncio.to_thread(self.process_pending)
+            processed += await self.process_pending_chunks()
         return processed
 
     async def _process_summary(self) -> int:
@@ -577,9 +579,10 @@ class BackgroundWorker:
         заданий: 0 уводит каркасную петлю к ожиданию сигнала
         `notify_summary_pending` (форма «по требованию», пул 6) или таймаута.
         """
-        processed = await asyncio.to_thread(self.process_title_pending)
-        processed += await asyncio.to_thread(self.process_summary_pending)
-        processed += await asyncio.to_thread(self.process_merge_pending)
+        with history.bind_origin(f"job:{SUMMARY_JOB}"):
+            processed = await asyncio.to_thread(self.process_title_pending)
+            processed += await asyncio.to_thread(self.process_summary_pending)
+            processed += await asyncio.to_thread(self.process_merge_pending)
         return processed
 
     async def _run_summary(self) -> None:
@@ -600,7 +603,8 @@ class BackgroundWorker:
         0 уводит каркасную петлю к ожиданию сигнала `notify_judge_pending`
         (форма «по требованию», пул 6) или таймаута интервала.
         """
-        return await asyncio.to_thread(self.process_judge_pending)
+        with history.bind_origin(f"job:{JUDGE_JOB}"):
+            return await asyncio.to_thread(self.process_judge_pending)
 
     async def _run_judge(self) -> None:
         """Обслуживать judge-джобу каркасным циклом (запуск одной джобы).
@@ -620,7 +624,8 @@ class BackgroundWorker:
         не мешает заметкам и наоборот (ARCH §3.4). 0 уводит каркасную петлю к
         ожиданию `notify_areas_pending` (пул 6) или таймаута интервала.
         """
-        return await asyncio.to_thread(self.process_pending_areas)
+        with history.bind_origin(f"job:{AREAS_JOB}"):
+            return await asyncio.to_thread(self.process_pending_areas)
 
     # --- джоба зачистки просроченных заметок (lsb-0004-02, этап 4) -----------
 
@@ -638,16 +643,17 @@ class BackgroundWorker:
         ускоряется/замедляется (FR-1.5). Возвращает число удалённых заметок
         (расписание ведёт интервал, а не прогресс — см. `run_loop`).
         """
-        deleted = await asyncio.to_thread(self.process_expired_notes)
-        if deleted:
-            logging.getLogger("app").info(
-                "expiration cleanup: purged expired notes",
-                extra={
-                    "event": "expiration_cleanup",
-                    "job": EXPIRATION_JOB,
-                    "count": deleted,
-                },
-            )
+        with history.bind_origin(f"job:{EXPIRATION_JOB}"):
+            deleted = await asyncio.to_thread(self.process_expired_notes)
+            if deleted:
+                logging.getLogger("app").info(
+                    "expiration cleanup: purged expired notes",
+                    extra={
+                        "event": "expiration_cleanup",
+                        "job": EXPIRATION_JOB,
+                        "count": deleted,
+                    },
+                )
         return deleted
 
     def process_expired_notes(self) -> int:
@@ -1640,6 +1646,19 @@ class BackgroundWorker:
                 + " WHERE id = ? AND namespace = ? AND deleted_at IS NULL",
                 (*params, note_id, expected_namespace),
             )
+            if cursor.rowcount and move:
+                # №41 (FR-3.1/FR-4.4, §13.5): фактический переезд `namespace` —
+                # контентное изменение, версия пишется ТОЙ ЖЕ транзакцией.
+                # Источник — из `bind_origin` тела джобы (`job:<name>`);
+                # служебные `hint_path`/`confidence` в проекцию не входят.
+                row = conn.execute(
+                    "SELECT text, title, namespace, expires_at FROM notes "
+                    "WHERE id = ?",
+                    (note_id,),
+                ).fetchone()
+                history.record_change(
+                    conn, history.ENTITY_NOTE, note_id, history.note_projection(row)
+                )
         if not cursor.rowcount:
             return "kept", "node_changed", target
         if move:
@@ -2324,7 +2343,10 @@ def build_nodes_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
     batch = settings.job_nodes_batch
 
     async def process() -> int:
-        return await asyncio.to_thread(worker.process_nodes, batch)
+        # №41 (§13.4): тело джобы несёт источник `job:nodes` — переезд
+        # `namespace` записывает версию с этой пометкой (FR-4.4).
+        with history.bind_origin(f"job:{NODES_JOB}"):
+            return await asyncio.to_thread(worker.process_nodes, batch)
 
     return JobSpec(
         name=NODES_JOB,

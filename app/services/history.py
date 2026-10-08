@@ -56,6 +56,29 @@ CONTENT_FIELDS: dict[str, tuple[str, ...]] = {
     ENTITY_USER_FACT: ("name", "body"),
 }
 
+
+def note_projection(
+    row: sqlite3.Row | Mapping[str, Any], *, explicit_summary: bool = False
+) -> dict[str, Any]:
+    """Проекция заметки по §5.3 — одна точка правды для save/update/merge.
+
+    Контент: `text`/`title`/`namespace`/`expires_at`. `summary` входит только
+    при ЯВНОЙ передаче (`explicit_summary=True`) — авто-перегенерация воркером
+    версий не создаёт (§13.3). Служебные поля (`vector_status`,
+    `summary_status`, `links_at`, `node_order_at`, `classified_at`) в проекцию
+    не входят и версий не создают (FR-4.2).
+    """
+    fields: dict[str, Any] = {
+        "text": row["text"],
+        "title": row["title"],
+        "namespace": row["namespace"],
+        "expires_at": row["expires_at"],
+    }
+    if explicit_summary:
+        fields["summary"] = row["summary"]
+    return fields
+
+
 # Мягкий ответ чтения, когда версии/записи нет: транспорт превращает его в
 # 404 (никакого исключения — «версии нет» валидный исход).
 HINT_VERSION_NOT_FOUND = (

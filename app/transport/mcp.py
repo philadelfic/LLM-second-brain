@@ -126,7 +126,7 @@ import asyncio
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Annotated, Any
 
 from mcp.server.context import ServerRequestContext
@@ -136,6 +136,7 @@ from pydantic import Field
 from app.config import Settings
 from app.observability import log_tool_call, preview
 from app.services import Services
+from app.services import history
 from app.services.namespaces import NamespaceError, NamespaceValidationError
 from app.services.notes import (
     _UNSET_EXPIRES_AT,
@@ -309,6 +310,21 @@ def _skills_announce(services: Services) -> str:
     return _SKILLS_ANNOUNCE_RULES + "".join(lines)
 
 
+def _mcp_session(ctx: ServerRequestContext[Any, Any]) -> str | None:
+    """Сессия версии для MCP-запроса (§13.4): идентификатор агента/вызова.
+
+    Имя клиента из `initialize` (`clientInfo.name`) или, иначе, `str(request_id)`
+    — имя человека никогда не придумываем. `params` приходят с провода
+    (`clientInfo` в camelCase), поэтому берём их как есть, без типизации.
+    """
+    params = getattr(ctx, "params", None) or {}
+    client = params.get("clientInfo") if isinstance(params, Mapping) else None
+    if isinstance(client, Mapping) and client.get("name"):
+        return str(client["name"])
+    request_id = getattr(ctx, "request_id", None)
+    return None if request_id is None else str(request_id)
+
+
 class InstructionsRefresher:
     """ServerMiddleware SDK mcp 2.x — пересборка instructions на каждый initialize.
 
@@ -334,21 +350,25 @@ class InstructionsRefresher:
         ctx: ServerRequestContext[Any, Any],
         call_next: Callable[[ServerRequestContext[Any, Any]], Awaitable[Any]],
     ) -> Any:
-        if ctx.method == "initialize":
-            try:
-                text = await asyncio.to_thread(build_instructions, self._services)
-            except Exception:
-                # Пересборка не должна ломать handshake: прежние инструкции
-                # остаются (недоступность БД уже деградирована внутри
-                # build_instructions — сюда доходит только дефект кода).
-                logging.getLogger("app").warning(
-                    "instructions rebuild failed — keeping previous",
-                    extra={"event": "instructions_refresh_failed"},
-                    exc_info=True,
-                )
-            else:
-                self._server._lowlevel_server.instructions = text
-        return await call_next(ctx)
+        # №41 (§13.4): каждый MCP-запрос обёрнут источником версий «mcp» —
+        # правки через любую ручку несут версию с этим источником и сессией
+        # агента/вызова. Contextvar переживает `asyncio.to_thread` сервисов.
+        with history.bind_origin("mcp", session=_mcp_session(ctx)):
+            if ctx.method == "initialize":
+                try:
+                    text = await asyncio.to_thread(build_instructions, self._services)
+                except Exception:
+                    # Пересборка не должна ломать handshake: прежние инструкции
+                    # остаются (недоступность БД уже деградирована внутри
+                    # build_instructions — сюда доходит только дефект кода).
+                    logging.getLogger("app").warning(
+                        "instructions rebuild failed — keeping previous",
+                        extra={"event": "instructions_refresh_failed"},
+                        exc_info=True,
+                    )
+                else:
+                    self._server._lowlevel_server.instructions = text
+            return await call_next(ctx)
 
 
 # Обучающие описания инструментов (ARCHITECTURE §5.2) — гарантированный канал
