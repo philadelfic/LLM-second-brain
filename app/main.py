@@ -31,6 +31,7 @@ from app.config import ConfigError, Settings, get_settings
 from app.observability import setup_logging
 from app.services import Services, WarningsService, build_services
 from app.services.llm_client import CHECK_AUTH_FAILED, CHECK_OK, LLMClient
+from app.services.slot_budget import resolve_output_budget
 from app.services.worker import BackgroundWorker
 from app.storage.db import StorageError, init_db
 from app.transport.auth import BearerAuthMiddleware
@@ -132,6 +133,37 @@ async def _provider_startup_check(services: Services) -> None:
                 "(деградация, воркер догонит по pending-очередям)",
                 extra=extra,
             )
+        # №49 (arch §13.5): предупреждения конфигурации слота — WARN и старт
+        # продолжается (фатален только auth_failed, см. выше); пишутся и при
+        # unreachable/model_missing — они про конфигурацию, не про сеть. У
+        # слота векторизации нет бюджета вывода и *_CONTEXT_TOKENS, поэтому
+        # предупреждения касаются только генеративных слотов.
+        if slot == "embedding":
+            continue
+        warnings = LLMClient.slot_config_warnings(client.spec)
+        if warnings:
+            budget, _budget_source = resolve_output_budget(
+                operation=slot,
+                prompt_tokens=0,
+                explicit=client.spec.num_predict or None,
+                context_tokens=client.spec.context_tokens,
+                reserve_tokens=client.spec.prompt_reserve_tokens,
+                defensive_cap=client.spec.max_output_tokens,
+            )
+            for code, text in warnings:
+                logger.warning(
+                    text,
+                    extra={
+                        "event": "slot_config_warning",
+                        "slot": slot,
+                        "code": code,
+                        "model_type": client.spec.model_type,
+                        "budget": budget,
+                        "context_tokens": client.spec.context_tokens,
+                        "timeout_sec": int(client.spec.read_timeout),
+                        "text": text,
+                    },
+                )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

@@ -182,12 +182,22 @@ class SlotSpec:
     api_key: str
     read_timeout: float
     think: bool | None = None
-    # №49 (§6.2): заявленный контекст модели (0 — неизвестен; тогда бюджет
+    # №49 (arch §13.1): тип модели слота — reasoning | generation; влияет на
+    # бюджет, трактовку think и стартовые предупреждения (`slot_config_warnings`),
+    # но НЕ на тело запроса (провод остаётся прежним).
+    model_type: str = "generation"
+    # №49 (arch §6.2): заявленный контекст модели (0 — неизвестен; тогда бюджет
     # деградирует к прежнему потолку), защитный потолок авто-бюджета и запас
     # на chat-template/служебные поля/рассинхрон токенизатора.
     context_tokens: int = 0
     max_output_tokens: int = 32768
     prompt_reserve_tokens: int = 512
+    # №49 (arch §8): порог WARN «нет места размышлению» и явный операторский
+    # бюджет слота (0 — авто «сколько влезет»); порог WARN «таймаут мал для
+    # "думать долго"» — из Settings (для чистоты `slot_config_warnings`).
+    reasoning_min_output_tokens: int = 4096
+    num_predict: int = 0
+    min_timeout_sec: int = 300
 
     @classmethod
     def for_embedding(cls, settings: Settings) -> SlotSpec:
@@ -212,9 +222,13 @@ class SlotSpec:
             api_key=settings.summary_api_key,
             read_timeout=float(settings.summary_timeout_sec),
             think=settings.summary_think,
+            model_type=settings.summary_model_type,
             context_tokens=settings.summary_context_tokens,
             max_output_tokens=settings.slot_max_output_tokens,
             prompt_reserve_tokens=settings.slot_prompt_reserve_tokens,
+            reasoning_min_output_tokens=settings.slot_reasoning_min_output_tokens,
+            num_predict=settings.summary_num_predict,
+            min_timeout_sec=settings.slot_min_timeout_sec,
         )
 
     @classmethod
@@ -228,9 +242,13 @@ class SlotSpec:
             api_key=settings.judge_api_key,
             read_timeout=float(settings.judge_timeout_sec),
             think=settings.judge_think,
+            model_type=settings.judge_model_type,
             context_tokens=settings.judge_context_tokens,
             max_output_tokens=settings.slot_max_output_tokens,
             prompt_reserve_tokens=settings.slot_prompt_reserve_tokens,
+            reasoning_min_output_tokens=settings.slot_reasoning_min_output_tokens,
+            num_predict=settings.judge_num_predict,
+            min_timeout_sec=settings.slot_min_timeout_sec,
         )
 
 
@@ -242,8 +260,8 @@ class ChatMeta:
     вывода (`slot_budget.resolve_output_budget`), счётчики и причина завершения
     — из ответа провайдера, `truncated` — обрезка по лимиту вывода
     (`finish_reason`/`done_reason == "length"`). `model_type` берётся из
-    `spec.model_type` (поле спека вводит no49-02; до неё — дефолт
-    `"generation"`). Секретов и тел промптов/ответов здесь нет (FR-3.4).
+    `spec.model_type` (тип модели слота, arch §13.1). Секретов и тел
+    промптов/ответов здесь нет (FR-3.4).
     """
 
     slot: str
@@ -370,7 +388,7 @@ class LLMClient:
             provider=self.spec.provider,
             model=self.spec.model,
             operation=operation,
-            model_type=getattr(self.spec, "model_type", "generation"),
+            model_type=self.spec.model_type,
             budget=budget,
             budget_source=budget_source,
             prompt_tokens=prompt_count,
@@ -405,6 +423,86 @@ class LLMClient:
             think=think,
             operation=operation,
         ).content
+
+    @staticmethod
+    def slot_config_warnings(spec: SlotSpec) -> list[tuple[str, str]]:
+        """Предупреждения конфигурации слота (№49, arch §13.5) — чистая функция.
+
+        Возвращает список `(code, EN-текст)` и ничего не логирует (логирует
+        `main.py` при старте, событие `slot_config_warning`); ни сети, ни
+        Settings не требует. Эффективный бюджет берётся тем же источником
+        истины, что и в вызове (`slot_budget.resolve_output_budget`): явный
+        операторский бюджет слота, иначе «сколько влезет» из заявленного
+        контекста, иначе прежний потолок операции. Пять кодов:
+        `reasoning_tight_budget`, `reasoning_think_off`, `budget_gt_context`,
+        `context_unknown`, `timeout_short`.
+        """
+        warnings: list[tuple[str, str]] = []
+        prefix = f"slot {spec.name}"
+        upper = spec.name.upper()
+        budget, _source = resolve_output_budget(
+            operation=spec.name,
+            prompt_tokens=0,
+            explicit=spec.num_predict or None,
+            context_tokens=spec.context_tokens,
+            reserve_tokens=spec.prompt_reserve_tokens,
+            defensive_cap=spec.max_output_tokens,
+        )
+        if (
+            spec.model_type == "reasoning"
+            and budget < spec.reasoning_min_output_tokens
+        ):
+            warnings.append(
+                (
+                    "reasoning_tight_budget",
+                    f"{prefix}: model declared as reasoning but the output budget "
+                    f"({budget}) leaves little room for thinking — raise the "
+                    f"budget, add {upper}_CONTEXT_TOKENS, or set "
+                    f"{upper}_MODEL_TYPE intentionally.",
+                )
+            )
+        if spec.model_type == "reasoning" and spec.think is False:
+            warnings.append(
+                (
+                    "reasoning_think_off",
+                    f"{prefix}: reasoning model with THINK=false — thinking is "
+                    "disabled on purpose? A reasoning model without thinking may "
+                    f"answer poorly or empty; set {upper}_THINK=true unless this "
+                    "is deliberate.",
+                )
+            )
+        if spec.context_tokens > 0 and budget > spec.context_tokens:
+            warnings.append(
+                (
+                    "budget_gt_context",
+                    f"{prefix}: output budget ({budget}) is above the model "
+                    f"context ({spec.context_tokens}) — the server will truncate "
+                    f"or reject; lower the budget or fix {upper}_CONTEXT_TOKENS.",
+                )
+            )
+        if spec.context_tokens == 0:
+            warnings.append(
+                (
+                    "context_unknown",
+                    f"{prefix}: model context is unknown — the output budget falls "
+                    "back to the previous per-operation caps; set "
+                    f"{upper}_CONTEXT_TOKENS to get the \"as much as fits\" "
+                    "policy.",
+                )
+            )
+        if (
+            spec.model_type == "reasoning"
+            and spec.read_timeout < spec.min_timeout_sec
+        ):
+            warnings.append(
+                (
+                    "timeout_short",
+                    f"{prefix}: timeout {spec.read_timeout:g}s is short for a "
+                    "reasoning model — a long-thinking call will look like a "
+                    f"timeout; raise {upper}_TIMEOUT_SEC.",
+                )
+            )
+        return warnings
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         """Закодировать batch текстов; порядок результата = порядку входа.

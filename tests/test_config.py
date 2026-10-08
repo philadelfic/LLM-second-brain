@@ -47,13 +47,16 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "SNIPPET_CHARS": ("snippet_chars", 120),
     "MAX_GET_BATCH": ("max_get_batch", 20),
     "SUMMARY_THINK": ("summary_think", True),
-    # №49 (3.2.0): 0 = «сколько влезет» (авто-бюджет), контексты 0 — неизвестен.
+    # №49 (3.2.0): тип модели, 0 = «сколько влезет» (авто-бюджет), контексты 0 — неизвестен.
+    "SUMMARY_MODEL_TYPE": ("summary_model_type", "generation"),
     "SUMMARY_NUM_PREDICT": ("summary_num_predict", 0),
     "MERGE_NUM_PREDICT": ("merge_num_predict", 0),
-    "SUMMARY_TIMEOUT_SEC": ("summary_timeout_sec", 60),
+    "SUMMARY_TIMEOUT_SEC": ("summary_timeout_sec", 900),
     "SUMMARY_CONTEXT_TOKENS": ("summary_context_tokens", 0),
     "SLOT_PROMPT_RESERVE_TOKENS": ("slot_prompt_reserve_tokens", 512),
     "SLOT_MAX_OUTPUT_TOKENS": ("slot_max_output_tokens", 32768),
+    "SLOT_REASONING_MIN_OUTPUT_TOKENS": ("slot_reasoning_min_output_tokens", 4096),
+    "SLOT_MIN_TIMEOUT_SEC": ("slot_min_timeout_sec", 300),
     "PORT": ("port", 8080),
     "MCP_PATH": ("mcp_path", "/mcp"),
     "DB_PATH": ("db_path", "/data/notes.db"),
@@ -103,8 +106,9 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "DEDUP_CANDIDATE_SIMILARITY": ("dedup_candidate_similarity", 0.80),
     # Фаза 8 (Этап 3.1): LLM-судья дедупа lfm2.5:latest (think:false).
     "JUDGE_THINK": ("judge_think", False),
+    "JUDGE_MODEL_TYPE": ("judge_model_type", "generation"),  # №49
     "JUDGE_NUM_PREDICT": ("judge_num_predict", 0),  # №49: 0 = авто
-    "JUDGE_TIMEOUT_SEC": ("judge_timeout_sec", 30),
+    "JUDGE_TIMEOUT_SEC": ("judge_timeout_sec", 900),
     "JUDGE_CONTEXT_TOKENS": ("judge_context_tokens", 0),  # №49: 0 — неизвестен
     "RRF_K": ("rrf_k", 60),
     "MAX_NOTE_CHARS": ("max_note_chars", 35000),

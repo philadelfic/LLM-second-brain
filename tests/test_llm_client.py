@@ -702,7 +702,7 @@ class TestSlotsAndTimeouts:
             [],
         )
         assert openai_client._client.timeout.connect == CONNECT_TIMEOUT_SEC_OPENAI == 10.0
-        assert ollama_client._client.timeout.read == 60.0  # SUMMARY_TIMEOUT_SEC дефолт
+        assert ollama_client._client.timeout.read == 900.0  # SUMMARY_TIMEOUT_SEC дефолт (№49: было 60)
 
     def test_close_is_idempotent_enough(self, monkeypatch: pytest.MonkeyPatch) -> None:
         client, _ = make_client(SlotSpec.for_summary(make_settings(monkeypatch)), [])

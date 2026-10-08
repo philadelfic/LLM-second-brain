@@ -26,6 +26,12 @@ LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 # API, openai — OpenAI-совместимый (Bearer).
 LLM_PROVIDERS = frozenset({"ollama", "openai"})
 
+# №49 (3.2.0, arch §13.1): тип модели генеративного слота — параметр
+# конфигурации. `reasoning` включает защиты бюджета и размышления;
+# `decision` — свойство отдельного decision-слота (свой конфиг DECISION_*),
+# у summary/judge он запрещён с подсказкой.
+LLM_MODEL_TYPES = frozenset({"reasoning", "generation"})
+
 # Максимум слов в названии заметки (решение №9 брифа Фазы 11): зашитая
 # константа, НЕ env. Слова = len(title.split()).
 TITLE_MAX_WORDS = 5
@@ -90,18 +96,27 @@ class Settings(BaseSettings):
     # summary_status != 'ok'). Прежние 200 были только fallback-лимитом.
     max_summary_chars: int = 150
     summary_think: bool = True  # при false в вызов идёт "think": false
+    # №49 (arch §13.1): reasoning | generation — влияет на бюджет, трактовку
+    # флага размышления и стартовые предупреждения (не на тело запроса).
+    summary_model_type: str = "generation"
     # №49 (3.2.0): 0 = «сколько влезет» (авто-бюджет из заявленного контекста
     # модели минус промпт и запас, зажат защитным потолком); прежние 35000 —
     # явный потолок оператора и деградация при неизвестном контексте.
     summary_num_predict: int = 0
     merge_num_predict: int = 0  # отдельный потолок слияния дублей (решение О. 2026-08-30)
-    summary_timeout_sec: int = 60  # клиентский таймаут вызова
+    # №49 (arch §13.4): 900 = потолок back-off/паузы слота («думать долго» —
+    # не ошибка); было 60.
+    summary_timeout_sec: int = 900  # клиентский таймаут вызова
     # Заявленный контекст модели слота summary (0 — неизвестен → прежние
     # потолки без падения); запас на chat-template/служебные поля и защитный
     # потолок авто-бюджета — общие для генеративных слотов.
     summary_context_tokens: int = 0
     slot_prompt_reserve_tokens: int = 512
     slot_max_output_tokens: int = 32768
+    # №49 (arch §8): порог WARN «бюджет не оставляет места размышлению» и
+    # порог WARN «таймаут мал для "думать долго"».
+    slot_reasoning_min_output_tokens: int = 4096
+    slot_min_timeout_sec: int = 300
 
     # --- выдача ---
     snippet_chars: int = 120
@@ -137,7 +152,10 @@ class Settings(BaseSettings):
     judge_think: bool = False  # при false в вызов идёт "think": false
     # №49: 0 = авто-бюджет; 256 — прежний потолок (legacy при неизвестном контексте).
     judge_num_predict: int = 0
-    judge_timeout_sec: int = 30  # клиентский таймаут вызова судьи
+    # №49 (arch §13.1): тип модели слота judge (reasoning | generation).
+    judge_model_type: str = "generation"
+    # №49 (arch §13.4): 900 = потолок back-off/паузы слота; было 30.
+    judge_timeout_sec: int = 900  # клиентский таймаут вызова судьи
     judge_context_tokens: int = 0  # заявленный контекст модели judge (0 — неизвестен)
     rrf_k: int = 60
 
@@ -334,6 +352,26 @@ class Settings(BaseSettings):
             )
         return provider
 
+    @field_validator("summary_model_type", "judge_model_type")
+    @classmethod
+    def _validate_model_type(cls, value: str) -> str:
+        """Тип модели слота — один из {reasoning, generation} (arch §13.1).
+
+        `decision` — самостоятельный слот со своим конфигом: попытка объявить
+        его у генеративного слота отправляет оператора к `DECISION_ENABLED`.
+        """
+        model_type = value.strip().lower()
+        if model_type == "decision":
+            raise ValueError(
+                "decision — отдельный слот: enable the decision slot via "
+                "DECISION_ENABLED instead"
+            )
+        if model_type not in LLM_MODEL_TYPES:
+            raise ValueError(
+                "тип модели — один из " + ", ".join(sorted(LLM_MODEL_TYPES))
+            )
+        return model_type
+
     @field_validator("log_level")
     @classmethod
     def _validate_log_level(cls, value: str) -> str:
@@ -508,6 +546,21 @@ class Settings(BaseSettings):
         need_low("slot_prompt_reserve_tokens", self.slot_prompt_reserve_tokens, 1)
         need_low("slot_max_output_tokens", self.slot_max_output_tokens, 1)
         need_low("judge_timeout_sec", self.judge_timeout_sec, 1)
+        # №49 (arch §8): пороги типа модели — минимум 1, реляционно порог
+        # размышления не может быть выше защитного потолка авто-бюджета.
+        need_low(
+            "slot_reasoning_min_output_tokens",
+            self.slot_reasoning_min_output_tokens,
+            1,
+        )
+        need_low("slot_min_timeout_sec", self.slot_min_timeout_sec, 1)
+        if self.slot_reasoning_min_output_tokens > self.slot_max_output_tokens:
+            errors.append(
+                "  - slot_reasoning_min_output_tokens: порог "
+                f"{self.slot_reasoning_min_output_tokens} выше защитного потолка "
+                f"slot_max_output_tokens ({self.slot_max_output_tokens}) — "
+                "предупреждение недостижимо"
+            )
         for context_field, context in (
             ("summary_context_tokens", self.summary_context_tokens),
             ("judge_context_tokens", self.judge_context_tokens),
