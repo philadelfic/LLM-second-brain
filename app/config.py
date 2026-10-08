@@ -253,6 +253,25 @@ class Settings(BaseSettings):
     slot_max_attempts: int = 8
     slot_attention_reset_on_start: bool = True
 
+    # --- decision-слот (LSBN-F-12, релиз 3.2.0; arch §6.4/§8/§13.6) ----------
+    # Третий тип слота: клиентская ветка POST /v1/systemone (state + вопросы →
+    # вероятности). Выключен по умолчанию — решения идут генеративно, как
+    # сегодня (нулевой риск регресса); включается и настраивается из
+    # docker-compose. Провайдер — нативный ollama ≥ 0.35.1 (маршрут НЕ
+    # OpenAI-совместимый); ключ уходит Bearer-ом только при заданном значении.
+    # THRESHOLD/UNCERTAINTY_ZONE — механизм переключения (числа выверяются на
+    # тестировании); MAX_QUESTIONS/MAX_LABELS — потолки запроса.
+    decision_enabled: bool = False
+    decision_base_url: str = ""
+    decision_model: str = ""
+    decision_api_key: str = ""
+    decision_timeout_sec: int = 300
+    decision_threshold: float = 0.5
+    decision_uncertainty_zone: float = 0.05
+    decision_fallback: bool = True
+    decision_max_questions: int = 64
+    decision_max_labels: int = 40
+
     # --- история версий (№41, релиз 3.2.0) ---
     # HISTORY_ENABLED — выключатель слоя истории (kill switch): false —
     # версии не пишутся, чтение отдаёт пусто. HISTORY_MAX_VERSIONS — потолок
@@ -595,6 +614,40 @@ class Settings(BaseSettings):
         need_low("slot_hint_every_sec", self.slot_hint_every_sec, 0)
         # --- счётчик попыток пары (№39 §6.8, no39-02): предел ≥ 1 ---
         need_low("slot_max_attempts", self.slot_max_attempts, 1)
+
+        # --- decision-слот (LSBN-F-12, arch §8): таймаут ≥ 1, потолок вопросов
+        # в 1..64 (лимит модели), потолок меток ≥ 2, порог и зона в 0..1. При
+        # включённом слоте обязательны непустые адрес (http(s)) и модель, а
+        # порог ± зона обязаны лежать внутри 0..1 (иначе зона уходит за границы).
+        need_low("decision_timeout_sec", self.decision_timeout_sec, 1)
+        need_range("decision_max_questions", self.decision_max_questions, 1, 64)
+        need_low("decision_max_labels", self.decision_max_labels, 2)
+        need_range("decision_threshold", self.decision_threshold, 0.0, 1.0)
+        need_range(
+            "decision_uncertainty_zone", self.decision_uncertainty_zone, 0.0, 1.0
+        )
+        if self.decision_enabled:
+            if not self.decision_base_url.strip().startswith(("http://", "https://")):
+                errors.append(
+                    "  - decision_base_url: ожидается URL с http:// или https:// "
+                    "(обязателен при DECISION_ENABLED=true)"
+                )
+            if not self.decision_model.strip():
+                errors.append(
+                    "  - decision_model: не может быть пустой при DECISION_ENABLED=true"
+                )
+            if not 0.0 <= self.decision_threshold - self.decision_uncertainty_zone:
+                errors.append(
+                    "  - decision_threshold: порог минус зона "
+                    f"{self.decision_threshold - self.decision_uncertainty_zone} "
+                    "уходит ниже 0 — зона неопределённости вне 0..1"
+                )
+            if self.decision_threshold + self.decision_uncertainty_zone > 1.0:
+                errors.append(
+                    "  - decision_threshold: порог плюс зона "
+                    f"{self.decision_threshold + self.decision_uncertainty_zone} "
+                    "уходит выше 1 — зона неопределённости вне 0..1"
+                )
 
         # --- история версий (№41): 0 — «без ограничения» для потолка версий и
         # срока хранения (дефолт — хранить всё); порог дельты ≥ 1 (иначе

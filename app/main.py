@@ -30,7 +30,13 @@ from app import __version__
 from app.config import ConfigError, Settings, get_settings
 from app.observability import setup_logging
 from app.services import Services, WarningsService, build_services
-from app.services.llm_client import CHECK_AUTH_FAILED, CHECK_OK, LLMClient
+from app.services.decision import DecisionService
+from app.services.llm_client import (
+    CHECK_AUTH_FAILED,
+    CHECK_OK,
+    DECISION_CHECK_OK,
+    LLMClient,
+)
 from app.services.slot_budget import resolve_output_budget
 from app.services.worker import BackgroundWorker
 from app.storage.db import StorageError, init_db
@@ -58,7 +64,48 @@ def _startup_slots(services: Services) -> list[tuple[str, LLMClient, object]]:
             ("judge", services.llm_judge, services.judge),
         )
         if client is not None
-    ]
+    ] + _decision_slot(services)
+
+
+def _decision_slot(services: Services) -> list[tuple[str, LLMClient, DecisionService]]:
+    """Пара decision-слота стартовой проверки — только когда она собрана.
+
+    LSBN-F-12: при выключенном слоте пары нет (Services.decision is None) —
+    стартовая проверка его не видит вообще.
+    """
+    if services.llm_decision is not None and services.decision is not None:
+        return [("decision", services.llm_decision, services.decision)]
+    return []
+
+
+def _handle_decision_check(
+    service: DecisionService,
+    client: LLMClient,
+    outcome: str,
+    logger: logging.Logger,
+) -> None:
+    """Исход проверки decision-слота (LSBN-F-12): WARN + гашение, старт жив.
+
+    Осознанное отступление от фатальности auth генеративных слотов: у decision
+    есть штатный генеративный путь, и ронять обязательный слот из-за
+    необязательного нельзя (§13.6). Событие — `decision_check` (slot/model/result);
+    `ok` слот не трогает, иной исход — `disable()`.
+    """
+    extra = {
+        "event": "decision_check",
+        "slot": "decision",
+        "model": client.spec.model,
+        "result": outcome,
+    }
+    if outcome == DECISION_CHECK_OK:
+        logger.info("стартовая проверка decision-слота пройдена", extra=extra)
+        return
+    service.disable()
+    logger.warning(
+        f"decision-слот не подтверждён (result={outcome}) — слот погашен, "
+        "решения идут генеративным путём; старт продолжается",
+        extra=extra,
+    )
 
 
 async def _provider_startup_check(services: Services) -> None:
@@ -95,9 +142,17 @@ async def _provider_startup_check(services: Services) -> None:
             },
         )
     outcomes = await asyncio.gather(
-        *[asyncio.to_thread(client.check) for _slot, client, _service in slots]
+        *[
+            asyncio.to_thread(
+                client.check_decision if slot == "decision" else client.check
+            )
+            for slot, client, _service in slots
+        ]
     )
     for (slot, client, service), outcome in zip(slots, outcomes):
+        if slot == "decision":
+            _handle_decision_check(service, client, outcome, logger)
+            continue
         provider = client.spec.provider
         extra = {
             "event": "provider_check_result",
@@ -136,8 +191,8 @@ async def _provider_startup_check(services: Services) -> None:
         # №49 (arch §13.5): предупреждения конфигурации слота — WARN и старт
         # продолжается (фатален только auth_failed, см. выше); пишутся и при
         # unreachable/model_missing — они про конфигурацию, не про сеть. У
-        # слота векторизации нет бюджета вывода и *_CONTEXT_TOKENS, поэтому
-        # предупреждения касаются только генеративных слотов.
+        # слота векторизации нет бюджета вывода и *_CONTEXT_TOKENS, а у
+        # decision нет ни бюджета, ни *_CONTEXT_TOKENS (LSBN-F-12).
         if slot == "embedding":
             continue
         warnings = LLMClient.slot_config_warnings(client.spec)

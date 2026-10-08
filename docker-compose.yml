@@ -51,6 +51,20 @@ services:
       JUDGE_NUM_PREDICT: "0"           # 0 = as much as fits (auto budget from JUDGE_CONTEXT_TOKENS); explicit values keep the old caps (1024)
       JUDGE_TIMEOUT_SEC: "300"         # thinking judge: long pair 46 s, worst live call ~121 s (E2E) — 300 s with margin; 900 = the back-off/pause ceiling (15 min): a single call must not hold the slot longer than the job cycle is willing to wait
       JUDGE_CONTEXT_TOKENS: "0"        # the model's context window; 0 = unknown → previous per-operation caps
+      # --- decision slot (LSBN-F-12, 3.2.0): OFF by default; decisions go
+      #     generative as today. decision needs Ollama ≥ 0.35.1: the route is
+      #     native /v1/systemone, NOT OpenAI-compatible. When enabled, all
+      #     questions of a group go in ONE call (up to DECISION_MAX_QUESTIONS).
+      # DECISION_ENABLED: "false"           # true — enable the decision slot
+      # DECISION_BASE_URL: "http://localhost:11434"  # /v1/systemone address (http(s); required when enabled)
+      # DECISION_MODEL: "decision-model"    # decision model (required when enabled)
+      # DECISION_API_KEY: ""                # optional; Bearer is sent only when set
+      # DECISION_TIMEOUT_SEC: "300"         # no generation, but the prefill is long (pilot: up to 19 s per 2k tokens)
+      # DECISION_THRESHOLD: "0.5"           # confidence threshold (0..1; a per-question value in the registry wins)
+      # DECISION_UNCERTAINTY_ZONE: "0.05"   # half-width of the uncertainty zone around the threshold → fallback
+      # DECISION_FALLBACK: "true"           # true — switch to the generative slot; false — the job waits (№39)
+      # DECISION_MAX_QUESTIONS: "64"        # questions asked in one call (model limit, 1..64)
+      # DECISION_MAX_LABELS: "40"           # choice labels ceiling (≥2; more → fallback, reason unsupported)
       # --- editable prompts (Phase 11): the directory is mounted at
       #     ./prompts:/app/prompts; with PROMPTS_DIR set, 3 files
       #     (summary_system, summary_merge_system, judge_system) are created

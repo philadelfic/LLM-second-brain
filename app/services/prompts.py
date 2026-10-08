@@ -39,6 +39,88 @@ import os
 from pathlib import Path
 
 from app.config import ConfigError
+from app.services.decision import DECISION_KINDS, DecisionQuestion
+
+
+def _build_decision_questions(
+    groups: dict, max_questions: int
+) -> dict[str, tuple[DecisionQuestion, ...]]:
+    """Собрать и провалидировать группы decision-вопросов (arch §6.4).
+
+    Валидация фатальна (`ConfigError`, прецедент маркеров `judge_system`):
+    неизвестный `kind`, пустое имя/текст, `choice` без меток или без критериев,
+    дубль имени в группе, число вопросов в группе больше `DECISION_MAX_QUESTIONS`,
+    `threshold` вне 0..1. Возвращает `group -> tuple[DecisionQuestion]`.
+    """
+    result: dict[str, tuple[DecisionQuestion, ...]] = {}
+    for group, items in groups.items():
+        if not isinstance(items, (list, tuple)):
+            raise ConfigError(
+                f"decision questions group «{group}»: expected a list of questions"
+            )
+        if len(items) > max_questions:
+            raise ConfigError(
+                f"decision questions group «{group}»: {len(items)} questions "
+                f"is more than DECISION_MAX_QUESTIONS ({max_questions})"
+            )
+        seen: set[str] = set()
+        built: list[DecisionQuestion] = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise ConfigError(
+                    f"decision questions group «{group}»: a question must be an object"
+                )
+            kind = item.get("kind")
+            name = item.get("name")
+            if kind not in DECISION_KINDS:
+                raise ConfigError(
+                    f"decision question «{name}»: unknown kind «{kind}» — "
+                    "one of " + ", ".join(DECISION_KINDS)
+                )
+            if not isinstance(name, str) or not name.strip():
+                raise ConfigError(
+                    f"decision questions group «{group}»: empty question name"
+                )
+            text = item.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise ConfigError(f"decision question «{name}»: empty text")
+            if name in seen:
+                raise ConfigError(
+                    f"decision questions group «{group}»: duplicate question "
+                    f"name «{name}»"
+                )
+            seen.add(name)
+            labels = tuple(str(label) for label in (item.get("labels") or ()))
+            criteria = item.get("criteria")
+            if kind == "choice":
+                if not labels:
+                    raise ConfigError(
+                        f"decision question «{name}»: choice question without labels"
+                    )
+                if not criteria:
+                    raise ConfigError(
+                        f"decision question «{name}»: choice question without criteria"
+                    )
+            threshold = item.get("threshold")
+            if threshold is not None:
+                value = float(threshold)
+                if not 0.0 <= value <= 1.0:
+                    raise ConfigError(
+                        f"decision question «{name}»: threshold {value} is out of 0..1"
+                    )
+            built.append(
+                DecisionQuestion(
+                    name=name,
+                    text=text,
+                    kind=kind,
+                    labels=labels,
+                    criteria=dict(criteria) if criteria else None,
+                    threshold=float(threshold) if threshold is not None else None,
+                )
+            )
+        result[str(group)] = tuple(built)
+    return result
+
 
 # --- Встроенные тексты -------------------------------------------------------
 # Перенесены 1-в-1 из app/services/summary.py, judge.py, classifier.py,
@@ -218,6 +300,47 @@ LEGACY_SEEDS: dict[str, tuple[str, ...]] = {
 }
 
 
+# --- встроенные decision-вопросы (LSBN-F-12, arch §6.4) -----------------------
+# Не промпты, а данные вопросов: имя, формулировка (EN, обезличенная), тип и
+# критерии. Критерии choice приходят в `state` (описания узлов); здесь —
+# резервная метка generic. Группа переопределяется файлом
+# `decision_questions.json` в prompts_dir ЦЕЛИКОМ (§6.4).
+BUILTIN_DECISION_QUESTIONS: dict[str, tuple[dict, ...]] = {
+    "judge": (
+        {
+            "name": "is_text_duplicate",
+            "text": (
+                "Is TEXT 2 a duplicate of TEXT 1 — the same thought restated "
+                "in other words? Matching details matter more than wording."
+            ),
+            "kind": "noul",
+            "criteria": {
+                "true": "both texts carry the same fact with matching details",
+                "false": "the texts differ in facts, details or intent",
+            },
+        },
+    ),
+    "classify": (
+        {
+            "name": "note_section",
+            "text": (
+                "Which section does the note belong to? Pick the best matching "
+                "known node from the request, or the generic label when the "
+                "note is not bound to any section."
+            ),
+            "kind": "choice",
+            "labels": ("generic",),
+            "criteria": {
+                "generic": "the note is generic and not bound to a known section",
+            },
+        },
+    ),
+}
+
+# Имя файла-переопределения групп decision-вопросов (не создаётся нами).
+_DECISION_QUESTIONS_FILENAME = "decision_questions.json"
+
+
 class PromptRegistry:
     """Встроенные константы всех 10 промптов + файловые переопределения.
 
@@ -233,7 +356,12 @@ class PromptRegistry:
     универсальный `get(name)` — для обхода по списку `BUILTIN_PROMPTS`.
     """
 
-    def __init__(self, prompts_dir: str | os.PathLike[str] | None = None) -> None:
+    def __init__(
+        self,
+        prompts_dir: str | os.PathLike[str] | None = None,
+        *,
+        decision_max_questions: int = 64,
+    ) -> None:
         # Копия встроенных: файловые переопределения ложатся поверх.
         self._texts: dict[str, str] = dict(BUILTIN_PROMPTS)
         # Имена, чей финальный текст пришёл из непустого файла (диагностика
@@ -242,8 +370,13 @@ class PromptRegistry:
         self.prompts_dir: Path | None = (
             Path(prompts_dir) if prompts_dir is not None else None
         )
+        # LSBN-F-12: реестр decision-вопросов (валидация фатальна, §6.4).
+        self._decision_questions: dict[str, tuple[DecisionQuestion, ...]] = (
+            _build_decision_questions(BUILTIN_DECISION_QUESTIONS, decision_max_questions)
+        )
         if self.prompts_dir is not None:
             self._load_files()
+            self._load_decision_file(decision_max_questions)
         self._validate_judge_markers()
 
     # --- API (имена — контракт пула 3/4) -------------------------------------
@@ -307,6 +440,39 @@ class PromptRegistry:
                 f"PromptRegistry: неизвестный промпт «{name}» — доступны: "
                 + ", ".join(BUILTIN_PROMPTS)
             ) from None
+
+    @property
+    def decision_questions(self) -> dict[str, tuple[DecisionQuestion, ...]]:
+        """Группы decision-вопросов (LSBN-F-12): mapping `group -> tuple` (§6.4)."""
+        return self._decision_questions
+
+    # --- decision-вопросы (LSBN-F-12, arch §6.4) -----------------------------
+
+    def _load_decision_file(self, max_questions: int) -> None:
+        """Необязательный `decision_questions.json` переопределяет группу целиком.
+
+        Файл не создаётся и не перезаписывается (прецедент `_load_files`:
+        правки оператора неприкосновенны); ошибка чтения/формата — фатальный
+        `ConfigError`. Группа из файла заменяет встроенную целиком.
+        """
+        assert self.prompts_dir is not None
+        path = self.prompts_dir / _DECISION_QUESTIONS_FILENAME
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(
+                f"{_DECISION_QUESTIONS_FILENAME}: cannot read/parse ({exc})"
+            ) from exc
+        if not isinstance(data, dict):
+            raise ConfigError(
+                f"{_DECISION_QUESTIONS_FILENAME}: top level must be an object "
+                "of question groups"
+            )
+        groups = dict(BUILTIN_DECISION_QUESTIONS)
+        groups.update(data)
+        self._decision_questions = _build_decision_questions(groups, max_questions)
 
     # --- файловая механика ---------------------------------------------------
 

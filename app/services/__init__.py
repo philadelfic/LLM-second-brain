@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from app.config import Settings
 from app.services.backup import BackupService
 from app.services.classifier import ClassificationService
+from app.services.decision import DecisionService
 from app.services.dedup import DeduplicationService
 from app.services.embedding import EmbeddingService
 from app.services.judge import JudgeService
@@ -48,6 +49,7 @@ from app.services.warnings import WarningsService
 __all__ = [
     "BackupService",
     "ClassificationService",
+    "DecisionService",
     "DeduplicationService",
     "EmbeddingService",
     "JudgeService",
@@ -107,6 +109,11 @@ class Services:
     llm_embedding: LLMClient | None = None  # клиент слота embedding (Фаза 11, решение №5)
     llm_summary: LLMClient | None = None  # клиент слота summary (summarize/merge/classify/describe)
     llm_judge: LLMClient | None = None  # клиент слота judge (дедуп + судья структуры)
+    # LSBN-F-12 (3.2.0): decision-слот — клиент (/v1/systemone) и сервис решений.
+    # Пара собирается ТОЛЬКО при settings.decision_enabled (симметрично флагам
+    # областей): выключенный слот — None, потребители ходят генеративным путём.
+    llm_decision: LLMClient | None = None  # клиент слота decision
+    decision: DecisionService | None = None  # решения: порог/зона/разрыв
     # 3.0.0: область навыков (lsb-0007). Опционально — только для DI-сборок
     # тестов, созданных до появления области (их Services(...) без skills
     # остаются валидны); в проде build_services всегда кладёт сервис.
@@ -142,12 +149,22 @@ def build_services(
             из файла без маркеров «ДУБЛЬ»/«НЕ ДУБЛЬ») — старт сервиса
             обязан прерваться.
     """
-    registry = PromptRegistry(settings.prompts_dir)
+    registry = PromptRegistry(
+        settings.prompts_dir,
+        decision_max_questions=settings.decision_max_questions,
+    )
     # Клиенты слотов — по одному на слот (решение №1); их делят сервисы
     # слота, и по ним же идёт стартовая проверка (решение №5).
     llm_embedding = LLMClient(SlotSpec.for_embedding(settings))
     llm_summary = LLMClient(SlotSpec.for_summary(settings))
     llm_judge = LLMClient(SlotSpec.for_judge(settings))
+    # LSBN-F-12: пара decision собирается только при включённом слоте
+    # (выключенный не делает ни одного вызова — FR-1.1).
+    llm_decision: LLMClient | None = None
+    decision: DecisionService | None = None
+    if settings.decision_enabled:
+        llm_decision = LLMClient(SlotSpec.for_decision(settings))
+        decision = DecisionService(settings, llm=llm_decision, registry=registry)
     embedding = EmbeddingService(settings, llm=llm_embedding)
     dedup = DeduplicationService(settings)
     namespaces = NamespaceService(settings)
@@ -184,6 +201,8 @@ def build_services(
         llm_embedding=llm_embedding,
         llm_summary=llm_summary,
         llm_judge=llm_judge,
+        llm_decision=llm_decision,
+        decision=decision,
         # Субстрат 3.0.0: сервис области навыков (lsb-0007-01); embedding —
         # общий экземпляр слота (запись его не зовёт — точка сборки для
         # поиска/антисинонимии трека).

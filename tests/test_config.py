@@ -57,6 +57,17 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "SLOT_MAX_OUTPUT_TOKENS": ("slot_max_output_tokens", 32768),
     "SLOT_REASONING_MIN_OUTPUT_TOKENS": ("slot_reasoning_min_output_tokens", 4096),
     "SLOT_MIN_TIMEOUT_SEC": ("slot_min_timeout_sec", 300),
+    # LSBN-F-12 (3.2.0): decision-слот (выключен по умолчанию).
+    "DECISION_ENABLED": ("decision_enabled", False),
+    "DECISION_BASE_URL": ("decision_base_url", ""),
+    "DECISION_MODEL": ("decision_model", ""),
+    "DECISION_API_KEY": ("decision_api_key", ""),
+    "DECISION_TIMEOUT_SEC": ("decision_timeout_sec", 300),
+    "DECISION_THRESHOLD": ("decision_threshold", 0.5),
+    "DECISION_UNCERTAINTY_ZONE": ("decision_uncertainty_zone", 0.05),
+    "DECISION_FALLBACK": ("decision_fallback", True),
+    "DECISION_MAX_QUESTIONS": ("decision_max_questions", 64),
+    "DECISION_MAX_LABELS": ("decision_max_labels", 40),
     "PORT": ("port", 8080),
     "MCP_PATH": ("mcp_path", "/mcp"),
     "DB_PATH": ("db_path", "/data/notes.db"),
@@ -198,7 +209,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 118 полей: 6 обязательных + 112 с умолчаниями
+        """В Settings — ровно 128 полей: 6 обязательных + 122 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
@@ -209,7 +220,8 @@ class TestCompleteness:
         SLOT_* — пауза/стук/хинт, предел попыток пары и стартовый сброс;
         + 6 настроек джобы предупреждений №12 релиза 3.2.0: JOB_WARNINGS_*
         и WARNINGS_* + 2 потолка страницы предупреждений: WARNINGS_MAX_LIMIT_*
-        + 5 настроек джобы нормализации терминов №32 релиза 3.2.0: JOB_TERMS_*)."""
+        + 5 настроек джобы нормализации терминов №32 релиза 3.2.0: JOB_TERMS_*
+        + 10 настроек decision-слота LSBN-F-12 релиза 3.2.0: DECISION_*)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

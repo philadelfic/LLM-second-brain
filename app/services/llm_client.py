@@ -111,6 +111,24 @@ def _as_int(value: Any) -> int | None:
     """Счётчик из ответа как int; отсутствие/чужой тип/bool → None (защита)."""
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
+
+def _as_float(value: Any) -> float | None:
+    """Число из ответа как float; отсутствие/чужой тип/bool → None (защита)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _as_probabilities(value: Any) -> dict[str, float]:
+    """Распределение вероятностей ответа: {метка: число}; мусор пропускаем."""
+    result: dict[str, float] = {}
+    if isinstance(value, dict):
+        for key, item in value.items():
+            number = _as_float(item)
+            if number is not None:
+                result[str(key)] = number
+    return result
+
 # Исходы стартовой проверки (решение №5): ok — слот готов; auth_failed —
 # 401/403 (фатально, решает main.py); unreachable — сеть/таймаут/5xx/404/
 # не-JSON (WARN + деградация); model_missing — модели слота нет в списке.
@@ -119,6 +137,23 @@ CHECK_OK: CheckResult = "ok"
 CHECK_AUTH_FAILED: CheckResult = "auth_failed"
 CHECK_UNREACHABLE: CheckResult = "unreachable"
 CHECK_MODEL_MISSING: CheckResult = "model_missing"
+
+# LSBN-F-12 (arch §6.2/§13.6): тип модели decision-слота (свой конфиг DECISION_*).
+SLOT_KIND_DECISION = "decision"
+
+# Нативный маршрут decision-модели (ollama ≥ 0.35.1): НЕ OpenAI-совместимый.
+DECISION_PATH = "/v1/systemone"
+
+# Статусы «сервер не знает маршрут / не принимает тип вопроса» (arch §6.2).
+_DECISION_UNSUPPORTED_STATUSES = frozenset({400, 404, 405, 422})
+
+# Исходы стартовой проверки «модель умеет decision» (FR-1.3/FR-6.2). Свой тип:
+# CheckResult генеративных слотов (блок 2) не трогаем.
+DecisionCheck = Literal["ok", "unsupported", "unreachable", "auth_failed"]
+DECISION_CHECK_OK: DecisionCheck = "ok"
+DECISION_CHECK_UNSUPPORTED: DecisionCheck = "unsupported"
+DECISION_CHECK_UNREACHABLE: DecisionCheck = "unreachable"
+DECISION_CHECK_AUTH_FAILED: DecisionCheck = "auth_failed"
 
 
 class LLMError(RuntimeError):
@@ -253,6 +288,26 @@ class SlotSpec:
             reasoning_min_output_tokens=settings.slot_reasoning_min_output_tokens,
             num_predict=settings.judge_num_predict,
             min_timeout_sec=settings.slot_min_timeout_sec,
+        )
+
+    @classmethod
+    def for_decision(cls, settings: Settings) -> SlotSpec:
+        """Слот решения (LSBN-F-12): нативный ollama-маршрут `/v1/systemone`.
+
+        Провайдер всегда `ollama` (маршрут нативный, НЕ OpenAI-совместимый);
+        бюджет генерации не применяется (`num_predict` не задаём), флага
+        размышления у decision нет вовсе (think=None, arch §13.1). Bearer
+        уходит только при заданном `DECISION_API_KEY` (см. `_headers`).
+        """
+        return cls(
+            name=SLOT_KIND_DECISION,
+            provider=PROVIDER_OLLAMA,
+            base_url=settings.decision_base_url,
+            model=settings.decision_model,
+            api_key=settings.decision_api_key,
+            read_timeout=float(settings.decision_timeout_sec),
+            think=None,
+            model_type=SLOT_KIND_DECISION,
         )
 
 
@@ -565,11 +620,191 @@ class LLMClient:
         """Закрыть HTTP-пул (чистое завершение процесса)."""
         self._client.close()
 
+    def decide(self, state: str, questions: list[dict]) -> dict:
+        """Один `POST /v1/systemone`: state + ВСЕ вопросы в одном теле (FR-2.3).
+
+        Возвращает разобранный блок `answers` (форма пилота LSBN-T-13);
+        `questions` — канонические dict'ы (`name`/`kind`/`text`/`labels`/
+        `criteria`), имена полей сервера знает только `_systemone_payload`.
+        Отказ (сеть/не-200/мусор) — `LLMError` с прежними признаками
+        (`transient`/`status`); признак `empty` не ставится никогда —
+        генерации нет, «пустого ответа» быть не может.
+        """
+        payload = {
+            "model": self.spec.model,
+            **self._systemone_payload(state, questions),
+        }
+        data = self._request_json("POST", DECISION_PATH, payload)
+        return self._parse_systemone(data)
+
+    def check_decision(self) -> DecisionCheck:
+        """Стартовая проверка «модель умеет decision» (FR-1.3/FR-6.2).
+
+        Одна попытка, таймаут слота, без слота очереди (не генерация):
+        минимальный `/v1/systemone` с одним тривиальным `noul`-вопросом.
+        Исходы: `ok` — корректный блок `answers`; `unsupported` — сервер не
+        знает маршрут или не принимает тип вопроса (400–404/200 с чужим
+        форматом); `auth_failed` — 401/403; `unreachable` — сеть/таймаут/5xx/
+        не-JSON. Фатальность исхода решает вызывающий (main.py).
+        """
+        questions = [
+            {
+                "name": "probe",
+                "kind": "noul",
+                "text": "Is this a routine availability probe of the decision route?",
+                "labels": (),
+                "criteria": None,
+            }
+        ]
+        payload = {
+            "model": self.spec.model,
+            **self._systemone_payload("probe", questions),
+        }
+        try:
+            response = self._client.post(
+                DECISION_PATH,
+                json=payload,
+                headers=self._headers(),
+                timeout=self.spec.read_timeout,
+            )
+        except _RETRIABLE:
+            return DECISION_CHECK_UNREACHABLE
+        if response.status_code in STATUS_UNAUTHORIZED:
+            return DECISION_CHECK_AUTH_FAILED
+        if response.status_code in _DECISION_UNSUPPORTED_STATUSES:
+            return DECISION_CHECK_UNSUPPORTED
+        if response.status_code != 200:
+            return DECISION_CHECK_UNREACHABLE
+        try:
+            data = response.json()
+        except ValueError:
+            return DECISION_CHECK_UNREACHABLE
+        try:
+            self._parse_systemone(data)
+        except LLMError:
+            # Сервер ответил, но контракта не знает — исход «не умеет decision».
+            return DECISION_CHECK_UNSUPPORTED
+        return DECISION_CHECK_OK
+
+    @staticmethod
+    def _systemone_payload(state: str, questions: list[dict]) -> dict:
+        """Тело `/v1/systemone` — ОДНА точка адаптации формата (arch §6.2/§13.6).
+
+        Запрос: `state` + вопросы `{name, type, text, labels/criteria}`.
+        `model` добавляет вызывающий (`decide`/`check_decision`): функция
+        чистая и тестируется без клиента. Если сервер разойдётся с пилотом —
+        правится ровно эта пара (`_systemone_payload`/`_parse_systemone`) и её
+        контрактный тест, потребители не меняются.
+        """
+        items: list[dict] = []
+        for question in questions:
+            item: dict[str, Any] = {
+                "name": question["name"],
+                "type": question["kind"],
+                "text": question["text"],
+            }
+            labels = question.get("labels")
+            if labels:
+                item["labels"] = list(labels)
+            criteria = question.get("criteria")
+            if criteria:
+                item["criteria"] = dict(criteria)
+            items.append(item)
+        return {"state": state, "questions": items}
+
+    @staticmethod
+    def _parse_systemone(data: Any) -> dict:
+        """Разобрать ответ `/v1/systemone` — ОДНА точка адаптации (arch §6.2).
+
+        Возвращает `{имя вопроса: канонический ответ}`; три формы пилота
+        LSBN-T-13 (`noul`/`choice`/`score`) нормализуются в канонические ключи
+        `kind`/`label`/`probability`/`confidence`/`probabilities`/`score`/`raw`.
+        Ответ без блока `answers` или с незнакомой формой вопроса — `LLMError`
+        (это НЕ «пустой ответ»: генерации нет).
+        """
+        if not isinstance(data, dict):
+            raise LLMError(f"{DECISION_PATH}: ответ не объект JSON")
+        answers = data.get("answers")
+        if not isinstance(answers, dict):
+            raise LLMError(f"{DECISION_PATH}: в ответе нет блока answers")
+        return {
+            str(name): LLMClient._normalize_decision_answer(str(name), value)
+            for name, value in answers.items()
+        }
+
+    @staticmethod
+    def _normalize_decision_answer(name: str, value: Any) -> dict:
+        """Один ответ вопроса → канонический dict (формы пилота LSBN-T-13)."""
+        if not isinstance(value, dict):
+            raise LLMError(
+                f"{DECISION_PATH}: ответ вопроса «{name}» — не объект JSON"
+            )
+        raw = dict(value)
+        if "noul" in value:
+            noul = _as_float(value.get("noul"))
+            if noul is None:
+                raise LLMError(
+                    f"{DECISION_PATH}: noul-ответ вопроса «{name}» без числа"
+                )
+            return {
+                "kind": "noul",
+                "label": "true" if noul >= 0.5 else "false",
+                "probability": noul,
+                "confidence": _as_float(value.get("confidence")),
+                "probabilities": {},
+                "score": None,
+                "raw": raw,
+            }
+        if "choice" in value:
+            choice = value.get("choice")
+            if not isinstance(choice, str) or not choice.strip():
+                raise LLMError(
+                    f"{DECISION_PATH}: choice-ответ вопроса «{name}» без метки"
+                )
+            probabilities = _as_probabilities(value.get("probabilities"))
+            return {
+                "kind": "choice",
+                "label": choice,
+                "probability": probabilities.get(choice),
+                "confidence": _as_float(value.get("confidence")),
+                "probabilities": probabilities,
+                "score": None,
+                "raw": raw,
+            }
+        if "score" in value:
+            score = _as_float(value.get("score"))
+            if score is None:
+                raise LLMError(
+                    f"{DECISION_PATH}: score-ответ вопроса «{name}» без числа"
+                )
+            return {
+                "kind": "score",
+                "label": None,
+                "probability": score,
+                "confidence": _as_float(value.get("confidence")),
+                "probabilities": _as_probabilities(value.get("probabilities")),
+                "score": score,
+                "raw": raw,
+            }
+        raise LLMError(
+            f"{DECISION_PATH}: незнакомая форма ответа вопроса «{name}»"
+        )
+
     # --- внутреннее ----------------------------------------------------------
 
     def _headers(self) -> dict[str, str]:
-        """Bearer только openai-провайдеру и только при заданном ключе."""
-        if self.spec.provider == PROVIDER_OPENAI and self.spec.api_key.strip():
+        """Bearer — при заданном ключе: openai-провайдеру и decision-слоту.
+
+        Нативный ollama-маршрут `/v1/systemone` (decision) ходит с Bearer,
+        когда оператор задал `DECISION_API_KEY` (arch §8); генеративные
+        ollama-слоты ключ не отправляют (решение №4).
+        """
+        if not self.spec.api_key.strip():
+            return {}
+        if (
+            self.spec.provider == PROVIDER_OPENAI
+            or self.spec.model_type == SLOT_KIND_DECISION
+        ):
             return {"Authorization": f"Bearer {self.spec.api_key.strip()}"}
         return {}
 
