@@ -193,6 +193,27 @@ SLOT_NAMES = (SLOT_EMBEDDING, SLOT_SUMMARY, SLOT_JUDGE)
 # реклассификация ставится заданием.
 NODES_RECLASS_KIND = "reclass"
 
+# Счётчик попыток пары и состояние «требует вмешательства» (№39, arch §6.8):
+# нетранзиентные исходы замораживают пару — задание перестаёт браться
+# (вызовы модели не жгутся), но остаётся `pending`. `unavailable`/`timeout`/
+# `auth` счётчик НЕ замораживают: ими занимаются back-off и разрыв слота.
+_NON_TRANSIENT_OUTCOMES = frozenset(
+    {SlotOutcome.EMPTY, SlotOutcome.TRUNCATED, SlotOutcome.OFF_CONTRACT}
+)
+
+# Слот → имя джобы-владельца очереди (для событий внимания и /jobs/attention).
+_SLOT_JOB_NAMES = {
+    SLOT_EMBEDDING: EMBEDDING_JOB,
+    SLOT_SUMMARY: SUMMARY_JOB,
+    SLOT_JUDGE: JUDGE_JOB,
+    NODES_JOB: NODES_JOB,
+}
+
+# meta-ключ отпечатка конфигурации слотов (№39, arch §6.8/§13.3): смена
+# конфигурации слота — часть «причины» внимания, поэтому старт со сменой
+# отпечатка снимает `attention_at` у всех заданий.
+SLOT_CONFIG_META_KEY = "slot_config_fingerprint"
+
 # Единое правило выборки быстрого пула обхода `default` (lsb-0011-01, arch §3.2):
 # активные default-заметки с готовой разметкой (`hint_path` + `confidence` не
 # ниже порога авто-переезда), ещё не разобранные (`node_order_at IS NULL`),
@@ -581,7 +602,11 @@ class BackgroundWorker:
             *(
                 run_loop(spec, self._is_stopping, self._job_backoff(spec))
                 for spec in specs
-            )
+            ),
+            # Старт со сменой конфигурации слота — «причина ушла»: внимание
+            # снимается, отпечаток перезаписывается (№39 §6.8/§13.3). Стартовая
+            # сверка идёт ПАРАЛЛЕЛЬНО петлям (не задерживает первый прогон).
+            self._startup_attention_reset_async(),
         )
 
     # --- разрывы слотов (№39, arch §6.2/§6.7) ----------------------------------
@@ -633,6 +658,7 @@ class BackgroundWorker:
             self._log_slot_event("slot_probe", slot, effective_job, result=result)
             if result == CHECK_OK:
                 breaker.note_success()
+                self._reset_attention_for_slot(slot, "probe")
                 self._log_slot_event(
                     "slot_resumed",
                     slot,
@@ -747,6 +773,389 @@ class BackgroundWorker:
             if secret and secret.strip() and secret.strip() in fragment:
                 fragment = fragment.replace(secret.strip(), secret.strip()[:4] + "***")
         return fragment
+
+    # --- счётчик попыток пары и «требует вмешательства» (№39, arch §6.8) --------
+
+    @staticmethod
+    def _load_payload(raw: str | None) -> dict:
+        """Разобрать payload работы (терпимо к пустому/битому JSON)."""
+        try:
+            loaded = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            loaded = {}
+        return loaded if isinstance(loaded, dict) else {}
+
+    def _set_job_payload(self, job_id: int, payload: dict) -> None:
+        """Перезаписать payload работы (идентичность пары и её штамп)."""
+        self._ensure_job_table()
+        with session(self._settings) as conn, transaction(conn):
+            conn.execute(
+                "UPDATE worker_jobs SET payload = ? WHERE id = ?",
+                (json.dumps(payload, ensure_ascii=False), job_id),
+            )
+
+    def _job_for_slot(self, slot: str) -> str:
+        """Имя джобы-владельца очереди слота (для событий и /jobs/attention)."""
+        return _SLOT_JOB_NAMES.get(slot, slot)
+
+    def _log_attention_event(self, event: str, **fields: object) -> None:
+        """Событие внимания задания (arch §7.4): `event` + поля по факту."""
+        payload: dict[str, object] = {"event": event}
+        for key, value in fields.items():
+            if value is not None:
+                payload[key] = value
+        logging.getLogger("app").info(event, extra=payload)
+
+    def _note_attempt(
+        self,
+        job_id: int,
+        outcome: SlotOutcome,
+        *,
+        detail: str | None = None,
+        pair_stamp: str | None = None,
+    ) -> dict:
+        """Зафиксировать исход попытки пары (№39, arch §6.8).
+
+        Транзиентный исход (`unavailable`/`timeout`/`auth`) обновляет только
+        `last_outcome`/`last_error` — счётчик не растёт (ждать — нормальное
+        состояние, им занимаются back-off и разрыв). Нетранзиентный
+        (`empty`/`truncated`/`off_contract`) наращивает `attempts`, и по
+        достижении `SLOT_MAX_ATTEMPTS` ставит `attention_at` — работа замирает,
+        оставаясь `pending`. Всё — одной транзакцией (`UPDATE … WHERE id = ?`).
+        `pair_stamp` — отпечаток пары (заметка/кандидат), обновляется в payload.
+        """
+        self._ensure_job_table()
+        masked = self._mask_detail(detail)
+        value = outcome.value if isinstance(outcome, SlotOutcome) else str(outcome)
+        nontransient = outcome in _NON_TRANSIENT_OUTCOMES
+        with session(self._settings) as conn, transaction(conn):
+            row = conn.execute(
+                "SELECT id, slot, note_id, payload, attempts, attention_at "
+                "FROM worker_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return {"job_id": job_id, "attempts": 0, "attention": False}
+            attempts = int(row["attempts"] or 0)
+            attention = row["attention_at"] is not None
+            pair = self._load_payload(row["payload"])
+            if pair_stamp is not None:
+                pair["updated_at"] = pair_stamp
+                conn.execute(
+                    "UPDATE worker_jobs SET payload = ? WHERE id = ?",
+                    (json.dumps(pair, ensure_ascii=False), job_id),
+                )
+            if nontransient:
+                attempts += 1
+                if attempts >= self._settings.slot_max_attempts:
+                    attention = True
+                    conn.execute(
+                        "UPDATE worker_jobs SET attempts = ?, last_outcome = ?, "
+                        "last_error = ?, attention_at = COALESCE(attention_at, "
+                        "strftime('%Y-%m-%dT%H:%M:%SZ','now')), updated_at = "
+                        "strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+                        (attempts, value, masked, job_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE worker_jobs SET attempts = ?, last_outcome = ?, "
+                        "last_error = ?, updated_at = "
+                        "strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+                        (attempts, value, masked, job_id),
+                    )
+            else:
+                conn.execute(
+                    "UPDATE worker_jobs SET last_outcome = ?, last_error = ?, "
+                    "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+                    (value, masked, job_id),
+                )
+            slot = row["slot"]
+            note_id = row["note_id"]
+            older_id = pair.get("older_id")
+        if nontransient and attention:
+            self._log_attention_event(
+                "job_attention",
+                job=self._job_for_slot(slot),
+                slot=slot,
+                note_id=note_id,
+                older_id=older_id,
+                outcome=value,
+                attempts=attempts,
+            )
+        return {"job_id": job_id, "attempts": attempts, "attention": attention}
+
+    def _release_attention(self, job_id: int, reason: str) -> dict:
+        """Сбросить счётчик пары и снять внимание (№39, arch §6.8/§13.3).
+
+        `attempts = 0, attention_at = NULL, last_error = NULL` — «причина
+        ушла»: работа идёт как новая. `released` — было ли задание во внимании
+        (операторская ручка отдаёт 404 на задание вне внимания); `found` —
+        есть ли строка вообще. Событие `job_attention_released` с причиной
+        (`edit`/`probe`/`operator`/`startup`) пишется на найденную строку.
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn, transaction(conn):
+            row = conn.execute(
+                "SELECT id, slot, note_id, payload, attention_at "
+                "FROM worker_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return {"job_id": job_id, "released": False, "found": False}
+            was_attention = row["attention_at"] is not None
+            conn.execute(
+                "UPDATE worker_jobs SET attempts = 0, attention_at = NULL, "
+                "last_error = NULL, updated_at = "
+                "strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+                (job_id,),
+            )
+            slot = row["slot"]
+            note_id = row["note_id"]
+            older_id = self._load_payload(row["payload"]).get("older_id")
+        self._log_attention_event(
+            "job_attention_released",
+            job=self._job_for_slot(slot),
+            slot=slot,
+            note_id=note_id,
+            older_id=older_id,
+            reason=reason,
+        )
+        return {
+            "job_id": job_id,
+            "released": was_attention,
+            "found": True,
+            "attempts": 0,
+        }
+
+    def release_attention(self, job_id: int) -> dict:
+        """Операторская переоткрытие задания из внимания (arch §6.7/§7.4).
+
+        Только для задания во внимании: вне внимания (или без строки) —
+        `released: false` без правок (REST-ручка отдаёт 404).
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT attention_at FROM worker_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        if row is None or row["attention_at"] is None:
+            return {"job_id": job_id, "released": False}
+        self._release_attention(job_id, "operator")
+        return {"job_id": job_id, "released": True, "attempts": 0}
+
+    def _reset_attention_for_slot(self, slot: str, reason: str) -> int:
+        """Снять внимание у заданий слота (`*` — у всех); число снятых.
+
+        Крючки «причина ушла» (arch §6.8/§13.3): успешный стук слота
+        (`probe`), старт со сменой отпечатка конфигурации (`startup`).
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            if slot == "*":
+                rows = conn.execute(
+                    "SELECT id FROM worker_jobs WHERE attention_at IS NOT NULL"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id FROM worker_jobs WHERE attention_at IS NOT NULL "
+                    "AND slot = ?",
+                    (slot,),
+                ).fetchall()
+        released = 0
+        for row in rows:
+            if self._release_attention(int(row["id"]), reason)["released"]:
+                released += 1
+        return released
+
+    def attention_jobs(self) -> list[dict]:
+        """Задания, ждущие человека (arch §6.7/§7.4): только SQL.
+
+        Форма записи: `{job_id, job, slot, note_id, older_id, outcome,
+        attempts, since}` — `since` — момент `attention_at`. Потребители —
+        `/health` и операторская ручка `GET /jobs/attention` (моделей не зовём).
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT id, slot, note_id, payload, attempts, last_outcome, "
+                "attention_at FROM worker_jobs WHERE attention_at IS NOT NULL "
+                "ORDER BY id"
+            ).fetchall()
+        jobs: list[dict] = []
+        for row in rows:
+            jobs.append(
+                {
+                    "job_id": int(row["id"]),
+                    "job": self._job_for_slot(row["slot"]),
+                    "slot": row["slot"],
+                    "note_id": row["note_id"],
+                    "older_id": self._load_payload(row["payload"]).get("older_id"),
+                    "outcome": row["last_outcome"],
+                    "attempts": int(row["attempts"] or 0),
+                    "since": row["attention_at"],
+                }
+            )
+        return jobs
+
+    def attention_count(self) -> int:
+        """Сколько заданий ждёт человека (агрегат по всем слотам, arch §6.7)."""
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM worker_jobs "
+                    "WHERE attention_at IS NOT NULL"
+                ).fetchone()[0]
+            )
+
+    def _review_attention_jobs(self, slot: str, kind: str) -> int:
+        """Пере-проверить пару замороженных работ без вызова модели (arch §6.8).
+
+        Протокол «правка пары» без ручных правок: правка заметки/кандидата или
+        смена лучшего кандидата возвращает работу в очередь (`attempts=0`),
+        решение о вердикте/слиянии принимает следующий прогон. Только SQL и
+        чтение вектора — моделей не зовём. Возвращает число размороженных.
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT id, note_id, payload FROM worker_jobs "
+                "WHERE slot = ? AND kind = ? AND status = 'pending' "
+                "AND attention_at IS NOT NULL ORDER BY id",
+                (slot, kind),
+            ).fetchall()
+        released = 0
+        for row in rows:
+            payload = self._load_payload(row["payload"])
+            note_id = int(row["note_id"])
+            with session(self._settings) as conn:
+                note = conn.execute(
+                    "SELECT id, namespace, vector_status, deleted_at, updated_at "
+                    "FROM notes WHERE id = ?",
+                    (note_id,),
+                ).fetchone()
+                vector = (
+                    vectors.get_vector(conn, note_id) if note is not None else None
+                )
+            if note is None or note["deleted_at"] is not None:
+                continue
+            # правка стороны пары (заметки/ранней) — причина ушла
+            if (
+                payload.get("note_updated_at") is not None
+                and payload["note_updated_at"] != note["updated_at"]
+            ) or (
+                payload.get("newer_updated_at") is not None
+                and payload["newer_updated_at"] != note["updated_at"]
+            ):
+                if self._release_attention(int(row["id"]), "edit")["released"]:
+                    released += 1
+                continue
+            older_id = payload.get("older_id")
+            if older_id is not None:
+                with session(self._settings) as conn:
+                    other = conn.execute(
+                        "SELECT deleted_at, updated_at FROM notes WHERE id = ?",
+                        (int(older_id),),
+                    ).fetchone()
+                if other is None or other["deleted_at"] is not None:
+                    continue
+                if (
+                    payload.get("older_updated_at") is not None
+                    and payload["older_updated_at"] != other["updated_at"]
+                ):
+                    if self._release_attention(int(row["id"]), "edit")["released"]:
+                        released += 1
+                continue
+            # дедуп: лучший кандидат пересчитывается по вектору; без вектора
+            # пару не проверить — ждём перевекторизации
+            if note["vector_status"] != "ok" or vector is None:
+                continue
+            candidates = self._find_dedup_candidates(
+                note_id, vector, note["namespace"]
+            )
+            alive = [pair for pair in candidates if pair[0] < note_id]
+            best_id = int(alive[0][0]) if alive else None
+            stored_id = payload.get("candidate_id")
+            if (
+                stored_id is not None
+                and best_id is not None
+                and stored_id != best_id
+            ):
+                if self._release_attention(int(row["id"]), "edit")["released"]:
+                    released += 1
+                continue
+            if best_id is not None:
+                with session(self._settings) as conn:
+                    candidate = conn.execute(
+                        "SELECT updated_at FROM notes WHERE id = ?", (best_id,)
+                    ).fetchone()
+                if (
+                    candidate is not None
+                    and payload.get("candidate_updated_at") is not None
+                    and payload["candidate_updated_at"] != candidate["updated_at"]
+                ):
+                    if self._release_attention(int(row["id"]), "edit")["released"]:
+                        released += 1
+        return released
+
+    def _slot_config_fingerprint(self) -> str:
+        """Отпечаток конфигурации слотов (arch §6.8/§13.3): провайдер + модель.
+
+        Смена любого слагаемого — «причина ушла»: пары, замороженные на
+        нетранзиентном исходе, могли быть заморожены именно конфигурацией
+        слота (например, сменённой моделью судьи).
+        """
+        settings = self._settings
+        return "|".join(
+            str(part)
+            for part in (
+                settings.summary_provider,
+                settings.summary_model,
+                settings.summary_num_predict,
+                settings.judge_provider,
+                settings.judge_model,
+                settings.judge_num_predict,
+            )
+        )
+
+    def _startup_attention_reset(self) -> int:
+        """Стартовая сверка отпечатка конфигурации слотов (arch §6.8/§13.3).
+
+        Отпечаток читается из `meta` (`SLOT_CONFIG_META_KEY`); отличается от
+        текущего или `SLOT_ATTENTION_RESET_ON_START` — внимание снимается у
+        всех заданий; отпечаток перезаписывается. Возвращает число снятых.
+        """
+        fingerprint = self._slot_config_fingerprint()
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (SLOT_CONFIG_META_KEY,),
+            ).fetchone()
+        stored = row["value"] if row is not None else None
+        released = 0
+        if stored != fingerprint or self._settings.slot_attention_reset_on_start:
+            released = self._reset_attention_for_slot("*", "startup")
+        with session(self._settings) as conn, transaction(conn):
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                (SLOT_CONFIG_META_KEY, fingerprint),
+            )
+        return released
+
+    async def _startup_attention_reset_async(self) -> None:
+        """Стартовая сверка внимания в рабочем потоке (не блокирует петли).
+
+        Отказ сверки не роняет воркер: внимание само снимется успешным стуком
+        слота или правкой пары, а сама сверка — оптимизация «причина ушла при
+        смене конфигурации» (arch §6.8).
+        """
+        try:
+            await asyncio.to_thread(self._startup_attention_reset)
+        except Exception:  # noqa: BLE001 — фоновая оптимизация не роняет старт
+            logging.getLogger("app").warning(
+                "slot attention startup reset failed",
+                extra={"event": "job_attention_reset_failed"},
+            )
 
     # --- работа джоб (цикл, back-off и супервизор — в каркасе) -----------------
 
@@ -898,27 +1307,56 @@ class BackgroundWorker:
         `_create_job`, `_pending_jobs`, `_mark_job_done`) возвращаются сразу.
         Индекс `idx_worker_jobs_queue` на (slot, kind, status, id): выборка
         pending-очереди слота — по индексу, а не полным сканом таблицы.
+        Колонки внимания (№39, arch §5.2/§6.8) — `attempts`/`last_outcome`/
+        `last_error`/`attention_at` — в свежем DDL и идемпотентным ALTER'ом по
+        `PRAGMA table_info(worker_jobs)` для живой базы предыдущей версии;
+        индекс `idx_worker_jobs_attention` обслуживает выборку «требует
+        вмешательства».
         """
         if self._jobs_table_ready:
             return
         with session(self._settings) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS worker_jobs ("
-                "  id         INTEGER PRIMARY KEY,"
-                "  slot       TEXT NOT NULL,"
-                "  kind       TEXT NOT NULL,"
-                "  note_id    INTEGER NOT NULL,"
-                "  payload    TEXT,"
-                "  status     TEXT NOT NULL DEFAULT 'pending',"
-                "  created_at TEXT NOT NULL DEFAULT "
+                "  id           INTEGER PRIMARY KEY,"
+                "  slot         TEXT NOT NULL,"
+                "  kind         TEXT NOT NULL,"
+                "  note_id      INTEGER NOT NULL,"
+                "  payload      TEXT,"
+                "  status       TEXT NOT NULL DEFAULT 'pending',"
+                "  created_at   TEXT NOT NULL DEFAULT "
                 "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
-                "  updated_at TEXT NOT NULL DEFAULT "
-                "    (strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+                "  updated_at   TEXT NOT NULL DEFAULT "
+                "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
+                "  attempts     INTEGER NOT NULL DEFAULT 0,"
+                "  last_outcome TEXT,"
+                "  last_error   TEXT,"
+                "  attention_at TEXT"
                 ")"
             )
+            existing = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(worker_jobs)"
+                ).fetchall()
+            }
+            for name, ddl in (
+                ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+                ("last_outcome", "TEXT"),
+                ("last_error", "TEXT"),
+                ("attention_at", "TEXT"),
+            ):
+                if name not in existing:
+                    conn.execute(
+                        f"ALTER TABLE worker_jobs ADD COLUMN {name} {ddl}"
+                    )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_worker_jobs_queue "
                 "ON worker_jobs(slot, kind, status, id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_worker_jobs_attention "
+                "ON worker_jobs(status, attention_at)"
             )
         self._jobs_table_ready = True
 
@@ -986,12 +1424,18 @@ class BackgroundWorker:
     def _pending_jobs(
         self, slot: str, kind: str, limit: int
     ) -> list:
-        """Вычитать pending-работы слота (порядок по id)."""
+        """Вычитать pending-работы слота (порядок по id).
+
+        Замороженные работы (`attention_at IS NOT NULL`, №39 §6.8) не берутся:
+        повторяющийся нетранзиентный отказ перестаёт жечь вызовы модели, пока
+        причина не ушла (работа при этом остаётся `pending`).
+        """
         self._ensure_job_table()
         with session(self._settings) as conn:
             return conn.execute(
                 "SELECT id, note_id, payload FROM worker_jobs "
                 "WHERE slot = ? AND kind = ? AND status = 'pending' "
+                "AND attention_at IS NULL "
                 "ORDER BY id LIMIT ?",
                 (slot, kind, limit),
             ).fetchall()
@@ -1331,6 +1775,9 @@ class BackgroundWorker:
         остаётся pending, повтор по back-off judge-петли (NFR-3: обе заметки
         целы). Протухшая заметка (удалена/вектор не готов) — работа снимается.
         """
+        # Протокол «правка пары»: замороженные работы перепроверяются без
+        # вызова модели — ушедшая причина размораживает их (арх §6.8).
+        self._review_attention_jobs("judge", "dedup")
         jobs = self._pending_jobs(
             "judge",
             "dedup",
@@ -1368,8 +1815,8 @@ class BackgroundWorker:
                 placeholders = ",".join("?" * len(ids))
                 with session(self._settings) as conn:
                     rows = conn.execute(
-                        f"SELECT id, text, deleted_at FROM notes WHERE id IN "
-                        f"({placeholders})",
+                        f"SELECT id, text, deleted_at, updated_at FROM notes "
+                        f"WHERE id IN ({placeholders})",
                         ids,
                     ).fetchall()
                 by_id = {r["id"]: r for r in rows}
@@ -1384,6 +1831,32 @@ class BackgroundWorker:
                     if (r := by_id.get(candidate_id)) is not None
                     and r["deleted_at"] is None
                 ]
+                # Идентичность пары (№39 §6.8/§13.3): лучший кандидат и штампы
+                # сторон («заметка», «кандидат»). Новый лучший кандидат или
+                # правка любой стороны — ДРУГАЯ пара: счётчик и внимание
+                # сбрасываются, работа идёт как новая; штампы сохраняются на
+                # следующую сверку (в т.ч. у замороженной работы,
+                # `_review_attention_jobs`).
+                best_id = int(alive[0][0]) if alive else None
+                stored = self._load_payload(job["payload"])
+                if best_id is not None:
+                    candidate_updated = by_id[best_id]["updated_at"]
+                    pair_changed = (
+                        stored.get("candidate_id") is not None
+                        and stored["candidate_id"] != best_id
+                    ) or (
+                        stored.get("note_updated_at") is not None
+                        and stored["note_updated_at"] != newer["updated_at"]
+                    ) or (
+                        stored.get("candidate_updated_at") is not None
+                        and stored["candidate_updated_at"] != candidate_updated
+                    )
+                    if pair_changed:
+                        self._release_attention(job["id"], "edit")
+                    stored["candidate_id"] = best_id
+                    stored["note_updated_at"] = newer["updated_at"]
+                    stored["candidate_updated_at"] = candidate_updated
+                    self._set_job_payload(job["id"], stored)
                 try:
                     best = self._pick_duplicate(note_id, alive, by_id)
                 except JudgeError as exc:
@@ -1399,6 +1872,11 @@ class BackgroundWorker:
                         candidates=[
                             candidate_id for candidate_id, _ in alive
                         ],
+                    )
+                    self._note_attempt(
+                        job["id"],
+                        outcome_of(exc),
+                        detail=str(exc),
                     )
                     continue  # работа остаётся pending — повтор по back-off
                 if best is not None:
@@ -1437,6 +1915,7 @@ class BackgroundWorker:
         """
         if self._summarizer is None:
             return 0  # тестовый режим без суммаризатора: слияние невозможно
+        self._review_attention_jobs("summary", "merge")
         jobs = self._pending_jobs(
             "summary",
             "merge",
@@ -1458,7 +1937,8 @@ class BackgroundWorker:
                 continue
             with session(self._settings) as conn:
                 rows = conn.execute(
-                    "SELECT id, text, deleted_at FROM notes WHERE id IN (?, ?)",
+                    "SELECT id, text, deleted_at, updated_at FROM notes "
+                    "WHERE id IN (?, ?)",
                     (older_id, note_id),
                 ).fetchall()
             by_id = {r["id"]: r for r in rows}
@@ -1473,6 +1953,25 @@ class BackgroundWorker:
                 self._mark_job_done(job["id"])
                 done += 1
                 continue
+            # Пара merge-работы — заметка (`older_id`); штампы сторон для
+            # сверки правки пары (№39 §6.8/§13.3): изменились — счётчик и
+            # внимание сбрасываются, работа идёт как новая.
+            pair_changed = (
+                payload.get("older_updated_at") is not None
+                and payload["older_updated_at"] != older["updated_at"]
+            ) or (
+                payload.get("newer_updated_at") is not None
+                and payload["newer_updated_at"] != newer["updated_at"]
+            )
+            if pair_changed:
+                self._release_attention(job["id"], "edit")
+            if (
+                payload.get("older_updated_at") != older["updated_at"]
+                or payload.get("newer_updated_at") != newer["updated_at"]
+            ):
+                payload["older_updated_at"] = older["updated_at"]
+                payload["newer_updated_at"] = newer["updated_at"]
+                self._set_job_payload(job["id"], payload)
             try:
                 merged = self._summarizer.merge(older["text"], newer["text"])
                 outcome = self._notes.merge_pair(older_id, merged, note_id)
@@ -1493,6 +1992,11 @@ class BackgroundWorker:
                     message="dedup: summarizer merge failed — both notes kept, retry queued",
                     older_id=older_id,
                     note_id=note_id,
+                    detail=str(exc),
+                )
+                self._note_attempt(
+                    job["id"],
+                    outcome_of(exc),
                     detail=str(exc),
                 )
                 continue  # работа остаётся pending — повтор по back-off

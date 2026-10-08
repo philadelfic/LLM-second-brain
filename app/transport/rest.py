@@ -1236,4 +1236,37 @@ def build_rest_router(settings: Settings) -> APIRouter:
             "revectorized": True,
         }
 
+    # --- очередь заданий: состояние «требует вмешательства» (№39, no39-02) ----
+    # §6.8/§7.4: задания, замороженные повторяющимся нетранзиентным отказом
+    # пары, видны оператору и возвращаются в работу без правок данных. Только
+    # SQL (моделей не зовём); внимание заданий — зона воркера, не контент
+    # памяти (в `warnings` и поверхность предупреждений не пишем).
+
+    @rest_router.get("/jobs/attention")
+    async def list_attention_jobs(request: Request) -> dict:
+        """Список заданий, ждущих человека: `{jobs: [...], total: N}`.
+
+        Форма записи — `{job_id, job, slot, note_id, older_id, outcome,
+        attempts, since}` (arch §7.4); собирает воркер, только SQL.
+        """
+        worker = request.app.state.worker  # type: ignore[attr-defined]
+        jobs = await asyncio.to_thread(worker.attention_jobs)
+        return {"jobs": jobs, "total": len(jobs)}
+
+    @rest_router.post("/jobs/attention/{job_id}/retry")
+    async def retry_attention_job(job_id: int, request: Request) -> dict:
+        """Операторское возвращение задания в работу: `{job_id, released, attempts}`.
+
+        Снимает внимание и сбрасывает счётчик пары (работа остаётся `pending`
+        и берётся петлёй со следующего прогона). Нет такого задания / оно не
+        во внимании → 404.
+        """
+        worker = request.app.state.worker  # type: ignore[attr-defined]
+        result = await asyncio.to_thread(worker.release_attention, job_id)
+        if not result.get("released"):
+            raise HTTPException(
+                status_code=404, detail="job is not waiting for attention"
+            )
+        return result
+
     return rest_router

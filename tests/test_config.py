@@ -143,6 +143,8 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "SLOT_PAUSE_SEC": ("slot_pause_sec", 900),
     "SLOT_PAUSE_AFTER": ("slot_pause_after", 3),
     "SLOT_HINT_EVERY_SEC": ("slot_hint_every_sec", 900),
+    "SLOT_MAX_ATTEMPTS": ("slot_max_attempts", 8),
+    "SLOT_ATTENTION_RESET_ON_START": ("slot_attention_reset_on_start", True),
 }
 
 
@@ -170,14 +172,15 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 103 поля: 6 обязательных + 97 с умолчаниями
+        """В Settings — ровно 105 полей: 6 обязательных + 99 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
         субстрата областей релиза 3.0.0: лимиты/пороги skills/terms/user;
         + 3 джобы расчёта связей lsb-0010-03 + 3 джобы обхода default lsb-0011-01
         + 4 истории версий №41 релиза 3.2.0: HISTORY_*; + 3 флага областей №40
-        релиза 3.2.0: AREA_*_ENABLED; + 3 паузы слота №39 релиза 3.2.0: SLOT_*)."""
+        релиза 3.2.0: AREA_*_ENABLED; + 5 настроек слота №39 релиза 3.2.0:
+        SLOT_* — пауза/стук/хинт, предел попыток пары и стартовый сброс)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

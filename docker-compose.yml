@@ -99,6 +99,8 @@ services:
       SLOT_PAUSE_SEC: "900"          # pause of a broken slot = back-off ceiling (≥30); one probe per pause
       SLOT_PAUSE_AFTER: "3"          # consecutive non-transient failures opening the break (≥1; auth opens at once)
       SLOT_HINT_EVERY_SEC: "900"     # throttle of the "tell your human" hint per slot (≥0; 0 — every call)
+      SLOT_MAX_ATTEMPTS: "8"         # attempts of one pair before "needs attention" (≥1; the job stays pending)
+      SLOT_ATTENTION_RESET_ON_START: "true"  # clear attention_at at startup (slot config may have changed)
       # --- version history (No41, release 3.2.0): record_versions layer ---
       HISTORY_ENABLED: "true"           # kill switch: false — no versions are written, history reads come back empty
       HISTORY_MAX_VERSIONS: "0"         # versions kept per record (0 — keep everything; >0 — prune with re-base)

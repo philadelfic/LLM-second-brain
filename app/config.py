@@ -181,6 +181,14 @@ class Settings(BaseSettings):
     slot_pause_sec: int = 900
     slot_pause_after: int = 3
     slot_hint_every_sec: int = 900
+    # SLOT_MAX_ATTEMPTS — предел попыток ПАРЫ до состояния «требует
+    # вмешательства»: при исчерпании задание замирает, оставаясь `pending`
+    # (вызовы модели не жгутся), и возвращается в работу при уходе причины
+    # (№39 §6.8, no39-02). SLOT_ATTENTION_RESET_ON_START — снимать ли
+    # `attention_at` при старте воркера (конфигурация слота могла измениться);
+    # отпечаток конфигурации в `meta` снимает внимание и без этого флага.
+    slot_max_attempts: int = 8
+    slot_attention_reset_on_start: bool = True
 
     # --- история версий (№41, релиз 3.2.0) ---
     # HISTORY_ENABLED — выключатель слоя истории (kill switch): false —
@@ -436,6 +444,8 @@ class Settings(BaseSettings):
         need_low("slot_pause_sec", self.slot_pause_sec, 30)
         need_low("slot_pause_after", self.slot_pause_after, 1)
         need_low("slot_hint_every_sec", self.slot_hint_every_sec, 0)
+        # --- счётчик попыток пары (№39 §6.8, no39-02): предел ≥ 1 ---
+        need_low("slot_max_attempts", self.slot_max_attempts, 1)
 
         # --- история версий (№41): 0 — «без ограничения» для потолка версий и
         # срока хранения (дефолт — хранить всё); порог дельты ≥ 1 (иначе
