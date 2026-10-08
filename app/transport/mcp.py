@@ -481,7 +481,16 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "search globally and narrow down. Search mode — parameter `mode`: "
         "`semantic` (default, by meaning) or `title` (by title substring). "
         "Freshness — parameter `updated_after` (ISO-8601 UTC, inclusive): only "
-        "notes changed at or after that moment."
+        "notes changed at or after that moment. Note comments (remarks) are NOT "
+        "searched here — use memory_comment_search."
+    ),
+    "memory_comment_search": (
+        "Search ONLY the comments (remarks) attached to notes — a separate "
+        "search from memory_search, which looks at note text and never returns "
+        "comments. Returns {id, title, namespace, comment, updated_at}. Pass "
+        "`namespace` (node or subtree from the map) to narrow; "
+        "`updated_after` (ISO-8601 UTC, inclusive) keeps only fresh notes. "
+        "Empty result = there is no such comment."
     ),
     "memory_list": (
         "Browse the memory: notes (brief summaries, newest first) with offset "
@@ -720,6 +729,10 @@ _GET_NOTE = ("id", "text", "chars", "created_at", "updated_at", "namespace", "ex
 _LINK_ITEM = ("id", "title", "namespace", "chars")
 _NS_ITEM = ("path", "description", "status", "notes_count", "subtree_count", "updated_at")
 
+# no24-02 (3.2.0): элемент отдельного поиска ПОМЕТОК — {id, title, namespace,
+# comment, updated_at}; пометки ищутся своей ручкой, не смешиваясь с search.
+_COMMENT_ITEM = ("id", "title", "namespace", "comment", "updated_at")
+
 
 async def _links_of(services: Services, note_id: int) -> list[dict[str, Any]]:
     """Компактный перечень связей заметки для MCP-выдачи (FR-3.1/FR-3.2).
@@ -764,6 +777,13 @@ def _with_hint(out: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
 def _compact_search(result: dict[str, Any]) -> dict[str, Any]:
     out = {"results": [_search_hit(r) for r in result["results"]]}
     return _with_hint(out, result)  # warning не копируется никогда (и null тоже)
+
+
+def _compact_comment_search(result: dict[str, Any]) -> dict[str, Any]:
+    """Компактный хит memory_comment_search: {id, title, namespace, comment,
+    updated_at}; hint мягкого отказа копируется, если есть."""
+    out = {"results": [_pick(r, _COMMENT_ITEM) for r in result["results"]]}
+    return _with_hint(out, result)
 
 
 # lsb-0013-02 (FR-2.1, arch §3.3): подсказка «есть ещё» — ОДНА на выдачу
@@ -1434,6 +1454,95 @@ def build_mcp(
         if mode == "title":
             return _compact_title_search(result)
         return _compact_search(result)
+
+    @mcp.tool(
+        name="memory_comment_search",
+        description=TOOL_DESCRIPTIONS["memory_comment_search"],
+    )
+    async def memory_comment_search(
+        query: Annotated[
+            str,
+            Field(
+                description="Search query",
+                min_length=1,
+                max_length=settings.max_query_chars,
+            ),
+        ],
+        top_k: Annotated[
+            int,
+            Field(description="Number of results", ge=1, le=20),
+        ] = settings.default_top_k,
+        namespace: Annotated[
+            str | None,
+            Field(
+                description="Hierarchy node: its subtree (node + leaves); "
+                "omitted — global",
+            ),
+        ] = None,
+        namespace_exact: Annotated[
+            bool,
+            Field(description="Only the node itself, without the leaves under it"),
+        ] = False,
+        updated_after: Annotated[
+            str | None,
+            Field(
+                description="Only notes changed at or after this moment "
+                "(ISO-8601 UTC: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ); "
+                "omitted — no freshness filter",
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        """Отдельный поиск ПОМЕТОК (no24-02, §13.6): только по comment.
+
+        Отдельная ручка, а не режим memory_search: результаты не смешиваются
+        со смысловым поиском. Невалидный `updated_after` — мягкий отказ
+        (fail + hint); неизвестный узел — hint от NamespaceError.
+        """
+        started = time.perf_counter()
+        try:
+            fresh = (
+                parse_updated_after(updated_after)
+                if updated_after is not None
+                else None
+            )
+        except FreshnessValidationError:
+            log_tool_call(
+                "memory_comment_search",
+                started,
+                failed=True,
+                reason="invalid updated_after",
+                namespace=namespace,
+                query=preview(query),
+            )
+            return {"results": [], "hint": HINT_INVALID_UPDATED_AFTER}
+        try:
+            result = await asyncio.to_thread(
+                services.search.comment_search,
+                query,
+                top_k,
+                namespace,
+                namespace_exact,
+                fresh,
+            )
+        except (NamespaceError, NamespaceValidationError) as exc:
+            log_tool_call(
+                "memory_comment_search",
+                started,
+                failed=True,
+                reason=str(exc),
+                namespace=namespace,
+                query=preview(query),
+            )
+            return {"results": [], "hint": str(exc)}
+        log_tool_call(
+            "memory_comment_search",
+            started,
+            results=len(result["results"]),
+            top_k=top_k,
+            namespace=namespace,
+            query=preview(query),
+        )
+        return _compact_comment_search(result)
 
     @mcp.tool(name="memory_list", description=TOOL_DESCRIPTIONS["memory_list"])
     async def memory_list(

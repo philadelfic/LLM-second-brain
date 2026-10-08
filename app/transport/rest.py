@@ -570,6 +570,34 @@ def build_rest_router(settings: Settings) -> APIRouter:
         except (NoteValidationError, FreshnessValidationError) as exc:
             raise _unprocessable(exc) from exc
 
+    @rest_router.get("/notes/comments")
+    async def search_comments(
+        request: Request,
+        q: str = Query(..., min_length=1, max_length=settings.max_query_chars),
+        top_k: int | None = Query(default=None, ge=1, le=20),
+        namespace: str | None = Query(default=None),
+        namespace_exact: bool = Query(default=False),
+        updated_after: str | None = Query(default=None),
+    ) -> dict:
+        """Отдельный поиск ПОМЕТОК (no24-02, §13.6): только по comment.
+
+        Объявлен ДО `GET /notes/{note_id}` (как `/skills/search` до
+        `/skills/{skill_id}`) — иначе «comments» парсился бы как note_id и
+        отдавал 422. Контракт тот же, что у MCP (`{results, hint?}`);
+        результаты не смешиваются со смысловым поиском. Невалидные
+        `q`/`top_k`/`updated_after` и незарегистрированный узел → 422 с
+        текстом-hint.
+        """
+        try:
+            return await asyncio.to_thread(
+                _services(request).search.comment_search,
+                q, top_k, namespace, namespace_exact, updated_after,
+            )
+        except (SearchValidationError, FreshnessValidationError) as exc:
+            raise _unprocessable(exc) from exc
+        except NamespaceError as exc:
+            raise _unprocessable(exc) from exc
+
     @rest_router.get("/notes/{note_id}")
     async def get_note(note_id: int, request: Request) -> dict:
         """Полный текст одной заметки + связи из ДРУГИХ неймспейсов.

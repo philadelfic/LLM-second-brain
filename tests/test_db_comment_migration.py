@@ -45,6 +45,11 @@ def _downgrade_to_prev(settings: Settings) -> None:
             "INSERT INTO notes (id, text, title) "
             "VALUES (2, 'текст второй заметки', 'Вторая заметка')"
         )
+        # no24-02: снимаем и объекты FTS пометок (признак версии «до №24») —
+        # иначе DROP COLUMN comment падает: триггер ссылается на new.comment.
+        conn.execute("DROP TRIGGER IF EXISTS notes_comment_fts_ai")
+        conn.execute("DROP TRIGGER IF EXISTS notes_comment_fts_au")
+        conn.execute("DROP TABLE IF EXISTS notes_comment_fts")
         conn.execute("ALTER TABLE notes DROP COLUMN comment")
 
 

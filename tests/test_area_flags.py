@@ -124,6 +124,7 @@ _CORE_TOOLS = frozenset(
         "memory_delete",
         "memory_namespaces",
         "memory_namespace_create",
+        "memory_comment_search",
         "history_list",
         "history_get",
         "warnings_list",

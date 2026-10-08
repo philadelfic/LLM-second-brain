@@ -174,6 +174,6 @@ async def test_limit_over_max_is_soft(
 async def test_surface_grew_by_exactly_one(mcp_server) -> None:
     """Регресс поверхности: набор вырос ровно на один — `warnings_list`."""
     names = {tool.name for tool in await mcp_server.list_tools()}
-    assert len(names) == 24
+    assert len(names) == 25
     assert names == TOOL_NAMES
     assert "warnings_list" in names

@@ -272,6 +272,34 @@ _TRIGGERS = (
     """,
 )
 
+# №24 (no24-02, 3.2.0): ОТДЕЛЬНЫЙ FTS-индекс пометок (arch §5.2). Смысловой
+# `notes_fts` индексирует title/text и пометок НЕ видит: пометки ищутся
+# отдельным поиском (MCP `memory_comment_search` / REST `GET /notes/comments`)
+# — результаты не смешиваются (§13.6).
+_COMMENT_FTS_DDL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_comment_fts USING fts5(
+  comment, content='notes', content_rowid='id', tokenize='trigram'
+)
+"""
+
+# Синхронизация индекса пометок с notes (по образцу _TRIGGERS): INSERT всегда
+# (в т.ч. comment IS NULL — «пометки нет»), UPDATE OF comment — спец-команда
+# 'delete' со СТАРЫМ значением + вставка нового. DELETE-триггера нет: заметки
+# soft-delete, физического удаления в штатном пути нет (как у notes_fts).
+_COMMENT_TRIGGERS = (
+    """
+    CREATE TRIGGER IF NOT EXISTS notes_comment_fts_ai AFTER INSERT ON notes BEGIN
+      INSERT INTO notes_comment_fts(rowid, comment) VALUES (new.id, new.comment);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS notes_comment_fts_au AFTER UPDATE OF comment ON notes BEGIN
+      INSERT INTO notes_comment_fts(notes_comment_fts, rowid, comment) VALUES ('delete', old.id, old.comment);
+      INSERT INTO notes_comment_fts(rowid, comment) VALUES (new.id, new.comment);
+    END
+    """,
+)
+
 
 # --- области 3.0.0 (субстрат: skills / terms / user) ----------------------
 
@@ -665,6 +693,10 @@ def init_db(settings: Settings) -> None:
             # Пометка заметки (№24, 3.2.0): notes.comment TEXT (nullable).
             # Колонка нужна до вставок/чтений сервиса; FTS пометок — no24-02.
             _migrate_comment_column(conn)
+            # FTS пометок (№24, no24-02): отдельная таблица notes_comment_fts
+            # + триггеры — сразу после колонки comment и ДО сверки эмбеддинга
+            # (таблицу не адресует). Rebuild не нужен: комментариев ещё нет.
+            _migrate_comment_fts(conn)
             # Неймспейсы (Фаза 10): колонки notes + реестр + дефолт-узел.
             _migrate_namespace_columns(conn)
             _migrate_classification_columns(conn)
@@ -777,6 +809,19 @@ def _migrate_comment_column(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
     if "comment" not in columns:
         conn.execute("ALTER TABLE notes ADD COLUMN comment TEXT")
+
+
+def _migrate_comment_fts(conn: sqlite3.Connection) -> None:
+    """FTS-индекс пометок (no24-02, 3.2.0): таблица + оба триггера.
+
+    Идемпотентно (IF NOT EXISTS) — повторный старт no-op. Rebuild НЕ делается:
+    на момент миграции комментариев нет (колонка только что создана
+    _migrate_comment_column), а последующие установки пометки идут через
+    `AFTER UPDATE OF comment`. Смысловой `notes_fts` не трогается.
+    """
+    conn.execute(_COMMENT_FTS_DDL)
+    for trigger in _COMMENT_TRIGGERS:
+        conn.execute(trigger)
 
 
 # Индексы list-выдач (фаза 2, пул 15; замер 50k: LIST p95 204 мс):

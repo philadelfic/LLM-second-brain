@@ -128,6 +128,7 @@ MEMORY_TOOL_NAMES = frozenset(
         "memory_delete",
         "memory_namespaces",
         "memory_namespace_create",
+        "memory_comment_search",
     }
 )
 SKILL_TOOL_NAMES = frozenset(
@@ -223,7 +224,7 @@ class TestToolRegistry:
             | HISTORY_TOOL_NAMES | WARNINGS_TOOL_NAMES
         )
         assert set(TOOL_NAMES) == names
-        assert len(names) == 24
+        assert len(names) == 25
 
     @pytest.mark.asyncio
     async def test_tool_descriptions_are_canon_verbatim(self, mcp_user) -> None:

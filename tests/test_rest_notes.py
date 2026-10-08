@@ -399,3 +399,53 @@ class TestFreshnessFilter:
         )
         assert bad_search.status_code == 422
         assert "updated_after" in bad_search.json()["detail"]
+
+
+class TestCommentSearchRest:
+    """no24-02 (3.2.0): отдельный поиск пометок на REST — `GET /notes/comments`."""
+
+    def _create(
+        self, client: TestClient, token: str, text: str, title: str
+    ) -> dict:
+        response = client.post(
+            "/notes", json={"text": text, "title": title},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 201, response.text
+        return response.json()
+
+    def test_rest_comment_search_route(self, client: TestClient, token: str) -> None:
+        """`GET /notes/comments?q=...` отдаёт пометки; объявлен до /notes/{id}."""
+        headers = {"Authorization": f"Bearer {token}"}
+        note = self._create(client, token, "Рест: заметка с пометкой", "Рест-пометка")
+        client.put(
+            f"/notes/{note['id']}", json={"comment": "уникальнаяпометка рест"},
+            headers=headers,
+        )
+
+        found = client.get(
+            "/notes/comments", params={"q": "уникальнаяпометка"}, headers=headers
+        )
+        assert found.status_code == 200, found.text
+        hits = found.json()["results"]
+        assert [h["id"] for h in hits] == [note["id"]]
+        assert hits[0]["comment"] == "уникальнаяпометка рест"
+
+        # маршрут объявлен РАНЬШЕ /notes/{note_id}: сегмент не «съеден» как id
+        empty = client.get(
+            "/notes/comments", params={"q": "неттакогослова"}, headers=headers
+        )
+        assert empty.json()["results"] == []
+        assert client.get("/notes/abc", headers=headers).status_code == 422
+
+        # невалидные q и updated_after → 422 (доменная валидация)
+        assert client.get(
+            "/notes/comments", params={"q": ""}, headers=headers
+        ).status_code == 422
+        bad = client.get(
+            "/notes/comments",
+            params={"q": "пометка", "updated_after": "за неделю"},
+            headers=headers,
+        )
+        assert bad.status_code == 422
+        assert "updated_after" in bad.json()["detail"]

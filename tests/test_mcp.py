@@ -29,6 +29,7 @@ from mcp.client.streamable_http import (
 
 from app.services.dedup import DEDUP_HINT
 from app.transport.mcp import (
+    HINT_INVALID_MODE,
     HINT_INVALID_UPDATED_AFTER,
     SERVER_INSTRUCTIONS,
     SERVER_NAME,
@@ -157,12 +158,13 @@ class TestHandshake:
 
 class TestToolsList:
     @pytest.mark.asyncio
-    async def test_twenty_four_tools(self, server_url: str) -> None:
-        """№12 (no12-02): поверхность = 8 ручек заметок/узлов + 1 предупреждения
-        + 5 навыков + 5 user + 3 terms + 2 общих ручки чтения истории."""
+    async def test_twenty_five_tools(self, server_url: str) -> None:
+        """№12 (no12-02) + no24-02: поверхность = 8 ручек заметок/узлов
+        (+ memory_comment_search = 9) + 1 предупреждения + 5 навыков + 5 user
+        + 3 terms + 2 общих ручки чтения истории."""
         async with connect(server_url) as session:
             tools = await session.list_tools()
-        assert len(tools.tools) == 24
+        assert len(tools.tools) == 25
         assert {tool.name for tool in tools.tools} == TOOL_NAMES
 
     @pytest.mark.asyncio
@@ -836,6 +838,54 @@ class TestTitleMCP:
                 "memory_get", {"ids": [note_id]}
             )).structured_content
         assert "title" not in got["notes"][0]
+
+
+class TestCommentSearchMCP:
+    """no24-02 (3.2.0): отдельная ручка memory_comment_search — только пометки.
+
+    Не режим memory_search: результаты не смешиваются со смысловым поиском;
+    выдача компактна ({id, title, namespace, comment, updated_at}); невалидный
+    updated_after и неизвестный узел — мягкий отказ с hint.
+    """
+
+    marker = f"csearch-{uuid.uuid4().hex[:8]}"
+
+    @pytest.mark.asyncio
+    async def test_memory_comment_search_tool(self, server_url: str) -> None:
+        """Ручка зарегистрирована, компактна; невалидный updated_after/узел → hint."""
+        text = f"{self.marker}: заметка для отдельного поиска пометок"
+        async with connect(server_url) as session:
+            note_id = await _saved_id(session, text, title="Пометки поиск")
+            comment = f"{self.marker} пригодится к задаче"
+            await session.call_tool(
+                "memory_update", {"id": note_id, "comment": comment}
+            )
+            found = (await session.call_tool(
+                "memory_comment_search", {"query": self.marker}
+            )).structured_content
+            bad = (await session.call_tool(
+                "memory_comment_search",
+                {"query": self.marker, "updated_after": "за неделю"},
+            )).structured_content
+            unknown = (await session.call_tool(
+                "memory_comment_search",
+                {"query": self.marker, "namespace": "nope"},
+            )).structured_content
+        hit = next(r for r in found["results"] if r["id"] == note_id)
+        assert set(hit) == {"id", "title", "namespace", "comment", "updated_at"}
+        assert hit["comment"] == comment
+        assert bad["results"] == [] and bad["hint"] == HINT_INVALID_UPDATED_AFTER
+        assert unknown["results"] == [] and "nope" in unknown["hint"]
+
+    @pytest.mark.asyncio
+    async def test_memory_search_has_no_comment_mode(self, server_url: str) -> None:
+        """Пометки — отдельная ручка, а не режим: mode='comment' → мягкий отказ."""
+        async with connect(server_url) as session:
+            found = (await session.call_tool(
+                "memory_search", {"query": "тест", "mode": "comment"}
+            )).structured_content
+        assert found["results"] == []
+        assert found["hint"] == HINT_INVALID_MODE
 
 
 class TestCommentMCP:

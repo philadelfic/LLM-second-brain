@@ -285,3 +285,21 @@ class TestSearchFreshness:
             updated_after="2026-02-01T00:00:00Z",
         )["results"]
         assert [r["id"] for r in hits] == [1]
+
+
+class TestCommentIsolation:
+    """no24-02 (3.2.0): пометка — НЕ в смысловом индексе `notes_fts`."""
+
+    def test_notes_fts_unchanged(self, service) -> None:
+        """Слово только из comment: обычный search его не находит (изоляция).
+
+        Пометки ищутся отдельным поиском (`comment_search`/`memory_comment_search`),
+        смысловой `search` смотрит только title/text — комментарий не
+        подмешивается (§13.6).
+        """
+        searcher, notes_service = service
+        saved = notes_service.save(
+            unique("Заметка без ключевого слова в тексте"), title="Изоляция"
+        )
+        notes_service.update(saved["id"], comment="уникальноепометка слово")
+        assert searcher.search("уникальноепометка")["results"] == []

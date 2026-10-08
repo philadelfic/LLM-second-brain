@@ -95,6 +95,13 @@ HINT_NO_RESULTS_TITLE = (
     "via memory_list; regular semantic search also searches by text"
 )
 
+# Пустой отдельный поиск ПОМЕТОК (no24-02, arch §13.6): пометки ищутся только
+# здесь — смысловой search их не видит; hint обучает модель различать ручки.
+HINT_NO_COMMENTS = (
+    "no notes with such a comment; comments are searched separately — "
+    "regular search looks at note text only"
+)
+
 
 class SearchValidationError(ValueError):
     """Нарушение доменных ограничений запроса (длина, top_k)."""
@@ -285,6 +292,77 @@ class SearchService:
         ]
         if not results:
             return {"results": [], "hint": HINT_NO_RESULTS_TITLE}
+        return {"results": results}
+
+    def comment_search(
+        self,
+        query: str,
+        top_k: int | None = None,
+        namespace: str | None = None,
+        namespace_exact: bool = False,
+        updated_after: str | None = None,
+    ) -> dict[str, Any]:
+        """Отдельный поиск ПОМЕТОК (no24-02, arch §13.6): только по comment.
+
+        Ищет по ОТДЕЛЬНОЙ FTS-таблице `notes_comment_fts` (trigram/BM25) —
+        результаты НЕ смешиваются со смысловым `search` (тот смотрит только
+        title/text). Валидация как у `search`: `query` 1..max_query_chars,
+        `top_k` 1..MAX_TOP_K (дефолт default_top_k). `namespace` — узел
+        иерархии (поддерево; `namespace_exact` — только сам узел);
+        незарегистрированный узел — NamespaceError (транспорт даёт hint).
+        no29-01: `updated_after` — включающая граница свежести (n.updated_at).
+        Эмбеддинг не используется — `warning` не бывает (FTS/BM25). Выдача —
+        {id, title, namespace, comment, updated_at} (≤ top_k); пусто → hint.
+        """
+        query = self._validate_query(query)
+        top_k = self._default_top_k() if top_k is None else top_k
+        if not 1 <= top_k <= MAX_TOP_K:
+            raise SearchValidationError(
+                f"top_k: expected 1..{MAX_TOP_K}, got {top_k}"
+            )
+        expression = match_expression(query)
+        ns_nodes = self._namespaces.filter_nodes(namespace, namespace_exact)
+        fresh = (
+            parse_updated_after(updated_after)
+            if updated_after is not None
+            else None
+        )
+        if expression is None:  # все слова короче 3 символов — trigram слеп
+            return {"results": [], "hint": HINT_NO_COMMENTS}
+        params: list[object] = [expression]
+        ns_clause = ""
+        if ns_nodes:
+            ns_ph = ",".join("?" * len(ns_nodes))
+            ns_clause = f" AND n.namespace IN ({ns_ph})"
+            params.extend(ns_nodes)
+        fresh_clause = ""
+        if fresh is not None:
+            fresh_clause = " AND n.updated_at >= ?"
+            params.append(fresh)
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT n.id, n.title, n.namespace, n.comment, n.updated_at, "
+                "       bm25(notes_comment_fts, 1.0) AS badness "
+                "FROM notes_comment_fts "
+                "JOIN notes n ON n.id = notes_comment_fts.rowid "
+                "WHERE notes_comment_fts MATCH ? AND n.deleted_at IS NULL "
+                "AND n.comment IS NOT NULL"
+                f"{ns_clause}{fresh_clause} "
+                "ORDER BY badness, n.updated_at DESC, n.id DESC LIMIT ?",
+                (*params, CANDIDATE_LIMIT),
+            ).fetchall()
+        results = [
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "namespace": row["namespace"],
+                "comment": row["comment"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows[:top_k]
+        ]
+        if not results:
+            return {"results": [], "hint": HINT_NO_COMMENTS}
         return {"results": results}
 
     def similar_notes(

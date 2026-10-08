@@ -112,7 +112,7 @@ class TestHistoryTools:
         names = {tool.name for tool in await mcp_history.list_tools()}
         assert {"history_list", "history_get"} <= names
         assert set(TOOL_NAMES) == names
-        assert len(names) == 24
+        assert len(names) == 25
         assert TOOL_DESCRIPTIONS["history_list"]
         assert TOOL_DESCRIPTIONS["history_get"]
 

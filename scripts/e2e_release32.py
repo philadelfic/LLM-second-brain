@@ -102,7 +102,7 @@ RELEASE = "3.2.0"
 # MCP listing ceiling is 20 (3.1.0 canon); the REST ceiling is 50.
 MCP_LIMIT = 20
 REST_LIMIT = 50
-MCP_TOOLS_TOTAL = 24  # 3.1.0 surface (21) + warnings_list + history handles
+MCP_TOOLS_TOTAL = 25  # 3.1.0 surface (21) + warnings_list + history handles + memory_comment_search
 HEALTH_LEGACY = ("status", "embedding_ok", "summarizer_ok", "judge_ok",
                  "notes_count", "pending_vector", "pending_summary")
 # №39: the queues of the contour (jobs registered on the job framework).
@@ -1821,6 +1821,26 @@ async def scenario_12_comment(c: Client, rest: httpx2.AsyncClient) -> None:
           all("comment" not in hit for hit in found.get("results", [])),
           f"hits={len(found.get('results', []))}")
 
+    # №24 (no24-02): отдельный поиск ПОМЕТОК — finds the note by its comment,
+    # while the regular semantic search never does (§13.6).
+    comment_hits = await c.call("memory_comment_search", {"query": "пригодится"})
+    check("memory_comment_search finds the note by its comment (no24-02)",
+          any(r.get("id") == note_id
+              for r in comment_hits.get("results", [])),
+          f"hits={comment_hits.get('results')}")
+    text_search = await c.call("memory_search", {"query": "пригодится"})
+    check("memory_search does NOT find the note by a comment-only word "
+          "(FR-5.7 / §13.6)",
+          all(r.get("id") != note_id
+              for r in text_search.get("results", [])),
+          f"hits={len(text_search.get('results', []))}")
+    rest_comments = await rest.get("/notes/comments", params={"q": "пригодится"})
+    check("REST GET /notes/comments returns the note by its comment (no24-02)",
+          rest_comments.status_code == 200
+          and any(r.get("id") == note_id
+                  for r in rest_comments.json().get("results", [])),
+          f"http {rest_comments.status_code}")
+
     too_long = await c.call("memory_update", {"id": note_id, "comment": "х" * 251})
     after_refusal = await c.call("memory_get", {"ids": [note_id]})
     kept = ((after_refusal.get("notes") or [{}])[0]).get("comment")
@@ -1852,6 +1872,10 @@ async def scenario_12_comment(c: Client, rest: httpx2.AsyncClient) -> None:
           cleared.status_code == 200 and after_comment is None
           and r_after.json().get("text") == text,
           f"http {cleared.status_code}, comment={after_comment!r}")
+
+    dropped = await c.call("memory_comment_search", {"query": "пригодится"})
+    check("clearing the comment removes the note from the comment search (no24-02)",
+          all(r.get("id") != note_id for r in dropped.get("results", [])))
 
     duplicate = await c.call("memory_save", {"text": text, "title": title})
     check("dedup of the note is unaffected by its comment (FR-5.4)",
