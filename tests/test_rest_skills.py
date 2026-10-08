@@ -159,12 +159,15 @@ class TestSkillsCrud:
         assert client.get(
             "/skills/1", headers=_headers(token)
         ).json()["text"] == "Run make deploy v2."
-        # Вторая механика версионирования снята: псевдоним отдаёт пусто, пока
-        # не переведён на общую историю (постановка 04).
+        # §13.7: псевдоним читает ОБЩУЮ историю и отдаёт прежнюю форму
+        # ответа — правка даёт вторую версию, обе реконструируются.
         archive = client.get(
             "/skills/1/versions", headers=_headers(token)
         ).json()
-        assert archive == {"id": 1, "versions": []}
+        assert archive["id"] == 1
+        assert [v["version"] for v in archive["versions"]] == [2, 1]
+        assert archive["versions"][0]["text"] == "Run make deploy v2."
+        assert archive["versions"][1]["text"] == "Run make deploy, then check /health."
         # Архив не участвует в выдачах: листинг/поиск тел и копий не несут.
         assert client.get("/skills", headers=_headers(token)).json()["total"] == 1
         assert len(client.get(

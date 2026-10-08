@@ -78,13 +78,43 @@ from app.services import history
 from app.services.namespaces import NamespaceError, NamespaceValidationError
 from app.services.notes import NoteValidationError
 from app.services.search import SearchValidationError
-from app.services.skills import SkillValidationError, SkillsService
+from app.services.skills import (
+    HINT_NOT_FOUND as HINT_SKILL_NOT_FOUND,
+    SkillValidationError,
+    SkillsService,
+)
 from app.services.terms import (
     TermKeyConflictError,
     TermValidationError,
     TermsService,
 )
 from app.services.user_facts import UserFactValidationError, UserFactsService
+
+# Сущности с историей (§5.3): оператору доступны ВСЕ, включая глобальный
+# шаблон навыков — флагов областей на этой поверхности нет (§13.10: REST
+# оператора остаётся доступен и у выключенной области).
+_HISTORY_ENTITIES = frozenset(
+    {
+        history.ENTITY_NOTE,
+        history.ENTITY_SKILL,
+        history.ENTITY_SKILL_TEMPLATE,
+        history.ENTITY_TERM,
+        history.ENTITY_USER_FACT,
+    }
+)
+
+
+def _check_history_entity(entity: str) -> None:
+    """Неизвестная сущность истории — 404 (исключение слоя наружу не идёт)."""
+    if entity not in _HISTORY_ENTITIES:
+        raise HTTPException(
+            status_code=404,
+            detail="unknown history entity: "
+            + entity
+            + " (known: "
+            + ", ".join(sorted(_HISTORY_ENTITIES))
+            + ")",
+        )
 
 
 class NoteCreate(BaseModel):
@@ -226,6 +256,16 @@ class TermUpdate(TermCreate):
     другой активной записью → 409 (`TermKeyConflictError`) — чужой смысл
     не затирается, старый ключ освобождается только при удалении.
     """
+
+
+class HistoryRollback(BaseModel):
+    """Тело POST /history/{entity}/{id}/rollback: номер целевой версии (§7.2).
+
+    Откат — операторская ручка (FR-5.4): модель возвращает запись к прежнему
+    состоянию НОВОЙ версией, историю не переписывая (§13.6).
+    """
+
+    version: int
 
 
 class QueueStat(BaseModel):
@@ -738,16 +778,44 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.get("/skills/{skill_id}/versions")
     async def get_skill_versions(skill_id: int, request: Request) -> dict:
-        """Архив копий версий навыка — только REST, оператору (в MCP нет).
+        """Архив версий навыка — REST-псевдоним над ОБЩЕЙ историей (№41).
 
-        Каждая правка копирует прежнее содержимое с прежним номером версии
-        (§3.4); строки архива в листинг/поиск/чтение не попадают. Навык не
-        найден/удалён → 404 с hint канона §3.8.
+        Вторая механика (`skill_versions`) снята в no41-03 (§13.7): ручка
+        читает ту же `record_versions` (`read_versions`/`read_version` по
+        сущности `skill`) и собирает ПРЕЖНЮЮ форму ответа — контракт
+        операторской ссылки не меняется. Навык не найден/удалён → 404 с
+        hint канона §3.8 (как раньше).
         """
-        result = await asyncio.to_thread(_skills_service(request).versions, skill_id)
-        if "hint" in result:
-            raise HTTPException(status_code=404, detail=result["hint"])
-        return result
+        live = await asyncio.to_thread(
+            history.entity_fields, history.ENTITY_SKILL, skill_id, settings
+        )
+        if live is None or live[1] == "deleted":
+            raise HTTPException(status_code=404, detail=HINT_SKILL_NOT_FOUND)
+
+        def _archive() -> dict:
+            """Собрать прежнюю форму архива из версий общей истории."""
+            listing = history.read_versions(history.ENTITY_SKILL, skill_id, settings)
+            versions = []
+            for meta in listing["versions"]:
+                detail = history.read_version(
+                    history.ENTITY_SKILL, skill_id, meta["version"], settings
+                )
+                fields = detail.get("fields") or {}
+                versions.append(
+                    {
+                        "version": meta["version"],
+                        "name": fields.get("name"),
+                        "description": fields.get("description"),
+                        "example": fields.get("example"),
+                        "steps": fields.get("steps"),
+                        "text": fields.get("text"),
+                        "extra": fields.get("extra"),
+                        "created_at": meta["created_at"],
+                    }
+                )
+            return {"id": skill_id, "versions": versions}
+
+        return await asyncio.to_thread(_archive)
 
     # --- область user: REST-зеркала (релиз 3.0.0, lsb-0009-03) ------------
     # Arch lsb-0009 §3.6 + субстрат §3.6: операторская поверхность фактов о
@@ -986,5 +1054,181 @@ def build_rest_router(settings: Settings) -> APIRouter:
                 status_code=404, detail=result.get("hint", "term not found")
             )
         return result
+
+    # --- история версий: поверхность оператора (№41, релиз 3.2.0) ----------
+    # §7.2: список версий, чтение версии, откат и статистика. Откат — только
+    # REST (модели не даём, §13.6); при `HISTORY_ENABLED=false` чтение отдаёт
+    # пусто с hint (§8), а не ошибку. ПОРЯДОК МАРШРУТОВ: статический
+    # `/history/stats` объявлен ДО `/history/{entity}/{entity_id}` — иначе
+    # «stats» ушёл бы в {entity}.
+
+    @rest_router.get("/history/stats")
+    async def get_history_stats(request: Request) -> dict:
+        """Размер истории: счётчики версий по сущностям + общий (FR-10.3)."""
+        return await asyncio.to_thread(history.history_stats, settings)
+
+    @rest_router.get("/history/{entity}/{entity_id}")
+    async def list_history(
+        entity: str,
+        entity_id: int,
+        request: Request,
+        limit: int | None = Query(default=None, ge=1, le=50),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        """Список версий записи без тел: метаданные + «что изменилось» (FR-5.1).
+
+        Форма ответа: `{entity, id, versions: [{version, created_at, event,
+        source, session, changed}], total, has_more, next_offset}`; страница —
+        по контракту lsb-0013. Неизвестная сущность → 404, пустая история —
+        валидный ответ (в т.ч. при выключенном слое — с hint §8).
+        """
+        _check_history_entity(entity)
+        return await asyncio.to_thread(
+            history.read_versions,
+            entity,
+            entity_id,
+            settings,
+            limit=limit,
+            offset=offset,
+        )
+
+    @rest_router.get("/history/{entity}/{entity_id}/{version}")
+    async def read_history_version(
+        entity: str, entity_id: int, version: int, request: Request
+    ) -> dict:
+        """Содержимое конкретной версии: метаданные + реконструированные поля.
+
+        Форма ответа: `{entity, id, version, created_at, event, source,
+        session, changed, fields: {…}}`; нет такой версии/записи → 404
+        (FR-5.2), исключений слой не бросает. При выключенном слое истории —
+        пусто + hint «history is off» (§8), а не ошибка.
+        """
+        _check_history_entity(entity)
+        result = await asyncio.to_thread(
+            history.read_version, entity, entity_id, version, settings
+        )
+        if "fields" not in result and result.get("hint") != history.HINT_HISTORY_OFF:
+            raise HTTPException(
+                status_code=404, detail=result.get("hint", "version not found")
+            )
+        return result
+
+    @rest_router.post("/history/{entity}/{entity_id}/rollback")
+    async def rollback_history(
+        entity: str, entity_id: int, payload: HistoryRollback, request: Request
+    ) -> dict:
+        """Откат к прежней версии через штатный путь правки (§7.3, §13.6).
+
+        Целевая версия читается `read_version` (нет → 404), её поля
+        применяются штатной правкой сущности под
+        `bind_origin("rest", …, rollback_to=N)` — поэтому FTS-триггеры заметок
+        срабатывают сами, а перевекторизация идёт тем же кодом
+        (`vector_status='pending'` + дроп вектора). Откат пишет НОВУЮ версию
+        (`event='rollback'`, `restore_from=N`) и историю не переписывает.
+        Заметке `text` передаётся целиком — гарантия перевекторизации при
+        откате `namespace`. Мягкие отказы сервисов → 404/422.
+        """
+        _check_history_entity(entity)
+        target = await asyncio.to_thread(
+            history.read_version, entity, entity_id, payload.version, settings
+        )
+        if "fields" not in target:
+            raise HTTPException(
+                status_code=404, detail=target.get("hint", "version not found")
+            )
+        live = await asyncio.to_thread(
+            history.entity_fields, entity, entity_id, settings
+        )
+        if live is None:
+            raise HTTPException(status_code=404, detail="record not found")
+        fields = target["fields"]
+        services = _services(request)
+        session_id = request.headers.get("X-LSB-Session")
+
+        def _apply() -> None:
+            """Штатная правка сущности под origin'ом отката (в рабочем потоке)."""
+            with history.bind_origin(
+                "rest", session=session_id, rollback_to=payload.version
+            ):
+                if entity == history.ENTITY_NOTE:
+                    outcome = services.notes.update(
+                        entity_id,
+                        text=fields["text"],
+                        title=fields["title"],
+                        namespace=fields["namespace"],
+                        expires_at=fields["expires_at"],
+                    )
+                    if not outcome.get("updated"):
+                        raise HTTPException(
+                            status_code=404,
+                            detail=outcome.get("hint", "note not found"),
+                        )
+                    return
+                if entity == history.ENTITY_SKILL:
+                    outcome = _skills_service(request).save(
+                        id=entity_id,
+                        name=fields["name"],
+                        description=fields["description"],
+                        steps=fields["steps"],
+                        text=fields["text"],
+                        example=fields["example"],
+                        extra=fields["extra"],
+                    )
+                    if not outcome.get("updated"):
+                        raise HTTPException(
+                            status_code=404,
+                            detail=outcome.get("hint", "skill not found"),
+                        )
+                    return
+                if entity == history.ENTITY_TERM:
+                    outcome = _terms_service(request).update(
+                        entity_id,
+                        fields["term"],
+                        fields["context"],
+                        fields["definition"],
+                    )
+                    if not outcome.get("updated"):
+                        raise HTTPException(
+                            status_code=404,
+                            detail=outcome.get("hint", "term not found"),
+                        )
+                    return
+                if entity == history.ENTITY_USER_FACT:
+                    outcome = _user_facts_service(request).update(
+                        entity_id, name=fields["name"], body=fields["body"]
+                    )
+                    if not outcome.get("changed"):
+                        raise HTTPException(
+                            status_code=404,
+                            detail=outcome.get("hint", "user fact not found"),
+                        )
+                    return
+                # skill_template — глобальный шаблон (id 0)
+                _skills_service(request).set_instruction_template(
+                    fields["instruction_template"]
+                )
+
+        try:
+            await asyncio.to_thread(_apply)
+        except (
+            NoteValidationError,
+            NamespaceError,
+            NamespaceValidationError,
+            SkillValidationError,
+            TermValidationError,
+            UserFactValidationError,
+        ) as exc:
+            raise _unprocessable(exc) from exc
+        head = await asyncio.to_thread(
+            history.read_versions, entity, entity_id, settings, limit=1
+        )
+        versions = head.get("versions") or []
+        return {
+            "entity": entity,
+            "id": entity_id,
+            "version": versions[0]["version"] if versions else payload.version,
+            "restored_from": payload.version,
+            "revectorized": True,
+        }
 
     return rest_router

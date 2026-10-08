@@ -135,6 +135,8 @@ SKILL_TOOL_NAMES = frozenset(
 USER_TOOL_NAMES = frozenset(
     {"user_search", "user_save", "user_update", "user_delete", "user_get"}
 )
+# №41 (3.2.0): пара общих инструментов чтения истории (§13.14).
+HISTORY_TOOL_NAMES = frozenset({"history_list", "history_get"})
 
 TERM = "ГЗ"
 CONTEXT_A = "студенты МГУ"
@@ -217,10 +219,10 @@ class TestToolRegistry:
         names = {tool.name for tool in await mcp_terms.list_tools()}
         assert set(CANON_TOOL_DESCRIPTIONS) <= names
         assert names - set(CANON_TOOL_DESCRIPTIONS) == (
-            MEMORY_TOOL_NAMES | SKILL_TOOL_NAMES | USER_TOOL_NAMES
+            MEMORY_TOOL_NAMES | SKILL_TOOL_NAMES | USER_TOOL_NAMES | HISTORY_TOOL_NAMES
         )
         assert set(TOOL_NAMES) == names
-        assert len(names) == 21  # листинга terms нет: только search/save/get
+        assert len(names) == 23  # листинга terms нет: только search/save/get
 
     @pytest.mark.asyncio
     async def test_tool_descriptions_are_canon_verbatim(self, mcp_terms) -> None:

@@ -33,7 +33,7 @@ from typing import Any
 
 from app.config import Settings, get_settings
 from app.services.listing import page_fields
-from app.storage.db import session
+from app.storage.db import INSTRUCTION_TEMPLATE_KEY, session
 
 # --- сущности и версионируемая проекция (§5.3) -----------------------------
 
@@ -140,6 +140,10 @@ HINT_VERSION_NOT_FOUND = (
     "version not found for this record — history_list shows the available versions"
 )
 
+# Мягкий ответ чтения при выключенном слое истории (`HISTORY_ENABLED=false`, §8):
+# версии не пишутся и не читаются — пусто + эта подсказка (EN), не исключение.
+HINT_HISTORY_OFF = "history is off"
+
 # Источник версии, если запись вызвана вне `bind_origin` (прямой вызов слоя
 # из тестов/утилит): настоящий источник неизвестен.
 DEFAULT_SOURCE = "unknown"
@@ -155,6 +159,17 @@ def _check_entity(entity: str) -> None:
         raise HistoryValidationError(
             "unknown entity: " + entity + " (known: " + ", ".join(CONTENT_FIELDS) + ")"
         )
+
+
+def _history_enabled() -> bool:
+    """Гейт слоя истории (§8, `HISTORY_ENABLED`): `false` — версии не пишутся.
+
+    Выключатель читается из текущих настроек на КАЖДОМ пути записи: правка
+    сущности при выключенном слое проходит как раньше, а строк в
+    `record_versions` не появляется. Тот же гейт в чтении отдаёт пусто с
+    `HINT_HISTORY_OFF`.
+    """
+    return bool(get_settings().history_enabled)
 
 
 # --- кодирование и применение дельты (§5.2) --------------------------------
@@ -311,8 +326,11 @@ def record_initial(
     Baseline — единственная версия со `snapshot`; все дальнейшие — дельты
     (FR-2.1/FR-2.2). Писать baseline для записи, у которой он уже есть, —
     ошибка вызывающей стороны (история не переписывается).
+    При `HISTORY_ENABLED=false` версия не пишется — возврат `0` (§8).
     """
     _check_entity(entity)
+    if not _history_enabled():
+        return 0
     resolved_source, resolved_session = _origin(source, session)
     conn.execute(
         "INSERT INTO record_versions (entity, entity_id, version, event, source, "
@@ -338,8 +356,11 @@ def record_change(
     версия помечается `event='rollback'` с `restore_from` (FR-5.4). Для навыка
     `skills.version` поднимается до головной версии — в ТОЙ ЖЕ транзакции
     (§13.7). После записи применяется политика хранения (`_prune`).
+    При `HISTORY_ENABLED=false` версия не пишется (§8).
     """
     _check_entity(entity)
+    if not _history_enabled():
+        return None
     settings = get_settings()
     inline_max = settings.history_delta_inline_max
     entity_id = int(entity_id)
@@ -395,8 +416,11 @@ def record_event(
 
     Мягкое удаление/восстановление — факт в истории, а не правка полей; для
     навыка зеркало `skills.version` поднимается так же, как у правки.
+    При `HISTORY_ENABLED=false` версия не пишется — возврат `0` (§8).
     """
     _check_entity(entity)
+    if not _history_enabled():
+        return 0
     settings = get_settings()
     entity_id = int(entity_id)
     version = _head(conn, entity, entity_id) + 1
@@ -465,6 +489,16 @@ def read_versions(
     entity_id = int(entity_id)
     page_size = settings.default_list_limit if limit is None else int(limit)
     offset = int(offset)
+    if not settings.history_enabled:
+        # §8: выключатель слоя истории — версий нет; чтение отдаёт пусто с
+        # подсказкой (EN), а не ошибку.
+        return {
+            "entity": entity,
+            "id": entity_id,
+            "versions": [],
+            "hint": HINT_HISTORY_OFF,
+            **page_fields(0, offset, 0),
+        }
     with session(settings) as conn:
         total = int(
             conn.execute(
@@ -508,6 +542,14 @@ def read_version(
     """
     _check_entity(entity)
     entity_id = int(entity_id)
+    if not settings.history_enabled:
+        # §8: выключатель слоя истории — версии не читаются (пусто + hint).
+        return {
+            "entity": entity,
+            "id": entity_id,
+            "version": int(version),
+            "hint": HINT_HISTORY_OFF,
+        }
     with session(settings) as conn:
         row = conn.execute(
             "SELECT version, created_at, event, source, session, changed FROM "
@@ -545,8 +587,15 @@ def history_stats(settings: Settings) -> dict[str, Any]:
     """Размер истории: счётчики версий по сущностям + общий (FR-10.3).
 
     Форма стабильна: все известные сущности присутствуют, даже с нулём
-    (оператору видно, какая область истории ещё пуста).
+    (оператору видно, какая область истории ещё пуста). При
+    `HISTORY_ENABLED=false` счётчики нулевые + `HINT_HISTORY_OFF` (§8).
     """
+    if not settings.history_enabled:
+        return {
+            "entities": dict.fromkeys(CONTENT_FIELDS, 0),
+            "total": 0,
+            "hint": HINT_HISTORY_OFF,
+        }
     with session(settings) as conn:
         counts = {
             str(row["entity"]): int(row["count"])
@@ -557,6 +606,66 @@ def history_stats(settings: Settings) -> dict[str, Any]:
     entities: dict[str, int] = dict.fromkeys(CONTENT_FIELDS, 0)
     entities.update(counts)
     return {"entities": entities, "total": sum(entities.values())}
+
+
+def entity_fields(
+    entity: str, entity_id: int, settings: Settings
+) -> tuple[dict[str, Any], str] | None:
+    """Проекция АКТУАЛЬНОЙ строки сущности + её состояние — точка отката (§7.3).
+
+    Возврат `(fields, state)`: `fields` — проекция живой строки по §5.3 (та же,
+    что легла бы в версию), `state` — `"active"` или `"deleted"` (строка
+    мягко удалена); `None` — строки нет. Читает живые строки всех версионных
+    сущностей — сырой SQL по чужим таблицам наружу не отдаётся (так же читает
+    состояние f10-04). Глобальный шаблон навыков — ключ `skills_meta`
+    (`skill_template`, id 0): он «есть», пока в таблице есть ключ.
+    """
+    _check_entity(entity)
+    entity_id = int(entity_id)
+    with session(settings) as conn:
+        if entity == ENTITY_NOTE:
+            row = conn.execute(
+                "SELECT text, title, namespace, expires_at, summary, deleted_at "
+                "FROM notes WHERE id = ?",
+                (entity_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            fields: dict[str, Any] = note_projection(row)
+        elif entity == ENTITY_SKILL:
+            row = conn.execute(
+                "SELECT * FROM skills WHERE id = ?", (entity_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            fields = skill_projection(row)
+        elif entity == ENTITY_TERM:
+            row = conn.execute(
+                "SELECT term, context, definition, deleted_at FROM terms "
+                "WHERE id = ?",
+                (entity_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            fields = term_projection(row)
+        elif entity == ENTITY_USER_FACT:
+            row = conn.execute(
+                "SELECT name, body, deleted_at FROM user_facts WHERE id = ?",
+                (entity_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            fields = user_fact_projection(row)
+        else:  # ENTITY_SKILL_TEMPLATE — глобальный шаблон (id 0)
+            row = conn.execute(
+                "SELECT value FROM skills_meta WHERE key = ?",
+                (INSTRUCTION_TEMPLATE_KEY,),
+            ).fetchone()
+            if row is None or row["value"] is None:
+                return None
+            return {"instruction_template": row["value"]}, "active"
+        state = "deleted" if row["deleted_at"] is not None else "active"
+    return fields, state
 
 
 # --- политика хранения: prune с re-base (§13.8) -----------------------------

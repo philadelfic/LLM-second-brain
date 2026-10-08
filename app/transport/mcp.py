@@ -1,6 +1,6 @@
-"""MCP-поверхность (ARCHITECTURE §3.1, §5): 21 инструмент (8 `memory_*`
+"""MCP-поверхность (ARCHITECTURE §3.1, §5): 23 инструмента (8 `memory_*`
 заметок/узлов + 5 `skills_*` области навыков + 5 `user_*` области «user»
-+ 3 `terms_*` области «terms») + инструкции.
++ 3 `terms_*` области «terms» + 2 `history_*` чтения истории) + инструкции.
 
 `MCPServer` — официальный высокоуровневый API mcp SDK 2.x (ex-`FastMCP`).
 Фаза 2: инструменты вызывают тот же service-слой, что и REST (ARCH §1);
@@ -120,6 +120,17 @@ lsb-0010-05 (релиз 3.1.0, задача №44): при одиночном ч
 `chars` — объём ПОЛНОГО текста связанной заметки; это НЕ верхнеуровневый
 `chars` chunk-режима (сумма отданных чанков) — два разных уровня ответа
 (FR-3.5). Подсказок про связи нет: пустой список — нормальный ответ.
+
+№41 (релиз 3.2.0, §7.1/§13.14): поверхность 21 → 23 — добавлены ровно ДВА
+ОБЩИХ инструмента чтения истории (`history_list`/`history_get` с параметром
+`entity`) вместо ручек по каждой области (бюджет F-11). История читается
+только по явному запросу и НЕ подмешивается в `memory_get`/`skills_get`/
+`terms_get`/`user_get` (FR-5.5/FR-9.2); существующие ручки не меняются
+(FR-9.1). Компактный список версий — без тел (FR-5.1), `session` в MCP не
+выводится (§13.4); `history_get` мягко отвечает `{…, hint}` на неизвестную
+сущность/версию, без исключения. Откат из MCP недоступен (решение О.,
+§13.6). При `HISTORY_ENABLED=false` оба инструмента отдают пусто + hint
+«history is off» (§8) — ошибкой это не считается.
 """
 
 import asyncio
@@ -554,6 +565,24 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     ),
     "terms_get": (
         "Read one term record by id: term, context, definition."
+    ),
+    # №41 (FR-5.3, §7.1, §13.14): два ОБЩИХ инструмента чтения истории —
+    # по явному запросу, компактно, без тел (FR-5.1); в обычные выдачи
+    # история не подмешивается (FR-5.5). Описания короткие (бюджет F-11).
+    "history_list": (
+        "Read the version history of a record on demand: pass entity (note | "
+        "skill | term | user_fact) and id. Returns compact version metadata "
+        "(version, created_at, event, source, changed) WITHOUT full bodies; "
+        "has_more/total page the list. The content of one version — "
+        "history_get. History is never mixed into memory_get/skills_get/"
+        "terms_get/user_get."
+    ),
+    "history_get": (
+        "Read ONE version of a record: entity, id and version (from "
+        "history_list). Returns that version's fields plus its metadata "
+        "(created_at, event, source, changed). An unknown entity or version "
+        "comes back as a soft {…, hint} without an exception; history is off "
+        "— empty with a hint."
     ),
 }
 
@@ -1026,10 +1055,62 @@ def _compact_term_get(result: dict[str, Any]) -> dict[str, Any]:
     return _pick(result, _TERM_GET_ITEM)
 
 
+# №41 (FR-5.3, §7.1, §13.14): история из MCP — одна общая пара инструментов
+# (`history_list`/`history_get`) с параметром `entity` вместо ручек на каждую
+# область: поверхность растёт на 2, а не на 8. Агентской поверхности доступны
+# четыре сущности (шаблон инструкции навыка агент не читает). `session` версии —
+# идентификатор вызова/агента, в выдачу не идёт (§13.4); тела версий отдаёт
+# только `history_get` (FR-5.1). Неизвестная сущность — мягкий hint, без
+# исключения (сущности выключенных областей отсекает no40-02, §13.10).
+_HISTORY_ENTITIES_MCP = (
+    history.ENTITY_NOTE,
+    history.ENTITY_SKILL,
+    history.ENTITY_TERM,
+    history.ENTITY_USER_FACT,
+)
+HINT_UNKNOWN_HISTORY_ENTITY = (
+    "unknown entity; available: "
+    + ", ".join(_HISTORY_ENTITIES_MCP)
+    + " — history_list shows the available versions"
+)
+
+# Белые списки версий: метаданные + «что изменилось» (FR-5.1). Без `session`
+# (§13.4) и без тел.
+_HISTORY_VERSION_ITEM = ("version", "created_at", "event", "source", "changed")
+_HISTORY_META_ITEM = ("created_at", "event", "source", "changed")
+
+
+def _compact_history_list(result: dict[str, Any]) -> dict[str, Any]:
+    """history_list: {entity, id, versions: [{version, created_at, event,
+    source, changed}], has_more, total, hint?} — без полных тел версий."""
+    out = {
+        "entity": result["entity"],
+        "id": result["id"],
+        "versions": [_pick(item, _HISTORY_VERSION_ITEM) for item in result["versions"]],
+        "has_more": result["has_more"],
+        "total": result["total"],
+    }
+    return _with_hint(out, result)
+
+
+def _compact_history_get(result: dict[str, Any]) -> dict[str, Any]:
+    """history_get: {entity, id, version, created_at, event, source, changed,
+    <поля проекции>, hint?}; нет версии/сущности — мягкий ответ с hint."""
+    out: dict[str, Any] = {
+        name: result[name] for name in ("entity", "id", "version") if name in result
+    }
+    if "fields" not in result:
+        # Мягкий ответ слоя (нет версии / история выключена) — как есть.
+        return _with_hint(out, result)
+    out.update({name: result[name] for name in _HISTORY_META_ITEM})
+    out.update(result["fields"])
+    return out
+
+
 def build_mcp(settings: Settings, services: Services) -> MCPServer:
     """Собрать MCP-сервер: инструкции (§5.1, база + карта неймспейсов) +
-    21 инструмент (8 `memory_*` + 5 `skills_*` + 5 `user_*` + 3 `terms_*`)
-    над сервисами.
+    23 инструмента (8 `memory_*` + 5 `skills_*` + 5 `user_*` + 3 `terms_*`
+    + 2 `history_*`) над сервисами.
 
     Сигнатуры и ограничения параметров — контракты REQUIREMENTS §5.1/§5.7;
     значения по умолчанию (DEFAULT_TOP_K, DEFAULT_LIST_LIMIT) — из env.
@@ -1557,6 +1638,83 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
             node=result["path"],
         )
         return _compact_namespace_create(result)
+
+    # --- история версий: чтение из MCP (№41, §7.1, §13.14) ------------------
+    # Два ОБЩИХ инструмента по явному запросу; сервисы не нужны — читает тот же
+    # слой истории, что пишут все пути правки. Обычные выдачи историю не несут
+    # (FR-5.5). `entity` вне допустимых (в т.ч. выключенная область, no40-02) —
+    # мягкий hint без раскрытия; при `HISTORY_ENABLED=false` — пусто + hint (§8).
+
+    @mcp.tool(name="history_list", description=TOOL_DESCRIPTIONS["history_list"])
+    async def history_list(
+        entity: Annotated[
+            str, Field(description="note | skill | term | user_fact")
+        ],
+        id: Annotated[int, Field(description="Record id")],
+        limit: Annotated[
+            int,
+            # Потолок проверяет сервисный слой истории (как у листингов).
+            Field(description="Page size", ge=1),
+        ] = settings.default_list_limit,
+        offset: Annotated[int, Field(description="Page offset", ge=0)] = 0,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        if entity not in _HISTORY_ENTITIES_MCP:
+            # Мягкий отказ (fail + hint): сущность неизвестна (или её область
+            # выключена) — что область существует, не раскрываем.
+            log_tool_call(
+                "history_list", started, failed=True,
+                reason="unknown entity", entity=entity, id=id,
+            )
+            return {
+                "entity": entity,
+                "id": id,
+                "versions": [],
+                "has_more": False,
+                "total": 0,
+                "hint": HINT_UNKNOWN_HISTORY_ENTITY,
+            }
+        result = await asyncio.to_thread(
+            history.read_versions, entity, id, settings, limit=limit, offset=offset
+        )
+        log_tool_call(
+            "history_list", started, results=len(result["versions"]),
+            entity=entity, id=id,
+        )
+        return _compact_history_list(result)
+
+    @mcp.tool(name="history_get", description=TOOL_DESCRIPTIONS["history_get"])
+    async def history_get(
+        entity: Annotated[
+            str, Field(description="note | skill | term | user_fact")
+        ],
+        id: Annotated[int, Field(description="Record id")],
+        version: Annotated[int, Field(description="Version number", ge=1)],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        if entity not in _HISTORY_ENTITIES_MCP:
+            log_tool_call(
+                "history_get", started, failed=True,
+                reason="unknown entity", entity=entity, id=id,
+            )
+            return {
+                "entity": entity,
+                "id": id,
+                "version": version,
+                "hint": HINT_UNKNOWN_HISTORY_ENTITY,
+            }
+        result = await asyncio.to_thread(
+            history.read_version, entity, id, version, settings
+        )
+        if "fields" not in result:
+            # Мягкий отказ: версии нет / история выключена — hint, без исключения.
+            log_tool_call(
+                "history_get", started, failed=True,
+                reason=result.get("hint"), entity=entity, id=id,
+            )
+        else:
+            log_tool_call("history_get", started, results=1, entity=entity, id=id)
+        return _compact_history_get(result)
 
     # --- область навыков (lsb-0007-03, arch §3.3–3.4) ------------------------
     # Тонкие обёртки над `SkillsService` (один код с REST-зеркалами §3.7):

@@ -155,6 +155,8 @@ USER_TOOL_NAMES = frozenset(
 
 # 3 ручки области terms (lsb-0008-02) — поверхность релиза 3.0.0 растёт.
 TERMS_TOOL_NAMES = frozenset({"terms_search", "terms_save", "terms_get"})
+# №41 (3.2.0): пара общих инструментов чтения истории (§13.14).
+HISTORY_TOOL_NAMES = frozenset({"history_list", "history_get"})
 
 
 def form(**overrides: object) -> dict[str, object]:
@@ -246,10 +248,10 @@ class TestToolRegistry:
         names = {tool.name for tool in await mcp_skills.list_tools()}
         assert set(CANON_TOOL_DESCRIPTIONS) <= names
         assert names - set(CANON_TOOL_DESCRIPTIONS) == (
-            MEMORY_TOOL_NAMES | USER_TOOL_NAMES | TERMS_TOOL_NAMES
+            MEMORY_TOOL_NAMES | USER_TOOL_NAMES | TERMS_TOOL_NAMES | HISTORY_TOOL_NAMES
         )
         assert set(TOOL_NAMES) == names
-        assert len(names) == 21
+        assert len(names) == 23
 
     @pytest.mark.asyncio
     async def test_tool_descriptions_are_canon_verbatim(self, mcp_skills) -> None:

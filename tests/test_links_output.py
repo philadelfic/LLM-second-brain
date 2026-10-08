@@ -431,9 +431,9 @@ class TestMCPLinks:
         overhead = payload_size(got) - payload_size(without)
         assert overhead <= LINK_OVERHEAD_BUDGET_BYTES, f"overhead связей: {overhead} B"
 
-    def test_mcp_surface_is_21_tools(self) -> None:
-        """Поверхность не расширялась: те же 21 инструмент (arch §3.8)."""
-        assert len(TOOL_NAMES) == 21
+    def test_mcp_surface_is_23_tools(self) -> None:
+        """Поверхность не расширялась сверх пары истории (№41): 23 инструмента."""
+        assert len(TOOL_NAMES) == 23
 
 
 class TestRESTLinks:
