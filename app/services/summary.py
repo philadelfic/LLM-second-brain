@@ -104,9 +104,13 @@ class SummaryError(RuntimeError):
         message: str,
         *,
         outcome: SlotOutcome = SlotOutcome.OFF_CONTRACT,
+        meta: ChatMeta | None = None,
     ) -> None:
         super().__init__(message)
         self.outcome = outcome
+        # Метаданные состоявшегося вызова (№49/№50): отказ после ответа модели
+        # несёт их воркеру — причина обрезки видна в журнале (§7.2).
+        self.meta = meta
 
 
 # Многоточие усечённого саммари: один символ — бюджет лимита тратится на текст
@@ -225,6 +229,9 @@ class SummaryService:
         )
         # None — попыток не было (health не врёт до первых данных).
         self.last_attempt_ok: bool | None = None
+        # Метаданные последнего вызова (№49/№50): диагностика в /health.slots
+        # без чтения журнала (None — вызова ещё не было).
+        self.last_meta: ChatMeta | None = None
 
     def summarize(self, text: str) -> SummaryResult:
         """Суммаризовать текст заметки; любой отказ — SummaryError."""
@@ -334,9 +341,11 @@ class SummaryService:
             # Текст клиента сохраняется: HTTP-статус, адрес слота, hint
             # про {SLOT}_API_KEY у auth-отказа (решение №4). Исход вызова
             # (№39, arch §6.4) — единый тип исхода на границе сервиса.
+            self.last_meta = exc.meta  # метаданные вызова для диагностики
             raise SummaryError(
-                str(exc), outcome=classify_llm_error(exc)
+                str(exc), outcome=classify_llm_error(exc), meta=exc.meta
             ) from exc
+        self.last_meta = result.meta
         # Поле thinking/reasoning_content идёт только в метаданные вызова:
         # читаем только content. Символьная страховка здесь осталась только
         # у merge: её результат — будущий ТЕКСТ заметки, обязан проходить

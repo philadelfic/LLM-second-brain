@@ -10,17 +10,50 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from app.services.llm_client import ChatMeta, ChatResult
 from app.services.slot_outcome import SlotOutcome
 
 SLOTS = ("embedding", "summary", "judge")
 
 
+def make_meta(**over: object) -> ChatMeta:
+    """Метаданные одного вызова чата для проверки диагностики /health.slots."""
+    base: dict[str, object] = {
+        "slot": "summary",
+        "provider": "ollama",
+        "model": "m",
+        "operation": "summary",
+        "model_type": "generation",
+        "budget": 4321,
+        "budget_source": "context",
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "reasoning_tokens": None,
+        "had_thinking": True,
+        "thinking_chars": 12,
+        "finish_reason": "length",
+        "truncated": True,
+        "duration_ms": 1,
+    }
+    base.update(over)
+    return ChatMeta(**base)  # type: ignore[arg-type]
+
+
 def test_slots_block(client: TestClient) -> None:
-    """/health.slots несёт все слоты с полным набором полей."""
+    """/health.slots несёт все слоты с полным набором полей (№39 + №49)."""
     body = client.get("/health").json()
     assert set(body["slots"]) == set(SLOTS)
     for stat in body["slots"].values():
-        assert set(stat) == {"ok", "last_outcome", "paused_until", "attention"}
+        assert set(stat) == {
+            "ok",
+            "last_outcome",
+            "paused_until",
+            "attention",
+            "last_finish_reason",
+            "last_budget",
+            "last_budget_source",
+            "last_had_thinking",
+        }
         assert stat["paused_until"] is None  # разрыва нет
         assert stat["attention"] == 0
 
@@ -35,6 +68,41 @@ def test_slots_block_paused_until_when_break_open(client: TestClient) -> None:
     assert stat["paused_until"] is not None
     # Остальные слоты не затронуты — недоступность одного слота не залипает.
     assert client.get("/health").json()["slots"]["judge"]["paused_until"] is None
+
+
+def test_last_call_diagnostics(client: TestClient, monkeypatch) -> None:
+    """/health.slots несёт диагностику последнего вызова слота (lsbdef-0008)."""
+    services = client.app.state.services  # type: ignore[attr-defined]
+    meta = make_meta()
+    monkeypatch.setattr(
+        services.summary._llm,
+        "chat_result",
+        lambda *a, **k: ChatResult(content="кратко", meta=meta),
+    )
+    monkeypatch.setattr(
+        services.judge._llm,
+        "chat_result",
+        lambda *a, **k: ChatResult(content="**DUPLICATE**", meta=meta),
+    )
+    services.summary.summarize("текст заметки для диагностики слота")
+    assert services.judge.judge("новый текст", "кандидат").verdict is True
+
+    slots = client.get("/health").json()["slots"]
+    for name in ("summary", "judge"):
+        stat = slots[name]
+        assert stat["last_finish_reason"] == "length"
+        assert stat["last_budget"] == 4321
+        assert stat["last_budget_source"] == "context"
+        assert stat["last_had_thinking"] is True
+
+
+def test_diagnostics_none_before_first_call(client: TestClient) -> None:
+    """До первого вызова слотов поля диагностики None — health не врёт."""
+    for stat in client.get("/health").json()["slots"].values():
+        assert stat["last_finish_reason"] is None
+        assert stat["last_budget"] is None
+        assert stat["last_budget_source"] is None
+        assert stat["last_had_thinking"] is None
 
 
 def test_health_no_model_calls(client: TestClient, monkeypatch) -> None:

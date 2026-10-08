@@ -683,9 +683,11 @@ async def scenario_0_context(c: Client, rest: httpx2.AsyncClient,
               f"{stat}")
     for slot in SLOTS:
         stat = slot_stat(snapshot, slot)
-        check(f"/health.slots reports {slot} (ok/last_outcome/paused_until/attention)",
+        check(f"/health.slots reports {slot} (ok/last_outcome/paused_until/attention/diagnostics)",
               stat is not None
-              and set(stat) == {"ok", "last_outcome", "paused_until", "attention"},
+              and {"ok", "last_outcome", "paused_until", "attention",
+                   "last_finish_reason", "last_budget",
+                   "last_budget_source", "last_had_thinking"} <= set(stat),
               f"{stat}")
     info(f"model slots at the start: embedding_ok={snapshot.get('embedding_ok')}, "
          f"summarizer_ok={snapshot.get('summarizer_ok')}, "
@@ -720,8 +722,10 @@ async def scenario_1_observability_baseline(rest: httpx2.AsyncClient) -> None:
               and isinstance(q.get("pending"), int) for q in queues.values()),
           f"{len(queues)} queues")
     slots = snapshot.get("slots") or {}
-    check("every slot carries the observability fields",
-          all(set(s) == {"ok", "last_outcome", "paused_until", "attention"}
+    check("every slot carries the observability and diagnostics fields",
+          all({"ok", "last_outcome", "paused_until", "attention",
+               "last_finish_reason", "last_budget",
+               "last_budget_source", "last_had_thinking"} <= set(s)
               for s in slots.values()),
           f"{list(slots)}")
 

@@ -131,6 +131,8 @@ class LLMError(RuntimeError):
     `timeout`/`empty`/`truncated` — признаки причины (№39, §6.3): исход
     вызова различается на границе клиента (`slot_outcome.classify_llm_error`),
     а не по тексту сообщения. `truncated` заполняет блок №49 (finish_reason).
+    `meta` — метаданные состоявшегося вызова (№49): отказ после ответа модели
+    несёт их сервису/воркеру для диагностики в журнале.
     """
 
     def __init__(
@@ -143,6 +145,7 @@ class LLMError(RuntimeError):
         timeout: bool = False,
         empty: bool = False,
         truncated: bool = False,
+        meta: ChatMeta | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
@@ -151,6 +154,7 @@ class LLMError(RuntimeError):
         self.timeout = timeout
         self.empty = empty
         self.truncated = truncated
+        self.meta = meta
 
 
 class LLMAuthError(LLMError):
@@ -374,7 +378,9 @@ class LLMClient:
         started = time.monotonic()
         data = self._request_json("POST", path, payload)
         duration_ms = int((time.monotonic() - started) * 1000)
-        content = self._parse_chat_content(data, path)
+        # №49/№50 (§13.8): причина завершения и счётчики читаются ДО разбора
+        # content — при пустом обрезанном ответе метаданные вызова уже есть и
+        # уходят с отказом (диагностика воркера без второй записи).
         finish_reason, truncated = self._read_finish_reason(data, self.spec.provider)
         (
             prompt_count,
@@ -400,6 +406,11 @@ class LLMClient:
             truncated=truncated,
             duration_ms=duration_ms,
         )
+        try:
+            content = self._parse_chat_content(data, path, truncated=truncated)
+        except LLMError as exc:
+            exc.meta = meta  # отказ после ответа модели — метаданные вызова
+            raise
         return ChatResult(content=content, meta=meta)
 
     def chat(
@@ -722,13 +733,16 @@ class LLMClient:
         had_thinking = bool(thinking)
         return prompt, completion, reasoning, had_thinking, len(thinking or "")
 
-    def _parse_chat_content(self, data: Any, path: str) -> str:
+    def _parse_chat_content(self, data: Any, path: str, *, truncated: bool) -> str:
         """Извлечь content ответа чата; малформация/пустота — отказ (§5.5).
 
         ollama — `message.content` (поле `thinking` отбрасывается в
         принципе); openai — `choices[0].message.content` (поля
         `reasoning_content`/`reasoning` игнорируются: ответ из одних
         рассуждений без content — не ответ).
+        Правило первенства (№50 §13.8): если `truncated` (причина завершения
+        `length`), пустой content — это ОБРЕЗКА бюджета, признак `truncated`
+        (признак `empty` не ставится); иначе — прежний `empty`.
         """
         content = None
         if isinstance(data, dict):
@@ -746,6 +760,15 @@ class LLMClient:
                 message = data.get("message")
                 content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str) or not content.strip():
+            if truncated:
+                # reasoning-модель могла съесть бюджет вывода целиком —
+                # вызов обрезан, а не «пуст» (№50 §13.8, дефект lsbdef-0008).
+                raise LLMError(
+                    f"пустой content при причине завершения 'length' "
+                    f"(обрезано по лимиту вывода; провайдер {self.spec.provider}, "
+                    f"слот {self.spec.name}, {path})",
+                    truncated=True,
+                )
             # №39 §6.3: пустой ответ помечается отдельным признаком `empty` —
             # исход EMPTY не смешивается с недоступностью (FR-3.3). Текст прежний.
             raise LLMError(

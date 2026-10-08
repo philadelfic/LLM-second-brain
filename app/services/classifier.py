@@ -133,6 +133,10 @@ class ClassificationService:
         )
         # None — попыток не было (health не врёт до первых данных).
         self.last_attempt_ok: bool | None = None
+        # Метаданные последнего вызова (№49/№50): диагностика в /health.slots
+        # без чтения журнала (None — вызова ещё не было). У `Classification`
+        # метаданные уже есть (№49) — сервис дополнительно кладёт их сюда.
+        self.last_meta: ChatMeta | None = None
 
     def classify(
         self, text: str, known_nodes: list[dict[str, Any]]
@@ -155,18 +159,21 @@ class ClassificationService:
             # Текст клиента сохраняется (HTTP-статус/hint ключа, решение №4).
             # Исход вызова (№39, arch §6.4) — единый тип на границе сервиса.
             self.last_attempt_ok = False  # деградация станет видна в /health
+            self.last_meta = exc.meta  # метаданные вызова для диагностики
             raise ClassificationError(
-                str(exc), outcome=classify_llm_error(exc)
+                str(exc), outcome=classify_llm_error(exc), meta=exc.meta
             ) from exc
         try:
             result = self._parse(chat.content)
         except ClassificationError as exc:
             self.last_attempt_ok = False  # некорректная разметка — тоже отказ
+            self.last_meta = chat.meta
             # Вызов состоялся — метаданные уходят воркеру вместе с отказом.
             raise ClassificationError(
                 str(exc), outcome=exc.outcome, meta=chat.meta
             ) from exc
         self.last_attempt_ok = True
+        self.last_meta = chat.meta
         return Classification(
             hint_path=result.hint_path,
             confidence=result.confidence,

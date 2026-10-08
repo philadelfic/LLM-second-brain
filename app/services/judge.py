@@ -152,6 +152,9 @@ class JudgeService:
         )
         # None — попыток не было (health не врёт до первых данных).
         self.last_attempt_ok: bool | None = None
+        # Метаданные последнего вызова (№49/№50): диагностика в /health.slots
+        # без чтения журнала (None — вызова ещё не было).
+        self.last_meta: ChatMeta | None = None
 
     def judge(self, text_new: str, text_candidate: str) -> bool:
         """Спросить судью про пару текстов; True — «ДУБЛЬ», False — «НЕ ДУБЛЬ».
@@ -177,14 +180,19 @@ class JudgeService:
             # про {SLOT}_API_KEY у auth-отказа (решение №4). Исход вызова
             # (№39, arch §6.4) — единый тип исхода на границе сервиса.
             self.last_attempt_ok = False  # деградация станет видна в /health
-            raise JudgeError(str(exc), outcome=classify_llm_error(exc)) from exc
+            self.last_meta = exc.meta  # метаданные вызова для диагностики
+            raise JudgeError(
+                str(exc), outcome=classify_llm_error(exc), meta=exc.meta
+            ) from exc
         try:
             verdict = self._verdict(result.content)
         except JudgeError as exc:
             self.last_attempt_ok = False  # нераспознанный вердикт — тоже отказ
+            self.last_meta = result.meta
             # Вызов состоялся — метаданные уходят воркеру вместе с отказом.
             raise JudgeError(str(exc), outcome=exc.outcome, meta=result.meta) from exc
         self.last_attempt_ok = True
+        self.last_meta = result.meta
         return JudgeResult(verdict=verdict, meta=result.meta)
 
     def close(self) -> None:

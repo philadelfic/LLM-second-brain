@@ -292,14 +292,21 @@ class SlotStat(BaseModel):
     `summarizer_ok`/`judge_ok`; None — попыток не было); `last_outcome` —
     исход последнего отказа (словарь `SlotOutcome`); `paused_until` —
     ISO-8601 UTC, пока разрыв открыт (null — слот работает); `attention` —
-    число заданий слота, ждущих человека (no39-02). Собирается воркером,
-    только SQL/память — моделей не зовём.
+    число заданий слота, ждущих человека (no39-02). №50 (lsbdef-0008):
+    `last_finish_reason`/`last_budget`/`last_budget_source`/`last_had_thinking`
+    — диагностика последнего вызова (None — вызова не было) — оператор видит
+    причину (обрезано по бюджету / размышление съело вывод) без журнала.
+    Собирается воркером, только SQL/память — моделей не зовём.
     """
 
     ok: bool | None
     last_outcome: str | None
     paused_until: str | None
     attention: int
+    last_finish_reason: str | None = None
+    last_budget: int | None = None
+    last_budget_source: str | None = None
+    last_had_thinking: bool | None = None
 
 
 class HealthResponse(BaseModel):

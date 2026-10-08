@@ -663,6 +663,11 @@ class BackgroundWorker:
         (`SlotBreaker.snapshot`: `last_outcome`, `paused_until` и др.), исход
         последней попытки (`ok` — прецедент `embedding_ok`/`summarizer_ok`/
         `judge_ok`) и число заданий слота в внимании (`attention`, no39-02).
+        №50 (lsbdef-0008, §7.3): плюс диагностика последнего вызова из
+        `services.*.last_meta` — `last_finish_reason`/`last_budget`/
+        `last_budget_source`/`last_had_thinking` (нет метаданных — None):
+        оператор читает причину (обрезано по бюджету / размышление съело
+        вывод) без журнала.
         Модели НЕ вызываются: только состояние в памяти и SQL по `worker_jobs`
         (сбор `/health` не должен будить слоты).
         """
@@ -685,8 +690,14 @@ class BackgroundWorker:
         health: dict[str, dict] = {}
         for name in SLOT_NAMES:
             snapshot = dict(self._breakers[name].snapshot())
-            snapshot["ok"] = getattr(services.get(name), "last_attempt_ok", None)
+            service = services.get(name)
+            snapshot["ok"] = getattr(service, "last_attempt_ok", None)
             snapshot["attention"] = attention.get(name, 0)
+            meta = getattr(service, "last_meta", None)
+            snapshot["last_finish_reason"] = meta.finish_reason if meta else None
+            snapshot["last_budget"] = meta.budget if meta else None
+            snapshot["last_budget_source"] = meta.budget_source if meta else None
+            snapshot["last_had_thinking"] = meta.had_thinking if meta else None
             health[name] = snapshot
         return health
 

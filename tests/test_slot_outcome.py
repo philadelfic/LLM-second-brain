@@ -46,6 +46,13 @@ def test_truncated_when_flag() -> None:
     assert classify_llm_error(exc) is SlotOutcome.TRUNCATED
 
 
+def test_truncated_reachable() -> None:
+    """Регресс lsbdef-0008: признак truncated достижим и даёт SlotOutcome.TRUNCATED."""
+    assert classify_llm_error(LLMError("обрезано", truncated=True)) is (
+        SlotOutcome.TRUNCATED
+    )
+
+
 def test_transient_maps_to_unavailable() -> None:
     """Сеть/5xx/429 (transient) — UNAVAILABLE."""
     assert classify_llm_error(LLMError("HTTP 503", transient=True)) is (
