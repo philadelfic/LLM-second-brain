@@ -51,6 +51,7 @@ import httpx
 
 from app.config import Settings
 from app.services.llm_client import LLMClient, LLMError, SlotSpec
+from app.services.slot_outcome import SlotOutcome, classify_llm_error
 
 # Одна повторная попытка в синхронном пути (ARCH §3.2): только транзиентные
 # сбои — сигнал `LLMError.transient` (429/5xx/транспорт/таймаут); 401/403
@@ -59,7 +60,21 @@ MAX_ATTEMPTS = 2
 
 
 class EmbeddingError(RuntimeError):
-    """Векторизация не выполнена: сервер недоступен или ответ некорректен."""
+    """Векторизация не выполнена: сервер недоступен или ответ некорректен.
+
+    `outcome` — единый тип исхода вызова слота (№39, arch §6.4): отказ
+    клиента — `classify_llm_error`, нарушение контракта ответа (число/
+    размерность векторов) — явно `OFF_CONTRACT` (дефолт). Воркер пишет исход.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        outcome: SlotOutcome = SlotOutcome.OFF_CONTRACT,
+    ) -> None:
+        super().__init__(message)
+        self.outcome = outcome
 
 
 class Embedder(Protocol):
@@ -77,6 +92,11 @@ class Embedder(Protocol):
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Закодировать batch текстов; порядок результата = порядку входа."""
+        ...
+
+    def probe(self) -> str:
+        """Дешёвый пробный стук слота (№39, arch §6.4): `check()` без генерации;
+        исход — CheckResult из llm_client."""
         ...
 
 
@@ -139,7 +159,10 @@ class EmbeddingService:
                 vectors = self._llm.embed(texts)
             except LLMError as exc:
                 if final or not exc.transient:
-                    raise EmbeddingError(str(exc)) from exc
+                    # Исход вызова (№39, arch §6.4): единый тип на границе сервиса.
+                    raise EmbeddingError(
+                        str(exc), outcome=classify_llm_error(exc)
+                    ) from exc
                 continue  # единственный ретрай (ARCH §3.2)
             return self._check_contract(vectors, expected)
         raise EmbeddingError("неожиданный выход из цикла попыток")  # unreachable
@@ -147,6 +170,11 @@ class EmbeddingService:
     def close(self) -> None:
         """Закрыть HTTP-пул (чистое завершение процесса)."""
         self._llm.close()
+
+    def probe(self) -> str:
+        """Дешёвый пробный стук слота embedding (№39, arch §6.4): `check()`
+        без генерации. Исход отдаётся как есть (CheckResult)."""
+        return self._llm.check()
 
     # --- внутреннее ---------------------------------------------------------
 

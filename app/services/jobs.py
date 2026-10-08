@@ -92,7 +92,10 @@ class JobSpec:
     интервал остаётся страховкой, с ним — перепроверка очереди после
     `clear()`); `idle_hook` — гигиена в idle-ветке (например
     retention `worker_jobs`); `queue_stat` — снимок своей очереди
-    `{"pending": int, "oldest_pending_sec": int | null}` для `/health.queues`.
+    `{"pending": int, "oldest_pending_sec": int | null}` для `/health.queues`;
+    `slot` — LLM-слот джобы (№39, arch §6.2): `embedding`/`summary`/`judge`
+    или None (разрыва нет; `nodes` объявляет `summary` — его классификатор
+    ходит в слот summary).
     """
 
     name: str
@@ -105,6 +108,9 @@ class JobSpec:
     wait_event: asyncio.Event | None
     idle_hook: Callable[[], None] | None
     queue_stat: Callable[[], dict] | None
+    # №39 (3.2.0): слот джобы — значение по умолчанию сохраняет сборщики
+    # без слота (links/areas/expiration) валидными, обратная совместимость.
+    slot: str | None = None
 
 
 class BackoffState:

@@ -53,6 +53,7 @@ from app.config import Settings
 from app.services.llm_client import LLMClient, LLMError, SlotSpec
 from app.services.namespaces import NamespaceService, NamespaceValidationError
 from app.services.prompts import PromptRegistry
+from app.services.slot_outcome import SlotOutcome, classify_llm_error
 
 # Параметры вызова, не настраиваемые env (ARCH §4.7): маленький бюджет
 # JSON-разметки; think:false — явный запрет рассуждений (быстрее).
@@ -60,7 +61,21 @@ CLASSIFIER_NUM_PREDICT = 768
 
 
 class ClassificationError(RuntimeError):
-    """Классификация не выполнена: сервер недоступен или ответ некорректен."""
+    """Классификация не выполнена: сервер недоступен или ответ некорректен.
+
+    `outcome` — единый тип исхода вызова слота (№39, arch §6.4): отказ
+    клиента — `classify_llm_error`, «не найден маркер/структура/JSON» —
+    явно `OFF_CONTRACT` (дефолт). Воркер пишет исход в журнал.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        outcome: SlotOutcome = SlotOutcome.OFF_CONTRACT,
+    ) -> None:
+        super().__init__(message)
+        self.outcome = outcome
 
 
 @dataclass(frozen=True)
@@ -127,8 +142,11 @@ class ClassificationService:
             )
         except LLMError as exc:
             # Текст клиента сохраняется (HTTP-статус/hint ключа, решение №4).
+            # Исход вызова (№39, arch §6.4) — единый тип на границе сервиса.
             self.last_attempt_ok = False  # деградация станет видна в /health
-            raise ClassificationError(str(exc)) from exc
+            raise ClassificationError(
+                str(exc), outcome=classify_llm_error(exc)
+            ) from exc
         try:
             result = self._parse(content)
         except ClassificationError:

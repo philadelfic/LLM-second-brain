@@ -587,6 +587,9 @@ async def test_backoff_independent_per_queue(slow) -> None:
     assert worker.interval > 1.0  # векторная очередь в back-off
     # «чиним» суммаризатор на лету: summary-петля разгребает свою очередь
     worker._summarizer = FixedSummarizer("Позднее, но успешное суммари.")
+    # №39: отказы суммаризации открыли паузу слота summary (потолок back-off) —
+    # «починив» слот, снимаем разрыв так же, как это делает успешный стук.
+    worker._breakers["summary"].note_success()
     status = None
     deadline = time.monotonic() + 6.0
     while time.monotonic() < deadline:

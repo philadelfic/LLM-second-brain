@@ -125,6 +125,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 from app.config import TITLE_MAX_WORDS, Settings
 from app.services import history
@@ -147,9 +148,12 @@ from app.services.jobs import (
     run_loop,
 )
 from app.services.judge import Judge, JudgeError
+from app.services.llm_client import CHECK_AUTH_FAILED, CHECK_OK
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
 from app.services.promotion import PromotionService
+from app.services.slot_breaker import SlotBreaker
+from app.services.slot_outcome import SlotOutcome, outcome_of
 from app.services.summary import Summarizer, SummaryError, cap_summary
 from app.storage import area_vectors, chunks, vectors
 from app.storage.db import delete_note_physical, session, transaction
@@ -175,6 +179,14 @@ AREAS_JOB = "areas"
 EXPIRATION_JOB = "expiration"
 # Джоба «порядок в узлах» (lsb-0011-01): обход накопленного `default`.
 NODES_JOB = "nodes"
+
+# LLM-слоты джоб (№39, arch §6.2): разрыв живёт на СЛОТ, а не на джобу —
+# слот summary делят суммаризация/слияние/классификация/описания и обход
+# `nodes`; слот judge — dedup-судья и судья структуры.
+SLOT_EMBEDDING = "embedding"
+SLOT_SUMMARY = "summary"
+SLOT_JUDGE = "judge"
+SLOT_NAMES = (SLOT_EMBEDDING, SLOT_SUMMARY, SLOT_JUDGE)
 
 # Имя работы слота `nodes` после сшивания (lsb-0012, arch §3.5): объединённая
 # заметка может лежать в ЛЮБОМ узле — обход `default` её не найдёт, поэтому
@@ -372,6 +384,23 @@ class BackgroundWorker:
                 EXPIRATION_CLEANUP_INTERVAL_SEC, fixed=True
             ),
         }
+        # Разрывы слотов (№39, arch §6.2): состояние СЛОТА, а не джобы —
+        # слот делят разные петли (summary: суммаризация/слияние/
+        # классификация/описания и обход `nodes`; judge: dedup и структура),
+        # поэтому разрыв живёт в одной точке на слот. `_slot_gate` проверяет
+        # разрыв в начале прогона, `_log_slot_failure` фиксирует исход отказа.
+        # Пауза — SLOT_PAUSE_SEC (потолок back-off), порог открытия —
+        # SLOT_PAUSE_AFTER (auth открывает сразу). Состояние — в памяти
+        # процесса: переживания рестарта не требует (конфигурация слота
+        # переоценивается стартовой проверкой, arch §13.2).
+        self._breakers: dict[str, SlotBreaker] = {
+            name: SlotBreaker(
+                name,
+                settings.slot_pause_sec,
+                open_after=settings.slot_pause_after,
+            )
+            for name in SLOT_NAMES
+        }
         self._stopping = False
         # Сигнал «появилась заметка с pending-вектором» — будит embedding-петлю
         # сразу после записи (save/update/merge/title-доген), минуя выросший
@@ -555,6 +584,170 @@ class BackgroundWorker:
             )
         )
 
+    # --- разрывы слотов (№39, arch §6.2/§6.7) ----------------------------------
+
+    def slot_states(self) -> dict[str, dict]:
+        """Снимок разрывов слотов (для журнала и хинта человеку; №39).
+
+        Только чтение памяти процесса — без обращений к моделям. Потребитель —
+        MCP-миддлварь хинта «предупреди своего человека». Полная поверхность
+        `/health.slots` и наблюдаемость очередей — постановка no39-03.
+        """
+        return {name: breaker.snapshot() for name, breaker in self._breakers.items()}
+
+    def _probe_slot(self, slot: str) -> str:
+        """Один дешёвый пробный вызов слота (без генерации, №39 §6.2).
+
+        По имени слота — `probe()` соответствующего сервиса (тонкая обёртка
+        над `LLMClient.check()`). Отсутствующий сервис или фейк без `probe`
+        (тестовый режим) — заглушка `CHECK_OK` (прецедент стартовой проверки).
+        """
+        service = {
+            SLOT_EMBEDDING: self._embedding,
+            SLOT_SUMMARY: self._summarizer,
+            SLOT_JUDGE: self._judge,
+        }.get(slot)
+        probe = getattr(service, "probe", None)
+        if probe is None:
+            return CHECK_OK
+        return probe()
+
+    def _slot_gate(self, slot: str | None, job: str | None = None) -> bool:
+        """Ворота слота: можно ли брать партию (№39, arch §6.2/§6.7).
+
+        `None`/неизвестный слот — True (разрыва нет). Разрыв закрыт — True.
+        Разрыв открыт и стук не наступил — False (партия не берётся, вызовы
+        модели не жгутся; прогон возвращает 0 → back-off петли). Стук наступил
+        — один `probe()`: `CHECK_OK` снимает разрыв (партия идёт в этом же
+        прогоне), `auth_failed`/иное — пауза переставляется, партии нет.
+        """
+        if slot is None:
+            return True
+        breaker = self._breakers.get(slot)
+        if breaker is None:
+            return True
+        effective_job = job or slot
+        now = time.time()
+        if breaker.probe_due(now):
+            result = self._probe_slot(slot)
+            self._log_slot_event("slot_probe", slot, effective_job, result=result)
+            if result == CHECK_OK:
+                breaker.note_success()
+                self._log_slot_event(
+                    "slot_resumed",
+                    slot,
+                    effective_job,
+                    after_sec=self._settings.slot_pause_sec,
+                )
+                return True
+            outcome = (
+                SlotOutcome.AUTH
+                if result == CHECK_AUTH_FAILED
+                else SlotOutcome.UNAVAILABLE
+            )
+            self._note_slot_outcome(effective_job, slot, outcome)
+            return False
+        if breaker.is_paused(now):
+            return False
+        return True
+
+    def _note_slot_outcome(self, job: str, slot: str, outcome: SlotOutcome) -> bool:
+        """Зафиксировать исход у разрыва слота; True — разрыв открылся сейчас."""
+        breaker = self._breakers.get(slot)
+        if breaker is None:
+            return False
+        opened = breaker.note_failure(outcome)
+        if opened:
+            self._log_slot_event(
+                "slot_paused",
+                slot,
+                job,
+                level=logging.WARNING,
+                outcome=outcome.value
+                if isinstance(outcome, SlotOutcome)
+                else str(outcome),
+                paused_until=breaker.snapshot()["paused_until"],
+            )
+        return opened
+
+    def _log_slot_failure(
+        self,
+        job: str,
+        slot: str,
+        outcome: SlotOutcome,
+        *,
+        event: str,
+        message: str = "slot call failed",
+        note_id: int | None = None,
+        older_id: int | None = None,
+        candidate_id: int | None = None,
+        detail: str | None = None,
+        **extra: object,
+    ) -> None:
+        """Единая точка отказа слота (№39, arch §6.7): событие + исход в журнал.
+
+        Поля события: `event`, `job`, `slot`, `outcome` (значение строки),
+        `detail` (фрагмент ≤160 симв.; секреты маскируются 4 симв. + `***`),
+        `note_id`/`older_id`/`candidate_id` по факту. Отказ фиксируется и у
+        разрыва слота: открылся — пишется `slot_paused`. Вызывающий сохраняет
+        прежнее поведение (работа остаётся pending, `continue`).
+        """
+        fields: dict[str, object] = {
+            "event": event,
+            "job": job,
+            "slot": slot,
+            "outcome": outcome.value
+            if isinstance(outcome, SlotOutcome)
+            else str(outcome),
+        }
+        for key, value in (
+            ("note_id", note_id),
+            ("older_id", older_id),
+            ("candidate_id", candidate_id),
+            ("detail", self._mask_detail(detail)),
+        ):
+            if value is not None:
+                fields[key] = value
+        fields.update(extra)
+        logging.getLogger("app").warning(message, extra=fields)
+        self._note_slot_outcome(job, slot, outcome)
+
+    def _log_slot_event(
+        self,
+        event: str,
+        slot: str,
+        job: str,
+        *,
+        level: int = logging.INFO,
+        **fields: object,
+    ) -> None:
+        """Событие разрыва/стука (№39 §7.4): `event`/`slot`/`job` + поля по факту."""
+        payload: dict[str, object] = {"event": event, "slot": slot, "job": job}
+        for key, value in fields.items():
+            if value is not None:
+                payload[key] = value
+        logging.getLogger("app").log(level, event, extra=payload)
+
+    def _mask_detail(self, detail: str | None) -> str | None:
+        """Фрагмент причины ≤160 симв. с маскировкой секретов (4 симв. + ***).
+
+        Секреты (API-ключи слотов, MCP-токен) могут попасть в текст отказа
+        (URL/эхо) — в журнал они не уходят ни в каком виде.
+        """
+        if detail is None:
+            return None
+        fragment = " ".join(str(detail).split())[:160]
+        secrets = (
+            self._settings.embedding_api_key,
+            self._settings.summary_api_key,
+            self._settings.judge_api_key,
+            self._settings.mcp_auth_token,
+        )
+        for secret in secrets:
+            if secret and secret.strip() and secret.strip() in fragment:
+                fragment = fragment.replace(secret.strip(), secret.strip()[:4] + "***")
+        return fragment
+
     # --- работа джоб (цикл, back-off и супервизор — в каркасе) -----------------
 
     async def _process_embedding(self) -> int:
@@ -566,6 +759,8 @@ class BackgroundWorker:
         Semaphore внутри). Возвращает число фактически обработанных заданий:
         0 уводит каркасную петлю в ожидание с back-off (arch §3.2).
         """
+        if not self._slot_gate(SLOT_EMBEDDING, EMBEDDING_JOB):
+            return 0  # разрыв слота: партия не берётся (№39, arch §6.2)
         with history.bind_origin(f"job:{EMBEDDING_JOB}"):
             processed = await asyncio.to_thread(self.process_pending)
             processed += await self.process_pending_chunks()
@@ -579,6 +774,8 @@ class BackgroundWorker:
         заданий: 0 уводит каркасную петлю к ожиданию сигнала
         `notify_summary_pending` (форма «по требованию», пул 6) или таймаута.
         """
+        if not self._slot_gate(SLOT_SUMMARY, SUMMARY_JOB):
+            return 0  # разрыв слота summary: партия не берётся (№39, §6.2)
         with history.bind_origin(f"job:{SUMMARY_JOB}"):
             processed = await asyncio.to_thread(self.process_title_pending)
             processed += await asyncio.to_thread(self.process_summary_pending)
@@ -603,6 +800,8 @@ class BackgroundWorker:
         0 уводит каркасную петлю к ожиданию сигнала `notify_judge_pending`
         (форма «по требованию», пул 6) или таймаута интервала.
         """
+        if not self._slot_gate(SLOT_JUDGE, JUDGE_JOB):
+            return 0  # разрыв слота judge: партия не берётся (№39, §6.2)
         with history.bind_origin(f"job:{JUDGE_JOB}"):
             return await asyncio.to_thread(self.process_judge_pending)
 
@@ -1064,15 +1263,17 @@ class BackgroundWorker:
             embeddings = self._embedding.embed_texts(
                 [spec.embed_text(row) for row in rows]
             )
-        except EmbeddingError:
-            logging.getLogger("app").warning(
-                "area vectorization failed — records stay pending",
-                extra={
-                    "event": "area_embed_failed",
-                    "job": AREAS_JOB,
-                    "area": spec.name,
-                    "count": len(rows),
-                },
+        except EmbeddingError as exc:
+            # №39: отказ слота embedding несёт тип исхода (записи — pending).
+            self._log_slot_failure(
+                AREAS_JOB,
+                SLOT_EMBEDDING,
+                outcome_of(exc),
+                event="area_embed_failed",
+                message="area vectorization failed — records stay pending",
+                detail=str(exc),
+                area=spec.name,
+                count=len(rows),
             )
             return 0
         processed = 0
@@ -1185,17 +1386,19 @@ class BackgroundWorker:
                 ]
                 try:
                     best = self._pick_duplicate(note_id, alive, by_id)
-                except JudgeError:
-                    logging.getLogger("app").warning(
-                        "dedup: judge undecidable — both notes kept, retry queued",
-                        extra={
-                            "event": "dedup_judge_failed",
-                            "job": JUDGE_JOB,
-                            "note_id": note_id,
-                            "candidates": [
-                                candidate_id for candidate_id, _ in alive
-                            ],
-                        },
+                except JudgeError as exc:
+                    # №39 (§6.7): отказ слота несёт тип исхода и фрагмент причины.
+                    self._log_slot_failure(
+                        JUDGE_JOB,
+                        SLOT_JUDGE,
+                        outcome_of(exc),
+                        event="dedup_judge_failed",
+                        message="dedup: judge undecidable — both notes kept, retry queued",
+                        note_id=note_id,
+                        detail=str(exc),
+                        candidates=[
+                            candidate_id for candidate_id, _ in alive
+                        ],
                     )
                     continue  # работа остаётся pending — повтор по back-off
                 if best is not None:
@@ -1281,15 +1484,16 @@ class BackgroundWorker:
                     self._mark_job_done(job["id"])
                     done += 1
                     continue
-            except SummaryError:
-                logging.getLogger("app").warning(
-                    "dedup: summarizer merge failed — both notes kept, retry queued",
-                    extra={
-                        "event": "dedup_merge_failed",
-                        "job": SUMMARY_JOB,
-                        "older_id": older_id,
-                        "note_id": note_id,
-                    },
+            except SummaryError as exc:
+                self._log_slot_failure(
+                    SUMMARY_JOB,
+                    SLOT_SUMMARY,
+                    outcome_of(exc),
+                    event="dedup_merge_failed",
+                    message="dedup: summarizer merge failed — both notes kept, retry queued",
+                    older_id=older_id,
+                    note_id=note_id,
+                    detail=str(exc),
                 )
                 continue  # работа остаётся pending — повтор по back-off
             logging.getLogger("app").info(
@@ -1445,14 +1649,15 @@ class BackgroundWorker:
         for row in rows:
             try:
                 generated = self._summarizer.title(row["text"])
-            except SummaryError:
-                logging.getLogger("app").warning(
-                    "title: generation failed — kept null, retry by back-off",
-                    extra={
-                        "event": "title_failed",
-                        "job": SUMMARY_JOB,
-                        "note_id": row["id"],
-                    },
+            except SummaryError as exc:
+                self._log_slot_failure(
+                    SUMMARY_JOB,
+                    SLOT_SUMMARY,
+                    outcome_of(exc),
+                    event="title_failed",
+                    message="title: generation failed — kept null, retry by back-off",
+                    note_id=row["id"],
+                    detail=str(exc),
                 )
                 continue  # отказ: title остаётся NULL, повтор по back-off
             title = self._truncate_title(generated)
@@ -1546,14 +1751,15 @@ class BackgroundWorker:
         for row in rows:
             try:
                 summary = self._summarizer.summarize(row["text"])
-            except SummaryError:
-                logging.getLogger("app").warning(
-                    "summary: generation failed — kept pending, retry by back-off",
-                    extra={
-                        "event": "summary_failed",
-                        "job": SUMMARY_JOB,
-                        "note_id": row["id"],
-                    },
+            except SummaryError as exc:
+                self._log_slot_failure(
+                    SUMMARY_JOB,
+                    SLOT_SUMMARY,
+                    outcome_of(exc),
+                    event="summary_failed",
+                    message="summary: generation failed — kept pending, retry by back-off",
+                    note_id=row["id"],
+                    detail=str(exc),
                 )
                 continue  # отказ: status pending остаётся, повтор по back-off
             # Страховка длины (решение гейта 3.1.0, 2026-09-19): модель может
@@ -1735,14 +1941,15 @@ class BackgroundWorker:
         known = self._namespaces.list_all()["namespaces"]
         try:
             result = self._classifier.classify(text, known)
-        except ClassificationError:
-            logging.getLogger("app").warning(
-                "classify: failed — note stays in default, retry on next update",
-                extra={
-                    "event": "classify_failed",
-                    "job": SUMMARY_JOB,
-                    "note_id": note_id,
-                },
+        except ClassificationError as exc:
+            self._log_slot_failure(
+                SUMMARY_JOB,
+                SLOT_SUMMARY,
+                outcome_of(exc),
+                event="classify_failed",
+                message="classify: failed — note stays in default, retry on next update",
+                note_id=note_id,
+                detail=str(exc),
             )
             return
         # Пул 6: переезд — ОДНА общая точка `_apply_node_order` (разметка +
@@ -1859,6 +2066,11 @@ class BackgroundWorker:
         петлю к ожиданию интервала или сигнала `notify_nodes_pending`).
         """
         limit = self._settings.job_nodes_batch if budget is None else budget
+        # Ворота слота summary (№39, §6.2): при разрыве классификатор не
+        # зовём — прогон возвращает 0, петля уходит в back-off; задание и
+        # очередь не теряются (разбудит сигнал/таймаут после снятия разрыва).
+        if not self._slot_gate(SLOT_SUMMARY, NODES_JOB):
+            return 0
         # (1) Промоция первой: заметка не «переезжает» в узел, который
         # появится в этом же прогоне (FR-3.1). Отказ не роняет джобу (FR-3.2).
         self._run_promotion(NODES_JOB)
@@ -1929,17 +2141,19 @@ class BackgroundWorker:
         text = f"{row['title']}\n{summary}" if row["title"] else summary
         try:
             result = self._classifier.classify(text, known)
-        except ClassificationError:
+        except ClassificationError as exc:
             # Отказ классификатора данные не портит (FR-3.1): заметка остаётся
-            # в текущем узле, разметка не пишется, задание — pending.
-            logging.getLogger("app").warning(
-                "nodes: reclass failed — note stays in its node, retry by back-off",
-                extra={
-                    "event": "node_order_failed",
-                    "job": NODES_JOB,
-                    "source": "after_merge",
-                    "note_id": note_id,
-                },
+            # в текущем узле, разметка не пишется, задание — pending. №39:
+            # событие несёт тип исхода отказа слота summary.
+            self._log_slot_failure(
+                NODES_JOB,
+                SLOT_SUMMARY,
+                outcome_of(exc),
+                event="node_order_failed",
+                message="nodes: reclass failed — note stays in its node, retry by back-off",
+                note_id=note_id,
+                detail=str(exc),
+                source="after_merge",
             )
             return False
         outcome, reason, target = self._apply_node_order(
@@ -2000,14 +2214,15 @@ class BackgroundWorker:
             text = f"{row['title']}\n{summary}" if row["title"] else summary
             try:
                 result = self._classifier.classify(text, known)
-            except ClassificationError:
-                logging.getLogger("app").warning(
-                    "nodes: classify failed — note stays in default, retry later",
-                    extra={
-                        "event": "classify_failed",
-                        "job": NODES_JOB,
-                        "note_id": note_id,
-                    },
+            except ClassificationError as exc:
+                self._log_slot_failure(
+                    NODES_JOB,
+                    SLOT_SUMMARY,
+                    outcome_of(exc),
+                    event="classify_failed",
+                    message="nodes: classify failed — note stays in default, retry later",
+                    note_id=note_id,
+                    detail=str(exc),
                 )
                 continue  # маркер не ставим: заметка снова кандидат обхода
             outcome, reason, target = self._apply_node_order(
@@ -2265,6 +2480,7 @@ def build_embedding_job(worker: BackgroundWorker, settings: Settings) -> JobSpec
         wait_event=worker._embedding_event,
         idle_hook=worker._purge_done_jobs,
         queue_stat=worker._vector_queue_stat,
+        slot=SLOT_EMBEDDING,
     )
 
 
@@ -2289,6 +2505,7 @@ def build_summary_job(
         wait_event=worker._summary_event,
         idle_hook=None,
         queue_stat=worker._summary_queue_stat,
+        slot=SLOT_SUMMARY,
     )
 
 
@@ -2305,6 +2522,7 @@ def build_judge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         wait_event=worker._judge_event,
         idle_hook=None,
         queue_stat=worker._judge_queue_stat,
+        slot=SLOT_JUDGE,
     )
 
 
@@ -2321,6 +2539,7 @@ def build_areas_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         wait_event=worker._areas_event,
         idle_hook=None,
         queue_stat=worker._areas_queue_stat,
+        slot=None,
     )
 
 
@@ -2343,6 +2562,7 @@ def build_expiration_job(worker: BackgroundWorker, settings: Settings) -> JobSpe
         wait_event=None,
         idle_hook=None,
         queue_stat=None,
+        slot=None,
     )
 
 
@@ -2385,6 +2605,7 @@ def build_nodes_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         wait_event=worker._nodes_event,
         idle_hook=None,
         queue_stat=worker._nodes_queue_stat,
+        slot=SLOT_SUMMARY,
     )
 
 

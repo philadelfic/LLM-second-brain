@@ -68,10 +68,25 @@ import httpx
 from app.config import Settings
 from app.services.llm_client import LLMClient, LLMError, SlotSpec
 from app.services.prompts import PromptRegistry
+from app.services.slot_outcome import SlotOutcome, classify_llm_error
 
 
 class JudgeError(RuntimeError):
-    """Судья не дал вердикта: сервер недоступен или ответ некорректен."""
+    """Судья не дал вердикта: сервер недоступен или ответ некорректен.
+
+    `outcome` — единый тип исхода вызова слота (№39, arch §6.4): отказ
+    клиента классифицируется `classify_llm_error`, а «вердикт не распознан»
+    — явно `OFF_CONTRACT` (дефолт). Воркер пишет исход в журнал.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        outcome: SlotOutcome = SlotOutcome.OFF_CONTRACT,
+    ) -> None:
+        super().__init__(message)
+        self.outcome = outcome
 
 
 class Judge(Protocol):
@@ -83,6 +98,11 @@ class Judge(Protocol):
 
     def judge(self, text_new: str, text_candidate: str) -> bool:
         """Вердикт по паре текстов: True — дубль, False — не дубль."""
+        ...
+
+    def probe(self) -> str:
+        """Дешёвый пробный стук слота (№39, arch §6.4): `check()` без генерации;
+        исход — CheckResult из llm_client."""
         ...
 
     def close(self) -> None:
@@ -135,9 +155,10 @@ class JudgeService:
             )
         except LLMError as exc:
             # Текст клиента сохраняется: HTTP-статус, адрес слота, hint
-            # про {SLOT}_API_KEY у auth-отказа (решение №4).
+            # про {SLOT}_API_KEY у auth-отказа (решение №4). Исход вызова
+            # (№39, arch §6.4) — единый тип исхода на границе сервиса.
             self.last_attempt_ok = False  # деградация станет видна в /health
-            raise JudgeError(str(exc)) from exc
+            raise JudgeError(str(exc), outcome=classify_llm_error(exc)) from exc
         try:
             verdict = self._verdict(content)
         except JudgeError:
@@ -149,6 +170,11 @@ class JudgeService:
     def close(self) -> None:
         """Закрыть HTTP-пул (чистое завершение процесса)."""
         self._llm.close()
+
+    def probe(self) -> str:
+        """Дешёвый пробный стук слота judge (№39, arch §6.4): `check()`
+        без генерации. Исход отдаётся как есть (CheckResult)."""
+        return self._llm.check()
 
     # --- внутреннее ---------------------------------------------------------
 
@@ -167,5 +193,6 @@ class JudgeService:
         if "DUPLICATE" in normalized:
             return True
         raise JudgeError(
-            f"judge gave no verdict DUPLICATE/NOT DUPLICATE: {content[:120]}"
+            f"judge gave no verdict DUPLICATE/NOT DUPLICATE: {content[:120]}",
+            outcome=SlotOutcome.OFF_CONTRACT,
         )

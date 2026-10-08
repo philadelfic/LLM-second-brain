@@ -145,10 +145,11 @@ import logging
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 from mcp.server.context import ServerRequestContext
 from mcp.server.mcpserver import MCPServer
+from mcp.types import CallToolResult, TextContent
 from pydantic import Field
 
 from app.config import Settings
@@ -171,6 +172,9 @@ from app.services.user_facts import (
     UserFactValidationError,
 )
 from app.storage.db import DEFAULT_NAMESPACE
+
+if TYPE_CHECKING:  # только аннотация: рантайм-зависимости от воркера нет
+    from app.services.worker import BackgroundWorker
 
 SERVER_NAME = "LLM Second Brain"
 
@@ -391,6 +395,74 @@ class InstructionsRefresher:
                 else:
                     self._server._lowlevel_server.instructions = text
             return await call_next(ctx)
+
+
+# №39 FR-4.4 (arch §7.3): короткий ОБЕЗЛИЧЕННЫЙ хинт о сломанном слоте —
+# примешивается к ответу инструмента; имён людей и слова «оператор» нет.
+SLOT_HINT_DOWN = (
+    "slot {slot} is down ({outcome}): its jobs are waiting — tell your human."
+)
+
+
+class SlotHintMiddleware:
+    """ServerMiddleware (архетип InstructionsRefresher): хинт о сломанном слоте.
+
+    №39 FR-4.4/FR-4.5 (arch §7.3): перед ответом инструмента middleware
+    проверяет снимок разрывов воркера (`worker.slot_states()`); если есть слот
+    в паузе и с последнего хинта по нему прошло ≥ `SLOT_HINT_EVERY_SEC` —
+    дописывает в ответ короткий обезличенный хинт (в `structured_content.hint`
+    и текстовым блоком в `content`). Троттлинг — в памяти процесса
+    (`dict[str, float]`): хинт не ест контекст (F-11), основное место
+    диагностики — `/health` и журнал. Своего канала наружу у LSB нет —
+    «предупредить» можно только хинтом (FR-4.6); имена людей не придумываем.
+    """
+
+    def __init__(
+        self, settings: Settings, worker: "BackgroundWorker | None" = None
+    ) -> None:
+        self._settings = settings
+        self._worker = worker
+        self._last_hint: dict[str, float] = {}
+
+    async def __call__(
+        self,
+        ctx: ServerRequestContext[Any, Any],
+        call_next: Callable[[ServerRequestContext[Any, Any]], Awaitable[Any]],
+    ) -> Any:
+        result = await call_next(ctx)
+        if getattr(ctx, "method", None) != "tools/call":
+            return result  # только ответы инструментов (не initialize/list)
+        hint = self._hint_text()
+        if hint is None or not isinstance(result, CallToolResult):
+            return result
+        result.content = list(result.content) + [
+            TextContent(type="text", text=hint)
+        ]
+        if isinstance(result.structured_content, dict):
+            result.structured_content = {
+                **result.structured_content,
+                "hint": hint,
+            }
+        return result
+
+    def _hint_text(self) -> str | None:
+        """Хинт по первому слоту в паузе, которому не мешает троттлинг (№39)."""
+        if self._worker is None:
+            return None
+        states = self._worker.slot_states()
+        now = time.monotonic()
+        every = self._settings.slot_hint_every_sec
+        for slot, snapshot in states.items():
+            if snapshot.get("state") != "paused":
+                continue
+            last = self._last_hint.get(slot)
+            if last is not None and now - last < every:
+                continue
+            self._last_hint[slot] = now
+            return SLOT_HINT_DOWN.format(
+                slot=slot, outcome=snapshot.get("last_outcome") or "unavailable"
+            )
+        return None
 
 
 # Обучающие описания инструментов (ARCHITECTURE §5.2) — гарантированный канал
@@ -1140,7 +1212,11 @@ def _compact_history_get(result: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def build_mcp(settings: Settings, services: Services) -> MCPServer:
+def build_mcp(
+    settings: Settings,
+    services: Services,
+    worker: "BackgroundWorker | None" = None,
+) -> MCPServer:
     """Собрать MCP-сервер: инструкции (§5.1, база + карта неймспейсов) +
     до 23 инструментов (8 `memory_*` + 5 `skills_*` + 5 `user_*` + 3 `terms_*`
     + 2 `history_*`) над сервисами.
@@ -1152,6 +1228,10 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
 
     Сигнатуры и ограничения параметров — контракты REQUIREMENTS §5.1/§5.7;
     значения по умолчанию (DEFAULT_TOP_K, DEFAULT_LIST_LIMIT) — из env.
+
+    `worker` (№39, FR-4.4) — источник снимка разрывов слотов для хинта
+    «предупреди своего человека»; None (DI-сборки тестов без воркера) — хинт
+    выключен.
     """
     mcp = MCPServer(
         name=SERVER_NAME,
@@ -1161,6 +1241,8 @@ def build_mcp(settings: Settings, services: Services) -> MCPServer:
     # инструкции перед каждым initialize — новый чат видит актуальный реестр
     # (данных пользователя в пересборке нет, только реестр навыков).
     mcp.middleware.append(InstructionsRefresher(services, mcp))
+    # №39 (FR-4.4/FR-4.5, arch §7.3): хинт о сломанном слоте с троттлингом.
+    mcp.middleware.append(SlotHintMiddleware(settings, worker))
 
     @mcp.tool(name="memory_search", description=TOOL_DESCRIPTIONS["memory_search"])
     async def memory_search(

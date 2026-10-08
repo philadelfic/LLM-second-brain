@@ -155,7 +155,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # JSON-логи stdout (NFR-4): включаются при сборке приложения (импорт
     # app.main / тесты / uvicorn — один и тот же идемпотентный setup).
     setup_logging(settings.log_level)
-    mcp = build_mcp(settings, services)
     # §3.4: две очереди — векторы (Фаза 3) и summary (Фаза 4, режим «Б»);
     # суммаризатор из DI — тот же экземпляр, что в /health.summarizer_ok.
     # Судья дедупа (Фаза 8, Этап 3.1) — тоже DI из services, один экземпляр
@@ -197,6 +196,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Внутренний маршрут MCP-сервера — ровно MCP_PATH. host="0.0.0.0" — не
     # localhost, поэтому SDK не включает DNS-rebinding protection (сервис
     # живёт в LAN за Bearer-токеном; Open WebUI ходит с не-localhost Host).
+    # MCP собирается после воркера (№39, FR-4.4): миддлварь хинта о сломанном
+    # слоте берёт снимок разрывов из воркера (`slot_states`).
+    mcp = build_mcp(settings, services, worker=worker)
     mcp_app = mcp.streamable_http_app(
         streamable_http_path=settings.mcp_path,
         host="0.0.0.0",

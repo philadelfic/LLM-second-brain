@@ -86,10 +86,26 @@ import httpx
 from app.config import Settings
 from app.services.llm_client import LLMClient, LLMError, SlotSpec
 from app.services.prompts import PromptRegistry
+from app.services.slot_outcome import SlotOutcome, classify_llm_error
 
 
 class SummaryError(RuntimeError):
-    """Суммаризация не выполнена: сервер недоступен или ответ некорректен."""
+    """Суммаризация не выполнена: сервер недоступен или ответ некорректен.
+
+    `outcome` — единый тип исхода вызова слота (№39, arch §6.4): сервис
+    ставит его при отказе клиента (`classify_llm_error`), а при «маркер/
+    структура не найдены» — явно `OFF_CONTRACT` (дефолт). Воркер читает
+    исход через `slot_outcome.outcome_of` и пишет его в журнал.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        outcome: SlotOutcome = SlotOutcome.OFF_CONTRACT,
+    ) -> None:
+        super().__init__(message)
+        self.outcome = outcome
 
 
 # Многоточие усечённого саммари: один символ — бюджет лимита тратится на текст
@@ -158,6 +174,12 @@ class Summarizer(Protocol):
 
     def merge(self, text_a: str, text_b: str) -> str:
         """Объединить пару текстов-дубликатов в один (дедуп, Этап 2.2)."""
+        ...
+
+    def probe(self) -> str:
+        """Дешёвый пробный стук слота (№39, arch §6.4): `check()` без генерации;
+        исход — CheckResult из llm_client (`ok`/`auth_failed`/`unreachable`/
+        `model_missing`)."""
         ...
 
     def close(self) -> None:
@@ -250,6 +272,11 @@ class SummaryService:
         """Закрыть HTTP-пул (чистое завершение процесса)."""
         self._llm.close()
 
+    def probe(self) -> str:
+        """Дешёвый пробный стук слота summary (№39, arch §6.4): `check()`
+        без генерации. Исход отдаётся как есть (CheckResult)."""
+        return self._llm.check()
+
     # --- внутреннее ---------------------------------------------------------
 
     def _chat(
@@ -275,8 +302,11 @@ class SummaryService:
             )
         except LLMError as exc:
             # Текст клиента сохраняется: HTTP-статус, адрес слота, hint
-            # про {SLOT}_API_KEY у auth-отказа (решение №4).
-            raise SummaryError(str(exc)) from exc
+            # про {SLOT}_API_KEY у auth-отказа (решение №4). Исход вызова
+            # (№39, arch §6.4) — единый тип исхода на границе сервиса.
+            raise SummaryError(
+                str(exc), outcome=classify_llm_error(exc)
+            ) from exc
         # Поле thinking/reasoning_content отброшено клиентом в принципе:
         # читаем только content. Символьная страховка здесь осталась только
         # у merge: её результат — будущий ТЕКСТ заметки, обязан проходить

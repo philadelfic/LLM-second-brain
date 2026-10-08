@@ -48,7 +48,11 @@ v2.1: каждый из трёх слотов (embedding, summary, judge) пол
   не фатально); модель не в списке → model_missing.
 - reasoning-поля ответа (`message.thinking` у ollama; `reasoning_content`/
   `reasoning` у openai) игнорируются в принципе: читается только content;
-  пустой content — отказ вызова (§5.5).
+  пустой content — отказ вызова (§5.5) с признаком `empty` (№39 §6.3).
+- №39 §6.3: `LLMError` несёт признаки `timeout`/`empty`/`truncated` —
+  таймаут и транспорт различаются, пустой ответ не смешивается с
+  недоступностью; исход вызова (SlotOutcome) читает сервисный слой.
+  `finish_reason`/`usage` и заполнение `truncated` — блок №49.
 - DI без сети: `transport` принимает httpx.MockTransport или handler —
   юнит-тесты (tests/test_llm_client.py); фейки сервисов (tests/fakes.py)
   не меняются — потребители зависят от протоколов, не от этого класса.
@@ -115,6 +119,9 @@ class LLMError(RuntimeError):
     сбой временный (429/5xx/транспорт/таймаут): сигнал для единственного
     ретрая эмбеддера (ARCH §3.2); чат по флагу не ретраит (NFR-3).
     `auth` — 401/403 при задействованном Bearer (см. LLMAuthError).
+    `timeout`/`empty`/`truncated` — признаки причины (№39, §6.3): исход
+    вызова различается на границе клиента (`slot_outcome.classify_llm_error`),
+    а не по тексту сообщения. `truncated` заполняет блок №49 (finish_reason).
     """
 
     def __init__(
@@ -124,11 +131,17 @@ class LLMError(RuntimeError):
         status: int | None = None,
         transient: bool = False,
         auth: bool = False,
+        timeout: bool = False,
+        empty: bool = False,
+        truncated: bool = False,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.transient = transient
         self.auth = auth
+        self.timeout = timeout
+        self.empty = empty
+        self.truncated = truncated
 
 
 class LLMAuthError(LLMError):
@@ -372,10 +385,13 @@ class LLMClient:
                     method, path, json=payload, headers=self._headers()
                 )
         except _RETRIABLE as exc:
+            # №39 §6.3: таймаут и транспорт больше не неотличимы — таймаут
+            # несёт отдельный признак `timeout` (исход TIMEOUT, не UNAVAILABLE).
             raise LLMError(
                 f"сервер слота {self.spec.name} недоступен "
                 f"({self.spec.base_url}): {exc}",
                 transient=True,
+                timeout=isinstance(exc, httpx.TimeoutException),
             ) from exc
         if response.status_code != 200:
             self._raise_for_status(response, path)
@@ -428,9 +444,12 @@ class LLMClient:
                 message = data.get("message")
                 content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str) or not content.strip():
+            # №39 §6.3: пустой ответ помечается отдельным признаком `empty` —
+            # исход EMPTY не смешивается с недоступностью (FR-3.3). Текст прежний.
             raise LLMError(
                 f"пустой content в ответе модели "
-                f"(провайдер {self.spec.provider}, слот {self.spec.name}, {path})"
+                f"(провайдер {self.spec.provider}, слот {self.spec.name}, {path})",
+                empty=True,
             )
         return content.strip()
 

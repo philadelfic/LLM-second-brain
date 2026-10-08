@@ -366,6 +366,20 @@ class TestTransientErrors:
             assert "недоступен" in str(exc_info.value)
             assert recorder.calls == 1
 
+    def test_timeout_flag_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Отдельный признак таймаута (№39 §6.3): транспортный таймаут помечен
+        и timeout, и transient — исход различается на границе клиента."""
+        settings = make_settings(monkeypatch)
+        client, recorder = make_client(
+            SlotSpec.for_summary(settings), [httpx.ReadTimeout("timed out")]
+        )
+        with pytest.raises(LLMError) as exc_info:
+            client.chat(SYSTEM, USER, num_predict=10)
+        assert exc_info.value.timeout is True
+        assert exc_info.value.transient is True
+        assert exc_info.value.empty is False
+        assert recorder.calls == 1
+
     def test_openai_429_transient_no_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """429 у openai — транзиент (эмбеддер ретраит), ретрая в клиенте нет."""
         settings = make_settings(
@@ -431,6 +445,17 @@ class TestChatParsing:
         )
         with pytest.raises(LLMError, match="пустой content"):
             client.chat(SYSTEM, USER, num_predict=10)
+
+    def test_empty_flag_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Пустой content помечен empty (№39 §6.3): «пусто» ≠ «недоступность»."""
+        settings = make_settings(monkeypatch)
+        client, _ = make_client(
+            SlotSpec.for_summary(settings), [ollama_chat_ok("   ")]
+        )
+        with pytest.raises(LLMError, match="пустой content") as exc_info:
+            client.chat(SYSTEM, USER, num_predict=10)
+        assert exc_info.value.empty is True
+        assert exc_info.value.transient is False
 
     def test_content_stripped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         settings = make_settings(monkeypatch)
