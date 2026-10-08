@@ -430,7 +430,21 @@ def clear_seeded_skills(settings) -> None:
     перестраивается (`rebuild` внешнего контента: строк-призраков не
     остаётся). Маркер сида в `skills_meta` повторную вставку не допускает —
     область остаётся пустой; сам сид проверяется в tests/test_skills_announce.py.
+
+    №41 (3.2.0): жёсткое удаление строки сида отпускает её id для переиспользования
+    (rowid), поэтому снимаем и его baseline в `record_versions` — иначе новый
+    навык получает тот же id и `record_initial` упирался бы в PK истории. В проде
+    навыки не удаляются жёстко (только soft delete), коллизии нет — это
+    приспособление тестового хелпера.
     """
     with session(settings) as conn, transaction(conn):
+        seeded = conn.execute(
+            "SELECT id FROM skills WHERE name = ?", (CREATOR_SKILL_NAME,)
+        ).fetchone()
         conn.execute("DELETE FROM skills WHERE name = ?", (CREATOR_SKILL_NAME,))
+        if seeded is not None:
+            conn.execute(
+                "DELETE FROM record_versions WHERE entity = 'skill' AND entity_id = ?",
+                (int(seeded["id"]),),
+            )
         conn.execute("INSERT INTO skills_fts(skills_fts) VALUES('rebuild')")

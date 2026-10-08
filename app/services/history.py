@@ -79,6 +79,61 @@ def note_projection(
     return fields
 
 
+def _parsed_extra(raw: Any) -> dict[str, Any] | None:
+    """`extra` навыка из живой строки → объект полей класса; NULL/битый → `None`.
+
+    В живой таблице `extra` — JSON-текст, в версии он живёт распарсенным
+    объектом (одна форма у baseline и дельт, §13.3): так `null` в дельте честно
+    означает «поле снято». Пусто/повреждённый JSON (ручная правка БД) — `None`.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(str(raw))
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) and parsed else None
+
+
+def skill_projection(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+    """Проекция навыка по §5.3 — одна точка правды для create/update/delete.
+
+    Контент: `name`/`description`/`example`/`steps`/`text`/`extra` (поля класса
+    — распарсенным объектом, §13.3). Служебное (`vector_status`; `version` —
+    зеркало головной версии) в проекцию не входит и версий не создаёт (FR-4.2).
+    """
+    return {
+        "name": row["name"],
+        "description": row["description"],
+        "example": row["example"],
+        "steps": row["steps"],
+        "text": row["text"],
+        "extra": _parsed_extra(row["extra"]),
+    }
+
+
+def term_projection(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+    """Проекция термина по §5.3 — одна точка правды для save/update/delete.
+
+    Контент: `term`/`context`/`definition`. Нормализованные ключи (`term_norm`,
+    `context_norm`) и `vector_status` — служебные, версий не создают (FR-4.2).
+    """
+    return {
+        "term": row["term"],
+        "context": row["context"],
+        "definition": row["definition"],
+    }
+
+
+def user_fact_projection(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+    """Проекция факта о пользователе по §5.3 — одна точка правды для CRUD.
+
+    Контент: `name`/`body`; `vector_status` — служебное, версий не создаёт
+    (FR-4.2).
+    """
+    return {"name": row["name"], "body": row["body"]}
+
+
 # Мягкий ответ чтения, когда версии/записи нет: транспорт превращает его в
 # 404 (никакого исключения — «версии нет» валидный исход).
 HINT_VERSION_NOT_FOUND = (

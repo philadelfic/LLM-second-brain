@@ -342,7 +342,7 @@ class TestList:
     def test_items_without_bodies_and_archive(self, service: SkillsService) -> None:
         first = service.save(**form())["id"]
         second = service.save(**form(name="Rotate the API key"))["id"]
-        # Правка копирует прежнюю версию в skill_versions — в листинге её нет.
+        # Правка пишет версию в общую историю — в листинге её нет.
         service.save(**form(id=first, name="Deploy the service v2"))
 
         listed = service.list()

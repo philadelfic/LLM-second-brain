@@ -2,8 +2,8 @@
 архив версий, soft delete, сид шаблона и pending-вектора области.
 
 ARCH lsb-0007 §3.1–3.4, §3.8: валидация формы обязательна (нарушение —
-`SkillValidationError` с дословным hint), правка копирует прежнюю версию в
-`skill_versions` одной транзакцией, удаление мягкое, глобальный
+`SkillValidationError` с дословным hint), правка пишет версию в общую историю
+(`record_versions`) одной транзакцией, удаление мягкое, глобальный
 `instruction_template` — сид `init_db` и композит `get`. Запись навыка
 кодировщик не зовёт: вектора догоняет петля `areas` воркера (субстрат §3.3).
 """
@@ -16,6 +16,7 @@ import pytest
 from fakes import clear_seeded_skills
 
 from app.config import Settings, get_settings
+from app.services import history
 from app.services.embedding import EmbeddingError
 from app.services.skills import (
     EXTRA_FIELDS,
@@ -34,10 +35,8 @@ from app.services.skills import (
 from app.storage.db import (
     INSTRUCTION_TEMPLATE_KEY,
     INSTRUCTION_TEMPLATE_SEED,
-    StorageError,
     init_db,
     session,
-    transaction,
 )
 
 
@@ -280,23 +279,23 @@ class TestList:
 
 
 class TestVersions:
-    """Правка копирует прежнюю версию в архив; архив в выдачах не участвует."""
+    """Правка пишет версию в общую историю; legacy-архив не наполняется."""
 
-    def test_update_archives_previous_version(self, service: SkillsService) -> None:
+    def test_update_writes_history_delta(self, service: SkillsService) -> None:
         service.save(**form())
         result = service.save(**form(id=1, name="Deploy v2"))
         assert result == {"id": 1, "updated": True, "version": 2}
         with session(get_settings()) as conn:
-            archived = [
+            rows = [
                 dict(row)
                 for row in conn.execute(
-                    "SELECT * FROM skill_versions WHERE skill_id = 1"
+                    "SELECT version, event FROM record_versions "
+                    "WHERE entity = 'skill' AND entity_id = 1 ORDER BY version"
                 )
             ]
-        assert len(archived) == 1
-        assert archived[0]["version"] == 1  # копия прежней версии, её же номером
-        assert archived[0]["name"] == "Deploy the service"
-        assert _row("skills", 1)["version"] == 2
+        assert [row["version"] for row in rows] == [1, 2]
+        assert rows[0]["event"] == "baseline" and rows[1]["event"] == "content"
+        assert _row("skills", 1)["version"] == 2  # зеркало головной версии (§13.7)
         assert _row("skills", 1)["name"] == "Deploy v2"
 
     def test_version_grows_on_each_update(self, service: SkillsService) -> None:
@@ -304,14 +303,14 @@ class TestVersions:
         service.save(**form(id=1, name="Deploy v2"))
         service.save(**form(id=1, name="Deploy v3"))
         with session(get_settings()) as conn:
-            archived = [
-                row["version"]
+            versions = [
+                int(row["version"])
                 for row in conn.execute(
-                    "SELECT version FROM skill_versions WHERE skill_id = 1 "
-                    "ORDER BY version"
+                    "SELECT version FROM record_versions WHERE entity = 'skill' "
+                    "AND entity_id = 1 ORDER BY version"
                 )
             ]
-        assert archived == [1, 2]
+        assert versions == [1, 2, 3]
         assert _row("skills", 1)["version"] == 3
 
     def test_archive_invisible_in_get_and_list(self, service: SkillsService) -> None:
@@ -322,15 +321,20 @@ class TestVersions:
         assert listed["total"] == 1
         assert [item["name"] for item in listed["items"]] == ["Deploy v2"]
 
-    def test_archived_copy_survives_soft_delete(self, service: SkillsService) -> None:
+    def test_history_survives_soft_delete(self, service: SkillsService) -> None:
         service.save(**form())
         service.save(**form(id=1, name="Deploy v2"))
         service.delete(1)
         with session(get_settings()) as conn:
-            count = conn.execute(
-                "SELECT COUNT(*) FROM skill_versions WHERE skill_id = 1"
-            ).fetchone()[0]
-        assert count == 1  # архив копий — операторская история, delete её не трогает
+            events = [
+                str(row["event"])
+                for row in conn.execute(
+                    "SELECT event FROM record_versions WHERE entity = 'skill' "
+                    "AND entity_id = 1 ORDER BY version"
+                )
+            ]
+        # История — операторская: мягкое удаление её не стирает (§13.7, FR-6).
+        assert events == ["baseline", "content", "delete"]
 
     def test_update_unknown_id_returns_hint(self, service: SkillsService) -> None:
         assert service.save(**form(id=999)) == {
@@ -339,31 +343,22 @@ class TestVersions:
             "hint": HINT_NOT_FOUND,
         }
 
-    def test_version_copy_and_edit_are_one_transaction(
-        self, service: SkillsService
+    def test_history_write_and_edit_are_one_transaction(
+        self, service: SkillsService, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Сбой на копировании версии откатывает и правку (одна транзакция)."""
+        """Сбой на записи версии откатывает и правку (одна транзакция, §13.5)."""
         service.save(**form())
-        with session(get_settings()) as conn, transaction(conn):
-            # Заняли PK (skill_id=1, version=1): INSERT копии упадёт.
-            conn.execute(
-                "INSERT INTO skill_versions (skill_id, version, name) "
-                "VALUES (1, 1, 'занято')"
-            )
-        with pytest.raises(StorageError):
+
+        def boom(*args: object, **kwargs: object) -> int:
+            raise RuntimeError("history write failed")
+
+        monkeypatch.setattr(history, "record_change", boom)
+        with pytest.raises(RuntimeError):
             service.save(**form(id=1, name="Deploy v2"))
         row = _row("skills", 1)
         assert row is not None
         assert row["version"] == 1  # правка откатилась
         assert row["name"] == "Deploy the service"
-        with session(get_settings()) as conn:
-            names = [
-                r["name"]
-                for r in conn.execute(
-                    "SELECT name FROM skill_versions WHERE skill_id = 1"
-                )
-            ]
-        assert names == ["занято"]  # новых копий не появилось
 
 
 class TestDelete:

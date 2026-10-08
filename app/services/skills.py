@@ -14,11 +14,13 @@
 * **Векторизации в момент записи нет** (субстрат §3.3): запись идёт с
   `vector_status='pending'`, вектора записи догоняет петля `areas` воркера
   (после создания/правки сервис её будит — `set_areas_notifier`).
-* **Версии:** на каждой правке текущее содержимое копируется в
-  `skill_versions` (номер — прежняя версия навыка); запись копии и правка —
-  ОДНА транзакция (`transaction()`), полусостояние исключено. Архив не
-  участвует ни в одной выдаче: `get`/`list` читают только `skills` и только
-  активные строки.
+* **Версии (№41, релиз 3.2.0):** история правок живёт в общей таблице
+  `record_versions` и пишется общим слоем `history` ТОЙ ЖЕ транзакцией, что
+  и сама правка (FR-2.4, §13.5); `skills.version` — зеркало головной версии,
+  его ведёт слой истории (§13.7). Прежней копии в `skill_versions` больше
+  нет: таблица оставлена legacy-слепком, код её не наполняет (одна механика,
+  §13.7). Архив не участвует ни в одной выдаче: `get`/`list` читают только
+  `skills` и только активные строки.
 * **Антисинонимия создания (FR-5.2, lsb-0007-03):** при создании (без `id`)
   текст кандидата (`name + description`) сверяется косинусом с активными
   навыками — один батч `embed_texts`, L2-нормализация, порог
@@ -67,6 +69,7 @@ from collections.abc import Callable
 from typing import Any
 
 from app.config import Settings
+from app.services import history
 from app.services.areas import AreaSearch, AreaSearchValidationError, SKILLS_AREA
 from app.services.embedding import Embedder, EmbeddingService
 from app.services.listing import page_fields
@@ -210,10 +213,11 @@ class SkillsService:
         Создание (без `id`) гоняет антисинонимию (FR-5.2, lsb-0007-03):
         слишком похожий на активный навык кандидат → мягкий отказ
         `{created: False, hint}` без записи; правка по `id` префильтр не
-        гоняет. Правка копирует прежнее содержимое в `skill_versions` и
-        обновляет строку одной транзакцией; `version` растёт на 1. Запись
-        всегда оставляет `vector_status='pending'` — вектора догоняет петля
-        `areas` (тело навыка в синхронном пути не кодируется).
+        гоняет. Правка пишет версию-дельту в общую историю (§13.5) и
+        обновляет строку одной транзакцией; `version` — зеркало головной
+        версии, его ведёт слой истории (§13.7). Запись всегда оставляет
+        `vector_status='pending'` — вектора догоняет петля `areas` (тело
+        навыка в синхронном пути не кодируется).
         """
         checked_name = self._checked_field(
             "name", name, self._settings.skill_name_max_chars, HINT_NAME_LIMIT
@@ -278,7 +282,12 @@ class SkillsService:
         text: str,
         extra: str | None,
     ) -> dict[str, Any]:
-        """INSERT нового навыка (version=1, vector_status='pending')."""
+        """INSERT нового навыка (version=1, vector_status='pending').
+
+        №41 (§13.5): baseline-версия пишется ТОЙ ЖЕ транзакцией, что и INSERT, —
+        состояния «навык есть, истории нет» не бывает; `version` ответа — из
+        `skills.version` (зеркало головной версии, §13.7).
+        """
         with session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
                 "INSERT INTO skills (name, description, example, steps, text, "
@@ -287,7 +296,14 @@ class SkillsService:
                 (name, description, example, steps, text, extra),
             )
             new_id = int(cursor.lastrowid or 0)
-        return {"id": new_id, "created": True, "version": 1}
+            row = conn.execute(
+                "SELECT * FROM skills WHERE id = ?", (new_id,)
+            ).fetchone()
+            history.record_initial(
+                conn, history.ENTITY_SKILL, new_id, history.skill_projection(row)
+            )
+            version = int(row["version"])
+        return {"id": new_id, "created": True, "version": version}
 
     def _update(
         self,
@@ -299,11 +315,14 @@ class SkillsService:
         text: str,
         extra: str | None,
     ) -> dict[str, Any]:
-        """Копия прежней версии в архив + правка строки — ОДНОЙ транзакцией.
+        """Правка строки + версия-дельта — ОДНОЙ транзакцией (§13.5).
 
-        Архивная копия сохраняет содержимое и НОМЕР прежней версии; навык
-        получает номер на 1 больше (требование «старая версия сохраняется
-        как копия»). Неактивный/несуществующий id → мягкий ответ с hint.
+        Версия пишется общим слоем истории (`record_change`), а не копией в
+        `skill_versions` — второй механики версионирования в коде больше нет
+        (§13.7; legacy-таблица не наполняется). `record_change` сам поднимает
+        `skills.version` до головной версии (зеркало, §13.7), поэтому номер
+        ответа берётся оттуда. Неактивный/несуществующий id → мягкий ответ
+        с hint; правка без изменений контента версии не создаёт.
         """
         with session(self._settings) as conn, transaction(conn):
             row = conn.execute(
@@ -313,38 +332,24 @@ class SkillsService:
             if row is None:
                 return {"id": skill_id, "updated": False, "hint": HINT_NOT_FOUND}
             conn.execute(
-                "INSERT INTO skill_versions (skill_id, version, name, description, "
-                "example, steps, text, extra) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    int(row["id"]),
-                    int(row["version"]),
-                    row["name"],
-                    row["description"],
-                    row["example"],
-                    row["steps"],
-                    row["text"],
-                    row["extra"],
-                ),
-            )
-            new_version = int(row["version"]) + 1
-            conn.execute(
                 "UPDATE skills SET name = ?, description = ?, example = ?, "
-                "steps = ?, text = ?, extra = ?, version = ?, "
+                "steps = ?, text = ?, extra = ?, "
                 "vector_status = 'pending', "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
                 "WHERE id = ? AND deleted_at IS NULL",
-                (
-                    name,
-                    description,
-                    example,
-                    steps,
-                    text,
-                    extra,
-                    new_version,
-                    skill_id,
-                ),
+                (name, description, example, steps, text, extra, skill_id),
             )
-        return {"id": skill_id, "updated": True, "version": new_version}
+            updated_row = conn.execute(
+                "SELECT * FROM skills WHERE id = ?", (skill_id,)
+            ).fetchone()
+            new_version = history.record_change(
+                conn,
+                history.ENTITY_SKILL,
+                skill_id,
+                history.skill_projection(updated_row),
+            )
+            version = int(row["version"]) if new_version is None else new_version
+        return {"id": skill_id, "updated": True, "version": version}
 
     # --- чтение (arch §3.1, §3.3) -------------------------------------------
 
@@ -520,6 +525,10 @@ class SkillsService:
                 (id,),
             )
             deleted = bool(cursor.rowcount)
+            if deleted:
+                # №41 (FR-6.1, §13.5): мягкое удаление — версия-событие в той
+                # же транзакции; повторное/несуществующее удаление версии не даёт.
+                history.record_event(conn, history.ENTITY_SKILL, id, "delete")
         if not deleted:
             return {"id": id, "deleted": False, "hint": HINT_NOT_FOUND}
         return {"id": id, "deleted": True}
@@ -549,6 +558,15 @@ class SkillsService:
                 "INSERT INTO skills_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (INSTRUCTION_TEMPLATE_KEY, normalized),
+            )
+            # №41 (FR-3.4, §13.5): глобальный шаблон — отдельная сущность
+            # истории (`skill_template`, id 0); версия пишется тем же слоем и
+            # той же транзакцией, что и правка.
+            history.record_change(
+                conn,
+                history.ENTITY_SKILL_TEMPLATE,
+                0,
+                {"instruction_template": normalized},
             )
         return {"instruction_template": normalized, "updated": True}
 

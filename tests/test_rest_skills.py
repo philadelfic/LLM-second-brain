@@ -145,9 +145,10 @@ class TestSkillsCrud:
         ).json()
         assert empty["results"] == [] and empty["hint"] == HINT_SEARCH_EMPTY
 
-    def test_update_keeps_version_in_archive(
+    def test_update_writes_history_not_legacy_archive(
         self, client: TestClient, token: str
     ) -> None:
+        """Правка пишет общую историю; legacy-архив больше не наполняется (§13.7)."""
         _create(client, token)
         updated = client.put(
             "/skills/1", json=form(text="Run make deploy v2."),
@@ -158,14 +159,12 @@ class TestSkillsCrud:
         assert client.get(
             "/skills/1", headers=_headers(token)
         ).json()["text"] == "Run make deploy v2."
+        # Вторая механика версионирования снята: псевдоним отдаёт пусто, пока
+        # не переведён на общую историю (постановка 04).
         archive = client.get(
             "/skills/1/versions", headers=_headers(token)
         ).json()
-        assert archive["id"] == 1 and len(archive["versions"]) == 1
-        copy = archive["versions"][0]
-        assert copy["version"] == 1  # номер прежней версии сохраняется
-        assert copy["text"] == "Run make deploy, then check /health."
-        assert copy["created_at"] and copy["extra"] is None
+        assert archive == {"id": 1, "versions": []}
         # Архив не участвует в выдачах: листинг/поиск тел и копий не несут.
         assert client.get("/skills", headers=_headers(token)).json()["total"] == 1
         assert len(client.get(
