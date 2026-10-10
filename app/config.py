@@ -26,6 +26,12 @@ LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 # API, openai — OpenAI-совместимый (Bearer).
 LLM_PROVIDERS = frozenset({"ollama", "openai"})
 
+# №49 (3.2.0, arch §13.1): тип модели генеративного слота — параметр
+# конфигурации. `reasoning` включает защиты бюджета и размышления;
+# `decision` — свойство отдельного decision-слота (свой конфиг DECISION_*),
+# у summary/judge он запрещён с подсказкой.
+LLM_MODEL_TYPES = frozenset({"reasoning", "generation"})
+
 # Максимум слов в названии заметки (решение №9 брифа Фазы 11): зашитая
 # константа, НЕ env. Слова = len(title.split()).
 TITLE_MAX_WORDS = 5
@@ -90,9 +96,27 @@ class Settings(BaseSettings):
     # summary_status != 'ok'). Прежние 200 были только fallback-лимитом.
     max_summary_chars: int = 150
     summary_think: bool = True  # при false в вызов идёт "think": false
-    summary_num_predict: int = 35000  # потолок thinking+content выжимки (решение О. 2026-08-30: 1500→35000)
-    merge_num_predict: int = 35000  # отдельный потолок слияния дублей (решение О. 2026-08-30)
-    summary_timeout_sec: int = 60  # клиентский таймаут вызова
+    # №49 (arch §13.1): reasoning | generation — влияет на бюджет, трактовку
+    # флага размышления и стартовые предупреждения (не на тело запроса).
+    summary_model_type: str = "generation"
+    # №49 (3.2.0): 0 = «сколько влезет» (авто-бюджет из заявленного контекста
+    # модели минус промпт и запас, зажат защитным потолком); прежние 35000 —
+    # явный потолок оператора и деградация при неизвестном контексте.
+    summary_num_predict: int = 0
+    merge_num_predict: int = 0  # отдельный потолок слияния дублей (решение О. 2026-08-30)
+    # №49 (arch §13.4): 900 = потолок back-off/паузы слота («думать долго» —
+    # не ошибка); было 60.
+    summary_timeout_sec: int = 900  # клиентский таймаут вызова
+    # Заявленный контекст модели слота summary (0 — неизвестен → прежние
+    # потолки без падения); запас на chat-template/служебные поля и защитный
+    # потолок авто-бюджета — общие для генеративных слотов.
+    summary_context_tokens: int = 0
+    slot_prompt_reserve_tokens: int = 512
+    slot_max_output_tokens: int = 32768
+    # №49 (arch §8): порог WARN «бюджет не оставляет места размышлению» и
+    # порог WARN «таймаут мал для "думать долго"».
+    slot_reasoning_min_output_tokens: int = 4096
+    slot_min_timeout_sec: int = 300
 
     # --- выдача ---
     snippet_chars: int = 120
@@ -114,6 +138,10 @@ class Settings(BaseSettings):
     # startup (see _validate_ranges).
     list_max_limit_mcp: int = 20
     list_max_limit_rest: int = 50
+    # №12 (no12-02, 3.2.0): потолки страницы предупреждений по поверхностям
+    # (§7.1): агентский MCP — 20, операторский REST — 50.
+    warnings_max_limit_mcp: int = 20
+    warnings_max_limit_rest: int = 50
     score_threshold: float = 0.50  # калибровка 2026-09-02: 0.35→0.50 (эксперимент на 82 реальных запросах, решение О.)
     dedup_similarity: float = 0.92
     # --- фоновый дедуп (Фаза 8, Этап 2.1): кандидат-предфильтр до сводки ---
@@ -122,8 +150,13 @@ class Settings(BaseSettings):
     # --- LLM-судья дедупа (Фаза 8, Этап 3.1; Фаза 11 — блок переименован в judge_*):
     # ornith-1.5:35b, think:false ---
     judge_think: bool = False  # при false в вызов идёт "think": false
-    judge_num_predict: int = 256  # бюджет вердикта (судье хватает)
-    judge_timeout_sec: int = 30  # клиентский таймаут вызова судьи
+    # №49: 0 = авто-бюджет; 256 — прежний потолок (legacy при неизвестном контексте).
+    judge_num_predict: int = 0
+    # №49 (arch §13.1): тип модели слота judge (reasoning | generation).
+    judge_model_type: str = "generation"
+    # №49 (arch §13.4): 900 = потолок back-off/паузы слота; было 30.
+    judge_timeout_sec: int = 900  # клиентский таймаут вызова судьи
+    judge_context_tokens: int = 0  # заявленный контекст модели judge (0 — неизвестен)
     rrf_k: int = 60
 
     # --- связи заметок, уровень 0 (lsb-0010, релиз 3.1.0) ---
@@ -164,12 +197,112 @@ class Settings(BaseSettings):
     # выше общего батча — экономия вызовов моделей (arch §3.2/§3.4, дефолт 10).
     job_nodes_classifier_budget: int = 10
 
+    # Джоба «предупреждения» `warnings` (№12, релиз 3.2.0; arch §6.5/§8):
+    # обход РАЗМЕЩЁННЫХ заметок (не `default` либо уже разобранных `nodes`) и
+    # подсветка расхождения с разметкой классификатора — БЕЗ автоматического
+    # переноса (§13.5). Интервал ≥ 30 с (дефолт 1 час), батч ≥ 1 (дефолт 20),
+    # бюджет вызовов классификатора за прогон ≥ 1 и ≤ батча (дефолт 10),
+    # порог уверенности 0..1 (дефолт 0.80), строгий уровень «родитель/ребёнок»
+    # (дефолт false — мелкий шум не подсвечиваем); выключатель (false — джоба
+    # не стартует, но её очередь остаётся видна в /health).
+    job_warnings_enabled: bool = True
+    job_warnings_interval_sec: int = 3600
+    job_warnings_batch: int = 20
+    job_warnings_classifier_budget: int = 10
+    warnings_min_confidence: float = 0.80
+    warnings_level_strict: bool = False
+
+    # Джоба `terms-normalize` (№32, релиз 3.2.0; arch §6.6/§8): кластеры
+    # контекстов термина + каноничное написание, без LLM. Интервал ≥ 30 с
+    # (дефолт 1800), батч (терминов за прогон) ≥ 1 (дефолт 50), порог
+    # кластеризации single-linkage 0..1 (дефолт 0.75, отдельно от
+    # `term_context_similarity`, чтобы тюнинг фона не ослаблял мягкий отказ на
+    # записи), порог переизбытка контекстов ≥ 2 (дефолт 5). Выключатель; джоба
+    # подчиняется ещё и `AREA_TERMS_ENABLED` (№40).
+    job_terms_enabled: bool = True
+    job_terms_interval_sec: int = 1800
+    job_terms_batch: int = 50
+    job_terms_cluster_similarity: float = 0.75
+    job_terms_contexts_excess: int = 5
+
     # --- лимиты (NFR-6: env-переопределяемы, валидируются; см. _validate_ranges) ---
     max_note_chars: int = 35000  # 2000→20000 (Фаза 7) → 35000 (решение О. 2026-08-30)
     max_query_chars: int = 512
+    # no24-01 (3.2.0): лимит пометки заметки `comment` (доменная валидация,
+    # не CHECK схемы; мягкий отказ CommentValidationError).
+    comment_max_chars: int = 250
 
     # --- фоновые операции ---
     pending_retry_sec: int = 30  # стартовый интервал до-векторизации/досуммаризации
+
+    # --- разрывы слотов (№39, релиз 3.2.0) ----------------------------------
+    # SLOT_PAUSE_SEC — пауза слота при разрыве (= потолок back-off), пробный
+    # стук раз в паузу; SLOT_PAUSE_AFTER — сколько подряд нетранзиентных
+    # отказов ОДНОГО исхода открывают разрыв (для `auth` — сразу, порог не
+    # применяется); SLOT_HINT_EVERY_SEC — троттлинг хинта «предупреди своего
+    # человека» на слот (0 — каждый вызов, не рекомендуется). Валидируются
+    # при старте (см. _validate_ranges).
+    slot_pause_sec: int = 900
+    slot_pause_after: int = 3
+    slot_hint_every_sec: int = 900
+    # SLOT_MAX_ATTEMPTS — предел попыток ПАРЫ до состояния «требует
+    # вмешательства»: при исчерпании задание замирает, оставаясь `pending`
+    # (вызовы модели не жгутся), и возвращается в работу при уходе причины
+    # (№39 §6.8, no39-02). SLOT_ATTENTION_RESET_ON_START — выполнять ли
+    # стартовую сверку отпечатка конфигурации слотов: true — отпечаток
+    # (`slot_config_fingerprint`, lsbdef0008-02) сравнивается с записанным в
+    # `meta` и внимание снимается при его отсутствии/отличии; false — шаг
+    # отключён целиком (воля оператора, отпечаток не читается и не пишется).
+    slot_max_attempts: int = 8
+    slot_attention_reset_on_start: bool = True
+
+    # --- decision-слот (LSBN-F-12, релиз 3.2.0; arch §6.4/§8/§13.6) ----------
+    # Третий тип слота: клиентская ветка POST /v1/systemone (state + вопросы →
+    # вероятности). Выключен по умолчанию — решения идут генеративно, как
+    # сегодня (нулевой риск регресса); включается и настраивается из
+    # docker-compose. Провайдер — нативный ollama ≥ 0.35.1 (маршрут НЕ
+    # OpenAI-совместимый); ключ уходит Bearer-ом только при заданном значении.
+    # THRESHOLD/UNCERTAINTY_ZONE — механизм переключения (числа выверяются на
+    # тестировании); MAX_QUESTIONS/MAX_LABELS — потолки запроса.
+    decision_enabled: bool = False
+    decision_base_url: str = ""
+    decision_model: str = ""
+    decision_api_key: str = ""
+    decision_timeout_sec: int = 300
+    decision_threshold: float = 0.5
+    decision_uncertainty_zone: float = 0.05
+    decision_fallback: bool = True
+    decision_max_questions: int = 64
+    decision_max_labels: int = 40
+
+    # --- история версий (№41, релиз 3.2.0) ---
+    # HISTORY_ENABLED — выключатель слоя истории (kill switch): false —
+    # версии не пишутся, чтение отдаёт пусто. HISTORY_MAX_VERSIONS — потолок
+    # версий на запись (0 — хранить всё, дефолт FR-10.1); HISTORY_RETENTION_DAYS
+    # — срок хранения версий в сутках (0 — без ограничения). При >0 prune
+    # вычищает старейшие версии и перебазирует самую раннюю сохраняемую в
+    # полный snapshot (§13.8). HISTORY_DELTA_INLINE_MAX — порог «поле целиком ↔
+    # построчная дельта» в символах (§5.2).
+    history_enabled: bool = True
+    history_max_versions: int = 0
+    history_retention_days: int = 0
+    history_delta_inline_max: int = 2048
+
+    # --- флаги областей (№40, релиз 3.2.0) ----------------------------------
+    # AREA_*_ENABLED — операторский выключатель области (дефолт «включено»,
+    # FR-1.1/FR-1.2): выключенная область не отдаёт MCP-ручки, её раздел и
+    # анонс не вшиваются в инструкцию, петля `areas` её не обрабатывает; при
+    # этом сервис области собирается всегда и операторский REST остаётся
+    # полным (решение владельца 2026-10-08: данные выключенной области
+    # доступны REST и слою истории). Невалидное значение — pydantic
+    # ValidationError → ConfigError → фатальный старт со перечислением ВСЕХ
+    # нарушений (FR-1.3, NFR-6), а не молчаливое выключение.
+    area_skills_enabled: bool = True
+    area_terms_enabled: bool = True
+    area_user_facts_enabled: bool = True
+    # Область «Логи ассистента» (LSBN-F-10, arch §9): гейтит MCP-ручки, раздел
+    # инструкции и фон; данные/REST/история остаются доступны (№40, §13.11).
+    area_logs_enabled: bool = True
 
     # --- прочее ---
     log_level: str = "INFO"
@@ -179,6 +312,29 @@ class Settings(BaseSettings):
     backup_dir: str = "/data/backups"
     backup_interval_sec: int = 86400  # сутки
     backup_keep: int = 7
+    # №14 (3.2.0, arch §8): проверять восстановление каждого N-го снапшота;
+    # 0 — авто-проверка выключена (только ручная POST /backups/verify).
+    backup_verify_every: int = 1
+    # №14 (3.2.0, arch §8/§13.4): вынос проверенной копии за пределы сервера.
+    # Хранится ТОЛЬКО команда: назначение и учётки живут ВНЕ репозитория и
+    # образа (host env/bind-mount), сервис передаёт команде лишь путь к файлу.
+    # Пусто (дефолт) — вынос выключен, тихий no-op без событий.
+    backup_ship_cmd: str = ""
+    backup_ship_timeout_sec: int = 300
+
+    # --- хинт о свежем релизе (№45, релиз 3.2.0; arch §6.2/§8/§13.8-13.13) ----
+    # Фоновая проверка версии: источник — локальный JSON-файл (работает без
+    # интернета) приоритетно, HTTP — осознанная опция оператора. Дефолт
+    # выключен: наличие выхода в интернет у контейнера не проверено, поэтому
+    # «сеть из рантайма» дефолтом быть не может (arch §13.8). Кеш и отметка
+    # «хинт показан» — в памяти процесса (без БД). Интервал опроса ≥ 60 с,
+    # период хинта ≥ 0 (0 — один на процесс), лимит текста 1..400.
+    update_check_enabled: bool = False
+    update_source_file: str = ""  # локальный JSON-источник (приоритетно)
+    update_check_url: str = ""  # HTTP-источник (опционально)
+    update_check_interval_sec: int = 21600  # период фонового опроса (6 ч)
+    update_hint_every_sec: int = 86400  # не чаще одного хинта за период
+    update_hint_max_chars: int = 240  # лимит текста подсказки
 
     # --- неймспейсы (Фаза 10, REQUIREMENTS §5.7/§8) ---
     namespace_auto_move_min_confidence: float = 0.80  # авто-переезд default-заметки в существующий домен
@@ -188,6 +344,26 @@ class Settings(BaseSettings):
     namespace_auto_max_per_day: int = 3  # лимит авто-созданных узлов в сутки (защита от шторма)
     namespace_max_leaves_per_domain: int = 12  # потолок листов в корне
     namespace_groom_min_notes: int = 2  # груминг: узел с меньшим числом заметок — кандидат на слияние
+    # Подсказка узла при save без `namespace` (№28, релиз 3.2.0; arch §6.2/§8):
+    # сравнение слов заголовка и первых `MEMORY_NODE_HINT_TEXT_CHARS` символов
+    # текста с сегментами путей (вес 3.0) и словами описаний (вес 2.0) — БЕЗ
+    # вызова модели; подсказка только ориентирует: заметку не двигает и запись
+    # не блокирует (§13.2). `MIN_SCORE` 2.0 = «≥1 совпавшее значимое слово»;
+    # `MAX_NODES` 1..2 (FR-1.1); выключатель гасит поле целиком.
+    memory_node_hint_enabled: bool = True
+    memory_node_hint_min_score: float = 2.0
+    memory_node_hint_max_nodes: int = 2
+    memory_node_hint_text_chars: int = 200
+    # Подсказка «похожее» при save (№30, релиз 3.2.0; arch §6.4/§8/§13.4):
+    # кандидаты из FTS-индекса `notes_fts` + Dice по значимым словам заголовка
+    # и первых `MEMORY_SIMILAR_TEXT_CHARS` символов текста — БЕЗ вызова модели
+    # (вектор свежей заметки ещё не построен). Подсказка не блокирует запись
+    # и не роняет её при сбое поиска; `LIMIT` 1..3; `POOL` ≥ `LIMIT`.
+    memory_similar_enabled: bool = True
+    memory_similar_limit: int = 2
+    memory_similar_pool: int = 5
+    memory_similar_threshold: float = 0.30
+    memory_similar_text_chars: int = 500
     # Судья структуры (Фаза 10): отдельный флаг think — дедуп-судья остаётся
     # думающим (решение Фазы 8), судья структуры бездумный (E2E Шага 7:
     # думающий «залипал» на парах-близнецах, голодая суммаризацию; вердикт
@@ -219,6 +395,14 @@ class Settings(BaseSettings):
     user_similar_strong: float = 0.85  # мягкий отказ «почти тот же факт»
     user_similar_weak: float = 0.55  # средняя зона: запись + список похожих
     user_search_excerpt_chars: int = 300  # обрезка body в выдаче поиска
+    # Область «Логи ассистента» (LSBN-F-10, arch §9): лимиты формы записи
+    # (валидация сервиса, CHECK-констрейнтов нет) и обрезка action в выдаче.
+    logs_action_max_chars: int = 500
+    logs_reason_max_chars: int = 500
+    logs_entity_ref_max_chars: int = 200
+    logs_outcome_max_chars: int = 500
+    logs_verified_max_chars: int = 200
+    logs_search_excerpt_chars: int = 300
 
     @field_validator(
         "embedding_base_url",
@@ -245,6 +429,26 @@ class Settings(BaseSettings):
                 "провайдер — один из " + ", ".join(sorted(LLM_PROVIDERS))
             )
         return provider
+
+    @field_validator("summary_model_type", "judge_model_type")
+    @classmethod
+    def _validate_model_type(cls, value: str) -> str:
+        """Тип модели слота — один из {reasoning, generation} (arch §13.1).
+
+        `decision` — самостоятельный слот со своим конфигом: попытка объявить
+        его у генеративного слота отправляет оператора к `DECISION_ENABLED`.
+        """
+        model_type = value.strip().lower()
+        if model_type == "decision":
+            raise ValueError(
+                "decision — отдельный слот: enable the decision slot via "
+                "DECISION_ENABLED instead"
+            )
+        if model_type not in LLM_MODEL_TYPES:
+            raise ValueError(
+                "тип модели — один из " + ", ".join(sorted(LLM_MODEL_TYPES))
+            )
+        return model_type
 
     @field_validator("log_level")
     @classmethod
@@ -292,6 +496,7 @@ class Settings(BaseSettings):
         need_low("max_note_chars", self.max_note_chars, 1)
         need_low("max_query_chars", self.max_query_chars, 1)
         need_low("max_summary_chars", self.max_summary_chars, 1)
+        need_low("comment_max_chars", self.comment_max_chars, 1)
         need_low("snippet_chars", self.snippet_chars, 1)
         need_low("max_get_batch", self.max_get_batch, 1)
         need_range("default_top_k", self.default_top_k, 1, 20)
@@ -301,6 +506,9 @@ class Settings(BaseSettings):
         need_low("default_list_limit", self.default_list_limit, 1)
         need_low("list_max_limit_mcp", self.list_max_limit_mcp, 1)
         need_low("list_max_limit_rest", self.list_max_limit_rest, 1)
+        # Джоба `warnings` (№12, 3.2.0): потолки страницы предупреждений (§7.1).
+        need_low("warnings_max_limit_mcp", self.warnings_max_limit_mcp, 1)
+        need_low("warnings_max_limit_rest", self.warnings_max_limit_rest, 1)
         if self.default_list_limit > self.list_max_limit_mcp:
             errors.append(
                 "  - default_list_limit: default page size above the MCP "
@@ -370,15 +578,78 @@ class Settings(BaseSettings):
                 "не разберётся"
             )
 
+        # Джоба `warnings` (№12, 3.2.0): интервал ≥ 30, батч ≥ 1, бюджет
+        # классификатора ≥ 1 и не выше батча, порог уверенности 0..1.
+        need_low("job_warnings_interval_sec", self.job_warnings_interval_sec, 30)
+        need_low("job_warnings_batch", self.job_warnings_batch, 1)
+        need_low(
+            "job_warnings_classifier_budget", self.job_warnings_classifier_budget, 1
+        )
+        if self.job_warnings_classifier_budget > self.job_warnings_batch:
+            errors.append(
+                "  - job_warnings_classifier_budget: бюджет классификатора выше "
+                "общего батча job_warnings_batch — за прогон столько заметок "
+                "не разберётся"
+            )
+        need_range(
+            "warnings_min_confidence", self.warnings_min_confidence, 0.0, 1.0
+        )
+
+        # Джоба `terms-normalize` (№32, 3.2.0): интервал ≥ 30, батч ≥ 1, порог
+        # кластеризации 0..1, порог переизбытка контекстов ≥ 2.
+        need_low("job_terms_interval_sec", self.job_terms_interval_sec, 30)
+        need_low("job_terms_batch", self.job_terms_batch, 1)
+        need_low(
+            "job_terms_contexts_excess", self.job_terms_contexts_excess, 2
+        )
+        need_range(
+            "job_terms_cluster_similarity",
+            self.job_terms_cluster_similarity,
+            0.0,
+            1.0,
+        )
+
         # --- векторизация / суммаризация ---
         need_low("embedding_dim", self.embedding_dim, 1)
-        need_low("summary_num_predict", self.summary_num_predict, 1)
-        need_low("merge_num_predict", self.merge_num_predict, 1)
+        # №49: бюджет 0 — «сколько влезет» (авто), поэтому минимум 0; контексты
+        # 0 — неизвестен (деградация); запас/потолок ≥ 1; запас обязан быть
+        # меньше заявленного контекста (иначе он съедает весь контекст).
+        need_low("summary_num_predict", self.summary_num_predict, 0)
+        need_low("merge_num_predict", self.merge_num_predict, 0)
+        need_low("summary_context_tokens", self.summary_context_tokens, 0)
         need_low("summary_timeout_sec", self.summary_timeout_sec, 1)
-        # LLM-судья дедупа (Фаза 8, Этап 3.1; Фаза 11 — judge_*): бюджет и
-        # таймаут ≥ 1 (NFR-6).
-        need_low("judge_num_predict", self.judge_num_predict, 1)
+        # LLM-судья дедупа (Фаза 8, Этап 3.1; Фаза 11 — judge_*): бюджет 0 =
+        # авто, контекст 0 — неизвестен, таймаут ≥ 1 (NFR-6).
+        need_low("judge_num_predict", self.judge_num_predict, 0)
+        need_low("judge_context_tokens", self.judge_context_tokens, 0)
+        need_low("slot_prompt_reserve_tokens", self.slot_prompt_reserve_tokens, 1)
+        need_low("slot_max_output_tokens", self.slot_max_output_tokens, 1)
         need_low("judge_timeout_sec", self.judge_timeout_sec, 1)
+        # №49 (arch §8): пороги типа модели — минимум 1, реляционно порог
+        # размышления не может быть выше защитного потолка авто-бюджета.
+        need_low(
+            "slot_reasoning_min_output_tokens",
+            self.slot_reasoning_min_output_tokens,
+            1,
+        )
+        need_low("slot_min_timeout_sec", self.slot_min_timeout_sec, 1)
+        if self.slot_reasoning_min_output_tokens > self.slot_max_output_tokens:
+            errors.append(
+                "  - slot_reasoning_min_output_tokens: порог "
+                f"{self.slot_reasoning_min_output_tokens} выше защитного потолка "
+                f"slot_max_output_tokens ({self.slot_max_output_tokens}) — "
+                "предупреждение недостижимо"
+            )
+        for context_field, context in (
+            ("summary_context_tokens", self.summary_context_tokens),
+            ("judge_context_tokens", self.judge_context_tokens),
+        ):
+            if context > 0 and self.slot_prompt_reserve_tokens >= context:
+                errors.append(
+                    "  - slot_prompt_reserve_tokens: запас "
+                    f"{self.slot_prompt_reserve_tokens} не меньше контекста "
+                    f"{context_field} ({context}) — авто-бюджет всегда упирался бы в минимум"
+                )
 
         # --- чанковая индексация (Фаза 7) ---
         if self.text_splitter.strip().lower() != "tiktoken":
@@ -394,13 +665,86 @@ class Settings(BaseSettings):
         # --- фоновые операции (0 допускается: у юнит-тестов — режим без пауз) ---
         need_low("pending_retry_sec", self.pending_retry_sec, 0)
 
+        # --- разрывы слотов (№39): пауза ≥ 30 (дёшево, но не в цикле),
+        # порог открытия ≥ 1, троттлинг хинта ≥ 0 (0 — каждый вызов).
+        need_low("slot_pause_sec", self.slot_pause_sec, 30)
+        need_low("slot_pause_after", self.slot_pause_after, 1)
+        need_low("slot_hint_every_sec", self.slot_hint_every_sec, 0)
+        # --- счётчик попыток пары (№39 §6.8, no39-02): предел ≥ 1 ---
+        need_low("slot_max_attempts", self.slot_max_attempts, 1)
+
+        # --- decision-слот (LSBN-F-12, arch §8): таймаут ≥ 1, потолок вопросов
+        # в 1..64 (лимит модели), потолок меток ≥ 2, порог и зона в 0..1. При
+        # включённом слоте обязательны непустые адрес (http(s)) и модель, а
+        # порог ± зона обязаны лежать внутри 0..1 (иначе зона уходит за границы).
+        need_low("decision_timeout_sec", self.decision_timeout_sec, 1)
+        need_range("decision_max_questions", self.decision_max_questions, 1, 64)
+        need_low("decision_max_labels", self.decision_max_labels, 2)
+        need_range("decision_threshold", self.decision_threshold, 0.0, 1.0)
+        need_range(
+            "decision_uncertainty_zone", self.decision_uncertainty_zone, 0.0, 1.0
+        )
+        if self.decision_enabled:
+            if not self.decision_base_url.strip().startswith(("http://", "https://")):
+                errors.append(
+                    "  - decision_base_url: ожидается URL с http:// или https:// "
+                    "(обязателен при DECISION_ENABLED=true)"
+                )
+            if not self.decision_model.strip():
+                errors.append(
+                    "  - decision_model: не может быть пустой при DECISION_ENABLED=true"
+                )
+            if not 0.0 <= self.decision_threshold - self.decision_uncertainty_zone:
+                errors.append(
+                    "  - decision_threshold: порог минус зона "
+                    f"{self.decision_threshold - self.decision_uncertainty_zone} "
+                    "уходит ниже 0 — зона неопределённости вне 0..1"
+                )
+            if self.decision_threshold + self.decision_uncertainty_zone > 1.0:
+                errors.append(
+                    "  - decision_threshold: порог плюс зона "
+                    f"{self.decision_threshold + self.decision_uncertainty_zone} "
+                    "уходит выше 1 — зона неопределённости вне 0..1"
+                )
+
+        # --- история версий (№41): 0 — «без ограничения» для потолка версий и
+        # срока хранения (дефолт — хранить всё); порог дельты ≥ 1 (иначе
+        # построчное кодирование длинных полей не включилось бы никогда).
+        need_low("history_max_versions", self.history_max_versions, 0)
+        need_low("history_retention_days", self.history_retention_days, 0)
+        need_low("history_delta_inline_max", self.history_delta_inline_max, 1)
+
         # --- backup (NFR-3) ---
         need_low("backup_interval_sec", self.backup_interval_sec, 1)
         need_low("backup_keep", self.backup_keep, 1)
+        # №14 (arch §8): 0 — авто-проверка выключена (только вручную).
+        need_low("backup_verify_every", self.backup_verify_every, 0)
+        # №14 (arch §8): таймаут команды выноса ≥ 1 (при пустой команде не важен).
+        need_low("backup_ship_timeout_sec", self.backup_ship_timeout_sec, 1)
         if not self.backup_dir.strip():
             errors.append("  - backup_dir: путь не может быть пустым")
         if not self.db_path.strip():
             errors.append("  - db_path: путь не может быть пустым")
+
+        # --- хинт о свежем релизе (№45, arch §8): интервал ≥ 60, период хинта
+        # ≥ 0 (0 — один на процесс), лимит текста 1..400; при включённой
+        # проверке обязателен хотя бы один источник (иначе — фатальный старт, NFR-6).
+        need_low("update_check_interval_sec", self.update_check_interval_sec, 60)
+        need_low("update_hint_every_sec", self.update_hint_every_sec, 0)
+        need_low("update_hint_max_chars", self.update_hint_max_chars, 1)
+        if self.update_hint_max_chars > 400:
+            errors.append(
+                "  - update_hint_max_chars: больше 400 — текст подсказки "
+                "раздувает ответ (arch §8), получено "
+                f"{self.update_hint_max_chars}"
+            )
+        if self.update_check_enabled and not (
+            self.update_source_file.strip() or self.update_check_url.strip()
+        ):
+            errors.append(
+                "  - update_check_enabled: проверка включена без источника — "
+                "задай UPDATE_SOURCE_FILE (локальный JSON) или UPDATE_CHECK_URL"
+            )
 
         # --- неймспейсы (Фаза 10) ---
         need_range(
@@ -424,6 +768,35 @@ class Settings(BaseSettings):
             "namespace_max_leaves_per_domain", self.namespace_max_leaves_per_domain, 1
         )
         need_low("namespace_groom_min_notes", self.namespace_groom_min_notes, 0)
+        # №28: порог отбора ≥ 0 (2.0 — дефолт), потолок узлов 1..2 (FR-1.1),
+        # текст для сравнения — хотя бы один символ.
+        need_range(
+            "memory_node_hint_min_score", self.memory_node_hint_min_score, 0.0, 1e6
+        )
+        need_low("memory_node_hint_max_nodes", self.memory_node_hint_max_nodes, 1)
+        if self.memory_node_hint_max_nodes > 2:
+            errors.append(
+                "  - memory_node_hint_max_nodes: больше 2 узлов — ответ раздувается "
+                "(FR-1.1, arch §13.1), получено "
+                f"{self.memory_node_hint_max_nodes}"
+            )
+        need_low("memory_node_hint_text_chars", self.memory_node_hint_text_chars, 1)
+        # №30: лимит/пул/текст ≥ 1, порог 0..1; потолок подсказок 1..3 (arch
+        # §6.4 — ответ ≤2, допускаем 3 с запасом) и пул не меньше лимита.
+        need_low("memory_similar_limit", self.memory_similar_limit, 1)
+        need_low("memory_similar_pool", self.memory_similar_pool, 1)
+        need_low("memory_similar_text_chars", self.memory_similar_text_chars, 1)
+        need_range("memory_similar_threshold", self.memory_similar_threshold, 0.0, 1.0)
+        if self.memory_similar_limit > 3:
+            errors.append(
+                "  - memory_similar_limit: больше 3 — ответ раздувается "
+                f"(arch §6.4), получено {self.memory_similar_limit}"
+            )
+        if self.memory_similar_pool < self.memory_similar_limit:
+            errors.append(
+                "  - memory_similar_pool: меньше memory_similar_limit — "
+                f"кандидатов меньше, чем подсказок, получено {self.memory_similar_pool}"
+            )
 
         # --- области 3.0.0 (субстрат: skills / terms / user) ---
         for field in (
@@ -444,6 +817,12 @@ class Settings(BaseSettings):
             "user_name_max_words",
             "user_body_max_chars",
             "user_search_excerpt_chars",
+            "logs_action_max_chars",
+            "logs_reason_max_chars",
+            "logs_entity_ref_max_chars",
+            "logs_outcome_max_chars",
+            "logs_verified_max_chars",
+            "logs_search_excerpt_chars",
         ):
             need_low(field, getattr(self, field), 1)
         # Пороги сходства — косинус/триграммы: шкала 0..1 (как у дедупа).

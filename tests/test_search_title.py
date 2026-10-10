@@ -328,3 +328,21 @@ class TestBm25TitleWeight:
         ранжирование задают bm25-веса — A выше B."""
         hits = titled_pair.search("taskflow")["results"]
         assert [hit["id"] for hit in hits] == [1, 2]
+
+
+class TestFreshnessFilter:
+    """no29-01: `updated_after` фильтрует и title-режим (граница включающая)."""
+
+    def test_search_title_updated_after(self, service) -> None:
+        """Старое название не проходит фильтр свежести; выдача не меняется."""
+        searcher, notes_service = service
+        notes_service.save("Текст один", title="Дежурство Халпи")
+        notes_service.save("Текст два", title="Дежурство Халпи")
+        set_meta(1, updated_at="2026-01-01T00:00:00Z")
+        set_meta(2, updated_at="2026-02-01T00:00:00Z")
+        hits = searcher.search_title(
+            "дежурство", updated_after="2026-02-01T00:00:00Z"
+        )["results"]
+        # заметка ровно на границе входит; старая отсекается
+        assert [hit["id"] for hit in hits] == [2]
+        assert set(hits[0]) == {"id", "title", "namespace", "summary", "score"}

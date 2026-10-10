@@ -20,7 +20,7 @@ from app.services.listing import page_fields
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService, NoteValidationError
 from app.services.skills import SkillValidationError, SkillsService
-from app.storage.db import init_db
+from app.storage.db import init_db, session, transaction
 
 MCP_LIMIT = 20  # LIST_MAX_LIMIT_MCP default
 REST_LIMIT = 50  # LIST_MAX_LIMIT_REST default
@@ -191,6 +191,61 @@ class TestNotesListFields:
         assert exact["total"] == 1
         assert [item["namespace"] for item in exact["items"]] == ["work"]
         assert exact["has_more"] is False
+
+
+class TestNotesListFreshness:
+    """no29-01: `updated_after` — включающая граница свежести страницы и total."""
+
+    @staticmethod
+    def _set_updated_at(note_id: int, stamp: str) -> None:
+        """Прямая правка updated_at (триггер FTS — UPDATE OF text,title — не срабатывает)."""
+        with session(get_settings()) as conn, transaction(conn):
+            conn.execute(
+                "UPDATE notes SET updated_at = ? WHERE id = ?", (stamp, note_id)
+            )
+
+    def test_list_updated_after_filters_and_total(self, notes: NoteService) -> None:
+        for i in range(3):
+            notes.save(unique(f"note {i}"))
+        self._set_updated_at(1, "2026-01-01T00:00:00Z")
+        self._set_updated_at(2, "2026-02-01T00:00:00Z")
+        self._set_updated_at(3, "2026-03-01T00:00:00Z")
+        result = notes.list(limit=REST_LIMIT, updated_after="2026-02-01T00:00:00Z")
+        # только не старше границы; порядок updated_at DESC, id DESC
+        assert [item["id"] for item in result["items"]] == [3, 2]
+        assert result["total"] == 2  # total согласован с фильтром страницы
+        assert result["has_more"] is False
+
+    def test_list_updated_after_inclusive_boundary(self, notes: NoteService) -> None:
+        for i in range(2):
+            notes.save(unique(f"note {i}"))
+        self._set_updated_at(1, "2026-01-01T00:00:00Z")
+        self._set_updated_at(2, "2026-02-01T00:00:00Z")
+        result = notes.list(limit=REST_LIMIT, updated_after="2026-02-01T00:00:00Z")
+        # заметка ровно на границе остаётся (>= , не >)
+        assert [item["id"] for item in result["items"]] == [2]
+        assert result["total"] == 1
+
+    def test_list_updated_after_combines_with_namespace(
+        self, notes: NoteService
+    ) -> None:
+        namespaces = NamespaceService(get_settings())
+        namespaces.create("work", "Work notes.")
+        notes.save(unique("work fresh"), namespace="work")
+        notes.save(unique("work old"), namespace="work")
+        notes.save(unique("default fresh"))
+        self._set_updated_at(1, "2026-02-01T00:00:00Z")
+        self._set_updated_at(2, "2026-01-01T00:00:00Z")
+        self._set_updated_at(3, "2026-02-01T00:00:00Z")
+        fresh = notes.list(
+            limit=REST_LIMIT,
+            namespace="work",
+            namespace_exact=True,
+            updated_after="2026-02-01T00:00:00Z",
+        )
+        # пересечение фильтров: узел work И свежесть; заметка в default не входит
+        assert [item["id"] for item in fresh["items"]] == [1]
+        assert fresh["total"] == 1
 
 
 class TestSkillsList:

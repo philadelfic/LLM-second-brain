@@ -201,9 +201,10 @@ class TestMCPChars:
             assert set(item) == {"id", "title", "namespace"}
 
     @pytest.mark.asyncio
-    async def test_mcp_surface_is_21_tools(self) -> None:
-        """Поверхность не расширялась: те же 21 инструмент (arch §3.8)."""
-        assert len(TOOL_NAMES) == 21
+    async def test_mcp_surface_is_31_tools(self) -> None:
+        """Поверхность = 23 + 1 предупреждения (№12) + 1 пометок (no24-02) + 6 логов
+        (LSBN-F-10, f10-02/03): 31."""
+        assert len(TOOL_NAMES) == 31
 
 
 class TestRESTChars:

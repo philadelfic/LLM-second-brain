@@ -574,4 +574,6 @@ def test_queue_stat_matches_direct_sql(settings: Settings) -> None:
 def test_queue_stat_empty_is_null(settings: Settings) -> None:
     """Пустая очередь: pending 0, oldest_pending_sec — null."""
     spec = links_spec(make_worker(settings), settings)
-    assert spec.queue_stat() == {"pending": 0, "oldest_pending_sec": None}
+    assert spec.queue_stat() == {
+        "pending": 0, "oldest_pending_sec": None, "waiting": 0, "attention": 0
+    }

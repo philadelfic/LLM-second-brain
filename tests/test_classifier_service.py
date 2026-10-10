@@ -87,7 +87,8 @@ def test_classify_returns_classification(monkeypatch) -> None:
     body = ok_body('{"hint_path": "work/sbos-2020", "confidence": 0.9}')
     service, _ = make_service(settings, [httpx.Response(200, json=body)])
     result = service.classify(NOTE, KNOWN)
-    assert result == Classification("work/sbos-2020", 0.9)
+    assert (result.hint_path, result.confidence) == ("work/sbos-2020", 0.9)
+    assert result.meta is not None  # №49: результат несёт метаданные вызова
     assert service.last_attempt_ok is True
     service.close()
 
@@ -97,7 +98,7 @@ def test_general_note_returns_null_hints(monkeypatch) -> None:
     body = ok_body('{"hint_path": null, "confidence": 0.2}')
     service, _ = make_service(settings, [httpx.Response(200, json=body)])
     result = service.classify(NOTE, KNOWN)
-    assert result == Classification(None, 0.2)
+    assert (result.hint_path, result.confidence) == (None, 0.2)
     service.close()
 
 
@@ -173,7 +174,9 @@ def test_thinking_response_wrapper_stripped(monkeypatch) -> None:
     )
     service, _ = make_service(settings, [httpx.Response(200, json=ok_body(content))])
     result = service.classify(NOTE, KNOWN)
-    assert result == Classification("work", 0.7)
+    assert (result.hint_path, result.confidence) == ("work", 0.7)
+    # №49: метаданные вызова (бюджет, тип модели, токены) едут в отрыве от разбора JSON
+    assert result.meta is not None and result.meta.operation == "classify"
     service.close()
 
 

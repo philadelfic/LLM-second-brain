@@ -125,11 +125,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 from app.config import TITLE_MAX_WORDS, Settings
+from app.services import history
 from app.services import jobs
-from app.services.areas import AreaSpec, ALL_AREAS
+from app.services.areas import AreaSpec, ALL_AREAS, enabled_areas
 from app.services.classifier import Classification, ClassificationError, Classifier
+from app.services.decision import SLOT_DECISION, DecisionService
 from app.services.dedup import DeduplicationService
 from app.services.embedding import Embedder, EmbeddingError
 # Back-off и его потолок перенесены в каркас джоб (lsb-0014, arch §3.3):
@@ -146,10 +149,15 @@ from app.services.jobs import (
     run_loop,
 )
 from app.services.judge import Judge, JudgeError
+from app.services.llm_client import CHECK_AUTH_FAILED, CHECK_OK, ChatMeta
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
 from app.services.promotion import PromotionService
+from app.services.slot_breaker import SlotBreaker
+from app.services.slot_budget import slot_config_fingerprint
+from app.services.slot_outcome import SlotOutcome, outcome_of
 from app.services.summary import Summarizer, SummaryError, cap_summary
+from app.services.terms import TermsService
 from app.storage import area_vectors, chunks, vectors
 from app.storage.db import delete_note_physical, session, transaction
 
@@ -175,10 +183,71 @@ EXPIRATION_JOB = "expiration"
 # Джоба «порядок в узлах» (lsb-0011-01): обход накопленного `default`.
 NODES_JOB = "nodes"
 
+# LLM-слоты джоб (№39, arch §6.2): разрыв живёт на СЛОТ, а не на джобу —
+# слот summary делят суммаризация/слияние/классификация/описания и обход
+# `nodes`; слот judge — dedup-судья и судья структуры.
+SLOT_EMBEDDING = "embedding"
+SLOT_SUMMARY = "summary"
+SLOT_JUDGE = "judge"
+SLOT_NAMES = (SLOT_EMBEDDING, SLOT_SUMMARY, SLOT_JUDGE)
+
 # Имя работы слота `nodes` после сшивания (lsb-0012, arch §3.5): объединённая
 # заметка может лежать в ЛЮБОМ узле — обход `default` её не найдёт, поэтому
 # реклассификация ставится заданием.
 NODES_RECLASS_KIND = "reclass"
+
+# Счётчик попыток пары и состояние «требует вмешательства» (№39, arch §6.8):
+# нетранзиентные исходы замораживают пару — задание перестаёт браться
+# (вызовы модели не жгутся), но остаётся `pending`. `unavailable`/`timeout`/
+# `auth` счётчик НЕ замораживают: ими занимаются back-off и разрыв слота.
+_NON_TRANSIENT_OUTCOMES = frozenset(
+    {SlotOutcome.EMPTY, SlotOutcome.TRUNCATED, SlotOutcome.OFF_CONTRACT}
+)
+
+# Слот → имя джобы-владельца очереди (для событий внимания и /jobs/attention).
+_SLOT_JOB_NAMES = {
+    SLOT_EMBEDDING: EMBEDDING_JOB,
+    SLOT_SUMMARY: SUMMARY_JOB,
+    SLOT_JUDGE: JUDGE_JOB,
+    NODES_JOB: NODES_JOB,
+}
+
+
+def _call_meta_fields(meta: ChatMeta) -> dict[str, object]:
+    """Поля вызова для события отказа (§7.2): цифры/признаки, без секретов."""
+    return {
+        "operation": meta.operation,
+        "model_type": meta.model_type,
+        "budget": meta.budget,
+        "budget_source": meta.budget_source,
+        "prompt_tokens": meta.prompt_tokens,
+        "completion_tokens": meta.completion_tokens,
+        "reasoning_tokens": meta.reasoning_tokens,
+        "had_thinking": meta.had_thinking,
+        "finish_reason": meta.finish_reason,
+        "duration_ms": meta.duration_ms,
+    }
+
+
+def _call_log_fields(meta: ChatMeta) -> dict[str, object]:
+    """Полный набор полей успешного вызова `slot_call` (№49, §7.2)."""
+    fields = _call_meta_fields(meta)
+    fields.update(
+        {
+            "provider": meta.provider,
+            "model": meta.model,
+            "thinking_chars": meta.thinking_chars,
+            "truncated": meta.truncated,
+        }
+    )
+    return fields
+
+# meta-ключ отпечатка конфигурации слотов (№39, arch §6.8/§13.3): смена
+# конфигурации слота — часть «причины» внимания, поэтому старт со сменой
+# отпечатка снимает `attention_at` у всех заданий. Состав отпечатка живёт в
+# `slot_budget.slot_config_fingerprint` (lsbdef0008-02): модель, тип, бюджет,
+# контекст, запас, потолок и параметры decision — одной реализацией на систему.
+SLOT_CONFIG_META_KEY = "slot_config_fingerprint"
 
 # Единое правило выборки быстрого пула обхода `default` (lsb-0011-01, arch §3.2):
 # активные default-заметки с готовой разметкой (`hint_path` + `confidence` не
@@ -321,6 +390,8 @@ class BackgroundWorker:
         judge: Judge | None = None,
         classifier: Classifier | None = None,
         promoter: PromotionService | None = None,
+        terms: TermsService | None = None,
+        decision: DecisionService | None = None,
     ) -> None:
         self._settings = settings
         self._embedding = embedding
@@ -330,6 +401,10 @@ class BackgroundWorker:
         # косинус-кандидату (judge-петля, Этап 3.2). None — тестовый режим:
         # воркер сводит по косинус-фоллбеку Этапа 2.2.
         self._judge = judge
+        # LSBN-F-12: decision-слот (None — выключен, поведение v3.1.0). Разрыв
+        # decision живёт ВНУТРИ сервиса (§13.8), воркер его не ведёт — берём
+        # только снимок для `/health.slots.decision`.
+        self._decision = decision
         # Фоновый дедуп (Фаза 8, Этап 2): поиск косинус-кандидатов против
         # ранних заметок. DI для тестов.
         self._dedup = (
@@ -351,6 +426,10 @@ class BackgroundWorker:
         # Реестр неймспейсов: известные узлы для классификатора и проверка
         # целевого узла авто-переезда.
         self._namespaces = NamespaceService(settings)
+        # Область terms (3.0.0, lsb-0008; 3.2.0 — джоба `terms-normalize`):
+        # тот же экземпляр, что у транспорта/петли areas (DI из build_services).
+        # None — DI-сборка без области: сборщик джобы не регистрируется (§6.6).
+        self._terms = terms
         # Триггер домена (Фаза 10, Шаг 5): авто-создание листов из hint-групп
         # после классификации; None — тестовый режим без триггера (в проде
         # DI из build_services: describer + судья структуры).
@@ -370,6 +449,23 @@ class BackgroundWorker:
             EXPIRATION_JOB: BackoffState(
                 EXPIRATION_CLEANUP_INTERVAL_SEC, fixed=True
             ),
+        }
+        # Разрывы слотов (№39, arch §6.2): состояние СЛОТА, а не джобы —
+        # слот делят разные петли (summary: суммаризация/слияние/
+        # классификация/описания и обход `nodes`; judge: dedup и структура),
+        # поэтому разрыв живёт в одной точке на слот. `_slot_gate` проверяет
+        # разрыв в начале прогона, `_log_slot_failure` фиксирует исход отказа.
+        # Пауза — SLOT_PAUSE_SEC (потолок back-off), порог открытия —
+        # SLOT_PAUSE_AFTER (auth открывает сразу). Состояние — в памяти
+        # процесса: переживания рестарта не требует (конфигурация слота
+        # переоценивается стартовой проверкой, arch §13.2).
+        self._breakers: dict[str, SlotBreaker] = {
+            name: SlotBreaker(
+                name,
+                settings.slot_pause_sec,
+                open_after=settings.slot_pause_after,
+            )
+            for name in SLOT_NAMES
         }
         self._stopping = False
         # Сигнал «появилась заметка с pending-вектором» — будит embedding-петлю
@@ -551,8 +647,667 @@ class BackgroundWorker:
             *(
                 run_loop(spec, self._is_stopping, self._job_backoff(spec))
                 for spec in specs
-            )
+            ),
+            # Старт со сменой конфигурации слота — «причина ушла»: внимание
+            # снимается, отпечаток перезаписывается (№39 §6.8/§13.3). Стартовая
+            # сверка идёт ПАРАЛЛЕЛЬНО петлям (не задерживает первый прогон).
+            self._startup_attention_reset_async(),
         )
+
+    # --- разрывы слотов (№39, arch §6.2/§6.7) ----------------------------------
+
+    def slot_states(self) -> dict[str, dict]:
+        """Снимок разрывов слотов (для журнала и хинта человеку; №39).
+
+        Только чтение памяти процесса — без обращений к моделям. Потребитель —
+        MCP-миддлварь хинта «предупреди своего человека». Полная поверхность
+        `/health.slots` и наблюдаемость очередей — постановка no39-03.
+        """
+        return {name: breaker.snapshot() for name, breaker in self._breakers.items()}
+
+    def slots_health(self) -> dict[str, dict]:
+        """Снимок слотов для `/health.slots` (№39, arch §7.2): только SQL/память.
+
+        По каждому слоту (`embedding`/`summary`/`judge`) — снимок разрыва
+        (`SlotBreaker.snapshot`: `last_outcome`, `paused_until` и др.), исход
+        последней попытки (`ok` — прецедент `embedding_ok`/`summarizer_ok`/
+        `judge_ok`) и число заданий слота в внимании (`attention`, no39-02).
+        №50 (lsbdef-0008, §7.3): плюс диагностика последнего вызова из
+        `services.*.last_meta` — `last_finish_reason`/`last_budget`/
+        `last_budget_source`/`last_had_thinking` (нет метаданных — None):
+        оператор читает причину (обрезано по бюджету / размышление съело
+        вывод) без журнала.
+        Модели НЕ вызываются: только состояние в памяти и SQL по `worker_jobs`
+        (сбор `/health` не должен будить слоты).
+        """
+        attention: dict[str, int] = {}
+        try:
+            self._ensure_job_table()
+            with session(self._settings) as conn:
+                rows = conn.execute(
+                    "SELECT slot, COUNT(*) AS c FROM worker_jobs "
+                    "WHERE attention_at IS NOT NULL GROUP BY slot"
+                ).fetchall()
+            attention = {rows[i]["slot"]: int(rows[i]["c"]) for i in range(len(rows))}
+        except Exception:  # noqa: BLE001 — наблюдаемость не роняет /health
+            attention = {}
+        services = {
+            SLOT_EMBEDDING: self._embedding,
+            SLOT_SUMMARY: self._summarizer,
+            SLOT_JUDGE: self._judge,
+        }
+        health: dict[str, dict] = {}
+        for name in SLOT_NAMES:
+            snapshot = dict(self._breakers[name].snapshot())
+            service = services.get(name)
+            snapshot["ok"] = getattr(service, "last_attempt_ok", None)
+            snapshot["attention"] = attention.get(name, 0)
+            meta = getattr(service, "last_meta", None)
+            snapshot["last_finish_reason"] = meta.finish_reason if meta else None
+            snapshot["last_budget"] = meta.budget if meta else None
+            snapshot["last_budget_source"] = meta.budget_source if meta else None
+            snapshot["last_had_thinking"] = meta.had_thinking if meta else None
+            health[name] = snapshot
+        health[SLOT_DECISION] = self._decision_slot_health(attention)
+        return health
+
+    def _decision_slot_health(self, attention: dict[str, int]) -> dict:
+        """Слот `decision` для `/health.slots` (LSBN-F-12, §7.1): только память.
+
+        Состояние берётся из `services.decision.snapshot()` (разрыв живёт в
+        сервисе, §13.8): `ok`, `last_outcome`, `paused_until`; `attention` — по
+        таблице заданий (своей очереди у decision нет — 0); четыре поля
+        диагностики последнего вызова — `None` (у decision нет `last_meta`).
+        Слот выключен/не собран — форма «выключен» (§7.1).
+        """
+        service = self._decision
+        if service is None:
+            return self._decision_disabled_stat()
+        snapshot = service.snapshot()
+        if not snapshot["enabled"]:
+            return self._decision_disabled_stat()
+        breaker = snapshot["breaker"]
+        return {
+            "ok": snapshot["ok"],
+            "last_outcome": breaker["last_outcome"],
+            "paused_until": breaker["paused_until"],
+            "attention": attention.get(SLOT_DECISION, 0),
+            "enabled": True,
+            "last_finish_reason": None,
+            "last_budget": None,
+            "last_budget_source": None,
+            "last_had_thinking": None,
+        }
+
+    @staticmethod
+    def _decision_disabled_stat() -> dict:
+        """Форма выключенного decision-слота в `/health.slots` (§7.1)."""
+        return {
+            "ok": None,
+            "last_outcome": None,
+            "paused_until": None,
+            "attention": 0,
+            "enabled": False,
+        }
+
+    def _probe_slot(self, slot: str) -> str:
+        """Один дешёвый пробный вызов слота (без генерации, №39 §6.2).
+
+        По имени слота — `probe()` соответствующего сервиса (тонкая обёртка
+        над `LLMClient.check()`). Отсутствующий сервис или фейк без `probe`
+        (тестовый режим) — заглушка `CHECK_OK` (прецедент стартовой проверки).
+        """
+        service = {
+            SLOT_EMBEDDING: self._embedding,
+            SLOT_SUMMARY: self._summarizer,
+            SLOT_JUDGE: self._judge,
+        }.get(slot)
+        probe = getattr(service, "probe", None)
+        if probe is None:
+            return CHECK_OK
+        return probe()
+
+    def _slot_gate(self, slot: str | None, job: str | None = None) -> bool:
+        """Ворота слота: можно ли брать партию (№39, arch §6.2/§6.7).
+
+        `None`/неизвестный слот — True (разрыва нет). Разрыв закрыт — True.
+        Разрыв открыт и стук не наступил — False (партия не берётся, вызовы
+        модели не жгутся; прогон возвращает 0 → back-off петли). Стук наступил
+        — один `probe()`: `CHECK_OK` снимает разрыв (партия идёт в этом же
+        прогоне), `auth_failed`/иное — пауза переставляется, партии нет.
+        """
+        if slot is None:
+            return True
+        breaker = self._breakers.get(slot)
+        if breaker is None:
+            return True
+        effective_job = job or slot
+        now = time.time()
+        if breaker.probe_due(now):
+            result = self._probe_slot(slot)
+            self._log_slot_event("slot_probe", slot, effective_job, result=result)
+            if result == CHECK_OK:
+                breaker.note_success()
+                self._reset_attention_for_slot(slot, "probe")
+                self._log_slot_event(
+                    "slot_resumed",
+                    slot,
+                    effective_job,
+                    after_sec=self._settings.slot_pause_sec,
+                )
+                return True
+            outcome = (
+                SlotOutcome.AUTH
+                if result == CHECK_AUTH_FAILED
+                else SlotOutcome.UNAVAILABLE
+            )
+            self._note_slot_outcome(effective_job, slot, outcome)
+            return False
+        if breaker.is_paused(now):
+            return False
+        return True
+
+    def _note_slot_outcome(self, job: str, slot: str, outcome: SlotOutcome) -> bool:
+        """Зафиксировать исход у разрыва слота; True — разрыв открылся сейчас."""
+        breaker = self._breakers.get(slot)
+        if breaker is None:
+            return False
+        opened = breaker.note_failure(outcome)
+        if opened:
+            self._log_slot_event(
+                "slot_paused",
+                slot,
+                job,
+                level=logging.WARNING,
+                outcome=outcome.value
+                if isinstance(outcome, SlotOutcome)
+                else str(outcome),
+                paused_until=breaker.snapshot()["paused_until"],
+            )
+        return opened
+
+    def _log_slot_failure(
+        self,
+        job: str,
+        slot: str,
+        outcome: SlotOutcome,
+        *,
+        event: str,
+        message: str = "slot call failed",
+        note_id: int | None = None,
+        older_id: int | None = None,
+        candidate_id: int | None = None,
+        detail: str | None = None,
+        meta: ChatMeta | None = None,
+        **extra: object,
+    ) -> None:
+        """Единая точка отказа слота (№39, arch §6.7): событие + исход в журнал.
+
+        Поля события: `event`, `job`, `slot`, `outcome` (значение строки),
+        `detail` (фрагмент ≤160 симв.; секреты маскируются 4 симв. + `***`),
+        `note_id`/`older_id`/`candidate_id` по факту. №49: если вызов модели
+        состоялся (отказ после ответа — `meta` у ошибки), событие дополняется
+        полями вызова (§7.2) — второй записи нет. Отказ фиксируется и у
+        разрыва слота: открылся — пишется `slot_paused`. Вызывающий сохраняет
+        прежнее поведение (работа остаётся pending, `continue`).
+        """
+        fields: dict[str, object] = {
+            "event": event,
+            "job": job,
+            "slot": slot,
+            "outcome": outcome.value
+            if isinstance(outcome, SlotOutcome)
+            else str(outcome),
+        }
+        for key, value in (
+            ("note_id", note_id),
+            ("older_id", older_id),
+            ("candidate_id", candidate_id),
+            ("detail", self._mask_detail(detail)),
+        ):
+            if value is not None:
+                fields[key] = value
+        if meta is not None:
+            fields.update(_call_meta_fields(meta))
+        fields.update(extra)
+        logging.getLogger("app").warning(message, extra=fields)
+        self._note_slot_outcome(job, slot, outcome)
+
+    def _log_slot_event(
+        self,
+        event: str,
+        slot: str,
+        job: str,
+        *,
+        level: int = logging.INFO,
+        **fields: object,
+    ) -> None:
+        """Событие разрыва/стука (№39 §7.4): `event`/`slot`/`job` + поля по факту."""
+        payload: dict[str, object] = {"event": event, "slot": slot, "job": job}
+        for key, value in fields.items():
+            if value is not None:
+                payload[key] = value
+        logging.getLogger("app").log(level, event, extra=payload)
+
+    def _log_slot_call(
+        self,
+        job: str,
+        slot: str,
+        meta: ChatMeta | None,
+        *,
+        note_id: int | None = None,
+        older_id: int | None = None,
+        candidate_id: int | None = None,
+    ) -> None:
+        """Успешный вызов чата слота — событие `slot_call` (№49, §7.2).
+
+        Одно событие на вызов: бюджет и его источник, счётчики, факт и объём
+        размышления, причина завершения, обрезка, длительность. Без метаданных
+        (тестовый двойник/слот без `chat_result`) событие не пишется — живой
+        сервис их всегда отдаёт (№49 FR-3.1).
+        """
+        if meta is None:
+            return
+        fields = _call_log_fields(meta)
+        for key, value in (
+            ("note_id", note_id),
+            ("older_id", older_id),
+            ("candidate_id", candidate_id),
+        ):
+            if value is not None:
+                fields[key] = value
+        self._log_slot_event("slot_call", slot, job, level=logging.INFO, **fields)
+
+    def _mask_detail(self, detail: str | None) -> str | None:
+        """Фрагмент причины ≤160 симв. с маскировкой секретов (4 симв. + ***).
+
+        Секреты (API-ключи слотов, MCP-токен) могут попасть в текст отказа
+        (URL/эхо) — в журнал они не уходят ни в каком виде.
+        """
+        if detail is None:
+            return None
+        fragment = " ".join(str(detail).split())[:160]
+        secrets = (
+            self._settings.embedding_api_key,
+            self._settings.summary_api_key,
+            self._settings.judge_api_key,
+            self._settings.mcp_auth_token,
+        )
+        for secret in secrets:
+            if secret and secret.strip() and secret.strip() in fragment:
+                fragment = fragment.replace(secret.strip(), secret.strip()[:4] + "***")
+        return fragment
+
+    # --- счётчик попыток пары и «требует вмешательства» (№39, arch §6.8) --------
+
+    @staticmethod
+    def _load_payload(raw: str | None) -> dict:
+        """Разобрать payload работы (терпимо к пустому/битому JSON)."""
+        try:
+            loaded = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            loaded = {}
+        return loaded if isinstance(loaded, dict) else {}
+
+    def _set_job_payload(self, job_id: int, payload: dict) -> None:
+        """Перезаписать payload работы (идентичность пары и её штамп)."""
+        self._ensure_job_table()
+        with session(self._settings) as conn, transaction(conn):
+            conn.execute(
+                "UPDATE worker_jobs SET payload = ? WHERE id = ?",
+                (json.dumps(payload, ensure_ascii=False), job_id),
+            )
+
+    def _job_for_slot(self, slot: str) -> str:
+        """Имя джобы-владельца очереди слота (для событий и /jobs/attention)."""
+        return _SLOT_JOB_NAMES.get(slot, slot)
+
+    def _log_attention_event(self, event: str, **fields: object) -> None:
+        """Событие внимания задания (arch §7.4): `event` + поля по факту."""
+        payload: dict[str, object] = {"event": event}
+        for key, value in fields.items():
+            if value is not None:
+                payload[key] = value
+        logging.getLogger("app").info(event, extra=payload)
+
+    def _note_attempt(
+        self,
+        job_id: int,
+        outcome: SlotOutcome,
+        *,
+        detail: str | None = None,
+        pair_stamp: str | None = None,
+    ) -> dict:
+        """Зафиксировать исход попытки пары (№39, arch §6.8).
+
+        Транзиентный исход (`unavailable`/`timeout`/`auth`) обновляет только
+        `last_outcome`/`last_error` — счётчик не растёт (ждать — нормальное
+        состояние, им занимаются back-off и разрыв). Нетранзиентный
+        (`empty`/`truncated`/`off_contract`) наращивает `attempts`, и по
+        достижении `SLOT_MAX_ATTEMPTS` ставит `attention_at` — работа замирает,
+        оставаясь `pending`. Всё — одной транзакцией (`UPDATE … WHERE id = ?`).
+        `pair_stamp` — отпечаток пары (заметка/кандидат), обновляется в payload.
+        """
+        self._ensure_job_table()
+        masked = self._mask_detail(detail)
+        value = outcome.value if isinstance(outcome, SlotOutcome) else str(outcome)
+        nontransient = outcome in _NON_TRANSIENT_OUTCOMES
+        with session(self._settings) as conn, transaction(conn):
+            row = conn.execute(
+                "SELECT id, slot, note_id, payload, attempts, attention_at "
+                "FROM worker_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return {"job_id": job_id, "attempts": 0, "attention": False}
+            attempts = int(row["attempts"] or 0)
+            attention = row["attention_at"] is not None
+            pair = self._load_payload(row["payload"])
+            if pair_stamp is not None:
+                pair["updated_at"] = pair_stamp
+                conn.execute(
+                    "UPDATE worker_jobs SET payload = ? WHERE id = ?",
+                    (json.dumps(pair, ensure_ascii=False), job_id),
+                )
+            if nontransient:
+                attempts += 1
+                if attempts >= self._settings.slot_max_attempts:
+                    attention = True
+                    conn.execute(
+                        "UPDATE worker_jobs SET attempts = ?, last_outcome = ?, "
+                        "last_error = ?, attention_at = COALESCE(attention_at, "
+                        "strftime('%Y-%m-%dT%H:%M:%SZ','now')), updated_at = "
+                        "strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+                        (attempts, value, masked, job_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE worker_jobs SET attempts = ?, last_outcome = ?, "
+                        "last_error = ?, updated_at = "
+                        "strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+                        (attempts, value, masked, job_id),
+                    )
+            else:
+                conn.execute(
+                    "UPDATE worker_jobs SET last_outcome = ?, last_error = ?, "
+                    "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+                    (value, masked, job_id),
+                )
+            slot = row["slot"]
+            note_id = row["note_id"]
+            older_id = pair.get("older_id")
+        if nontransient and attention:
+            self._log_attention_event(
+                "job_attention",
+                job=self._job_for_slot(slot),
+                slot=slot,
+                note_id=note_id,
+                older_id=older_id,
+                outcome=value,
+                attempts=attempts,
+            )
+        return {"job_id": job_id, "attempts": attempts, "attention": attention}
+
+    def _release_attention(self, job_id: int, reason: str) -> dict:
+        """Сбросить счётчик пары и снять внимание (№39, arch §6.8/§13.3).
+
+        `attempts = 0, attention_at = NULL, last_error = NULL` — «причина
+        ушла»: работа идёт как новая. `released` — было ли задание во внимании
+        (операторская ручка отдаёт 404 на задание вне внимания); `found` —
+        есть ли строка вообще. Событие `job_attention_released` с причиной
+        (`edit`/`probe`/`operator`/`startup`) пишется на найденную строку.
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn, transaction(conn):
+            row = conn.execute(
+                "SELECT id, slot, note_id, payload, attention_at "
+                "FROM worker_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return {"job_id": job_id, "released": False, "found": False}
+            was_attention = row["attention_at"] is not None
+            conn.execute(
+                "UPDATE worker_jobs SET attempts = 0, attention_at = NULL, "
+                "last_error = NULL, updated_at = "
+                "strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+                (job_id,),
+            )
+            slot = row["slot"]
+            note_id = row["note_id"]
+            older_id = self._load_payload(row["payload"]).get("older_id")
+        self._log_attention_event(
+            "job_attention_released",
+            job=self._job_for_slot(slot),
+            slot=slot,
+            note_id=note_id,
+            older_id=older_id,
+            reason=reason,
+        )
+        return {
+            "job_id": job_id,
+            "released": was_attention,
+            "found": True,
+            "attempts": 0,
+        }
+
+    def release_attention(self, job_id: int) -> dict:
+        """Операторская переоткрытие задания из внимания (arch §6.7/§7.4).
+
+        Только для задания во внимании: вне внимания (или без строки) —
+        `released: false` без правок (REST-ручка отдаёт 404).
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT attention_at FROM worker_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        if row is None or row["attention_at"] is None:
+            return {"job_id": job_id, "released": False}
+        self._release_attention(job_id, "operator")
+        return {"job_id": job_id, "released": True, "attempts": 0}
+
+    def _reset_attention_for_slot(self, slot: str, reason: str) -> int:
+        """Снять внимание у заданий слота (`*` — у всех); число снятых.
+
+        Крючки «причина ушла» (arch §6.8/§13.3): успешный стук слота
+        (`probe`), старт со сменой отпечатка конфигурации (`startup`).
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            if slot == "*":
+                rows = conn.execute(
+                    "SELECT id FROM worker_jobs WHERE attention_at IS NOT NULL"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id FROM worker_jobs WHERE attention_at IS NOT NULL "
+                    "AND slot = ?",
+                    (slot,),
+                ).fetchall()
+        released = 0
+        for row in rows:
+            if self._release_attention(int(row["id"]), reason)["released"]:
+                released += 1
+        return released
+
+    def attention_jobs(self) -> list[dict]:
+        """Задания, ждущие человека (arch §6.7/§7.4): только SQL.
+
+        Форма записи: `{job_id, job, slot, note_id, older_id, outcome,
+        attempts, since}` — `since` — момент `attention_at`. Потребители —
+        `/health` и операторская ручка `GET /jobs/attention` (моделей не зовём).
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT id, slot, note_id, payload, attempts, last_outcome, "
+                "attention_at FROM worker_jobs WHERE attention_at IS NOT NULL "
+                "ORDER BY id"
+            ).fetchall()
+        jobs: list[dict] = []
+        for row in rows:
+            jobs.append(
+                {
+                    "job_id": int(row["id"]),
+                    "job": self._job_for_slot(row["slot"]),
+                    "slot": row["slot"],
+                    "note_id": row["note_id"],
+                    "older_id": self._load_payload(row["payload"]).get("older_id"),
+                    "outcome": row["last_outcome"],
+                    "attempts": int(row["attempts"] or 0),
+                    "since": row["attention_at"],
+                }
+            )
+        return jobs
+
+    def attention_count(self) -> int:
+        """Сколько заданий ждёт человека (агрегат по всем слотам, arch §6.7)."""
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM worker_jobs "
+                    "WHERE attention_at IS NOT NULL"
+                ).fetchone()[0]
+            )
+
+    def _review_attention_jobs(self, slot: str, kind: str) -> int:
+        """Пере-проверить пару замороженных работ без вызова модели (arch §6.8).
+
+        Протокол «правка пары» без ручных правок: правка заметки/кандидата или
+        смена лучшего кандидата возвращает работу в очередь (`attempts=0`),
+        решение о вердикте/слиянии принимает следующий прогон. Только SQL и
+        чтение вектора — моделей не зовём. Возвращает число размороженных.
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT id, note_id, payload FROM worker_jobs "
+                "WHERE slot = ? AND kind = ? AND status = 'pending' "
+                "AND attention_at IS NOT NULL ORDER BY id",
+                (slot, kind),
+            ).fetchall()
+        released = 0
+        for row in rows:
+            payload = self._load_payload(row["payload"])
+            note_id = int(row["note_id"])
+            with session(self._settings) as conn:
+                note = conn.execute(
+                    "SELECT id, namespace, vector_status, deleted_at, updated_at "
+                    "FROM notes WHERE id = ?",
+                    (note_id,),
+                ).fetchone()
+                vector = (
+                    vectors.get_vector(conn, note_id) if note is not None else None
+                )
+            if note is None or note["deleted_at"] is not None:
+                continue
+            # правка стороны пары (заметки/ранней) — причина ушла
+            if (
+                payload.get("note_updated_at") is not None
+                and payload["note_updated_at"] != note["updated_at"]
+            ) or (
+                payload.get("newer_updated_at") is not None
+                and payload["newer_updated_at"] != note["updated_at"]
+            ):
+                if self._release_attention(int(row["id"]), "edit")["released"]:
+                    released += 1
+                continue
+            older_id = payload.get("older_id")
+            if older_id is not None:
+                with session(self._settings) as conn:
+                    other = conn.execute(
+                        "SELECT deleted_at, updated_at FROM notes WHERE id = ?",
+                        (int(older_id),),
+                    ).fetchone()
+                if other is None or other["deleted_at"] is not None:
+                    continue
+                if (
+                    payload.get("older_updated_at") is not None
+                    and payload["older_updated_at"] != other["updated_at"]
+                ):
+                    if self._release_attention(int(row["id"]), "edit")["released"]:
+                        released += 1
+                continue
+            # дедуп: лучший кандидат пересчитывается по вектору; без вектора
+            # пару не проверить — ждём перевекторизации
+            if note["vector_status"] != "ok" or vector is None:
+                continue
+            candidates = self._find_dedup_candidates(
+                note_id, vector, note["namespace"]
+            )
+            alive = [pair for pair in candidates if pair[0] < note_id]
+            best_id = int(alive[0][0]) if alive else None
+            stored_id = payload.get("candidate_id")
+            if (
+                stored_id is not None
+                and best_id is not None
+                and stored_id != best_id
+            ):
+                if self._release_attention(int(row["id"]), "edit")["released"]:
+                    released += 1
+                continue
+            if best_id is not None:
+                with session(self._settings) as conn:
+                    candidate = conn.execute(
+                        "SELECT updated_at FROM notes WHERE id = ?", (best_id,)
+                    ).fetchone()
+                if (
+                    candidate is not None
+                    and payload.get("candidate_updated_at") is not None
+                    and payload["candidate_updated_at"] != candidate["updated_at"]
+                ):
+                    if self._release_attention(int(row["id"]), "edit")["released"]:
+                        released += 1
+        return released
+
+    def _startup_attention_reset(self) -> int:
+        """Стартовая сверка отпечатка конфигурации слотов (arch §6.8/§13.3).
+
+        Сравниваем текущий отпечаток (`slot_budget.slot_config_fingerprint`,
+        lsbdef0008-02: модель/тип/бюджет/контекст/запас/потолок + параметры
+        decision) с записанным в `meta` (`SLOT_CONFIG_META_KEY`). Отпечатка нет
+        или он отличается — «причина ушла»: внимание снимается у заданий всех
+        слотов (событие блока 2 `job_attention_released`, `reason="startup"`),
+        отпечаток перезаписывается. Тот же отпечаток — ничего не снимаем.
+
+        `SLOT_ATTENTION_RESET_ON_START=false` отключает шаг целиком: оператор
+        запретил снятие, читать и переписывать отпечаток не нужно.
+        """
+        if not self._settings.slot_attention_reset_on_start:
+            return 0
+        fingerprint = slot_config_fingerprint(self._settings)
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (SLOT_CONFIG_META_KEY,),
+            ).fetchone()
+        stored = row["value"] if row is not None else None
+        released = 0
+        if stored != fingerprint:
+            released = self._reset_attention_for_slot("*", "startup")
+        with session(self._settings) as conn, transaction(conn):
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                (SLOT_CONFIG_META_KEY, fingerprint),
+            )
+        return released
+
+    async def _startup_attention_reset_async(self) -> None:
+        """Стартовая сверка внимания в рабочем потоке (не блокирует петли).
+
+        Отказ сверки не роняет воркер: внимание само снимется успешным стуком
+        слота или правкой пары, а сама сверка — оптимизация «причина ушла при
+        смене конфигурации» (arch §6.8).
+        """
+        try:
+            await asyncio.to_thread(self._startup_attention_reset)
+        except Exception:  # noqa: BLE001 — фоновая оптимизация не роняет старт
+            logging.getLogger("app").warning(
+                "slot attention startup reset failed",
+                extra={"event": "job_attention_reset_failed"},
+            )
 
     # --- работа джоб (цикл, back-off и супервизор — в каркасе) -----------------
 
@@ -565,8 +1320,11 @@ class BackgroundWorker:
         Semaphore внутри). Возвращает число фактически обработанных заданий:
         0 уводит каркасную петлю в ожидание с back-off (arch §3.2).
         """
-        processed = await asyncio.to_thread(self.process_pending)
-        processed += await self.process_pending_chunks()
+        if not self._slot_gate(SLOT_EMBEDDING, EMBEDDING_JOB):
+            return 0  # разрыв слота: партия не берётся (№39, arch §6.2)
+        with history.bind_origin(f"job:{EMBEDDING_JOB}"):
+            processed = await asyncio.to_thread(self.process_pending)
+            processed += await self.process_pending_chunks()
         return processed
 
     async def _process_summary(self) -> int:
@@ -577,9 +1335,12 @@ class BackgroundWorker:
         заданий: 0 уводит каркасную петлю к ожиданию сигнала
         `notify_summary_pending` (форма «по требованию», пул 6) или таймаута.
         """
-        processed = await asyncio.to_thread(self.process_title_pending)
-        processed += await asyncio.to_thread(self.process_summary_pending)
-        processed += await asyncio.to_thread(self.process_merge_pending)
+        if not self._slot_gate(SLOT_SUMMARY, SUMMARY_JOB):
+            return 0  # разрыв слота summary: партия не берётся (№39, §6.2)
+        with history.bind_origin(f"job:{SUMMARY_JOB}"):
+            processed = await asyncio.to_thread(self.process_title_pending)
+            processed += await asyncio.to_thread(self.process_summary_pending)
+            processed += await asyncio.to_thread(self.process_merge_pending)
         return processed
 
     async def _run_summary(self) -> None:
@@ -600,7 +1361,10 @@ class BackgroundWorker:
         0 уводит каркасную петлю к ожиданию сигнала `notify_judge_pending`
         (форма «по требованию», пул 6) или таймаута интервала.
         """
-        return await asyncio.to_thread(self.process_judge_pending)
+        if not self._slot_gate(SLOT_JUDGE, JUDGE_JOB):
+            return 0  # разрыв слота judge: партия не берётся (№39, §6.2)
+        with history.bind_origin(f"job:{JUDGE_JOB}"):
+            return await asyncio.to_thread(self.process_judge_pending)
 
     async def _run_judge(self) -> None:
         """Обслуживать judge-джобу каркасным циклом (запуск одной джобы).
@@ -620,7 +1384,8 @@ class BackgroundWorker:
         не мешает заметкам и наоборот (ARCH §3.4). 0 уводит каркасную петлю к
         ожиданию `notify_areas_pending` (пул 6) или таймаута интервала.
         """
-        return await asyncio.to_thread(self.process_pending_areas)
+        with history.bind_origin(f"job:{AREAS_JOB}"):
+            return await asyncio.to_thread(self.process_pending_areas)
 
     # --- джоба зачистки просроченных заметок (lsb-0004-02, этап 4) -----------
 
@@ -638,16 +1403,17 @@ class BackgroundWorker:
         ускоряется/замедляется (FR-1.5). Возвращает число удалённых заметок
         (расписание ведёт интервал, а не прогресс — см. `run_loop`).
         """
-        deleted = await asyncio.to_thread(self.process_expired_notes)
-        if deleted:
-            logging.getLogger("app").info(
-                "expiration cleanup: purged expired notes",
-                extra={
-                    "event": "expiration_cleanup",
-                    "job": EXPIRATION_JOB,
-                    "count": deleted,
-                },
-            )
+        with history.bind_origin(f"job:{EXPIRATION_JOB}"):
+            deleted = await asyncio.to_thread(self.process_expired_notes)
+            if deleted:
+                logging.getLogger("app").info(
+                    "expiration cleanup: purged expired notes",
+                    extra={
+                        "event": "expiration_cleanup",
+                        "job": EXPIRATION_JOB,
+                        "count": deleted,
+                    },
+                )
         return deleted
 
     def process_expired_notes(self) -> int:
@@ -693,27 +1459,56 @@ class BackgroundWorker:
         `_create_job`, `_pending_jobs`, `_mark_job_done`) возвращаются сразу.
         Индекс `idx_worker_jobs_queue` на (slot, kind, status, id): выборка
         pending-очереди слота — по индексу, а не полным сканом таблицы.
+        Колонки внимания (№39, arch §5.2/§6.8) — `attempts`/`last_outcome`/
+        `last_error`/`attention_at` — в свежем DDL и идемпотентным ALTER'ом по
+        `PRAGMA table_info(worker_jobs)` для живой базы предыдущей версии;
+        индекс `idx_worker_jobs_attention` обслуживает выборку «требует
+        вмешательства».
         """
         if self._jobs_table_ready:
             return
         with session(self._settings) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS worker_jobs ("
-                "  id         INTEGER PRIMARY KEY,"
-                "  slot       TEXT NOT NULL,"
-                "  kind       TEXT NOT NULL,"
-                "  note_id    INTEGER NOT NULL,"
-                "  payload    TEXT,"
-                "  status     TEXT NOT NULL DEFAULT 'pending',"
-                "  created_at TEXT NOT NULL DEFAULT "
+                "  id           INTEGER PRIMARY KEY,"
+                "  slot         TEXT NOT NULL,"
+                "  kind         TEXT NOT NULL,"
+                "  note_id      INTEGER NOT NULL,"
+                "  payload      TEXT,"
+                "  status       TEXT NOT NULL DEFAULT 'pending',"
+                "  created_at   TEXT NOT NULL DEFAULT "
                 "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
-                "  updated_at TEXT NOT NULL DEFAULT "
-                "    (strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+                "  updated_at   TEXT NOT NULL DEFAULT "
+                "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
+                "  attempts     INTEGER NOT NULL DEFAULT 0,"
+                "  last_outcome TEXT,"
+                "  last_error   TEXT,"
+                "  attention_at TEXT"
                 ")"
             )
+            existing = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(worker_jobs)"
+                ).fetchall()
+            }
+            for name, ddl in (
+                ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+                ("last_outcome", "TEXT"),
+                ("last_error", "TEXT"),
+                ("attention_at", "TEXT"),
+            ):
+                if name not in existing:
+                    conn.execute(
+                        f"ALTER TABLE worker_jobs ADD COLUMN {name} {ddl}"
+                    )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_worker_jobs_queue "
                 "ON worker_jobs(slot, kind, status, id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_worker_jobs_attention "
+                "ON worker_jobs(status, attention_at)"
             )
         self._jobs_table_ready = True
 
@@ -781,12 +1576,18 @@ class BackgroundWorker:
     def _pending_jobs(
         self, slot: str, kind: str, limit: int
     ) -> list:
-        """Вычитать pending-работы слота (порядок по id)."""
+        """Вычитать pending-работы слота (порядок по id).
+
+        Замороженные работы (`attention_at IS NOT NULL`, №39 §6.8) не берутся:
+        повторяющийся нетранзиентный отказ перестаёт жечь вызовы модели, пока
+        причина не ушла (работа при этом остаётся `pending`).
+        """
         self._ensure_job_table()
         with session(self._settings) as conn:
             return conn.execute(
                 "SELECT id, note_id, payload FROM worker_jobs "
                 "WHERE slot = ? AND kind = ? AND status = 'pending' "
+                "AND attention_at IS NULL "
                 "ORDER BY id LIMIT ?",
                 (slot, kind, limit),
             ).fetchall()
@@ -812,6 +1613,11 @@ class BackgroundWorker:
         после него стёр бы сигнал (пауза до интервала на непустой очереди).
         Очередь пуста — только если нет title-догена (title IS NULL),
         pending суммаризации и pending merge-работ (все в summary-слоте).
+
+        №39 (arch §6.9/§13.9): считаем только БЕРУЩЕЕСЯ сейчас — merge-работы
+        без внимания (`attention_at IS NULL`). Замороженное задание
+        (`attention_at`, no39-02) петлю брать не может, а если бы очередь
+        считала его непустой — петля крутилась бы вхолостую (busy-loop).
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
@@ -819,23 +1625,31 @@ class BackgroundWorker:
                 "SELECT (SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL "
                 "  AND (title IS NULL OR summary_status = 'pending')) "
                 "+ (SELECT COUNT(*) FROM worker_jobs "
-                "  WHERE slot = 'summary' AND status = 'pending') AS c"
+                "  WHERE slot = 'summary' AND status = 'pending' "
+                "  AND attention_at IS NULL) AS c"
             ).fetchone()
-        return int(row["c"]) == 0
+        # №39 (arch §6.9): при открытом разрыве слота петля партию не берёт —
+        # очередь для неё пуста (иначе отложенное задание гонит busy-loop).
+        return int(row["c"]) == 0 or self._breakers[SLOT_SUMMARY].is_paused()
 
     def _judge_queue_empty(self) -> bool:
         """Пуста ли judge-очередь (дешёвый SELECT, пул 6, lost wakeup).
 
         Считает pending dedup-работы judge-слота — ту же очередь, что
-        выгребает process_judge_pending в этой петле.
+        выгребает process_judge_pending в этой петле. №39 (arch §6.9/§13.9):
+        замороженное задание (`attention_at`, no39-02) не считается — петля
+        его не берёт, и очередь для неё пуста (busy-loop'а нет).
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
             row = conn.execute(
                 "SELECT COUNT(*) FROM worker_jobs "
-                "WHERE slot = 'judge' AND kind = 'dedup' AND status = 'pending'"
+                "WHERE slot = 'judge' AND kind = 'dedup' AND status = 'pending' "
+                "AND attention_at IS NULL"
             ).fetchone()
-        return int(row[0]) == 0
+        # №39 (arch §6.9): при открытом разрыве судьи партия не берётся —
+        # очередь для петли пуста (busy-loop'а нет).
+        return int(row[0]) == 0 or self._breakers[SLOT_JUDGE].is_paused()
 
     # --- наблюдаемость очередей (lsb-0014-03, FR-2.2) -------------------------
 
@@ -854,49 +1668,132 @@ class BackgroundWorker:
             queues[spec.queue] = spec.queue_stat()
         return queues
 
+    def _gated_queue_stat(self, slot: str, stat: dict) -> dict:
+        """Снимок очереди с учётом разрыва слота (№39, arch §6.9).
+
+        Разрыв слота открыт (`SlotBreaker.is_paused`) — петля партию не берёт,
+        поэтому вся текущая работа из `pending` уезжает в `waiting`
+        (`pending=0`), а `oldest_pending_sec`/`attention` сохраняются: ожидание
+        видно в `/health.queues`, но петля не крутится вхолостую. Иначе —
+        снимок нормализуется как есть (возраст и внимание не пересчитываются).
+        """
+        pending = int(stat.get("pending", 0) or 0)
+        waiting = int(stat.get("waiting", 0) or 0)
+        attention = int(stat.get("attention", 0) or 0)
+        breaker = self._breakers.get(slot)
+        if breaker is not None and breaker.is_paused():
+            return queue_snapshot(
+                0,
+                stat.get("oldest_pending_sec"),
+                waiting=waiting + pending,
+                attention=attention,
+            )
+        return queue_snapshot(
+            pending,
+            stat.get("oldest_pending_sec"),
+            waiting=waiting,
+            attention=attention,
+        )
+
     def _vector_queue_stat(self) -> dict:
         """Снимок очереди векторизации заметок: pending и возраст старейшего.
 
         Источник — `notes.vector_status='pending'` (тот же предикат, что у
         легаси-счётчика `pending_vector`); SQL живёт рядом с `health_counts`
-        в NoteService.
+        в NoteService. №39 (arch §6.9): при открытом разрыве embedding очередь
+        ждёт слот — `_gated_queue_stat` (работа едет в `waiting`).
         """
-        return self._notes.vector_queue_stat()
+        return self._gated_queue_stat(
+            SLOT_EMBEDDING, self._notes.vector_queue_stat()
+        )
 
     def _summary_queue_stat(self) -> dict:
-        """Снимок очереди суммаризации заметок (`notes.summary_status`)."""
-        return self._notes.summary_queue_stat()
+        """Снимок очереди суммаризации (№39, arch §6.9).
 
-    def _judge_queue_stat(self) -> dict:
-        """Снимок очереди judge: pending-работы слота в `worker_jobs`.
-
-        Число — `worker_jobs(slot='judge', status='pending')`, возраст
-        старейшего — `now - MIN(created_at)`. Таблица создаётся лениво
-        (`_ensure_job_table`), моделей не зовём.
+        `pending` — работа, которую петля может взять СЕЙЧАС: заметки
+        (title-доген + pending суммаризации) плюс pending merge-работы слота
+        summary БЕЗ внимания. `attention` — pending merge-работы с вниманием
+        (no39-02, ждут человека), `waiting = attention`: у слота summary
+        отложено именно замороженное. `oldest_pending_sec` — максимум возраста
+        по обоим источникам; при открытом разрыве слота — `_gated_queue_stat`.
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
             row = conn.execute(
-                "SELECT COUNT(*) AS pending, "
-                "MAX(CAST(strftime('%s','now') AS INTEGER) - "
-                "CAST(strftime('%s', created_at) AS INTEGER)) "
-                "AS oldest_pending_sec FROM worker_jobs "
-                "WHERE slot = 'judge' AND status = 'pending'"
+                "SELECT "
+                "(SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL "
+                "  AND (title IS NULL OR summary_status = 'pending')) "
+                "+ (SELECT COUNT(*) FROM worker_jobs WHERE slot = 'summary' "
+                "  AND status = 'pending' AND attention_at IS NULL) AS pending, "
+                "(SELECT COUNT(*) FROM worker_jobs WHERE slot = 'summary' "
+                "  AND status = 'pending' AND attention_at IS NOT NULL) "
+                "AS attention, "
+                "MAX("
+                "COALESCE((SELECT MAX(CAST(strftime('%s','now') AS INTEGER) - "
+                "  CAST(strftime('%s', updated_at) AS INTEGER)) FROM notes "
+                "  WHERE deleted_at IS NULL AND (title IS NULL OR "
+                "  summary_status = 'pending')), 0), "
+                "COALESCE((SELECT MAX(CAST(strftime('%s','now') AS INTEGER) - "
+                "  CAST(strftime('%s', created_at) AS INTEGER)) FROM worker_jobs "
+                "  WHERE slot = 'summary' AND status = 'pending'), 0)"
+                ") AS oldest_pending_sec"
             ).fetchone()
-        return queue_snapshot(row["pending"], row["oldest_pending_sec"])
+        attention = int(row["attention"])
+        stat = queue_snapshot(
+            row["pending"],
+            row["oldest_pending_sec"],
+            waiting=attention,
+            attention=attention,
+        )
+        return self._gated_queue_stat(SLOT_SUMMARY, stat)
+
+    def _judge_queue_stat(self) -> dict:
+        """Снимок очереди judge (№39, arch §6.9).
+
+        `pending` — dedup-работы слота judge БЕЗ внимания (берущееся сейчас,
+        драйвер `_judge_queue_empty`); `attention` — с вниманием (no39-02),
+        `waiting = attention`: у судьи отложено именно замороженное. Возраст —
+        `now - MIN(created_at)` по берущемуся. При открытом разрыве judge —
+        `_gated_queue_stat`. Таблица создаётся лениво (`_ensure_job_table`),
+        моделей не зовём.
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT "
+                "COALESCE(SUM(status = 'pending' AND attention_at IS NULL), 0) "
+                "AS pending, "
+                "COALESCE(SUM(status = 'pending' AND attention_at IS NOT NULL), 0) "
+                "AS attention, "
+                "MAX(CASE WHEN status = 'pending' AND attention_at IS NULL "
+                "  THEN CAST(strftime('%s','now') AS INTEGER) - "
+                "  CAST(strftime('%s', created_at) AS INTEGER) END) "
+                "AS oldest_pending_sec "
+                "FROM worker_jobs WHERE slot = 'judge'"
+            ).fetchone()
+        attention = int(row["attention"])
+        stat = queue_snapshot(
+            row["pending"],
+            row["oldest_pending_sec"],
+            waiting=attention,
+            attention=attention,
+        )
+        return self._gated_queue_stat(SLOT_JUDGE, stat)
 
     def _areas_queue_stat(self) -> dict:
-        """Снимок очереди областей: сумма pending по `ALL_AREAS` (FR-2.2).
+        """Снимок очереди областей: сумма pending по ВКЛЮЧЁННЫМ областям (FR-2.5).
 
         Источник pending — тот же, что у `_areas_queue_empty`: pending-записи
-        активных строк каждой области (skills/terms/user). Суммы складываются,
-        возраст старейшего — максимум `now - updated_at` по областям; пусто —
-        `null`.
+        активных строк включённых областей (`enabled_areas`, №40) — выключенная
+        область фоном не забирается и в общий счётчик не входит. Суммы
+        складываются, возраст старейшего — максимум `now - updated_at` по
+        областям; пусто — `null`. Накопление выключенной области видно
+        отдельно в `/health.areas` (`areas_health`).
         """
         pending = 0
         oldest: int | None = None
         with session(self._settings) as conn:
-            for spec in ALL_AREAS:
+            for spec in enabled_areas(self._settings):
                 row = conn.execute(
                     "SELECT COUNT(*) AS pending, "
                     "MAX(CAST(strftime('%s','now') AS INTEGER) - "
@@ -909,7 +1806,34 @@ class BackgroundWorker:
                 value = row["oldest_pending_sec"]
                 if value is not None:
                     oldest = int(value) if oldest is None else max(oldest, int(value))
-        return queue_snapshot(pending, oldest)
+        stat = queue_snapshot(pending, oldest)
+        # №39 (arch §6.9): петля `areas` кодирует тем же слотом embedding —
+        # разрыв слота означает, что очередь ждёт его.
+        return self._gated_queue_stat(SLOT_EMBEDDING, stat)
+
+    def areas_health(self) -> dict[str, dict]:
+        """`/health.areas` (FR-4.3, №40): по ВСЕМ областям `{enabled, pending}`.
+
+        Отдаётся по `ALL_AREAS`, а не по `enabled_areas`: накопление у
+        выключенной области должно быть видно (прецедент `JOB_*_ENABLED`:
+        «очередь остаётся видна в /health»). `pending` — тот же SQL, что у
+        `_areas_queue_stat`, но БЕЗ суммирования (по области); обращений к
+        моделям нет — только чтение pending-состояния.
+        """
+        enabled = {spec.name for spec in enabled_areas(self._settings)}
+        health: dict[str, dict] = {}
+        with session(self._settings) as conn:
+            for spec in ALL_AREAS:
+                row = conn.execute(
+                    f"SELECT COUNT(*) FROM {spec.table} "
+                    "WHERE vector_status = 'pending' "
+                    "AND deleted_at IS NULL"
+                ).fetchone()
+                health[spec.name] = {
+                    "enabled": spec.name in enabled,
+                    "pending": int(row[0]),
+                }
+        return health
 
     # --- синхронная работа (выполняется в to_thread) --------------------------
 
@@ -1012,7 +1936,7 @@ class BackgroundWorker:
             limit if limit is not None else self._settings.embedding_batch_size
         )
         processed = 0
-        for spec in ALL_AREAS:
+        for spec in enabled_areas(self._settings):
             processed += self._process_area_batch(spec, batch)
         return processed
 
@@ -1032,15 +1956,17 @@ class BackgroundWorker:
             embeddings = self._embedding.embed_texts(
                 [spec.embed_text(row) for row in rows]
             )
-        except EmbeddingError:
-            logging.getLogger("app").warning(
-                "area vectorization failed — records stay pending",
-                extra={
-                    "event": "area_embed_failed",
-                    "job": AREAS_JOB,
-                    "area": spec.name,
-                    "count": len(rows),
-                },
+        except EmbeddingError as exc:
+            # №39: отказ слота embedding несёт тип исхода (записи — pending).
+            self._log_slot_failure(
+                AREAS_JOB,
+                SLOT_EMBEDDING,
+                outcome_of(exc),
+                event="area_embed_failed",
+                message="area vectorization failed — records stay pending",
+                detail=str(exc),
+                area=spec.name,
+                count=len(rows),
             )
             return 0
         processed = 0
@@ -1069,12 +1995,12 @@ class BackgroundWorker:
     def _areas_queue_empty(self) -> bool:
         """Пуста ли очередь областей (дешёвый SELECT, пул 6, lost wakeup).
 
-        pending-записи считаются по всем областям реестра (ALL_AREAS) —
-        та же очередь, что выгребает process_pending_areas.
+        pending-записи считаются по включённым областям реестра (`enabled_areas`,
+        №40) — та же очередь, что выгребает process_pending_areas.
         """
         pending = 0
         with session(self._settings) as conn:
-            for spec in ALL_AREAS:
+            for spec in enabled_areas(self._settings):
                 pending += int(
                     conn.execute(
                         f"SELECT COUNT(*) FROM {spec.table} "
@@ -1082,7 +2008,9 @@ class BackgroundWorker:
                         "AND deleted_at IS NULL"
                     ).fetchone()[0]
                 )
-        return pending == 0
+        # №39 (arch §6.9): области кодируются слотом embedding — при его
+        # разрыве партия не берётся, очередь для петли пуста (busy-loop'а нет).
+        return pending == 0 or self._breakers[SLOT_EMBEDDING].is_paused()
 
     # --- judge-петля: судья дедупа (Фаза 8, Этап 3.2; Фаза 11, решение №10) ---
 
@@ -1097,7 +2025,12 @@ class BackgroundWorker:
         №10: merge ходит в summary-слот). Отказ судьи (JudgeError) — работа
         остаётся pending, повтор по back-off judge-петли (NFR-3: обе заметки
         целы). Протухшая заметка (удалена/вектор не готов) — работа снимается.
+        Заметка с таймером (TTL, no46-03) — тоже снимается, но ДО судьи и без
+        вызова моделей (событие `dedup_skipped`, reason="note has a lifetime").
         """
+        # Протокол «правка пары»: замороженные работы перепроверяются без
+        # вызова модели — ушедшая причина размораживает их (арх §6.8).
+        self._review_attention_jobs("judge", "dedup")
         jobs = self._pending_jobs(
             "judge",
             "dedup",
@@ -1110,7 +2043,8 @@ class BackgroundWorker:
             note_id = int(job["note_id"])
             with session(self._settings) as conn:
                 row = conn.execute(
-                    "SELECT id, text, namespace, vector_status, deleted_at "
+                    "SELECT id, text, namespace, vector_status, deleted_at, "
+                    "expires_at "
                     "FROM notes WHERE id = ?",
                     (note_id,),
                 ).fetchone()
@@ -1121,6 +2055,24 @@ class BackgroundWorker:
                 or row["vector_status"] != "ok"
                 or vector is None
             ):
+                self._mark_job_done(job["id"])
+                done += 1
+                continue
+            if row["expires_at"] is not None:
+                # no46-03 (3.2.0): заметка с таймером (TTL, `expires_at IS NOT
+                # NULL`) НИКОГДА не сливается — ранний выход ДО судьи и до
+                # поиска кандидатов: модели не дёргаем, работа снимается;
+                # наблюдаемое событие dedup_skipped с причиной. Правило О.
+                # 2026-10-10; связи у такой заметки разрешены (links не тут).
+                logging.getLogger("app").info(
+                    "dedup: skipped — note has a lifetime",
+                    extra={
+                        "event": "dedup_skipped",
+                        "job": JUDGE_JOB,
+                        "note_id": note_id,
+                        "reason": "note has a lifetime",
+                    },
+                )
                 self._mark_job_done(job["id"])
                 done += 1
                 continue
@@ -1135,8 +2087,8 @@ class BackgroundWorker:
                 placeholders = ",".join("?" * len(ids))
                 with session(self._settings) as conn:
                     rows = conn.execute(
-                        f"SELECT id, text, deleted_at FROM notes WHERE id IN "
-                        f"({placeholders})",
+                        f"SELECT id, text, deleted_at, updated_at FROM notes "
+                        f"WHERE id IN ({placeholders})",
                         ids,
                     ).fetchall()
                 by_id = {r["id"]: r for r in rows}
@@ -1151,19 +2103,53 @@ class BackgroundWorker:
                     if (r := by_id.get(candidate_id)) is not None
                     and r["deleted_at"] is None
                 ]
+                # Идентичность пары (№39 §6.8/§13.3): лучший кандидат и штампы
+                # сторон («заметка», «кандидат»). Новый лучший кандидат или
+                # правка любой стороны — ДРУГАЯ пара: счётчик и внимание
+                # сбрасываются, работа идёт как новая; штампы сохраняются на
+                # следующую сверку (в т.ч. у замороженной работы,
+                # `_review_attention_jobs`).
+                best_id = int(alive[0][0]) if alive else None
+                stored = self._load_payload(job["payload"])
+                if best_id is not None:
+                    candidate_updated = by_id[best_id]["updated_at"]
+                    pair_changed = (
+                        stored.get("candidate_id") is not None
+                        and stored["candidate_id"] != best_id
+                    ) or (
+                        stored.get("note_updated_at") is not None
+                        and stored["note_updated_at"] != newer["updated_at"]
+                    ) or (
+                        stored.get("candidate_updated_at") is not None
+                        and stored["candidate_updated_at"] != candidate_updated
+                    )
+                    if pair_changed:
+                        self._release_attention(job["id"], "edit")
+                    stored["candidate_id"] = best_id
+                    stored["note_updated_at"] = newer["updated_at"]
+                    stored["candidate_updated_at"] = candidate_updated
+                    self._set_job_payload(job["id"], stored)
                 try:
                     best = self._pick_duplicate(note_id, alive, by_id)
-                except JudgeError:
-                    logging.getLogger("app").warning(
-                        "dedup: judge undecidable — both notes kept, retry queued",
-                        extra={
-                            "event": "dedup_judge_failed",
-                            "job": JUDGE_JOB,
-                            "note_id": note_id,
-                            "candidates": [
-                                candidate_id for candidate_id, _ in alive
-                            ],
-                        },
+                except JudgeError as exc:
+                    # №39 (§6.7): отказ слота несёт тип исхода и фрагмент причины.
+                    self._log_slot_failure(
+                        JUDGE_JOB,
+                        SLOT_JUDGE,
+                        outcome_of(exc),
+                        event="dedup_judge_failed",
+                        message="dedup: judge undecidable — both notes kept, retry queued",
+                        note_id=note_id,
+                        detail=str(exc),
+                        candidates=[
+                            candidate_id for candidate_id, _ in alive
+                        ],
+                        meta=getattr(exc, "meta", None),
+                    )
+                    self._note_attempt(
+                        job["id"],
+                        outcome_of(exc),
+                        detail=str(exc),
                     )
                     continue  # работа остаётся pending — повтор по back-off
                 if best is not None:
@@ -1197,11 +2183,18 @@ class BackgroundWorker:
            (trash). Пул 6: единая транзакция исключает полусостояние
            «обновлена ранняя, поздняя жива» при отказе между операциями.
 
+        no46-03 (3.2.0), второй барьер: если у любой заметки пары есть таймер
+        (`expires_at IS NOT NULL`) — слияния нет, работа снимается, событие
+        `dedup_skipped` (reason="note has a lifetime"). Это защита в глубине:
+        заметка с TTL не сливается и снаружи (нормальный путь сюда не доходит —
+        judge-петля такую заметку не обрабатывает).
+
         Отказ слияния (SummaryError, NFR-3) данные не портит: обе заметки
         остаются, работа остаётся pending — повтор по back-off summary-петли.
         """
         if self._summarizer is None:
             return 0  # тестовый режим без суммаризатора: слияние невозможно
+        self._review_attention_jobs("summary", "merge")
         jobs = self._pending_jobs(
             "summary",
             "merge",
@@ -1223,7 +2216,9 @@ class BackgroundWorker:
                 continue
             with session(self._settings) as conn:
                 rows = conn.execute(
-                    "SELECT id, text, deleted_at FROM notes WHERE id IN (?, ?)",
+                    "SELECT id, text, deleted_at, updated_at, expires_at "
+                    "FROM notes "
+                    "WHERE id IN (?, ?)",
                     (older_id, note_id),
                 ).fetchall()
             by_id = {r["id"]: r for r in rows}
@@ -1238,9 +2233,52 @@ class BackgroundWorker:
                 self._mark_job_done(job["id"])
                 done += 1
                 continue
+            if older["expires_at"] is not None or newer["expires_at"] is not None:
+                # no46-03 (3.2.0), второй барьер (защита в глубине): если у
+                # ЛЮБОЙ заметки пары есть таймер — слияния нет (судья/суммаризатор
+                # не вызываются), работа снимается, событие того же вида.
+                logging.getLogger("app").info(
+                    "dedup: merge skipped — a note has a lifetime",
+                    extra={
+                        "event": "dedup_skipped",
+                        "job": SUMMARY_JOB,
+                        "older_id": older_id,
+                        "note_id": note_id,
+                        "reason": "note has a lifetime",
+                    },
+                )
+                self._mark_job_done(job["id"])
+                done += 1
+                continue
+            # Пара merge-работы — заметка (`older_id`); штампы сторон для
+            # сверки правки пары (№39 §6.8/§13.3): изменились — счётчик и
+            # внимание сбрасываются, работа идёт как новая.
+            pair_changed = (
+                payload.get("older_updated_at") is not None
+                and payload["older_updated_at"] != older["updated_at"]
+            ) or (
+                payload.get("newer_updated_at") is not None
+                and payload["newer_updated_at"] != newer["updated_at"]
+            )
+            if pair_changed:
+                self._release_attention(job["id"], "edit")
+            if (
+                payload.get("older_updated_at") != older["updated_at"]
+                or payload.get("newer_updated_at") != newer["updated_at"]
+            ):
+                payload["older_updated_at"] = older["updated_at"]
+                payload["newer_updated_at"] = newer["updated_at"]
+                self._set_job_payload(job["id"], payload)
             try:
-                merged = self._summarizer.merge(older["text"], newer["text"])
-                outcome = self._notes.merge_pair(older_id, merged, note_id)
+                merge_result = self._summarizer.merge(older["text"], newer["text"])
+                self._log_slot_call(
+                    SUMMARY_JOB,
+                    SLOT_SUMMARY,
+                    merge_result.meta,
+                    older_id=older_id,
+                    note_id=note_id,
+                )
+                outcome = self._notes.merge_pair(older_id, merge_result.text, note_id)
                 if not outcome["merged"]:
                     # Ранняя исчезла (оператор удалил) между вычиткой и
                     # сведением — слияние не состоялось, работа снимается;
@@ -1249,15 +2287,22 @@ class BackgroundWorker:
                     self._mark_job_done(job["id"])
                     done += 1
                     continue
-            except SummaryError:
-                logging.getLogger("app").warning(
-                    "dedup: summarizer merge failed — both notes kept, retry queued",
-                    extra={
-                        "event": "dedup_merge_failed",
-                        "job": SUMMARY_JOB,
-                        "older_id": older_id,
-                        "note_id": note_id,
-                    },
+            except SummaryError as exc:
+                self._log_slot_failure(
+                    SUMMARY_JOB,
+                    SLOT_SUMMARY,
+                    outcome_of(exc),
+                    event="dedup_merge_failed",
+                    message="dedup: summarizer merge failed — both notes kept, retry queued",
+                    older_id=older_id,
+                    note_id=note_id,
+                    detail=str(exc),
+                    meta=getattr(exc, "meta", None),
+                )
+                self._note_attempt(
+                    job["id"],
+                    outcome_of(exc),
+                    detail=str(exc),
                 )
                 continue  # работа остаётся pending — повтор по back-off
             logging.getLogger("app").info(
@@ -1360,8 +2405,15 @@ class BackgroundWorker:
                 None,
             )
         for candidate_id, cosine_value in candidates:
-            verdict = self._judge.judge(
+            result = self._judge.judge(
                 by_id[note_id]["text"], by_id[candidate_id]["text"]
+            )
+            self._log_slot_call(
+                JUDGE_JOB,
+                SLOT_JUDGE,
+                result.meta,
+                note_id=note_id,
+                candidate_id=candidate_id,
             )
             logging.getLogger("app").info(
                 "dedup: judge verdict for cosine candidate",
@@ -1371,10 +2423,10 @@ class BackgroundWorker:
                     "note_id": note_id,
                     "candidate_id": candidate_id,
                     "cosine": cosine_value,
-                    "verdict": verdict,
+                    "verdict": result.verdict,
                 },
             )
-            if verdict:
+            if result.verdict:
                 return (candidate_id, cosine_value)
         return None
 
@@ -1413,17 +2465,22 @@ class BackgroundWorker:
         for row in rows:
             try:
                 generated = self._summarizer.title(row["text"])
-            except SummaryError:
-                logging.getLogger("app").warning(
-                    "title: generation failed — kept null, retry by back-off",
-                    extra={
-                        "event": "title_failed",
-                        "job": SUMMARY_JOB,
-                        "note_id": row["id"],
-                    },
+            except SummaryError as exc:
+                self._log_slot_failure(
+                    SUMMARY_JOB,
+                    SLOT_SUMMARY,
+                    outcome_of(exc),
+                    event="title_failed",
+                    message="title: generation failed — kept null, retry by back-off",
+                    note_id=row["id"],
+                    detail=str(exc),
+                    meta=getattr(exc, "meta", None),
                 )
                 continue  # отказ: title остаётся NULL, повтор по back-off
-            title = self._truncate_title(generated)
+            self._log_slot_call(
+                SUMMARY_JOB, SLOT_SUMMARY, generated.meta, note_id=row["id"]
+            )
+            title = self._truncate_title(generated.text)
             if not title:
                 continue
             with session(self._settings) as conn, transaction(conn):
@@ -1513,21 +2570,28 @@ class BackgroundWorker:
         done = 0
         for row in rows:
             try:
-                summary = self._summarizer.summarize(row["text"])
-            except SummaryError:
-                logging.getLogger("app").warning(
-                    "summary: generation failed — kept pending, retry by back-off",
-                    extra={
-                        "event": "summary_failed",
-                        "job": SUMMARY_JOB,
-                        "note_id": row["id"],
-                    },
+                summary_result = self._summarizer.summarize(row["text"])
+            except SummaryError as exc:
+                self._log_slot_failure(
+                    SUMMARY_JOB,
+                    SLOT_SUMMARY,
+                    outcome_of(exc),
+                    event="summary_failed",
+                    message="summary: generation failed — kept pending, retry by back-off",
+                    note_id=row["id"],
+                    detail=str(exc),
+                    meta=getattr(exc, "meta", None),
                 )
                 continue  # отказ: status pending остаётся, повтор по back-off
+            self._log_slot_call(
+                SUMMARY_JOB, SLOT_SUMMARY, summary_result.meta, note_id=row["id"]
+            )
             # Страховка длины (решение гейта 3.1.0, 2026-09-19): модель может
             # не послушать промпт («no more than 150 characters») — в БД уходит
             # усечённое по границе слова саммари, всегда ≤ MAX_SUMMARY_CHARS.
-            summary = cap_summary(summary, self._settings.max_summary_chars)
+            summary = cap_summary(
+                summary_result.text, self._settings.max_summary_chars
+            )
             with session(self._settings) as conn, transaction(conn):
                 cursor = conn.execute(
                     "UPDATE notes SET summary = ?, summary_status = 'ok' "
@@ -1640,6 +2704,19 @@ class BackgroundWorker:
                 + " WHERE id = ? AND namespace = ? AND deleted_at IS NULL",
                 (*params, note_id, expected_namespace),
             )
+            if cursor.rowcount and move:
+                # №41 (FR-3.1/FR-4.4, §13.5): фактический переезд `namespace` —
+                # контентное изменение, версия пишется ТОЙ ЖЕ транзакцией.
+                # Источник — из `bind_origin` тела джобы (`job:<name>`);
+                # служебные `hint_path`/`confidence` в проекцию не входят.
+                row = conn.execute(
+                    "SELECT text, title, namespace, expires_at, comment FROM notes "
+                    "WHERE id = ?",
+                    (note_id,),
+                ).fetchone()
+                history.record_change(
+                    conn, history.ENTITY_NOTE, note_id, history.note_projection(row)
+                )
         if not cursor.rowcount:
             return "kept", "node_changed", target
         if move:
@@ -1690,16 +2767,21 @@ class BackgroundWorker:
         known = self._namespaces.list_all()["namespaces"]
         try:
             result = self._classifier.classify(text, known)
-        except ClassificationError:
-            logging.getLogger("app").warning(
-                "classify: failed — note stays in default, retry on next update",
-                extra={
-                    "event": "classify_failed",
-                    "job": SUMMARY_JOB,
-                    "note_id": note_id,
-                },
+        except ClassificationError as exc:
+            self._log_slot_failure(
+                SUMMARY_JOB,
+                SLOT_SUMMARY,
+                outcome_of(exc),
+                event="classify_failed",
+                message="classify: failed — note stays in default, retry on next update",
+                note_id=note_id,
+                detail=str(exc),
+                meta=getattr(exc, "meta", None),
             )
             return
+        self._log_slot_call(
+            SUMMARY_JOB, SLOT_SUMMARY, result.meta, note_id=note_id
+        )
         # Пул 6: переезд — ОДНА общая точка `_apply_node_order` (разметка +
         # namespace/vector_status одним UPDATE, guard внутри); отказ
         # вычисления цели (в т.ч. NamespaceValidationError на мусорном hint)
@@ -1814,6 +2896,11 @@ class BackgroundWorker:
         петлю к ожиданию интервала или сигнала `notify_nodes_pending`).
         """
         limit = self._settings.job_nodes_batch if budget is None else budget
+        # Ворота слота summary (№39, §6.2): при разрыве классификатор не
+        # зовём — прогон возвращает 0, петля уходит в back-off; задание и
+        # очередь не теряются (разбудит сигнал/таймаут после снятия разрыва).
+        if not self._slot_gate(SLOT_SUMMARY, NODES_JOB):
+            return 0
         # (1) Промоция первой: заметка не «переезжает» в узел, который
         # появится в этом же прогоне (FR-3.1). Отказ не роняет джобу (FR-3.2).
         self._run_promotion(NODES_JOB)
@@ -1884,19 +2971,25 @@ class BackgroundWorker:
         text = f"{row['title']}\n{summary}" if row["title"] else summary
         try:
             result = self._classifier.classify(text, known)
-        except ClassificationError:
+        except ClassificationError as exc:
             # Отказ классификатора данные не портит (FR-3.1): заметка остаётся
-            # в текущем узле, разметка не пишется, задание — pending.
-            logging.getLogger("app").warning(
-                "nodes: reclass failed — note stays in its node, retry by back-off",
-                extra={
-                    "event": "node_order_failed",
-                    "job": NODES_JOB,
-                    "source": "after_merge",
-                    "note_id": note_id,
-                },
+            # в текущем узле, разметка не пишется, задание — pending. №39:
+            # событие несёт тип исхода отказа слота summary.
+            self._log_slot_failure(
+                NODES_JOB,
+                SLOT_SUMMARY,
+                outcome_of(exc),
+                event="node_order_failed",
+                message="nodes: reclass failed — note stays in its node, retry by back-off",
+                note_id=note_id,
+                detail=str(exc),
+                source="after_merge",
+                meta=getattr(exc, "meta", None),
             )
             return False
+        self._log_slot_call(
+            NODES_JOB, SLOT_SUMMARY, result.meta, note_id=note_id
+        )
         outcome, reason, target = self._apply_node_order(
             note_id,
             row["namespace"],
@@ -1955,16 +3048,21 @@ class BackgroundWorker:
             text = f"{row['title']}\n{summary}" if row["title"] else summary
             try:
                 result = self._classifier.classify(text, known)
-            except ClassificationError:
-                logging.getLogger("app").warning(
-                    "nodes: classify failed — note stays in default, retry later",
-                    extra={
-                        "event": "classify_failed",
-                        "job": NODES_JOB,
-                        "note_id": note_id,
-                    },
+            except ClassificationError as exc:
+                self._log_slot_failure(
+                    NODES_JOB,
+                    SLOT_SUMMARY,
+                    outcome_of(exc),
+                    event="classify_failed",
+                    message="nodes: classify failed — note stays in default, retry later",
+                    note_id=note_id,
+                    detail=str(exc),
+                    meta=getattr(exc, "meta", None),
                 )
                 continue  # маркер не ставим: заметка снова кандидат обхода
+            self._log_slot_call(
+                NODES_JOB, SLOT_SUMMARY, result.meta, note_id=note_id
+            )
             outcome, reason, target = self._apply_node_order(
                 note_id,
                 "default",
@@ -2030,7 +3128,10 @@ class BackgroundWorker:
                         self._settings.namespace_auto_move_min_confidence
                 },
             ).fetchone()
-        return queue_snapshot(row["pending"], row["oldest_pending_sec"])
+        stat = queue_snapshot(row["pending"], row["oldest_pending_sec"])
+        # №39 (arch §6.9): классификатор обхода `nodes` ходит в слот summary —
+        # при его разрыве очередь ждёт слот (работа едет в `waiting`).
+        return self._gated_queue_stat(SLOT_SUMMARY, stat)
 
     def _nodes_queue_empty(self) -> bool:
         """Пуста ли очередь `nodes` (дешёвая перепроверка, пул 6, lost wakeup).
@@ -2220,6 +3321,7 @@ def build_embedding_job(worker: BackgroundWorker, settings: Settings) -> JobSpec
         wait_event=worker._embedding_event,
         idle_hook=worker._purge_done_jobs,
         queue_stat=worker._vector_queue_stat,
+        slot=SLOT_EMBEDDING,
     )
 
 
@@ -2244,6 +3346,7 @@ def build_summary_job(
         wait_event=worker._summary_event,
         idle_hook=None,
         queue_stat=worker._summary_queue_stat,
+        slot=SLOT_SUMMARY,
     )
 
 
@@ -2260,6 +3363,7 @@ def build_judge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         wait_event=worker._judge_event,
         idle_hook=None,
         queue_stat=worker._judge_queue_stat,
+        slot=SLOT_JUDGE,
     )
 
 
@@ -2276,6 +3380,7 @@ def build_areas_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         wait_event=worker._areas_event,
         idle_hook=None,
         queue_stat=worker._areas_queue_stat,
+        slot=None,
     )
 
 
@@ -2298,6 +3403,7 @@ def build_expiration_job(worker: BackgroundWorker, settings: Settings) -> JobSpe
         wait_event=None,
         idle_hook=None,
         queue_stat=None,
+        slot=None,
     )
 
 
@@ -2324,7 +3430,10 @@ def build_nodes_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
     batch = settings.job_nodes_batch
 
     async def process() -> int:
-        return await asyncio.to_thread(worker.process_nodes, batch)
+        # №41 (§13.4): тело джобы несёт источник `job:nodes` — переезд
+        # `namespace` записывает версию с этой пометкой (FR-4.4).
+        with history.bind_origin(f"job:{NODES_JOB}"):
+            return await asyncio.to_thread(worker.process_nodes, batch)
 
     return JobSpec(
         name=NODES_JOB,
@@ -2337,6 +3446,7 @@ def build_nodes_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         wait_event=worker._nodes_event,
         idle_hook=None,
         queue_stat=worker._nodes_queue_stat,
+        slot=SLOT_SUMMARY,
     )
 
 

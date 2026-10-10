@@ -32,7 +32,9 @@ from app.transport.mcp import (
     TOOL_DESCRIPTIONS,
     TOOL_NAMES,
     _NS_RULES,
+    _logs_section,
     _namespace_map,
+    _note_lifetime_section,
     _skills_announce,
     build_instructions,
     build_mcp,
@@ -46,23 +48,22 @@ CANON_TOOL_DESCRIPTIONS = {
     "user_search": (
         "Search the user area: atomic facts about the user (steady preferences, "
         "working habits, agreements — ONE FACT PER RECORD, never a list). Returns "
-        "{id, name, excerpt}; the full body — user_get. Search here when the "
+        "{id, name, excerpt}; the full body — via `user_get`. Search here when the "
         "answer depends on the user's preferences or arrangements; do not invent "
         "what might be stored — search first."
     ),
     "user_save": (
-        "Save ONE atomic durable fact about the user: name ≤5 words (like a note "
-        "title) + body ≤1200 characters. ONE FACT = ONE RECORD: never pack a list "
-        "of facts into one record and never repeat a fact that is already stored "
-        "— several facts mean several separate calls. A strong overlap with an "
-        "existing fact is refused with a hint pointing to it: the same fact — "
-        "refine it via user_update(id=…); a new fact — save it as a separate "
-        "record. Never store secrets (passwords, tokens, keys)."
+        "Save ONE atomic durable fact about the user: a short name plus a compact "
+        "body. ONE FACT = ONE RECORD: never pack a list of facts into one record "
+        "and never repeat a fact that is already stored — several facts mean "
+        "several separate calls. A strong overlap with an existing fact is refused "
+        "with a hint pointing to it: refine that fact via `user_update`; a new one "
+        "is saved separately. Never store secrets (passwords, tokens, keys)."
     ),
     "user_update": (
-        "Update a fact by id: name and/or body; a value that is not passed = keep "
-        "the current one. Run user_get first so you don't lose details. This is "
-        "the right tool when user_save hinted that a similar fact already exists."
+        "Update a fact by id: name and/or body; a value that is not passed keeps "
+        "the current one. Run `user_get` first so no details are lost. This is the "
+        "tool to call when `user_save` hinted that a similar fact already exists."
     ),
     "user_delete": (
         "Delete a fact by id (soft delete: it disappears from all outputs; "
@@ -128,6 +129,7 @@ MEMORY_TOOL_NAMES = frozenset(
         "memory_delete",
         "memory_namespaces",
         "memory_namespace_create",
+        "memory_comment_search",
     }
 )
 SKILL_TOOL_NAMES = frozenset(
@@ -135,6 +137,10 @@ SKILL_TOOL_NAMES = frozenset(
 )
 # 3 ручки области terms (lsb-0008-02) — поверхность релиза 3.0.0 растёт.
 TERMS_TOOL_NAMES = frozenset({"terms_search", "terms_save", "terms_get"})
+# №41 (3.2.0): пара общих инструментов чтения истории (§13.14).
+HISTORY_TOOL_NAMES = frozenset({"history_list", "history_get"})
+# №12 (no12-02): одна точка чтения предупреждений — ядро поверхности.
+WARNINGS_TOOL_NAMES = frozenset({"warnings_list"})
 
 FACT_NAME = "Moscow timezone"
 FACT_BODY = "Oleg is in Moscow, Europe/Moscow is the default for weather and time"
@@ -216,9 +222,19 @@ class TestToolRegistry:
         assert set(CANON_TOOL_DESCRIPTIONS) <= names
         assert names - set(CANON_TOOL_DESCRIPTIONS) == (
             MEMORY_TOOL_NAMES | SKILL_TOOL_NAMES | TERMS_TOOL_NAMES
+            | HISTORY_TOOL_NAMES | WARNINGS_TOOL_NAMES
         )
-        assert set(TOOL_NAMES) == names
-        assert len(names) == 21
+        # Логи (f10-02/03) в этой DI-сборке не собраны (`services.logs is None`):
+        # их ручек в поверхности нет, остальное совпадает со словарём TOOL_NAMES.
+        assert set(TOOL_NAMES) - {
+            "logs_save",
+            "logs_get",
+            "logs_update",
+            "logs_delete",
+            "logs_search",
+            "logs_list",
+        } == names
+        assert len(names) == 25
 
     @pytest.mark.asyncio
     async def test_tool_descriptions_are_canon_verbatim(self, mcp_user) -> None:
@@ -262,8 +278,9 @@ class TestToolRegistry:
     def test_instructions_have_no_user_block_and_unchanged(self, settings) -> None:
         """Инъекции нет (arch §2): блока «user» нет и текст не изменился.
 
-        Хвост анонса навыков — существующий (lsb-0007-04); всё остальное —
-        база + правило неймспейсов + карта, как до этого пула.
+        Хвост анонса навыков — существующий (lsb-0007-04), за ним — статический
+        раздел области логов (f10-04 §10); всё остальное — база + правило
+        неймспейсов + карта, как до этого пула.
         """
         services = _services(settings, HashEmbedder(DIM))
         expected = (
@@ -271,6 +288,8 @@ class TestToolRegistry:
             + _NS_RULES
             + _namespace_map(services)
             + _skills_announce(services)
+            + _logs_section(services, settings)
+            + _note_lifetime_section(services, settings)
         )
         text = build_instructions(services)
         assert text == expected
@@ -472,7 +491,7 @@ class TestOtherOutputsRegression:
             "memory_save",
             {"text": "Regression note for the user-area pool.", "title": "Regression note"},
         )
-        assert set(note) == {"id", "stored", "summary_pending"}
+        assert {"id", "stored", "summary_pending"} <= set(note)  # №28: + namespace_hint
         found = await _call(mcp_full, "memory_search", {"query": "regression"})
         assert set(found["results"][0]) == {
             "id",

@@ -174,6 +174,9 @@ visible in `/health`.
 | `BACKUP_DIR` | `/data/backups` | backup snapshot directory |
 | `BACKUP_INTERVAL_SEC` | `86400` | snapshot interval (daily) |
 | `BACKUP_KEEP` | `7` | snapshots kept (rotation) |
+| `BACKUP_VERIFY_EVERY` | `1` | verify the restore of every Nth snapshot; `0` = manual only (`POST /backups/verify`) |
+| `BACKUP_SHIP_CMD` | *(empty)* | operator command that ships a verified snapshot off the box; gets `LSB_BACKUP_FILE`/`LSB_BACKUP_NAME` in env and must print `size=<N>` — destination and credentials live OUTSIDE this repository |
+| `BACKUP_SHIP_TIMEOUT_SEC` | `300` | timeout of the ship command, seconds |
 
 `/health` (no token) also reports `version` and `queues`: for each background
 queue, the number of `pending` jobs and `oldest_pending_sec` — the age of the

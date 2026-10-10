@@ -255,10 +255,10 @@ class TestMCPUnchanged:
     """Постановка не трогает поиск, реестр узлов и состав поверхности."""
 
     @pytest.mark.asyncio
-    async def test_surface_is_still_21_tools(self, mcp_server) -> None:
-        """Регресс поверхности: 21 инструмент, состав не изменился."""
+    async def test_surface_is_still_31_tools(self, mcp_server) -> None:
+        """Регресс поверхности: 31 инструмент (+ пары истории/№41 и warnings/№12, + пометки no24-02, + 6 ручек логов LSBN-F-10: 4 в f10-02, ещё 2 в f10-03)."""
         names = {tool.name for tool in await mcp_server.list_tools()}
-        assert len(names) == 21
+        assert len(names) == 31
         assert names == TOOL_NAMES
 
     @pytest.mark.asyncio
@@ -278,13 +278,15 @@ class TestMCPUnchanged:
 
     @pytest.mark.asyncio
     async def test_memory_search_schema_unchanged(self, mcp_server) -> None:
-        """Входы поиска не менялись: те же параметры и потолок top_k."""
+        """Входы поиска: те же параметры и потолок top_k; no29-01 добавляет
+        только `updated_after` (свежесть) — остальной контракт не тронут."""
         schemas = {
             tool.name: tool.input_schema for tool in await mcp_server.list_tools()
         }
         props = schemas["memory_search"]["properties"]
         assert set(props) == {
-            "query", "top_k", "namespace", "namespace_exact", "mode"
+            "query", "top_k", "namespace", "namespace_exact", "mode",
+            "updated_after",
         }
         assert props["top_k"]["maximum"] == 20
 

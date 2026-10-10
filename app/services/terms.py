@@ -63,6 +63,7 @@ from collections.abc import Callable
 from typing import Any
 
 from app.config import Settings
+from app.services import history
 from app.services.areas import (
     TERMS_AREA,
     AreaSearch,
@@ -226,6 +227,13 @@ class TermsService:
                         term_id,
                     ),
                 )
+                # №41 (FR-3.3, §13.5): правка по совпавшему ключу — версия-
+                # дельта в общей истории той же транзакцией; служебные
+                # `term_norm`/`context_norm` в проекцию не входят (FR-4.2).
+                live = self._projection_row(conn, term_id)
+                history.record_change(
+                    conn, history.ENTITY_TERM, term_id, history.term_projection(live)
+                )
                 answer: dict[str, Any] = {"updated": True, "id": term_id}
             else:
                 near = self._nearest_context(
@@ -259,7 +267,13 @@ class TermsService:
                         checked_definition,
                     ),
                 )
-                answer = {"created": True, "id": int(cursor.lastrowid or 0)}
+                term_id = int(cursor.lastrowid or 0)
+                # №41 (§13.5): baseline нового смысла — той же транзакцией.
+                live = self._projection_row(conn, term_id)
+                history.record_initial(
+                    conn, history.ENTITY_TERM, term_id, history.term_projection(live)
+                )
+                answer = {"created": True, "id": term_id}
             # Справочная часть ответа (FR-3.2): смыслы термина после записи и
             # использованные контексты области — обе ветки успеха.
             answer["senses"] = self._senses(conn, term_norm)
@@ -330,6 +344,12 @@ class TermsService:
                     checked_definition,
                     id,
                 ),
+            )
+            # №41 (FR-3.3, §13.5): правка по id — версия-дельта той же
+            # транзакцией; `term_norm`/`context_norm`/`vector_status` вне проекции.
+            live = self._projection_row(conn, id)
+            history.record_change(
+                conn, history.ENTITY_TERM, id, history.term_projection(live)
             )
         self._notify_areas_pending()
         return {"id": id, "updated": True}
@@ -434,6 +454,9 @@ class TermsService:
                 (id,),
             )
             deleted = bool(cursor.rowcount)
+            if deleted:
+                # №41 (FR-6.1, §13.5): мягкое удаление — версия-событие.
+                history.record_event(conn, history.ENTITY_TERM, id, "delete")
         if not deleted:
             return {"id": id, "deleted": False, "hint": HINT_NOT_FOUND}
         # Сигнал петле areas един по всем успешным изменениям области: у
@@ -443,6 +466,42 @@ class TermsService:
         return {"id": id, "deleted": True}
 
     # --- внутреннее: подсказки и близость контекста -------------------------
+
+    def group(self, term_norm: str) -> list[dict[str, Any]]:
+        """Активные строки группы термина — читающий хелпер джобы `terms-normalize`.
+
+        Возвращает `[{id, term, context, definition, context_norm, updated_at}]`
+        только по активным строкам (`deleted_at IS NULL`), порядок — по id.
+        Только SQL: запись джоба ведёт существующими `update`/`delete`, их
+        поведение и контракты не меняются (№32 FR-9.1). Листинга у области не
+        появляется — ручка живёт только внутри фоновой джобы.
+        """
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT id, term, context, definition, context_norm, updated_at "
+                "FROM terms WHERE term_norm = ? AND deleted_at IS NULL "
+                "ORDER BY id",
+                (term_norm,),
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "term": str(row["term"]),
+                "context": str(row["context"]),
+                "definition": str(row["definition"]),
+                "context_norm": str(row["context_norm"]),
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _projection_row(conn: sqlite3.Connection, term_id: int) -> sqlite3.Row:
+        """Строка проекции термина после записи — одна форма baseline/дельты."""
+        return conn.execute(
+            "SELECT term, context, definition FROM terms WHERE id = ?",
+            (term_id,),
+        ).fetchone()
 
     def _senses(
         self, conn: sqlite3.Connection, term_norm: str

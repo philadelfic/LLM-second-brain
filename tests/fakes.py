@@ -47,15 +47,38 @@ import math
 
 from app.services.classifier import Classification, ClassificationError
 from app.services.embedding import EmbeddingError
-from app.services.judge import JudgeError
+from app.services.judge import JudgeError, JudgeResult
+from app.services.llm_client import ChatMeta
 from app.services.promotion import (
     DescriberError,
     StructureJudgeError,
     Verdict,
 )
-from app.services.summary import SummaryError
+from app.services.summary import SummaryError, SummaryResult
 from app.services.worker import BackgroundWorker
 from app.storage.db import CREATOR_SKILL_NAME, session, transaction
+
+
+def fake_meta(slot: str = "summary", operation: str | None = None) -> ChatMeta:
+    """Минимальные метаданные вызова для фейков (№49): воркер читает их в
+    `slot_call`. Значения детерминированы и на поведение тестов не влияют."""
+    return ChatMeta(
+        slot=slot,
+        provider="ollama",
+        model="fake-model",
+        operation=operation,
+        model_type="generation",
+        budget=1000,
+        budget_source="legacy",
+        prompt_tokens=10,
+        completion_tokens=5,
+        reasoning_tokens=None,
+        had_thinking=False,
+        thinking_chars=0,
+        finish_reason="stop",
+        truncated=False,
+        duration_ms=1,
+    )
 
 
 class HashEmbedder:
@@ -157,23 +180,23 @@ class FixedSummarizer:
         self.merge_calls: list[tuple[str, str]] = []
         self.last_attempt_ok: bool | None = None  # для /health.summarizer_ok
 
-    def summarize(self, text: str) -> str:
+    def summarize(self, text: str) -> SummaryResult:
         self.calls.append(text)
         self.last_attempt_ok = True
-        return self.summary
+        return SummaryResult(text=self.summary, meta=fake_meta("summary", "summary"))
 
-    def title(self, text: str) -> str:
+    def title(self, text: str) -> SummaryResult:
         """Title-доген (Фаза 11, решение №9): тот же фиксированный текст;
         обрезку до 5 слов делает воркер."""
         self.calls.append(text)
         self.last_attempt_ok = True
-        return self.summary
+        return SummaryResult(text=self.summary, meta=fake_meta("summary", "title"))
 
-    def merge(self, text_a: str, text_b: str) -> str:
+    def merge(self, text_a: str, text_b: str) -> SummaryResult:
         """Слияние дубликатов (Этап 2.2): фиксированный ответ, журнал пар."""
         self.merge_calls.append((text_a, text_b))
         self.last_attempt_ok = True
-        return self.merge_result
+        return SummaryResult(text=self.merge_result, meta=fake_meta("summary", "merge"))
 
     def close(self) -> None:  # интерфейс-совместимость с SummaryService
         return None
@@ -259,13 +282,13 @@ class MergeFailingSummarizer(FixedSummarizer):
         self.merge_calls: list[tuple[str, str]] = []
         self.fail: bool = True  # False — слияние восстановилось
 
-    def merge(self, text_a: str, text_b: str) -> str:
+    def merge(self, text_a: str, text_b: str) -> SummaryResult:
         self.merge_calls.append((text_a, text_b))
         if self.fail:
             self.last_attempt_ok = False
             raise SummaryError("слияние недоступно")
         self.last_attempt_ok = True
-        return self.merge_result
+        return SummaryResult(text=self.merge_result, meta=fake_meta("summary", "merge"))
 
 
 class FixedClassifier:
@@ -406,14 +429,15 @@ class ScriptedJudge:
         self.judge_calls: list[tuple[str, str]] = []
         self.last_attempt_ok: bool | None = None
 
-    def judge(self, text_new: str, text_candidate: str) -> bool:
+    def judge(self, text_new: str, text_candidate: str) -> JudgeResult:
         """Вердикт из очереди; отказ — JudgeError (интерфейс Judge)."""
         self.judge_calls.append((text_new, text_candidate))
         if self.fail:
             self.last_attempt_ok = False
             raise JudgeError("судья недоступен")
         self.last_attempt_ok = True
-        return self.verdicts.pop(0) if self.verdicts else self.default
+        verdict = self.verdicts.pop(0) if self.verdicts else self.default
+        return JudgeResult(verdict=verdict, meta=fake_meta("judge", "judge"))
 
     def close(self) -> None:  # интерфейс-совместимость с JudgeService
         return None
@@ -430,7 +454,21 @@ def clear_seeded_skills(settings) -> None:
     перестраивается (`rebuild` внешнего контента: строк-призраков не
     остаётся). Маркер сида в `skills_meta` повторную вставку не допускает —
     область остаётся пустой; сам сид проверяется в tests/test_skills_announce.py.
+
+    №41 (3.2.0): жёсткое удаление строки сида отпускает её id для переиспользования
+    (rowid), поэтому снимаем и его baseline в `record_versions` — иначе новый
+    навык получает тот же id и `record_initial` упирался бы в PK истории. В проде
+    навыки не удаляются жёстко (только soft delete), коллизии нет — это
+    приспособление тестового хелпера.
     """
     with session(settings) as conn, transaction(conn):
+        seeded = conn.execute(
+            "SELECT id FROM skills WHERE name = ?", (CREATOR_SKILL_NAME,)
+        ).fetchone()
         conn.execute("DELETE FROM skills WHERE name = ?", (CREATOR_SKILL_NAME,))
+        if seeded is not None:
+            conn.execute(
+                "DELETE FROM record_versions WHERE entity = 'skill' AND entity_id = ?",
+                (int(seeded["id"]),),
+            )
         conn.execute("INSERT INTO skills_fts(skills_fts) VALUES('rebuild')")

@@ -40,14 +40,31 @@ services:
       SUMMARY_BASE_URL: "http://localhost:11434"  # ollama: /api/chat; openai: /v1/chat/completions
       SUMMARY_API_KEY: "CHANGE_ME"               # optional; required for the openai provider
       SUMMARY_MODEL: "ornith:35b"                # summarization model
+      SUMMARY_MODEL_TYPE: "generation"   # reasoning | generation; declare reasoning to get the budget and thinking guards
       # --- judge slot (dedup judge + structure judge) ---
       JUDGE_PROVIDER: "ollama"                 # ollama (default) | openai
       JUDGE_BASE_URL: "http://localhost:11434"  # ollama: /api/chat; openai: /v1/chat/completions
       JUDGE_API_KEY: "CHANGE_ME"               # optional; required for the openai provider
       JUDGE_MODEL: "ornith:35b"                # dedup judge model
+      JUDGE_MODEL_TYPE: "generation"   # reasoning | generation; declare reasoning to get the budget and thinking guards
       JUDGE_THINK: "true"              # thinking judge: think:false produced false positives on long notes (E2E); ollama provider only
-      JUDGE_NUM_PREDICT: "1024"        # thinking+verdict budget (measured ~1200 tokens, done_reason=stop)
-      JUDGE_TIMEOUT_SEC: "300"         # thinking judge: long pair 46 s, worst live call ~121 s (E2E) — 300 s with margin
+      JUDGE_NUM_PREDICT: "0"           # 0 = as much as fits (auto budget from JUDGE_CONTEXT_TOKENS); explicit values keep the old caps (1024)
+      JUDGE_TIMEOUT_SEC: "300"         # thinking judge: long pair 46 s, worst live call ~121 s (E2E) — 300 s with margin; 900 = the back-off/pause ceiling (15 min): a single call must not hold the slot longer than the job cycle is willing to wait
+      JUDGE_CONTEXT_TOKENS: "0"        # the model's context window; 0 = unknown → previous per-operation caps
+      # --- decision slot (LSBN-F-12, 3.2.0): OFF by default; decisions go
+      #     generative as today. decision needs Ollama ≥ 0.35.1: the route is
+      #     native /v1/systemone, NOT OpenAI-compatible. When enabled, all
+      #     questions of a group go in ONE call (up to DECISION_MAX_QUESTIONS).
+      # DECISION_ENABLED: "false"           # true — enable the decision slot
+      # DECISION_BASE_URL: "http://localhost:11434"  # /v1/systemone address (http(s); required when enabled)
+      # DECISION_MODEL: "decision-model"    # decision model (required when enabled)
+      # DECISION_API_KEY: ""                # optional; Bearer is sent only when set
+      # DECISION_TIMEOUT_SEC: "300"         # no generation, but the prefill is long (pilot: up to 19 s per 2k tokens)
+      # DECISION_THRESHOLD: "0.5"           # confidence threshold (0..1; a per-question value in the registry wins)
+      # DECISION_UNCERTAINTY_ZONE: "0.05"   # half-width of the uncertainty zone around the threshold → fallback
+      # DECISION_FALLBACK: "true"           # true — switch to the generative slot; false — the job waits (№39)
+      # DECISION_MAX_QUESTIONS: "64"        # questions asked in one call (model limit, 1..64)
+      # DECISION_MAX_LABELS: "40"           # choice labels ceiling (≥2; more → fallback, reason unsupported)
       # --- editable prompts (Phase 11): the directory is mounted at
       #     ./prompts:/app/prompts; with PROMPTS_DIR set, 3 files
       #     (summary_system, summary_merge_system, judge_system) are created
@@ -79,27 +96,81 @@ services:
       JOB_NODES_INTERVAL_SEC: "3600"   # start pause between nodes runs in seconds (≥30)
       JOB_NODES_BATCH: "20"            # default notes processed per nodes run (≥1)
       JOB_NODES_CLASSIFIER_BUDGET: "10"  # classifier calls per nodes run (≥1, ≤ JOB_NODES_BATCH)
+      # --- background jobs (lsb-0014): warnings job (№12) ---
+      JOB_WARNINGS_ENABLED: "true"     # misplaced-note warnings job on/off (its queue stays visible in /health)
+      JOB_WARNINGS_INTERVAL_SEC: "3600"  # start pause between warnings runs in seconds (≥30)
+      JOB_WARNINGS_BATCH: "20"         # placed notes checked per warnings run (≥1)
+      JOB_WARNINGS_CLASSIFIER_BUDGET: "10"  # classifier calls per warnings run (≥1, ≤ JOB_WARNINGS_BATCH)
+      WARNINGS_MIN_CONFIDENCE: "0.80"  # confidence threshold for "note is misplaced" (0..1)
+      WARNINGS_LEVEL_STRICT: "false"   # treat a parent/child node mismatch as a warning too
+      # --- background jobs (lsb-0014): terms-normalize job (№32) ---
+      JOB_TERMS_ENABLED: "true"       # terms-normalize job on/off (also gated by AREA_TERMS_ENABLED)
+      JOB_TERMS_INTERVAL_SEC: "1800"  # start pause between terms-normalize runs in seconds (≥30)
+      JOB_TERMS_BATCH: "50"           # term groups processed per terms-normalize run (≥1)
+      JOB_TERMS_CLUSTER_SIMILARITY: "0.75"  # context clustering threshold, single-linkage (0..1)
+      JOB_TERMS_CONTEXTS_EXCESS: "5"  # contexts-per-term excess warning threshold (≥2)
+      # --- node hint on save without namespace (№28): map read, no model call ---
+      MEMORY_NODE_HINT_ENABLED: "true"     # node hint on save without namespace (its absence hides the field)
+      MEMORY_NODE_HINT_MIN_SCORE: "2.0"    # node selection threshold (2.0 = one matching significant word)
+      MEMORY_NODE_HINT_MAX_NODES: "2"      # how many nodes at most in the hint (1..2)
+      MEMORY_NODE_HINT_TEXT_CHARS: "200"   # text characters compared alongside the title (≥1)
+      # --- "similar" hint on save (№30): FTS candidates + Dice, no model call ---
+      MEMORY_SIMILAR_ENABLED: "true"       # similar hint on save (its absence hides the field)
+      MEMORY_SIMILAR_LIMIT: "2"            # how many similar notes at most in the reply (1..3)
+      MEMORY_SIMILAR_POOL: "5"             # FTS candidates fetched before scoring (≥ limit)
+      MEMORY_SIMILAR_THRESHOLD: "0.30"     # Dice threshold over significant words (0..1)
+      MEMORY_SIMILAR_TEXT_CHARS: "500"     # text characters scored alongside the title (≥1)
       DEDUP_SIMILARITY: "0.92"               # "duplicate" cosine threshold in background dedup (Phase 8)
       DEDUP_CANDIDATE_TOP_N: "3"             # top-N cosine candidates for the dedup judge
       DEDUP_CANDIDATE_SIMILARITY: "0.80"     # lower paraphrase-candidate threshold (≤ DEDUP_SIMILARITY)
       # --- summarization (mode "B") ---
       MAX_SUMMARY_CHARS: "150"               # summary length limit: model summary + fallback (gate 2026-09-19)
       SUMMARY_THINK: "true"                  # keep model reasoning; ollama provider only
-      SUMMARY_NUM_PREDICT: "35000"           # thinking+content budget for summaries
-      MERGE_NUM_PREDICT: "35000"             # separate budget for duplicate merges
-      SUMMARY_TIMEOUT_SEC: "750"             # 12.5 min margin for merging 35k-char notes
+      SUMMARY_NUM_PREDICT: "0"               # 0 = as much as fits (auto budget from SUMMARY_CONTEXT_TOKENS); explicit 35000 keeps the old cap
+      MERGE_NUM_PREDICT: "0"                 # 0 = as much as fits; explicit 35000 keeps the old merge cap
+      SUMMARY_TIMEOUT_SEC: "750"             # 12.5 min margin for merging 35k-char notes; 900 = the back-off/pause ceiling (15 min): a single call must not hold the slot longer than the job cycle is willing to wait
+      SUMMARY_CONTEXT_TOKENS: "0"            # the model's context window; 0 = unknown → previous per-operation caps
+      SLOT_PROMPT_RESERVE_TOKENS: "512"      # prompt-chat-template + tokenizer-drift reserve for the auto budget
+      SLOT_MAX_OUTPUT_TOKENS: "32768"        # defensive ceiling of the auto output budget (explicit budgets are never clamped)
+      SLOT_REASONING_MIN_OUTPUT_TOKENS: "4096"  # below it a reasoning slot gets a startup WARN: too little room for thinking
+      SLOT_MIN_TIMEOUT_SEC: "300"            # below it a reasoning slot gets a startup WARN: a long-thinking call looks like a timeout
       # --- HTTP/MCP ---
       PORT: "8080"
       MCP_PATH: "/mcp"
       # --- storage ---
       DB_PATH: "/data/notes.db"
       MAX_NOTE_CHARS: "35000"                # max note length
+      COMMENT_MAX_CHARS: "250"               # no24-01 (3.2.0): max comment length of a note (a remark, not knowledge)
       PENDING_RETRY_SEC: "30"                # background worker start interval (×2 → 15 min)
+      # --- slot breaks (No39, release 3.2.0): pause with a probe + human hint ---
+      SLOT_PAUSE_SEC: "900"          # pause of a broken slot = back-off ceiling (≥30); one probe per pause
+      SLOT_PAUSE_AFTER: "3"          # consecutive non-transient failures opening the break (≥1; auth opens at once)
+      SLOT_HINT_EVERY_SEC: "900"     # throttle of the "tell your human" hint per slot (≥0; 0 — every call)
+      SLOT_MAX_ATTEMPTS: "8"         # attempts of one pair before "needs attention" (≥1; the job stays pending)
+      SLOT_ATTENTION_RESET_ON_START: "true"  # clear attention_at at startup (slot config may have changed)
+      # --- version history (No41, release 3.2.0): record_versions layer ---
+      HISTORY_ENABLED: "true"           # kill switch: false — no versions are written, history reads come back empty
+      HISTORY_MAX_VERSIONS: "0"         # versions kept per record (0 — keep everything; >0 — prune with re-base)
+      HISTORY_RETENTION_DAYS: "0"       # version retention in days (0 — unlimited; >0 — prune with re-base)
+      HISTORY_DELTA_INLINE_MAX: "2048"  # threshold "full value ↔ line delta", chars (≥1)
+      # --- area flags (No40, release 3.2.0): skills/terms/user-facts surfaces ---
+      AREA_SKILLS_ENABLED: "true"       # skills area on/off; its queue stays visible in /health.areas
+      AREA_TERMS_ENABLED: "true"        # terms area on/off; its queue stays visible in /health.areas
+      AREA_USER_FACTS_ENABLED: "true"   # user-facts area on/off; its queue stays visible in /health.areas
+      AREA_LOGS_ENABLED: "true"         # assistant-logs area on/off; its queue stays visible in /health.areas
+      LOGS_ACTION_MAX_CHARS: "500"      # assistant-logs form: action limit (>=1), validated by the service
+      LOGS_REASON_MAX_CHARS: "500"      # assistant-logs form: reason limit (>=1)
+      LOGS_ENTITY_REF_MAX_CHARS: "200"  # assistant-logs form: entity_ref limit (>=1)
+      LOGS_OUTCOME_MAX_CHARS: "500"     # assistant-logs form: outcome limit (>=1)
+      LOGS_VERIFIED_MAX_CHARS: "200"    # assistant-logs form: verified limit (>=1)
+      LOGS_SEARCH_EXCERPT_CHARS: "300"  # action truncation in search/listing output (>=1)
       # --- search ---
       DEFAULT_TOP_K: "5"
       DEFAULT_LIST_LIMIT: "20"
       LIST_MAX_LIMIT_MCP: "20"          # listing ceiling on the MCP surface (lsb-0013)
       LIST_MAX_LIMIT_REST: "50"         # listing ceiling on the REST surface (lsb-0013)
+      WARNINGS_MAX_LIMIT_MCP: "20"      # warnings page ceiling on the MCP surface (no12-02, §7.1)
+      WARNINGS_MAX_LIMIT_REST: "50"     # warnings page ceiling on the REST surface (no12-02, §7.1)
       RRF_K: "60"
       MAX_QUERY_CHARS: "512"
       MAX_GET_BATCH: "20"
@@ -110,6 +181,24 @@ services:
       BACKUP_DIR: "/data/backups"
       BACKUP_INTERVAL_SEC: "86400"
       BACKUP_KEEP: "7"
+      # verify the restore of every Nth snapshot; 0 = manual only (POST /backups/verify)
+      BACKUP_VERIFY_EVERY: "1"
+      # command to ship a verified snapshot off the box; empty = shipping disabled.
+      # Keep the destination and credentials OUTSIDE this repo: mount a config/
+      # known_hosts/key via a bind-mount and only reference it from the command here
+      # (the service passes just the file path in $LSB_BACKUP_FILE). Example:
+      #   rclone --config /srv/ship/rclone.conf copy "$LSB_BACKUP_FILE" remote:lsb-backups/ && echo size=$(stat -c%s "$LSB_BACKUP_FILE")
+      BACKUP_SHIP_CMD: ""
+      # timeout of the ship command, seconds (>=1)
+      BACKUP_SHIP_TIMEOUT_SEC: "300"
+      # --- release check (№45): off by default — no verified egress from the
+      #     container, so the network cannot be the default source ---
+      # UPDATE_CHECK_ENABLED: "false"       # true turns on the background version check
+      # UPDATE_SOURCE_FILE: ""             # a JSON file dropped by the host, works without internet
+      # UPDATE_CHECK_URL: ""               # optional HTTP source; leave empty to stay offline
+      # UPDATE_CHECK_INTERVAL_SEC: "21600"  # background poll period, seconds (≥60)
+      # UPDATE_HINT_EVERY_SEC: "86400"      # at most one hint per period, seconds (0 — once per process)
+      # UPDATE_HINT_MAX_CHARS: "240"        # hint text limit (1..400)
       # --- namespaces (Phase 10) ---
       NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE: "0.80"  # auto-move of a default note into an existing domain
       NAMESPACE_PROMOTION_THRESHOLD: "15"         # counter of default notes with one subdomain_hint → auto-create a leaf

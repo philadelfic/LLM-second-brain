@@ -66,23 +66,67 @@ Bearer и тот же сервисный слой, что у MCP (`user_save`/`u
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
 from app import __version__
 from app.config import Settings
 from app.services import Services
+from app.services import history
+from app.services.backup import BackupService
+from app.services.freshness import FreshnessValidationError
 from app.services.namespaces import NamespaceError, NamespaceValidationError
-from app.services.notes import NoteValidationError
+from app.services.notes import (
+    _UNSET_COMMENT,
+    _UNSET_TEXT,
+    NoteValidationError,
+)
 from app.services.search import SearchValidationError
-from app.services.skills import SkillValidationError, SkillsService
+from app.services.skills import (
+    HINT_NOT_FOUND as HINT_SKILL_NOT_FOUND,
+    SkillValidationError,
+    SkillsService,
+)
 from app.services.terms import (
     TermKeyConflictError,
     TermValidationError,
     TermsService,
 )
+from app.services.logs import LogsService, LogValidationError
+# «Не передано = оставить» в PUT /logs/{id}: тот же сентинел, что у MCP
+# (`_LOG_UNSET`), — REST не заводит своей семантики пустого поля.
+from app.services.logs import _UNSET as _LOG_UNSET
 from app.services.user_facts import UserFactValidationError, UserFactsService
+from app.services.warnings import WarningsService, WarningsValidationError
+
+# Сущности с историей (§5.3): оператору доступны ВСЕ, включая глобальный
+# шаблон навыков — флагов областей на этой поверхности нет (§13.10: REST
+# оператора остаётся доступен и у выключенной области).
+_HISTORY_ENTITIES = frozenset(
+    {
+        history.ENTITY_NOTE,
+        history.ENTITY_SKILL,
+        history.ENTITY_SKILL_TEMPLATE,
+        history.ENTITY_TERM,
+        history.ENTITY_USER_FACT,
+    }
+)
+
+
+def _check_history_entity(entity: str) -> None:
+    """Неизвестная сущность истории — 404 (исключение слоя наружу не идёт)."""
+    if entity not in _HISTORY_ENTITIES:
+        raise HTTPException(
+            status_code=404,
+            detail="unknown history entity: "
+            + entity
+            + " (known: "
+            + ", ".join(sorted(_HISTORY_ENTITIES))
+            + ")",
+        )
 
 
 class NoteCreate(BaseModel):
@@ -92,11 +136,14 @@ class NoteCreate(BaseModel):
     (не передан) или невалидный (пустой/длиннее TITLE_MAX_WORDS слов) →
     422 «задай title ≤5 слов», заметка НЕ создаётся; контракт един
     с MCP memory_save (сентинел-легаси save(text) — только сервис-слой).
+    no24-01 (3.2.0): необязательный `comment` (≤250) — пометка, известная
+    уже в момент записи (решение О. 2026-10-08).
     """
 
     text: str
     title: str | None = None
     author: str | None = None
+    comment: str | None = None  # no24-01 (3.2.0): пометка заметки (≤250)
 
 
 class NamespaceCreate(BaseModel):
@@ -133,10 +180,15 @@ class NoteUpdate(BaseModel):
 
     Фаза 11 (решение №9): `title` опционален — передан и валиден →
     перезапись, не передан → прежний остаётся (merge-путь не затирает).
+    no24-01 (3.2.0): `comment` — пометка заметки (≤250); наличие поля
+    определяется `model_fields_set` (опущено → сентинел `_UNSET_COMMENT` =
+    не трогаем, `null`/`""` → сброс). `text` тоже опционален: опущен или
+    `null` → текст не перезаписывается (правка только пометки).
     """
 
-    text: str
+    text: str | None = None
     title: str | None = None
+    comment: str | None = None
 
 
 class SkillCreate(BaseModel):
@@ -157,10 +209,10 @@ class SkillCreate(BaseModel):
 
 
 class SkillUpdate(SkillCreate):
-    """Тело PUT /skills/{id}: та же полная форма; прежняя версия — в архив.
+    """Тело PUT /skills/{id}: та же полная форма; прежняя версия — в истории.
 
     Отдельного частичного обновления нет (§3.4): форма перезаписывается
-    целиком, копия прежнего содержимого уходит в `skill_versions`.
+    целиком, версия-дельта уходит в общую историю (`record_versions`, №41).
     """
 
 
@@ -226,15 +278,122 @@ class TermUpdate(TermCreate):
     """
 
 
-class QueueStat(BaseModel):
-    """Снимок одной очереди для /health.queues (FR-2.2).
+class LogCreate(BaseModel):
+    """Тело POST /logs: запись области логов (arch §7.2, f10-03).
 
-    `pending` — сколько заданий ждёт в очереди; `oldest_pending_sec` — возраст
-    старейшего задания в секундах (null — очередь пуста).
+    Поля — как у `logs_save`; `action`/`reason` обязательны (§7.3), но их
+    НЕПУСТОТУ и лимиты проверяет СЕРВИС (не схема — как у формы термина):
+    нарушение → `LogValidationError` → 422 с дословным hint канона §7.3,
+    записи нет. `entity`/связки и `source`/`session` валидируются там же;
+    непереданные `source`/`session` берёт `bind_origin` миддлвари.
+    """
+
+    action: str
+    reason: str
+    entity: str | None = None
+    entity_id: int | None = None
+    entity_version: int | None = None
+    entity_ref: str | None = None
+    outcome: str | None = None
+    verified: str | None = None
+    source: str | None = None
+    session: str | None = None
+
+
+class LogUpdate(BaseModel):
+    """Тело PUT /logs/{id}: частичная правка — «не передано = оставить» (§7.2).
+
+    Все поля опциональны: непереданное (None) уходит сентинелом «оставить как
+    есть» (тот же `_LOG_UNSET`, что у MCP `logs_update`). Сервис вернёт
+    `updated: False` + hint, если ничего не передано или записи нет; связки
+    объекта проверяются по эффективным значениям (как в `logs_update`).
+    """
+
+    action: str | None = None
+    reason: str | None = None
+    entity: str | None = None
+    entity_id: int | None = None
+    entity_version: int | None = None
+    entity_ref: str | None = None
+    outcome: str | None = None
+    verified: str | None = None
+    source: str | None = None
+    session: str | None = None
+
+
+class HistoryRollback(BaseModel):
+    """Тело POST /history/{entity}/{id}/rollback: номер целевой версии (§7.2).
+
+    Откат — операторская ручка (FR-5.4): модель возвращает запись к прежнему
+    состоянию НОВОЙ версией, историю не переписывая (§13.6).
+    """
+
+    version: int
+
+
+class QueueStat(BaseModel):
+    """Снимок одной очереди для /health.queues (FR-2.2, №39 arch §7.2).
+
+    `pending` — сколько заданий берётся СЕЙЧАС; `oldest_pending_sec` — возраст
+    старейшего берущегося задания в секундах (null — очередь пуста);
+    `waiting` — отложено из-за слота/готовности (№39); `attention` —
+    подмножество `waiting`, ждущее человека (no39-02).
     """
 
     pending: int
     oldest_pending_sec: int | None
+    waiting: int = 0
+    attention: int = 0
+
+
+class SlotStat(BaseModel):
+    """Снимок одного слота для /health.slots (№39, arch §7.2).
+
+    `ok` — исход последней попытки слота (прецедент `embedding_ok`/
+    `summarizer_ok`/`judge_ok`; None — попыток не было); `last_outcome` —
+    исход последнего отказа (словарь `SlotOutcome`); `paused_until` —
+    ISO-8601 UTC, пока разрыв открыт (null — слот работает); `attention` —
+    число заданий слота, ждущих человека (no39-02). №50 (lsbdef-0008):
+    `last_finish_reason`/`last_budget`/`last_budget_source`/`last_had_thinking`
+    — диагностика последнего вызова (None — вызова не было) — оператор видит
+    причину (обрезано по бюджету / размышление съело вывод) без журнала.
+    Собирается воркером, только SQL/память — моделей не зовём.
+    """
+
+    ok: bool | None
+    last_outcome: str | None
+    paused_until: str | None
+    attention: int
+    last_finish_reason: str | None = None
+    last_budget: int | None = None
+    last_budget_source: str | None = None
+    last_had_thinking: bool | None = None
+
+
+class BackupStat(BaseModel):
+    """Наблюдаемость бэкапов для /health (№14, arch §7.2).
+
+    Собирается сканом каталога BACKUP_DIR, БЕЗ открытия БД: число/возраст/
+    объём снапшотов, число помеченных (`.bad`) и последние исходы проверки
+    и выноса из сайдкар-индекса (None — ещё не было).
+    """
+
+    count: int
+    newest_age_sec: int | None
+    oldest_age_sec: int | None
+    total_bytes: int
+    bad: int
+    last_verify: dict | None
+    last_ship: dict | None
+
+
+class BackupVerifyRequest(BaseModel):
+    """Тело `POST /backups/verify` (№14, arch §7.2): файл или свежайший.
+
+    `file` нет/пусто → свежайший снапшот; иначе — имя файла в BACKUP_DIR.
+    """
+
+    file: str | None = None
 
 
 class HealthResponse(BaseModel):
@@ -250,14 +409,68 @@ class HealthResponse(BaseModel):
     embedding_ok: bool | None  # Фаза 3
     summarizer_ok: bool | None  # Фаза 4
     judge_ok: bool | None  # Фаза 11: судья дедупа/структуры (слот judge)
+    # LSBN-F-12 (arch §7.1): умеет ли decision-слот (None — выключен или
+    # проверки не было; False — стартовая проверка/вызов погасили слот).
+    decision_ok: bool | None
     notes_count: int
     pending_vector: int
     pending_summary: int
     queues: dict[str, QueueStat]  # lsb-0014-03: ожидание по каждой очереди
+    # №39 (arch §7.2): по слоту {ok, last_outcome, paused_until, attention} —
+    # причина и пауза разрыва слота, число заданий в внимании. Только SQL/память.
+    slots: dict[str, SlotStat]
+    # №40 (FR-4.3): по каждой области {enabled, pending} — по ВСЕМ областям,
+    # включая выключенные (их накопление видно). Собирает воркер, только SQL.
+    areas: dict[str, dict]
+    # №12 (no12-02, §7.1/§7.2): агрегаты открытых предупреждений — {by_kind,
+    # total} по общей таблице `warnings` (память и термины). Только SQL.
+    warnings: dict[str, Any]
+    # LSBN-F-12 (arch §7.1): агрегаты decision-слота — {enabled, ok, answers,
+    # fallbacks, by_reason:{unavailable,unsupported,low_confidence}} из памяти
+    # процесса (вероятности наружу не отдаются — только журнал).
+    decision: dict[str, Any]
+    # №45 (arch §7.2): наблюдаемость версии — {enabled, current, latest,
+    # checked_at, hint_shown_at}; собирается из памяти `UpdateChecker` (без I/O).
+    update: dict[str, Any]
+    # №14 (arch §7.2): наблюдаемость бэкапов — скан каталога BACKUP_DIR без
+    # открытия БД + последние исходы проверки/выноса из сайдкар-индекса.
+    backups: BackupStat
 
 
 def _services(request: Request) -> Services:
     return request.app.state.services  # type: ignore[no-any-return]
+
+
+def _decision_health(services: Services) -> tuple[bool | None, dict[str, Any]]:
+    """Снимок decision-слота для /health (LSBN-F-12, arch §7.1/§7.3).
+
+    `decision_ok` — умеет ли слот (None — выключен/не собран); `decision` —
+    агрегаты `{enabled, ok, answers, fallbacks, by_reason}` из памяти сервиса
+    (вероятности наружу не отдаются, только журнал). Модели не зовём: только
+    чтение счётчиков (`DecisionService.snapshot()`); пустой слот — форма
+    «выключен» с нулевыми счётчиками.
+    """
+    service = services.decision
+    if service is None:
+        return None, {
+            "enabled": False,
+            "ok": None,
+            "answers": 0,
+            "fallbacks": 0,
+            "by_reason": {
+                "unavailable": 0,
+                "unsupported": 0,
+                "low_confidence": 0,
+            },
+        }
+    snapshot = service.snapshot()
+    return snapshot["ok"], {
+        "enabled": snapshot["enabled"],
+        "ok": snapshot["ok"],
+        "answers": snapshot["answers"],
+        "fallbacks": snapshot["fallbacks"],
+        "by_reason": snapshot["by_reason"],
+    }
 
 
 def _skills_service(request: Request) -> SkillsService:
@@ -283,6 +496,35 @@ def _user_facts_service(request: Request) -> UserFactsService:
     return _services(request).user_facts
 
 
+def _warnings_service(request: Request) -> WarningsService:
+    """Сервис общей поверхности предупреждений (№12, no12-02) — для /warnings.
+
+    `Services.warnings` опционален только ради старых DI-сборок; приложение
+    (`create_app`/`build_services`) всегда его кладёт — его недоступность
+    означала бы ошибку сборки, отвечаем 503, а не падаем трейсбеком.
+    """
+    service = _services(request).warnings
+    if service is None:
+        raise HTTPException(
+            status_code=503, detail="warnings surface is not available"
+        )
+    return service
+
+
+def _backup_service(request: Request) -> BackupService:
+    """Сервис бэкапов — для операторских `GET /backups` и `POST /backups/verify`.
+
+    `Services.backup` типизирован необязательным только ради старых DI-сборок
+    тестов (там он None); приложение (`create_app`/`build_services`) всегда его
+    кладёт — его недоступность отвечаем 503, а не падаем трейсбеком (как у
+    `_skills_service`/`_warnings_service`).
+    """
+    service = _services(request).backup
+    if service is None:
+        raise HTTPException(status_code=503, detail="backup service is not available")
+    return service
+
+
 def _terms_service(request: Request) -> TermsService:
     """Сервис области «terms» — общий для всех REST-ручек /terms.
 
@@ -293,9 +535,33 @@ def _terms_service(request: Request) -> TermsService:
     return _services(request).terms
 
 
+def _logs_service(request: Request) -> LogsService:
+    """Сервис области логов — общий для всех REST-ручек /logs (f10-03).
+
+    `Services.logs` опционален только ради старых DI-сборок; приложение
+    (`create_app`/`build_services`) собирает область ВСЕГДА — доступ оператора
+    сохраняется и у выключенного флага (§13.11), поэтому 503 — только для
+    сборок без области (как у `_skills_service`/`_warnings_service`).
+    """
+    service = _services(request).logs
+    if service is None:
+        raise HTTPException(status_code=503, detail="logs area is not available")
+    return service
+
+
 def _unprocessable(exc: ValueError) -> HTTPException:
     """Доменные нарушения → 422 с текстом сервиса (без внутренностей)."""
     return HTTPException(status_code=422, detail=str(exc))
+
+
+def _log_field(value: Any) -> Any:
+    """Поле PUT /logs/{id}: не переданное (None) — значит «оставить как есть».
+
+    Мост между схемой REST (у опциональных полей default None) и сервисом, где
+    «не передано» — сентинел `_LOG_UNSET` (один код с MCP `logs_update`); так
+    пустая строка остаётся осмысленной (очистка поля).
+    """
+    return _LOG_UNSET if value is None else value
 
 
 def _conflict(exc: NamespaceError) -> HTTPException:
@@ -304,9 +570,21 @@ def _conflict(exc: NamespaceError) -> HTTPException:
     return HTTPException(status_code=409, detail=str(exc))
 
 
+async def _bind_rest_origin(request: Request) -> AsyncIterator[None]:
+    """Обвязать REST-запрос источником версий (§13.4, №41).
+
+    `source='rest'`, сессия — заголовок `X-LSB-Session` (не передан → NULL:
+    человекоподобный идентификатор не придумываем). Зависимость роутера
+    держит contextvar на время обработки запроса; `asyncio.to_thread` сервисов
+    контекст пробрасывает — версии правок оператора несут источник `rest`.
+    """
+    with history.bind_origin("rest", session=request.headers.get("X-LSB-Session")):
+        yield
+
+
 def build_rest_router(settings: Settings) -> APIRouter:
     """Собрать роутер; умолчания пагинации — из настроек окружения."""
-    rest_router = APIRouter()
+    rest_router = APIRouter(dependencies=[Depends(_bind_rest_origin)])
 
     @rest_router.get("/health", response_model=HealthResponse)
     async def health(request: Request) -> HealthResponse:
@@ -331,16 +609,65 @@ def build_rest_router(settings: Settings) -> APIRouter:
         worker = request.app.state.worker  # type: ignore[attr-defined]
         counts = await asyncio.to_thread(services.notes.health_counts)
         queues = await asyncio.to_thread(worker.queues_health)
+        # №39 (arch §7.2): снимок слотов — причина и пауза разрыва (только
+        # SQL/память, модели не вызываются).
+        slots = await asyncio.to_thread(worker.slots_health)
+        areas = await asyncio.to_thread(worker.areas_health)
+        # №12 (no12-02): агрегаты открытых предупреждений — только SQL.
+        if services.warnings is None:
+            warnings: dict[str, Any] = {"by_kind": {}, "total": 0}
+        else:
+            warnings = await asyncio.to_thread(services.warnings.counts)
+        # LSBN-F-12 (arch §7.1): `decision_ok` и блок `decision` — из памяти
+        # сервиса (§7.3): сколько решений принято, сколько переключений и по
+        # каким причинам. Модели не зовём (только снимок счётчиков).
+        decision_ok, decision = _decision_health(services)
+        # №45 (arch §7.2): снимок версии — из памяти чекера, без I/O.
+        checker = getattr(request.app.state, "update_checker", None)
+        update = (
+            checker.health()
+            if checker is not None
+            else {
+                "enabled": False,
+                "current": __version__,
+                "latest": None,
+                "checked_at": None,
+                "hint_shown_at": None,
+            }
+        )
+        # №14 (arch §7.2): наблюдаемость бэкапов — скан каталога без открытия
+        # БД (`BackupService.status`); DI-сборка без сервиса — пустая форма.
+        backup = services.backup
+        backups = (
+            BackupStat(
+                count=0,
+                newest_age_sec=None,
+                oldest_age_sec=None,
+                total_bytes=0,
+                bad=0,
+                last_verify=None,
+                last_ship=None,
+            )
+            if backup is None
+            else BackupStat(**await asyncio.to_thread(backup.status))
+        )
         return HealthResponse(
             status="ok",
             version=__version__,
             embedding_ok=services.embedding.last_attempt_ok,
             summarizer_ok=services.summary.last_attempt_ok,
             judge_ok=services.judge.last_attempt_ok,
+            decision_ok=decision_ok,
             notes_count=counts["notes_count"],
             pending_vector=counts["pending_vector"],
             pending_summary=counts["pending_summary"],
             queues=queues,
+            slots=slots,
+            areas=areas,
+            warnings=warnings,
+            decision=decision,
+            update=update,
+            backups=backups,
         )
 
     @rest_router.post("/notes", status_code=201)
@@ -360,6 +687,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
                 payload.text,
                 payload.author,
                 title=payload.title,
+                comment=payload.comment,
             )
         except NoteValidationError as exc:
             raise _unprocessable(exc) from exc
@@ -369,13 +697,16 @@ def build_rest_router(settings: Settings) -> APIRouter:
         request: Request,
         limit: int | None = Query(default=None, ge=1, le=50),
         offset: int = Query(default=0, ge=0),
+        updated_after: str | None = Query(default=None),
     ) -> dict:
         """Обзор памяти: страница кратких содержаний + поля пагинации (FR-2).
 
         lsb-0013-02 (arch §3.4): потолок поверхности (`list_max_limit_rest`,
         50) проверяет сервис, в ответе — те же поля страницы, что у MCP
         (`total`/`has_more`/`next_offset`/`next_cursor`); подсказки «+N more»
-        на REST нет — полный контракт оператора.
+        на REST нет — полный контракт оператора. no29-01: `updated_after`
+        (ISO-8601 UTC, включающая граница) фильтрует страницу и `total`;
+        невалидное значение → 422 с текстом-hint.
         """
         try:
             return await asyncio.to_thread(
@@ -383,8 +714,37 @@ def build_rest_router(settings: Settings) -> APIRouter:
                 limit,
                 offset,
                 max_limit=settings.list_max_limit_rest,
+                updated_after=updated_after,
             )
-        except NoteValidationError as exc:
+        except (NoteValidationError, FreshnessValidationError) as exc:
+            raise _unprocessable(exc) from exc
+
+    @rest_router.get("/notes/comments")
+    async def search_comments(
+        request: Request,
+        q: str = Query(..., min_length=1, max_length=settings.max_query_chars),
+        top_k: int | None = Query(default=None, ge=1, le=20),
+        namespace: str | None = Query(default=None),
+        namespace_exact: bool = Query(default=False),
+        updated_after: str | None = Query(default=None),
+    ) -> dict:
+        """Отдельный поиск ПОМЕТОК (no24-02, §13.6): только по comment.
+
+        Объявлен ДО `GET /notes/{note_id}` (как `/skills/search` до
+        `/skills/{skill_id}`) — иначе «comments» парсился бы как note_id и
+        отдавал 422. Контракт тот же, что у MCP (`{results, hint?}`);
+        результаты не смешиваются со смысловым поиском. Невалидные
+        `q`/`top_k`/`updated_after` и незарегистрированный узел → 422 с
+        текстом-hint.
+        """
+        try:
+            return await asyncio.to_thread(
+                _services(request).search.comment_search,
+                q, top_k, namespace, namespace_exact, updated_after,
+            )
+        except (SearchValidationError, FreshnessValidationError) as exc:
+            raise _unprocessable(exc) from exc
+        except NamespaceError as exc:
             raise _unprocessable(exc) from exc
 
     @rest_router.get("/notes/{note_id}")
@@ -416,13 +776,25 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.put("/notes/{note_id}")
     async def update_note(note_id: int, payload: NoteUpdate, request: Request) -> dict:
-        """Перезаписать заметку целиком (FR-5)."""
+        """Перезаписать заметку целиком (FR-5).
+
+        no24-01 (3.2.0): `comment` — по `model_fields_set` (опущено → сентинел
+        `_UNSET_COMMENT` = не трогаем, `null`/`""` → сброс); `text` не передан
+        (или `null`) → сентинел `_UNSET_TEXT` — правка только пометки, текст
+        не перезаписывается (контракт сервиса lsb-0004-01). ``CommentValidationError``
+        → 422 существующим `except NoteValidationError`.
+        """
         try:
             result = await asyncio.to_thread(
                 _services(request).notes.update,
                 note_id,
-                payload.text,
+                payload.text if payload.text is not None else _UNSET_TEXT,
                 title=payload.title,
+                comment=(
+                    payload.comment
+                    if "comment" in payload.model_fields_set
+                    else _UNSET_COMMENT
+                ),
             )
         except NoteValidationError as exc:
             raise _unprocessable(exc) from exc
@@ -449,13 +821,19 @@ def build_rest_router(settings: Settings) -> APIRouter:
         request: Request,
         q: str = Query(..., min_length=1, max_length=settings.max_query_chars),
         top_k: int | None = Query(default=None, ge=1, le=20),
+        updated_after: str | None = Query(default=None),
     ) -> dict:
-        """Поиск (Фаза 3 — гибрид vec0+FTS, выдача FR-1; offline → FTS-only)."""
+        """Поиск (Фаза 3 — гибрид vec0+FTS, выдача FR-1; offline → FTS-only).
+
+        no29-01: `updated_after` (ISO-8601 UTC, включающая граница) сужает
+        гибрид до свежих заметок; невалидное значение → 422 с текстом-hint.
+        """
         try:
             return await asyncio.to_thread(
-                _services(request).search.search, q, top_k
+                _services(request).search.search, q, top_k, None, False,
+                updated_after,
             )
-        except SearchValidationError as exc:
+        except (SearchValidationError, FreshnessValidationError) as exc:
             raise _unprocessable(exc) from exc
 
     # --- неймспейсы: операторские ручки структуры (Фаза 10, Шаг 6) ----------
@@ -724,16 +1102,44 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.get("/skills/{skill_id}/versions")
     async def get_skill_versions(skill_id: int, request: Request) -> dict:
-        """Архив копий версий навыка — только REST, оператору (в MCP нет).
+        """Архив версий навыка — REST-псевдоним над ОБЩЕЙ историей (№41).
 
-        Каждая правка копирует прежнее содержимое с прежним номером версии
-        (§3.4); строки архива в листинг/поиск/чтение не попадают. Навык не
-        найден/удалён → 404 с hint канона §3.8.
+        Вторая механика (`skill_versions`) снята в no41-03 (§13.7): ручка
+        читает ту же `record_versions` (`read_versions`/`read_version` по
+        сущности `skill`) и собирает ПРЕЖНЮЮ форму ответа — контракт
+        операторской ссылки не меняется. Навык не найден/удалён → 404 с
+        hint канона §3.8 (как раньше).
         """
-        result = await asyncio.to_thread(_skills_service(request).versions, skill_id)
-        if "hint" in result:
-            raise HTTPException(status_code=404, detail=result["hint"])
-        return result
+        live = await asyncio.to_thread(
+            history.entity_fields, history.ENTITY_SKILL, skill_id, settings
+        )
+        if live is None or live[1] == "deleted":
+            raise HTTPException(status_code=404, detail=HINT_SKILL_NOT_FOUND)
+
+        def _archive() -> dict:
+            """Собрать прежнюю форму архива из версий общей истории."""
+            listing = history.read_versions(history.ENTITY_SKILL, skill_id, settings)
+            versions = []
+            for meta in listing["versions"]:
+                detail = history.read_version(
+                    history.ENTITY_SKILL, skill_id, meta["version"], settings
+                )
+                fields = detail.get("fields") or {}
+                versions.append(
+                    {
+                        "version": meta["version"],
+                        "name": fields.get("name"),
+                        "description": fields.get("description"),
+                        "example": fields.get("example"),
+                        "steps": fields.get("steps"),
+                        "text": fields.get("text"),
+                        "extra": fields.get("extra"),
+                        "created_at": meta["created_at"],
+                    }
+                )
+            return {"id": skill_id, "versions": versions}
+
+        return await asyncio.to_thread(_archive)
 
     # --- область user: REST-зеркала (релиз 3.0.0, lsb-0009-03) ------------
     # Arch lsb-0009 §3.6 + субстрат §3.6: операторская поверхность фактов о
@@ -972,5 +1378,436 @@ def build_rest_router(settings: Settings) -> APIRouter:
                 status_code=404, detail=result.get("hint", "term not found")
             )
         return result
+
+    # --- область логов: операторская поверхность (LSBN-F-10, f10-03) --------
+    # §7.2: ПОЛНЫЕ выдачи (тело не режем — оператору нужен полный текст;
+    # MCP режет белыми списками), работают при ЛЮБОМ значении флага области
+    # (§13.11). Порядок: статических подпутей нет — все `/logs/{log_id}`
+    # целочисленные, «search» здесь не идёт REST-дорогой (§7.2).
+
+    @rest_router.post("/logs", status_code=201)
+    async def create_log(payload: LogCreate, request: Request) -> dict:
+        """Создать запись: 201 — ПОЛНАЯ запись, 422 — форма (§7.2).
+
+        Форма проверяется сервисом ДО БД (нарушение → дословный hint §7.3);
+        после создания отдаём запись целиком (`get`), а не конверт save.
+        """
+        service = _logs_service(request)
+        try:
+            result = await asyncio.to_thread(
+                service.save,
+                action=payload.action,
+                reason=payload.reason,
+                entity=payload.entity,
+                entity_id=payload.entity_id,
+                entity_version=payload.entity_version,
+                entity_ref=payload.entity_ref,
+                outcome=payload.outcome,
+                verified=payload.verified,
+                source=payload.source,
+                session=payload.session,
+            )
+        except LogValidationError as exc:
+            raise _unprocessable(exc) from exc
+        return await asyncio.to_thread(service.get, result["id"])
+
+    @rest_router.get("/logs")
+    async def list_logs(
+        request: Request,
+        entity: str | None = Query(default=None),
+        entity_id: int | None = Query(default=None),
+        entity_version: int | None = Query(default=None),
+        session: str | None = Query(default=None),
+        source: str | None = Query(default=None),
+        date_from: str | None = Query(default=None),
+        date_to: str | None = Query(default=None),
+        limit: int | None = Query(default=None),
+        offset: int = Query(default=0),
+    ) -> dict:
+        """Листинг со срезами и пагинацией (§7.2), потолок `list_max_limit_rest`.
+
+        Обратный запрос «почему изменился объект» — ЭТОТ же маршрут с
+        `entity`+`entity_id`[+`entity_version`] (§8/§13.4), отдельной ручки нет.
+        Потолок лимита и знак offset проверяет сервис → мягкий 422 с hint.
+        """
+        try:
+            return await asyncio.to_thread(
+                _logs_service(request).list,
+                entity=entity,
+                entity_id=entity_id,
+                entity_version=entity_version,
+                session=session,
+                source=source,
+                date_from=date_from,
+                date_to=date_to,
+                limit=limit,
+                offset=offset,
+            )
+        except LogValidationError as exc:
+            raise _unprocessable(exc) from exc
+
+    @rest_router.get("/logs/{log_id}")
+    async def get_log(log_id: int, request: Request) -> dict:
+        """Прочитать запись целиком (тело не режется); нет/удалена → 404 (§7.2).
+
+        Несуществующая/удалённая запись не отличается от «нет строки» → 404
+        с hint канона §7.3 (служебное восстановление — оператор).
+        """
+        record = await asyncio.to_thread(_logs_service(request).get, log_id)
+        if "action" not in record:  # мягкий ответ сервиса: строки нет/удалена
+            raise HTTPException(
+                status_code=404,
+                detail=record.get("hint", "log entry not found"),
+            )
+        return record
+
+    @rest_router.put("/logs/{log_id}")
+    async def update_log(
+        log_id: int, payload: LogUpdate, request: Request
+    ) -> dict:
+        """Частичная правка: 200 `{updated: true}`, 404 — нет записи, 422 — форма.
+
+        «Не передано = оставить» (сентинелы); каждая фактическая правка
+        версионируется общим слоем истории (№41, §13.5). Записи нет или ничего
+        не передано → 404 с hint канона §7.3.
+        """
+        try:
+            result = await asyncio.to_thread(
+                _logs_service(request).update,
+                log_id,
+                action=_log_field(payload.action),
+                reason=_log_field(payload.reason),
+                entity=_log_field(payload.entity),
+                entity_id=_log_field(payload.entity_id),
+                entity_version=_log_field(payload.entity_version),
+                entity_ref=_log_field(payload.entity_ref),
+                outcome=_log_field(payload.outcome),
+                verified=_log_field(payload.verified),
+                source=_log_field(payload.source),
+                session=_log_field(payload.session),
+            )
+        except LogValidationError as exc:
+            raise _unprocessable(exc) from exc
+        if not result.get("updated"):
+            raise HTTPException(
+                status_code=404,
+                detail=result.get("hint", "log entry not found"),
+            )
+        return result
+
+    @rest_router.delete("/logs/{log_id}")
+    async def delete_log(log_id: int, request: Request) -> dict:
+        """Мягко удалить запись: 200 `{id, deleted: true}` / 404 (§7.2).
+
+        Строка и индексы живы, выдачи агента запись не видят (§11); повторное/
+        несуществующее удаление → 404 с hint канона §7.3 (восстановление —
+        оператором).
+        """
+        result = await asyncio.to_thread(
+            _logs_service(request).delete, log_id
+        )
+        if not result.get("deleted"):
+            raise HTTPException(
+                status_code=404,
+                detail=result.get("hint", "log entry not found"),
+            )
+        return result
+
+    # --- история версий: поверхность оператора (№41, релиз 3.2.0) ----------
+    # §7.2: список версий, чтение версии, откат и статистика. Откат — только
+    # REST (модели не даём, §13.6); при `HISTORY_ENABLED=false` чтение отдаёт
+    # пусто с hint (§8), а не ошибку. ПОРЯДОК МАРШРУТОВ: статический
+    # `/history/stats` объявлен ДО `/history/{entity}/{entity_id}` — иначе
+    # «stats» ушёл бы в {entity}.
+
+    @rest_router.get("/history/stats")
+    async def get_history_stats(request: Request) -> dict:
+        """Размер истории: счётчики версий по сущностям + общий (FR-10.3)."""
+        return await asyncio.to_thread(history.history_stats, settings)
+
+    @rest_router.get("/history/{entity}/{entity_id}")
+    async def list_history(
+        entity: str,
+        entity_id: int,
+        request: Request,
+        limit: int | None = Query(default=None, ge=1, le=50),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        """Список версий записи без тел: метаданные + «что изменилось» (FR-5.1).
+
+        Форма ответа: `{entity, id, versions: [{version, created_at, event,
+        source, session, changed}], total, has_more, next_offset}`; страница —
+        по контракту lsb-0013. Неизвестная сущность → 404, пустая история —
+        валидный ответ (в т.ч. при выключенном слое — с hint §8).
+        """
+        _check_history_entity(entity)
+        return await asyncio.to_thread(
+            history.read_versions,
+            entity,
+            entity_id,
+            settings,
+            limit=limit,
+            offset=offset,
+        )
+
+    @rest_router.get("/history/{entity}/{entity_id}/{version}")
+    async def read_history_version(
+        entity: str, entity_id: int, version: int, request: Request
+    ) -> dict:
+        """Содержимое конкретной версии: метаданные + реконструированные поля.
+
+        Форма ответа: `{entity, id, version, created_at, event, source,
+        session, changed, fields: {…}}`; нет такой версии/записи → 404
+        (FR-5.2), исключений слой не бросает. При выключенном слое истории —
+        пусто + hint «history is off» (§8), а не ошибка.
+        """
+        _check_history_entity(entity)
+        result = await asyncio.to_thread(
+            history.read_version, entity, entity_id, version, settings
+        )
+        if "fields" not in result and result.get("hint") != history.HINT_HISTORY_OFF:
+            raise HTTPException(
+                status_code=404, detail=result.get("hint", "version not found")
+            )
+        return result
+
+    @rest_router.post("/history/{entity}/{entity_id}/rollback")
+    async def rollback_history(
+        entity: str, entity_id: int, payload: HistoryRollback, request: Request
+    ) -> dict:
+        """Откат к прежней версии через штатный путь правки (§7.3, §13.6).
+
+        Целевая версия читается `read_version` (нет → 404), её поля
+        применяются штатной правкой сущности под
+        `bind_origin("rest", …, rollback_to=N)` — поэтому FTS-триггеры заметок
+        срабатывают сами, а перевекторизация идёт тем же кодом
+        (`vector_status='pending'` + дроп вектора). Откат пишет НОВУЮ версию
+        (`event='rollback'`, `restore_from=N`) и историю не переписывает.
+        Заметке `text` передаётся целиком — гарантия перевекторизации при
+        откате `namespace`. Мягкие отказы сервисов → 404/422.
+        """
+        _check_history_entity(entity)
+        target = await asyncio.to_thread(
+            history.read_version, entity, entity_id, payload.version, settings
+        )
+        if "fields" not in target:
+            raise HTTPException(
+                status_code=404, detail=target.get("hint", "version not found")
+            )
+        live = await asyncio.to_thread(
+            history.entity_fields, entity, entity_id, settings
+        )
+        if live is None:
+            raise HTTPException(status_code=404, detail="record not found")
+        fields = target["fields"]
+        services = _services(request)
+        session_id = request.headers.get("X-LSB-Session")
+
+        def _apply() -> None:
+            """Штатная правка сущности под origin'ом отката (в рабочем потоке)."""
+            with history.bind_origin(
+                "rest", session=session_id, rollback_to=payload.version
+            ):
+                if entity == history.ENTITY_NOTE:
+                    outcome = services.notes.update(
+                        entity_id,
+                        text=fields["text"],
+                        title=fields["title"],
+                        namespace=fields["namespace"],
+                        expires_at=fields["expires_at"],
+                    )
+                    if not outcome.get("updated"):
+                        raise HTTPException(
+                            status_code=404,
+                            detail=outcome.get("hint", "note not found"),
+                        )
+                    return
+                if entity == history.ENTITY_SKILL:
+                    outcome = _skills_service(request).save(
+                        id=entity_id,
+                        name=fields["name"],
+                        description=fields["description"],
+                        steps=fields["steps"],
+                        text=fields["text"],
+                        example=fields["example"],
+                        extra=fields["extra"],
+                    )
+                    if not outcome.get("updated"):
+                        raise HTTPException(
+                            status_code=404,
+                            detail=outcome.get("hint", "skill not found"),
+                        )
+                    return
+                if entity == history.ENTITY_TERM:
+                    outcome = _terms_service(request).update(
+                        entity_id,
+                        fields["term"],
+                        fields["context"],
+                        fields["definition"],
+                    )
+                    if not outcome.get("updated"):
+                        raise HTTPException(
+                            status_code=404,
+                            detail=outcome.get("hint", "term not found"),
+                        )
+                    return
+                if entity == history.ENTITY_USER_FACT:
+                    outcome = _user_facts_service(request).update(
+                        entity_id, name=fields["name"], body=fields["body"]
+                    )
+                    if not outcome.get("changed"):
+                        raise HTTPException(
+                            status_code=404,
+                            detail=outcome.get("hint", "user fact not found"),
+                        )
+                    return
+                # skill_template — глобальный шаблон (id 0)
+                _skills_service(request).set_instruction_template(
+                    fields["instruction_template"]
+                )
+
+        try:
+            await asyncio.to_thread(_apply)
+        except (
+            NoteValidationError,
+            NamespaceError,
+            NamespaceValidationError,
+            SkillValidationError,
+            TermValidationError,
+            UserFactValidationError,
+        ) as exc:
+            raise _unprocessable(exc) from exc
+        head = await asyncio.to_thread(
+            history.read_versions, entity, entity_id, settings, limit=1
+        )
+        versions = head.get("versions") or []
+        return {
+            "entity": entity,
+            "id": entity_id,
+            "version": versions[0]["version"] if versions else payload.version,
+            "restored_from": payload.version,
+            "revectorized": True,
+        }
+
+    # --- предупреждения: единая поверхность (№12, no12-02, §7.1) -----------
+    # Одна точка чтения на систему: те же фильтры, что у MCP `warnings_list`,
+    # но ПОЛНЫЙ контракт (без MCP-среза) и потолок `WARNINGS_MAX_LIMIT_REST`.
+    # Чтение — только SQL, без модели (§13.4); снятие — человеком.
+
+    @rest_router.get("/warnings")
+    async def list_warnings(
+        request: Request,
+        kind: str | None = Query(default=None),
+        subject_type: str | None = Query(default=None),
+        subject_id: int | None = Query(default=None),
+        status: str = Query(default="open"),
+        limit: int | None = Query(
+            default=None, ge=1, le=settings.warnings_max_limit_rest
+        ),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        """Листинг предупреждений оператора: полный контракт + поля страницы.
+
+        Потолок поверхности проверяет и схема (`le`), и сервис (единый текст
+        отказа, прецедент lsb-0013); лимит по умолчанию — `DEFAULT_LIST_LIMIT`.
+        """
+        try:
+            return await asyncio.to_thread(
+                _warnings_service(request).list,
+                kind=kind,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                status=status,
+                limit=(
+                    settings.default_list_limit if limit is None else limit
+                ),
+                offset=offset,
+                max_limit=settings.warnings_max_limit_rest,
+            )
+        except WarningsValidationError as exc:
+            raise _unprocessable(exc) from exc
+
+    @rest_router.post("/warnings/{warning_id}/dismiss")
+    async def dismiss_warning(warning_id: int, request: Request) -> dict:
+        """Снять предупреждение человеком: `{id, status, resolved_at}`.
+
+        Нет такой записи / уже снята — 404 (мягкий ответ сервиса ведёт к нему).
+        """
+        result = await asyncio.to_thread(
+            _warnings_service(request).dismiss, warning_id
+        )
+        if not result.get("dismissed"):
+            raise HTTPException(
+                status_code=404,
+                detail=result.get("hint", "warning not found"),
+            )
+        return {
+            "id": result["id"],
+            "status": result["status"],
+            "resolved_at": result["resolved_at"],
+        }
+
+    # --- очередь заданий: состояние «требует вмешательства» (№39, no39-02) ----
+    # §6.8/§7.4: задания, замороженные повторяющимся нетранзиентным отказом
+    # пары, видны оператору и возвращаются в работу без правок данных. Только
+    # SQL (моделей не зовём); внимание заданий — зона воркера, не контент
+    # памяти (в `warnings` и поверхность предупреждений не пишем).
+
+    @rest_router.get("/jobs/attention")
+    async def list_attention_jobs(request: Request) -> dict:
+        """Список заданий, ждущих человека: `{jobs: [...], total: N}`.
+
+        Форма записи — `{job_id, job, slot, note_id, older_id, outcome,
+        attempts, since}` (arch §7.4); собирает воркер, только SQL.
+        """
+        worker = request.app.state.worker  # type: ignore[attr-defined]
+        jobs = await asyncio.to_thread(worker.attention_jobs)
+        return {"jobs": jobs, "total": len(jobs)}
+
+    @rest_router.post("/jobs/attention/{job_id}/retry")
+    async def retry_attention_job(job_id: int, request: Request) -> dict:
+        """Операторское возвращение задания в работу: `{job_id, released, attempts}`.
+
+        Снимает внимание и сбрасывает счётчик пары (работа остаётся `pending`
+        и берётся петлёй со следующего прогона). Нет такого задания / оно не
+        во внимании → 404.
+        """
+        worker = request.app.state.worker  # type: ignore[attr-defined]
+        result = await asyncio.to_thread(worker.release_attention, job_id)
+        if not result.get("released"):
+            raise HTTPException(
+                status_code=404, detail="job is not waiting for attention"
+            )
+        return result
+
+    # --- бэкапы: наблюдаемость и проверка восстановления (№14, arch §7.2) ---
+    # Операторские ручки: список снапшотов и проверка по вызову. Чтение
+    # каталога/снапшота — без записи в боевую БД (arch §5.1); сами исходы
+    # живут в сайдкар-индексе рядом с копиями.
+
+    @rest_router.get("/backups")
+    async def list_backups(request: Request) -> dict:
+        """Список снапшотов оператору: `{items: [...], total}` (свежие первыми).
+
+        Элемент — `{file, size_bytes, created_at, verified, bad, shipped}`;
+        `verified` ∈ ok/failed/unknown (§7.2). Скан каталога, БД не открываем.
+        """
+        items = await asyncio.to_thread(_backup_service(request).list_snapshots)
+        return {"items": items, "total": len(items)}
+
+    @rest_router.post("/backups/verify")
+    async def verify_backup(payload: BackupVerifyRequest, request: Request) -> dict:
+        """Проверить снапшот по вызову (FR-2.2): результат `verify()` как есть.
+
+        `file` нет/пусто → свежайший; файла нет → 404 «no such snapshot».
+        """
+        service = _backup_service(request)
+        if payload.file:
+            target = await asyncio.to_thread(service.resolve, payload.file)
+        else:
+            target = await asyncio.to_thread(service.newest_snapshot)
+        if target is None:
+            raise HTTPException(status_code=404, detail="no such snapshot")
+        return await asyncio.to_thread(service.verify, target)
 
     return rest_router

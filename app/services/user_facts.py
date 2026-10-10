@@ -52,6 +52,7 @@ from collections.abc import Callable
 from typing import Any
 
 from app.config import Settings
+from app.services import history
 from app.services.areas import (
     USER_FACTS_AREA,
     AreaSearch,
@@ -237,14 +238,28 @@ class UserFactsService:
         return answer
 
     def _create(self, name: str, body: str) -> int:
-        """INSERT факта с `vector_status='pending'` (вектора — петля `areas`)."""
+        """INSERT факта с `vector_status='pending'` (вектора — петля `areas`).
+
+        №41 (§13.5): baseline-версия пишется ТОЙ ЖЕ транзакцией, что и INSERT,
+        — состояния «факт есть, истории нет» не бывает.
+        """
         with session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
                 "INSERT INTO user_facts (name, body, vector_status) "
                 "VALUES (?, ?, 'pending')",
                 (name, body),
             )
-            return int(cursor.lastrowid or 0)
+            fact_id = int(cursor.lastrowid or 0)
+            row = conn.execute(
+                "SELECT name, body FROM user_facts WHERE id = ?", (fact_id,)
+            ).fetchone()
+            history.record_initial(
+                conn,
+                history.ENTITY_USER_FACT,
+                fact_id,
+                history.user_fact_projection(row),
+            )
+            return fact_id
 
     # --- правка (arch §3.3: «не передано» = оставить) -----------------------
 
@@ -309,6 +324,18 @@ class UserFactsService:
                     checked_body if checked_body is not None else row["body"],
                     id,
                 ),
+            )
+            # №41 (FR-3.3, §13.5): фактическая правка — версия-дельта той же
+            # транзакцией; пустой PUT сюда не доходит (вернулся раньше выше),
+            # а правка без изменений контента версии не создаёт (пустая дельта).
+            live = conn.execute(
+                "SELECT name, body FROM user_facts WHERE id = ?", (id,)
+            ).fetchone()
+            history.record_change(
+                conn,
+                history.ENTITY_USER_FACT,
+                id,
+                history.user_fact_projection(live),
             )
         self._notify_areas_pending()
         return {"id": id, "changed": True}
@@ -384,6 +411,11 @@ class UserFactsService:
                 (id,),
             )
             deleted = bool(cursor.rowcount)
+            if deleted:
+                # №41 (FR-6.1, §13.5): мягкое удаление — версия-событие.
+                history.record_event(
+                    conn, history.ENTITY_USER_FACT, id, "delete"
+                )
         if not deleted:
             return {"id": id, "deleted": False, "hint": HINT_NOT_FOUND}
         # Сигнал петле areas един по всем успешным изменениям области

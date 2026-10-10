@@ -1,6 +1,7 @@
 """Обвязка областей (субстрат 3.0.0): нормализация, сходство, гибридный поиск.
 
-Один переиспользуемый помощник на три области (skills / terms / user):
+Один переиспользуемый помощник на все области (skills / terms / user /
+logs):
 каждая область описывается `AreaSpec` — своими таблицами, полями индексации
 и проекцией выдачи; `AreaSearch` выполняет гибрид
 vec0-KNN + FTS5(BM25) → RRF (тот же `settings.rrf_k`, примитив
@@ -35,6 +36,9 @@ from app.services.search import (
 )
 from app.storage import area_vectors
 from app.storage.db import (
+    ASSISTANT_LOGS_FTS_COLUMNS,
+    ASSISTANT_LOGS_FTS_TABLE,
+    ASSISTANT_LOGS_TABLE,
     SKILLS_FTS_COLUMNS,
     SKILLS_FTS_TABLE,
     SKILLS_TABLE,
@@ -120,9 +124,15 @@ class AreaSpec:
     проекции выдачи БЕЗ `id` (id добавляется всегда); `embed_fields` — поля,
     склеиваемые в текст векторизации записи (порядок = порядок склейки);
     `fts_weights` — веса колонок bm25 (пусто — все 1.0).
+
+    `settings_flag` — имя bool-поля `Settings`, включающего область
+    (FR-1.1/FR-5.1, №40): выключенная область не отдаёт MCP-ручки, её раздел и
+    анонс не вшиваются, петля `areas` её не обрабатывает. Будущее сужение до
+    групп ручек (LSBN-F-11) добавляется новым уровнем флага, не переделкой имён.
     """
 
     name: str
+    settings_flag: str
     table: str
     fts_table: str
     vec_table: str
@@ -145,6 +155,7 @@ class AreaSpec:
 
 SKILLS_AREA = AreaSpec(
     name="skills",
+    settings_flag="area_skills_enabled",
     table=SKILLS_TABLE,
     fts_table=SKILLS_FTS_TABLE,
     vec_table=area_vectors.SKILLS_VEC_TABLE,
@@ -155,6 +166,7 @@ SKILLS_AREA = AreaSpec(
 )
 TERMS_AREA = AreaSpec(
     name="terms",
+    settings_flag="area_terms_enabled",
     table=TERMS_TABLE,
     fts_table=TERMS_FTS_TABLE,
     vec_table=area_vectors.TERMS_VEC_TABLE,
@@ -165,6 +177,7 @@ TERMS_AREA = AreaSpec(
 )
 USER_FACTS_AREA = AreaSpec(
     name="user",
+    settings_flag="area_user_facts_enabled",
     table=USER_FACTS_TABLE,
     fts_table=USER_FACTS_FTS_TABLE,
     vec_table=area_vectors.USER_FACTS_VEC_TABLE,
@@ -173,9 +186,43 @@ USER_FACTS_AREA = AreaSpec(
     select_columns=("name", "body"),
     embed_fields=("name", "body"),
 )
+# Область «Логи ассистента» (LSBN-F-10, arch §5.3/§6.2): текст векторизации —
+# непустые `action` + `reason` + `outcome` через перевод строки; выдача —
+# ссылка на объект изменения и время (полное чтение — f10-02/03).
+LOGS_AREA = AreaSpec(
+    name="logs",
+    settings_flag="area_logs_enabled",
+    table=ASSISTANT_LOGS_TABLE,
+    fts_table=ASSISTANT_LOGS_FTS_TABLE,
+    vec_table=area_vectors.ASSISTANT_LOGS_VEC_TABLE,
+    vec_id_column=area_vectors.ASSISTANT_LOGS_VEC_ID_COLUMN,
+    fts_columns=ASSISTANT_LOGS_FTS_COLUMNS,
+    select_columns=("action", "entity", "entity_id", "entity_version", "created_at"),
+    embed_fields=("action", "reason", "outcome"),
+)
 
 # Реестр областей (петля `areas` воркера и тесты изоляции ходят по нему).
-ALL_AREAS: tuple[AreaSpec, ...] = (SKILLS_AREA, TERMS_AREA, USER_FACTS_AREA)
+ALL_AREAS: tuple[AreaSpec, ...] = (
+    SKILLS_AREA,
+    TERMS_AREA,
+    USER_FACTS_AREA,
+    LOGS_AREA,
+)
+
+
+def enabled_areas(settings: Settings) -> tuple[AreaSpec, ...]:
+    """Реестр ВКЛЮЧЁННЫХ областей — фильтр `ALL_AREAS` по флагам (FR-1.1, №40).
+
+    Единственная точка чтения флагов: поверхность MCP, инструкция/анонс и
+    фоновая петля `areas` ходят по этому реестру, а не по `ALL_AREAS`.
+    Выключенная область не исчезает из данных и наблюдаемости (FR-3.1,
+    `/health.areas` собирается по `ALL_AREAS`), но не участвует в поверхности
+    и фоновой обработке. Точка расширения F-11: сужение состава — правка
+    реестра, а не имён флагов (FR-5.1).
+    """
+    return tuple(
+        spec for spec in ALL_AREAS if getattr(settings, spec.settings_flag)
+    )
 
 
 # --- гибридный поиск внутри области ----------------------------------------

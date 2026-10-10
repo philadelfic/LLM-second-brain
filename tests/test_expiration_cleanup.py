@@ -21,13 +21,15 @@ from fakes import HashEmbedder
 from app.config import get_settings
 from app.services.jobs import run_loop
 from app.services.notes import NoteService
+from app.services.links import LinksService
+from app.services.namespaces import NamespaceService
 from app.services.worker import (
     EXPIRATION_CLEANUP_INTERVAL_SEC,
     BackgroundWorker,
     build_expiration_job,
 )
 from app.storage import chunks, vectors
-from app.storage.db import init_db, session, transaction
+from app.storage.db import delete_note_physical, init_db, session, transaction
 
 # ISO-8601 UTC, как в БД (strftime('%Y-%m-%dT%H:%M:%SZ','now')).
 _ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -71,6 +73,13 @@ def _insert_note_with_ttl(settings, text: str, expires_at: str) -> int:
             (note_id, expires_at),
         )
     return note_id
+
+
+def _insert_plain_note(settings, text: str, namespace: str | None = None) -> int:
+    """Обычная заметка без TTL (для связей соседей); возвращает note_id."""
+    return NoteService(settings, HashEmbedder(settings.embedding_dim)).save(
+        text, namespace=namespace
+    )["id"]
 
 
 def _counts(settings, note_id: int) -> dict[str, int]:
@@ -163,6 +172,44 @@ class TestExpirationCleanup:
         worker = make_worker(settings)
         assert worker.process_expired_notes() == 0
 
+    def test_physical_delete_drops_links(self, settings) -> None:
+        """no46-03: физическое удаление чистит `links` заметки с ОБЕИХ сторон
+        (note_a и note_b) в той же транзакции, не трогая связи соседей."""
+        expired = _insert_note_with_ttl(
+            settings, "просроченная заметка со связями", "2000-01-01T00:00:00Z"
+        )
+        left = _insert_plain_note(settings, "сосед слева от удаляемой")
+        right = _insert_plain_note(settings, "сосед справа от удаляемой")
+        with session(settings) as conn, transaction(conn):
+            # Удаляемая с обеих сторон пары: одна строка как note_a, другая как note_b.
+            conn.execute(
+                "INSERT INTO links (note_a, note_b, kind, score) VALUES (?,?,?,?)",
+                (expired, left, "cosine", 0.9),
+            )
+            conn.execute(
+                "INSERT INTO links (note_a, note_b, kind, score) VALUES (?,?,?,?)",
+                (right, expired, "mention", None),
+            )
+            # Связь соседей между собой — физическое удаление её не касается.
+            conn.execute(
+                "INSERT INTO links (note_a, note_b, kind, score) VALUES (?,?,?,?)",
+                (left, right, "entities", 0.5),
+            )
+        worker = make_worker(settings)
+        assert worker.process_expired_notes() == 1
+        with session(settings) as conn:
+            dangling = conn.execute(
+                "SELECT COUNT(*) FROM links WHERE note_a = ? OR note_b = ?",
+                (expired, expired),
+            ).fetchone()[0]
+            kept = conn.execute(
+                "SELECT COUNT(*) FROM links WHERE note_a = ? AND note_b = ?",
+                (left, right),
+            ).fetchone()[0]
+        assert dangling == 0                # ни одной строки удалённой заметки
+        assert kept == 1                    # связь соседей не задета
+        assert _counts(settings, expired)["notes"] == 0
+
     def test_interval_constant(self) -> None:
         """Интервал фиксированный — 5 минут (решение О. 2026-09-09)."""
         assert EXPIRATION_CLEANUP_INTERVAL_SEC == 5 * 60
@@ -235,3 +282,40 @@ async def test_expiration_loop_keeps_fixed_300(
     ]
     assert [record.job for record in events] == ["expiration"]
     assert events[0].count == 1
+
+
+# --- чтение связей после физического удаления (no46-03) ----------------------
+
+
+def test_links_read_hides_deleted(settings) -> None:
+    """no46-03: физически удалённая заметка не видна в чтении связей.
+
+    До удаления связь уровня 1 видна (заметки в разных узлах), после
+    физического удаления — строк `links` с её id нет, а выдача `related`
+    её не показывает (отсечение на чтении + уборка в той же транзакции).
+    """
+    NamespaceService(settings).create("work", "Узел для проверки чтения связей.")
+    reader = _insert_plain_note(settings, "заметка-читатель связей")
+    gone = _insert_plain_note(
+        settings, "удаляемая заметка в другом узле", namespace="work"
+    )
+    with session(settings) as conn, transaction(conn):
+        conn.execute(
+            "INSERT INTO links (note_a, note_b, kind, score) VALUES (?,?,?,?)",
+            (reader, gone, "cosine", 0.9),
+        )
+        conn.execute(
+            "UPDATE notes SET links_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            "WHERE id = ?",
+            (reader,),
+        )
+    links = LinksService(settings)
+    assert [row["id"] for row in links.related(reader)] == [gone]  # связь видна
+    with session(settings) as conn, transaction(conn):
+        delete_note_physical(conn, gone)
+    with session(settings) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM links WHERE note_a = ? OR note_b = ?",
+            (gone, gone),
+        ).fetchone()[0] == 0
+    assert links.related(reader) == []  # удалённую не показываем

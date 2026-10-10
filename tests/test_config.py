@@ -47,9 +47,34 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "SNIPPET_CHARS": ("snippet_chars", 120),
     "MAX_GET_BATCH": ("max_get_batch", 20),
     "SUMMARY_THINK": ("summary_think", True),
-    "SUMMARY_NUM_PREDICT": ("summary_num_predict", 35000),
-    "MERGE_NUM_PREDICT": ("merge_num_predict", 35000),
-    "SUMMARY_TIMEOUT_SEC": ("summary_timeout_sec", 60),
+    # №49 (3.2.0): тип модели, 0 = «сколько влезет» (авто-бюджет), контексты 0 — неизвестен.
+    "SUMMARY_MODEL_TYPE": ("summary_model_type", "generation"),
+    "SUMMARY_NUM_PREDICT": ("summary_num_predict", 0),
+    "MERGE_NUM_PREDICT": ("merge_num_predict", 0),
+    "SUMMARY_TIMEOUT_SEC": ("summary_timeout_sec", 900),
+    "SUMMARY_CONTEXT_TOKENS": ("summary_context_tokens", 0),
+    "SLOT_PROMPT_RESERVE_TOKENS": ("slot_prompt_reserve_tokens", 512),
+    "SLOT_MAX_OUTPUT_TOKENS": ("slot_max_output_tokens", 32768),
+    "SLOT_REASONING_MIN_OUTPUT_TOKENS": ("slot_reasoning_min_output_tokens", 4096),
+    "SLOT_MIN_TIMEOUT_SEC": ("slot_min_timeout_sec", 300),
+    # LSBN-F-12 (3.2.0): decision-слот (выключен по умолчанию).
+    "DECISION_ENABLED": ("decision_enabled", False),
+    "DECISION_BASE_URL": ("decision_base_url", ""),
+    "DECISION_MODEL": ("decision_model", ""),
+    "DECISION_API_KEY": ("decision_api_key", ""),
+    "DECISION_TIMEOUT_SEC": ("decision_timeout_sec", 300),
+    "DECISION_THRESHOLD": ("decision_threshold", 0.5),
+    "DECISION_UNCERTAINTY_ZONE": ("decision_uncertainty_zone", 0.05),
+    "DECISION_FALLBACK": ("decision_fallback", True),
+    "DECISION_MAX_QUESTIONS": ("decision_max_questions", 64),
+    "DECISION_MAX_LABELS": ("decision_max_labels", 40),
+    # №45 (3.2.0): хинт о свежем релизе — источник/период/лимит (дефолт выключен).
+    "UPDATE_CHECK_ENABLED": ("update_check_enabled", False),
+    "UPDATE_SOURCE_FILE": ("update_source_file", ""),
+    "UPDATE_CHECK_URL": ("update_check_url", ""),
+    "UPDATE_CHECK_INTERVAL_SEC": ("update_check_interval_sec", 21600),
+    "UPDATE_HINT_EVERY_SEC": ("update_hint_every_sec", 86400),
+    "UPDATE_HINT_MAX_CHARS": ("update_hint_max_chars", 240),
     "PORT": ("port", 8080),
     "MCP_PATH": ("mcp_path", "/mcp"),
     "DB_PATH": ("db_path", "/data/notes.db"),
@@ -58,6 +83,8 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     # lsb-0013 (3.1.0): listing ceilings per surface.
     "LIST_MAX_LIMIT_MCP": ("list_max_limit_mcp", 20),
     "LIST_MAX_LIMIT_REST": ("list_max_limit_rest", 50),
+    "WARNINGS_MAX_LIMIT_MCP": ("warnings_max_limit_mcp", 20),
+    "WARNINGS_MAX_LIMIT_REST": ("warnings_max_limit_rest", 50),
     "SCORE_THRESHOLD": ("score_threshold", 0.50),
     # lsb-0010 (3.1.0): связи заметок, уровень 0 («ленивый граф»).
     "LINK_TOP": ("link_top", 3),
@@ -76,23 +103,46 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "JOB_NODES_INTERVAL_SEC": ("job_nodes_interval_sec", 3600),
     "JOB_NODES_BATCH": ("job_nodes_batch", 20),
     "JOB_NODES_CLASSIFIER_BUDGET": ("job_nodes_classifier_budget", 10),
+    # Релиз 3.2.0, джоба предупреждений №12 (постановка no12-01): расписание,
+    # бюджет вызовов классификатора и пороги подсветки «не на своём месте».
+    "JOB_WARNINGS_ENABLED": ("job_warnings_enabled", True),
+    "JOB_WARNINGS_INTERVAL_SEC": ("job_warnings_interval_sec", 3600),
+    "JOB_WARNINGS_BATCH": ("job_warnings_batch", 20),
+    "JOB_WARNINGS_CLASSIFIER_BUDGET": ("job_warnings_classifier_budget", 10),
+    "WARNINGS_MIN_CONFIDENCE": ("warnings_min_confidence", 0.80),
+    "WARNINGS_LEVEL_STRICT": ("warnings_level_strict", False),
+    # Релиз 3.2.0, джоба нормализации контекстов терминов №32 (постановка
+    # no32-01): интервал/батч, порог кластеризации и порог переизбытка.
+    "JOB_TERMS_ENABLED": ("job_terms_enabled", True),
+    "JOB_TERMS_INTERVAL_SEC": ("job_terms_interval_sec", 1800),
+    "JOB_TERMS_BATCH": ("job_terms_batch", 50),
+    "JOB_TERMS_CLUSTER_SIMILARITY": ("job_terms_cluster_similarity", 0.75),
+    "JOB_TERMS_CONTEXTS_EXCESS": ("job_terms_contexts_excess", 5),
     "DEDUP_SIMILARITY": ("dedup_similarity", 0.92),
     # Фаза 8 (Этап 2.1): фоновый дедуп — косинус-кандидаты.
     "DEDUP_CANDIDATE_TOP_N": ("dedup_candidate_top_n", 3),
     "DEDUP_CANDIDATE_SIMILARITY": ("dedup_candidate_similarity", 0.80),
     # Фаза 8 (Этап 3.1): LLM-судья дедупа lfm2.5:latest (think:false).
     "JUDGE_THINK": ("judge_think", False),
-    "JUDGE_NUM_PREDICT": ("judge_num_predict", 256),
-    "JUDGE_TIMEOUT_SEC": ("judge_timeout_sec", 30),
+    "JUDGE_MODEL_TYPE": ("judge_model_type", "generation"),  # №49
+    "JUDGE_NUM_PREDICT": ("judge_num_predict", 0),  # №49: 0 = авто
+    "JUDGE_TIMEOUT_SEC": ("judge_timeout_sec", 900),
+    "JUDGE_CONTEXT_TOKENS": ("judge_context_tokens", 0),  # №49: 0 — неизвестен
     "RRF_K": ("rrf_k", 60),
     "MAX_NOTE_CHARS": ("max_note_chars", 35000),
     "MAX_QUERY_CHARS": ("max_query_chars", 512),
+    "COMMENT_MAX_CHARS": ("comment_max_chars", 250),  # no24-01 (3.2.0)
     "PENDING_RETRY_SEC": ("pending_retry_sec", 30),
     "LOG_LEVEL": ("log_level", "INFO"),
     "AUTHOR_DEFAULT": ("author_default", "unknown"),
     "BACKUP_DIR": ("backup_dir", "/data/backups"),
     "BACKUP_INTERVAL_SEC": ("backup_interval_sec", 86400),
     "BACKUP_KEEP": ("backup_keep", 7),
+    # №14 (3.2.0): проверка восстановления каждого N-го снапшота (0 — вручную).
+    "BACKUP_VERIFY_EVERY": ("backup_verify_every", 1),
+    # №14 (3.2.0): вынос проверенной копии за пределы сервера (команда/таймаут).
+    "BACKUP_SHIP_CMD": ("backup_ship_cmd", ""),
+    "BACKUP_SHIP_TIMEOUT_SEC": ("backup_ship_timeout_sec", 300),
     # Фаза 10: иерархические неймспейсы (§5.7).
     "NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE": ("namespace_auto_move_min_confidence", 0.80),
     "NAMESPACE_PROMOTION_THRESHOLD": ("namespace_promotion_threshold", 15),
@@ -104,6 +154,17 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     # Фаза 10.1: флаг think судьи структуры отделён от дедуп-судьи (A/B Шага 7);
     # умолчание None = наследует JUDGE_THINK.
     "NAMESPACE_JUDGE_THINK": ("namespace_judge_think", None),
+    # №28 (3.2.0): подсказка узла при save без namespace (MEMORY_NODE_HINT_*).
+    "MEMORY_NODE_HINT_ENABLED": ("memory_node_hint_enabled", True),
+    "MEMORY_NODE_HINT_MIN_SCORE": ("memory_node_hint_min_score", 2.0),
+    "MEMORY_NODE_HINT_MAX_NODES": ("memory_node_hint_max_nodes", 2),
+    "MEMORY_NODE_HINT_TEXT_CHARS": ("memory_node_hint_text_chars", 200),
+    # №30 (3.2.0): подсказка «похожее» при save (MEMORY_SIMILAR_*).
+    "MEMORY_SIMILAR_ENABLED": ("memory_similar_enabled", True),
+    "MEMORY_SIMILAR_LIMIT": ("memory_similar_limit", 2),
+    "MEMORY_SIMILAR_POOL": ("memory_similar_pool", 5),
+    "MEMORY_SIMILAR_THRESHOLD": ("memory_similar_threshold", 0.30),
+    "MEMORY_SIMILAR_TEXT_CHARS": ("memory_similar_text_chars", 500),
     # Релиз 3.0.0, субстрат областей (постановка 00): лимиты формы и пороги
     # сходства skills/terms/user — из контрактов фич lsb-0007/0008/0009.
     "SKILL_NAME_MAX_CHARS": ("skill_name_max_chars", 65),
@@ -127,6 +188,33 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "USER_SIMILAR_STRONG": ("user_similar_strong", 0.85),
     "USER_SIMILAR_WEAK": ("user_similar_weak", 0.55),
     "USER_SEARCH_EXCERPT_CHARS": ("user_search_excerpt_chars", 300),
+    # Релиз 3.2.0, история версий №41 (постановка no41-01): охват/политика
+    # хранения и порог построчной дельты (§8 архитектуры субстрата).
+    "HISTORY_ENABLED": ("history_enabled", True),
+    "HISTORY_MAX_VERSIONS": ("history_max_versions", 0),
+    "HISTORY_RETENTION_DAYS": ("history_retention_days", 0),
+    "HISTORY_DELTA_INLINE_MAX": ("history_delta_inline_max", 2048),
+    # Релиз 3.2.0, флаги областей №40 (постановка no40-01): операторские
+    # выключатели области, дефолт «включено» (FR-1.1/FR-1.2).
+    "AREA_SKILLS_ENABLED": ("area_skills_enabled", True),
+    "AREA_TERMS_ENABLED": ("area_terms_enabled", True),
+    "AREA_USER_FACTS_ENABLED": ("area_user_facts_enabled", True),
+    # Релиз 3.2.0, область логов LSBN-F-10 (постановка f10-01): флаг области и
+    # лимиты формы записи + обрезка action в выдаче (§9).
+    "AREA_LOGS_ENABLED": ("area_logs_enabled", True),
+    "LOGS_ACTION_MAX_CHARS": ("logs_action_max_chars", 500),
+    "LOGS_REASON_MAX_CHARS": ("logs_reason_max_chars", 500),
+    "LOGS_ENTITY_REF_MAX_CHARS": ("logs_entity_ref_max_chars", 200),
+    "LOGS_OUTCOME_MAX_CHARS": ("logs_outcome_max_chars", 500),
+    "LOGS_VERIFIED_MAX_CHARS": ("logs_verified_max_chars", 200),
+    "LOGS_SEARCH_EXCERPT_CHARS": ("logs_search_excerpt_chars", 300),
+    # Релиз 3.2.0, исходы слота и пауза №39 (постановка no39-01): потолок
+    # паузы слота, порог открытия разрыва и период хинта человеку.
+    "SLOT_PAUSE_SEC": ("slot_pause_sec", 900),
+    "SLOT_PAUSE_AFTER": ("slot_pause_after", 3),
+    "SLOT_HINT_EVERY_SEC": ("slot_hint_every_sec", 900),
+    "SLOT_MAX_ATTEMPTS": ("slot_max_attempts", 8),
+    "SLOT_ATTENTION_RESET_ON_START": ("slot_attention_reset_on_start", True),
 }
 
 
@@ -154,12 +242,27 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 87 полей: 6 обязательных + 81 с умолчаниями
+        """В Settings — ровно 162 поля: 6 обязательных + 156 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
         субстрата областей релиза 3.0.0: лимиты/пороги skills/terms/user;
-        + 3 джобы расчёта связей lsb-0010-03 + 3 джобы обхода default lsb-0011-01)."""
+        + 3 джобы расчёта связей lsb-0010-03 + 3 джобы обхода default lsb-0011-01
+        + 4 истории версий №41 релиза 3.2.0: HISTORY_*; + 3 флага областей №40
+        релиза 3.2.0: AREA_*_ENABLED; + 5 настроек слота №39 релиза 3.2.0:
+        SLOT_* — пауза/стук/хинт, предел попыток пары и стартовый сброс;
+        + 6 настроек джобы предупреждений №12 релиза 3.2.0: JOB_WARNINGS_*
+        и WARNINGS_* + 2 потолка страницы предупреждений: WARNINGS_MAX_LIMIT_*
+        + 5 настроек джобы нормализации терминов №32 релиза 3.2.0: JOB_TERMS_*
+        + 10 настроек decision-слота LSBN-F-12 релиза 3.2.0: DECISION_*;
+        + 4 настройки подсказки узла №28 релиза 3.2.0: MEMORY_NODE_HINT_*
+        + 5 настроек подсказки «похожее» №30 релиза 3.2.0: MEMORY_SIMILAR_*
+        + 1 лимит пометки заметки №24 релиза 3.2.0: COMMENT_MAX_CHARS
+        + 7 настроек области логов LSBN-F-10 релиза 3.2.0: AREA_LOGS_ENABLED
+        и LOGS_*
+        + 6 настроек хинта о свежем релизе №45 релиза 3.2.0: UPDATE_*
+        + 3 настройки бэкапа №14 релиза 3.2.0: BACKUP_VERIFY_EVERY
+        и BACKUP_SHIP_CMD/BACKUP_SHIP_TIMEOUT_SEC)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

@@ -1,5 +1,5 @@
 """Векторные индексы областей (субстрат 3.0.0): skills_vec / terms_vec /
-user_facts_vec — vec0.
+user_facts_vec / assistant_logs_vec — vec0.
 
 Слой без доменных правил (как `app.storage.vectors` для notes_vec): создание,
 дроп, запись/чтение векторов и KNN. Доменные правила (когда кодировать текст,
@@ -30,12 +30,17 @@ TERMS_VEC_TABLE = "terms_vec"
 TERMS_VEC_ID_COLUMN = "term_id"
 USER_FACTS_VEC_TABLE = "user_facts_vec"
 USER_FACTS_VEC_ID_COLUMN = "fact_id"
+# Область логов ассистента (LSBN-F-10, arch §5.3): одна vec0 на область, ключ —
+# id строки `assistant_logs`; размерность/метрика — общие (`create_vec_tables`).
+ASSISTANT_LOGS_VEC_TABLE = "assistant_logs_vec"
+ASSISTANT_LOGS_VEC_ID_COLUMN = "log_id"
 
 # (таблица vec0, ключевая колонка) — реестр для создания/дропа всех area-vec.
 VEC_TABLES: tuple[tuple[str, str], ...] = (
     (SKILLS_VEC_TABLE, SKILLS_VEC_ID_COLUMN),
     (TERMS_VEC_TABLE, TERMS_VEC_ID_COLUMN),
     (USER_FACTS_VEC_TABLE, USER_FACTS_VEC_ID_COLUMN),
+    (ASSISTANT_LOGS_VEC_TABLE, ASSISTANT_LOGS_VEC_ID_COLUMN),
 )
 
 

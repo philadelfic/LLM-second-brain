@@ -61,17 +61,47 @@ JUDGE_NUM_PREDICT (прод 1024: замер ~1200 токенов, done_reason=s
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
 import httpx
 
 from app.config import Settings
-from app.services.llm_client import LLMClient, LLMError, SlotSpec
+from app.services.decision import DecisionService, DecisionUnavailable
+from app.services.llm_client import ChatMeta, LLMClient, LLMError, SlotSpec
 from app.services.prompts import PromptRegistry
+from app.services.slot_outcome import SlotOutcome, classify_llm_error
 
 
 class JudgeError(RuntimeError):
-    """Судья не дал вердикта: сервер недоступен или ответ некорректен."""
+    """Судья не дал вердикта: сервер недоступен или ответ некорректен.
+
+    `outcome` — единый тип исхода вызова слота (№39, arch §6.4): отказ
+    клиента классифицируется `classify_llm_error`, а «вердикт не распознан»
+    — явно `OFF_CONTRACT` (дефолт). Воркер пишет исход в журнал.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        outcome: SlotOutcome = SlotOutcome.OFF_CONTRACT,
+        meta: ChatMeta | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.outcome = outcome
+        # Метаданные состоявшегося вызова (№49): отказ после ответа модели
+        # (вердикт не распознан) несёт их воркеру — отказ в журнале виден
+        # теми же полями вызова, что и успех (§7.2).
+        self.meta = meta
+
+
+@dataclass(frozen=True)
+class JudgeResult:
+    """Результат судьи вместе с метаданными вызова (№49, §6.3)."""
+
+    verdict: bool
+    meta: ChatMeta
 
 
 class Judge(Protocol):
@@ -81,8 +111,17 @@ class Judge(Protocol):
     (tests/fakes.py) — воркер зависит от протокола, а не от класса клиента.
     """
 
-    def judge(self, text_new: str, text_candidate: str) -> bool:
-        """Вердикт по паре текстов: True — дубль, False — не дубль."""
+    def judge(self, text_new: str, text_candidate: str) -> JudgeResult:
+        """Вердикт по паре текстов: True — дубль, False — не дубль.
+
+        Невозможность дать вердикт — отказ (безопаснее «не сводить»): воркер
+        оставит обе заметки и повторит по back-off (NFR-3).
+        """
+        ...
+
+    def probe(self) -> str:
+        """Дешёвый пробный стук слота (№39, arch §6.4): `check()` без генерации;
+        исход — CheckResult из llm_client."""
         ...
 
     def close(self) -> None:
@@ -102,9 +141,12 @@ class JudgeService:
         *,
         llm: LLMClient | None = None,
         registry: PromptRegistry | None = None,
+        decider: DecisionService | None = None,
     ) -> None:
         self._settings = settings
         self._prompts = registry if registry is not None else PromptRegistry()
+        # LSBN-F-12: decision-слот (None — выключен, поведение v3.1.0).
+        self._decider = decider
         # DI сборки (общий клиент слота judge) или свой клиент с
         # transport-инъекцией для юнит-тестов (MockTransport).
         self._llm = (
@@ -114,41 +156,106 @@ class JudgeService:
         )
         # None — попыток не было (health не врёт до первых данных).
         self.last_attempt_ok: bool | None = None
+        # Метаданные последнего вызова (№49/№50): диагностика в /health.slots
+        # без чтения журнала (None — вызова ещё не было).
+        self.last_meta: ChatMeta | None = None
 
-    def judge(self, text_new: str, text_candidate: str) -> bool:
-        """Спросить судью про пару текстов; True — «ДУБЛЬ», False — «НЕ ДУБЛЬ».
+    def judge(self, text_new: str, text_candidate: str) -> JudgeResult:
+        """Вердикт по паре: decision-слот, иначе генеративный путь (§6.3/§13.6).
 
-        Любой отказ — JudgeError: воркер оставит пару нетронутой и повторит
-        по back-off (NFR-3) — лучше обе заметки, чем ошибочное сведение.
+        Решение может прийти от decision-слота (state — боевой `judge_user`,
+        один `noul`-вопрос реестра); три причины переключения
+        (`unavailable`/`unsupported`/`low_confidence`) уводят на прежний
+        генеративный путь, а при `DECISION_FALLBACK=false` — в отказ
+        `UNAVAILABLE` (контракт №39: задание ждёт, вердикт не выдумывается).
+        Внешний контракт (`JudgeResult.verdict: bool`) не меняется (FR-5.3).
         """
         if not text_new or not text_new.strip():
             raise ValueError("judge: пустая заметка недопустима")
         if not text_candidate or not text_candidate.strip():
             raise ValueError("judge: пустая заметка недопустима")
+        if self._decider is not None:
+            try:
+                return self._judge_decision(text_new, text_candidate)
+            except DecisionUnavailable as exc:
+                if not self._settings.decision_fallback:
+                    # Контракт №39: генеративный вердикт не берём — задание ждёт.
+                    self.last_attempt_ok = False
+                    raise JudgeError(
+                        str(exc), outcome=SlotOutcome.UNAVAILABLE
+                    ) from exc
+        return self._judge_generative(text_new, text_candidate)
+
+    def _judge_decision(
+        self, text_new: str, text_candidate: str
+    ) -> JudgeResult:
+        """Решение decision-слота: `label == "true"` → вердикт «ДУБЛЬ».
+
+        Журнал (`decision_answer`/`decision_fallback`) — внутри `DecisionService`
+        (arch §7.2/§13.6): потребитель не знает, каким типом слота получено
+        решение (FR-5.3).
+        """
+        assert self._decider is not None
+        questions = self._decider.questions_for("judge")
+        if not questions:
+            raise DecisionUnavailable(
+                "в реестре нет вопроса судьи дедупа", reason="unsupported"
+            )
+        state = self._prompts.judge_user.format(
+            text_new=text_new, text_candidate=text_candidate
+        )
+        result = self._decider.decide(state, questions, operation="judge")
+        answer = result.answers.get(questions[0].name)
+        if answer is None or answer.label is None:
+            raise DecisionUnavailable(
+                f"в ответе нет вердикта вопроса «{questions[0].name}»",
+                reason="unsupported",
+            )
+        self.last_attempt_ok = True
+        self.last_meta = result.meta
+        return JudgeResult(verdict=answer.label == "true", meta=result.meta)
+
+    def _judge_generative(
+        self, text_new: str, text_candidate: str
+    ) -> JudgeResult:
+        """Прежний генеративный путь (маркеры `**DUPLICATE**`/`**NOT DUPLICATE**`)."""
         try:
-            content = self._llm.chat(
+            result = self._llm.chat_result(
                 self._prompts.judge_system,
                 self._prompts.judge_user.format(
                     text_new=text_new, text_candidate=text_candidate
                 ),
-                num_predict=self._settings.judge_num_predict,
+                num_predict=self._settings.judge_num_predict or None,
+                operation="judge",
             )
         except LLMError as exc:
             # Текст клиента сохраняется: HTTP-статус, адрес слота, hint
-            # про {SLOT}_API_KEY у auth-отказа (решение №4).
+            # про {SLOT}_API_KEY у auth-отказа (решение №4). Исход вызова
+            # (№39, arch §6.4) — единый тип исхода на границе сервиса.
             self.last_attempt_ok = False  # деградация станет видна в /health
-            raise JudgeError(str(exc)) from exc
+            self.last_meta = exc.meta  # метаданные вызова для диагностики
+            raise JudgeError(
+                str(exc), outcome=classify_llm_error(exc), meta=exc.meta
+            ) from exc
         try:
-            verdict = self._verdict(content)
-        except JudgeError:
+            verdict = self._verdict(result.content)
+        except JudgeError as exc:
             self.last_attempt_ok = False  # нераспознанный вердикт — тоже отказ
-            raise
+            self.last_meta = result.meta
+            # Вызов состоялся — метаданные уходят воркеру вместе с отказом.
+            raise JudgeError(str(exc), outcome=exc.outcome, meta=result.meta) from exc
         self.last_attempt_ok = True
-        return verdict
+        self.last_meta = result.meta
+        return JudgeResult(verdict=verdict, meta=result.meta)
 
     def close(self) -> None:
         """Закрыть HTTP-пул (чистое завершение процесса)."""
         self._llm.close()
+
+    def probe(self) -> str:
+        """Дешёвый пробный стук слота judge (№39, arch §6.4): `check()`
+        без генерации. Исход отдаётся как есть (CheckResult)."""
+        return self._llm.check()
 
     # --- внутреннее ---------------------------------------------------------
 
@@ -167,5 +274,6 @@ class JudgeService:
         if "DUPLICATE" in normalized:
             return True
         raise JudgeError(
-            f"judge gave no verdict DUPLICATE/NOT DUPLICATE: {content[:120]}"
+            f"judge gave no verdict DUPLICATE/NOT DUPLICATE: {content[:120]}",
+            outcome=SlotOutcome.OFF_CONTRACT,
         )

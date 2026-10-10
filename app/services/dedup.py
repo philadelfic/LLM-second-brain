@@ -20,6 +20,12 @@ Trash (soft delete) не участвует ни в одном пути: уда�
 кандидат в дубликаты (undo оператора вернёт её как отдельную заметку,
 REQUIREMENTS FR-6); вектора trash живы (ARCH §3.3), дедуп читает только
 активные.
+
+Заметка с таймером (TTL, `expires_at IS NOT NULL`, no46-03, 3.2.0) — тоже не
+кандидат на слияние ни в одном пути: такую заметку нельзя сшить с другой
+(правило О. 2026-10-10). Отбор исключает её SQL-стороной (и KNN-ветка, и
+текстовый фоллбек), без пост-фильтра на Python; связи (`links`) при этом
+разрешены — TTL-заметка может быть связана с другими.
 """
 
 from __future__ import annotations
@@ -84,6 +90,9 @@ class DeduplicationService:
         и без исключения занял бы слот топ-N с cosine 1.0. Trash не кандидат:
         окно KNN расширяется на число trash-векторов, пост-фильтр оставляет
         только активные (как в SearchService — vec0 не знает о notes).
+        Заметка с TTL (`expires_at IS NOT NULL`, no46-03) — тоже не кандидат
+        на слияние: исключается в SQL (условие к `deleted_at IS NULL`); её
+        вектор так же занимает слот окна KNN — расширяем и на него.
         Фаза 10 (§5.7): `namespace` — дедуп в пределах неймспейса (KNN
         сканирует партицию узла); None — глобально (legacy-совместимость).
         Меж-неймспейсовый близкий контент — не дубль: заметки в разных
@@ -99,13 +108,17 @@ class DeduplicationService:
             else:
                 ns_clause = ""
                 ns_params = []
-            trash = conn.execute(
+            # Не-кандидаты (trash и заметки с TTL, no46-03) свои вектора в
+            # notes_vec всё равно держат — окно KNN расширяем на их число,
+            # иначе такой сосед вытеснил бы активного кандидата из топ-N.
+            skipped = conn.execute(
                 "SELECT COUNT(*) FROM notes_vec WHERE note_id IN "
-                "(SELECT id FROM notes WHERE deleted_at IS NOT NULL"
+                "(SELECT id FROM notes WHERE "
+                "(deleted_at IS NOT NULL OR expires_at IS NOT NULL)"
                 f"{ns_clause})",
                 ns_params,
             ).fetchone()[0]
-            window = top_n + trash + (1 if exclude_id is not None else 0)
+            window = top_n + skipped + (1 if exclude_id is not None else 0)
             hits = vectors.knn(
                 conn,
                 vector,
@@ -119,6 +132,7 @@ class DeduplicationService:
                 row[0]
                 for row in conn.execute(
                     f"SELECT id FROM notes WHERE deleted_at IS NULL "
+                    f"AND expires_at IS NULL "
                     f"{ns_clause} AND id IN ({placeholders})",
                     ns_params + [note_id for note_id, _ in hits],
                 )
@@ -128,7 +142,7 @@ class DeduplicationService:
                 if cosine_value < threshold:
                     break  # выдача KNN отсортирована — дальше только ниже
                 if candidate_id == exclude_id or candidate_id not in active:
-                    continue  # сама свежая заметка / trash — не кандидаты
+                    continue  # сама свежая заметка / trash / TTL — не кандидаты
                 result.append((candidate_id, cosine_value))
                 if len(result) == top_n:
                     break
@@ -178,6 +192,10 @@ class DeduplicationService:
     ) -> sqlite3.Row | None:
         """Тело дословного дедупа на открытом соединении (SQL + FTS-фоллбек).
 
+        Заметка с TTL (`expires_at IS NOT NULL`, no46-03) не кандидат и здесь:
+        условие `expires_at IS NULL` добавлено в оба SQL (exact-scan и
+        FTS-фоллбек) — такое слияние запрещено правилом О. 2026-10-10.
+
         План-хинты (пул 13, бенч 50k: find_by_text с ns-фильтром — 132 с):
         - `NOT INDEXED` на exact-scan: без него с `AND namespace = ?`
           планировщик берёт idx_notes_namespace (низкоселективный — все строки
@@ -190,7 +208,8 @@ class DeduplicationService:
         """
         exact = conn.execute(
             "SELECT id, text, namespace FROM notes NOT INDEXED "
-            f"WHERE deleted_at IS NULL AND text = ?{ns_clause} ORDER BY id LIMIT 1",
+            "WHERE deleted_at IS NULL AND expires_at IS NULL "
+            f"AND text = ?{ns_clause} ORDER BY id LIMIT 1",
             (text, *ns_params),
         ).fetchone()
         if exact is not None:
@@ -206,8 +225,8 @@ class DeduplicationService:
         candidates = conn.execute(
             "SELECT n.id, n.text, n.namespace FROM notes_fts "
             "CROSS JOIN notes n ON n.id = notes_fts.rowid "
-            f"WHERE notes_fts MATCH ? AND n.deleted_at IS NULL"
-            f"{ns_fts_clause} LIMIT ?",
+            f"WHERE notes_fts MATCH ? AND n.deleted_at IS NULL "
+            f"AND n.expires_at IS NULL{ns_fts_clause} LIMIT ?",
             (expression, *ns_params, FALLBACK_SCAN),
         ).fetchall()
         for candidate in candidates:

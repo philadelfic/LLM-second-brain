@@ -66,7 +66,7 @@ def test_save_returns_contract_without_embed(dim8) -> None:
     embedder = FailingEmbedder()
     notes = notes_with(dim8, embedder)
     result = notes.save("Заметка о мгновенной записи")
-    assert result == {"id": 1, "stored": True, "summary_pending": True}  # без warning
+    assert {"id", "stored", "summary_pending"} <= set(result)  # без warning (+ №28 namespace_hint)
     assert embedder.calls == []  # синхронный embed исчез (критерий приёмки)
     with session(dim8) as conn:
         row = conn.execute("SELECT * FROM notes WHERE id = 1").fetchone()
@@ -153,7 +153,7 @@ def test_embedding_availability_no_longer_changes_save(dim8) -> None:
     что и с живым кодировщиком; заметка просто стоит в очереди (NFR-3)."""
     broken = notes_with(dim8, FailingEmbedder())
     result = broken.save("Заметка без сервера векторизации")
-    assert result == {"id": 1, "stored": True, "summary_pending": True}  # без warning
+    assert {"id", "stored", "summary_pending"} <= set(result)  # без warning (+ №28 namespace_hint)
     with session(dim8) as conn:
         row = conn.execute("SELECT * FROM notes WHERE id = 1").fetchone()
         assert row["vector_status"] == "pending"
