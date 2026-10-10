@@ -402,6 +402,9 @@ class HealthResponse(BaseModel):
     # fallbacks, by_reason:{unavailable,unsupported,low_confidence}} из памяти
     # процесса (вероятности наружу не отдаются — только журнал).
     decision: dict[str, Any]
+    # №45 (arch §7.2): наблюдаемость версии — {enabled, current, latest,
+    # checked_at, hint_shown_at}; собирается из памяти `UpdateChecker` (без I/O).
+    update: dict[str, Any]
 
 
 def _services(request: Request) -> Services:
@@ -575,6 +578,19 @@ def build_rest_router(settings: Settings) -> APIRouter:
         # сервиса (§7.3): сколько решений принято, сколько переключений и по
         # каким причинам. Модели не зовём (только снимок счётчиков).
         decision_ok, decision = _decision_health(services)
+        # №45 (arch §7.2): снимок версии — из памяти чекера, без I/O.
+        checker = getattr(request.app.state, "update_checker", None)
+        update = (
+            checker.health()
+            if checker is not None
+            else {
+                "enabled": False,
+                "current": __version__,
+                "latest": None,
+                "checked_at": None,
+                "hint_shown_at": None,
+            }
+        )
         return HealthResponse(
             status="ok",
             version=__version__,
@@ -590,6 +606,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
             areas=areas,
             warnings=warnings,
             decision=decision,
+            update=update,
         )
 
     @rest_router.post("/notes", status_code=201)

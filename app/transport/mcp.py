@@ -156,6 +156,7 @@ from app.config import Settings, get_settings
 from app.observability import log_tool_call, preview
 from app.services import Services
 from app.services import history
+from app.services.update_check import UpdateChecker
 from app.services.freshness import FreshnessValidationError, parse_updated_after
 from app.services.namespaces import NamespaceError, NamespaceValidationError
 from app.services.notes import (
@@ -506,6 +507,40 @@ class SlotHintMiddleware:
                 slot=slot, outcome=snapshot.get("last_outcome") or "unavailable"
             )
         return None
+
+
+class UpdateHintMiddleware:
+    """ServerMiddleware: хинт о свежем релизе (№45, arch §7.1/§7.3).
+
+    Перед ответом инструмента читает кеш `UpdateChecker` (только память —
+    никаких файловых/сетевых обращений в пути ручки) и, если вернулся текст,
+    добавляет поле верхнего уровня `update_hint`. `hint`/`fail` не подменяются
+    и не дублируются. Дефолт выключен: `hint()` возвращает None — выдача
+    инструмента не меняется ни на байт (FR-45.8/FR-45.9).
+    """
+
+    def __init__(self, checker: UpdateChecker | None = None) -> None:
+        self._checker = checker
+
+    async def __call__(
+        self,
+        ctx: ServerRequestContext[Any, Any],
+        call_next: Callable[[ServerRequestContext[Any, Any]], Awaitable[Any]],
+    ) -> Any:
+        result = await call_next(ctx)
+        if getattr(ctx, "method", None) != "tools/call":
+            return result  # только ответы инструментов (не initialize/list)
+        if self._checker is None or not isinstance(result, CallToolResult):
+            return result
+        hint = self._checker.hint()
+        if hint is None:
+            return result
+        if isinstance(result.structured_content, dict):
+            result.structured_content = {
+                **result.structured_content,
+                "update_hint": hint,
+            }
+        return result
 
 
 # Обучающие описания инструментов (ARCHITECTURE §5.2) — гарантированный канал
@@ -1521,6 +1556,7 @@ def build_mcp(
     settings: Settings,
     services: Services,
     worker: "BackgroundWorker | None" = None,
+    update_checker: UpdateChecker | None = None,
 ) -> MCPServer:
     """Собрать MCP-сервер: инструкции (§5.1, база + карта неймспейсов) +
     до 24 инструментов (8 `memory_*` + 1 `warnings_list` + 5 `skills_*` +
@@ -1537,6 +1573,9 @@ def build_mcp(
     `worker` (№39, FR-4.4) — источник снимка разрывов слотов для хинта
     «предупреди своего человека»; None (DI-сборки тестов без воркера) — хинт
     выключен.
+
+    `update_checker` (№45, FR-45.8) — источник хинта о свежем релизе; None
+    (DI-сборки без чекера) — поле `update_hint` не добавляется.
     """
     mcp = MCPServer(
         name=SERVER_NAME,
@@ -1548,6 +1587,9 @@ def build_mcp(
     mcp.middleware.append(InstructionsRefresher(services, mcp))
     # №39 (FR-4.4/FR-4.5, arch §7.3): хинт о сломанном слоте с троттлингом.
     mcp.middleware.append(SlotHintMiddleware(settings, worker))
+    # №45 (FR-45.8, arch §7.1): хинт о свежем релизе отдельным полем
+    # `update_hint` с троттлингом; дефолт выключен — выдача не меняется.
+    mcp.middleware.append(UpdateHintMiddleware(update_checker))
 
     @mcp.tool(name="memory_search", description=TOOL_DESCRIPTIONS["memory_search"])
     async def memory_search(

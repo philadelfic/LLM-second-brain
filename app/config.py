@@ -313,6 +313,20 @@ class Settings(BaseSettings):
     backup_interval_sec: int = 86400  # сутки
     backup_keep: int = 7
 
+    # --- хинт о свежем релизе (№45, релиз 3.2.0; arch §6.2/§8/§13.8-13.13) ----
+    # Фоновая проверка версии: источник — локальный JSON-файл (работает без
+    # интернета) приоритетно, HTTP — осознанная опция оператора. Дефолт
+    # выключен: наличие выхода в интернет у контейнера не проверено, поэтому
+    # «сеть из рантайма» дефолтом быть не может (arch §13.8). Кеш и отметка
+    # «хинт показан» — в памяти процесса (без БД). Интервал опроса ≥ 60 с,
+    # период хинта ≥ 0 (0 — один на процесс), лимит текста 1..400.
+    update_check_enabled: bool = False
+    update_source_file: str = ""  # локальный JSON-источник (приоритетно)
+    update_check_url: str = ""  # HTTP-источник (опционально)
+    update_check_interval_sec: int = 21600  # период фонового опроса (6 ч)
+    update_hint_every_sec: int = 86400  # не чаще одного хинта за период
+    update_hint_max_chars: int = 240  # лимит текста подсказки
+
     # --- неймспейсы (Фаза 10, REQUIREMENTS §5.7/§8) ---
     namespace_auto_move_min_confidence: float = 0.80  # авто-переезд default-заметки в существующий домен
     namespace_promotion_threshold: int = 15  # счётчик default-заметок с одним hint → авто-создание листа
@@ -698,6 +712,26 @@ class Settings(BaseSettings):
             errors.append("  - backup_dir: путь не может быть пустым")
         if not self.db_path.strip():
             errors.append("  - db_path: путь не может быть пустым")
+
+        # --- хинт о свежем релизе (№45, arch §8): интервал ≥ 60, период хинта
+        # ≥ 0 (0 — один на процесс), лимит текста 1..400; при включённой
+        # проверке обязателен хотя бы один источник (иначе — фатальный старт, NFR-6).
+        need_low("update_check_interval_sec", self.update_check_interval_sec, 60)
+        need_low("update_hint_every_sec", self.update_hint_every_sec, 0)
+        need_low("update_hint_max_chars", self.update_hint_max_chars, 1)
+        if self.update_hint_max_chars > 400:
+            errors.append(
+                "  - update_hint_max_chars: больше 400 — текст подсказки "
+                "раздувает ответ (arch §8), получено "
+                f"{self.update_hint_max_chars}"
+            )
+        if self.update_check_enabled and not (
+            self.update_source_file.strip() or self.update_check_url.strip()
+        ):
+            errors.append(
+                "  - update_check_enabled: проверка включена без источника — "
+                "задай UPDATE_SOURCE_FILE (локальный JSON) или UPDATE_CHECK_URL"
+            )
 
         # --- неймспейсы (Фаза 10) ---
         need_range(

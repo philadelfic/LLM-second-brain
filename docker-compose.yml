@@ -181,6 +181,14 @@ services:
       BACKUP_DIR: "/data/backups"
       BACKUP_INTERVAL_SEC: "86400"
       BACKUP_KEEP: "7"
+      # --- release check (№45): off by default — no verified egress from the
+      #     container, so the network cannot be the default source ---
+      # UPDATE_CHECK_ENABLED: "false"       # true turns on the background version check
+      # UPDATE_SOURCE_FILE: ""             # a JSON file dropped by the host, works without internet
+      # UPDATE_CHECK_URL: ""               # optional HTTP source; leave empty to stay offline
+      # UPDATE_CHECK_INTERVAL_SEC: "21600"  # background poll period, seconds (≥60)
+      # UPDATE_HINT_EVERY_SEC: "86400"      # at most one hint per period, seconds (0 — once per process)
+      # UPDATE_HINT_MAX_CHARS: "240"        # hint text limit (1..400)
       # --- namespaces (Phase 10) ---
       NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE: "0.80"  # auto-move of a default note into an existing domain
       NAMESPACE_PROMOTION_THRESHOLD: "15"         # counter of default notes with one subdomain_hint → auto-create a leaf

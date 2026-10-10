@@ -63,6 +63,13 @@ class TestHealth:
                     "low_confidence": 0,
                 },
             },
+            "update": {
+                "enabled": False,
+                "current": __version__,
+                "latest": None,
+                "checked_at": None,
+                "hint_shown_at": None,
+            },
         }
 
     def test_contract_fields(self, client: TestClient) -> None:
@@ -83,6 +90,7 @@ class TestHealth:
             "areas",
             "warnings",
             "decision",
+            "update",
         }
         assert body["status"] == "ok"
         # techdebt-0036 (FR-4.2): версия — из приложения, не из окружения.
@@ -125,6 +133,16 @@ class TestHealth:
 
     def test_query_string_does_not_break_openness(self, client: TestClient) -> None:
         assert client.get("/health", params={"verbose": 1}).status_code == 200
+
+    def test_health_update(self, client: TestClient) -> None:
+        """№45 (arch §7.2): `/health.update` несёт оговорённые поля (дефолт — пусто)."""
+        assert client.get("/health").json()["update"] == {
+            "enabled": False,
+            "current": __version__,
+            "latest": None,
+            "checked_at": None,
+            "hint_shown_at": None,
+        }
 
     def test_health_areas(self, client: TestClient) -> None:
         """Дефолт: все области включены, очередей нет (№40, FR-4.3)."""

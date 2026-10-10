@@ -68,6 +68,13 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "DECISION_FALLBACK": ("decision_fallback", True),
     "DECISION_MAX_QUESTIONS": ("decision_max_questions", 64),
     "DECISION_MAX_LABELS": ("decision_max_labels", 40),
+    # №45 (3.2.0): хинт о свежем релизе — источник/период/лимит (дефолт выключен).
+    "UPDATE_CHECK_ENABLED": ("update_check_enabled", False),
+    "UPDATE_SOURCE_FILE": ("update_source_file", ""),
+    "UPDATE_CHECK_URL": ("update_check_url", ""),
+    "UPDATE_CHECK_INTERVAL_SEC": ("update_check_interval_sec", 21600),
+    "UPDATE_HINT_EVERY_SEC": ("update_hint_every_sec", 86400),
+    "UPDATE_HINT_MAX_CHARS": ("update_hint_max_chars", 240),
     "PORT": ("port", 8080),
     "MCP_PATH": ("mcp_path", "/mcp"),
     "DB_PATH": ("db_path", "/data/notes.db"),
@@ -230,7 +237,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 145 полей: 6 обязательных + 139 с умолчаниями
+        """В Settings — ровно 159 полей: 6 обязательных + 153 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
@@ -247,7 +254,8 @@ class TestCompleteness:
         + 5 настроек подсказки «похожее» №30 релиза 3.2.0: MEMORY_SIMILAR_*
         + 1 лимит пометки заметки №24 релиза 3.2.0: COMMENT_MAX_CHARS
         + 7 настроек области логов LSBN-F-10 релиза 3.2.0: AREA_LOGS_ENABLED
-        и LOGS_*)."""
+        и LOGS_*
+        + 6 настроек хинта о свежем релизе №45 релиза 3.2.0: UPDATE_*)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

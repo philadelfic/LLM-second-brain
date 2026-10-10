@@ -38,6 +38,7 @@ from app.services.llm_client import (
     LLMClient,
 )
 from app.services.slot_budget import resolve_output_budget
+from app.services.update_check import UpdateChecker
 from app.services.worker import BackgroundWorker
 from app.storage.db import StorageError, init_db
 from app.transport.auth import BearerAuthMiddleware
@@ -300,8 +301,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # localhost, поэтому SDK не включает DNS-rebinding protection (сервис
     # живёт в LAN за Bearer-токеном; Open WebUI ходит с не-localhost Host).
     # MCP собирается после воркера (№39, FR-4.4): миддлварь хинта о сломанном
-    # слоте берёт снимок разрывов из воркера (`slot_states`).
-    mcp = build_mcp(settings, services, worker=worker)
+    # слоте берёт снимок разрывов из воркера (`slot_states`). №45 (FR-45.8):
+    # чекер версии создаётся здесь и передаётся в MCP — миддлварь `update_hint`
+    # читает только его кеш; фоновая петля стартует в lifespan (если включено).
+    update_checker = UpdateChecker(settings)
+    mcp = build_mcp(settings, services, worker=worker, update_checker=update_checker)
     mcp_app = mcp.streamable_http_app(
         streamable_http_path=settings.mcp_path,
         host="0.0.0.0",
@@ -359,6 +363,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             backup_task = asyncio.create_task(
                 services.backup.run(), name="backup-snapshots"
             )
+            # №45 (FR-45.3): фоновая проверка версии — только когда включена;
+            # первый опрос сразу после старта, далее по интервалу.
+            update_task: asyncio.Task[None] | None = None
+            if settings.update_check_enabled:
+                update_task = asyncio.create_task(
+                    update_checker.run(), name="update-check"
+                )
             try:
                 yield
             finally:
@@ -370,6 +381,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 backup_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await backup_task
+                if update_task is not None:
+                    update_checker.stop()
+                    update_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await update_task
 
     app = FastAPI(
         title="LLM Second Brain",
@@ -386,6 +402,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Воркер нужен REST-ручке /health: снимки очередей (queues, FR-2.2)
     # собираются по реестру джоб — только SQL, без обращений к моделям.
     app.state.worker = worker
+    # №45 (FR-4.4): снимок версии для /health.update — из памяти чекера.
+    app.state.update_checker = update_checker
     # Монтирование в корень: MCP_PATH задаёт точный путь MCP-эндпоинта;
     # маршруты FastAPI (/health и будущие REST) матчатся раньше mount.
     app.mount("/", mcp_app)
