@@ -48,23 +48,22 @@ CANON_TOOL_DESCRIPTIONS = {
     "user_search": (
         "Search the user area: atomic facts about the user (steady preferences, "
         "working habits, agreements — ONE FACT PER RECORD, never a list). Returns "
-        "{id, name, excerpt}; the full body — user_get. Search here when the "
+        "{id, name, excerpt}; the full body — via `user_get`. Search here when the "
         "answer depends on the user's preferences or arrangements; do not invent "
         "what might be stored — search first."
     ),
     "user_save": (
-        "Save ONE atomic durable fact about the user: name ≤5 words (like a note "
-        "title) + body ≤1200 characters. ONE FACT = ONE RECORD: never pack a list "
-        "of facts into one record and never repeat a fact that is already stored "
-        "— several facts mean several separate calls. A strong overlap with an "
-        "existing fact is refused with a hint pointing to it: the same fact — "
-        "refine it via user_update(id=…); a new fact — save it as a separate "
-        "record. Never store secrets (passwords, tokens, keys)."
+        "Save ONE atomic durable fact about the user: a short name plus a compact "
+        "body. ONE FACT = ONE RECORD: never pack a list of facts into one record "
+        "and never repeat a fact that is already stored — several facts mean "
+        "several separate calls. A strong overlap with an existing fact is refused "
+        "with a hint pointing to it: refine that fact via `user_update`; a new one "
+        "is saved separately. Never store secrets (passwords, tokens, keys)."
     ),
     "user_update": (
-        "Update a fact by id: name and/or body; a value that is not passed = keep "
-        "the current one. Run user_get first so you don't lose details. This is "
-        "the right tool when user_save hinted that a similar fact already exists."
+        "Update a fact by id: name and/or body; a value that is not passed keeps "
+        "the current one. Run `user_get` first so no details are lost. This is the "
+        "tool to call when `user_save` hinted that a similar fact already exists."
     ),
     "user_delete": (
         "Delete a fact by id (soft delete: it disappears from all outputs; "

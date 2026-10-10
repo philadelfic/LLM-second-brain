@@ -1577,6 +1577,37 @@ class TestInstructionsBudget:
         assert len(instructions.encode("utf-8")) / 4 <= 1300
 
 
+    def test_instructions_have_no_russian(self, test_env: dict[str, str]) -> None:
+        """LSBN-F-11 (f11-02): статика инъекции — EN-only.
+
+        Требование «EN-only» относится к СТАТИЧЕСКИМ частям: ядро, правила,
+        манифест анонса, раздел логов, строка про lifetime и тексты описаний
+        инструментов. Данные оператора — описания узлов в карте
+        (`_namespace_map`) и строки анонса навыков — приходят из БД и бывают
+        русскими: их не трогаем (см. test_map_in_instructions_within_budget).
+        """
+        from app.transport.mcp import (
+            SERVER_INSTRUCTIONS,
+            TOOL_DESCRIPTIONS,
+            _LOGS_SECTION,
+            _NS_RULES,
+            _NOTE_LIFETIME_SECTION,
+            _SKILLS_ANNOUNCE_MORE,
+            _SKILLS_ANNOUNCE_RULES,
+        )
+
+        static = (
+            SERVER_INSTRUCTIONS,
+            _NS_RULES,
+            _LOGS_SECTION,
+            _NOTE_LIFETIME_SECTION,
+            _SKILLS_ANNOUNCE_RULES,
+            _SKILLS_ANNOUNCE_MORE,
+            *TOOL_DESCRIPTIONS.values(),
+        )
+        for text in static:
+            assert not any("\u0400" <= char <= "\u04FF" for char in text), text[:80]
+
     def test_instructions_carry_english_default(self, test_env: dict[str, str]) -> None:
         """Карта узлов несёт EN-описание `default` и не несёт прежний RU-дефолт.
 

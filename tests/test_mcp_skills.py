@@ -44,38 +44,35 @@ CANON_TOOL_DESCRIPTIONS = {
         "skills are stored procedures (how-to), kept separately from notes. "
         "Empty result = there is no such skill — do not browse skills without "
         "reason. Returns short hits (id, name, description); the full "
-        "procedure — only via skills_get."
+        "procedure — only via `skills_get`."
     ),
     "skills_list": (
-        "List all available skills (id, name, description) — compact, without "
+        "List available skills (id, name, description) — compact, without "
         "bodies. Use it to see which routines this memory already has; many "
         "conversations need no skills at all."
     ),
     "skills_get": (
-        "Read a full skill by id: name + description + example (if any) + "
-        "steps (the order) + text (what exactly each step does), composed over "
-        "the global instruction_template (how to execute steps). Follow it as "
-        "a procedure when the task matches its description; if a step cannot "
-        "be executed, stop and report what is missing instead of skipping it."
+        "Read a full skill by id: description, example (if any), steps (the "
+        "order) and text (what exactly each step does), composed over the "
+        "global instruction_template. Follow it as a procedure when the task "
+        "matches its description; if a step cannot be executed, stop and "
+        "report what is missing instead of skipping it."
     ),
     "skills_save": (
         "Create a new skill or update an existing one by id. A skill is a "
-        "stored procedure: name ≤65 characters (≤5 words recommended), "
-        "description ≤250 (what it does), steps ≤500 (the order: what after "
-        "what), text ≤4000 (what exactly each step does); optional example "
-        "≤1000 and optional class fields (trigger, mode, preconditions, "
-        "fallbacks, invariant, exceptions, guardrails, references, "
-        "output_contract, behavior_contract) — only when this skill class "
-        "needs them. Run skills_search first: if a similar skill exists, "
-        "update it instead of creating a duplicate (a too-similar creation is "
-        "refused with a hint). Read the skill via skills_get before editing; "
-        "every update keeps the previous version as a copy automatically."
+        "stored procedure: name (short, ≤5 words recommended), description "
+        "(what it does), steps (the order: what after what), text (what "
+        "exactly each step does), plus optional example and class fields (see "
+        "the `extra` field) — only when this skill class needs them. Run "
+        "`skills_search` first: a similar skill is edited, not duplicated (a "
+        "too-similar creation is refused). Read the skill via `skills_get` "
+        "before editing; every update keeps the previous version as a copy."
     ),
     "skills_delete": (
         "Delete a skill by id (soft delete: it disappears from search, list "
-        "and the skills announce; restoring is the operator's job). Delete "
-        "only a skill that is factually wrong, fully duplicates another one "
-        "or was created by mistake."
+        "and the announce; restoring is the operator's job). Delete only a "
+        "skill that is factually wrong, fully duplicates another one or was "
+        "created by mistake."
     ),
 }
 
@@ -308,24 +305,29 @@ class TestToolRegistry:
         """Страховка к анонсу: перед рутиной — search/list, тело — только get."""
         search = CANON_TOOL_DESCRIPTIONS["skills_search"]
         assert "BEFORE doing a routine or repeatable task" in search
-        assert "the full procedure — only via skills_get" in search
+        assert "the full procedure — only via `skills_get`" in search
         assert "do not browse skills without reason" in search
         # save требует поиска перед созданием и чтения перед правкой.
         save = CANON_TOOL_DESCRIPTIONS["skills_save"]
-        assert "Run skills_search first" in save
-        assert "Read the skill via skills_get before editing" in save
+        assert "Run `skills_search` first" in save
+        assert "Read the skill via `skills_get` before editing" in save
         assert "skills_search" in TOOL_DESCRIPTIONS["skills_save"]
 
     def test_instructions_not_changed_by_this_pool(self, test_env: dict[str, str]) -> None:
-        """Анонс скиллов — отдельный пул 7-04: база и карта не тронуты."""
+        """Анонс скиллов — хвост: база переписана ядром F-11 (f11-02), карта та же.
+
+        lsb-0007-04 фиксировал, что тот пул базу не трогал; LSBN-F-11 (f11-02)
+        базу ПЕРЕПИСАЛ в короткое ядро — теперь она несёт указатели на области
+        (в т.ч. на навыки), а манифест и карта узлов остаются на месте.
+        """
         settings = get_settings()
         init_db(settings)
         services = _services(settings, HashEmbedder(DIM))
         instructions = build_instructions(services)
         assert instructions.startswith(SERVER_INSTRUCTIONS)
         assert "Node map (path: description)" in instructions
-        # В этом пуле тексты описаний инструментов и манифест не менялись.
-        assert "skill" not in SERVER_INSTRUCTIONS.lower()
+        assert "`skills_get`" in SERVER_INSTRUCTIONS
+        assert "`history_list`" in SERVER_INSTRUCTIONS
         # Блок анонса — хвост пула 7-04 (его регресс — test_skills_announce.py).
         assert "Available skills (id — name: description):" in instructions
 

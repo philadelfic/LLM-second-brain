@@ -56,22 +56,22 @@ CANON_TOOL_DESCRIPTIONS = {
         "senses of the term together with their contexts: one term means "
         "different things in different contexts — never pick a single sense "
         "silently, choose by the context of the conversation, and if it is "
-        "unclear, ask the user instead of guessing. If there is no exact term, "
-        "the closest senses by meaning are returned (not an exact match). There "
-        "is no listing — search is the only way to a definition."
+        "unclear, ask the user instead of guessing. Without an exact term "
+        "the closest senses by meaning are returned. There is no listing — "
+        "search is the only way to a definition."
     ),
     "terms_save": (
-        "Save a term with a MANDATORY context: term ≤100 characters, context "
-        "≤40 (always filled in — even when the term has a single sense), "
-        "definition ≤350. The key is (term + context): the same key updates the "
-        "record; the same term with a new context creates a NEW sense and never "
-        "overwrites the old one. Reuse one of the contexts already used in this "
-        "memory (the response lists them) instead of inventing a near-duplicate "
-        "wording — a too-close context is refused with a hint that points to the "
-        "existing context. The response also lists the senses this term already "
-        "has."
+        "Save a term with a MANDATORY context (always filled in — even when "
+        "the term has a single sense). The key is (term + context): the same "
+        "key updates the record; the same term with a new context creates a "
+        "NEW sense and never overwrites the old one. Reuse one of the "
+        "contexts already used in this memory (the response lists them) "
+        "instead of inventing a near-duplicate wording — a too-close context "
+        "is refused with a hint pointing to the existing context."
     ),
-    "terms_get": "Read one term record by id: term, context, definition.",
+    "terms_get": (
+        "Read one term record by id: term, context, definition."
+    ),
 }
 
 # Field-описания параметров (EN): канон §3.7 задаёт тексты инструментов и
