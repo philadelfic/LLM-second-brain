@@ -102,6 +102,8 @@ class TestHybrid:
             "entity_id",
             "created_at",
             "score",
+            # f10-04 (§11): состояние объекта ссылки (ссылки нет — внешний).
+            "entity_state",
         }
 
     def test_fts_only_warning(

@@ -404,7 +404,7 @@ class LogsService:
             ).fetchone()
         if row is None:
             return {"id": id, "hint": HINT_NOT_FOUND}
-        return {
+        record: dict[str, Any] = {
             "id": int(row["id"]),
             "action": row["action"],
             "reason": row["reason"],
@@ -419,6 +419,41 @@ class LogsService:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+        if row["entity"] is not None:
+            # Состояние объекта ссылки (f10-04, §11): поле появляется ТОЛЬКО
+            # когда `entity` задан — у записи без ссылки состояния нет.
+            record.update(self._entity_state_field(row["entity"], row["entity_id"]))
+        return record
+
+    # --- состояние объекта ссылки (f10-04, arch §11/§13.4) -------------------
+
+    def _entity_state(
+        self, entity: str | None, entity_id: int | None
+    ) -> str | None:
+        """Состояние объекта ссылки — считает слой истории (арх §11, §13.4).
+
+        `"active"`/`"deleted"`/`"unavailable"` — версионные сущности памяти;
+        `"external"` — неверсионные и неизвестные (в т.ч. ссылки нет вовсе).
+        `None` — состояние не достраивается: слой истории выключен
+        (`HISTORY_ENABLED=false`) либо резолв отказал; отказ резолва НЕ роняет
+        выдачу (§11). Сырой SQL по чужим таблицам сервис области не делает —
+        только API слоя истории (§4, изоляция области).
+        """
+        try:
+            resolved = history.resolve_entity(entity, entity_id or 0, self._settings)
+        except Exception:  # noqa: BLE001 — отказ резолва не роняет выдачу (§11)
+            return None
+        if resolved is not None:
+            return resolved["state"]
+        # Неверсионная/неизвестная сущность либо выключенный слой истории.
+        return "external" if self._settings.history_enabled else None
+
+    def _entity_state_field(
+        self, entity: str | None, entity_id: int | None
+    ) -> dict[str, str]:
+        """Поле `entity_state` для элемента выдачи; `{}` — если не достраивается."""
+        state = self._entity_state(entity, entity_id)
+        return {} if state is None else {"entity_state": state}
 
     # --- поиск и срезы (arch §6.1/§8, f10-03) -------------------------------
 
@@ -580,6 +615,7 @@ class LogsService:
                 "entity": row["entity"],
                 "entity_id": row["entity_id"],
                 "created_at": row["created_at"],
+                **self._entity_state_field(row["entity"], row["entity_id"]),
             }
             for row in rows
         ]
@@ -726,6 +762,7 @@ class LogsService:
                 "entity_id": row["entity_id"],
                 "created_at": row["created_at"],
                 "score": score,
+                **self._entity_state_field(row["entity"], row["entity_id"]),
             }
             for score, row in candidates
         ]

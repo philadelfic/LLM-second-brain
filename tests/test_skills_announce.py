@@ -26,6 +26,7 @@ from app.storage.db import CREATOR_SKILL_SEED_KEY, init_db, session
 from app.transport.mcp import (
     SERVER_INSTRUCTIONS,
     InstructionsRefresher,
+    _logs_section,
     _skills_announce,
     build_instructions,
     build_mcp,
@@ -145,14 +146,17 @@ class TestAnnounceBlock:
 
     def test_block_is_tail_and_base_unchanged(self, setup) -> None:
         settings, services = setup
+        tail = _logs_section(services, settings)  # f10-04 §10: хвост области логов
         base = build_instructions(_services(settings, HashEmbedder(DIM), skills=False))
         full = build_instructions(services)
-        # Регресс: манифест и карта — те же, блок лишь дописан хвостом.
+        # Регресс: манифест и карта — те же, блок лишь дописан хвостом; после
+        # анонса идёт только статический раздел области логов (f10-04, §10).
         assert base.startswith(SERVER_INSTRUCTIONS)
         assert "Node map (path: description)" in base
         assert ANNOUNCE_HEAD not in base
-        assert full == base + _skills_announce(services)
-        assert full.startswith(base)
+        core = base[: -len(tail)] if tail else base
+        assert full == core + _skills_announce(services) + tail
+        assert full.startswith(core)
 
     def test_empty_registry_has_no_block(self, setup) -> None:
         settings, services = setup
@@ -188,8 +192,9 @@ class TestAnnounceBlock:
                     (f"Skill {index:02d}", "d" * 140),
                 )
         block = _skills_announce(services)
+        tail = _logs_section(services, settings)
         assert len(block) <= settings.skill_announce_max_chars == 2000
-        assert build_instructions(services).endswith(block)
+        assert build_instructions(services).endswith(block + tail)
         rows = [line for line in block.splitlines() if line.startswith("  - ")]
         more = re.search(r"\(\+(\d+) more — skills_list\)$", block)
         assert more is not None and block.rstrip().endswith("more — skills_list)")

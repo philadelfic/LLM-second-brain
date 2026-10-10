@@ -22,6 +22,7 @@ from fakes import HashEmbedder, clear_seeded_skills
 from app.config import get_settings
 from app.services import Services
 from app.services.history import HINT_HISTORY_OFF
+from app.services.logs import LogsService
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
 from app.services.skills import SkillsService
@@ -292,3 +293,42 @@ async def test_history_tool_entity_gated(monkeypatch: pytest.MonkeyPatch) -> Non
     description = props["entity"]["description"]
     assert "note" in description and "skill" in description
     assert "term" not in description
+
+
+@pytest.mark.asyncio
+async def test_history_entity_assistant_log_gated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LSBN-F-10 (f10-04, §10/§13.10): `assistant_log` — под флагом области логов.
+
+    Включённая область отдаёт историю записи лога общей парой
+    (`history_list`/`history_get`); выключенная — сущность для агента
+    неотличима от опечатки: мягкий `{…, hint}` без раскрытия области.
+    """
+    monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
+    get_settings.cache_clear()
+    settings = get_settings()
+    init_db(settings)
+    clear_seeded_skills(settings)
+    saved = LogsService(settings, embedding=HashEmbedder(DIM)).save(
+        "Перенёс слот эмбеддингов", "замер показал вдвое быстрее"
+    )
+    log_id = int(saved["id"])
+
+    mcp = build_mcp(settings, _services(settings, HashEmbedder(DIM)))
+    listing = await _call(
+        mcp, "history_list", {"entity": "assistant_log", "id": log_id}
+    )
+    assert listing["total"] == 1 and "hint" not in listing, listing
+    assert [item["version"] for item in listing["versions"]] == [1]
+
+    off = _mcp_with_areas(monkeypatch, AREA_LOGS_ENABLED="false")
+    gated = await _call(
+        off, "history_list", {"entity": "assistant_log", "id": log_id}
+    )
+    assert gated["versions"] == [] and "hint" in gated, gated
+    assert "assistant_log" not in gated["hint"]
+    single = await _call(
+        off, "history_get", {"entity": "assistant_log", "id": log_id, "version": 1}
+    )
+    assert "fields" not in single and "hint" in single, single

@@ -242,6 +242,9 @@ class TestLogsListing:
             "entity",
             "entity_id",
             "created_at",
+            # f10-04 (§11): состояние объекта ссылки (навыка id=5 нет —
+            # `unavailable`).
+            "entity_state",
         }
 
         limited = _list(client, token, limit=2)

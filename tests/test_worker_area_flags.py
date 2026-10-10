@@ -12,6 +12,7 @@ import pytest
 from fakes import HashEmbedder, clear_seeded_skills
 
 from app.config import get_settings
+from app.services.logs import LogsService
 from app.services.worker import BackgroundWorker
 from app.storage.db import init_db, session, transaction
 
@@ -77,6 +78,20 @@ def test_areas_queue_stat_enabled_only(monkeypatch: pytest.MonkeyPatch) -> None:
     worker = BackgroundWorker(settings, HashEmbedder(DIM))
     stat = worker._areas_queue_stat()
     assert stat["pending"] == 2  # skills + user; terms исключён (FR-2.5)
+
+
+def test_areas_queue_stat_skips_disabled_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """f10-04 (§10): снимок очереди `areas` pending логов у off-области не считает."""
+    settings = _settings(monkeypatch, AREA_LOGS_ENABLED="false")
+    saved = LogsService(settings, embedding=HashEmbedder(DIM)).save("Замер", "повод")
+    assert saved["created"] is True
+    worker = BackgroundWorker(settings, HashEmbedder(DIM))
+    assert worker._areas_queue_stat()["pending"] == 0
+
+    monkeypatch.setenv("AREA_LOGS_ENABLED", "true")
+    get_settings.cache_clear()
+    on = get_settings()
+    assert BackgroundWorker(on, HashEmbedder(DIM))._areas_queue_stat()["pending"] == 1
 
 
 def test_areas_health_covers_all_areas(monkeypatch: pytest.MonkeyPatch) -> None:

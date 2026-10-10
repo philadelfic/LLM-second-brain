@@ -152,7 +152,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult, TextContent
 from pydantic import Field
 
-from app.config import Settings
+from app.config import Settings, get_settings
 from app.observability import log_tool_call, preview
 from app.services import Services
 from app.services import history
@@ -246,19 +246,56 @@ def _namespace_map(services: Services) -> str:
     )
 
 
-def build_instructions(services: Services) -> str:
+def build_instructions(
+    services: Services, settings: Settings | None = None
+) -> str:
     """Полный текст инструкций: база + правило неймспейсов + карта + анонс.
 
     Блок анонса навыков — ХВОСТ (lsb-0007 §3.5): манифест, правила и карта
     не меняются, блок лишь дописывается и не добавляется вовсе, если
     активных навыков нет (или БД ещё недоступна).
+
+    LSBN-F-10 (f10-04, arch §10): хвостом ПОСЛЕ анонса навыков добавляется
+    короткий раздел области логов — и только при `AREA_LOGS_ENABLED`; в карту
+    узлов логи не входят (карта — про неймспейсы заметок, §13.13).
     """
+    settings = get_settings() if settings is None else settings
     return (
         SERVER_INSTRUCTIONS
         + _NS_RULES
         + _namespace_map(services)
         + _skills_announce(services)
+        + _logs_section(services, settings)
     )
+
+
+# Раздел области логов в инструкциях (f10-04, arch §10) — статический EN-текст
+# арх-дока, дословно (вёрстка доки разбита на строки — это склейка пробелами).
+# Обезличенный: ни имён, ни «оператора»; реестра записей в разделе нет (§13.13,
+# бюджет F-11 — раздел держим коротким). Добавляется только при включённой
+# области; выключенная — раздела нет вовсе (§10).
+_LOGS_SECTION = (
+    "\n\nAssistant logs are a separate area for «what I did and why» (a "
+    "decision, a measurement, a human's instruction, a defect, a release "
+    "requirement) — NOT notes and NOT the background-job journal. Rule: after "
+    "a change worth remembering, record it once via `logs_save(action, "
+    "reason, entity?, entity_id?, entity_ref?)`; before repeating or "
+    "revisiting a change, look the reason up — `logs_search` by meaning or "
+    "`logs_list(entity=…, entity_id=…)`. Keep entries short; the full entry "
+    "reads via `logs_get`."
+)
+
+
+def _logs_section(services: Services, settings: Settings) -> str:
+    """Хвост инструкций — короткий раздел области логов (arch §10, f10-04).
+
+    Статический текст, без имён и без реестра записей; карта узлов (`_namespace_map`)
+    логов не содержит — карта про неймспейсы заметок (§13.13). При выключенной
+    области (`AREA_LOGS_ENABLED=false`) — пустая строка: раздела нет.
+    """
+    if not settings.area_logs_enabled:
+        return ""
+    return _LOGS_SECTION
 
 
 # Блок анонса навыков (arch lsb-0007 §3.5/§3.8): правило поведения —
@@ -1280,6 +1317,8 @@ _LOG_GET_ITEM = (
     "session",
     "created_at",
     "updated_at",
+    # f10-04 (§11): состояние объекта ссылки — только когда `entity` задан.
+    "entity_state",
 )
 
 
@@ -1322,7 +1361,9 @@ def _compact_log_delete(result: dict[str, Any]) -> dict[str, Any]:
 # `logs_search_excerpt_chars`, чтобы тело лога не вываливалось в контекст
 # (FR-2.3/FR-5.3; REST оператора, наоборот, отдаёт текст целиком).
 _LOG_HIT_REQUIRED = ("id", "action", "created_at")
-_LOG_HIT_OPTIONAL = ("entity", "entity_id", "score")
+# `entity_state` (f10-04, §11) — состояние объекта ссылки; у элемента поиска/
+# листинга оно есть, пока слой истории доступен.
+_LOG_HIT_OPTIONAL = ("entity", "entity_id", "entity_state", "score")
 
 
 def _compact_log_hit(hit: dict[str, Any], excerpt_chars: int) -> dict[str, Any]:
@@ -1381,12 +1422,14 @@ def _compact_log_list(
 # из флагов областей — сущность выключенной области обрабатывается как
 # НЕИЗВЕСТНАЯ (мягкий hint без раскрытия, что область существует). `note` —
 # ядровая память, есть всегда; `skill`/`term`/`user_fact` — по флагу своей
-# области. Шаблон инструкции навыка (`skill_template`) агенту не отдаётся и при
+# области; `assistant_log` (f10-04, LSBN-F-10) — по флагу области логов.
+# Шаблон инструкции навыка (`skill_template`) агенту не отдаётся и при
 # включённой области.
 _HISTORY_ENTITIES_BY_AREA = (
     ("area_skills_enabled", history.ENTITY_SKILL),
     ("area_terms_enabled", history.ENTITY_TERM),
     ("area_user_facts_enabled", history.ENTITY_USER_FACT),
+    ("area_logs_enabled", history.ENTITY_ASSISTANT_LOG),
 )
 
 

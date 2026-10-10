@@ -5,8 +5,8 @@ Arch assistant-logs §7.1: шесть ручек `logs_save`/`logs_get`/`logs_up
 `AREA_LOGS_ENABLED=true` (выключенная область не даёт агенту ни одной ручки),
 выдачи компактны (белые списки, тело записи целиком отдаёт только `logs_get`,
 `action` в поиске/листинге срезан до `logs_search_excerpt_chars`), `hint`
-приходит только при мягком отказе. Раздела инструкции нет (f10-04): инъекции
-при initialize не появляется.
+приходит только при мягком отказе. Короткий EN-раздел области появляется в
+инструкциях вместе с флагом (f10-04, §10), а логи в карту узлов не входят (§13.13).
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from app.services.worker import BackgroundWorker
 from app.transport.mcp import (
     TOOL_DESCRIPTIONS,
     TOOL_NAMES,
+    _namespace_map,
     build_instructions,
     build_mcp,
 )
@@ -133,11 +134,35 @@ class TestToolRegistry:
         assert {"memory_search", "memory_get", "history_list"} <= names
         assert "skills_save" in names
 
-    def test_no_logs_section_in_instructions(self, settings: Settings) -> None:
-        """Раздела логов в инструкции НЕТ (f10-04): инъекции при initialize нет."""
+    def test_logs_section_present_when_enabled(self, settings: Settings) -> None:
+        """`build_instructions` несёт короткий EN-раздел области (f10-04, §10)."""
         text = build_instructions(_services(settings, HashEmbedder(DIM)))
-        assert "logs_save" not in text
+        assert "Assistant logs are a separate area" in text
+        assert "logs_save" in text and "logs_search" in text and "logs_get" in text
+        # Раздел — обезличенный и без реестра записей: ни имён, ни «оператора»,
+        # ни перечня конкретных логов.
+        assert "operator" not in text.lower()
         assert "assistant-logs" not in text
+
+    def test_logs_section_absent_when_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`AREA_LOGS_ENABLED=false` — раздела области в инструкциях нет."""
+        monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
+        monkeypatch.setenv("AREA_LOGS_ENABLED", "false")
+        get_settings.cache_clear()
+        off = get_settings()
+        init_db(off)
+        text = build_instructions(_services(off, HashEmbedder(DIM)))
+        assert "Assistant logs" not in text
+        assert "logs_save" not in text
+
+    def test_logs_not_in_namespace_map(self, settings: Settings) -> None:
+        """Карта узлов — про неймспейсы заметок: логи в неё не входят (§13.13)."""
+        NamespaceService(settings).create("work", "Рабочие заметки. Подпроекты — в листьях.")
+        text = _namespace_map(_services(settings, HashEmbedder(DIM)))
+        assert "- work: Рабочие заметки. Подпроекты — в листьях." in text
+        assert "logs" not in text
 
 
 class TestCompactAnswers:
@@ -177,6 +202,8 @@ class TestCompactAnswers:
             "session",
             "created_at",
             "updated_at",
+            # f10-04 (§11): состояние объекта ссылки (заметки id=41 нет).
+            "entity_state",
         }
         assert record["action"] == ACTION and record["reason"] == REASON
         assert record["entity_id"] == 41 and record["entity_version"] == 3
@@ -228,6 +255,7 @@ class TestCompactAnswers:
             "created_at",
             "entity",
             "entity_id",
+            "entity_state",
             "score",
         }
         assert hit["id"] == saved["id"]
@@ -262,7 +290,14 @@ class TestCompactAnswers:
         assert [item["id"] for item in sliced["items"]] == [first["id"]]
         assert sliced["total"] == 1
         item = sliced["items"][0]
-        assert set(item) == {"id", "action", "created_at", "entity", "entity_id"}
+        assert set(item) == {
+            "id",
+            "action",
+            "created_at",
+            "entity",
+            "entity_id",
+            "entity_state",
+        }
         assert item["action"] == long_action[: settings.logs_search_excerpt_chars]
         # Потолок MCP — свой, меньший, чем у оператора (list_max_limit_rest).
         over = await _call(

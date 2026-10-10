@@ -699,6 +699,16 @@ def entity_fields(
             if row is None:
                 return None
             fields = user_fact_projection(row)
+        elif entity == ENTITY_ASSISTANT_LOG:
+            row = conn.execute(
+                "SELECT action, reason, entity, entity_id, entity_version, "
+                "entity_ref, outcome, verified, source, session, deleted_at "
+                "FROM assistant_logs WHERE id = ?",
+                (entity_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            fields = assistant_log_projection(row)
         else:  # ENTITY_SKILL_TEMPLATE — глобальный шаблон (id 0)
             row = conn.execute(
                 "SELECT value FROM skills_meta WHERE key = ?",
@@ -709,6 +719,52 @@ def entity_fields(
             return {"instruction_template": row["value"]}, "active"
         state = "deleted" if row["deleted_at"] is not None else "active"
     return fields, state
+
+
+# Флаги областей версионных сущностей (№40, no40-02): сущность выключенной
+# области неотличима от несуществующей. `note` и глобальный шаблон навыков
+# (`skill_template`) — ядро, флага не имеют; `assistant_log` — область логов.
+_ENTITY_AREA_FLAGS: dict[str, str] = {
+    ENTITY_SKILL: "area_skills_enabled",
+    ENTITY_TERM: "area_terms_enabled",
+    ENTITY_USER_FACT: "area_user_facts_enabled",
+    ENTITY_ASSISTANT_LOG: "area_logs_enabled",
+}
+
+
+def resolve_entity(
+    entity: str, entity_id: int, settings: Settings
+) -> dict[str, Any] | None:
+    """Состояние объекта ссылки лога и его головная версия (arch §11, §13.4).
+
+    Возврат `{"state": str, "current_version": int | None} | None`:
+    * `"active"` — живая строка есть, `deleted_at IS NULL`, область включена;
+    * `"deleted"` — строка есть, но мягко удалена (запись лога жива, FR-4.3);
+    * `"unavailable"` — строки нет **либо** область сущности выключена флагом
+      (что область существует, не раскрываем);
+    * `None` — неверсионная (`file`/`commit`/`tracker_task`/`config`/`contour`)
+      или неизвестная сущность (вызывающий ставит `"external"`), а также при
+      `HISTORY_ENABLED=false`: истории нет — состояние не достраивается.
+
+    `current_version` — головная версия из `record_versions` (MAX(version))
+    для активной/удалённой строки, иначе `None`. Живые строки версионных
+    сущностей читает тот же субстрат, что `entity_fields`; сырой SQL по чужим
+    таблицам наружу не отдаётся (изоляция области логов, §4/§13.4).
+    """
+    if not settings.history_enabled:
+        return None
+    if entity not in CONTENT_FIELDS:
+        return None
+    flag = _ENTITY_AREA_FLAGS.get(entity)
+    if flag is not None and not getattr(settings, flag):
+        return {"state": "unavailable", "current_version": None}
+    live = entity_fields(entity, int(entity_id), settings)
+    if live is None:
+        return {"state": "unavailable", "current_version": None}
+    _fields, state = live
+    with session(settings) as conn:
+        current = _head(conn, entity, int(entity_id))
+    return {"state": state, "current_version": current}
 
 
 # --- политика хранения: prune с re-base (§13.8) -----------------------------

@@ -32,6 +32,7 @@ from app.transport.mcp import (
     TOOL_DESCRIPTIONS,
     TOOL_NAMES,
     _NS_RULES,
+    _logs_section,
     _namespace_map,
     _skills_announce,
     build_instructions,
@@ -277,8 +278,9 @@ class TestToolRegistry:
     def test_instructions_have_no_user_block_and_unchanged(self, settings) -> None:
         """Инъекции нет (arch §2): блока «user» нет и текст не изменился.
 
-        Хвост анонса навыков — существующий (lsb-0007-04); всё остальное —
-        база + правило неймспейсов + карта, как до этого пула.
+        Хвост анонса навыков — существующий (lsb-0007-04), за ним — статический
+        раздел области логов (f10-04 §10); всё остальное — база + правило
+        неймспейсов + карта, как до этого пула.
         """
         services = _services(settings, HashEmbedder(DIM))
         expected = (
@@ -286,6 +288,7 @@ class TestToolRegistry:
             + _NS_RULES
             + _namespace_map(services)
             + _skills_announce(services)
+            + _logs_section(services, settings)
         )
         text = build_instructions(services)
         assert text == expected

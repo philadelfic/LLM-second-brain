@@ -54,6 +54,8 @@ class TestRegistry:
         assert services.skills is not None
         assert services.terms is not None
         assert services.user_facts is not None
+        # LSBN-F-10 (f10-04, §13.11): сервис области логов — тем же правилом.
+        assert services.logs is not None
 
     def test_every_area_has_settings_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """У каждой области реестра есть имя поля-флага (`settings_flag`)."""
@@ -96,6 +98,18 @@ class TestDisabledSurface:
             )
             assert response.status_code == 201, response.text
             assert response.json()["created"] is True
+
+
+    def test_disabled_logs_area_keeps_service(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AREA_LOGS_ENABLED=false: агентских ручек нет, сервис собран (§13.11)."""
+        settings = _settings(monkeypatch, AREA_LOGS_ENABLED="false")
+        services = build_services(settings)
+        assert services.logs is not None
+        names = _tool_names(build_mcp(settings, services))
+        assert not {name for name in names if name.startswith("logs_")}
+        assert {"history_list", "history_get"} <= names
 
 
 class TestInvalidFlag:
