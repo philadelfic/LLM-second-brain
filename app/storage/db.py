@@ -1819,10 +1819,17 @@ def delete_note_physical(conn: sqlite3.Connection, note_id: int) -> None:
 
     Полное физическое удаление (НЕ soft delete): просроченная заметка должна
     исчезнуть из всех индексов — notes + notes_chunks + notes_chunks_vec +
-    notes_vec + notes_fts + note_expirations. Композиция существующих
+    notes_vec + notes_fts + note_expirations + links. Композиция существующих
     примитивов слоя (chunks.drop_note_chunks, vectors.drop, expirations.delete)
     + явный DELETE из notes_fts (внешний контент: DELETE-триггера нет, индекс
     не чистится каскадом) и notes.
+
+    Связи (3.2.0, no46-03): `links` заметки сносятся здесь же, в ТОЙ ЖЕ
+    транзакции вызывающего (`DELETE FROM links WHERE note_a = ? OR note_b = ?` —
+    обе стороны пары, идемпотентно). Фоновый свип `purge_orphans` (idle-ветка
+    джобы `links`) остаётся страховкой, а не единственной чисталкой. Soft
+    delete связи НЕ трогает: заметка восстанавливаема — её строки `links`
+    живут (arch §3.2).
 
     Идемпотентно и безопасно: отсутствующей заметки нет — каждый DELETE
     просто не матчит ничего; повторный вызов не падает. Вызывается внутри
@@ -1835,3 +1842,8 @@ def delete_note_physical(conn: sqlite3.Connection, note_id: int) -> None:
     conn.execute("DELETE FROM notes_fts WHERE rowid = ?", (note_id,))
     conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
     expirations.delete(conn, note_id)  # note_expirations
+    # 3.2.0 (no46-03): связи заметки уходят вместе с ней — обе стороны пары,
+    # в той же транзакции (идемпотентно: повторный вызов просто не матчит).
+    conn.execute(
+        "DELETE FROM links WHERE note_a = ? OR note_b = ?", (note_id, note_id)
+    )

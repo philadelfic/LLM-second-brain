@@ -2025,6 +2025,8 @@ class BackgroundWorker:
         №10: merge ходит в summary-слот). Отказ судьи (JudgeError) — работа
         остаётся pending, повтор по back-off judge-петли (NFR-3: обе заметки
         целы). Протухшая заметка (удалена/вектор не готов) — работа снимается.
+        Заметка с таймером (TTL, no46-03) — тоже снимается, но ДО судьи и без
+        вызова моделей (событие `dedup_skipped`, reason="note has a lifetime").
         """
         # Протокол «правка пары»: замороженные работы перепроверяются без
         # вызова модели — ушедшая причина размораживает их (арх §6.8).
@@ -2041,7 +2043,8 @@ class BackgroundWorker:
             note_id = int(job["note_id"])
             with session(self._settings) as conn:
                 row = conn.execute(
-                    "SELECT id, text, namespace, vector_status, deleted_at "
+                    "SELECT id, text, namespace, vector_status, deleted_at, "
+                    "expires_at "
                     "FROM notes WHERE id = ?",
                     (note_id,),
                 ).fetchone()
@@ -2052,6 +2055,24 @@ class BackgroundWorker:
                 or row["vector_status"] != "ok"
                 or vector is None
             ):
+                self._mark_job_done(job["id"])
+                done += 1
+                continue
+            if row["expires_at"] is not None:
+                # no46-03 (3.2.0): заметка с таймером (TTL, `expires_at IS NOT
+                # NULL`) НИКОГДА не сливается — ранний выход ДО судьи и до
+                # поиска кандидатов: модели не дёргаем, работа снимается;
+                # наблюдаемое событие dedup_skipped с причиной. Правило О.
+                # 2026-10-10; связи у такой заметки разрешены (links не тут).
+                logging.getLogger("app").info(
+                    "dedup: skipped — note has a lifetime",
+                    extra={
+                        "event": "dedup_skipped",
+                        "job": JUDGE_JOB,
+                        "note_id": note_id,
+                        "reason": "note has a lifetime",
+                    },
+                )
                 self._mark_job_done(job["id"])
                 done += 1
                 continue
@@ -2162,6 +2183,12 @@ class BackgroundWorker:
            (trash). Пул 6: единая транзакция исключает полусостояние
            «обновлена ранняя, поздняя жива» при отказе между операциями.
 
+        no46-03 (3.2.0), второй барьер: если у любой заметки пары есть таймер
+        (`expires_at IS NOT NULL`) — слияния нет, работа снимается, событие
+        `dedup_skipped` (reason="note has a lifetime"). Это защита в глубине:
+        заметка с TTL не сливается и снаружи (нормальный путь сюда не доходит —
+        judge-петля такую заметку не обрабатывает).
+
         Отказ слияния (SummaryError, NFR-3) данные не портит: обе заметки
         остаются, работа остаётся pending — повтор по back-off summary-петли.
         """
@@ -2189,7 +2216,8 @@ class BackgroundWorker:
                 continue
             with session(self._settings) as conn:
                 rows = conn.execute(
-                    "SELECT id, text, deleted_at, updated_at FROM notes "
+                    "SELECT id, text, deleted_at, updated_at, expires_at "
+                    "FROM notes "
                     "WHERE id IN (?, ?)",
                     (older_id, note_id),
                 ).fetchall()
@@ -2202,6 +2230,23 @@ class BackgroundWorker:
                 or older["deleted_at"] is not None
                 or newer["deleted_at"] is not None
             ):
+                self._mark_job_done(job["id"])
+                done += 1
+                continue
+            if older["expires_at"] is not None or newer["expires_at"] is not None:
+                # no46-03 (3.2.0), второй барьер (защита в глубине): если у
+                # ЛЮБОЙ заметки пары есть таймер — слияния нет (судья/суммаризатор
+                # не вызываются), работа снимается, событие того же вида.
+                logging.getLogger("app").info(
+                    "dedup: merge skipped — a note has a lifetime",
+                    extra={
+                        "event": "dedup_skipped",
+                        "job": SUMMARY_JOB,
+                        "older_id": older_id,
+                        "note_id": note_id,
+                        "reason": "note has a lifetime",
+                    },
+                )
                 self._mark_job_done(job["id"])
                 done += 1
                 continue
