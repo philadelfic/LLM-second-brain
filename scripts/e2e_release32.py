@@ -672,6 +672,29 @@ async def log_has(needle: str) -> tuple[bool, str]:
         f"in {len(proc.stdout.splitlines())} log lines"
 
 
+def log_events(*needles: str) -> Callable[[], Awaitable[tuple[bool, str]]]:
+    """Predicate: EVERY marker is written to the contour log.
+
+    The factory form is deliberate: `log_has` is a coroutine function, so a bare
+    `lambda: log_has(...)` hands `wait_until` an ALREADY created coroutine. An
+    `and`-chain then awaits the LAST marker only, leaks the first
+    (`RuntimeWarning: coroutine 'log_has' was never awaited`) and reads as a
+    guaranteed false FAIL (the 401 branch, live run 10.10.2026). `wait_until`
+    awaits the callable it is given — so the awaited calls live here.
+    """
+
+    async def predicate() -> tuple[bool, str]:
+        details: list[str] = []
+        for needle in needles:
+            found, detail = await log_has(needle)
+            details.append(detail)
+            if not found:
+                return False, "; ".join(details)
+        return True, "; ".join(details)
+
+    return predicate
+
+
 def db_ready() -> bool:
     return Path(CFG["db"]).exists()
 
@@ -919,7 +942,7 @@ async def scenario_1_observability_baseline(rest: httpx2.AsyncClient) -> None:
 
     # The queue_waiting event is the log-side proof of deferred work (FR-2.3).
     if CFG["logs_cmd"]:
-        found, detail = await wait_until(lambda: log_has("queue_waiting"),
+        found, detail = await wait_until(log_events("queue_waiting"),
                                          "the queue_waiting event is present in the log",
                                          timeout=min(CFG["wait_sec"], 60.0))
         check("the log carries the queue_waiting event (deferred work is visible)",
@@ -1045,7 +1068,7 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
 
         if CFG["logs_cmd"]:
             found, detail = await wait_until(
-                lambda: log_has("queue_waiting"),
+                log_events("queue_waiting"),
                 f"[{slot}] the queue_waiting event appears in the log (slot still off)",
                 timeout=min(CFG["wait_sec"], 120.0))
             check(f"[{slot}] the queue_waiting event is written to the log", found, detail)
@@ -1161,7 +1184,7 @@ async def scenario_3_auth_branch(rest: httpx2.AsyncClient) -> None:
     try:
         if CFG["logs_cmd"]:
             found, detail = await wait_until(
-                lambda: log_has("slot_paused"),
+                log_events("slot_paused"),
                 "[auth] the slot_paused event appears in the log",
                 timeout=min(CFG["wait_sec"], 120.0))
             check("[auth] the slot_paused event is written with the cause", found, detail)
@@ -1190,7 +1213,7 @@ async def scenario_3_auth_branch(rest: httpx2.AsyncClient) -> None:
 
     if CFG["logs_cmd"]:
         found, detail = await wait_until(
-            lambda: log_has("slot_probe") and log_has("slot_resumed"),
+            log_events("slot_probe", "slot_resumed"),
             "[auth] the probe and resume events appear in the log",
             timeout=CFG["wait_sec"])
         check("[auth] after the fix the probe and the resume are written", found, detail)
@@ -1301,8 +1324,17 @@ async def scenario_5_restart_inside_outage(c: Client, rest: httpx2.AsyncClient) 
     # Рестарт рвёт MCP-сессию раннера: сначала дожидаемся, что контур отвечает,
     # и только потом переоткрываем сессию — иначе весь прогон уходит в повторы
     # попыток и заканчивается FATAL (проверено 10.10.2026).
+    # Предикаты ниже — `async def` и ЖДУТ свои хелперы: лямбда отдала бы
+    # `wait_until` уже созданную корутину (никем не ожидаемую) — ложный FAIL,
+    # см. `log_events`.
+    async def contour_alive() -> tuple[bool, str]:
+        return await _http_alive(rest)
+
+    async def pending_kept() -> tuple[bool, str]:
+        return await _pending_not_below(before)
+
     alive, detail = await wait_until(
-        lambda: _http_alive(rest),
+        contour_alive,
         "the contour answers /health after the restart",
         timeout=min(CFG["wait_sec"], 120.0),
     )
@@ -1312,7 +1344,7 @@ async def scenario_5_restart_inside_outage(c: Client, rest: httpx2.AsyncClient) 
           init is not None, "session re-initialized")
 
     ok, detail = await wait_until(
-        lambda: _pending_not_below(before),
+        pending_kept,
         "the pending count is not below the pre-restart value (nothing lost)",
         timeout=min(CFG["wait_sec"], 120.0))
     check("no pending work is lost across the restart", ok, detail)
@@ -1482,22 +1514,35 @@ def own_summaries_ready(count: int) -> Callable[[], Awaitable[tuple[bool, str]]]
     return predicate
 
 
-async def judge_attention(rest: httpx2.AsyncClient) -> tuple[bool, str]:
-    """Predicate: the judge queue shows a pair waiting for a human (no busy-loop)."""
-    snapshot = await health_snapshot(rest)
-    stat = queue_stat(snapshot, "judge")
-    if stat is None:
-        return False, "the judge queue is not reported by /health"
-    try:
-        answer = await rest.get("/jobs/attention")
-        jobs = (answer.json() if answer.status_code == 200 else {}).get("jobs") or []
-    except Exception as exc:  # noqa: BLE001 — a transient error is not the answer
-        return False, describe(exc)
-    attention = stat.get("attention") or 0
-    return bool(attention and jobs), (
-        f"judge: pending={stat.get('pending')}, waiting={stat.get('waiting')}, "
-        f"attention={attention}, GET /jobs/attention={len(jobs)}"
-    )
+def judge_attention(rest: httpx2.AsyncClient,
+                    ) -> Callable[[], Awaitable[tuple[bool, str]]]:
+    """Predicate factory: the judge queue shows a pair waiting for a human.
+
+    The factory shape is the one of `queue_has_work`/`queue_drained`: the call
+    site passes `judge_attention(rest)` — a CALLABLE that `wait_until` awaits.
+    The earlier `async def judge_attention(...)` was handed over as an already
+    created coroutine (`wait_until(judge_attention(rest), ...)`), which
+    `wait_until` refuses with a TypeError — scenario 8 died outright (no
+    busy-loop).
+    """
+
+    async def predicate() -> tuple[bool, str]:
+        snapshot = await health_snapshot(rest)
+        stat = queue_stat(snapshot, "judge")
+        if stat is None:
+            return False, "the judge queue is not reported by /health"
+        try:
+            answer = await rest.get("/jobs/attention")
+            jobs = (answer.json() if answer.status_code == 200 else {}).get("jobs") or []
+        except Exception as exc:  # noqa: BLE001 — a transient error is not the answer
+            return False, describe(exc)
+        attention = stat.get("attention") or 0
+        return bool(attention and jobs), (
+            f"judge: pending={stat.get('pending')}, waiting={stat.get('waiting')}, "
+            f"attention={attention}, GET /jobs/attention={len(jobs)}"
+        )
+
+    return predicate
 
 
 async def scenario_8_budget_raise_release(c: Client, rest: httpx2.AsyncClient) -> None:
