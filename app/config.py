@@ -300,6 +300,9 @@ class Settings(BaseSettings):
     area_skills_enabled: bool = True
     area_terms_enabled: bool = True
     area_user_facts_enabled: bool = True
+    # Область «Логи ассистента» (LSBN-F-10, arch §9): гейтит MCP-ручки, раздел
+    # инструкции и фон; данные/REST/история остаются доступны (№40, §13.11).
+    area_logs_enabled: bool = True
 
     # --- прочее ---
     log_level: str = "INFO"
@@ -369,6 +372,14 @@ class Settings(BaseSettings):
     user_similar_strong: float = 0.85  # мягкий отказ «почти тот же факт»
     user_similar_weak: float = 0.55  # средняя зона: запись + список похожих
     user_search_excerpt_chars: int = 300  # обрезка body в выдаче поиска
+    # Область «Логи ассистента» (LSBN-F-10, arch §9): лимиты формы записи
+    # (валидация сервиса, CHECK-констрейнтов нет) и обрезка action в выдаче.
+    logs_action_max_chars: int = 500
+    logs_reason_max_chars: int = 500
+    logs_entity_ref_max_chars: int = 200
+    logs_outcome_max_chars: int = 500
+    logs_verified_max_chars: int = 200
+    logs_search_excerpt_chars: int = 300
 
     @field_validator(
         "embedding_base_url",
@@ -759,6 +770,12 @@ class Settings(BaseSettings):
             "user_name_max_words",
             "user_body_max_chars",
             "user_search_excerpt_chars",
+            "logs_action_max_chars",
+            "logs_reason_max_chars",
+            "logs_entity_ref_max_chars",
+            "logs_outcome_max_chars",
+            "logs_verified_max_chars",
+            "logs_search_excerpt_chars",
         ):
             need_low(field, getattr(self, field), 1)
         # Пороги сходства — косинус/триграммы: шкала 0..1 (как у дедупа).

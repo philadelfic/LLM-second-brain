@@ -49,7 +49,7 @@ class TestHealth:
             },
             "areas": {
                 name: {"enabled": True, "pending": 0}
-                for name in ("skills", "terms", "user")
+                for name in ("skills", "terms", "user", "logs")
             },
             "warnings": {"by_kind": {}, "total": 0},
             "decision": {
@@ -117,7 +117,7 @@ class TestHealth:
                 "last_had_thinking",
             }
         # №40 (FR-4.3): /health.areas — по всем областям {enabled, pending}.
-        assert set(body["areas"]) == {"skills", "terms", "user"}
+        assert set(body["areas"]) == {"skills", "terms", "user", "logs"}
         for stat in body["areas"].values():
             assert set(stat) == {"enabled", "pending"}
         # №12 (no12-02): /health.warnings — {by_kind, total} (только SQL).
@@ -132,6 +132,7 @@ class TestHealth:
             "skills": {"enabled": True, "pending": 0},
             "terms": {"enabled": True, "pending": 0},
             "user": {"enabled": True, "pending": 0},
+            "logs": {"enabled": True, "pending": 0},
         }
 
     def test_health_areas_pending_visible_when_disabled(

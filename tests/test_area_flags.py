@@ -42,12 +42,13 @@ def _tool_names(mcp) -> set[str]:
 
 class TestRegistry:
     def test_defaults_all_enabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Дефолт без правок compose: все три области включены и собраны."""
+        """Дефолт без правок compose: все четыре области включены и собраны."""
         settings = _settings(monkeypatch)
         assert [spec.name for spec in enabled_areas(settings)] == [
             "skills",
             "terms",
             "user",
+            "logs",
         ]
         services = build_services(settings)
         assert services.skills is not None
@@ -68,7 +69,11 @@ class TestDisabledSurface:
     ) -> None:
         """AREA_TERMS_ENABLED=false: нет в реестре/на MCP, но REST работает."""
         settings = _settings(monkeypatch, AREA_TERMS_ENABLED="false")
-        assert [spec.name for spec in enabled_areas(settings)] == ["skills", "user"]
+        assert [spec.name for spec in enabled_areas(settings)] == [
+            "skills",
+            "user",
+            "logs",
+        ]
 
         services = build_services(settings)
         # Решение 2026-10-08: сервис собран всегда — данные доступны REST/истории.
@@ -113,7 +118,12 @@ _FLAG_NAMES = (
     "AREA_SKILLS_ENABLED",
     "AREA_TERMS_ENABLED",
     "AREA_USER_FACTS_ENABLED",
+    "AREA_LOGS_ENABLED",
 )
+
+# Области реестра, чья агентская поверхность появляется позже f10-01 (ручки —
+# f10-02/03): на этом этапе область зарегистрирована, но ручек ещё не даёт.
+_SURFACE_PENDING_AREAS = frozenset({"logs"})
 _CORE_TOOLS = frozenset(
     {
         "memory_search",
@@ -160,7 +170,9 @@ def test_surface_consistency(monkeypatch: pytest.MonkeyPatch) -> None:
 
         names = _tool_names(build_mcp(settings, services))
         enabled = {spec.name for spec in enabled_areas(settings)}
-        assert _areas_in_surface(names) == enabled, flags
+        # Логи (f10-01) в реестре, но без MCP-поверхности (ручки — f10-02/03).
+        surfaced = enabled - _SURFACE_PENDING_AREAS
+        assert _areas_in_surface(names) == surfaced, flags
         assert _CORE_TOOLS <= names, flags
         # Лишних ручек нет: всё вне ядра принадлежит ВКЛЮЧЁННОЙ области.
         prefixes = tuple(f"{area}_" for area in enabled)

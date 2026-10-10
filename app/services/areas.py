@@ -1,6 +1,7 @@
 """Обвязка областей (субстрат 3.0.0): нормализация, сходство, гибридный поиск.
 
-Один переиспользуемый помощник на три области (skills / terms / user):
+Один переиспользуемый помощник на все области (skills / terms / user /
+logs):
 каждая область описывается `AreaSpec` — своими таблицами, полями индексации
 и проекцией выдачи; `AreaSearch` выполняет гибрид
 vec0-KNN + FTS5(BM25) → RRF (тот же `settings.rrf_k`, примитив
@@ -35,6 +36,9 @@ from app.services.search import (
 )
 from app.storage import area_vectors
 from app.storage.db import (
+    ASSISTANT_LOGS_FTS_COLUMNS,
+    ASSISTANT_LOGS_FTS_TABLE,
+    ASSISTANT_LOGS_TABLE,
     SKILLS_FTS_COLUMNS,
     SKILLS_FTS_TABLE,
     SKILLS_TABLE,
@@ -182,9 +186,28 @@ USER_FACTS_AREA = AreaSpec(
     select_columns=("name", "body"),
     embed_fields=("name", "body"),
 )
+# Область «Логи ассистента» (LSBN-F-10, arch §5.3/§6.2): текст векторизации —
+# непустые `action` + `reason` + `outcome` через перевод строки; выдача —
+# ссылка на объект изменения и время (полное чтение — f10-02/03).
+LOGS_AREA = AreaSpec(
+    name="logs",
+    settings_flag="area_logs_enabled",
+    table=ASSISTANT_LOGS_TABLE,
+    fts_table=ASSISTANT_LOGS_FTS_TABLE,
+    vec_table=area_vectors.ASSISTANT_LOGS_VEC_TABLE,
+    vec_id_column=area_vectors.ASSISTANT_LOGS_VEC_ID_COLUMN,
+    fts_columns=ASSISTANT_LOGS_FTS_COLUMNS,
+    select_columns=("action", "entity", "entity_id", "entity_version", "created_at"),
+    embed_fields=("action", "reason", "outcome"),
+)
 
 # Реестр областей (петля `areas` воркера и тесты изоляции ходят по нему).
-ALL_AREAS: tuple[AreaSpec, ...] = (SKILLS_AREA, TERMS_AREA, USER_FACTS_AREA)
+ALL_AREAS: tuple[AreaSpec, ...] = (
+    SKILLS_AREA,
+    TERMS_AREA,
+    USER_FACTS_AREA,
+    LOGS_AREA,
+)
 
 
 def enabled_areas(settings: Settings) -> tuple[AreaSpec, ...]:

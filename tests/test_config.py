@@ -187,6 +187,15 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "AREA_SKILLS_ENABLED": ("area_skills_enabled", True),
     "AREA_TERMS_ENABLED": ("area_terms_enabled", True),
     "AREA_USER_FACTS_ENABLED": ("area_user_facts_enabled", True),
+    # Релиз 3.2.0, область логов LSBN-F-10 (постановка f10-01): флаг области и
+    # лимиты формы записи + обрезка action в выдаче (§9).
+    "AREA_LOGS_ENABLED": ("area_logs_enabled", True),
+    "LOGS_ACTION_MAX_CHARS": ("logs_action_max_chars", 500),
+    "LOGS_REASON_MAX_CHARS": ("logs_reason_max_chars", 500),
+    "LOGS_ENTITY_REF_MAX_CHARS": ("logs_entity_ref_max_chars", 200),
+    "LOGS_OUTCOME_MAX_CHARS": ("logs_outcome_max_chars", 500),
+    "LOGS_VERIFIED_MAX_CHARS": ("logs_verified_max_chars", 200),
+    "LOGS_SEARCH_EXCERPT_CHARS": ("logs_search_excerpt_chars", 300),
     # Релиз 3.2.0, исходы слота и пауза №39 (постановка no39-01): потолок
     # паузы слота, порог открытия разрыва и период хинта человеку.
     "SLOT_PAUSE_SEC": ("slot_pause_sec", 900),
@@ -221,7 +230,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 138 полей: 6 обязательных + 132 с умолчаниями
+        """В Settings — ровно 145 полей: 6 обязательных + 139 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
@@ -236,7 +245,9 @@ class TestCompleteness:
         + 10 настроек decision-слота LSBN-F-12 релиза 3.2.0: DECISION_*;
         + 4 настройки подсказки узла №28 релиза 3.2.0: MEMORY_NODE_HINT_*
         + 5 настроек подсказки «похожее» №30 релиза 3.2.0: MEMORY_SIMILAR_*
-        + 1 лимит пометки заметки №24 релиза 3.2.0: COMMENT_MAX_CHARS)."""
+        + 1 лимит пометки заметки №24 релиза 3.2.0: COMMENT_MAX_CHARS
+        + 7 настроек области логов LSBN-F-10 релиза 3.2.0: AREA_LOGS_ENABLED
+        и LOGS_*)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

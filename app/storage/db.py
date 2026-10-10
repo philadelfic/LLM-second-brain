@@ -315,8 +315,21 @@ USER_FACTS_TABLE = "user_facts"
 USER_FACTS_FTS_TABLE = "user_facts_fts"
 USER_FACTS_FTS_COLUMNS = ("name", "body")
 
+# Область «Логи ассистента» (LSBN-F-10, релиз 3.2.0, arch §5.1/§5.2): одна
+# таблица записей + FTS5-индекс тех же смысловых текстовых полей. Структурные
+# фильтры (`entity*`, `source`, `session`, `created_at`) — обычные колонки и в
+# FTS не входят.
+ASSISTANT_LOGS_TABLE = "assistant_logs"
+ASSISTANT_LOGS_FTS_TABLE = "assistant_logs_fts"
+ASSISTANT_LOGS_FTS_COLUMNS = ("action", "reason", "entity_ref", "outcome", "verified")
+
 # Записи областей (без vec-таблиц): общие колонки + поля конкретной области.
-AREA_RECORD_TABLES = (SKILLS_TABLE, TERMS_TABLE, USER_FACTS_TABLE)
+AREA_RECORD_TABLES = (
+    SKILLS_TABLE,
+    TERMS_TABLE,
+    USER_FACTS_TABLE,
+    ASSISTANT_LOGS_TABLE,
+)
 
 # (таблица записей, FTS-таблица, индексируемые колонки) — реестр FTS/триггеров:
 # один DDL и один набор триггеров на каждую область (без копипасты по областям).
@@ -324,6 +337,7 @@ _AREA_FTS_SPECS = (
     (SKILLS_TABLE, SKILLS_FTS_TABLE, SKILLS_FTS_COLUMNS),
     (TERMS_TABLE, TERMS_FTS_TABLE, TERMS_FTS_COLUMNS),
     (USER_FACTS_TABLE, USER_FACTS_FTS_TABLE, USER_FACTS_FTS_COLUMNS),
+    (ASSISTANT_LOGS_TABLE, ASSISTANT_LOGS_FTS_TABLE, ASSISTANT_LOGS_FTS_COLUMNS),
 )
 
 # Поля записей — по архитектурам фич lsb-0007/0008/0009; общее у всех —
@@ -392,6 +406,25 @@ CREATE TABLE IF NOT EXISTS user_facts (
   deleted_at    TEXT    NULL
 )
 """,
+    """
+CREATE TABLE IF NOT EXISTS assistant_logs (
+  id             INTEGER PRIMARY KEY,
+  action         TEXT    NOT NULL DEFAULT '',   -- что сделано (обязательно, <= LOGS_ACTION_MAX_CHARS)
+  reason         TEXT    NOT NULL DEFAULT '',   -- почему (обязательно, <= LOGS_REASON_MAX_CHARS)
+  entity         TEXT    NULL,                  -- тип объекта изменения (закрытый словарь, §5.4)
+  entity_id      INTEGER NULL,                  -- id объекта в своей области (версионные сущности)
+  entity_version INTEGER NULL,                  -- версия объекта на момент записи (№41)
+  entity_ref     TEXT    NULL,                  -- текстовая ссылка/путь (объекты без id; <= LOGS_ENTITY_REF_MAX_CHARS)
+  outcome        TEXT    NULL,                  -- результат (что получилось; <= LOGS_OUTCOME_MAX_CHARS)
+  verified       TEXT    NULL,                  -- что проверено (<= LOGS_VERIFIED_MAX_CHARS)
+  source         TEXT    NOT NULL DEFAULT 'mcp',-- источник записи: mcp|rest|job:<name>|merge|migration
+  session        TEXT    NULL,                  -- идентификатор вызова/агента, не имя человека
+  vector_status  TEXT    NOT NULL DEFAULT 'pending',
+  created_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  deleted_at     TEXT    NULL
+)
+""",
 )
 
 # Глобальный шаблон области навыков (lsb-0007 §3.1/§3.8): одна запись
@@ -445,6 +478,17 @@ CREATOR_SKILL_TEXT = (
 _TERMS_ACTIVE_KEY_INDEX_DDL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_terms_key_active "
     "ON terms(term_norm, context_norm) WHERE deleted_at IS NULL"
+)
+
+# Индексы обратного запроса области логов (arch §5.1, FR-4.1/FR-5.2): оба
+# частичные — только по активным записям (прецедент idx_terms_key_active).
+# Первый — «почему изменился объект»; второй — срез по абсолютной дате.
+# Отдельных индексов по session/source нет: домен узкий, объём мал (§4).
+_ASSISTANT_LOGS_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_assistant_logs_entity_active "
+    "ON assistant_logs(entity, entity_id, created_at DESC) WHERE deleted_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_assistant_logs_created_active "
+    "ON assistant_logs(created_at DESC) WHERE deleted_at IS NULL",
 )
 
 # История версий (№41, релиз 3.2.0, substrate-versioning §5.1): одна общая
@@ -523,6 +567,8 @@ def _create_area_schema(conn: sqlite3.Connection, settings: Settings) -> None:
         for trigger in _area_trigger_ddls(table, fts_table, columns):
             conn.execute(trigger)
     conn.execute(_TERMS_ACTIVE_KEY_INDEX_DDL)
+    for ddl in _ASSISTANT_LOGS_INDEX_DDL:
+        conn.execute(ddl)
     area_vectors.create_vec_tables(conn, settings.embedding_dim)
 
 
@@ -1155,6 +1201,7 @@ def _backfill_history_baseline(conn: sqlite3.Connection) -> None:
     """
     from app.services.history import (
         CONTENT_FIELDS,
+        ENTITY_ASSISTANT_LOG,
         ENTITY_NOTE,
         ENTITY_SKILL,
         ENTITY_SKILL_TEMPLATE,
@@ -1167,6 +1214,7 @@ def _backfill_history_baseline(conn: sqlite3.Connection) -> None:
         ENTITY_SKILL: "skills",
         ENTITY_TERM: "terms",
         ENTITY_USER_FACT: "user_facts",
+        ENTITY_ASSISTANT_LOG: ASSISTANT_LOGS_TABLE,
     }
     for entity, table in entity_tables.items():
         fields = CONTENT_FIELDS[entity]

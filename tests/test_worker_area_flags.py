@@ -24,6 +24,7 @@ def _settings(monkeypatch: pytest.MonkeyPatch, **flags: str):
         "AREA_SKILLS_ENABLED",
         "AREA_TERMS_ENABLED",
         "AREA_USER_FACTS_ENABLED",
+        "AREA_LOGS_ENABLED",
     ):
         monkeypatch.delenv(name, raising=False)
     for name, value in flags.items():
@@ -84,7 +85,9 @@ def test_areas_health_covers_all_areas(monkeypatch: pytest.MonkeyPatch) -> None:
     _seed_pending_areas()
     worker = BackgroundWorker(settings, HashEmbedder(DIM))
     health = worker.areas_health()
-    assert set(health) == {"skills", "terms", "user"}
+    assert set(health) == {"skills", "terms", "user", "logs"}
     assert health["skills"] == {"enabled": True, "pending": 1}
     assert health["user"] == {"enabled": True, "pending": 1}
+    assert health["terms"] == {"enabled": False, "pending": 1}
+    assert health["logs"] == {"enabled": True, "pending": 0}
     assert health["terms"] == {"enabled": False, "pending": 1}

@@ -157,6 +157,13 @@ services:
       AREA_SKILLS_ENABLED: "true"       # skills area on/off; its queue stays visible in /health.areas
       AREA_TERMS_ENABLED: "true"        # terms area on/off; its queue stays visible in /health.areas
       AREA_USER_FACTS_ENABLED: "true"   # user-facts area on/off; its queue stays visible in /health.areas
+      AREA_LOGS_ENABLED: "true"         # assistant-logs area on/off; its queue stays visible in /health.areas
+      LOGS_ACTION_MAX_CHARS: "500"      # assistant-logs form: action limit (>=1), validated by the service
+      LOGS_REASON_MAX_CHARS: "500"      # assistant-logs form: reason limit (>=1)
+      LOGS_ENTITY_REF_MAX_CHARS: "200"  # assistant-logs form: entity_ref limit (>=1)
+      LOGS_OUTCOME_MAX_CHARS: "500"     # assistant-logs form: outcome limit (>=1)
+      LOGS_VERIFIED_MAX_CHARS: "200"    # assistant-logs form: verified limit (>=1)
+      LOGS_SEARCH_EXCERPT_CHARS: "300"  # action truncation in search/listing output (>=1)
       # --- search ---
       DEFAULT_TOP_K: "5"
       DEFAULT_LIST_LIMIT: "20"

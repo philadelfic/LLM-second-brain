@@ -42,6 +42,9 @@ ENTITY_SKILL = "skill"
 ENTITY_SKILL_TEMPLATE = "skill_template"
 ENTITY_TERM = "term"
 ENTITY_USER_FACT = "user_fact"
+# Область «Логи ассистента» (LSBN-F-10, arch §5.4): версионируемая сущность
+# области логов; служебные поля (`vector_status`, времена) версий не создают.
+ENTITY_ASSISTANT_LOG = "assistant_log"
 
 # Реестр проекции §5.3: какие поля сущности создают версию. Служебные
 # (`vector_status`, `summary_status`, `links_at`, `node_order_at`,
@@ -54,6 +57,21 @@ CONTENT_FIELDS: dict[str, tuple[str, ...]] = {
     ENTITY_SKILL_TEMPLATE: ("instruction_template",),
     ENTITY_TERM: ("term", "context", "definition"),
     ENTITY_USER_FACT: ("name", "body"),
+    # Контент лога (arch §5.4): `source`/`session` — часть контента («что за
+    # действие и какой канал/сессия его породили»), отдельно от
+    # `record_versions.source/session` (происхождение самой версии, §13.3).
+    ENTITY_ASSISTANT_LOG: (
+        "action",
+        "reason",
+        "entity",
+        "entity_id",
+        "entity_version",
+        "entity_ref",
+        "outcome",
+        "verified",
+        "source",
+        "session",
+    ),
 }
 
 
@@ -134,6 +152,28 @@ def user_fact_projection(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]
     (FR-4.2).
     """
     return {"name": row["name"], "body": row["body"]}
+
+
+def assistant_log_projection(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+    """Проекция лога ассистента по §5.4 — одна точка правды для CRUD области.
+
+    Контент: `action`/`reason`/`entity`/`entity_id`/`entity_version`/`entity_ref`/
+    `outcome`/`verified`/`source`/`session`. Служебные поля (`vector_status`,
+    `created_at`/`updated_at`/`deleted_at`) в проекцию не входят и версий не
+    создают (FR-4.2).
+    """
+    return {
+        "action": row["action"],
+        "reason": row["reason"],
+        "entity": row["entity"],
+        "entity_id": row["entity_id"],
+        "entity_version": row["entity_version"],
+        "entity_ref": row["entity_ref"],
+        "outcome": row["outcome"],
+        "verified": row["verified"],
+        "source": row["source"],
+        "session": row["session"],
+    }
 
 
 # Мягкий ответ чтения, когда версии/записи нет: транспорт превращает его в
