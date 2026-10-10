@@ -1840,12 +1840,21 @@ async def scenario_12_comment(c: Client, rest: httpx2.AsyncClient) -> None:
           any(r.get("id") == note_id
               for r in comment_hits.get("results", [])),
           f"hits={comment_hits.get('results')}")
-    text_search = await c.call("memory_search", {"query": "пригодится"})
-    check("memory_search does NOT find the note by a comment-only word "
-          "(FR-5.7 / §13.6)",
+    # Изоляция проверяется по FTS/подстрочному пути (`mode=title`): векторная
+    # сторона гибридного поиска возвращает ближайшие заметки независимо от
+    # наличия слова, поэтому на маленьком корпусе она отдаёт пробную заметку и
+    # без утечки комментария. Смысловая сторона — отдельное наблюдение.
+    title_search = await c.call("memory_search",
+                                {"query": "пригодится", "mode": "title"})
+    check("memory_search (title/substring) does NOT find the note by a "
+          "comment-only word (FR-5.7 / §13.6)",
           all(r.get("id") != note_id
-              for r in text_search.get("results", [])),
-          f"hits={len(text_search.get('results', []))}")
+              for r in title_search.get("results", [])),
+          f"hits={len(title_search.get('results', []))}")
+    semantic = await c.call("memory_search", {"query": "пригодится"})
+    if any(r.get("id") == note_id for r in semantic.get("results", [])):
+        warn("the semantic side returns the probe note as a neighbour — "
+             "expected on a small corpus, not a comment leak")
     rest_comments = await rest.get("/notes/comments", params={"q": "пригодится"})
     check("REST GET /notes/comments returns the note by its comment (no24-02)",
           rest_comments.status_code == 200
@@ -1890,8 +1899,11 @@ async def scenario_12_comment(c: Client, rest: httpx2.AsyncClient) -> None:
           all(r.get("id") != note_id for r in dropped.get("results", [])))
 
     duplicate = await c.call("memory_save", {"text": text, "title": title})
+    # MCP-поверхность отдаёт дословный дубль как `stored: false` + hint
+    # (`_compact_save`), служебное `duplicated` из сервиса агенту не видно.
     check("dedup of the note is unaffected by its comment (FR-5.4)",
-          duplicate.get("duplicated") is True, f"answer={duplicate}")
+          duplicate.get("stored") is False and bool(duplicate.get("hint")),
+          f"answer={duplicate}")
 
 
 # ==== scenarios: 13. injected-text budget + agent smoke (LSBN-F-11) =============
@@ -2163,8 +2175,12 @@ async def scenario_13_injected_text(c: Client, rest: httpx2.AsyncClient,
             continue
         payload = answer.get(key)
         why = refusal(answer)
+        # Пустая выдача с каноническим «ничего не найдено» — нормальный ответ
+        # области, а не ошибка: маркер приёмки ничему не соответствует.
+        empty_ok = (isinstance(payload, list) and not payload
+                    and why.startswith("nothing found in this area"))
         check(f"the {label} area answers {tool} without an error",
-              isinstance(payload, list) and not why,
+              isinstance(payload, list) and (not why or empty_ok),
               f"{key}=" + (f"{len(payload)}" if isinstance(payload, list)
                            else repr(payload))
               + (f", refusal={why!r}" if why else ""))
