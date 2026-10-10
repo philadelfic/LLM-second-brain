@@ -10,7 +10,9 @@ SQLite backup API (`Connection.backup`) — **онлайн**: читает со�
 снапшоте), `BACKUP_INTERVAL_SEC` (интервал петли; первый снапшот — сразу
 после старта), `BACKUP_KEEP` (число хранимых копий; ротация после каждого
 снапшота), `BACKUP_VERIFY_EVERY` (проверка каждого N-го снапшота; 0 — только
-вручную, `POST /backups/verify`).
+вручную, `POST /backups/verify`), `BACKUP_SHIP_CMD` (операторская команда
+выноса проверенной копии за пределы сервера; пусто — вынос выключен) и
+`BACKUP_SHIP_TIMEOUT_SEC` (таймаут команды выноса, с).
 
 Файл снапшота: `notes-YYYYmmddTHHMMSSZ.db` (UTC — лексикографический порядок
 имён совпадает с хронологией; vec0-таблица требует sqlite-vec на открытии —
@@ -31,7 +33,14 @@ vec0 (`SELECT 1 ... LIMIT 1`); расхождение `meta.embedding_model` —
 (NFR-3). Петля запускается lifespan-ом отдельной asyncio-таской; тяжёлая
 часть (I/O) — в `asyncio.to_thread`.
 
-Вынос копии (`ship`) и `BACKUP_SHIP_CMD` — no14-02: здесь не делается.
+Вынос копии (`ship`, no14-02, arch §6.1/§13.4): после успешной проверки
+операторская команда `BACKUP_SHIP_CMD` уносит копию за пределы сервера;
+назначение и учётки живут ВНЕ репозитория и образа — сервис передаёт команде
+только путь к файлу (`LSB_BACKUP_FILE`/`LSB_BACKUP_NAME`). Успех — только
+`returncode == 0` И отчёт `size=<N>` в stdout, равный размеру файла; иначе
+отказ с `reason` и событием. Команда и её вывод в логи НЕ попадают (никаких
+секретов). Отказ выноса петлю не роняет и локальную ротацию не ломает
+(FR-3.2).
 """
 
 from __future__ import annotations
@@ -39,8 +48,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import sqlite3
+import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -68,6 +79,11 @@ VERIFY_REASONS = (
 # Мягкое замечание (не делает ok=false): копия снята до смены модели
 # эмбеддинга — валидная база, при открытии просто переиндексируется (§13.1).
 EMBEDDING_MISMATCH = "embedding_mismatch"
+
+# №14 (arch §6.1/§13.4): контракт выноса копии за пределы сервера.
+MIN_SHIP_REPORT = "size="  # отчёт команды выноса: `size=<N>`, N = размер копии
+# Значения `reason` для ship (дословно EN, arch §6.1).
+SHIP_REASONS = ("disabled", "command_failed", "size_mismatch", "timeout")
 
 _STAMP_FMT = "%Y%m%dT%H%M%SZ"
 _LATENCY = time.perf_counter
@@ -108,6 +124,12 @@ def _created_at(name: str) -> str | None:
         return None
     moment = datetime.strptime(name[len(IMAGE_PREFIX):-len(IMAGE_SUFFIX)], _STAMP_FMT)
     return moment.replace(tzinfo=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_ship_size(stdout: str) -> int | None:
+    """Размер копии из отчёта команды выноса (`size=<N>`, первое вхождение)."""
+    match = re.search(rf"{re.escape(MIN_SHIP_REPORT)}(\d+)", stdout)
+    return int(match.group(1)) if match is not None else None
 
 
 class BackupService:
@@ -376,6 +398,123 @@ class BackupService:
             json.dumps(payload, sort_keys=True), encoding="utf-8"
         )
 
+    # --- вынос копии за пределы сервера (№14, arch §6.1/§13.4) ---------------
+
+    def ship(self, path: Path) -> dict[str, Any]:
+        """Вынести проверенную копию снапшота за пределы сервера (FR-3.1/FR-3.2).
+
+        Команда — операторская (`BACKUP_SHIP_CMD`); назначение и учётки живут
+        ВНЕ репозитория и образа, сервис передаёт команде только путь к файлу в
+        `LSB_BACKUP_FILE` (+ имя в `LSB_BACKUP_NAME`) и запускает команду через
+        `shell` с таймаутом `BACKUP_SHIP_TIMEOUT_SEC`. Пустая команда — тихий
+        no-op: `{\"ok\": None, \"skipped\": True, \"reason\": \"disabled\"}`; событие НЕ
+        пишется и сайдкар-индекс не трогается.
+
+        Успех — только `returncode == 0` И отчёт `size=<N>` в stdout, равный
+        размеру локального файла; иначе `reason` ∈ `SHIP_REASONS`
+        (`command_failed` — ненулевой код, нет отчёта или файл исчез;
+        `size_mismatch` — отчёт есть, размер другой; `timeout` — таймаут).
+        Исход пишется в сайдкар-индекс (`last_ship`) и событием
+        `backup_shipped`/`backup_ship_failed`. Значения команды и её вывода в
+        логи НЕ попадают (никаких секретов); отказ выноса локальные снапшоты и
+        ротацию не трогает (FR-3.2).
+
+        Returns:
+            `{\"file\", \"ok\", \"size_bytes\"?, \"reason\"?, \"latency_ms\"}`; для
+            выключенного выноса — `{\"file\", \"ok\": None, \"skipped\": True,
+            \"reason\": \"disabled\"}`.
+        """
+        started = _LATENCY()
+        target = Path(path)
+        command = self._settings.backup_ship_cmd
+        if not command.strip():
+            return {
+                "file": target.name,
+                "ok": None,
+                "skipped": True,
+                "reason": "disabled",
+            }
+        try:
+            local_size = target.stat().st_size
+        except OSError:
+            # Локальной копии нет — подтвердить вынос нечем; команду не зовём.
+            return self._finish_ship(
+                target, ok=False, size_bytes=None, reason="command_failed", started=started
+            )
+        env = {
+            **os.environ,
+            "LSB_BACKUP_FILE": str(target),
+            "LSB_BACKUP_NAME": target.name,
+        }
+        try:
+            completed = subprocess.run(
+                command,
+                shell=True,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=self._settings.backup_ship_timeout_sec,
+            )
+        except subprocess.TimeoutExpired:
+            return self._finish_ship(
+                target, ok=False, size_bytes=local_size, reason="timeout", started=started
+            )
+        except OSError:
+            # Команда не запустилась (нет оболочки/прав) — как отказ команды.
+            return self._finish_ship(
+                target, ok=False, size_bytes=local_size, reason="command_failed", started=started
+            )
+        if completed.returncode != 0:
+            return self._finish_ship(
+                target, ok=False, size_bytes=local_size, reason="command_failed", started=started
+            )
+        reported = _parse_ship_size(completed.stdout)
+        if reported is None:
+            # Код 0, но контрактного отчёта `size=<N>` нет — вынос не подтверждён.
+            return self._finish_ship(
+                target, ok=False, size_bytes=local_size, reason="command_failed", started=started
+            )
+        if reported != local_size:
+            return self._finish_ship(
+                target, ok=False, size_bytes=local_size, reason="size_mismatch", started=started
+            )
+        return self._finish_ship(
+            target, ok=True, size_bytes=local_size, reason=None, started=started
+        )
+
+    def _finish_ship(
+        self,
+        path: Path,
+        *,
+        ok: bool,
+        size_bytes: int | None,
+        reason: str | None,
+        started: float,
+    ) -> dict[str, Any]:
+        """Записать исход выноса в сайдкар-индекс и журнал (без секретов)."""
+        latency_ms = round((_LATENCY() - started) * 1000, 1)
+        result: dict[str, Any] = {"file": path.name, "ok": ok, "latency_ms": latency_ms}
+        if size_bytes is not None:
+            result["size_bytes"] = size_bytes
+        if reason is not None:
+            result["reason"] = reason
+        self._record_ship(path, result)
+        extra: dict[str, Any] = {
+            "event": "backup_shipped" if ok else "backup_ship_failed",
+            "file": path.name,
+            "latency_ms": latency_ms,
+        }
+        if size_bytes is not None:
+            extra["size_bytes"] = size_bytes
+        if reason is not None:
+            extra["reason"] = reason
+        logging.getLogger("app").log(
+            logging.INFO if ok else logging.WARNING,
+            "backup snapshot shipped" if ok else "backup snapshot ship failed",
+            extra=extra,
+        )
+        return result
+
     # --- сайдкар-индекс (наблюдаемость переживает рестарт, arch §5.1) --------
 
     def _state_path(self) -> Path:
@@ -420,6 +559,32 @@ class BackupService:
         verified[path.name] = record
         self._write_state(state)
 
+    def _record_ship(self, path: Path, result: dict[str, Any]) -> None:
+        """Обновить исход выноса в сайдкар-индексе (`last_ship` + `shipped`).
+
+        Метка `shipped` ставится только при подтверждённом выносе; неудача уже
+        подтверждённую копию не разметает — файл снапшота неизменяем, а
+        наблюдаемость выноса живёт отдельной записью.
+        """
+        record: dict[str, Any] = {
+            "at": _now_iso(),
+            "file": path.name,
+            "result": "ok" if result["ok"] else "failed",
+        }
+        if result.get("reason"):
+            record["reason"] = result["reason"]
+        if "size_bytes" in result:
+            record["size_bytes"] = result["size_bytes"]
+        state = self._read_state()
+        state["last_ship"] = record
+        shipped = state.get("shipped")
+        if not isinstance(shipped, dict):
+            shipped = {}
+            state["shipped"] = shipped
+        if result["ok"]:
+            shipped[path.name] = record
+        self._write_state(state)
+
     # --- наблюдаемость ------------------------------------------------------
 
     def status(self) -> dict[str, Any]:
@@ -456,7 +621,7 @@ class BackupService:
 
         Свежие первыми; `verified` ∈ ok/failed/unknown (маркер `.bad` — явный
         `failed`), `bad` — есть сайдкар, `shipped` — по сайдкар-индексу
-        (вынос — no14-02: без него всегда False).
+        (подтверждённый вынос копии за пределы сервера).
         """
         state = self._read_state()
         verified_map = state.get("verified")
@@ -500,23 +665,29 @@ class BackupService:
         > 0 и счётчик дошёл до кратного значения, — проверка восстановления
         (`verify`); её отказ петлю не роняет (NFR-3), исход — событием.
 
+        №14 (no14-02, arch §6.1): если проверка прошла (`verify.ok=True`) и задана
+        операторская команда выноса (`BACKUP_SHIP_CMD`) — копия уносится за
+        пределы сервера (`ship`, FR-3.1); отказ выноса петлю не роняет и
+        локальную ротацию не ломает (FR-3.2).
+
         Фаза 10: после каждого снапшота — груминг реестра неймспейсов;
         отказ груминга не убивает петлю (как отказ снапшота, NFR-3):
         событие groom_failed в логе, повтор — следующий интервал.
         """
         while not self._stopping:
-            created = False
+            target: Path | None = None
             try:
-                await asyncio.to_thread(self.snapshot)
-                created = True
+                target = await asyncio.to_thread(self.snapshot)
             except (sqlite3.Error, OSError):
                 # БД/каталог недоступны — процесс должен жить (NFR-3);
                 # подробности — в JSON-лог, повтор по интервалу.
                 logging.getLogger("app").exception(
                     "backup snapshot failed", extra={"event": "backup_failed"}
                 )
-            if created:
-                await self._maybe_verify()
+            if target is not None:
+                verified = await self._maybe_verify()
+                if verified and self._settings.backup_ship_cmd.strip():
+                    await self._maybe_ship(target)
             try:
                 report = await asyncio.to_thread(self.groom)
                 if any(report.values()):
@@ -530,24 +701,43 @@ class BackupService:
                 )
             await asyncio.sleep(self._settings.backup_interval_sec)
 
-    async def _maybe_verify(self) -> None:
+    async def _maybe_verify(self) -> bool:
         """Проверить снапшот по расписанию `BACKUP_VERIFY_EVERY` (0 — вручную).
 
         Отказ проверки не роняет петлю: событие `backup_verify_failed`
         (NFR-3). Счётчик — в памяти процесса (после рестарта начинается заново
         — проверка редкая и дешёвая, состояние на диск не выносим).
+
+        Returns:
+            True — проверка выполнена и снапшот годен (`ok=True`); иначе False
+            (проверка выключена, не пришла очередь или отказ).
         """
         every = self._settings.backup_verify_every
         if every <= 0:
-            return
+            return False
         self._verify_counter += 1
         if self._verify_counter % every != 0:
-            return
+            return False
         try:
-            await asyncio.to_thread(self.verify)
+            result = await asyncio.to_thread(self.verify)
         except Exception:
             logging.getLogger("app").exception(
                 "backup verify failed", extra={"event": "backup_verify_failed"}
+            )
+            return False
+        return bool(result.get("ok"))
+
+    async def _maybe_ship(self, target: Path) -> None:
+        """Вынести копию после успешной проверки (FR-3.1/FR-3.2).
+
+        Отказ выноса петлю не роняет (NFR-3): исход — событие
+        `backup_ship_failed`, локальная ротация работает как прежде.
+        """
+        try:
+            await asyncio.to_thread(self.ship, target)
+        except Exception:
+            logging.getLogger("app").exception(
+                "backup ship failed", extra={"event": "backup_ship_failed"}
             )
 
 

@@ -183,6 +183,14 @@ services:
       BACKUP_KEEP: "7"
       # verify the restore of every Nth snapshot; 0 = manual only (POST /backups/verify)
       BACKUP_VERIFY_EVERY: "1"
+      # command to ship a verified snapshot off the box; empty = shipping disabled.
+      # Keep the destination and credentials OUTSIDE this repo: mount a config/
+      # known_hosts/key via a bind-mount and only reference it from the command here
+      # (the service passes just the file path in $LSB_BACKUP_FILE). Example:
+      #   rclone --config /srv/ship/rclone.conf copy "$LSB_BACKUP_FILE" remote:lsb-backups/ && echo size=$(stat -c%s "$LSB_BACKUP_FILE")
+      BACKUP_SHIP_CMD: ""
+      # timeout of the ship command, seconds (>=1)
+      BACKUP_SHIP_TIMEOUT_SEC: "300"
       # --- release check (№45): off by default — no verified egress from the
       #     container, so the network cannot be the default source ---
       # UPDATE_CHECK_ENABLED: "false"       # true turns on the background version check

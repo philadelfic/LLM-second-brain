@@ -98,6 +98,32 @@ first-run walkthrough (compose, token, Open WebUI, `/health`).
   dedup judge and classifier see full texts). Choose providers per slot
   deliberately.
 
+## Restore from a snapshot
+
+Snapshots are ordinary SQLite files in `BACKUP_DIR` (default `/data/backups`,
+inside the `./data` volume); the name carries the UTC timestamp. To restore one:
+
+1. Take the newest `notes-*.db`. `GET /backups` lists the snapshots with
+   `verified` (`ok` / `failed` / `unknown`) — prefer an `ok` one; a file marked
+   `failed` also has a `<file>.bad` sidecar next to it. `POST /backups/verify`
+   checks one on demand.
+2. Stop the service: `docker compose down` (nothing must write to the file you
+   are about to replace).
+3. Put the snapshot in place of the live database (`DB_PATH`, default
+   `data/notes.db`), e.g. `cp data/backups/notes-<stamp>.db data/notes.db`, and
+   delete the stale `notes.db-wal` / `notes.db-shm` beside it if any. To keep the
+   old file untouched, drop the copy next to it and point `DB_PATH` at the copy.
+4. Start the service (`docker compose up -d`) and check `/health`: `status` is
+   `ok`, `notes_count` matches the snapshot, and `embedding_ok` turns `true`
+   after the first successful call to the embedding slot.
+5. If the snapshot was taken with a different embedding model (the verification
+   note `embedding_mismatch`), a full reindex starts on its own — wait for
+   `pending_vector` to reach `0` before searching.
+
+Shipping a verified copy off the box is optional and driven by `BACKUP_SHIP_CMD`
+(empty by default); `scripts/backup_ship.sh` is a secret-free template. The
+command and its output never reach the logs.
+
 ## License
 
 Distributed under the [MIT](LICENSE) license.

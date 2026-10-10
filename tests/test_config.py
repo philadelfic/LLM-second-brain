@@ -140,6 +140,9 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "BACKUP_KEEP": ("backup_keep", 7),
     # №14 (3.2.0): проверка восстановления каждого N-го снапшота (0 — вручную).
     "BACKUP_VERIFY_EVERY": ("backup_verify_every", 1),
+    # №14 (3.2.0): вынос проверенной копии за пределы сервера (команда/таймаут).
+    "BACKUP_SHIP_CMD": ("backup_ship_cmd", ""),
+    "BACKUP_SHIP_TIMEOUT_SEC": ("backup_ship_timeout_sec", 300),
     # Фаза 10: иерархические неймспейсы (§5.7).
     "NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE": ("namespace_auto_move_min_confidence", 0.80),
     "NAMESPACE_PROMOTION_THRESHOLD": ("namespace_promotion_threshold", 15),
@@ -239,7 +242,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 160 полей: 6 обязательных + 154 с умолчаниями
+        """В Settings — ровно 162 поля: 6 обязательных + 156 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
@@ -258,7 +261,8 @@ class TestCompleteness:
         + 7 настроек области логов LSBN-F-10 релиза 3.2.0: AREA_LOGS_ENABLED
         и LOGS_*
         + 6 настроек хинта о свежем релизе №45 релиза 3.2.0: UPDATE_*
-        + 1 настройка проверки бэкапа №14 релиза 3.2.0: BACKUP_VERIFY_EVERY)."""
+        + 3 настройки бэкапа №14 релиза 3.2.0: BACKUP_VERIFY_EVERY
+        и BACKUP_SHIP_CMD/BACKUP_SHIP_TIMEOUT_SEC)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

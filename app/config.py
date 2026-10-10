@@ -315,6 +315,12 @@ class Settings(BaseSettings):
     # №14 (3.2.0, arch §8): проверять восстановление каждого N-го снапшота;
     # 0 — авто-проверка выключена (только ручная POST /backups/verify).
     backup_verify_every: int = 1
+    # №14 (3.2.0, arch §8/§13.4): вынос проверенной копии за пределы сервера.
+    # Хранится ТОЛЬКО команда: назначение и учётки живут ВНЕ репозитория и
+    # образа (host env/bind-mount), сервис передаёт команде лишь путь к файлу.
+    # Пусто (дефолт) — вынос выключен, тихий no-op без событий.
+    backup_ship_cmd: str = ""
+    backup_ship_timeout_sec: int = 300
 
     # --- хинт о свежем релизе (№45, релиз 3.2.0; arch §6.2/§8/§13.8-13.13) ----
     # Фоновая проверка версии: источник — локальный JSON-файл (работает без
@@ -713,6 +719,8 @@ class Settings(BaseSettings):
         need_low("backup_keep", self.backup_keep, 1)
         # №14 (arch §8): 0 — авто-проверка выключена (только вручную).
         need_low("backup_verify_every", self.backup_verify_every, 0)
+        # №14 (arch §8): таймаут команды выноса ≥ 1 (при пустой команде не важен).
+        need_low("backup_ship_timeout_sec", self.backup_ship_timeout_sec, 1)
         if not self.backup_dir.strip():
             errors.append("  - backup_dir: путь не может быть пустым")
         if not self.db_path.strip():

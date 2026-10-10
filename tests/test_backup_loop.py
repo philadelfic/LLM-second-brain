@@ -2,7 +2,9 @@
 
 `run()` после успешного снапшота проверяет каждый N-й снапшот по
 `BACKUP_VERIFY_EVERY` (0 — только вручную); отказ проверки петлю не роняет
-(NFR-3), исход — событием журнала.
+(NFR-3), исход — событием журнала. После успешной проверки и при заданной
+команде `BACKUP_SHIP_CMD` копия уносится за пределы сервера (`ship`); отказ
+выноса петлю не роняет и локальную ротацию не ломает (FR-3.2).
 """
 
 from __future__ import annotations
@@ -28,13 +30,14 @@ def service(tmp_path: Path):
     backup_dir = tmp_path / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
 
-    def build(every: int) -> BackupService:
+    def build(every: int, **overrides: Any) -> BackupService:
         return BackupService(
             settings.model_copy(
                 update={
                     "backup_dir": str(backup_dir),
                     "backup_interval_sec": 0.05,
                     "backup_verify_every": every,
+                    **overrides,
                 }
             )
         )
@@ -119,3 +122,80 @@ async def test_verify_failure_does_not_kill_loop(
     assert _with_event(caplog, "backup_verify_failed")
     # Петля жива: снапшоты продолжают сниматься.
     assert len(list(backup_dir.glob(f"{IMAGE_PREFIX}*{IMAGE_SUFFIX}"))) >= 1
+
+
+@pytest.mark.asyncio
+async def test_loop_ships_after_verify(
+    service, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Задана команда и проверка прошла — `ship` вызван с свежим снапшотом."""
+    build, _backup_dir = service
+    instance = build(1, backup_ship_cmd="true")
+    shipped: list[Path] = []
+
+    def ship_spy(path: Path) -> dict[str, Any]:
+        shipped.append(path)
+        return {"file": path.name, "ok": True}
+
+    monkeypatch.setattr(instance, "ship", ship_spy)
+    await _run_until(instance, lambda: bool(shipped))
+    assert shipped
+    assert shipped[0].name.startswith(IMAGE_PREFIX)
+    assert shipped[0].exists()
+
+
+@pytest.mark.asyncio
+async def test_loop_does_not_ship_when_verify_failed(
+    service, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`verify.ok=False` — вынос не запускается (FR-3.2)."""
+    build, _backup_dir = service
+    instance = build(1, backup_ship_cmd="true")
+    verified: list[Any] = []
+    shipped: list[Any] = []
+
+    def verify_spy(path: Path | None = None) -> dict[str, Any]:
+        verified.append(path)
+        return {
+            "file": None,
+            "ok": False,
+            "reason": "not_openable",
+            "checks": {},
+            "latency_ms": 0.0,
+        }
+
+    def ship_spy(path: Path) -> dict[str, Any]:  # pragma: no cover
+        shipped.append(path)
+        return {}
+
+    monkeypatch.setattr(instance, "verify", verify_spy)
+    monkeypatch.setattr(instance, "ship", ship_spy)
+    await _run_until(instance, lambda: len(verified) >= 2)
+    assert len(verified) >= 2
+    assert shipped == []
+
+
+@pytest.mark.asyncio
+async def test_loop_does_not_ship_when_disabled(
+    service, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Пустая `BACKUP_SHIP_CMD` — вынос не зовётся вовсе, хотя verify идёт."""
+    build, _backup_dir = service
+    instance = build(1)  # команда по умолчанию пуста
+    verified: list[Any] = []
+    shipped: list[Any] = []
+    real = instance.verify
+
+    def verify_spy(path: Path | None = None) -> dict[str, Any]:
+        verified.append(path)
+        return real(path)
+
+    def ship_spy(path: Path) -> dict[str, Any]:  # pragma: no cover
+        shipped.append(path)
+        return {}
+
+    monkeypatch.setattr(instance, "verify", verify_spy)
+    monkeypatch.setattr(instance, "ship", ship_spy)
+    await _run_until(instance, lambda: len(verified) >= 2)
+    assert len(verified) >= 2
+    assert shipped == []

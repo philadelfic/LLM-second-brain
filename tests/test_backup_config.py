@@ -3,6 +3,10 @@
 `BACKUP_VERIFY_EVERY` — int ≥ 0, дефолт 1: проверяем каждый свежий снапшот;
 0 — авто-проверка выключена (только ручная `POST /backups/verify`).
 Отрицательное значение — фатальная ошибка конфигурации со ВСЕМИ нарушениями.
+
+`BACKUP_SHIP_CMD` — команда выноса проверенной копии (дефолт пуст — вынос
+выключен; назначение/учётки живут вне репозитория), `BACKUP_SHIP_TIMEOUT_SEC` —
+её таймаут (int ≥ 1, дефолт 300).
 """
 
 from __future__ import annotations
@@ -33,6 +37,8 @@ def load_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> Settings:
 def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DB_PATH", raising=False)  # дефолт §8, как в test_config
     monkeypatch.delenv("BACKUP_VERIFY_EVERY", raising=False)
+    monkeypatch.delenv("BACKUP_SHIP_CMD", raising=False)
+    monkeypatch.delenv("BACKUP_SHIP_TIMEOUT_SEC", raising=False)
 
 
 def test_verify_every_defaults_and_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -48,3 +54,19 @@ def test_verify_every_defaults_and_invalid(monkeypatch: pytest.MonkeyPatch) -> N
 def test_verify_every_zero_is_manual_only(monkeypatch: pytest.MonkeyPatch) -> None:
     """0 — валидное значение: авто-проверка выключена (вручную)."""
     assert load_env(monkeypatch, BACKUP_VERIFY_EVERY="0").backup_verify_every == 0
+
+
+def test_ship_defaults_and_invalid_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Дефолты выноса: команда пуста (вынос выключен), таймаут 300 с."""
+    settings = load_env(monkeypatch)
+    assert settings.backup_ship_cmd == ""
+    assert settings.backup_ship_timeout_sec == 300
+    # Команда — не секрет и читается как есть (назначение/учётки — вне репо).
+    assert load_env(monkeypatch, BACKUP_SHIP_CMD="true").backup_ship_cmd == "true"
+
+
+def test_ship_timeout_invalid_fatal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`BACKUP_SHIP_TIMEOUT_SEC=0` — фатальная ошибка конфигурации."""
+    with pytest.raises(ConfigError) as exc_info:
+        load_env(monkeypatch, BACKUP_SHIP_TIMEOUT_SEC="0")
+    assert 'backup_ship_timeout_sec' in str(exc_info.value)
