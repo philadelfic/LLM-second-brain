@@ -10,8 +10,9 @@ requirements — `release/3.2.0/documents/req/no39-queue-unavailable-requirement
 This is the BASE script of the 3.2.0 acceptance: it carries the shared harness
 (observable-state waiting, idempotent probe data, teardown trace, report) and the
 mandatory №39 scenario "models unavailable → jobs wait → models are back → jobs
-finish WITHOUT a container restart", checked PER SLOT (`embedding`, `summary`,
-`judge`) and over the new queues, plus the observability checks (queues carry
+finish WITHOUT a container restart", checked PER SLOT (`summary`, `judge`,
+`embedding` — in that order, see `SLOT_OUTAGE_ORDER`) and over the new queues,
+plus the observability checks (queues carry
 `pending`/`waiting`/`attention`, `/health.slots` carries the cause and the pause,
 `queue_waiting` is written for deferred work, a deferred job never spins the loop
 in a busy-loop).
@@ -48,10 +49,15 @@ Scenarios (this base version):
      with `ok`/`last_outcome`/`paused_until`/`attention`), version, DB size.
   1. Queue and slot observability baseline (before the outage): queues are
      reported, `waiting`/`attention` are numbers, `/health` answers without models.
-  2. №39 core: for EACH slot `embedding`/`summary`/`judge` — stop the slot by the
-     contour hook, wait for the queue to grow (`pending`/`waiting` and the age of
-     the oldest), check `/health` stays alive and no request flood appears in the
-     log, then start the slot back and see the queue drain WITHOUT a restart.
+  2. №39 core: for EACH slot `summary`/`judge`/`embedding` (in that order) —
+     stop the slot by the contour hook, wait for the queue to grow
+     (`pending`/`waiting` and the age of the oldest), check `/health` stays alive
+     and no request flood appears in the log, then start the slot back and see
+     the queue drain WITHOUT a restart. The `summary`/`judge` queues count only
+     the notes with a READY vector: those branches first wait for the vector of
+     their probe notes and refuse to run while the embedding slot is paused
+     (an honest SKIP, not a FAIL); `embedding` itself goes LAST because its own
+     queue `vector` needs no embedding at all.
   3. Auth branch: the slot provider answers `401` (fake-provider hook) →
      `slot_paused` in the log, `/health.slots.<slot>.last_outcome='auth'`,
      `paused_until` set, the tool hint; after the fix — `slot_probe` +
@@ -124,6 +130,15 @@ HEALTH_QUEUES = ("vector", "summary", "judge", "areas", "links", "nodes",
 SLOTS = ("embedding", "summary", "judge", "decision")
 # Queue that belongs to each slot for the "queue grows while the slot is down".
 SLOT_QUEUE = {"embedding": "vector", "summary": "summary", "judge": "judge"}
+# №39: the outage walk of scenario 2 — only the slots that OWN a queue, and the
+# ORDER MATTERS. `embedding` goes LAST: its own queue `vector` needs no embedding
+# at all, while the `summary`/`judge` queues count ONLY the notes whose vector is
+# ready. When the embedding branch runs first, it leaves its slot in a pause /
+# back-off, the dependent queues honestly show zero work and the branch reads as
+# a false FAIL (live run 10.10.2026: «queue summary: pending=0, waiting=0»).
+SLOT_OUTAGE_ORDER = ("summary", "judge", "embedding")
+# №39: slots whose queue is filled ONLY by the notes with a ready vector.
+VECTOR_DEPENDENT_SLOTS = ("summary", "judge")
 
 # ==== harness: run configuration (filled in main) ==============================
 CFG: dict[str, Any] = {}
@@ -556,6 +571,54 @@ def slot_paused(rest: httpx2.AsyncClient, slot: str, outcome: str | None = None,
     return predicate
 
 
+def slot_ready(rest: httpx2.AsyncClient, slot: str,
+               ) -> Callable[[], Awaitable[tuple[bool, str]]]:
+    """Predicate: the slot is usable right now (not paused, no attention owed)."""
+
+    async def predicate() -> tuple[bool, str]:
+        snapshot = await health_snapshot(rest)
+        stat = slot_stat(snapshot, slot)
+        if stat is None:
+            return False, f"slot {slot} is not reported by /health.slots"
+        paused_until = stat.get("paused_until")
+        attention = stat.get("attention")
+        ok = paused_until is None and not attention
+        return bool(ok), (f"slot {slot}: ok={stat.get('ok')}, "
+                          f"last_outcome={stat.get('last_outcome')!r}, "
+                          f"paused_until={paused_until!r}, attention={attention!r}")
+
+    return predicate
+
+
+def probe_vectors_ready(note_ids: list[int],
+                        ) -> Callable[[], Awaitable[tuple[bool, str]]]:
+    """Predicate: every listed probe note carries a READY vector (DB, read-only).
+
+    №39: the `summary`/`judge` queues count a note only when `vector_status='ok'`,
+    so a branch that runs while the embedding slot is still catching up (its own
+    pause / back-off after the embedding branch) sees an empty queue and reads as
+    a false FAIL — the work is there, the queue simply cannot count it yet.
+    """
+
+    ids = tuple(note_ids)
+
+    async def predicate() -> tuple[bool, str]:
+        if not ids:
+            return True, "no probe note of the branch needs a vector"
+        marks = ",".join("?" * len(ids))
+        ready = db_count(
+            f"SELECT COUNT(*) AS c FROM notes WHERE id IN ({marks}) "
+            "AND deleted_at IS NULL AND vector_status = 'ok'",
+            ids,
+        )
+        if ready is None:
+            return False, f"the vector status is unreadable (DB {CFG['db']})"
+        return ready >= len(ids), \
+            f"probe notes with vector_status='ok': {ready} of {len(ids)}"
+
+    return predicate
+
+
 # ==== harness: external steps (contour hooks) ==================================
 async def run_shell(cmd: str, timeout: float = 600.0) -> subprocess.CompletedProcess[str]:
     """Run an operator-provided contour hook (never echoed into the output)."""
@@ -868,12 +931,37 @@ async def scenario_1_observability_baseline(rest: httpx2.AsyncClient) -> None:
 
 # ==== scenarios: 2. models unavailable → wait → back (per slot) ================
 async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> None:
-    """№39 core for ONE slot: stop → the queue grows → start → it drains."""
+    """№39 core for ONE slot: stop → the queue grows → start → it drains.
+
+    `summary`/`judge` are VECTOR-DEPENDENT: their queue counts only the notes
+    whose vector is ready, so the branch waits for the probe notes to be
+    vectorised and refuses to run at all while the embedding slot is paused.
+    """
     queue = SLOT_QUEUE[slot]
+    needs_vector = slot in VECTOR_DEPENDENT_SLOTS
     before = await health_snapshot(rest)
     stat_before = queue_stat(before, queue) or {}
     info(f"[{slot}] before the outage: queue {queue} pending="
          f"{stat_before.get('pending')}, waiting={stat_before.get('waiting')}")
+
+    # №39 (guard BEFORE the outage): the `summary`/`judge` queues count ONLY the
+    # notes with a READY vector, so the embedding slot must be usable before this
+    # branch. After the `embedding` branch it sits in a pause / back-off and the
+    # dependent queue honestly shows zero work — take care of that state here
+    # (an honest SKIP with a hint) instead of reading it as a FAIL later.
+    if needs_vector:
+        ready, ready_detail = await slot_ready(rest, "embedding")()
+        if not ready:
+            skip(f"[{slot}] the outage of a queue that needs a ready vector",
+                 "the embedding slot is not usable, while the queue "
+                 f"{queue} counts only the notes whose vector is ready: "
+                 f"{ready_detail} — wait for the pause to pass "
+                 "(/health.slots.embedding.paused_until), start the slot back "
+                 "(LSB_SLOT_ON_CMD), then re-run the scenario")
+            manual(f"scenario 2, branch [{slot}] (№39 FR-1/FR-2/FR-5.1)",
+                   "the branch needs a working embedding slot: its queue is filled "
+                   "only by notes whose vector is ready")
+            return
 
     proc = await run_shell(slot_cmd(CFG["slot_off_cmd"], slot))
     check(f"[{slot}] the slot is stopped by the contour hook", proc.returncode == 0,
@@ -886,7 +974,8 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
     try:
         # Push work into the slot's queue so the wait is observable (a probe note
         # lands in vector+summary; the judge queue grows from the dedup hand-off).
-        await save_probe_note(c, RUN[f"note_outage_{slot}"], after_hook=True)
+        probe = await save_probe_note(c, RUN[f"note_outage_{slot}"], after_hook=True)
+        probe_ids = [probe] if probe is not None else []
         if slot == "judge":
             # Судье нужна ПАРА-КАНДИДАТ: одной заметки мало — без близкого текста в
             # том же узле очередь `judge` остаётся пустой, и проверять «работа
@@ -900,9 +989,43 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
             })
             if twin.get("id") is not None:
                 RUN["notes"].append(twin["id"])
+                probe_ids.append(twin["id"])
             else:
                 warn("[judge] the near-duplicate probe note was not created",
                      f"answer={twin}")
+
+        # №39 (guard BEFORE the queue check): this queue counts a note only when
+        # its vector is ready, so the embedding slot must have vectorised the
+        # probe notes of the branch FIRST. Otherwise the queue honestly shows zero
+        # work while the work is really there — a false FAIL. If the vector never
+        # arrives because the embedding slot went into a pause / back-off, the
+        # branch is left honestly (SKIP), the slot is started back, nothing lost.
+        if needs_vector:
+            vector_ok, vector_detail = await wait_until(
+                probe_vectors_ready(probe_ids),
+                f"[{slot}] the probe notes of the branch are vectorised "
+                f"(the queue {queue} counts them)",
+                timeout=min(CFG["wait_sec"], 180.0))
+            if not vector_ok:
+                live, live_detail = await slot_ready(rest, "embedding")()
+                if not live:
+                    skip(f"[{slot}] the probe notes of the branch are vectorised "
+                         f"(the queue {queue} counts them)",
+                         "the embedding slot is in a pause / back-off: "
+                         f"{live_detail} — wait for the pause to pass "
+                         "(/health.slots.embedding.paused_until), start the slot "
+                         "back (LSB_SLOT_ON_CMD), then re-run the scenario")
+                    manual(f"scenario 2, branch [{slot}] (№39 FR-1/FR-2/FR-5.1)",
+                           "the branch needs a working embedding slot: its queue is "
+                           "filled only by notes whose vector is ready")
+                else:
+                    check(f"[{slot}] the probe notes of the branch got their vector "
+                          f"(the queue {queue} counts them)", False, vector_detail)
+                back = await run_shell(slot_cmd(CFG["slot_on_cmd"], slot))
+                released = True
+                check(f"[{slot}] the slot is started back by the contour hook",
+                      back.returncode == 0, f"rc={back.returncode}")
+                return
 
         ok, detail = await wait_until(
             queue_has_work(rest, queue),
@@ -990,7 +1113,9 @@ async def scenario_2_models_outage(c: Client, rest: httpx2.AsyncClient) -> None:
                "a container restart")
         return
 
-    for slot in SLOTS:
+    # ORDER (`SLOT_OUTAGE_ORDER`), not `SLOTS`: only the slots owning a queue are
+    # walked, and `embedding` is walked LAST — see the constant for the reason.
+    for slot in SLOT_OUTAGE_ORDER:
         await _outage_for_slot(c, rest, slot)
 
     # FR-2.3/FR-5.1: a session opened BEFORE the outage is still alive — the
