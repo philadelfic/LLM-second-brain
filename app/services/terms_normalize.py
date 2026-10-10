@@ -402,12 +402,21 @@ class TermsNormalizerService:
     def run(self, batch: int | None = None) -> int:
         """Партия групп (лимит `JOB_TERMS_BATCH`, порядок по `term_norm`).
 
-        Возвращает число разобранных групп; событие `terms_normalize_run` несёт
-        агрегаты за прогон (FR-8.1).
+        Возвращает число групп, где произошла ФАКТИЧЕСКАЯ правка данных
+        (переименование/слияние контекстов). Событие `terms_normalize_run` несёт
+        агрегаты за прогон (FR-8.1), включая число разобранных групп (`terms`).
+
+        Возврат кормит петлю джобы (`run_loop`: `processed > 0` — выгребаем
+        сразу, без ожидания интервала). Группа, где правка невозможна (два
+        контекста расходятся определениями — только предупреждение) или где
+        нужны лишь идемпотентные предупреждения, прогрессом НЕ считается: иначе
+        петля крутится вхолостую (в тест-контуре — 30 прогонов в секунду,
+        lsbdef-0011), потому что отбор групп (`contexts > 1`) сам по себе не
+        гарантирует, что есть что менять.
         """
         limit = int(self._settings.job_terms_batch if batch is None else batch)
         rows = self._selected_groups(limit)
-        clusters = renamed = merged = flagged = excess = 0
+        clusters = renamed = merged = flagged = excess = progressed = 0
         for row in rows:
             result = self.normalize(str(row["term_norm"]))
             clusters += int(result["clusters"])
@@ -415,6 +424,8 @@ class TermsNormalizerService:
             merged += int(result["merged"])
             flagged += int(result["flagged"])
             excess += 1 if result["excess"] else 0
+            if int(result["renamed"]) or int(result["merged"]):
+                progressed += 1
         self._log(
             "terms-normalize: run finished",
             "terms_normalize_run",
@@ -424,8 +435,9 @@ class TermsNormalizerService:
             merged=merged,
             flagged=flagged,
             excess=excess,
+            progressed=progressed,
         )
-        return len(rows)
+        return progressed
 
     def queue_stat(self) -> dict:
         """Снимок очереди `terms-normalize` — только SQL, без моделей (§6.6)."""

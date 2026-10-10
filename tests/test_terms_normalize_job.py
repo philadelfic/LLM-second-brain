@@ -102,3 +102,30 @@ def test_job_process_runs_via_thread(test_env, monkeypatch) -> None:
     )
     spec = _spec(make_worker(settings, terms), settings)
     assert asyncio.run(spec.process()) == 1
+
+
+def test_run_without_data_changes_is_not_progress(test_env, monkeypatch) -> None:
+    """Группа без возможной правки не считается прогрессом (lsbdef-0011).
+
+    Два близких контекста с РАЗНЫМИ определениями: переименования/слияния не
+    будет (только идемпотентное предупреждение), поэтому `run()` обязан вернуть
+    0 — иначе петля `run_loop` (`processed > 0` → прогон сразу) крутится
+    вхолостую; в тест-контуре это давало ~30 прогонов в секунду.
+    """
+    settings = make_settings(test_env, monkeypatch)
+    service = TermsNormalizerService(
+        settings,
+        terms=TermsService(settings, HashEmbedder(DIM)),
+        warnings=WarningsService(settings),
+    )
+    seed(
+        settings,
+        [
+            {"id": 1, "term": "первый", "context": "проект", "definition": "одно"},
+            {"id": 2, "term": "первый", "context": "проекте", "definition": "другое"},
+        ],
+    )
+    assert service.queue_empty() is False  # группа с двумя контекстами — в очереди
+    assert service.run() == 0  # но менять нечего → прогресса нет
+    assert service.queue_empty() is False  # очередь не выдумывается пустой
+    assert service.run() == 0  # повтор идемпотентен

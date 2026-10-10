@@ -33,7 +33,10 @@ def test_excess_threshold_and_resolve(parts) -> None:
             for index, context in enumerate(CONTEXTS, start=1)
         ],
     )
-    assert service.run() == 1
+    # Предупреждение — не правка данных: для петли джобы это НЕ прогресс
+    # (иначе группа с одним лишь предупреждением крутила бы петлю вхолостую,
+    # lsbdef-0011). Разобранные группы видны в событии как `terms`.
+    assert service.run() == 0
     opened = warnings_rows(settings, "term_contexts_excess")
     assert len(opened) == 1
     assert json.loads(opened[0]["payload"])["contexts"] == 5
