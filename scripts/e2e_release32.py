@@ -22,8 +22,9 @@ The script is split into explicit sections marked with `# ====` banners:
 
   * harness — counters/report, teardown trace, MCP/REST clients, `wait_until`,
     `/health` helpers (`queue_stat`, `slot_stat`, predicates), external hooks;
-  * probe data — marking by the run tag in titles, idempotent pre-cleanup and
-    teardown (reused verbatim from `e2e_release31.py`);
+  * probe data — marking by the attempt tag in titles (unique per attempt, so a
+    retry never collides with its own note), idempotent pre-cleanup and
+    teardown (the prefix still matches every attempt);
   * scenarios — one `async def scenario_<n>_<name>(...)` per block, each opening
     with `scenario(n, "<title>")` and ending with its own `check()`/`skip()`;
   * `# TODO(3.2.0 future blocks)` — the empty section a follow-up postановка
@@ -92,6 +93,7 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+import anyio
 import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
@@ -257,6 +259,27 @@ def describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def is_transport_break(exc: BaseException) -> bool:
+    """Разрыв транспорта MCP, а не доменная ошибка продукта.
+
+    Живой прогон 10.10.2026: разрыв приходит и как `ExceptionGroup: unhandled
+    errors in a TaskGroup (1 sub-exception)` (anyio), поэтому группу разбираем
+    рекурсивно — «транспортной» она считается, только если внутри транспорт.
+    """
+    if isinstance(exc, MCPError):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(is_transport_break(inner) for inner in exc.exceptions)
+    if isinstance(exc, (httpx2.TransportError, httpx2.HTTPError, OSError,
+                        anyio.BrokenResourceError, anyio.ClosedResourceError,
+                        anyio.EndOfStream)):
+        return True
+    # MCP SDK 2.x тянет и httpx 1.x, и anyio: транспорт ловим и по модулю класса,
+    # а не только по типам своего httpx2 (иначе любой чужой клиент проскочит).
+    root = (getattr(type(exc), "__module__", "") or "").split(".")[0]
+    return root in ("httpx", "httpx2", "httpcore", "anyio", "h11")
+
+
 def json_size(obj: Any) -> int:
     """Size of the compact answer in bytes (the canon budget metric)."""
     return len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
@@ -353,6 +376,26 @@ class Client:
         self._keepalive.append(fresh)  # стек новой сессии живёт до конца процесса
         self.session = fresh.session
         return init
+
+
+async def call_with_reconnect(c: Client, tool: str, args: dict) -> dict:
+    """MCP call right after a contour hook: a transport break is re-opened once.
+
+    Хуки (рестарт контура, глушение/подъём слота) рвут живую сессию раннера, и
+    первый же вызов после хука падает — не только `MCPError`, но и
+    `ExceptionGroup`/anyio/httpx-транспортом (живой прогон 10.10.2026). Здесь
+    такой разрыв переоткрывается один раз, а доменная ошибка уходит наверх как
+    есть: продукт от неё не прикрываем.
+    """
+    try:
+        return await c.call(tool, args)
+    except Exception as exc:  # noqa: BLE001 — решаем по типу, а не глотаем
+        if not is_transport_break(exc):
+            raise
+        info(f"the MCP transport broke on {tool} ({describe(exc)}) — "
+             f"re-opening the session and retrying the call once")
+        await c.reconnect()
+        return await c.call(tool, args)
 
 
 async def fresh_session(stack: AsyncExitStack, url: str | None = None,
@@ -716,12 +759,18 @@ async def cleanup_own_data() -> None:
         await c.close()
 
 
-async def save_probe_note(c: Client, title: str) -> int | None:
-    """Create one probe note (marked by the run tag in its title); return its id."""
-    saved = await c.call("memory_save", {
+async def save_probe_note(c: Client, title: str, *, after_hook: bool = False) -> int | None:
+    """Create one probe note (marked by the run tag in its title); return its id.
+
+    `after_hook=True` — the call goes right after a contour hook (the transport
+    may be breaking): it is re-opened once via `call_with_reconnect`.
+    """
+    args = {
         "text": f"{RUN['tag']} probe note text (observability acceptance).",
         "title": title,
-    })
+    }
+    saved = (await call_with_reconnect(c, "memory_save", args) if after_hook
+             else await c.call("memory_save", args))
     if saved.get("id") is not None:
         RUN["notes"].append(saved["id"])
     return saved.get("id")
@@ -837,14 +886,14 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
     try:
         # Push work into the slot's queue so the wait is observable (a probe note
         # lands in vector+summary; the judge queue grows from the dedup hand-off).
-        await save_probe_note(c, RUN[f"note_outage_{slot}"])
+        await save_probe_note(c, RUN[f"note_outage_{slot}"], after_hook=True)
         if slot == "judge":
             # Судье нужна ПАРА-КАНДИДАТ: одной заметки мало — без близкого текста в
             # том же узле очередь `judge` остаётся пустой, и проверять «работа
             # видна, ничего не теряется» нечем. Текст отличается на хвост —
             # значит запись не блокируется как дословный дубль, а косинус пары
             # уходит выше порога кандидатов.
-            twin = await c.call("memory_save", {
+            twin = await call_with_reconnect(c, "memory_save", {
                 "text": f"{RUN['tag']} probe note text (observability acceptance) — "
                         "a near duplicate of the outage probe.",
                 "title": f"{RUN[f'note_outage_{slot}']} twin",
@@ -1322,8 +1371,9 @@ async def scenario_8_budget_raise_release(c: Client, rest: httpx2.AsyncClient) -
     try:
         # Push work into both queues: the probe note needs a summary, its dedup
         # hand-off needs a judge verdict (a hand-off pair is what freezes here).
-        probe_ids = [await save_probe_note(c, RUN["note_budget_break"]),
-                     await save_probe_note(c, RUN["note_budget_break_2"])]
+        probe_ids = [await save_probe_note(c, RUN["note_budget_break"], after_hook=True),
+                     await save_probe_note(c, RUN["note_budget_break_2"],
+                                           after_hook=True)]
         probes = len([item for item in probe_ids if item is not None])
 
         ok, detail = await wait_until(queue_has_work(rest, "summary"),
@@ -1520,7 +1570,7 @@ async def scenario_9_decision_fallback(c: Client, rest: httpx2.AsyncClient) -> N
         if not await restart("decision_on_cmd",
                              "DECISION_ENABLED=true + a working decision model"):
             return
-        await save_probe_note(c, RUN["note_decision"])
+        await save_probe_note(c, RUN["note_decision"], after_hook=True)
         ok, detail = await wait_until(
             _decision_reached(rest),
             "[decision] the slot takes decisions (/health.decision.answers grows)",
@@ -1544,7 +1594,7 @@ async def scenario_9_decision_fallback(c: Client, rest: httpx2.AsyncClient) -> N
         if not await restart("decision_unsupported_cmd",
                              "a model without /v1/systemone"):
             return
-        await save_probe_note(c, RUN["note_decision_unsupported"])
+        await save_probe_note(c, RUN["note_decision_unsupported"], after_hook=True)
         ok, detail = await wait_until(
             _decision_reached(rest, "unsupported"),
             "[decision] reason=unsupported is counted", timeout=min(CFG["wait_sec"], 240.0))
@@ -1559,7 +1609,7 @@ async def scenario_9_decision_fallback(c: Client, rest: httpx2.AsyncClient) -> N
         if not await restart("decision_off_cmd",
                              "the slot off + DECISION_FALLBACK=false"):
             return
-        await save_probe_note(c, RUN["note_decision_unavailable"])
+        await save_probe_note(c, RUN["note_decision_unavailable"], after_hook=True)
         ok, detail = await wait_until(
             queue_has_work(rest, "judge"),
             "[decision] the job waits (contract №39, no lost work)",
@@ -1578,7 +1628,7 @@ async def scenario_9_decision_fallback(c: Client, rest: httpx2.AsyncClient) -> N
         if not await restart("decision_low_confidence_cmd",
                              "a threshold+zone catching the probability"):
             return
-        await save_probe_note(c, RUN["note_decision_low_confidence"])
+        await save_probe_note(c, RUN["note_decision_low_confidence"], after_hook=True)
         ok, detail = await wait_until(
             _decision_reached(rest, "low_confidence"),
             "[decision] reason=low_confidence is counted",
@@ -2318,6 +2368,8 @@ async def run_all() -> None:
 
 def print_report() -> int:
     print(f"\n=== RUN RESULT (E2E release {RELEASE}) ===")
+    print(f"probe tag of the run: {RUN.get('tag')!r} "
+          f"(attempt {RUN.get('attempt')})")
     print(f"app version: {ENV.get('version')!r} | image: {CFG['image'] or '(not set)'} | "
           f"image revision: {ENV.get('revision')!r} | "
           f"image version: {ENV.get('image_version')!r}")
@@ -2356,6 +2408,34 @@ def print_report() -> int:
     if TRACE_PATH is not None:
         print(f"Teardown trace: {TRACE_PATH}")
     return 0 if FAIL == 0 else 1
+
+
+def configure_probe_data(run_id: str, attempt: int) -> str:
+    """Tag of ONE attempt — the probe data of every attempt must be unique.
+
+    Иначе повтор упирается в дословный дубль собственной заметки (`memory_save`
+    → `stored: false`), очередь `summary` остаётся пустой и проверка «работа
+    видна при выключенном слоте» падает по таймауту (живой прогон 10.10.2026).
+    Уборка по префиксу (--prefix e2e32) ищет подстроку — значит, находит и
+    старые попытки, и текущую. Возвращает фактический тег попытки.
+    """
+    tag = f"{CFG['prefix']}-{run_id}-a{attempt}"
+    RUN.update({
+        "tag": tag,
+        "attempt": attempt,
+        "notes": [],
+        "note_observability": f"{tag} observability probe",
+        "note_outage_embedding": f"{tag} outage probe embedding",
+        "note_outage_summary": f"{tag} outage probe summary",
+        "note_outage_judge": f"{tag} outage probe judge",
+        "note_budget_break": f"{tag} budget probe note one",
+        "note_budget_break_2": f"{tag} budget probe note two",
+        "note_decision": f"{tag} decision probe note",
+        "note_decision_unsupported": f"{tag} decision unsupported probe",
+        "note_decision_unavailable": f"{tag} decision unavailable probe",
+        "note_decision_low_confidence": f"{tag} decision low-confidence probe",
+    })
+    return tag
 
 
 async def main() -> int:
@@ -2506,27 +2586,16 @@ async def main() -> int:
         "no_cleanup": args.no_cleanup,
     })
     run_id = os.environ.get("LSB_E2E_RUN_ID") or time.strftime("%m%d%H%M%S")
-    tag = f"{CFG['prefix']}-{run_id}"
-    RUN.update({
-        "tag": tag,
-        "note_observability": f"{tag} observability probe",
-        "note_outage_embedding": f"{tag} outage probe embedding",
-        "note_outage_summary": f"{tag} outage probe summary",
-        "note_outage_judge": f"{tag} outage probe judge",
-        "note_budget_break": f"{tag} budget probe note one",
-        "note_budget_break_2": f"{tag} budget probe note two",
-        "note_decision": f"{tag} decision probe note",
-        "note_decision_unsupported": f"{tag} decision unsupported probe",
-        "note_decision_unavailable": f"{tag} decision unavailable probe",
-        "note_decision_low_confidence": f"{tag} decision low-confidence probe",
-        "notes": [],
-    })
 
-    # Up to 3 attempts: a broken MCP session must not zero the run.
+    # Up to 3 attempts: a broken MCP session must not zero the run. The probe
+    # tag carries the attempt number so a retry never collides with the probe
+    # data of the previous attempt (a literal duplicate means no new note).
     attempts = 0
     while attempts < 3:
         attempts += 1
         reset_counters()
+        tag = configure_probe_data(run_id, attempts)
+        print(f"\n=== attempt {attempts}: probe tag {tag} ===")
         try:
             await run_all()
             break
@@ -2537,7 +2606,9 @@ async def main() -> int:
             print(f"\n[retry] contour transport (attempt {attempts}): {describe(exc)}")
             await asyncio.sleep(5)
         except Exception as exc:
-            print(f"\n[retry] run error (attempt {attempts}): {describe(exc)}")
+            # Разрыв транспорта (в т.ч. `ExceptionGroup` anyio) — не ошибка продукта.
+            reason = "transport break" if is_transport_break(exc) else "run error"
+            print(f"\n[retry] {reason} (attempt {attempts}): {describe(exc)}")
             await asyncio.sleep(5)
     else:
         print("\n[FATAL] the run did not finish within 3 attempts")
