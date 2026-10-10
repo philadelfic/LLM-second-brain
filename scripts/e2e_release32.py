@@ -1015,7 +1015,13 @@ async def scenario_3_auth_branch(rest: httpx2.AsyncClient) -> None:
         manual("scenario 3 (№39 FR-3/FR-4.2/FR-4.3)",
                "point LSB_SLOT_AUTH_CMD at a fake provider that answers 401 and "
                "LSB_SLOT_AUTH_FIX_CMD at its fix: the slot must pause, /health.slots "
-               "must show last_outcome='auth' with paused_until, then probe and resume")
+               "must show last_outcome='auth' with paused_until, then probe and resume. "
+               "scripts/slot_fake.sh (see its --help) does exactly this: the 401 is "
+               "applied AFTER the contour is up (a 401 slot is fatal at the startup "
+               "check) and the fix restarts the fake only, never the contour — the "
+               "break, the probe and the resume stay alive: "
+               "LSB_SLOT_AUTH_CMD='scripts/slot_fake.sh auth' with LSB_AUTH_SLOT=summary, "
+               "LSB_SLOT_AUTH_FIX_CMD='scripts/slot_fake.sh on ok'")
         return
 
     slot = CFG["auth_slot"]
@@ -1080,7 +1086,15 @@ async def scenario_4_attention_pair(rest: httpx2.AsyncClient) -> None:
         manual("scenario 4 (№39 FR-3.4, no39-02)",
                "point the off-contract hook at a fake judge answering off-contract: "
                "the retries must be bounded, the job must appear in GET /jobs/attention "
-               "and, after the answer changes, be released and finish")
+               "and, after the answer changes, be released and finish. "
+               "scripts/slot_fake.sh: "
+               "LSB_JUDGE_OFFCONTRACT_CMD='scripts/slot_fake.sh on offcontract judge', "
+               "LSB_JUDGE_OFFCONTRACT_FIX_CMD='scripts/slot_fake.sh off'. The fix puts "
+               "the stock contour back: the restart releases the frozen job through "
+               "SLOT_ATTENTION_RESET_ON_START and the real judge finishes it. "
+               "'scripts/slot_fake.sh on ok judge' exercises the probe release "
+               "instead (the pause must expire first), but it leaves the judge on the "
+               "fake — the outage of scenarios 2/5 would then stop being visible")
         return
 
     proc = await run_shell(CFG["offcontract_cmd"])
@@ -1250,6 +1264,27 @@ async def future_block_todo() -> None:
            "the budget/finish_reason part of this placeholder is claimed by "
            "`scenario_8_budget_raise_release()` (lsbdef0008-02); the decision "
            "slot is claimed by `scenario_9_decision_fallback()` (f12-03)")
+    # Заглушки-провайдеры ветвей отказа: `scripts/fake_slot.py` (режимы ok / auth /
+    # empty-length / offcontract / decision-*) и хук `scripts/slot_fake.sh`
+    # (`on <mode> [slot ...]` пересоздаёт контур с env ветви, `off` возвращает
+    # штатный compose). Все четыре сценария остаются пропускаемыми, пока хук не
+    # задан: команды ниже подключает `scripts/acceptance_run.sh` (LSB_FAKE_HOOKS=0
+    # их отключает).
+    manual("outage branches: the contour hooks of scenarios 3/4/8/9",
+           "LSB_SLOT_AUTH_CMD='scripts/slot_fake.sh auth' + LSB_AUTH_SLOT=summary, "
+           "LSB_SLOT_AUTH_FIX_CMD='scripts/slot_fake.sh on ok'; "
+           "LSB_JUDGE_OFFCONTRACT_CMD='scripts/slot_fake.sh on offcontract judge', "
+           "LSB_JUDGE_OFFCONTRACT_FIX_CMD='scripts/slot_fake.sh off'; "
+           "LSB_BUDGET_BREAK_CMD='scripts/slot_fake.sh on empty-length summary "
+           "judge', LSB_BUDGET_FIX_CMD='scripts/slot_fake.sh on ok summary judge'; "
+           "LSB_DECISION_ON_CMD='scripts/slot_fake.sh on decision-ok', "
+           "LSB_DECISION_UNSUPPORTED_CMD='scripts/slot_fake.sh on "
+           "decision-unsupported', LSB_DECISION_OFF_CMD='scripts/slot_fake.sh on "
+           "decision-off', LSB_DECISION_LOW_CONFIDENCE_CMD='scripts/slot_fake.sh on "
+           "decision-low-confidence', LSB_DECISION_RESTORE_CMD='scripts/slot_fake.sh "
+           "off'. Run `scripts/slot_fake.sh --help` for the env of the hook "
+           "(SLOT_FAKE_PAUSE_SEC, SLOT_FAKE_MAX_ATTEMPTS, SLOT_FAKE_PROJECT_DIR, "
+           "SLOT_FAKE_MODELS ...)")
     # TODO(3.2.0 future blocks) — memory handles surface:
     manual("memory handles: search/list/get contract, budgets, pagination",
            "the node hint of `save` (№28) is claimed by "
@@ -1357,7 +1392,13 @@ async def scenario_8_budget_raise_release(c: Client, rest: httpx2.AsyncClient) -
                "empty content with done_reason=length, and LSB_BUDGET_FIX_CMD at a "
                "restart with SUMMARY_NUM_PREDICT=0 / SUMMARY_CONTEXT_TOKENS set and a "
                "working slot: the notes waiting for a summary must get it and the "
-               "judge queue must drain by itself")
+               "judge queue must drain by itself. scripts/slot_fake.sh: "
+               "LSB_BUDGET_BREAK_CMD='scripts/slot_fake.sh on empty-length summary "
+               "judge' (SLOT_FAKE_SUMMARY_MODEL_TYPE / SLOT_FAKE_SUMMARY_NUM_PREDICT "
+               "tune the tight budget), LSB_BUDGET_FIX_CMD='scripts/slot_fake.sh on ok "
+               "summary judge' (the raised budget is the stock env: the re-creation "
+               "drops the tight knobs and changes the slot fingerprint, which "
+               "releases the frozen pair)")
         return
 
     proc = await run_shell(CFG["budget_break_cmd"])
@@ -1553,7 +1594,13 @@ async def scenario_9_decision_fallback(c: Client, rest: httpx2.AsyncClient) -> N
                "LSB_DECISION_OFF_CMD (the slot off + DECISION_FALLBACK=false), "
                "LSB_DECISION_LOW_CONFIDENCE_CMD (a threshold+zone catching the "
                "probability), LSB_DECISION_RESTORE_CMD (the baseline back): "
-               "/health must stay honest at every step")
+               "/health must stay honest at every step. scripts/slot_fake.sh: "
+               "LSB_DECISION_ON_CMD='scripts/slot_fake.sh on decision-ok', "
+               "LSB_DECISION_UNSUPPORTED_CMD='scripts/slot_fake.sh on "
+               "decision-unsupported', LSB_DECISION_OFF_CMD='scripts/slot_fake.sh on "
+               "decision-off', LSB_DECISION_LOW_CONFIDENCE_CMD='scripts/slot_fake.sh "
+               "on decision-low-confidence', LSB_DECISION_RESTORE_CMD='scripts/"
+               "slot_fake.sh off'")
         return
 
     async def restart(hook: str, state: str) -> bool:

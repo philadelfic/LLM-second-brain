@@ -29,13 +29,42 @@ trap 'rm -f "$ENV_FILE"' EXIT
 # Токен контура берём из самого контейнера и НИКОГДА не печатаем.
 docker exec lsb-test env | grep -E '^(MCP_AUTH_TOKEN|MCP_)=' > "$ENV_FILE"
 
+# Заглушки-провайдеры ветвей отказа (сценарии 3/4/8/9): те самые хуки, без
+# которых эти сценарии честно SKIP. Работает пара `scripts/slot_fake.sh` +
+# `scripts/fake_slot.py`: `on <mode> [slot ...]` пересобирает контур с env ветви
+# (слот смотрит на http://lsb-fake:8080), `off` возвращает штатный compose.
+# Выключатель — LSB_FAKE_HOOKS=0 (тогда набор хуков не подставляется вовсе).
+# ВНИМАНИЕ: хуку нужен `docker compose` внутри раннера — плагин compose
+# монтируется ниже отдельной строкой (простого `docker restart` не хватает:
+# env вшивается при СОЗДАНИИ контейнера, контур пересобирается).
+FAKE_HOOKS=()
+if [[ "${LSB_FAKE_HOOKS:-1}" != "0" ]]; then
+  FAKE_HOOKS=(
+    -e "LSB_SLOT_AUTH_CMD=scripts/slot_fake.sh on auth"
+    -e "LSB_SLOT_AUTH_FIX_CMD=scripts/slot_fake.sh on ok"
+    -e "LSB_AUTH_SLOT=summary"
+    -e "LSB_JUDGE_OFFCONTRACT_CMD=scripts/slot_fake.sh on offcontract judge"
+    -e "LSB_JUDGE_OFFCONTRACT_FIX_CMD=scripts/slot_fake.sh off"
+    -e "LSB_BUDGET_BREAK_CMD=scripts/slot_fake.sh on empty-length summary judge"
+    -e "LSB_BUDGET_FIX_CMD=scripts/slot_fake.sh on ok summary judge"
+    -e "LSB_DECISION_ON_CMD=scripts/slot_fake.sh on decision-ok"
+    -e "LSB_DECISION_UNSUPPORTED_CMD=scripts/slot_fake.sh on decision-unsupported"
+    -e "LSB_DECISION_OFF_CMD=scripts/slot_fake.sh on decision-off"
+    -e "LSB_DECISION_LOW_CONFIDENCE_CMD=scripts/slot_fake.sh on decision-low-confidence"
+    -e "LSB_DECISION_RESTORE_CMD=scripts/slot_fake.sh off"
+    -e "SLOT_FAKE_PROJECT_DIR=/w"
+  )
+fi
+
 docker run --rm --user root --network lsb-test_default \
   -v "${HOST_ROOT}/test:/w" \
   -v "${HOST_ROOT}/dev/release:/w/release" \
   -v ${HOST_ROOT}/test/data-test:/data \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /usr/bin/docker:/usr/local/bin/docker \
+  -v /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro \
   -w /w --env-file "$ENV_FILE" \
+  "${FAKE_HOOKS[@]+"${FAKE_HOOKS[@]}"}" \
   -e LSB_SLOT_OFF_CMD="scripts/slot_gate.sh off" \
   -e LSB_SLOT_ON_CMD="scripts/slot_gate.sh on" \
   -e LSB_RESTART_CMD="docker restart lsb-test" \
