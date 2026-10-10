@@ -823,6 +823,22 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
         # Push work into the slot's queue so the wait is observable (a probe note
         # lands in vector+summary; the judge queue grows from the dedup hand-off).
         await save_probe_note(c, RUN[f"note_outage_{slot}"])
+        if slot == "judge":
+            # Судье нужна ПАРА-КАНДИДАТ: одной заметки мало — без близкого текста в
+            # том же узле очередь `judge` остаётся пустой, и проверять «работа
+            # видна, ничего не теряется» нечем. Текст отличается на хвост —
+            # значит запись не блокируется как дословный дубль, а косинус пары
+            # уходит выше порога кандидатов.
+            twin = await c.call("memory_save", {
+                "text": f"{RUN['tag']} probe note text (observability acceptance) — "
+                        "a near duplicate of the outage probe.",
+                "title": f"{RUN[f'note_outage_{slot}']} twin",
+            })
+            if twin.get("id") is not None:
+                RUN["notes"].append(twin["id"])
+            else:
+                warn("[judge] the near-duplicate probe note was not created",
+                     f"answer={twin}")
 
         ok, detail = await wait_until(
             queue_has_work(rest, queue),
