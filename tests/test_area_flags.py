@@ -121,9 +121,8 @@ _FLAG_NAMES = (
     "AREA_LOGS_ENABLED",
 )
 
-# Области реестра, чья агентская поверхность появляется позже f10-01 (ручки —
-# f10-02/03): на этом этапе область зарегистрирована, но ручек ещё не даёт.
-_SURFACE_PENDING_AREAS = frozenset({"logs"})
+# Области реестра и их агентская поверхность совпадают без поблажек (f10-02:
+# у области логов появились ручки `logs_*` — временное исключение f10-01 снято).
 _CORE_TOOLS = frozenset(
     {
         "memory_search",
@@ -170,9 +169,7 @@ def test_surface_consistency(monkeypatch: pytest.MonkeyPatch) -> None:
 
         names = _tool_names(build_mcp(settings, services))
         enabled = {spec.name for spec in enabled_areas(settings)}
-        # Логи (f10-01) в реестре, но без MCP-поверхности (ручки — f10-02/03).
-        surfaced = enabled - _SURFACE_PENDING_AREAS
-        assert _areas_in_surface(names) == surfaced, flags
+        assert _areas_in_surface(names) == enabled, flags
         assert _CORE_TOOLS <= names, flags
         # Лишних ручек нет: всё вне ядра принадлежит ВКЛЮЧЁННОЙ области.
         prefixes = tuple(f"{area}_" for area in enabled)

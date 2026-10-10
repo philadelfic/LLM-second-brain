@@ -255,10 +255,10 @@ class TestMCPUnchanged:
     """Постановка не трогает поиск, реестр узлов и состав поверхности."""
 
     @pytest.mark.asyncio
-    async def test_surface_is_still_25_tools(self, mcp_server) -> None:
-        """Регресс поверхности: 25 инструментов (+ пары истории/№41 и warnings/№12, + пометки no24-02)."""
+    async def test_surface_is_still_29_tools(self, mcp_server) -> None:
+        """Регресс поверхности: 29 инструментов (+ пары истории/№41 и warnings/№12, + пометки no24-02, + 4 ручки логов LSBN-F-10)."""
         names = {tool.name for tool in await mcp_server.list_tools()}
-        assert len(names) == 25
+        assert len(names) == 29
         assert names == TOOL_NAMES
 
     @pytest.mark.asyncio

@@ -167,6 +167,8 @@ from app.services.notes import (
     NoteValidationError,
     TitleValidationError,
 )
+from app.services.logs import _UNSET as _LOG_UNSET
+from app.services.logs import LogValidationError
 from app.services.skills import SkillValidationError
 from app.services.terms import TermValidationError
 from app.services.warnings import WarningsValidationError
@@ -701,6 +703,45 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "comes back as a soft {…, hint} without an exception; history is off "
         "— empty with a hint."
     ),
+    # LSBN-F-10 (f10-02, arch §7.1): описания четырёх ручек области логов.
+    # Правило «лог — не знание, пиши только явным вызовом, не выдумывай
+    # источник» и словарь объекта изменения вшиты в тексты: описания —
+    # гарантированный канал, инструкции MCP блока «logs» не содержат
+    # (инъекции нет, arch §2; раздел инструкции — f10-04). Поиск/листинг — 03.
+    "logs_save": (
+        "Save ONE entry to the assistant-logs area: action (what was done) and "
+        "reason (why) are required, ≤500 characters each; entity names the "
+        "object of the change — one of note, skill, term, user_fact, "
+        "assistant_log, file, commit, tracker_task, config, contour — versioned "
+        "kinds need entity_id (plus entity_version when the change was made to "
+        "a known version), the others need entity_ref (a path, commit hash, "
+        "task key or config name); outcome (result) and verified (what was "
+        "checked) are optional. A log is a record of work, NOT knowledge: write "
+        "only on an explicit call, never for other tools' calls, and never "
+        "invent source/session — the call context supplies them. Returns "
+        "{id, created, version}; a soft refusal returns {created: false, hint} "
+        "and writes nothing."
+    ),
+    "logs_get": (
+        "Read ONE log entry by id: action, reason, the referenced object "
+        "(entity/entity_id/entity_version/entity_ref), outcome, verified, "
+        "source, session and timestamps. The full text is returned here; the "
+        "search and listing tools cut it. The entry stays readable after the "
+        "object of the change was deleted."
+    ),
+    "logs_update": (
+        "Update a log entry by id: any field of logs_save; a field that is not "
+        "passed keeps its current value. Run logs_get first so you don't lose "
+        "details, and pass a field only when the entry is really wrong — each "
+        "edit is versioned by the shared history layer. An empty update comes "
+        "back as a soft {updated: false, hint} and changes nothing."
+    ),
+    "logs_delete": (
+        "Delete a log entry by id (soft delete: it disappears from the agent "
+        "surface; restoring is the operator's job). The deletion is recorded in "
+        "the shared history as an event. Delete only an entry that is "
+        "factually wrong or duplicates another one."
+    ),
 }
 
 TOOL_NAMES = frozenset(TOOL_DESCRIPTIONS)
@@ -1197,6 +1238,62 @@ def _compact_term_get(result: dict[str, Any]) -> dict[str, Any]:
     if "term" not in result:
         return _with_hint({}, result)
     return _pick(result, _TERM_GET_ITEM)
+
+
+# LSBN-F-10 (f10-02, arch §7.1/§6.1): компактные выдачи области логов — белые
+# списки полей. Тела записи режет только поиск/листинг (f10-03: `excerpt`
+# `logs_search_excerpt_chars`); `logs_get` отдаёт запись целиком — агент обязан
+# видеть, к какому объекту и с какой версией относится запись. `hint` — только
+# при мягком отказе; `warning` (деградация FTS-only) появится в 03.
+_LOG_GET_ITEM = (
+    "id",
+    "action",
+    "reason",
+    "entity",
+    "entity_id",
+    "entity_version",
+    "entity_ref",
+    "outcome",
+    "verified",
+    "source",
+    "session",
+    "created_at",
+    "updated_at",
+)
+
+
+def _log_field(value: Any) -> Any:
+    """Поле `logs_update`: не переданное (None) — значит «оставить как есть».
+
+    Мост между схемой инструмента (у опциональных полей default None) и
+    сервисом, где «не передано» — сентинел `_LOG_UNSET` (прецедент
+    `memory_update`/`user_update`): так пустая строка остаётся осмысленной.
+    """
+    return _LOG_UNSET if value is None else value
+
+
+def _compact_log_save(result: dict[str, Any]) -> dict[str, Any]:
+    """logs_save: (id, created, version); мягкий отказ — (created: false, hint)."""
+    if not result.get("created"):
+        return _with_hint({"created": False}, result)
+    return _pick(result, ("id", "created", "version"))
+
+
+def _compact_log_get(result: dict[str, Any]) -> dict[str, Any]:
+    """logs_get: белый список полей записи; нет/удалена → (id) + hint §7.3."""
+    if "action" not in result:
+        return _with_hint({"id": result["id"]}, result)
+    return _pick(result, _LOG_GET_ITEM)
+
+
+def _compact_log_update(result: dict[str, Any]) -> dict[str, Any]:
+    """logs_update: (id, updated); «ничего не передано»/нет записи → hint §7.3."""
+    return _with_hint(_pick(result, ("id", "updated")), result)
+
+
+def _compact_log_delete(result: dict[str, Any]) -> dict[str, Any]:
+    """logs_delete: (id, deleted); повторный/чужой id → hint канона §7.3."""
+    return _with_hint(_pick(result, ("id", "deleted")), result)
 
 
 # №41 (FR-5.3, §7.1, §13.14): история из MCP — одна общая пара инструментов
@@ -2645,5 +2742,272 @@ def build_mcp(
             else:
                 log_tool_call("terms_get", started, results=1, id=id)
             return _compact_term_get(result)
+
+    # --- область логов (LSBN-F-10, f10-02, arch §7.1) ----------------------
+    # Тонкие обёртки над `LogsService` (один код с REST-зеркалами — f10-03):
+    # блокирующие вызовы — в `asyncio.to_thread`, выдачи — белые списки, hint —
+    # только при мягком отказе, содержимое лога в журнал НЕ идёт (NFR-4: длины,
+    # id и признак отказа). Регистрация под флагом области: выключенная область
+    # не даёт агенту ни одной ручки (FR-4.1), но данные и REST оператора
+    # остаются (§13.11). `source`/`session` по умолчанию не передаются: их берёт
+    # миддлварь вызова (`bind_origin`) — модель источник не выдумывает. Поиск и
+    # листинг (`logs_search`/`logs_list`) — f10-03; раздел инструкции и
+    # `assistant_log` в словаре `history_*` — f10-04.
+
+    if settings.area_logs_enabled and services.logs is not None:
+        @mcp.tool(name="logs_save", description=TOOL_DESCRIPTIONS["logs_save"])
+        async def logs_save(
+            action: Annotated[
+                str,
+                Field(description="What was done: ≤500 characters"),
+            ],
+            reason: Annotated[
+                str,
+                Field(description="Why it was done: ≤500 characters"),
+            ],
+            entity: Annotated[
+                str | None,
+                Field(
+                    description="Object of the change: note | skill | term | "
+                    "user_fact | assistant_log | file | commit | tracker_task | "
+                    "config | contour; omit when nothing specific changed",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            entity_id: Annotated[
+                int | None,
+                Field(
+                    description="Id of the changed object in its own area "
+                    "(versioned kinds only)",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            entity_version: Annotated[
+                int | None,
+                Field(
+                    description="Version of the changed object at the moment "
+                    "of the entry (requires entity_id)",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            entity_ref: Annotated[
+                str | None,
+                Field(
+                    description="Text reference for the kinds without an id: "
+                    "a path, commit hash, task key or config name",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            outcome: Annotated[
+                str | None,
+                Field(
+                    description="What came out of it: ≤500 characters",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            verified: Annotated[
+                str | None,
+                Field(
+                    description="What was checked: ≤200 characters",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            source: Annotated[
+                str | None,
+                Field(
+                    description="Call channel: mcp | rest | merge | migration "
+                    "| job:<name>; not passed — taken from the call context",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            session: Annotated[
+                str | None,
+                Field(
+                    description="Identifier of the call/agent; not passed — "
+                    "taken from the call context",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+        ) -> dict[str, Any]:
+            # Лимиты формы валидирует СЕРВИС (не схема — как `terms_save`):
+            # нарушение → LogValidationError с дословным hint §7.3, записи НЕТ.
+            # NFR-4: в журнал идут длины и id, не содержимое.
+            started = time.perf_counter()
+            sizes = {"action_chars": len(action), "reason_chars": len(reason)}
+            try:
+                result = await asyncio.to_thread(
+                    services.logs.save,
+                    action,
+                    reason,
+                    entity=entity,
+                    entity_id=entity_id,
+                    entity_version=entity_version,
+                    entity_ref=entity_ref,
+                    outcome=outcome,
+                    verified=verified,
+                    source=source,
+                    session=session,
+                )
+            except LogValidationError as exc:
+                log_tool_call(
+                    "logs_save", started, failed=True, reason=str(exc), **sizes
+                )
+                return {"created": False, "hint": str(exc)}
+            log_tool_call(
+                "logs_save", started, results=1, id=result["id"], **sizes
+            )
+            return _compact_log_save(result)
+
+        @mcp.tool(name="logs_get", description=TOOL_DESCRIPTIONS["logs_get"])
+        async def logs_get(
+            id: Annotated[int, Field(description="Log entry id")],
+        ) -> dict[str, Any]:
+            started = time.perf_counter()
+            result = await asyncio.to_thread(services.logs.get, id)
+            if "hint" in result:
+                # Мягкий отказ: записи нет (мягко — возможно, удалена).
+                log_tool_call(
+                    "logs_get", started, failed=True, reason=result["hint"], id=id
+                )
+            else:
+                log_tool_call("logs_get", started, results=1, id=id)
+            return _compact_log_get(result)
+
+        @mcp.tool(
+            name="logs_update", description=TOOL_DESCRIPTIONS["logs_update"]
+        )
+        async def logs_update(
+            id: Annotated[int, Field(description="Log entry id")],
+            action: Annotated[
+                str | None,
+                Field(
+                    description="New action: ≤500 characters; not passed — "
+                    "the current one stays",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            reason: Annotated[
+                str | None,
+                Field(
+                    description="New reason: ≤500 characters; not passed — "
+                    "the current one stays",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            entity: Annotated[
+                str | None,
+                Field(
+                    description="New object of the change (empty string clears "
+                    "it); not passed — the current one stays",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            entity_id: Annotated[
+                int | None,
+                Field(
+                    description="New id of the changed object; not passed — "
+                    "the current one stays",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            entity_version: Annotated[
+                int | None,
+                Field(
+                    description="New version of the changed object; not passed "
+                    "— the current one stays",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            entity_ref: Annotated[
+                str | None,
+                Field(
+                    description="New text reference; not passed — the current "
+                    "one stays",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            outcome: Annotated[
+                str | None,
+                Field(
+                    description="New outcome: ≤500 characters; not passed — "
+                    "the current one stays",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            verified: Annotated[
+                str | None,
+                Field(
+                    description="New 'what was checked': ≤200 characters; not "
+                    "passed — the current one stays",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            source: Annotated[
+                str | None,
+                Field(
+                    description="New call channel; not passed — the current one "
+                    "stays",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            session: Annotated[
+                str | None,
+                Field(
+                    description="New call/agent identifier; not passed — the "
+                    "current one stays",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+        ) -> dict[str, Any]:
+            # «Не передано = оставить»: None схемы → сентинел сервиса
+            # (`_log_field`). Лимиты и словари валидирует сервис (hint §7.3).
+            started = time.perf_counter()
+            result = await asyncio.to_thread(
+                services.logs.update,
+                id,
+                action=_log_field(action),
+                reason=_log_field(reason),
+                entity=_log_field(entity),
+                entity_id=_log_field(entity_id),
+                entity_version=_log_field(entity_version),
+                entity_ref=_log_field(entity_ref),
+                outcome=_log_field(outcome),
+                verified=_log_field(verified),
+                source=_log_field(source),
+                session=_log_field(session),
+            )
+            if result.get("updated"):
+                log_tool_call("logs_update", started, results=1, id=id)
+            else:
+                # Мягкий отказ: ничего не передано либо записи нет.
+                log_tool_call(
+                    "logs_update",
+                    started,
+                    failed=True,
+                    reason=result["hint"],
+                    id=id,
+                )
+            return _compact_log_update(result)
+
+        @mcp.tool(
+            name="logs_delete", description=TOOL_DESCRIPTIONS["logs_delete"]
+        )
+        async def logs_delete(
+            id: Annotated[int, Field(description="Log entry id")],
+        ) -> dict[str, Any]:
+            started = time.perf_counter()
+            result = await asyncio.to_thread(services.logs.delete, id)
+            if result.get("deleted"):
+                log_tool_call("logs_delete", started, id=id, deleted=True)
+            else:
+                # Повторный/несуществующий id — мягкий отказ с hint §7.3.
+                log_tool_call(
+                    "logs_delete",
+                    started,
+                    failed=True,
+                    reason=result["hint"],
+                    id=id,
+                )
+            return _compact_log_delete(result)
 
     return mcp

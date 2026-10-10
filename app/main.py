@@ -290,6 +290,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # None — симметрично прочим областям (№40).
     if services.terms is not None:
         services.terms.set_areas_notifier(worker.notify_areas_pending)
+    # Область логов (3.2.0, LSBN-F-10, f10-02): запись/правка/удаление лога будит ту
+    # же петлю areas — вектор записи (непустые action + reason + outcome, §5.3)
+    # догоняется сразу, а не по выросшему back-off. Проверка на None — как у
+    # прочих областей (№40).
+    if services.logs is not None:
+        services.logs.set_areas_notifier(worker.notify_areas_pending)
     # Внутренний маршрут MCP-сервера — ровно MCP_PATH. host="0.0.0.0" — не
     # localhost, поэтому SDK не включает DNS-rebinding protection (сервис
     # живёт в LAN за Bearer-токеном; Open WebUI ходит с не-localhost Host).
@@ -335,6 +341,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "skills": settings.area_skills_enabled,
                     "terms": settings.area_terms_enabled,
                     "user_facts": settings.area_user_facts_enabled,
+                    # LSBN-F-10 (f10-02): область логов активна тем же реестром;
+                    # ключ добавлен минимально, реестровый рефакторинг события —
+                    # отдельная позиция (f10-04).
+                    "logs": settings.area_logs_enabled,
                 },
             },
         )

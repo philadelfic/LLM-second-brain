@@ -172,6 +172,8 @@ class TestHealth:
             "skills": True,
             "terms": False,
             "user_facts": True,
+            # LSBN-F-10 (f10-02): область логов в событии старта.
+            "logs": True,
         }
 
 

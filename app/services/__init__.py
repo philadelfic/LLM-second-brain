@@ -31,6 +31,7 @@ from app.services.embedding import EmbeddingService
 from app.services.judge import JudgeService
 from app.services.links import LinksService
 from app.services.llm_client import LLMClient, SlotSpec
+from app.services.logs import LogsService
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
 from app.services.promotion import DescriptionService, PromotionService, StructureJudgeService
@@ -55,6 +56,7 @@ __all__ = [
     "JudgeService",
     "LinksService",
     "LLMClient",
+    "LogsService",
     "NamespaceService",
     "NoteService",
     "PromotionService",
@@ -106,6 +108,13 @@ class Services:
     # 3.1.0: связи заметок (lsb-0010) — уровень 0 («ленивый граф»). В проде (build_services)
     # всегда с общим экземпляром search; DI-сборки тестов без связей передают None.
     links: LinksService
+    # 3.2.0 (LSBN-F-10, arch §6.2/§13.11): область «Логи ассистента» — журнал
+    # действий ассистента («что сделано, почему, объект, результат, что
+    # проверено»). Собирается ВСЕГДА, как notes/terms/user_facts: REST оператора
+    # и слой истории обязаны работать и у выключенной области (§13.11) — флаг
+    # `AREA_LOGS_ENABLED` гейтит только поверхность MCP и фон. `embedding` —
+    # общий экземпляр слота (путь записи его не зовёт; точка сборки поиска 03).
+    logs: LogsService | None = None
     llm_embedding: LLMClient | None = None  # клиент слота embedding (Фаза 11, решение №5)
     llm_summary: LLMClient | None = None  # клиент слота summary (summarize/merge/classify/describe)
     llm_judge: LLMClient | None = None  # клиент слота judge (дедуп + судья структуры)
@@ -138,7 +147,7 @@ def build_services(
     собираются из Settings всегда (стартовая проверка №5 проверяет
     конфигурацию слотов, даже если сервисы подменены фейками).
 
-    Сервисы областей (skills/terms/user_facts) собираются ВСЕГДА, независимо
+    Сервисы областей (skills/terms/user_facts/logs) собираются ВСЕГДА, независимо
     от флагов `AREA_*_ENABLED` (№40, релиз 3.2.0): операторский REST и слой
     истории должны иметь доступ к данным выключенной области (решение
     владельца 2026-10-08). Флаг гейтит только поверхность MCP, раздел/анонс в
@@ -227,6 +236,10 @@ def build_services(
         # триграммная, arch lsb-0008 §3.5; точка сборки гибридного поиска).
         terms=TermsService(settings, embedding=embedding),
         links=links,
+        # 3.2.0 (LSBN-F-10): сервис области «Логи ассистента» (f10-02); embedding —
+        # общий экземпляр слота (запись его не зовёт — вектор догоняет петля
+        # areas; точка сборки поиска области — f10-03).
+        logs=LogsService(settings, embedding=embedding),
         # 3.2.0 (№12): общая поверхность предупреждений (no12-02) — только SQL,
         # классификатор не нужен (пишет джоба `warnings`, №12 FR-3.2/§13.4).
         warnings=WarningsService(settings, classifier=None, namespaces=namespaces),

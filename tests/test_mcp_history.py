@@ -111,7 +111,14 @@ class TestHistoryTools:
         """Пара общих инструментов истории; поверхность 21 → 23 (FR-5.3)."""
         names = {tool.name for tool in await mcp_history.list_tools()}
         assert {"history_list", "history_get"} <= names
-        assert set(TOOL_NAMES) == names
+        # Логи (f10-02) в этой DI-сборке не собраны (`services.logs is None`):
+        # их ручек в поверхности нет, остальное совпадает со словарём TOOL_NAMES.
+        assert set(TOOL_NAMES) - {
+            "logs_save",
+            "logs_get",
+            "logs_update",
+            "logs_delete",
+        } == names
         assert len(names) == 25
         assert TOOL_DESCRIPTIONS["history_list"]
         assert TOOL_DESCRIPTIONS["history_get"]
