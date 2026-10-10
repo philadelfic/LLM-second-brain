@@ -845,21 +845,98 @@ async def cleanup_own_data() -> None:
         await c.close()
 
 
-async def save_probe_note(c: Client, title: str, *, after_hook: bool = False) -> int | None:
-    """Create one probe note (marked by the run tag in its title); return its id.
+def contour_alive(rest: httpx2.AsyncClient) -> Callable[[], Awaitable[tuple[bool, str]]]:
+    """Zero-arg `wait_until` predicate: the contour answers `/health` (см. `_http_alive`)."""
 
-    `after_hook=True` — the call goes right after a contour hook (the transport
-    may be breaking): it is re-opened once via `call_with_reconnect`.
+    async def predicate() -> tuple[bool, str]:
+        return await _http_alive(rest)
+
+    return predicate
+
+
+async def _await_contour_ready(rest: httpx2.AsyncClient) -> None:
+    """Дождаться живости контура перед повторной попыткой сохранить заметку.
+
+    Переоткрытие сессии после хука могло застать контур перезапускающимся
+    (хук рестарта, смена конфигурации слота): тогда повторный `memory_save`
+    падает так же, как первая попытка, и пробная заметка молча не создаётся
+    (живой прогон 10.10.2026). Живость уже проверяет `_http_alive` — ждём только
+    если она ещё не наступила, чтобы не плодить пустые строки в таблице ожиданий.
+    """
+    alive, detail = await _http_alive(rest)
+    if alive:
+        return
+    info(f"the contour is not ready before the probe retry ({detail}) — waiting "
+         f"for /health")
+    await wait_until(contour_alive(rest),
+                     "the contour answers /health before the probe note is re-saved",
+                     timeout=min(CFG["wait_sec"], 120.0))
+
+
+async def _save_probe_once(c: Client, args: dict, *,
+                           reconnect: bool = False) -> tuple[int | None, str]:
+    """One `memory_save` of a probe note → `(id, detail)`; не глотает доменную ошибку.
+
+    `reconnect=True` — вызов идёт через `call_with_reconnect` (разрыв транспорта
+    переоткрывает сессию один раз). Разрыв, оставшийся разрывом, возвращается
+    причиной, а не исключением: вызывающий сам решает, повторять ли.
+    """
+    try:
+        answer = (await call_with_reconnect(c, "memory_save", args) if reconnect
+                  else await c.call("memory_save", args))
+    except Exception as exc:  # noqa: BLE001 — разрыв решаем по типу, не глотаем
+        if not is_transport_break(exc):
+            raise
+        return None, f"transport broke: {describe(exc)}"
+    if not isinstance(answer, dict):
+        return None, f"unexpected answer: {answer!r}"
+    if answer.get("id") is not None:
+        RUN["notes"].append(answer["id"])
+        return answer["id"], f"id={answer['id']}"
+    return None, note_detail(answer)
+
+
+async def save_probe_note_result(c: Client, title: str, *, text: str | None = None,
+                                 after_hook: bool = False,
+                                 rest: httpx2.AsyncClient | None = None,
+                                 ) -> tuple[int | None, str]:
+    """Create one probe note, CHECK that it exists, retry once → `(id, detail)`.
+
+    Ответ без `id` — это не «заметка создана»: продукт мог отказать (дословный
+    дубль, лимит) или транспорт мог оборваться, оставив ответ пустым. Живой
+    прогон 10.10.2026: сессия раннера умерла на хуке, переоткрытие прошло, но
+    заметка так и не создалась — ветка обрыва ждала пустую очередь 180 с и
+    краснела ложным FAIL. Здесь сохраняем не больше двух раз: первый — сразу
+    (после хука через `call_with_reconnect`), второй — снова через
+    `call_with_reconnect` и, если контур ещё поднимается, после ожидания его
+    живости (`rest`). `detail` — причина неудачи (ответ продукта / разрыв), при
+    успехе — `id=<n>`.
     """
     args = {
-        "text": f"{RUN['tag']} probe note text (observability acceptance).",
+        "text": text or f"{RUN['tag']} probe note text (observability acceptance).",
         "title": title,
     }
-    saved = (await call_with_reconnect(c, "memory_save", args) if after_hook
-             else await c.call("memory_save", args))
-    if saved.get("id") is not None:
-        RUN["notes"].append(saved["id"])
-    return saved.get("id")
+    note_id, detail = await _save_probe_once(c, args, reconnect=after_hook)
+    if note_id is not None:
+        return note_id, detail
+    info(f"the probe note {title!r} is not created ({detail}) — retrying once "
+         f"through the session re-open")
+    if rest is not None:
+        await _await_contour_ready(rest)
+    return await _save_probe_once(c, args, reconnect=True)
+
+
+async def save_probe_note(c: Client, title: str, *, after_hook: bool = False,
+                          rest: httpx2.AsyncClient | None = None) -> int | None:
+    """Create one probe note (marked by the run tag in its title); return its id.
+
+    Обёртка над `save_probe_note_result`: там — проверка «заметка создана» и
+    единственный повтор через переоткрытие сессии; тем, кому причина не нужна,
+    здесь возвращается только `id` (или None).
+    """
+    note_id, _detail = await save_probe_note_result(c, title, after_hook=after_hook,
+                                                    rest=rest)
+    return note_id
 
 
 # ==== scenarios: 0. surface and readiness ======================================
@@ -997,25 +1074,47 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
     try:
         # Push work into the slot's queue so the wait is observable (a probe note
         # lands in vector+summary; the judge queue grows from the dedup hand-off).
-        probe = await save_probe_note(c, RUN[f"note_outage_{slot}"], after_hook=True)
+        probe, probe_detail = await save_probe_note_result(
+            c, RUN[f"note_outage_{slot}"], after_hook=True, rest=rest)
         probe_ids = [probe] if probe is not None else []
+        if probe is None:
+            # Пробная заметка не создалась (ответ без `id`: отказ, разрыв,
+            # дословный дубль). Очередь этого слота гарантированно пуста — её
+            # 180-секундное ожидание дало бы ложный FAIL вместо честного SKIP
+            # (живой прогон 10.10.2026: сессия раннера умерла на хуке, а
+            # пробная заметка не сохранилась даже после переоткрытия). Ветку
+            # оставляем честно: SKIP с причиной, слот поднимаем обратно, ничего
+            # не теряем — как и в случае «слот эмбеддингов в паузе» выше.
+            skip(f"[{slot}] with the slot down the work stays visible (nothing is lost)",
+                 f"пробная заметка не создана: {probe_detail}")
+            manual(f"scenario 2, branch [{slot}] (№39 FR-1/FR-2/FR-5.1)",
+                   "пробную заметку не удалось создать, поэтому очередь пуста "
+                   f"не по вине слота (memory_save → {probe_detail}); проверь "
+                   "живость контура и MCP-сессии (LSB_LOGS_CMD), подними слот "
+                   "(LSB_SLOT_ON_CMD) и перезапусти сценарий")
+            back = await run_shell(slot_cmd(CFG["slot_on_cmd"], slot))
+            released = True
+            check(f"[{slot}] the slot is started back by the contour hook",
+                  back.returncode == 0, f"rc={back.returncode}")
+            return
         if slot == "judge":
             # Судье нужна ПАРА-КАНДИДАТ: одной заметки мало — без близкого текста в
             # том же узле очередь `judge` остаётся пустой, и проверять «работа
             # видна, ничего не теряется» нечем. Текст отличается на хвост —
             # значит запись не блокируется как дословный дубль, а косинус пары
-            # уходит выше порога кандидатов.
-            twin = await call_with_reconnect(c, "memory_save", {
-                "text": f"{RUN['tag']} probe note text (observability acceptance) — "
-                        "a near duplicate of the outage probe.",
-                "title": f"{RUN[f'note_outage_{slot}']} twin",
-            })
-            if twin.get("id") is not None:
-                RUN["notes"].append(twin["id"])
-                probe_ids.append(twin["id"])
+            # уходит выше порога кандидатов. Заметка-близнец создаётся тем же
+            # надёжным путём, что и пробная: без `id` в ответе очередь снова
+            # осталась бы пустой и ветка прочлась бы ложным FAIL.
+            twin, twin_detail = await save_probe_note_result(
+                c, f"{RUN[f'note_outage_{slot}']} twin",
+                text=f"{RUN['tag']} probe note text (observability acceptance) — "
+                     "a near duplicate of the outage probe.",
+                after_hook=True, rest=rest)
+            if twin is not None:
+                probe_ids.append(twin)
             else:
                 warn("[judge] the near-duplicate probe note was not created",
-                     f"answer={twin}")
+                     twin_detail)
 
         # №39 (guard BEFORE the queue check): this queue counts a note only when
         # its vector is ready, so the embedding slot must have vectorised the
