@@ -340,6 +340,37 @@ _AREA_FTS_SPECS = (
     (ASSISTANT_LOGS_TABLE, ASSISTANT_LOGS_FTS_TABLE, ASSISTANT_LOGS_FTS_COLUMNS),
 )
 
+# Обязательные таблицы «ядра» для проверки снапшота (no14-01, релиз 3.2.0):
+# имена всех не-векторных таблиц, которые `init_db` создаёт в боевой БД (ядро
+# заметок + записи/FTS областей). Векторные (vec0) таблицы живут в своих
+# реестрах (`vectors.VEC_TABLE`, `chunks.CHUNKS_VEC_TABLE`, `area_vectors.VEC_TABLES`)
+# и здесь не перечисляются: `BackupService.verify` собирает обязательный
+# набор из всех реестров `app.storage`, а не хардкодит его. Единый источник
+# имён ядра — этот кортеж.
+CORE_TABLES: tuple[str, ...] = (
+    "notes",
+    "notes_fts",
+    "notes_comment_fts",
+    "namespaces",
+    "promotions",
+    "note_expirations",
+    "links",
+    "warnings",
+    "meta",
+    chunks.CHUNKS_TABLE,
+    "record_versions",
+    SKILLS_TABLE,
+    SKILLS_FTS_TABLE,
+    "skill_versions",
+    "skills_meta",
+    TERMS_TABLE,
+    TERMS_FTS_TABLE,
+    USER_FACTS_TABLE,
+    USER_FACTS_FTS_TABLE,
+    ASSISTANT_LOGS_TABLE,
+    ASSISTANT_LOGS_FTS_TABLE,
+)
+
 # Поля записей — по архитектурам фич lsb-0007/0008/0009; общее у всех —
 # id, vector_status (default pending), created_at, updated_at, deleted_at.
 # CHECK-констрейнты, как у заметок, не используем: лимиты формы — валидация

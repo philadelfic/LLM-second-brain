@@ -20,7 +20,24 @@ class TestHealth:
         """/health доступен без Authorization — исключение из NFR-2."""
         response = client.get("/health")
         assert response.status_code == 200
-        assert response.json() == {
+        body = response.json()
+        # №14 (arch §7.2): поле `backups` собирается сканом каталога BACKUP_DIR;
+        # число снапшотов зависит от гонки с первой итерацией backup-петли (0 или
+        # 1 при суточном интервале) — форму и остальные поля проверяем отдельно.
+        backups = body.pop("backups")
+        assert set(backups) == {
+            "count",
+            "newest_age_sec",
+            "oldest_age_sec",
+            "total_bytes",
+            "bad",
+            "last_verify",
+            "last_ship",
+        }
+        assert backups["count"] in (0, 1)
+        assert backups["bad"] == 0
+        assert backups["total_bytes"] >= 0
+        assert body == {
             "status": "ok",
             "version": __version__,
             "embedding_ok": None,
@@ -91,6 +108,7 @@ class TestHealth:
             "warnings",
             "decision",
             "update",
+            "backups",
         }
         assert body["status"] == "ok"
         # techdebt-0036 (FR-4.2): версия — из приложения, не из окружения.
@@ -130,6 +148,31 @@ class TestHealth:
             assert set(stat) == {"enabled", "pending"}
         # №12 (no12-02): /health.warnings — {by_kind, total} (только SQL).
         assert body["warnings"] == {"by_kind": {}, "total": 0}
+
+    def test_health_backups(self, client: TestClient) -> None:
+        """№14 (arch §7.2): /health.backups — скан каталога без открытия БД.
+
+        Форма полей оговорена; число снапшотов зависит от гонки с первой
+        итерацией backup-петли (0 или 1 при суточном интервале), поэтому
+        проверяем состав и типы, а не конкретные значения.
+        """
+        backups = client.get("/health").json()["backups"]
+        assert set(backups) == {
+            "count",
+            "newest_age_sec",
+            "oldest_age_sec",
+            "total_bytes",
+            "bad",
+            "last_verify",
+            "last_ship",
+        }
+        assert isinstance(backups["count"], int)
+        assert isinstance(backups["total_bytes"], int)
+        assert backups["bad"] == 0
+        assert backups["last_ship"] is None
+        assert backups["newest_age_sec"] is None or isinstance(
+            backups["newest_age_sec"], int
+        )
 
     def test_query_string_does_not_break_openness(self, client: TestClient) -> None:
         assert client.get("/health", params={"verbose": 1}).status_code == 200

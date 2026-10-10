@@ -312,6 +312,9 @@ class Settings(BaseSettings):
     backup_dir: str = "/data/backups"
     backup_interval_sec: int = 86400  # сутки
     backup_keep: int = 7
+    # №14 (3.2.0, arch §8): проверять восстановление каждого N-го снапшота;
+    # 0 — авто-проверка выключена (только ручная POST /backups/verify).
+    backup_verify_every: int = 1
 
     # --- хинт о свежем релизе (№45, релиз 3.2.0; arch §6.2/§8/§13.8-13.13) ----
     # Фоновая проверка версии: источник — локальный JSON-файл (работает без
@@ -708,6 +711,8 @@ class Settings(BaseSettings):
         # --- backup (NFR-3) ---
         need_low("backup_interval_sec", self.backup_interval_sec, 1)
         need_low("backup_keep", self.backup_keep, 1)
+        # №14 (arch §8): 0 — авто-проверка выключена (только вручную).
+        need_low("backup_verify_every", self.backup_verify_every, 0)
         if not self.backup_dir.strip():
             errors.append("  - backup_dir: путь не может быть пустым")
         if not self.db_path.strip():

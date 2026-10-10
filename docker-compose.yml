@@ -181,6 +181,8 @@ services:
       BACKUP_DIR: "/data/backups"
       BACKUP_INTERVAL_SEC: "86400"
       BACKUP_KEEP: "7"
+      # verify the restore of every Nth snapshot; 0 = manual only (POST /backups/verify)
+      BACKUP_VERIFY_EVERY: "1"
       # --- release check (№45): off by default — no verified egress from the
       #     container, so the network cannot be the default source ---
       # UPDATE_CHECK_ENABLED: "false"       # true turns on the background version check

@@ -76,6 +76,7 @@ from app import __version__
 from app.config import Settings
 from app.services import Services
 from app.services import history
+from app.services.backup import BackupService
 from app.services.freshness import FreshnessValidationError
 from app.services.namespaces import NamespaceError, NamespaceValidationError
 from app.services.notes import (
@@ -369,6 +370,32 @@ class SlotStat(BaseModel):
     last_had_thinking: bool | None = None
 
 
+class BackupStat(BaseModel):
+    """Наблюдаемость бэкапов для /health (№14, arch §7.2).
+
+    Собирается сканом каталога BACKUP_DIR, БЕЗ открытия БД: число/возраст/
+    объём снапшотов, число помеченных (`.bad`) и последние исходы проверки
+    и выноса из сайдкар-индекса (None — ещё не было).
+    """
+
+    count: int
+    newest_age_sec: int | None
+    oldest_age_sec: int | None
+    total_bytes: int
+    bad: int
+    last_verify: dict | None
+    last_ship: dict | None
+
+
+class BackupVerifyRequest(BaseModel):
+    """Тело `POST /backups/verify` (№14, arch §7.2): файл или свежайший.
+
+    `file` нет/пусто → свежайший снапшот; иначе — имя файла в BACKUP_DIR.
+    """
+
+    file: str | None = None
+
+
 class HealthResponse(BaseModel):
     """Контракт /health (NFR-4): для docker healthcheck и оператора.
 
@@ -405,6 +432,9 @@ class HealthResponse(BaseModel):
     # №45 (arch §7.2): наблюдаемость версии — {enabled, current, latest,
     # checked_at, hint_shown_at}; собирается из памяти `UpdateChecker` (без I/O).
     update: dict[str, Any]
+    # №14 (arch §7.2): наблюдаемость бэкапов — скан каталога BACKUP_DIR без
+    # открытия БД + последние исходы проверки/выноса из сайдкар-индекса.
+    backups: BackupStat
 
 
 def _services(request: Request) -> Services:
@@ -478,6 +508,20 @@ def _warnings_service(request: Request) -> WarningsService:
         raise HTTPException(
             status_code=503, detail="warnings surface is not available"
         )
+    return service
+
+
+def _backup_service(request: Request) -> BackupService:
+    """Сервис бэкапов — для операторских `GET /backups` и `POST /backups/verify`.
+
+    `Services.backup` типизирован необязательным только ради старых DI-сборок
+    тестов (там он None); приложение (`create_app`/`build_services`) всегда его
+    кладёт — его недоступность отвечаем 503, а не падаем трейсбеком (как у
+    `_skills_service`/`_warnings_service`).
+    """
+    service = _services(request).backup
+    if service is None:
+        raise HTTPException(status_code=503, detail="backup service is not available")
     return service
 
 
@@ -591,6 +635,22 @@ def build_rest_router(settings: Settings) -> APIRouter:
                 "hint_shown_at": None,
             }
         )
+        # №14 (arch §7.2): наблюдаемость бэкапов — скан каталога без открытия
+        # БД (`BackupService.status`); DI-сборка без сервиса — пустая форма.
+        backup = services.backup
+        backups = (
+            BackupStat(
+                count=0,
+                newest_age_sec=None,
+                oldest_age_sec=None,
+                total_bytes=0,
+                bad=0,
+                last_verify=None,
+                last_ship=None,
+            )
+            if backup is None
+            else BackupStat(**await asyncio.to_thread(backup.status))
+        )
         return HealthResponse(
             status="ok",
             version=__version__,
@@ -607,6 +667,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
             warnings=warnings,
             decision=decision,
             update=update,
+            backups=backups,
         )
 
     @rest_router.post("/notes", status_code=201)
@@ -1718,5 +1779,35 @@ def build_rest_router(settings: Settings) -> APIRouter:
                 status_code=404, detail="job is not waiting for attention"
             )
         return result
+
+    # --- бэкапы: наблюдаемость и проверка восстановления (№14, arch §7.2) ---
+    # Операторские ручки: список снапшотов и проверка по вызову. Чтение
+    # каталога/снапшота — без записи в боевую БД (arch §5.1); сами исходы
+    # живут в сайдкар-индексе рядом с копиями.
+
+    @rest_router.get("/backups")
+    async def list_backups(request: Request) -> dict:
+        """Список снапшотов оператору: `{items: [...], total}` (свежие первыми).
+
+        Элемент — `{file, size_bytes, created_at, verified, bad, shipped}`;
+        `verified` ∈ ok/failed/unknown (§7.2). Скан каталога, БД не открываем.
+        """
+        items = await asyncio.to_thread(_backup_service(request).list_snapshots)
+        return {"items": items, "total": len(items)}
+
+    @rest_router.post("/backups/verify")
+    async def verify_backup(payload: BackupVerifyRequest, request: Request) -> dict:
+        """Проверить снапшот по вызову (FR-2.2): результат `verify()` как есть.
+
+        `file` нет/пусто → свежайший; файла нет → 404 «no such snapshot».
+        """
+        service = _backup_service(request)
+        if payload.file:
+            target = await asyncio.to_thread(service.resolve, payload.file)
+        else:
+            target = await asyncio.to_thread(service.newest_snapshot)
+        if target is None:
+            raise HTTPException(status_code=404, detail="no such snapshot")
+        return await asyncio.to_thread(service.verify, target)
 
     return rest_router
