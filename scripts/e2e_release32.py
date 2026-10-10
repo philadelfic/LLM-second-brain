@@ -890,6 +890,15 @@ async def _save_probe_once(c: Client, args: dict, *,
         return None, f"transport broke: {describe(exc)}"
     if not isinstance(answer, dict):
         return None, f"unexpected answer: {answer!r}"
+    if answer.get("duplicated") or answer.get("stored") is False:
+        # Продукт заметку НЕ записал: дословный дубль существующей (`stored:
+        # false`/`duplicated: true`) или отказ валидации. В ответе дубля есть
+        # `id` — но это id СУЩЕСТВУЮЩЕЙ заметки, не заметки этой ветви: принять
+        # его за успех значит мерить очередь чужой заметки (живой прогон
+        # 10.10.2026, ветка [judge]: своей пробной заметки в базе нет вообще, а
+        # «2 из 2» ожидания вектора — заметка сценария 1 и близнец).
+        return None, ("the note was NOT created — the product answered "
+                      f"{note_detail(answer)}")
     if answer.get("id") is not None:
         RUN["notes"].append(answer["id"])
         return answer["id"], f"id={answer['id']}"
@@ -1074,8 +1083,15 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
     try:
         # Push work into the slot's queue so the wait is observable (a probe note
         # lands in vector+summary; the judge queue grows from the dedup hand-off).
+        # Текст — СВОЙ у каждой ветви и попытки: с общим текстом сценария 1
+        # (`<tag> probe note text (observability acceptance).`) продукт отвечает
+        # «дословный дубль» и заметки не пишет, а ветвь получала бы id ЧУЖОЙ
+        # заметки и мерила бы её очередь (живой прогон 10.10.2026, ветка [judge]).
+        probe_text = (f"{RUN['tag']} {slot} outage probe text "
+                      "(observability acceptance).")
         probe, probe_detail = await save_probe_note_result(
-            c, RUN[f"note_outage_{slot}"], after_hook=True, rest=rest)
+            c, RUN[f"note_outage_{slot}"], text=probe_text, after_hook=True,
+            rest=rest)
         probe_ids = [probe] if probe is not None else []
         if probe is None:
             # Пробная заметка не создалась (ответ без `id`: отказ, разрыв,
@@ -1107,8 +1123,10 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
             # осталась бы пустой и ветка прочлась бы ложным FAIL.
             twin, twin_detail = await save_probe_note_result(
                 c, f"{RUN[f'note_outage_{slot}']} twin",
-                text=f"{RUN['tag']} probe note text (observability acceptance) — "
-                     "a near duplicate of the outage probe.",
+                # Почти дубль ТОЛЬКО пробной заметки этой ветви (кандидат для
+                # судьи): тот же текст плюс хвост — дословным дублем не является
+                # и заметку сценария 1 не задевает.
+                text=probe_text[:-1] + " — a near duplicate of the outage probe.",
                 after_hook=True, rest=rest)
             if twin is not None:
                 probe_ids.append(twin)
@@ -1155,6 +1173,19 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
             timeout=min(CFG["wait_sec"], 180.0))
         check(f"[{slot}] with the slot down the work stays visible (nothing is lost)",
               ok, detail)
+        if not ok:
+            # Диагностика (живой прогон 10.10.2026): очередь честно пуста, если
+            # обрыв НЕ перерезал канал слота — контур ходит к другому провайдеру,
+            # и работа ветви завершается за секунды. Типичная причина — остатки
+            # ветви отказа от прерванного прогона: `scripts/slot_fake.sh` оставил
+            # слот на заглушке, а глушится прокси, к которому контур не ходит.
+            snapshot = await health_snapshot(rest)
+            stat = slot_stat(snapshot, slot) or {}
+            warn(f"[{slot}] the outage did not cut the channel of the slot: the "
+                 f"work of the branch was finished, not deferred",
+                 f"/health.slots.{slot}={stat}; check the contour: "
+                 f"'scripts/slot_fake.sh status' (a leftover fake provider) and "
+                 f"'scripts/slot_gate.sh status {slot}'")
 
         ok, detail = await wait_until(
             queue_has_work(rest, queue, min_age=10),

@@ -56,6 +56,25 @@ if [[ "${LSB_FAKE_HOOKS:-1}" != "0" ]]; then
   )
 fi
 
+# Предполётная гигиена контура: снять остатки ветвей отказа от ПРЕДЫДУЩЕГО
+# (прерванного) прогона — заглушку `lsb-fake`, её env в слотах и глушёные прокси.
+# Иначе ветвь читается ложной краснотой: живой прогон 10.10.2026 — прогон,
+# убитый в ветви 8 (`slot_fake.sh on empty-length summary judge`), оставил слот
+# `judge` на заглушке; следующая приёмка глушила `slot_gate.sh off judge` прокси,
+# к которому контур не ходил, заглушка отвечала судье «не дубль», работа
+# завершалась за секунды — и очередь честно показывала пустоту (два ложных FAIL
+# ветви №39). На здоровом контуре это no-op: `docker compose up -d second-brain`
+# без изменений env контейнер не пересоздаёт, а остановленной заглушки нет.
+# Контур пересобирается ДО старта раннера приёмки — проверок это не задевает.
+docker run --rm --user root --network lsb-test_default \
+  -v "${HOST_ROOT}/test:/w" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /usr/bin/docker:/usr/local/bin/docker \
+  -v /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro \
+  -w /w --entrypoint sh llm-second-brain:test -c \
+  'scripts/slot_fake.sh off; scripts/slot_gate.sh on all' \
+  || echo "note: the pre-flight contour hygiene failed — the outage branches may read a stale fake-slot env" >&2
+
 # Окно чтения журнала (LSB_LOGS_CMD): пересборка контура хуками сценариев 3/4/8/9
 # УДАЛЯЕТ прежний контейнер, поэтому 15 минут иногда не покрывают нужные события
 # (живой прогон 10.10.2026: ветка 401 прочла 164 строки и не нашла `slot_resumed`).
