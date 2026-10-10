@@ -36,6 +36,7 @@ Release 3.2.0 — "Hygiene, contour and slots": the memory becomes accountable. 
 
 * **lsbdef-0008** — empty slot answers: a reasoning model that spends the whole budget on thinking is no longer indistinguishable from a broken or truncated call; the cause is visible in the journal and `/health.slots`, retries are bounded, and notes waiting for a summary are released when the configuration changes.
 * **lsbdef-0011** — the `terms-normalize` job spun in a busy loop: a run that can change nothing (contexts whose definitions differ) was counted as progress, so the loop restarted immediately (~30 runs per second on the acceptance contour, starving the other jobs). Only real data changes count as progress now.
+* **Decision is not asked when there is nothing to choose** (LSBN-F-12): the node classifier used to build a `choice` question from a single candidate (an empty node map leaves only the fallback label `generic`), which violates the live server contract (2–26 candidates in `criteria`) and came back as a 400 — a false `off_contract` that moved the decision-slot breaker and burned a call. With fewer than two candidates the decision call is now skipped entirely: one `decision_skipped` event (`reason=single_candidate`, `candidates`), the existing generative path is used straight away, and the `/health.decision` switch counters and the breaker stay untouched. This is "the decision is not applicable", not one of the three switch reasons.
 
 ## [3.1.0] - 2026-09-20
 
