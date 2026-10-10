@@ -13,7 +13,13 @@ import sqlite3
 from fastapi.testclient import TestClient
 
 from app.config import get_settings
-from app.storage.db import init_db, session, transaction
+from app.storage.db import (
+    DEFAULT_DESCRIPTION_META_KEY,
+    DEFAULT_DESCRIPTION_VERSION,
+    init_db,
+    session,
+    transaction,
+)
 
 AUTH = "Bearer test-secret-token"  # conftest TEST_ENV
 
@@ -153,6 +159,44 @@ class TestPatch:
             "/namespaces/ghost", json={"description": "Нет узла."},
             headers=_headers(token),
         ).status_code == 404
+
+    def test_operator_update_survives_restart(
+        self, client: TestClient, token: str
+    ) -> None:
+        """Правка описания `default` переживает рестарт (№34, 3.2.0).
+
+        Миграция доводит RU-дефолт до EN ровно один раз и только при точном
+        совпадении текста, поэтому ручная правка оператора не затирается —
+        и после повторного `init_db` (рестарт) остаётся на месте. Штамп при
+        этом ставится (одноразовость).
+        """
+        settings = get_settings()
+        edited = "Личные заметки без домена."
+        response = client.patch(
+            "/namespaces/default",
+            json={"description": edited},
+            headers=_headers(token),
+        )
+        assert response.status_code == 200
+        assert response.json()["description"] == edited
+        # Рестарт без штампа (как у БД предыдущей версии): миграция обязана
+        # пройти, увидеть правку оператора и ничего не поменять.
+        with session(settings) as conn, transaction(conn):
+            conn.execute("DELETE FROM meta WHERE key = ?", (DEFAULT_DESCRIPTION_META_KEY,))
+        init_db(settings)
+        response = client.get("/namespaces", headers=_headers(token))
+        assert response.status_code == 200
+        node = next(
+            item
+            for item in response.json()["namespaces"]
+            if item["path"] == "default"
+        )
+        assert node["description"] == edited
+        with session(settings) as conn:
+            stamp = conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (DEFAULT_DESCRIPTION_META_KEY,)
+            ).fetchone()
+        assert stamp["value"] == DEFAULT_DESCRIPTION_VERSION
 
 
 class TestMergeAndDelete:

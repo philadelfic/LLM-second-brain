@@ -1577,6 +1577,28 @@ class TestInstructionsBudget:
         assert len(instructions.encode("utf-8")) / 4 <= 1300
 
 
+    def test_instructions_carry_english_default(self, test_env: dict[str, str]) -> None:
+        """Карта узлов несёт EN-описание `default` и не несёт прежний RU-дефолт.
+
+        №34 (3.2.0): описание — модельный текст, значит английский; строка
+        берётся из реестра как есть, второй копии текста в `mcp.py` нет.
+        """
+        from app.config import get_settings
+        from app.services import build_services
+        from app.storage.db import (
+            DEFAULT_NAMESPACE_DESCRIPTION,
+            DEFAULT_NAMESPACE_DESCRIPTION_LEGACY,
+            init_db,
+        )
+        from app.transport.mcp import build_instructions
+
+        settings = get_settings()
+        init_db(settings)
+        instructions = build_instructions(build_services(settings))
+        assert f"- default: {DEFAULT_NAMESPACE_DESCRIPTION}" in instructions
+        assert DEFAULT_NAMESPACE_DESCRIPTION_LEGACY not in instructions
+
+
 class TestFreshnessMCP:
     """no29-01: невалидное `updated_after` — мягкий отказ с хинтом (fail+hint)."""
 

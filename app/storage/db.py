@@ -774,6 +774,10 @@ def init_db(settings: Settings) -> None:
             conn.execute(_INDEX_DELETED_UPDATED_DDL)
             conn.execute(_INDEX_NS_DELETED_UPDATED_DDL)
             _ensure_default_namespace(conn)
+            # №34 (3.2.0): описание `default` — EN; существующие БД доводятся
+            # одноразово и только если текст точно равен прежнему RU-дефолту
+            # (правка оператора сохраняется). Штамп в `meta` — см. функцию.
+            _migrate_default_namespace_description(conn)
             conn.execute(_PROMOTIONS_DDL)
             # lsb-0005-03: ключ promotions (domain, subdomain) → единый
             # hint_path; миграция старых вердиктов (идемпотентно).
@@ -829,7 +833,15 @@ def init_db(settings: Settings) -> None:
 # --- неймспейсы (Фаза 10) --------------------------------------------------
 
 DEFAULT_NAMESPACE = "default"
-DEFAULT_NAMESPACE_DESCRIPTION = "общие заметки, не привязанные к доменам"
+# Описание системного узла — модельный текст, значит EN (№34, 3.2.0). Прежний
+# RU-дефолт остаётся отдельной константой: по нему одноразовая миграция
+# отличает «сид» от правки оператора (см. _migrate_default_namespace_description).
+DEFAULT_NAMESPACE_DESCRIPTION = "general notes not tied to any domain"
+DEFAULT_NAMESPACE_DESCRIPTION_LEGACY = "общие заметки, не привязанные к доменам"
+
+# Штамп одноразового доведения описания `default` (№34, 3.2.0): ключ в `meta`.
+DEFAULT_DESCRIPTION_META_KEY = "default_description_version"
+DEFAULT_DESCRIPTION_VERSION = "en-v1"
 
 
 def _migrate_title_column(conn: sqlite3.Connection) -> None:
@@ -1391,6 +1403,49 @@ def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
+
+
+def _migrate_default_namespace_description(conn: sqlite3.Connection) -> None:
+    """Довести описание узла `default` до EN (№34, 3.2.0): одноразово.
+
+    Свежая БД получает EN-текст из `_ensure_default_namespace` — для неё
+    миграция no-op (текст не равен прежнему RU-дефолту), но штамп всё равно
+    ставится. Унаследованная БД правится ТОЛЬКО если описание точно равно
+    прежнему русскому дефолту (DEFAULT_NAMESPACE_DESCRIPTION_LEGACY): любая
+    иная, в том числе русская, правка оператора сохраняется — «сид» и
+    «правка» различаются сравнением текста, новой колонки не заводится.
+
+    Одноразовость даёт штамп DEFAULT_DESCRIPTION_META_KEY в `meta`: он
+    ставится НЕЗАВИСИМО от исхода (обновлена строка или нет), поэтому
+    повторный `init_db` ничего не ищет и ничего не меняет. Вызывается в
+    `init_db` сразу после `_ensure_default_namespace`.
+    """
+    conn.execute(_META_DDL)  # meta может ещё не существовать у древних БД —
+    # штатно таблица создаётся позже, в _sync_embedding_meta (см. init_db)
+    if _get_meta(conn, DEFAULT_DESCRIPTION_META_KEY) is not None:
+        return  # доведено ранее — идемпотентно
+    with transaction(conn):
+        cursor = conn.execute(
+            "UPDATE namespaces SET description = ?, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            "WHERE path = ? AND description = ?",
+            (
+                DEFAULT_NAMESPACE_DESCRIPTION,
+                DEFAULT_NAMESPACE,
+                DEFAULT_NAMESPACE_DESCRIPTION_LEGACY,
+            ),
+        )
+        if cursor.rowcount == 1:
+            logging.getLogger("app").info(
+                "default namespace description migrated to english",
+                extra={
+                    "event": "default_description_migrated",
+                    "path": DEFAULT_NAMESPACE,
+                    "old": DEFAULT_NAMESPACE_DESCRIPTION_LEGACY,
+                    "new": DEFAULT_NAMESPACE_DESCRIPTION,
+                },
+            )
+        _set_meta(conn, DEFAULT_DESCRIPTION_META_KEY, DEFAULT_DESCRIPTION_VERSION)
 
 
 # --- title-индекс (lsb-0001-01) ---------------------------------------------
