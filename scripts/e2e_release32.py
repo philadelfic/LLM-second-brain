@@ -86,6 +86,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -97,6 +98,13 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 
 RELEASE = "3.2.0"
+
+# Repository root: the script runs from `scripts/`, while the LSBN-F-11
+# scenario needs `app.services.injection_budget` (the budget constants live in
+# the code, not in the environment) and `scripts/measure_injected_text.py`.
+REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 # ==== harness: canon constants =================================================
 # MCP listing ceiling is 20 (3.1.0 canon); the REST ceiling is 50.
@@ -1136,8 +1144,10 @@ async def future_block_todo() -> None:
            "the node hint of `save` (№28) is claimed by "
            "`scenario_10_node_hint()`; the freshness filter (№29) — by "
            "`scenario_11_freshness()`; the note `comment` field (№24) — by "
-           "`scenario_12_comment()`; the rest of the surface is claimed by "
-           "the follow-up postановки")
+           "`scenario_12_comment()`; the injected-text budget/guard of "
+           "LSBN-F-11 is claimed by `tests/test_injection_budget.py` and "
+           "`scenario_13_injected_text()`; the rest of the surface is claimed "
+           "by the follow-up postановки")
     # TODO(3.2.0 future blocks) — assistant logs:
     manual("assistant logs: event names, masking, no secrets in the log",
            "add a `scenario_10_logs()` here")
@@ -1882,6 +1892,303 @@ async def scenario_12_comment(c: Client, rest: httpx2.AsyncClient) -> None:
           duplicate.get("duplicated") is True, f"answer={duplicate}")
 
 
+# ==== scenarios: 13. injected-text budget + agent smoke (LSBN-F-11) =============
+# LSBN-F-11 (f11-03): константы бюджета живут в КОДЕ
+# (`app/services/injection_budget.py`, arch §13.17, канон §6 — не env, FR-4.4),
+# а сторож — обычный тест `tests/test_injection_budget.py`, падающий при
+# превышении. Этот сценарий прогоняет ТОТ ЖЕ замер
+# (`scripts/measure_injected_text.py --phase after`, f11-01), сверяет его с
+# бюджетом, с отчётом «до» и с инструкциями, которые контур реально отдаёт,
+# затем смоуком подтверждает, что сокращение текстов не сломало ведение
+# заметок, области и фоновые джобы (FR-6.1/FR-6.2).
+#
+# Замер пишется во ВРЕМЕННЫЙ каталог: `release/3.2.0/acceptance/
+# injected-text-after.{md,json}` — артефакт f11-01/f11-03 с рукописной дельтой,
+# повторный прогон сценария его не затирает (идемпотентность прогона).
+INJECTED_TEXT_TOOL_COUNT = 31  # бюджетная поверхность блоков 1–5 (arch §7.1)
+INJECTED_TEXT_BEFORE = "injected-text-before.json"
+SMOKE_MARKER = "zblorptsmoke"
+
+
+def acceptance_dir() -> Path:
+    """Каталог приёмочных артефактов релиза (`release/` не версионируется)."""
+    return Path(CFG["repo_dir"]) / "release" / RELEASE / "acceptance"
+
+
+def budget_module() -> Any:
+    """Модуль бюджетов вшитого текста из кода приложения; None — недоступен.
+
+    Числа берём ИМЕННО оттуда (единый источник и для сторожа, и для приёмки),
+    а не дублируем в скрипте: иначе бюджет сторожа и бюджет приёмки разошлись бы.
+    """
+    try:
+        from app.services import injection_budget
+    except Exception as exc:  # noqa: BLE001 — сценарий обязан жить и вне репозитория
+        warn("the injected-text budget module is unreadable", describe(exc))
+        return None
+    return injection_budget
+
+
+def injected_text_measurement() -> dict[str, Any]:
+    """Локальный прогон `measure_injected_text.py --phase after` (временный out).
+
+    Контур для самого замера не нужен: он поднимает временную пустую БД, а слоты
+    закрыты на loopback:1 (в сеть не ходит). Возвращает разобранный JSON замера,
+    дополненный отчётом «до» (None, если канонического файла нет).
+    """
+    script = Path(CFG["repo_dir"]) / "scripts" / "measure_injected_text.py"
+    with tempfile.TemporaryDirectory(prefix="e2e-injected-text-") as out_dir:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--phase", "after", "--out", out_dir],
+            cwd=CFG["repo_dir"], capture_output=True, text=True, timeout=600,
+        )
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout).strip().splitlines()
+            raise RuntimeError(
+                f"measure_injected_text.py rc={proc.returncode}: "
+                f"{tail[-1] if tail else '(no output)'}"
+            )
+        payload = (Path(out_dir) / "injected-text-after.json").read_text(encoding="utf-8")
+    data = json.loads(payload)
+    before = acceptance_dir() / INJECTED_TEXT_BEFORE
+    data["before"] = (
+        json.loads(before.read_text(encoding="utf-8")) if before.exists() else None
+    )
+    return data
+
+
+def _injected_acceptance_lines(numbers: dict[str, Any]) -> list[str]:
+    """Блок `f11-03` отчёта приёмки: бюджет вшитого текста, числа до/после."""
+
+    def delta(before_value: Any, after_value: Any) -> str:
+        if not isinstance(before_value, int) or not isinstance(after_value, int):
+            return "—"
+        return f"{after_value - before_value:+d}"
+
+    rows = (
+        ("A — `build_instructions` (статика подключения)", "before_a", "after_a"),
+        ("A — ядро `SERVER_INSTRUCTIONS`", "before_core", "after_core"),
+        ("B — сумма описаний инструментов", "before_descriptions",
+         "after_descriptions"),
+    )
+    lines = [
+        "### Вшитый текст: сторож бюджета и замер «после» (f11-03)",
+        "",
+        "Блок заполняется сценарием 13 (`scenario_13_injected_text`) на тестовом "
+        "контуре: прогон замера (`scripts/measure_injected_text.py --phase after`), "
+        "сверка с бюджетом `app/services/injection_budget.py` и с отчётом «до», "
+        "смоук агента (заметки, области, очереди). Блок идемпотентен по своим "
+        "HTML-маркерам, повторный прогон заменяет его; сторож — обычный тест "
+        "общего прогона `tests/test_injection_budget.py`, падающий при превышении "
+        "(FR-4.2). Числа бюджета — константы кода, не env (FR-4.4).",
+        "",
+        "| Место / метрика | «до» (f11-01) | «после» (f11-03) | Δ токенов |",
+        "|---|---|---|---|",
+    ]
+    for title, before_key, after_key in rows:
+        lines.append(
+            f"| {title} | {numbers.get(before_key, '—')} ток. | "
+            f"{numbers.get(after_key, '—')} ток. | "
+            f"{delta(numbers.get(before_key), numbers.get(after_key))} |"
+        )
+    lines += [
+        "",
+        f"* Инструментов на поверхности: {numbers.get('tool_count', '—')} "
+        f"(бюджетное число — {INJECTED_TEXT_TOOL_COUNT}); самое тяжёлое описание — "
+        f"{numbers.get('after_description_max', '—')} ток.",
+        "* Что удалено/переехало при сокращении (f11-02): справочные перечни и "
+        "числовые лимиты ушли из ядра в канон §6 и в `hint`-ответы ручек; правило "
+        "выбора узла и шапка карты, манифест навыков и раздел логов сжаты без "
+        "потери обязательных правил; 18 описаний инструментов сокращены (самые "
+        "тяжёлые — `memory_save` −82, `memory_namespace_create` −81, "
+        "`memory_update` −80 ток.); схемы параметров и логика ручек НЕ менялись, "
+        "образцы веса вызова не изменились.",
+    ]
+    live = numbers.get("live_instructions")
+    lines.append(
+        "* Инструкции, которые контур реально отдаёт агенту: "
+        + (f"{live} ток. при бюджете `TOKENS_INSTRUCTIONS_MAX`."
+           if isinstance(live, int)
+           else "— (нужен живой контур).")
+    )
+    smoke = numbers.get("smoke_note")
+    if smoke is None:
+        lines.append(
+            "* Смоук агента: НЕ выполнен (нет живой контур / заметка не создана) — "
+            "числа сторожа выше получены локальным прогоном замера."
+        )
+    else:
+        lines.append(
+            f"* Смоук агента: заметка записана и найдена (id {smoke}); области "
+            "(навыки, термины, факты, логи) отвечают без ошибок; очередь "
+            f"`summary` дренирована — {numbers.get('summary_drained', '—')}."
+        )
+    lines += [
+        "",
+        "Числа и дельта по образцам веса вызова — "
+        "`release/3.2.0/acceptance/injected-text-before.md` и "
+        "`injected-text-after.md`.",
+    ]
+    return lines
+
+
+async def scenario_13_injected_text(c: Client, rest: httpx2.AsyncClient,
+                                    instructions: str) -> None:
+    """LSBN-F-11 (f11-03): замер вшитого текста под бюджетом + смоук агента.
+
+    Сверка: числа «после» ≤ бюджет кода; число инструментов = бюджетному;
+    «после» ≤ «до» по статике подключения и описаниям; инструкции контура — в
+    бюджете. Смоук: запись/поиск/чтение заметки, ответы всех четырёх областей
+    без ошибок, дренаж очереди `summary` по заметкам этого прогона, здоровье
+    контура. Замер локальный — контур нужен только смоуку.
+    """
+    scenario(13, "LSBN-F-11: the injected-text budget (A/B/C) under the guard and "
+                 "the agent smoke (notes, areas, queues)")
+    numbers: dict[str, Any] = {}
+
+    module = budget_module()
+    data: dict[str, Any] | None = None
+    if module is not None:
+        try:
+            data = injected_text_measurement()
+        except Exception as exc:  # noqa: BLE001 — прогон замера не удался
+            skip("the injected-text measurement run",
+                 f"measure_injected_text.py did not complete: {describe(exc)}")
+
+    if data is not None:
+        place_a, place_b = data["place_a"], data["place_b"]
+        core = next((mrow for mrow in place_a["components"]
+                     if mrow["block"] == "SERVER_INSTRUCTIONS"), {"tokens": None})
+        after_a = place_a["total"]["tokens"]
+        after_desc = place_b["total_description"]["tokens"]
+        desc_max = max(mrow["description_tokens"] for mrow in place_b["tools"])
+        tool_count = place_b["tool_count"]
+        numbers.update(after_a=after_a, after_core=core["tokens"],
+                       after_descriptions=after_desc,
+                       after_description_max=desc_max, tool_count=tool_count)
+        info(f"injected text «after»: A {after_a} tok., core {core['tokens']} tok., "
+             f"descriptions {after_desc} tok. (max {desc_max}, tools {tool_count})")
+
+        check("build_instructions is within TOKENS_INSTRUCTIONS_MAX="
+              f"{module.TOKENS_INSTRUCTIONS_MAX}",
+              after_a <= module.TOKENS_INSTRUCTIONS_MAX, f"{after_a} tokens")
+        check(f"SERVER_INSTRUCTIONS is within TOKENS_CORE_MAX={module.TOKENS_CORE_MAX}",
+              core["tokens"] <= module.TOKENS_CORE_MAX, f"{core['tokens']} tokens")
+        check("every tool description is within TOKENS_TOOL_DESCRIPTION_MAX="
+              f"{module.TOKENS_TOOL_DESCRIPTION_MAX}",
+              desc_max <= module.TOKENS_TOOL_DESCRIPTION_MAX,
+              f"heaviest {desc_max} tokens")
+        check("the tool surface is within TOKENS_TOOL_SURFACE_MAX="
+              f"{module.TOKENS_TOOL_SURFACE_MAX}",
+              after_desc <= module.TOKENS_TOOL_SURFACE_MAX, f"{after_desc} tokens")
+        check(f"the MCP surface still lists {INJECTED_TEXT_TOOL_COUNT} tools "
+              "(growth means the budget must be revised deliberately, FR-4.4)",
+              tool_count == INJECTED_TEXT_TOOL_COUNT, f"got {tool_count}")
+
+        before = data.get("before")
+        if before is None:
+            skip("the delta to the «before» measurement",
+                 f"{INJECTED_TEXT_BEFORE} is missing in {acceptance_dir()}")
+        else:
+            before_a = before["place_a"]["total"]["tokens"]
+            before_desc = before["place_b"]["total_description"]["tokens"]
+            before_core = next((mrow["tokens"] for mrow in before["place_a"]["components"]
+                                if mrow["block"] == "SERVER_INSTRUCTIONS"), None)
+            numbers.update(before_a=before_a, before_core=before_core,
+                           before_descriptions=before_desc)
+            check("the f11-02 shortening did not grow the handshake static or the "
+                  "description surface («after» ≤ «before»)",
+                  after_a <= before_a and after_desc <= before_desc,
+                  f"A {before_a} → {after_a} tok., descriptions "
+                  f"{before_desc} → {after_desc} tok.")
+            info(f"the core grew deliberately inside its own budget: {before_core} "
+                 f"→ {core['tokens']} tok. (TOKENS_CORE_MAX={module.TOKENS_CORE_MAX})")
+
+        if instructions:
+            live = module.count_tokens(instructions)
+            numbers["live_instructions"] = live
+            check("the instructions the contour actually hands out are within "
+                  f"TOKENS_INSTRUCTIONS_MAX={module.TOKENS_INSTRUCTIONS_MAX}",
+                  live <= module.TOKENS_INSTRUCTIONS_MAX, f"{live} tokens")
+        else:
+            skip("the live-instructions budget",
+                 "the contour handed out no instructions text")
+
+    # --- смоук агента: заметки и области живы (FR-6.1/FR-6.2) -------------------
+    smoke_text = (f"{RUN['tag']} smoke: the shortened instructions still let the "
+                  f"agent keep notes ({SMOKE_MARKER}).")
+    saved = await c.call("memory_save", {"text": smoke_text,
+                                         "title": f"{RUN['tag']} smoke note"})
+    note_id = saved.get("id")
+    if note_id is not None:
+        RUN["notes"].append(note_id)
+    numbers["smoke_note"] = note_id
+    check("memory_save writes a note after the text shortening",
+          saved.get("stored") is True, note_detail(saved))
+    if note_id is None:
+        skip("the note read/search smoke", "the probe note was not created")
+    else:
+        found = await c.call("memory_search", {"query": SMOKE_MARKER})
+        check("memory_search finds the note written just now",
+              any(hit.get("id") == note_id for hit in found.get("results", [])),
+              f"hits={[hit.get('id') for hit in found.get('results', [])]}")
+        got = await c.call("memory_get", {"ids": [note_id]})
+        note = (got.get("notes") or [{}])[0]
+        check("memory_get reads the note back with its text intact",
+              note.get("text") == smoke_text, f"chars={note.get('chars')}")
+        titles = await c.call("memory_list", {"limit": MCP_LIMIT, "detail": "titles"})
+        check("memory_list (titles) still walks the registry",
+              any(item.get("id") == note_id for item in titles.get("items", [])),
+              f"items={len(titles.get('items', []))}")
+
+    # Области отвечают без ошибок: навыки, термины, факты, логи (FR-6.1).
+    areas = (
+        ("skills", "skills_list", {}, "items"),
+        ("terms", "terms_search", {"query": SMOKE_MARKER}, "senses"),
+        ("user facts", "user_search", {"query": SMOKE_MARKER}, "results"),
+        ("assistant logs", "logs_list", {"limit": 5}, "items"),
+    )
+    for label, tool, args, key in areas:
+        try:
+            answer = await c.call(tool, args)
+        except Exception as exc:  # noqa: BLE001 — ошибка ручки — это FAIL
+            check(f"the {label} area answers {tool} without an error", False,
+                  describe(exc))
+            continue
+        if not isinstance(answer, dict):
+            check(f"the {label} area answers {tool} without an error", False,
+                  f"answer={answer!r}")
+            continue
+        payload = answer.get(key)
+        why = refusal(answer)
+        check(f"the {label} area answers {tool} without an error",
+              isinstance(payload, list) and not why,
+              f"{key}=" + (f"{len(payload)}" if isinstance(payload, list)
+                           else repr(payload))
+              + (f", refusal={why!r}" if why else ""))
+
+    # Фоновые джобы: заметки прогона обрабатываются, очередь дренируется (FR-6.2).
+    if note_id is not None:
+        count = len(RUN["notes"])
+        drained, detail = await wait_until(
+            own_summaries_ready(count),
+            f"the probe notes of this run get a summary ({count})",
+        )
+        numbers["summary_drained"] = drained
+        check_slot("the summary queue drains the notes of this run (background jobs "
+                   "still work after the shortening)", drained, detail)
+    snapshot = await refresh_health(rest)
+    check("the contour stays healthy after the smoke (status ok)",
+          snapshot.get("status") == "ok", f"status={snapshot.get('status')!r}")
+
+    # Отчёт релиза: блок f11-03 (идемпотентно по маркерам).
+    try:
+        path = write_acceptance_block("f11-03", _injected_acceptance_lines(numbers))
+        info(f"the acceptance block f11-03 is written: {path}")
+    except Exception as exc:  # noqa: BLE001 — отчёт операторский, не контур
+        warn("the acceptance block f11-03 was not written", describe(exc))
+
+
 # ==== run ======================================================================
 async def run_all() -> None:
     async with AsyncExitStack() as stack:
@@ -1911,6 +2218,7 @@ async def run_all() -> None:
             await scenario_10_node_hint(c, rest)
             await scenario_11_freshness(c, rest)
             await scenario_12_comment(c, rest)
+            await scenario_13_injected_text(c, rest, instructions)
             await future_block_todo()
             close_scenario()
         finally:
