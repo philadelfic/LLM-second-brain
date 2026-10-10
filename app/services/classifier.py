@@ -43,6 +43,7 @@ base_url). Отказ — `ClassificationError`: заметка остаётся
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
@@ -50,7 +51,7 @@ from typing import Any, Protocol
 import httpx
 
 from app.config import Settings
-from app.services.decision import DecisionService, DecisionUnavailable
+from app.services.decision import SLOT_DECISION, DecisionService, DecisionUnavailable
 from app.services.llm_client import ChatMeta, LLMClient, LLMError, SlotSpec
 from app.services.namespaces import NamespaceService, NamespaceValidationError
 from app.services.prompts import PromptRegistry
@@ -65,6 +66,12 @@ CLASSIFIER_NUM_PREDICT = 768
 # Резервная метка decision-вопроса разметки (реестр, arch §6.4): «общая»
 # заметка, не привязанная к узлу, → `hint_path is None`.
 GENERIC_LABEL = "generic"
+
+# Минимум кандидатов у `choice`-вопроса decision-модели (живой контракт
+# `/v1/systemone`, сверено 2026-10-10): сервер требует 2–26 вариантов в
+# `criteria`, иначе 400. Один кандидат — выбирать не из чего: решение НЕ
+# применимо, вызова нет (arch §13.6).
+DECISION_MIN_CANDIDATES = 2
 
 
 class ClassificationError(RuntimeError):
@@ -160,27 +167,41 @@ class ClassificationService:
         if not text or not text.strip():
             raise ValueError("classify: пустой текст заметки")
         if self._decider is not None:
-            try:
-                return self._classify_decision(text, known_nodes)
-            except DecisionUnavailable as exc:
-                if not self._settings.decision_fallback:
-                    self.last_attempt_ok = False
-                    raise ClassificationError(
-                        str(exc), outcome=SlotOutcome.UNAVAILABLE
-                    ) from exc
+            labels = self._decision_labels(known_nodes)
+            if len(labels) < DECISION_MIN_CANDIDATES:
+                # Выбирать не из чего: решение НЕ применимо — это не одно из
+                # трёх переключений (§13.6). Вызова нет, счётчики
+                # переключений и разрыв decision-слота не трогаются, сразу
+                # идём прежним генеративным путём.
+                self._log_decision_skipped(len(labels))
+            else:
+                try:
+                    return self._classify_decision(text, known_nodes, labels)
+                except DecisionUnavailable as exc:
+                    if not self._settings.decision_fallback:
+                        self.last_attempt_ok = False
+                        raise ClassificationError(
+                            str(exc), outcome=SlotOutcome.UNAVAILABLE
+                        ) from exc
         return self._classify_generative(text, known_nodes)
 
+    @staticmethod
+    def _decision_labels(known_nodes: list[dict[str, Any]]) -> list[str]:
+        """Метки `choice`-вопроса разметки: пути узлов карты + резервная `generic`."""
+        return [node["path"] for node in known_nodes] + [GENERIC_LABEL]
+
     def _classify_decision(
-        self, text: str, known_nodes: list[dict[str, Any]]
+        self, text: str, known_nodes: list[dict[str, Any]], labels: list[str]
     ) -> Classification:
         """Решение decision-слота: метка → `hint_path`, вероятность → `confidence`.
 
         Вопрос — из реестра (`decider.questions_for("classify")`); метки
-        подставляются на каждый вызов: пути известных узлов + резервная
-        `generic` (→ `hint_path is None`), состояние — заметка + узлы
-        (`path: description`, как сегодня). Этот же вопрос обслуживает джобу
-        `warnings` («заметка не на своём месте»): она ходит через тот же
-        `classify` (arch §13.6, FR-8.4).
+        приходят от `classify` (пути известных узлов + резервная `generic` →
+        `hint_path is None`), состояние — заметка + узлы (`path: description`,
+        как сегодня). Вызов — только при `len(labels) >= DECISION_MIN_CANDIDATES`:
+        иначе решение не применимо и сюда не заходят. Этот же вопрос
+        обслуживает джобу `warnings` («заметка не на своём месте»): она ходит
+        через тот же `classify` (arch §13.6, FR-8.4).
         """
         assert self._decider is not None
         questions = self._decider.questions_for("classify")
@@ -188,7 +209,6 @@ class ClassificationService:
             raise DecisionUnavailable(
                 "в реестре нет вопроса разметки узла", reason="unsupported"
             )
-        labels = [node["path"] for node in known_nodes] + [GENERIC_LABEL]
         question = replace(questions[0], labels=tuple(labels))
         result = self._decider.decide(
             self._user_message(text, known_nodes), [question], operation="classify"
@@ -265,6 +285,26 @@ class ClassificationService:
     def close(self) -> None:
         """Закрыть HTTP-пул (чистое завершение процесса)."""
         self._llm.close()
+
+    @staticmethod
+    def _log_decision_skipped(candidates: int) -> None:
+        """Событие `decision_skipped`: решение не применимо, вызова НЕ было (§13.6).
+
+        Пишется, когда кандидатов у `choice`-вопроса меньше
+        `DECISION_MIN_CANDIDATES` (выбирать не из чего). Это не переключение:
+        счётчики `/health.decision` (`fallbacks`/`by_reason`) и разрыв слота не
+        двигаются, вероятностей в событии нет (FR-3.3).
+        """
+        logging.getLogger("app").info(
+            "decision_skipped",
+            extra={
+                "event": "decision_skipped",
+                "slot": SLOT_DECISION,
+                "operation": "classify",
+                "reason": "single_candidate",
+                "candidates": candidates,
+            },
+        )
 
     # --- внутреннее ---------------------------------------------------------
 

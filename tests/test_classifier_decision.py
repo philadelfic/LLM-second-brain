@@ -168,6 +168,81 @@ def test_generic_label_maps_to_null(monkeypatch, caplog) -> None:
     assert generative.calls == 0
 
 
+# --- decision не применим: выбирать не из чего --------------------------------
+
+
+def test_single_candidate_skips_decision(monkeypatch, caplog) -> None:
+    """Один кандидат (пустая карта узлов) → вызова решения НЕТ, идём генеративно.
+
+    `choice`-вопрос с единственной меткой сервер отвергает (400 «criteria must
+    contain 2–26 candidates»), поэтому при кандидатах меньше двух решение не
+    спрашивается вовсе: событие `decision_skipped`, счётчики переключений не
+    растут, разрыв decision-слота не двигается.
+    """
+    settings = decision_settings(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="app"):
+        classifier, decider, decision, generative = make_classifier(
+            settings,
+            [choice(GENERIC_LABEL, {GENERIC_LABEL: 0.9})],
+            [chat_body("life", 0.61)],
+        )
+        result = classifier.classify(TEXT, [])
+    assert result.hint_path == "life"
+    assert result.confidence == pytest.approx(0.61)
+    assert decision.calls == 0
+    assert generative.calls == 1
+    snapshot = decider.snapshot()
+    assert snapshot["fallbacks"] == 0
+    assert snapshot["by_reason"] == {
+        "unavailable": 0,
+        "unsupported": 0,
+        "low_confidence": 0,
+    }
+    assert snapshot["breaker"]["state"] == "closed"
+    records = events(caplog, "decision_skipped")
+    assert records and records[0].reason == "single_candidate"
+    assert records[0].candidates == 1
+    assert records[0].slot == "decision"
+    assert records[0].operation == "classify"
+    # Отказа не было — штатных переключений (и их событий) тоже нет.
+    assert not events(caplog, "decision_fallback")
+    assert not events(caplog, "slot_paused")
+
+
+def test_single_candidate_is_not_a_fallback_switch(monkeypatch) -> None:
+    """«Не применим» — не переключение: и при `DECISION_FALLBACK=false` идём генеративно."""
+    settings = decision_settings(monkeypatch, DECISION_FALLBACK="false")
+    classifier, decider, decision, generative = make_classifier(
+        settings, [choice(GENERIC_LABEL, {GENERIC_LABEL: 0.9})], [chat_body("life", 0.5)]
+    )
+    result = classifier.classify(TEXT, [])
+    assert result.hint_path == "life"
+    assert result.confidence == pytest.approx(0.5)
+    assert decision.calls == 0
+    assert decider.snapshot()["fallbacks"] == 0
+
+
+def test_two_candidates_call_decision(monkeypatch, caplog) -> None:
+    """Два кандидата (узел + `generic`) — решение по-прежнему вызывается (регресс)."""
+    settings = decision_settings(monkeypatch)
+    one_node = [{"path": "work/sbos2020", "description": "рабочий проект"}]
+    with caplog.at_level(logging.INFO, logger="app"):
+        classifier, decider, decision, generative = make_classifier(
+            settings,
+            [choice("work/sbos2020", {"work/sbos2020": 0.9, GENERIC_LABEL: 0.1})],
+            [chat_body()],
+        )
+        result = classifier.classify(TEXT, one_node)
+    assert result.hint_path == "work/sbos2020"
+    assert result.confidence == pytest.approx(0.9)
+    assert result.meta is not None and result.meta.model_type == "decision"
+    assert decision.calls == 1
+    assert generative.calls == 0
+    question = payloads(decision)[0]["questions"][CLASSIFY_QUESTION]
+    assert list(question["criteria"]) == ["work/sbos2020", GENERIC_LABEL]
+    assert not events(caplog, "decision_skipped")
+
+
 # --- переключение на генеративный слот ----------------------------------------
 
 
