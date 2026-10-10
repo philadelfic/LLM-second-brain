@@ -339,6 +339,21 @@ class Client:
         except Exception as exc:  # noqa: BLE001 — closing is not a subject of checks
             info(f"closing the MCP session: {describe(exc)}")
 
+    async def reconnect(self) -> Any:
+        """Re-open the MCP session after a contour restart (the old socket is dead).
+
+        Сценарий 5 по своей сути перезапускает контейнер контура — сессия раннера
+        при этом рвётся, и без переоткрытия весь прогон уходит в повторы попыток
+        и завершается FATAL, хотя продукт жив (проверено 10.10.2026). Новую сессию
+        держим в своём стеке на этом же клиенте: старый сокет уже закрыт контуром,
+        его половину закроет общий стек прогона при выходе.
+        """
+        fresh, init = await fresh_session(AsyncExitStack(), own_stack=True)
+        self._keepalive = getattr(self, "_keepalive", [])
+        self._keepalive.append(fresh)  # стек новой сессии живёт до конца процесса
+        self.session = fresh.session
+        return init
+
 
 async def fresh_session(stack: AsyncExitStack, url: str | None = None,
                         token: str | None = None,
@@ -1071,7 +1086,7 @@ async def scenario_4_attention_pair(rest: httpx2.AsyncClient) -> None:
 
 
 # ==== scenarios: 5. restart inside the outage window ==========================
-async def scenario_5_restart_inside_outage(rest: httpx2.AsyncClient) -> None:
+async def scenario_5_restart_inside_outage(c: Client, rest: httpx2.AsyncClient) -> None:
     scenario(5, "Restart inside the outage window: work is neither lost nor duplicated")
     if not CFG["restart_cmd"]:
         skip("restart inside the outage window",
@@ -1095,6 +1110,19 @@ async def scenario_5_restart_inside_outage(rest: httpx2.AsyncClient) -> None:
         return
     teardown_note("the contour was restarted by the scenario hook")
 
+    # Рестарт рвёт MCP-сессию раннера: сначала дожидаемся, что контур отвечает,
+    # и только потом переоткрываем сессию — иначе весь прогон уходит в повторы
+    # попыток и заканчивается FATAL (проверено 10.10.2026).
+    alive, detail = await wait_until(
+        lambda: _http_alive(rest),
+        "the contour answers /health after the restart",
+        timeout=min(CFG["wait_sec"], 120.0),
+    )
+    check("the contour answers /health after the restart", alive, detail)
+    init = await c.reconnect()
+    check("the MCP session is re-opened after the restart",
+          init is not None, "session re-initialized")
+
     ok, detail = await wait_until(
         lambda: _pending_not_below(before),
         "the pending count is not below the pre-restart value (nothing lost)",
@@ -1114,6 +1142,22 @@ async def _pending_not_below(value: int) -> tuple[bool, str]:
         return False, err
     current = int(rows[0]["c"])
     return current >= value, f"pending {current} (was {value})"
+
+
+async def _http_alive(rest: httpx2.AsyncClient) -> tuple[bool, str]:
+    """Контур отвечает по HTTP (после рестарта — с повторами, сокет мог умереть)."""
+    last = "no answer"
+    for _ in range(3):
+        try:
+            response = await rest.get("/health")
+            body = response.json() if response.status_code == 200 else None
+            if body and body.get("status") == "ok":
+                return True, f"status=ok, version={body.get('version')!r}"
+            last = f"http {response.status_code}"
+        except Exception as exc:  # noqa: BLE001 — контур мог ещё подниматься
+            last = describe(exc)
+        await asyncio.sleep(2.0)
+    return False, last
 
 
 # ==== scenarios: 6. regression =================================================
@@ -2249,7 +2293,7 @@ async def run_all() -> None:
             await scenario_2_models_outage(c, rest)
             await scenario_3_auth_branch(rest)
             await scenario_4_attention_pair(rest)
-            await scenario_5_restart_inside_outage(rest)
+            await scenario_5_restart_inside_outage(c, rest)
             await scenario_6_regression()
             await scenario_8_budget_raise_release(c, rest)
             await scenario_9_decision_fallback(c, rest)
