@@ -110,7 +110,9 @@ if REPO_ROOT not in sys.path:
 # MCP listing ceiling is 20 (3.1.0 canon); the REST ceiling is 50.
 MCP_LIMIT = 20
 REST_LIMIT = 50
-MCP_TOOLS_TOTAL = 25  # 3.1.0 surface (21) + warnings_list + history handles + memory_comment_search
+MCP_TOOLS_TOTAL = 31  # 3.1.0 surface (21) + warnings_list + 2 history + memory_comment_search + 6 logs tools
+# Литерал намеренно, а не len(TOOL_NAMES): рост поверхности должен остаться
+# осознанным решением с пересмотром бюджетов текста (F-11, f11-03).
 HEALTH_LEGACY = ("status", "embedding_ok", "summarizer_ok", "judge_ok",
                  "notes_count", "pending_vector", "pending_summary")
 # №39: the queues of the contour (jobs registered on the job framework).
