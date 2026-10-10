@@ -80,7 +80,7 @@ def systemone(answers: dict) -> httpx.Response:
 
 
 def choice(label: str, probabilities: dict | None = None) -> httpx.Response:
-    body: dict = {"choice": label}
+    body: dict = {"type": "choice", "choice": label}
     if probabilities is not None:
         body["probabilities"] = probabilities
     return systemone({CLASSIFY_QUESTION: body})
@@ -143,9 +143,14 @@ def test_hint_path_from_choice(monkeypatch, caplog) -> None:
     assert result.meta is not None and result.meta.model_type == "decision"
     assert generative.calls == 0
     body = payloads(decision)[0]
-    assert body["questions"][0]["name"] == CLASSIFY_QUESTION
-    assert body["questions"][0]["type"] == "choice"
-    assert body["questions"][0]["labels"] == ["work/sbos2020", "life", GENERIC_LABEL]
+    assert list(body["questions"]) == [CLASSIFY_QUESTION]
+    question = body["questions"][CLASSIFY_QUESTION]
+    assert question["type"] == "choice"
+    # Варианты choice — ключи `criteria`: пути узлов без описания (`null`)
+    # плюс резервная метка `generic` с описанием из реестра.
+    assert list(question["criteria"]) == ["work/sbos2020", "life", GENERIC_LABEL]
+    assert question["criteria"]["work/sbos2020"] is None
+    assert question["criteria"][GENERIC_LABEL] == "the note is generic and not bound to a known section"
     assert body["state"] == ClassificationService._user_message(TEXT, KNOWN)
 
 
@@ -271,7 +276,7 @@ def test_warnings_and_nodes_share_decision(monkeypatch, caplog) -> None:
     # Джоба `nodes` (обход default) — тот же сервис и тот же вопрос разметки.
     assert classifier.classify(TEXT, KNOWN).hint_path is None
     assert decision.calls == 2
-    assert [body["questions"][0]["name"] for body in payloads(decision)] == [
-        CLASSIFY_QUESTION,
-        CLASSIFY_QUESTION,
+    assert [list(body["questions"]) for body in payloads(decision)] == [
+        [CLASSIFY_QUESTION],
+        [CLASSIFY_QUESTION],
     ]

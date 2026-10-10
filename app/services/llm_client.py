@@ -62,7 +62,7 @@ v2.1: каждый из трёх слотов (embedding, summary, judge) пол
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -623,9 +623,10 @@ class LLMClient:
     def decide(self, state: str, questions: list[dict]) -> dict:
         """Один `POST /v1/systemone`: state + ВСЕ вопросы в одном теле (FR-2.3).
 
-        Возвращает разобранный блок `answers` (форма пилота LSBN-T-13);
-        `questions` — канонические dict'ы (`name`/`kind`/`text`/`labels`/
-        `criteria`), имена полей сервера знает только `_systemone_payload`.
+        Возвращает разобранный блок `answers` (фактическая форма сервера,
+        сверено 2026-10-10); `questions` — канонические dict'ы (`name`/`kind`/
+        `text`/`labels`/`criteria`), имена полей сервера знает только
+        `_systemone_payload`.
         Отказ (сеть/не-200/мусор) — `LLMError` с прежними признаками
         (`transient`/`status`); признак `empty` не ставится никогда —
         генерации нет, «пустого ответа» быть не может.
@@ -690,34 +691,62 @@ class LLMClient:
     def _systemone_payload(state: str, questions: list[dict]) -> dict:
         """Тело `/v1/systemone` — ОДНА точка адаптации формата (arch §6.2/§13.6).
 
-        Запрос: `state` + вопросы `{name, type, text, labels/criteria}`.
-        `model` добавляет вызывающий (`decide`/`check_decision`): функция
-        чистая и тестируется без клиента. Если сервер разойдётся с пилотом —
+        Фактический контракт сервера (ollama ≥ 0.35.1; сверено живым запросом
+        2026-10-10): `questions` — ОБЪЕКТ «имя вопроса → вопрос» (1..64),
+        у вопроса `type` (choice|noul|score) и `instructions` (формулировка,
+        НЕ `name`/`text`), а `criteria` — варианты `choice` (ключ — метка,
+        значение — описание либо null для голой метки; сервер требует не
+        меньше двух), массив описаний для `score` (от низшего балла к высшему)
+        либо `{"true": …, "false": …}` для `noul` (необязательно). `state` —
+        непустая строка (объект/массив сервер тоже принимает). `model`
+        добавляет вызывающий (`decide`/`check_decision`): функция чистая и
+        тестируется без клиента. Если сервер разойдётся с этим форматом —
         правится ровно эта пара (`_systemone_payload`/`_parse_systemone`) и её
         контрактный тест, потребители не меняются.
         """
-        items: list[dict] = []
+        items: dict[str, dict[str, Any]] = {}
         for question in questions:
+            kind = str(question["kind"])
             item: dict[str, Any] = {
-                "name": question["name"],
-                "type": question["kind"],
-                "text": question["text"],
+                "type": kind,
+                "instructions": question["text"],
             }
-            labels = question.get("labels")
-            if labels:
-                item["labels"] = list(labels)
             criteria = question.get("criteria")
-            if criteria:
-                item["criteria"] = dict(criteria)
-            items.append(item)
+            if kind == "choice":
+                # Варианты choice задаёт сам объект criteria: метки — его ключи.
+                # Метки без описания доезжают как null (голая метка).
+                options: dict[str, str | None] = {
+                    str(label): None for label in (question.get("labels") or ())
+                }
+                if criteria:
+                    for label, description in criteria.items():
+                        options[str(label)] = (
+                            None if description is None else str(description)
+                        )
+                item["criteria"] = options
+            elif kind == "score":
+                # score: описания уровней от низшего балла к высшему (0..N-1).
+                levels = (
+                    criteria.values() if isinstance(criteria, Mapping) else criteria
+                )
+                item["criteria"] = [str(level) for level in (levels or ())]
+            elif criteria:
+                # noul: необязательные описания двух исходов; сервер знает
+                # только ключи 'true'/'false' (лишние отвергает).
+                item["criteria"] = {
+                    str(key): str(value)
+                    for key, value in criteria.items()
+                    if str(key) in ("true", "false")
+                }
+            items[str(question["name"])] = item
         return {"state": state, "questions": items}
 
     @staticmethod
     def _parse_systemone(data: Any) -> dict:
         """Разобрать ответ `/v1/systemone` — ОДНА точка адаптации (arch §6.2).
 
-        Возвращает `{имя вопроса: канонический ответ}`; три формы пилота
-        LSBN-T-13 (`noul`/`choice`/`score`) нормализуются в канонические ключи
+        Возвращает `{имя вопроса: канонический ответ}`; три формы ответа
+        сервера (`noul`/`choice`/`score`) нормализуются в канонические ключи
         `kind`/`label`/`probability`/`confidence`/`probabilities`/`score`/`raw`.
         Ответ без блока `answers` или с незнакомой формой вопроса — `LLMError`
         (это НЕ «пустой ответ»: генерации нет).
@@ -734,7 +763,7 @@ class LLMClient:
 
     @staticmethod
     def _normalize_decision_answer(name: str, value: Any) -> dict:
-        """Один ответ вопроса → канонический dict (формы пилота LSBN-T-13)."""
+        """Один ответ вопроса → канонический dict (формы сервера)."""
         if not isinstance(value, dict):
             raise LLMError(
                 f"{DECISION_PATH}: ответ вопроса «{name}» — не объект JSON"

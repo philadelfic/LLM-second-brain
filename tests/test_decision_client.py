@@ -1,10 +1,12 @@
 """Decision-слот: клиент /v1/systemone (LSBN-F-12, релиз 3.2.0; arch §6.2/§13.6).
 
 Юнит через httpx.MockTransport — без сети. Покрывается одна точка адаптации
-формата (`_systemone_payload` / `_parse_systemone`): один state и все вопросы
-в одном теле (FR-2.3); три формы ответа пилота LSBN-T-13 разбираются в
-`DecisionAnswer`; незнакомый формат — `LLMError` (не «пустой ответ»:
-генерации нет); стартовая проверка `check_decision()` — все исходы.
+формата (`_systemone_payload` / `_parse_systemone`) в фактической форме
+сервера (ollama ≥ 0.35.1; сверено живым запросом 2026-10-10): запрос —
+`state` + `questions` ОБЪЕКТОМ «имя → вопрос» (`type` + `instructions` +
+`criteria`); три формы ответа разбираются в `DecisionAnswer`; незнакомый
+формат — `LLMError` (не «пустой ответ»: генерации нет); стартовая проверка
+`check_decision()` — все исходы.
 """
 
 from __future__ import annotations
@@ -82,7 +84,13 @@ def ok_answers(payload: dict) -> httpx.Response:
 
 
 def test_systemone_payload_shape(monkeypatch) -> None:
-    """Один state и все вопросы группы в одном теле (FR-2.3)."""
+    """Один state и все вопросы группы в одном теле (FR-2.3).
+
+    Тело — в фактической форме сервера: `questions` — ОБЪЕКТ «имя → вопрос»,
+    формулировка едет в `instructions` (не `text`), у `choice` варианты —
+    ключи `criteria` (метка без описания → null), у `noul` — необязательные
+    описания двух исходов.
+    """
     state = "node descriptions"
     questions = [
         {"name": "is_text_duplicate", "kind": "noul", "text": "Dup?", "labels": (), "criteria": None},
@@ -91,17 +99,21 @@ def test_systemone_payload_shape(monkeypatch) -> None:
     payload = LLMClient._systemone_payload(state, questions)
     assert set(payload) == {"state", "questions"}
     assert payload["state"] == state
-    assert [item["name"] for item in payload["questions"]] == [
-        "is_text_duplicate",
-        "note_section",
-    ]
-    assert payload["questions"][0]["type"] == "noul"
-    assert payload["questions"][1]["labels"] == ["generic"]
-    assert payload["questions"][1]["criteria"] == {"generic": "elsewhere"}
+    assert isinstance(payload["questions"], dict)
+    assert list(payload["questions"]) == ["is_text_duplicate", "note_section"]
+    assert payload["questions"]["is_text_duplicate"] == {
+        "type": "noul",
+        "instructions": "Dup?",
+    }
+    assert payload["questions"]["note_section"] == {
+        "type": "choice",
+        "instructions": "Where?",
+        "criteria": {"generic": "elsewhere"},
+    }
 
     client, recorder = make_client(
         decision_settings(monkeypatch),
-        [ok_answers({"is_text_duplicate": {"noul": 0.9}, "note_section": {"choice": "generic", "probabilities": {"generic": 0.9}}})],
+        [ok_answers({"is_text_duplicate": {"type": "noul", "noul": 0.9}, "note_section": {"type": "choice", "choice": "generic", "probabilities": {"generic": 0.9}}})],
     )
     client.decide(state, questions)
     body = json.loads(recorder.requests[0].content)
@@ -112,37 +124,89 @@ def test_systemone_payload_shape(monkeypatch) -> None:
     assert len(body["questions"]) == 2
 
 
+def test_systemone_payload_choice_labels_and_score() -> None:
+    """Метка без описания → `null`; `score` — массив описаний уровней."""
+    payload = LLMClient._systemone_payload(
+        "node descriptions",
+        [
+            {"name": "note_section", "kind": "choice", "text": "Where?", "labels": ("work/sbos2020", "life", "generic"), "criteria": {"generic": "elsewhere"}},
+            {"name": "urgency", "kind": "score", "text": "How urgent?", "labels": (), "criteria": ["later", "today", "now"]},
+        ],
+    )
+    assert payload["questions"]["note_section"]["criteria"] == {
+        "work/sbos2020": None,
+        "life": None,
+        "generic": "elsewhere",
+    }
+    assert payload["questions"]["urgency"]["criteria"] == ["later", "today", "now"]
+
+
 def test_systemone_parse_noul(monkeypatch) -> None:
-    """Форма noul пилота → DecisionAnswer(label=true, probability=noul)."""
-    parsed = LLMClient._parse_systemone({"answers": {"q": {"type": "noul", "noul": 0.95}}})
+    """Ответ `noul` сервера → DecisionAnswer(label=true, probability=noul).
+
+    Тело — фактический ответ ollama (сверено 2026-10-10): `model`/`answers`/
+    `usage` верхнего уровня, у ответа вопроса — `type` и `noul`, уверенности нет.
+    """
+    parsed = LLMClient._parse_systemone(
+        {
+            "model": "clef-flash:latest",
+            "answers": {"q": {"type": "noul", "noul": 0.95}},
+            "usage": {"input_tokens": 144, "output_tokens": 0},
+        }
+    )
     answer = answer_from_parsed("q", parsed["q"])
     assert answer.kind == "noul"
     assert answer.label == "true"
     assert answer.probability == pytest.approx(0.95)
+    assert answer.confidence is None
+    assert answer.raw["type"] == "noul"
 
 
 def test_systemone_parse_choice(monkeypatch) -> None:
-    """Форма choice пилота → DecisionAnswer(label, probabilities, confidence)."""
+    """Ответ `choice` сервера → DecisionAnswer(label, probabilities, confidence)."""
     parsed = LLMClient._parse_systemone(
-        {"answers": {"q": {"choice": "task", "probabilities": {"task": 0.36, "generic": 0.1}, "confidence": 0.36}}}
+        {
+            "model": "clef-flash:latest",
+            "answers": {
+                "q": {
+                    "type": "choice",
+                    "choice": "bug",
+                    "probabilities": {"bug": 0.8473, "billing": 0.1421},
+                    "confidence": 0.5763,
+                }
+            },
+            "usage": {"input_tokens": 161, "output_tokens": 0},
+        }
     )
     answer = answer_from_parsed("q", parsed["q"])
     assert answer.kind == "choice"
-    assert answer.label == "task"
-    assert answer.probability == pytest.approx(0.36)
-    assert answer.confidence == pytest.approx(0.36)
-    assert answer.probabilities == {"task": 0.36, "generic": 0.1}
+    assert answer.label == "bug"
+    assert answer.probability == pytest.approx(0.8473)
+    assert answer.confidence == pytest.approx(0.5763)
+    assert answer.probabilities == {"bug": 0.8473, "billing": 0.1421}
 
 
 def test_systemone_parse_score(monkeypatch) -> None:
-    """Форма score пилота → DecisionAnswer(score, legend в raw)."""
+    """Ответ `score` сервера → DecisionAnswer(score, legend в raw)."""
     parsed = LLMClient._parse_systemone(
-        {"answers": {"q": {"score": 0.657, "legend": {"a": 1}, "probabilities": {"a": 0.6}, "confidence": 0.5}}}
+        {
+            "model": "clef-flash:latest",
+            "answers": {
+                "q": {
+                    "type": "score",
+                    "score": 0.657,
+                    "legend": {"0": "low", "1": "high"},
+                    "probabilities": {"0": 0.4, "1": 0.6},
+                    "confidence": 0.5,
+                }
+            },
+            "usage": {"input_tokens": 150, "output_tokens": 0},
+        }
     )
     answer = answer_from_parsed("q", parsed["q"])
     assert answer.kind == "score"
     assert answer.score == pytest.approx(0.657)
-    assert answer.raw["legend"] == {"a": 1}
+    assert answer.raw["legend"] == {"0": "low", "1": "high"}
 
 
 def test_systemone_unknown_shape_raises(monkeypatch) -> None:
