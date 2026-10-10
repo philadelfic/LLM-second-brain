@@ -1,11 +1,12 @@
-"""Тесты MCP-поверхности области «Логи ассистента» (LSBN-F-10, f10-02).
+"""Тесты MCP-поверхности области «Логи ассистента» (LSBN-F-10, f10-02/f10-03).
 
-Arch assistant-logs §7.1: четыре ручки `logs_save`/`logs_get`/`logs_update`/
-`logs_delete` появляются ТОЛЬКО при `AREA_LOGS_ENABLED=true` (выключенная
-область не даёт агенту ни одной ручки), выдачи компактны (белые списки, тело
-записи целиком отдаёт только `logs_get`), `hint` приходит только при мягком
-отказе. Поиск/листинг (`logs_search`/`logs_list`) — f10-03, раздела инструкции
-нет (f10-04): инъекции при initialize не появляется.
+Arch assistant-logs §7.1: шесть ручек `logs_save`/`logs_get`/`logs_update`/
+`logs_delete` + `logs_search`/`logs_list` появляются ТОЛЬКО при
+`AREA_LOGS_ENABLED=true` (выключенная область не даёт агенту ни одной ручки),
+выдачи компактны (белые списки, тело записи целиком отдаёт только `logs_get`,
+`action` в поиске/листинге срезан до `logs_search_excerpt_chars`), `hint`
+приходит только при мягком отказе. Раздела инструкции нет (f10-04): инъекции
+при initialize не появляется.
 """
 
 from __future__ import annotations
@@ -17,13 +18,16 @@ import pytest
 
 from app.config import Settings, get_settings
 from app.services import Services
+from app.services.areas import HINT_SHORT_QUERY
 from app.services.logs import (
     HINT_ACTION_REQUIRED,
+    HINT_DATE_ABSOLUTE,
     HINT_NOT_FOUND,
     HINT_UPDATE_EMPTY,
     LogsService,
 )
 from app.services.namespaces import NamespaceService
+from app.services.worker import BackgroundWorker
 from app.transport.mcp import (
     TOOL_DESCRIPTIONS,
     TOOL_NAMES,
@@ -36,7 +40,14 @@ from fakes import HashEmbedder
 DIM = 8
 
 LOGS_TOOL_NAMES = frozenset(
-    {"logs_save", "logs_get", "logs_update", "logs_delete"}
+    {
+        "logs_save",
+        "logs_get",
+        "logs_update",
+        "logs_delete",
+        "logs_search",
+        "logs_list",
+    }
 )
 
 ACTION = "записал замер эмбеддингов"
@@ -98,7 +109,7 @@ async def _save(mcp, **extra) -> dict:
 
 class TestToolRegistry:
     def test_logs_tools_registered(self, settings: Settings, mcp_logs) -> None:
-        """При включённом флаге в реестре ровно четыре ручки области §7.1."""
+        """При включённом флаге в реестре ровно шесть ручек области §7.1."""
         names = _tool_names(mcp_logs)
         assert LOGS_TOOL_NAMES <= names
         assert set(TOOL_NAMES) == names
@@ -200,3 +211,65 @@ class TestCompactAnswers:
         }
         gone = await _call(mcp_logs, "logs_get", {"id": saved["id"]})
         assert gone["hint"] == HINT_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_logs_search_compact(self, settings: Settings, mcp_logs) -> None:
+        """`logs_search`: белый список хита, срез `action`, hint только при отказе."""
+        long_action = "обрезать " + "х" * 400
+        saved = await _save(mcp_logs, action=long_action, entity="note", entity_id=5)
+        BackgroundWorker(settings, HashEmbedder(DIM)).process_pending_areas()
+
+        found = await _call(mcp_logs, "logs_search", {"query": "обрезать"})
+        assert set(found) == {"results"}, found  # без warning/hint — не отказ
+        hit = found["results"][0]
+        assert set(hit) == {
+            "id",
+            "action",
+            "created_at",
+            "entity",
+            "entity_id",
+            "score",
+        }
+        assert hit["id"] == saved["id"]
+        assert hit["action"] == long_action[: settings.logs_search_excerpt_chars]
+        assert len(hit["action"]) == settings.logs_search_excerpt_chars
+
+        # Пустой запрос и запрос вне лимита top_k — мягкие отказы, не исключения.
+        empty = await _call(mcp_logs, "logs_search", {"query": "   "})
+        assert empty == {"results": [], "hint": HINT_SHORT_QUERY}
+        # Срез по относительной дате — мягкий отказ (только абсолютные дни, §13.12).
+        relative = await _call(
+            mcp_logs, "logs_search", {"query": "обрезать", "date_from": "вчера"}
+        )
+        assert relative == {"results": [], "hint": HINT_DATE_ABSOLUTE}
+
+    @pytest.mark.asyncio
+    async def test_logs_list_compact(self, settings: Settings, mcp_logs) -> None:
+        """`logs_list`: страница без `next_cursor`, срез `action`, срезы работают."""
+        long_action = "обрезать " + "х" * 400
+        first = await _save(mcp_logs, action=long_action, entity="note", entity_id=5)
+        second = await _save(mcp_logs)
+
+        page = await _call(mcp_logs, "logs_list", {})
+        assert set(page) == {"items", "total", "has_more", "next_offset"}
+        assert [item["id"] for item in page["items"]] == [second["id"], first["id"]]
+        assert page["total"] == 2 and page["has_more"] is False
+        assert page["next_offset"] is None
+        # Обратный запрос «почему изменился объект» — срез по объекту и его id.
+        sliced = await _call(
+            mcp_logs, "logs_list", {"entity": "note", "entity_id": 5}
+        )
+        assert [item["id"] for item in sliced["items"]] == [first["id"]]
+        assert sliced["total"] == 1
+        item = sliced["items"][0]
+        assert set(item) == {"id", "action", "created_at", "entity", "entity_id"}
+        assert item["action"] == long_action[: settings.logs_search_excerpt_chars]
+        # Потолок MCP — свой, меньший, чем у оператора (list_max_limit_rest).
+        over = await _call(
+            mcp_logs, "logs_list", {"limit": settings.list_max_limit_mcp + 1}
+        )
+        assert over == {
+            "items": [],
+            "hint": f"limit: expected 1..{settings.list_max_limit_mcp}, "
+            f"got {settings.list_max_limit_mcp + 1}",
+        }

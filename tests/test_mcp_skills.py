@@ -254,13 +254,15 @@ class TestToolRegistry:
             MEMORY_TOOL_NAMES | USER_TOOL_NAMES | TERMS_TOOL_NAMES
             | HISTORY_TOOL_NAMES | WARNINGS_TOOL_NAMES
         )
-        # Логи (f10-02) в этой DI-сборке не собраны (`services.logs is None`):
+        # Логи (f10-02/03) в этой DI-сборке не собраны (`services.logs is None`):
         # их ручек в поверхности нет, остальное совпадает со словарём TOOL_NAMES.
         assert set(TOOL_NAMES) - {
             "logs_save",
             "logs_get",
             "logs_update",
             "logs_delete",
+            "logs_search",
+            "logs_list",
         } == names
         assert len(names) == 25
 

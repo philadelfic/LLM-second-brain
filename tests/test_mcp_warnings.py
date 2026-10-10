@@ -172,9 +172,9 @@ async def test_limit_over_max_is_soft(
 
 @pytest.mark.asyncio
 async def test_surface_grew_by_exactly_one(mcp_server) -> None:
-    """Регресс поверхности: словарь TOOL_NAMES целиком (№12 + пометки + 4 ручки
-    логов LSBN-F-10, f10-02)."""
+    """Регресс поверхности: словарь TOOL_NAMES целиком (№12 + пометки + 6 ручек
+    логов LSBN-F-10: 4 в f10-02, ещё 2 в f10-03)."""
     names = {tool.name for tool in await mcp_server.list_tools()}
-    assert len(names) == 29
+    assert len(names) == 31
     assert names == TOOL_NAMES
     assert "warnings_list" in names

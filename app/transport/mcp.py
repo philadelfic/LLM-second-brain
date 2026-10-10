@@ -707,7 +707,8 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     # Правило «лог — не знание, пиши только явным вызовом, не выдумывай
     # источник» и словарь объекта изменения вшиты в тексты: описания —
     # гарантированный канал, инструкции MCP блока «logs» не содержат
-    # (инъекции нет, arch §2; раздел инструкции — f10-04). Поиск/листинг — 03.
+    # (инъекции нет, arch §2; раздел инструкции — f10-04). Поиск и листинг —
+    # ниже, f10-03 (тексты описаний там же — короткие EN).
     "logs_save": (
         "Save ONE entry to the assistant-logs area: action (what was done) and "
         "reason (why) are required, ≤500 characters each; entity names the "
@@ -741,6 +742,25 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "surface; restoring is the operator's job). The deletion is recorded in "
         "the shared history as an event. Delete only an entry that is "
         "factually wrong or duplicates another one."
+    ),
+    # f10-03 (arch §7.1): recalls over the area — a hybrid (semantics + full
+    # text) with slices, and a listing. Both answer 'why did this object
+    # change': pass entity + entity_id (+ entity_version).
+    "logs_search": (
+        "Recall the assistant-logs area: hybrid semantic + full-text search "
+        "over what was done and why, with slices by object "
+        "(entity/entity_id/entity_version), session, source and absolute "
+        "dates (date_from/date_to, YYYY-MM-DD, inclusive). A paraphrase is "
+        "fine; the log body comes back only as an excerpt — read the full "
+        "text via logs_get. Returns {results, warning?, hint?}."
+    ),
+    "logs_list": (
+        "List assistant-log entries, newest first, one page at a time "
+        "(limit/offset), with the same slices as logs_search. Use it to "
+        "answer 'why did this object change': pass entity + entity_id "
+        "(+ entity_version). Returns {items, total, has_more, next_offset, "
+        "hint?}; the body is cut to an excerpt — read the full text via "
+        "logs_get."
     ),
 }
 
@@ -1244,7 +1264,8 @@ def _compact_term_get(result: dict[str, Any]) -> dict[str, Any]:
 # списки полей. Тела записи режет только поиск/листинг (f10-03: `excerpt`
 # `logs_search_excerpt_chars`); `logs_get` отдаёт запись целиком — агент обязан
 # видеть, к какому объекту и с какой версией относится запись. `hint` — только
-# при мягком отказе; `warning` (деградация FTS-only) появится в 03.
+# при мягком отказе; `warning` (деградация FTS-only) приходит в `logs_search`
+# (f10-03: `_compact_log_search`).
 _LOG_GET_ITEM = (
     "id",
     "action",
@@ -1294,6 +1315,59 @@ def _compact_log_update(result: dict[str, Any]) -> dict[str, Any]:
 def _compact_log_delete(result: dict[str, Any]) -> dict[str, Any]:
     """logs_delete: (id, deleted); повторный/чужой id → hint канона §7.3."""
     return _with_hint(_pick(result, ("id", "deleted")), result)
+
+
+# f10-03 (arch §7.1): компактный хит поиска/листинга — {id, action, created_at}
+# плюс присутствующие `entity`/`entity_id`/`score`; `action` режется до
+# `logs_search_excerpt_chars`, чтобы тело лога не вываливалось в контекст
+# (FR-2.3/FR-5.3; REST оператора, наоборот, отдаёт текст целиком).
+_LOG_HIT_REQUIRED = ("id", "action", "created_at")
+_LOG_HIT_OPTIONAL = ("entity", "entity_id", "score")
+
+
+def _compact_log_hit(hit: dict[str, Any], excerpt_chars: int) -> dict[str, Any]:
+    """Один элемент выдачи поиска/листинга: белый список + обрезка `action`."""
+    compact = {name: hit[name] for name in _LOG_HIT_REQUIRED}
+    for name in _LOG_HIT_OPTIONAL:
+        if hit.get(name) is not None:
+            compact[name] = hit[name]
+    action = compact["action"]
+    if len(action) > excerpt_chars:
+        compact["action"] = action[:excerpt_chars]
+    return compact
+
+
+def _compact_log_search(
+    result: dict[str, Any], excerpt_chars: int
+) -> dict[str, Any]:
+    """logs_search: {results, warning?, hint?} — warning FTS-only виден агенту."""
+    if "results" not in result:  # мягкий отказ до БД (например, лимит top_k)
+        return _with_hint({"results": []}, result)
+    out: dict[str, Any] = {
+        "results": [
+            _compact_log_hit(hit, excerpt_chars) for hit in result["results"]
+        ]
+    }
+    if result.get("warning"):
+        out["warning"] = result["warning"]
+    return _with_hint(out, result)
+
+
+def _compact_log_list(
+    result: dict[str, Any], excerpt_chars: int
+) -> dict[str, Any]:
+    """logs_list: {items, total, has_more, next_offset, hint?} без next_cursor."""
+    if "items" not in result:  # мягкий отказ (лимит/offset) — пустая страница
+        return _with_hint({"items": []}, result)
+    out: dict[str, Any] = {
+        "items": [
+            _compact_log_hit(row, excerpt_chars) for row in result["items"]
+        ],
+        "total": result["total"],
+        "has_more": result["has_more"],
+        "next_offset": result["next_offset"],
+    }
+    return _with_hint(out, result)
 
 
 # №41 (FR-5.3, §7.1, §13.14): история из MCP — одна общая пара инструментов
@@ -3009,5 +3083,210 @@ def build_mcp(
                     id=id,
                 )
             return _compact_log_delete(result)
+
+        # f10-03 (arch §7.1/§8): вспоминание области — гибридный поиск со
+        # срезами и листинг. Потолок `top_k` — схемой (1..20, как у других
+        # ручек), а потолок `limit`/знак `offset` — СЕРВИСОМ (мягкий отказ
+        # hint'ом, а не схема-ошибка: предцедент `memory_list`). Срезы — те же,
+        # что у REST-зеркала: один код сервиса на обе поверхности (f10-03/REST).
+        _logs_excerpt = settings.logs_search_excerpt_chars
+
+        @mcp.tool(name="logs_search", description=TOOL_DESCRIPTIONS["logs_search"])
+        async def logs_search(
+            query: Annotated[
+                str,
+                Field(
+                    description="What to recall (a paraphrase is fine)",
+                    min_length=1,
+                    max_length=settings.max_query_chars,
+                ),
+            ],
+            top_k: Annotated[
+                int,
+                Field(description="Number of results", ge=1, le=20),
+            ] = settings.default_top_k,
+            entity: Annotated[
+                str | None,
+                Field(
+                    description="Slice by object of the change: note | skill "
+                    "| term | user_fact | assistant_log | file | commit | "
+                    "tracker_task | config | contour",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            entity_id: Annotated[
+                int | None,
+                Field(
+                    description="Slice by id of the changed object",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            entity_version: Annotated[
+                int | None,
+                Field(
+                    description="Slice by version of the changed object "
+                    "(requires entity_id)",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            session: Annotated[
+                str | None,
+                Field(
+                    description="Slice by call/agent identifier",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            source: Annotated[
+                str | None,
+                Field(
+                    description="Slice by call channel: mcp | rest | merge "
+                    "| migration | job:<name>",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            date_from: Annotated[
+                str | None,
+                Field(
+                    description="Only entries on or after this day "
+                    "(YYYY-MM-DD, UTC, inclusive)",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            date_to: Annotated[
+                str | None,
+                Field(
+                    description="Only entries on or before this day "
+                    "(YYYY-MM-DD, UTC, inclusive)",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+        ) -> dict[str, Any]:
+            started = time.perf_counter()
+            try:
+                result = await asyncio.to_thread(
+                    services.logs.search,
+                    query,
+                    top_k,
+                    entity=entity,
+                    entity_id=entity_id,
+                    entity_version=entity_version,
+                    session=session,
+                    source=source,
+                    date_from=date_from,
+                    date_to=date_to,
+                )
+            except LogValidationError as exc:
+                # Срез/лимит/дата нарушены — мягкий отказ (fail + hint), без
+                # схемы: форма проверяется сервисом.
+                log_tool_call("logs_search", started, failed=True, reason=str(exc))
+                return {"results": [], "hint": str(exc)}
+            fts_only = result.get("warning") is not None
+            if result.get("results"):
+                log_tool_call(
+                    "logs_search",
+                    started,
+                    results=len(result["results"]),
+                    fts_only=fts_only,
+                )
+            else:
+                log_tool_call(
+                    "logs_search",
+                    started,
+                    failed=True,
+                    reason=result["hint"],
+                    fts_only=fts_only,
+                )
+            return _compact_log_search(result, _logs_excerpt)
+
+        @mcp.tool(name="logs_list", description=TOOL_DESCRIPTIONS["logs_list"])
+        async def logs_list(
+            entity: Annotated[
+                str | None,
+                Field(
+                    description="Slice by object of the change (see logs_search)",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            entity_id: Annotated[
+                int | None,
+                Field(
+                    description="Slice by id of the changed object — the "
+                    "reverse lookup 'why did it change'",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            entity_version: Annotated[
+                int | None,
+                Field(
+                    description="Slice by version of the changed object "
+                    "(requires entity_id)",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            session: Annotated[
+                str | None,
+                Field(
+                    description="Slice by call/agent identifier",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            source: Annotated[
+                str | None,
+                Field(
+                    description="Slice by call channel: mcp | rest | merge "
+                    "| migration | job:<name>",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            date_from: Annotated[
+                str | None,
+                Field(
+                    description="Only entries on or after this day "
+                    "(YYYY-MM-DD, UTC, inclusive)",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            date_to: Annotated[
+                str | None,
+                Field(
+                    description="Only entries on or before this day "
+                    "(YYYY-MM-DD, UTC, inclusive)",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            limit: Annotated[
+                int,
+                # Потолок (list_max_limit_mcp) проверяет СЕРВИС: сверх него —
+                # мягкий отказ hint'ом, а не schema-error (предцедент memory_list).
+                Field(description="Page size (1..20)", ge=1),
+            ] = settings.default_list_limit,
+            offset: Annotated[
+                int,
+                # Знак offset тоже проверяет СЕРВИС (offset < 0 — мягкий отказ).
+                Field(description="Page offset"),
+            ] = 0,
+        ) -> dict[str, Any]:
+            started = time.perf_counter()
+            try:
+                result = await asyncio.to_thread(
+                    services.logs.list,
+                    entity=entity,
+                    entity_id=entity_id,
+                    entity_version=entity_version,
+                    session=session,
+                    source=source,
+                    date_from=date_from,
+                    date_to=date_to,
+                    limit=limit,
+                    offset=offset,
+                    max_limit=settings.list_max_limit_mcp,
+                )
+            except LogValidationError as exc:
+                log_tool_call("logs_list", started, failed=True, reason=str(exc))
+                return {"items": [], "hint": str(exc)}
+            log_tool_call(
+                "logs_list", started, results=len(result["items"])
+            )
+            return _compact_log_list(result, _logs_excerpt)
 
     return mcp

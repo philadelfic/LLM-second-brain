@@ -94,6 +94,10 @@ from app.services.terms import (
     TermValidationError,
     TermsService,
 )
+from app.services.logs import LogsService, LogValidationError
+# «Не передано = оставить» в PUT /logs/{id}: тот же сентинел, что у MCP
+# (`_LOG_UNSET`), — REST не заводит своей семантики пустого поля.
+from app.services.logs import _UNSET as _LOG_UNSET
 from app.services.user_facts import UserFactValidationError, UserFactsService
 from app.services.warnings import WarningsService, WarningsValidationError
 
@@ -273,6 +277,49 @@ class TermUpdate(TermCreate):
     """
 
 
+class LogCreate(BaseModel):
+    """Тело POST /logs: запись области логов (arch §7.2, f10-03).
+
+    Поля — как у `logs_save`; `action`/`reason` обязательны (§7.3), но их
+    НЕПУСТОТУ и лимиты проверяет СЕРВИС (не схема — как у формы термина):
+    нарушение → `LogValidationError` → 422 с дословным hint канона §7.3,
+    записи нет. `entity`/связки и `source`/`session` валидируются там же;
+    непереданные `source`/`session` берёт `bind_origin` миддлвари.
+    """
+
+    action: str
+    reason: str
+    entity: str | None = None
+    entity_id: int | None = None
+    entity_version: int | None = None
+    entity_ref: str | None = None
+    outcome: str | None = None
+    verified: str | None = None
+    source: str | None = None
+    session: str | None = None
+
+
+class LogUpdate(BaseModel):
+    """Тело PUT /logs/{id}: частичная правка — «не передано = оставить» (§7.2).
+
+    Все поля опциональны: непереданное (None) уходит сентинелом «оставить как
+    есть» (тот же `_LOG_UNSET`, что у MCP `logs_update`). Сервис вернёт
+    `updated: False` + hint, если ничего не передано или записи нет; связки
+    объекта проверяются по эффективным значениям (как в `logs_update`).
+    """
+
+    action: str | None = None
+    reason: str | None = None
+    entity: str | None = None
+    entity_id: int | None = None
+    entity_version: int | None = None
+    entity_ref: str | None = None
+    outcome: str | None = None
+    verified: str | None = None
+    source: str | None = None
+    session: str | None = None
+
+
 class HistoryRollback(BaseModel):
     """Тело POST /history/{entity}/{id}/rollback: номер целевой версии (§7.2).
 
@@ -441,9 +488,33 @@ def _terms_service(request: Request) -> TermsService:
     return _services(request).terms
 
 
+def _logs_service(request: Request) -> LogsService:
+    """Сервис области логов — общий для всех REST-ручек /logs (f10-03).
+
+    `Services.logs` опционален только ради старых DI-сборок; приложение
+    (`create_app`/`build_services`) собирает область ВСЕГДА — доступ оператора
+    сохраняется и у выключенного флага (§13.11), поэтому 503 — только для
+    сборок без области (как у `_skills_service`/`_warnings_service`).
+    """
+    service = _services(request).logs
+    if service is None:
+        raise HTTPException(status_code=503, detail="logs area is not available")
+    return service
+
+
 def _unprocessable(exc: ValueError) -> HTTPException:
     """Доменные нарушения → 422 с текстом сервиса (без внутренностей)."""
     return HTTPException(status_code=422, detail=str(exc))
+
+
+def _log_field(value: Any) -> Any:
+    """Поле PUT /logs/{id}: не переданное (None) — значит «оставить как есть».
+
+    Мост между схемой REST (у опциональных полей default None) и сервисом, где
+    «не передано» — сентинел `_LOG_UNSET` (один код с MCP `logs_update`); так
+    пустая строка остаётся осмысленной (очистка поля).
+    """
+    return _LOG_UNSET if value is None else value
 
 
 def _conflict(exc: NamespaceError) -> HTTPException:
@@ -1227,6 +1298,140 @@ def build_rest_router(settings: Settings) -> APIRouter:
         if not result.get("deleted"):
             raise HTTPException(
                 status_code=404, detail=result.get("hint", "term not found")
+            )
+        return result
+
+    # --- область логов: операторская поверхность (LSBN-F-10, f10-03) --------
+    # §7.2: ПОЛНЫЕ выдачи (тело не режем — оператору нужен полный текст;
+    # MCP режет белыми списками), работают при ЛЮБОМ значении флага области
+    # (§13.11). Порядок: статических подпутей нет — все `/logs/{log_id}`
+    # целочисленные, «search» здесь не идёт REST-дорогой (§7.2).
+
+    @rest_router.post("/logs", status_code=201)
+    async def create_log(payload: LogCreate, request: Request) -> dict:
+        """Создать запись: 201 — ПОЛНАЯ запись, 422 — форма (§7.2).
+
+        Форма проверяется сервисом ДО БД (нарушение → дословный hint §7.3);
+        после создания отдаём запись целиком (`get`), а не конверт save.
+        """
+        service = _logs_service(request)
+        try:
+            result = await asyncio.to_thread(
+                service.save,
+                action=payload.action,
+                reason=payload.reason,
+                entity=payload.entity,
+                entity_id=payload.entity_id,
+                entity_version=payload.entity_version,
+                entity_ref=payload.entity_ref,
+                outcome=payload.outcome,
+                verified=payload.verified,
+                source=payload.source,
+                session=payload.session,
+            )
+        except LogValidationError as exc:
+            raise _unprocessable(exc) from exc
+        return await asyncio.to_thread(service.get, result["id"])
+
+    @rest_router.get("/logs")
+    async def list_logs(
+        request: Request,
+        entity: str | None = Query(default=None),
+        entity_id: int | None = Query(default=None),
+        entity_version: int | None = Query(default=None),
+        session: str | None = Query(default=None),
+        source: str | None = Query(default=None),
+        date_from: str | None = Query(default=None),
+        date_to: str | None = Query(default=None),
+        limit: int | None = Query(default=None),
+        offset: int = Query(default=0),
+    ) -> dict:
+        """Листинг со срезами и пагинацией (§7.2), потолок `list_max_limit_rest`.
+
+        Обратный запрос «почему изменился объект» — ЭТОТ же маршрут с
+        `entity`+`entity_id`[+`entity_version`] (§8/§13.4), отдельной ручки нет.
+        Потолок лимита и знак offset проверяет сервис → мягкий 422 с hint.
+        """
+        try:
+            return await asyncio.to_thread(
+                _logs_service(request).list,
+                entity=entity,
+                entity_id=entity_id,
+                entity_version=entity_version,
+                session=session,
+                source=source,
+                date_from=date_from,
+                date_to=date_to,
+                limit=limit,
+                offset=offset,
+            )
+        except LogValidationError as exc:
+            raise _unprocessable(exc) from exc
+
+    @rest_router.get("/logs/{log_id}")
+    async def get_log(log_id: int, request: Request) -> dict:
+        """Прочитать запись целиком (тело не режется); нет/удалена → 404 (§7.2).
+
+        Несуществующая/удалённая запись не отличается от «нет строки» → 404
+        с hint канона §7.3 (служебное восстановление — оператор).
+        """
+        record = await asyncio.to_thread(_logs_service(request).get, log_id)
+        if "action" not in record:  # мягкий ответ сервиса: строки нет/удалена
+            raise HTTPException(
+                status_code=404,
+                detail=record.get("hint", "log entry not found"),
+            )
+        return record
+
+    @rest_router.put("/logs/{log_id}")
+    async def update_log(
+        log_id: int, payload: LogUpdate, request: Request
+    ) -> dict:
+        """Частичная правка: 200 `{updated: true}`, 404 — нет записи, 422 — форма.
+
+        «Не передано = оставить» (сентинелы); каждая фактическая правка
+        версионируется общим слоем истории (№41, §13.5). Записи нет или ничего
+        не передано → 404 с hint канона §7.3.
+        """
+        try:
+            result = await asyncio.to_thread(
+                _logs_service(request).update,
+                log_id,
+                action=_log_field(payload.action),
+                reason=_log_field(payload.reason),
+                entity=_log_field(payload.entity),
+                entity_id=_log_field(payload.entity_id),
+                entity_version=_log_field(payload.entity_version),
+                entity_ref=_log_field(payload.entity_ref),
+                outcome=_log_field(payload.outcome),
+                verified=_log_field(payload.verified),
+                source=_log_field(payload.source),
+                session=_log_field(payload.session),
+            )
+        except LogValidationError as exc:
+            raise _unprocessable(exc) from exc
+        if not result.get("updated"):
+            raise HTTPException(
+                status_code=404,
+                detail=result.get("hint", "log entry not found"),
+            )
+        return result
+
+    @rest_router.delete("/logs/{log_id}")
+    async def delete_log(log_id: int, request: Request) -> dict:
+        """Мягко удалить запись: 200 `{id, deleted: true}` / 404 (§7.2).
+
+        Строка и индексы живы, выдачи агента запись не видят (§11); повторное/
+        несуществующее удаление → 404 с hint канона §7.3 (восстановление —
+        оператором).
+        """
+        result = await asyncio.to_thread(
+            _logs_service(request).delete, log_id
+        )
+        if not result.get("deleted"):
+            raise HTTPException(
+                status_code=404,
+                detail=result.get("hint", "log entry not found"),
             )
         return result
 
