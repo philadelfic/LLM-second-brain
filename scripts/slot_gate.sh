@@ -50,9 +50,12 @@
 #                    fallback needs a longer acceptance window
 #   SLOT_GATE_PROXY_EMBED_CONTAINER  (docker only) proxy container of the embedding
 #                    slot (default: lsb-test-model-proxy-embed)
-#   SLOT_GATE_PROXY_GEN_CONTAINER    (docker only) proxy container of the summary
-#                    AND judge slots (default: lsb-test-model-proxy-gen): in the
-#                    test contour the two generative slots share one proxy
+#   SLOT_GATE_PROXY_SUMMARY_CONTAINER (docker only) proxy container of the summary
+#                    slot (default: lsb-test-model-proxy-summary)
+#   SLOT_GATE_PROXY_JUDGE_CONTAINER  (docker only) proxy container of the judge
+#                    slot (default: lsb-test-model-proxy-judge): every slot has
+#                    its OWN proxy container, so muting one slot never closes
+#                    the channel of another one
 #   SLOT_GATE_ENV    (iptables only) env file with the slot addresses
 #                    (default: ./.env.test, i.e. beside the contour working copy —
 #                    run the script from there)
@@ -78,7 +81,8 @@ ACTION="${SLOT_GATE_ACTION:-stop}"
 
 # docker-режим: имена прокси-контейнеров слотов (адресов и токенов в файле нет).
 PROXY_EMBED_CONTAINER="${SLOT_GATE_PROXY_EMBED_CONTAINER:-lsb-test-model-proxy-embed}"
-PROXY_GEN_CONTAINER="${SLOT_GATE_PROXY_GEN_CONTAINER:-lsb-test-model-proxy-gen}"
+PROXY_SUMMARY_CONTAINER="${SLOT_GATE_PROXY_SUMMARY_CONTAINER:-lsb-test-model-proxy-summary}"
+PROXY_JUDGE_CONTAINER="${SLOT_GATE_PROXY_JUDGE_CONTAINER:-lsb-test-model-proxy-judge}"
 
 # iptables-режим (запасной путь): адреса берутся только из окружения/env-файла.
 CHAIN="DOCKER-USER"
@@ -231,13 +235,15 @@ ipt_text() {
 # Бэкенд по умолчанию: выключение прокси-контейнеров слотов (docker stop/start)
 # =============================================================================
 
-# Контейнер-прокси слота: embedding — свой, summary и judge делят один
-# (в тест-контуре оба генеративных слота смотрят на одну модель).
+# Контейнер-прокси слота: у КАЖДОГО слота свой прокси, поэтому глушение одного
+# слота не задевает соседний. summary и judge могут смотреть на одну и ту же
+# модель (в тест-контуре обе живут на .112), но идут через разные контейнеры.
 proxy_for_slot() {
     case "$1" in
-        embedding)     printf '%s' "$PROXY_EMBED_CONTAINER" ;;
-        summary|judge) printf '%s' "$PROXY_GEN_CONTAINER" ;;
-        *)             return 1 ;;
+        embedding) printf '%s' "$PROXY_EMBED_CONTAINER" ;;
+        summary)   printf '%s' "$PROXY_SUMMARY_CONTAINER" ;;
+        judge)     printf '%s' "$PROXY_JUDGE_CONTAINER" ;;
+        *)         return 1 ;;
     esac
 }
 
