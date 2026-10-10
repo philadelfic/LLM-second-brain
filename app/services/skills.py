@@ -124,6 +124,12 @@ HINT_SEARCH_EMPTY = (
     "repeatable procedure, save it via skills_save"
 )
 
+# Непустой `skills_search` (arch 3.2.0 §7.1/§7.4, №38): подсказка «тело — только
+# `skills_get`» — РОВНО одна на ответ (поле верхнего уровня), НЕ в элементах
+# `results`: дублирование по элементам тратило контекст агента. Короткая
+# (≤120 симв.) — бюджет вшитого текста (LSBN-F-11).
+HINT_SKILLS_BODY = "skill bodies are read only via skills_get"
+
 # Антисинонимия создания (§3.8): подсказка ведёт к существующему навыку,
 # создание не происходит. Шаблон подставляет id и name ближайшего навыка.
 HINT_SIMILAR_SKILL = (
@@ -477,11 +483,13 @@ class SkillsService:
         (вектор = `name + description`, субстрат §3.3) + FTS5/BM25 по
         `skills_fts` (`name`/`description`/`steps`/`text`) → RRF, фильтр
         `deleted_at IS NULL`. Выдача компактна — тел нет: `{results: [{id,
-        name, description, score}], warning?}`; пустой результат — мягкий
-        ответ с дословным hint канона §3.8 (проба: навыка нет — валидный
-        исход, без fail). Отказ эмбеддера поиск не ломает: FTS-only +
-        `warning` (прецедент заметок, NFR-3) — warning в ответе сервиса
-        сохраняется, MCP-слой его срежет (lsb-0007-03).
+        name, description, score}], hint, warning?}`. Подсказка — РОВНО одна
+        на ответ и на верхнем уровне (arch 3.2.0 §7.1, №38): непустой
+        результат → `HINT_SKILLS_BODY` («тело — только `skills_get`»), пустой
+        → `HINT_SEARCH_EMPTY` (проба: навыка нет — валидный исход, без fail);
+        в элементах `results` поля `hint` нет. Отказ эмбеддера поиск не
+        ломает: FTS-only + `warning` (прецедент заметок, NFR-3) — warning в
+        ответе сервиса сохраняется, MCP-слой его срежет (lsb-0007-03).
 
         `top_k` — границы как у поиска заметок (`1..MAX_TOP_K`), нарушение —
         `SkillValidationError` (мягкий отказ транспорта, как у `list`).
@@ -502,7 +510,11 @@ class SkillsService:
             "results": found["results"],
             "warning": found.get("warning"),
         }
-        if not found["results"]:
+        if found["results"]:
+            # Канон §3.8 (№38): у непустого поиска навыка подсказка о чтении
+            # тела — ровно одна, на верхнем уровне ответа (не на элемент).
+            answer["hint"] = HINT_SKILLS_BODY
+        else:
             # Канон §3.8: у пустого поиска навыка ровно один hint (подсказки
             # субстрата про короткий запрос в выдачу навыков не выносим).
             answer["hint"] = HINT_SEARCH_EMPTY

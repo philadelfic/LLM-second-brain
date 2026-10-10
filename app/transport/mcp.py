@@ -1142,10 +1142,15 @@ def _skill_hit(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_skill_search(result: dict[str, Any]) -> dict[str, Any]:
-    """skills_search: {results: [{id, name, description, score?}], hint?}.
+    """skills_search: {results: [{id, name, description, score?}], hint}.
 
-    Пустой поиск — не fail сервиса, а мягкий ответ с дословным hint канона
-    §3.8 (проба: навыка нет — валидный исход).
+    №38: подсказка берётся с ВЕРХНЕГО уровня ответа — ровно одна на весь поиск
+    (`HINT_SKILLS_BODY` при хитах, `HINT_SEARCH_EMPTY` при пустом результате);
+    в белом списке элемента (`_SKILL_SEARCH_ITEM`) поля `hint` нет. Пустой
+    поиск — не fail сервиса, а мягкий ответ с дословным hint канона §3.8
+    (проба: навыка нет — валидный исход). Мягкий отказ `fail + hint`
+    (невалидный `top_k`/запрос) обрабатывается в ручке ДО поиска и сюда не
+    доходит.
     """
     out = {"results": [_skill_hit(row) for row in result["results"]]}
     return _with_hint(out, result)  # warning не копируется никогда

@@ -2,7 +2,8 @@
 компактные выдачи, hint'ы мягких отказов, антисинонимия создания.
 
 ARCH lsb-0007 §3.3–3.4, §3.8: описания инструментов и hint'ы — дословный канон
-(сверяем литералами), выдачи компактны (тело навыка — только `skills_get`),
+(сверяем литералами), выдачи компактны (тело навыка — только `skills_get`) —
+№38 (3.2.0): подсказка поиска одна на ответ, в элементах `results` её нет,
 антисинонимия создания живёт в сервисном слое (её же обязан звать REST
 POST /skills) и проверяется здесь сквозь MCP-поверхность. Поверхность —
 in-process MCP (живой uvicorn — tests/test_mcp.py): caplog видит событие
@@ -127,6 +128,7 @@ CANON_HINT_SEARCH_EMPTY = (
     "no skill found for this task — do the task as usual; if you worked out a "
     "repeatable procedure, save it via skills_save"
 )
+CANON_HINT_SKILLS_BODY = "skill bodies are read only via skills_get"
 CANON_HINT_SIMILAR_SKILL = (
     "there is a similar skill: {id} — {name}; reuse or update it "
     "(skills_save with id=…) or make this skill clearly different"
@@ -402,11 +404,32 @@ class TestCompactOutputs:
         got = (
             await mcp_skills.call_tool("skills_search", {"query": "deploy the service"})
         ).structured_content
-        assert set(got) == {"results"}  # warning сервиса срезан
+        assert set(got) == {"results", "hint"}  # warning сервиса срезан
         hit = got["results"][0]
         assert hit["id"] == skill_id
         assert set(hit) == {"id", "name", "description", "score"}
         assert "text" not in hit and "steps" not in hit  # тела в выдаче нет
+
+    @pytest.mark.asyncio
+    async def test_compact_search_single_hint(self, mcp_skills) -> None:
+        """№38: подсказка поиска — одна на ответ (верхний уровень), не в элементах;
+
+        непустой → `HINT_SKILLS_BODY` (≤120 симв.), пустой → ровно один
+        `HINT_SEARCH_EMPTY` (второй подсказки нет).
+        """
+        assert (await _save(mcp_skills))["created"] is True
+        got = (
+            await mcp_skills.call_tool("skills_search", {"query": "deploy the service"})
+        ).structured_content
+        assert got["results"]
+        assert got["hint"] == CANON_HINT_SKILLS_BODY
+        assert len(got["hint"]) <= 120  # бюджет вшитого текста (F-11)
+        assert all("hint" not in hit for hit in got["results"])
+
+        empty = (
+            await mcp_skills.call_tool("skills_search", {"query": "нет такого навыка"})
+        ).structured_content
+        assert empty == {"results": [], "hint": CANON_HINT_SEARCH_EMPTY}
 
     @pytest.mark.asyncio
     async def test_delete_is_compact(self, mcp_skills) -> None:
