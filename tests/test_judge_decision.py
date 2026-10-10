@@ -71,12 +71,12 @@ class Recorder:
 
 
 def systemone(answers: dict) -> httpx.Response:
-    """Ответ `/v1/systemone` (форма пилота LSBN-T-13)."""
+    """Ответ `/v1/systemone` (фактическая форма сервера, сверено 2026-10-10)."""
     return httpx.Response(200, json={"answers": answers})
 
 
 def noul(probability: float) -> httpx.Response:
-    return systemone({JUDGE_QUESTION: {"noul": probability}})
+    return systemone({JUDGE_QUESTION: {"type": "noul", "noul": probability}})
 
 
 def chat_body(content: str = "**DUPLICATE**\n\nBoth notes say the same.") -> httpx.Response:
@@ -150,7 +150,7 @@ def test_verdict_from_noul_true(monkeypatch, caplog) -> None:
 
 
 def test_decision_call_uses_pilot_state(monkeypatch, caplog) -> None:
-    """`state` — боевой `judge_user`; в теле ровно один `noul`-вопрос реестра."""
+    """`state` — боевой `judge_user`; вопрос — реестровый `noul`, формулировка в `instructions`."""
     settings = decision_settings(monkeypatch)
     registry = PromptRegistry(None)
     judge, decider, decision, generative = make_judge(
@@ -166,8 +166,14 @@ def test_decision_call_uses_pilot_state(monkeypatch, caplog) -> None:
         text_new=TEXT_NEW, text_candidate=TEXT_CANDIDATE
     )
     assert len(body["questions"]) == 1
-    assert body["questions"][0]["name"] == JUDGE_QUESTION
-    assert body["questions"][0]["type"] == "noul"
+    assert list(body["questions"]) == [JUDGE_QUESTION]
+    question = body["questions"][JUDGE_QUESTION]
+    assert question["type"] == "noul"
+    assert question["instructions"] == registry.decision_questions["judge"][0].text
+    assert question["criteria"] == {
+        "true": "both texts carry the same fact with matching details",
+        "false": "the texts differ in facts, details or intent",
+    }
 
 
 # --- переключение на генеративный слот ----------------------------------------
