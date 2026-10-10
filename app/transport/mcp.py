@@ -252,6 +252,10 @@ def build_instructions(
 ) -> str:
     """Полный текст инструкций: база + правило неймспейсов + карта + анонс.
 
+    Порядок слагаемых: база (`SERVER_INSTRUCTIONS`), правила неймспейсов
+    (`_NS_RULES`), карта узлов, анонс навыков, раздел логов, строка про
+    lifetime заметки.
+
     Блок анонса навыков — ХВОСТ (lsb-0007 §3.5): манифест, правила и карта
     не меняются, блок лишь дописывается и не добавляется вовсе, если
     активных навыков нет (или БД ещё недоступна).
@@ -259,6 +263,10 @@ def build_instructions(
     LSBN-F-10 (f10-04, arch §10): хвостом ПОСЛЕ анонса навыков добавляется
     короткий раздел области логов — и только при `AREA_LOGS_ENABLED`; в карту
     узлов логи не входят (карта — про неймспейсы заметок, §13.13).
+
+    №46 (no46-02): САМЫМ последним хвостом — строка про lifetime заметки;
+    флагами областей НЕ гейтится (TTL — ядровая механика заметок, как
+    `note`/`memory_*`), остаётся и при выключенных областях.
     """
     settings = get_settings() if settings is None else settings
     return (
@@ -267,6 +275,7 @@ def build_instructions(
         + _namespace_map(services)
         + _skills_announce(services)
         + _logs_section(services, settings)
+        + _note_lifetime_section(services, settings)
     )
 
 
@@ -297,6 +306,29 @@ def _logs_section(services: Services, settings: Settings) -> str:
     if not settings.area_logs_enabled:
         return ""
     return _LOGS_SECTION
+
+
+# Строка про lifetime заметки в инструкциях (№46, no46-02) — статический EN-текст
+# канона постановки, дословно. Обезличенный: ни имён, ни «оператора». Даёт модели
+# знать про TTL: `expires_at` превращается в абсолютный ISO-8601, просроченную
+# заметку удаляет сам LSB джобой `expiration`. Флагами областей НЕ гейтится —
+# TTL это ядровая механика заметок, а не область. Бюджет F-11 держим: короткая
+# строка, перечень форматов TTL — минимально необходимый.
+_NOTE_LIFETIME_SECTION = (
+    "\n\nNotes can carry a lifetime: pass `expires_at` (a TTL like «1d», «2h», "
+    "«30m», «45s», «2w») to `memory_save` — LSB deletes the note when it "
+    "expires. A note with a lifetime is never merged with other notes."
+)
+
+
+def _note_lifetime_section(services: Services, settings: Settings) -> str:
+    """Хвост инструкций — строка про lifetime заметки (№46, no46-02).
+
+    Статический EN-текст канона; от флагов областей не зависит (TTL — ядровая
+    механика заметок), поэтому возвращается всегда. `services`/`settings` —
+    ради единой подписи слагаемых `build_instructions`.
+    """
+    return _NOTE_LIFETIME_SECTION
 
 
 # Блок анонса навыков (arch lsb-0007 §3.5/§3.8): правило поведения —

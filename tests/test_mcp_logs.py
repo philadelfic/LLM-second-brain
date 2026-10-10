@@ -31,6 +31,7 @@ from app.services.worker import BackgroundWorker
 from app.transport.mcp import (
     TOOL_DESCRIPTIONS,
     TOOL_NAMES,
+    _NOTE_LIFETIME_SECTION,
     _namespace_map,
     build_instructions,
     build_mcp,
@@ -156,6 +157,8 @@ class TestToolRegistry:
         text = build_instructions(_services(off, HashEmbedder(DIM)))
         assert "Assistant logs" not in text
         assert "logs_save" not in text
+        # no46-02: строка про lifetime от области логов НЕ зависит — остаётся.
+        assert _NOTE_LIFETIME_SECTION in text
 
     def test_logs_not_in_namespace_map(self, settings: Settings) -> None:
         """Карта узлов — про неймспейсы заметок: логи в неё не входят (§13.13)."""

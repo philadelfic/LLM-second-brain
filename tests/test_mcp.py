@@ -1598,6 +1598,88 @@ class TestInstructionsBudget:
         assert f"- default: {DEFAULT_NAMESPACE_DESCRIPTION}" in instructions
         assert DEFAULT_NAMESPACE_DESCRIPTION_LEGACY not in instructions
 
+    def test_instructions_carry_note_lifetime(self, test_env: dict[str, str]) -> None:
+        """№46 (no46-02): инструкции несут строку про lifetime заметки (TTL).
+
+        Модель при подключении видит: что передаётся (`expires_at` с TTL-примерами),
+        что делает LSB (удаляет заметку сам по истечении) и что заметка с lifetime
+        не сливается с другими. Строка обезличенная — без имён и «оператора».
+        """
+        from app.config import get_settings
+        from app.services import build_services
+        from app.storage.db import init_db
+        from app.transport.mcp import _NOTE_LIFETIME_SECTION, build_instructions
+
+        settings = get_settings()
+        init_db(settings)
+        instructions = build_instructions(build_services(settings))
+        assert _NOTE_LIFETIME_SECTION in instructions
+        assert "`expires_at`" in instructions
+        assert "`memory_save`" in instructions
+        for ttl in ("«1d»", "«2h»", "«30m»", "«45s»", "«2w»"):
+            assert ttl in instructions
+        assert "LSB deletes the note when it expires" in instructions
+        assert "never merged with other notes" in instructions
+        assert "operator" not in instructions.lower()
+
+    def test_instructions_lifetime_is_the_tail(self, test_env: dict[str, str]) -> None:
+        """Порядок слагаемых зафиксирован: «логи → lifetime», lifetime — последний."""
+        from app.config import get_settings
+        from app.services import build_services
+        from app.storage.db import init_db
+        from app.transport.mcp import (
+            _NOTE_LIFETIME_SECTION,
+            _logs_section,
+            _note_lifetime_section,
+            build_instructions,
+        )
+
+        settings = get_settings()
+        init_db(settings)
+        services = build_services(settings)
+        text = build_instructions(services, settings)
+        lifetime = _note_lifetime_section(services, settings)
+        assert lifetime == _NOTE_LIFETIME_SECTION
+        # Хвост целиком: раздел логов (если включён) + строка про lifetime.
+        assert text.endswith(_logs_section(services, settings) + lifetime)
+        logs = _logs_section(services, settings)
+        if logs:
+            assert text.index(logs) < text.index(lifetime)
+
+    def test_instructions_lifetime_canon_verbatim(self) -> None:
+        """Константа — дословный литерал канона постановки no46-02."""
+        from app.transport.mcp import _NOTE_LIFETIME_SECTION
+
+        canon = (
+            "\n\nNotes can carry a lifetime: pass `expires_at` (a TTL like «1d», «2h», "
+            "«30m», «45s», «2w») to `memory_save` — LSB deletes the note when it "
+            "expires. A note with a lifetime is never merged with other notes."
+        )
+        assert _NOTE_LIFETIME_SECTION == canon
+
+    def test_instructions_lifetime_within_budget(self, test_env: dict[str, str]) -> None:
+        """Строка про lifetime влезает в бюджет §2 и не вытесняет соседние слагаемые."""
+        from app.config import get_settings
+        from app.services import build_services
+        from app.storage.db import init_db
+        from app.transport.mcp import (
+            _NS_RULES,
+            _NOTE_LIFETIME_SECTION,
+            build_instructions,
+        )
+
+        settings = get_settings()
+        init_db(settings)
+        instructions = build_instructions(build_services(settings))
+        # Бюджет §2 (LSBN-F-11): грубая оценка токенов ≈ длина/4, лимит 1300.
+        assert len(instructions.encode("utf-8")) / 4 <= 1300
+        assert _NOTE_LIFETIME_SECTION in instructions
+        # Строка не вытесняет правила неймспейсов и анонс навыков.
+        assert _NS_RULES in instructions
+        assert "Hierarchical namespaces are large sections" in instructions
+        assert "Skills are stored procedures" in instructions
+        assert len(_NOTE_LIFETIME_SECTION) <= 300
+
 
 class TestFreshnessMCP:
     """no29-01: невалидное `updated_after` — мягкий отказ с хинтом (fail+hint)."""

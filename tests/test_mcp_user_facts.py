@@ -34,6 +34,7 @@ from app.transport.mcp import (
     _NS_RULES,
     _logs_section,
     _namespace_map,
+    _note_lifetime_section,
     _skills_announce,
     build_instructions,
     build_mcp,
@@ -289,6 +290,7 @@ class TestToolRegistry:
             + _namespace_map(services)
             + _skills_announce(services)
             + _logs_section(services, settings)
+            + _note_lifetime_section(services, settings)
         )
         text = build_instructions(services)
         assert text == expected
