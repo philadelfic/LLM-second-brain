@@ -56,6 +56,10 @@ if [[ "${LSB_FAKE_HOOKS:-1}" != "0" ]]; then
   )
 fi
 
+# Окно чтения журнала (LSB_LOGS_CMD): пересборка контура хуками сценариев 3/4/8/9
+# УДАЛЯЕТ прежний контейнер, поэтому 15 минут иногда не покрывают нужные события
+# (живой прогон 10.10.2026: ветка 401 прочла 164 строки и не нашла `slot_resumed`).
+# 2 часа с запасом покрывают один приёмочный прогон целиком.
 docker run --rm --user root --network lsb-test_default \
   -v "${HOST_ROOT}/test:/w" \
   -v "${HOST_ROOT}/dev/release:/w/release" \
@@ -68,6 +72,6 @@ docker run --rm --user root --network lsb-test_default \
   -e LSB_SLOT_OFF_CMD="scripts/slot_gate.sh off" \
   -e LSB_SLOT_ON_CMD="scripts/slot_gate.sh on" \
   -e LSB_RESTART_CMD="docker restart lsb-test" \
-  -e LSB_LOGS_CMD="docker logs --since 15m lsb-test" \
+  -e LSB_LOGS_CMD="docker logs --since 2h lsb-test" \
   llm-second-brain:test python scripts/e2e_release32.py \
   --base-url http://lsb-test:8080 "$@"
