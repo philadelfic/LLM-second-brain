@@ -2613,6 +2613,7 @@ async def scenario_10_node_hint(c: Client, rest: httpx2.AsyncClient) -> None:
 
 # ==== scenarios: 11. freshness filter (№29) ===================================
 FRESHNESS_BOUNDARY = "2001-01-01T00:00:00Z"
+FRESHNESS_AFTER_BOUNDARY = "2001-01-01T00:00:01Z"
 FRESHNESS_OLD = "2000-01-01T00:00:00Z"
 
 
@@ -2650,18 +2651,28 @@ async def scenario_11_freshness(c: Client, rest: httpx2.AsyncClient) -> None:
     db_write("UPDATE notes SET updated_at = ? WHERE id = ?",
              (FRESHNESS_BOUNDARY, fresh["id"]))
 
+    # Граница включающая: заметка, обновлённая РОВНО в границу, остаётся в срезе,
+    # а строго старше — выпадает. Проверяем СЧЁТОМ, а не вхождением в страницу:
+    # лимит MCP-листинга (list_max_limit_mcp = 20) меньше числа заметок в памяти,
+    # а проба намеренно самая старая — в первую страницу она не попадает, и
+    # вхождение проверяло бы лимит, а не фильтр (прогон 12.10.2026).
     listed = await c.call("memory_list", {
         "limit": 20, "updated_after": FRESHNESS_BOUNDARY})
-    ids = [item["id"] for item in listed.get("items", [])]
+    unfiltered = await c.call("memory_list", {"limit": 20})
     check("memory_list with `updated_after` keeps the fresh note (inclusive "
           "boundary) and drops the old one",
-          fresh["id"] in ids and old["id"] not in ids,
-          f"ids={ids}, fresh={fresh['id']}, old={old['id']}")
-    unfiltered = await c.call("memory_list", {"limit": 20})
-    check("the listing `total` follows the freshness filter (exactly the stale "
-          "note is excluded)",
           unfiltered.get("total") == listed.get("total", -1) + 1,
-          f"filtered={listed.get('total')}, all={unfiltered.get('total')}")
+          f"filtered={listed.get('total')}, all={unfiltered.get('total')}, "
+          f"fresh={fresh['id']}, old={old['id']}")
+    # Сдвиг границы на секунду вперёд обязан выкинуть и свежую заметку: значит она
+    # стояла РОВНО на границе (сравнение `>=`), а не «где-то после неё».
+    later = await c.call("memory_list", {
+        "limit": 20, "updated_after": FRESHNESS_AFTER_BOUNDARY})
+    check("one second after the boundary the fresh note falls out too (the "
+          "comparison is `>=`, not `>`)",
+          listed.get("total", -1) == later.get("total", -2) + 1,
+          f"at the boundary={listed.get('total')}, one second later="
+          f"{later.get('total')}")
 
     found = await c.call("memory_search", {
         "query": "TaskFlow деплой", "updated_after": FRESHNESS_BOUNDARY})
@@ -2674,12 +2685,16 @@ async def scenario_11_freshness(c: Client, rest: httpx2.AsyncClient) -> None:
           bad.get("items") == [] and "updated_after" in (bad.get("hint") or ""),
           f"hint={bad.get('hint')!r}")
 
-    r = await rest.get("/notes", params={"updated_after": FRESHNESS_BOUNDARY})
-    rest_ids = ([item["id"] for item in (r.json().get("items") or [])]
-                if r.status_code == 200 else [])
+    r = await rest.get("/notes", params={"updated_after": FRESHNESS_BOUNDARY,
+                                         "limit": 50})
+    r_all = await rest.get("/notes", params={"limit": 50})
+    rest_total = r.json().get("total") if r.status_code == 200 else None
+    rest_all = r_all.json().get("total") if r_all.status_code == 200 else None
     check("the REST surface filters GET /notes the same way",
-          r.status_code == 200 and fresh["id"] in rest_ids and old["id"] not in rest_ids,
-          f"http {r.status_code}, ids={rest_ids}")
+          r.status_code == 200 and rest_total is not None
+          and rest_all == rest_total + 1,
+          f"http {r.status_code}, filtered={rest_total}, all={rest_all}, "
+          f"fresh={fresh['id']}, old={old['id']}")
     r_bad = await rest.get("/notes", params={"updated_after": "за неделю"})
     check("REST answers an invalid `updated_after` with 422 (soft refusal, hint)",
           r_bad.status_code == 422 and "updated_after" in str(r_bad.json().get("detail")),
