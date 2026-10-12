@@ -35,6 +35,7 @@ from test_judge_decision import (
     decision_settings,
     make_judge,
     noul,
+    systemone,
 )
 
 
@@ -156,7 +157,13 @@ def test_decision_answer_fields(monkeypatch, caplog) -> None:
 
 
 def test_decision_fallback_reason_enum(monkeypatch, caplog) -> None:
-    """`reason` переключения — ровно три значения; иных нет (§13.6/FR-4.2)."""
+    """`reason` переключения — ровно три значения; иных нет (§13.6/FR-4.2).
+
+    Проверен весь словарь: зона неопределённости (`low_confidence`), разрыв и
+    сеть (`unavailable`), контракт с сервером (`unsupported`). Чужое имя
+    причина не принимает вовсе — в разработке это ошибка (`ValueError`),
+    а не четвёртый счётчик.
+    """
     settings = decision_settings(monkeypatch)
     allowed = {"unavailable", "unsupported", "low_confidence"}
     with caplog.at_level(logging.INFO, logger="app"):
@@ -170,9 +177,19 @@ def test_decision_fallback_reason_enum(monkeypatch, caplog) -> None:
             [chat_body()],
         )
         judge_bad.judge(TEXT_NEW, TEXT_CANDIDATE)  # unavailable
-    reasons = {record.reason for record in events(caplog, "decision_fallback")}
-    assert reasons and reasons <= allowed
+        judge_contract, _, _, _ = make_judge(
+            settings, [systemone({})], [chat_body()]
+        )
+        judge_contract.judge(TEXT_NEW, TEXT_CANDIDATE)  # unsupported (нет решения)
+        reasons = {record.reason for record in events(caplog, "decision_fallback")}
+        assert reasons == allowed
+        assert set(decider.snapshot()["by_reason"]) == allowed
+        with pytest.raises(ValueError):
+            decider._fallback("timeout", operation="judge")
     assert set(decider.snapshot()["by_reason"]) == allowed
+    assert decider.snapshot()["fallbacks"] == sum(
+        decider.snapshot()["by_reason"].values()
+    )
 
 
 def test_decision_paused_events(monkeypatch, caplog) -> None:

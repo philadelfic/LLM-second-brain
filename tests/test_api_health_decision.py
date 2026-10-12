@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -66,6 +68,53 @@ def test_decision_disabled_shape(client: TestClient) -> None:
         "fallbacks": 0,
         "by_reason": dict(DISABLED_REASONS),
     }
+
+
+def test_by_reason_shape_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Выключенный флагом слот: `/health.decision.by_reason` — ровно три нуля, `fallbacks == 0` (FR-4.4).
+
+    Выключенный decision не переключение: счётчики причин не трогаются даже
+    при попытках решения, форма `/health` остаётся с тремя ключами.
+    """
+    settings = make_settings(
+        monkeypatch,
+        DECISION_ENABLED="false",
+        DECISION_BASE_URL="http://127.0.0.1:1",
+        DECISION_MODEL="decision-test",
+    )
+    with TestClient(create_app(settings)) as client:
+        body = client.get("/health").json()
+    assert body["decision_ok"] is None
+    decision = body["decision"]
+    assert decision["enabled"] is False
+    assert decision["fallbacks"] == 0
+    assert decision["by_reason"] == dict(DISABLED_REASONS)
+    assert decision["fallbacks"] == sum(decision["by_reason"].values())
+
+
+def test_reason_not_counted_twice(monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+    """Один отказ → ровно одно событие `decision_fallback` и один инкремент (§7.3)."""
+    app = decision_app(monkeypatch)
+    with TestClient(app) as client:
+        service = app.state.services.decision
+        # Разрыв открыт (auth): отказ виден без обращения к модели.
+        service._breaker.note_failure(SlotOutcome.AUTH)
+        question = DecisionQuestion(name="q", text="Is Q true?", kind="noul")
+        with caplog.at_level(logging.INFO, logger="app"):
+            with pytest.raises(DecisionUnavailable) as excinfo:
+                service.decide("state", [question], operation="judge")
+        assert excinfo.value.reason == "unavailable"
+        records = [
+            record
+            for record in caplog.records
+            if getattr(record, "event", None) == "decision_fallback"
+        ]
+        assert len(records) == 1
+        assert records[0].reason == "unavailable"
+        decision = client.get("/health").json()["decision"]
+        assert decision["fallbacks"] == 1
+        assert decision["by_reason"]["unavailable"] == 1
+        assert decision["fallbacks"] == sum(decision["by_reason"].values())
 
 
 def test_decision_ok_after_check(monkeypatch: pytest.MonkeyPatch) -> None:

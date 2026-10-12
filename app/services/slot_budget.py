@@ -69,24 +69,34 @@ def resolve_output_budget(
     return LEGACY_OUTPUT_BUDGET.get(operation, LEGACY_DEFAULT_OUTPUT_BUDGET), SOURCE_LEGACY
 
 
-# Состав отпечатка конфигурации слота (lsbdef0008-02, arch §5/§13.8): порядок
-# слагаемых — часть контракта, значения приводятся к строкам. Провайдер, модель,
-# тип модели, бюджет вывода, заявленный контекст, запас и защитный потолок, плюс
-# параметры decision-слота: поднятый бюджет и включённый decision — тоже «причина
-# ушла» (FR-2.3), поэтому входят в отпечаток наравне с моделью.
+# Состав отпечатка конфигурации слота (lsbdef0008-02/-03, arch §5/§8/§13.8):
+# порядок слагаемых — часть контракта, значения приводятся к строкам. Провайдер,
+# модель, тип модели, «думать / не думать» (`*_THINK`), бюджет вывода, заявленный
+# контекст, клиентский таймаут (`*_TIMEOUT_SEC`), запас и защитный потолок, плюс
+# параметры decision-слота: поднятый бюджет, включённый decision, правка
+# размышления или таймаута — тоже «причина ушла» (FR-2.3), поэтому входят в
+# отпечаток наравне с моделью. THINK и таймаут здесь не для полноты картинки:
+# они меняют исход вызова (`think: false` — другой ответ; таймаут — `timeout`
+# вместо ответа), а боевой случай 30.09–01.10.2026 показал цену их отсутствия —
+# слоты на обходе `JUDGE_THINK=false` + малый бюджет не размораживали пары после
+# правки размышления.
 FINGERPRINT_FIELDS: tuple[str, ...] = (
     "summary_model",
     "summary_provider",
     "summary_model_type",
+    "summary_think",
     "summary_num_predict",
     "summary_context_tokens",
+    "summary_timeout_sec",
     "slot_max_output_tokens",
     "slot_prompt_reserve_tokens",
     "judge_model",
     "judge_provider",
     "judge_model_type",
+    "judge_think",
     "judge_num_predict",
     "judge_context_tokens",
+    "judge_timeout_sec",
     "decision_enabled",
     "decision_model",
     "decision_threshold",

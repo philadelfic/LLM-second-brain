@@ -292,11 +292,23 @@ async def run_loop(
                 backoff_state.grow(spec.interval_sec)
                 continue
             # Форма «по требованию»: перепроверка очереди ПОСЛЕ clear() (пул 6,
-            # lost wakeup) — работа, появившаяся до clear(), видна селекту
-            # (продолжаем без сна); появившаяся после — будит уже очищенное
-            # событие, сигнал не стирается.
+            # lost wakeup) — работа, появившаяся до clear(), видна селекту,
+            # значит ей даётся ОДИН немедленный прогон; появившаяся после —
+            # будит уже очищенное событие, сигнал не стирается.
             spec.wait_event.clear()
             if spec.queue_empty is not None and not await _call_hook(spec.queue_empty):
+                processed = await spec.process()
+                if processed > 0:
+                    backoff_state.interval = float(spec.interval_sec)
+                    continue
+                # Прогон пуст: работа в очереди есть, но взять её не удалось
+                # (слот отказывает заданию — оно остаётся pending). Отказ
+                # джобы не считается прогрессом петли (№39, no39-05): иначе
+                # повтор без сна превращался бы в холостой шторм (живой
+                # случай 12.10.2026: ≈11 вызовов/с).
+                await _log_queue_waiting(spec)
+                await asyncio.sleep(backoff_state.interval)
+                backoff_state.grow(spec.interval_sec)
                 continue
             await _log_queue_waiting(spec)
             try:

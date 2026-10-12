@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 
 from pydantic import Field, ValidationError, field_validator, model_validator
@@ -672,6 +673,19 @@ class Settings(BaseSettings):
         need_low("slot_hint_every_sec", self.slot_hint_every_sec, 0)
         # --- счётчик попыток пары (№39 §6.8, no39-02): предел ≥ 1 ---
         need_low("slot_max_attempts", self.slot_max_attempts, 1)
+        # no39-04 (решение О. 2026-10-12): софт-проверка достижимости порога
+        # внимания. Если порог внимания НЕ выше порога паузы
+        # (`slot_max_attempts <= slot_pause_after`), пара будет казаться
+        # безнадёжной только после нескольких циклов «пауза → стук → отказ», и
+        # состояние «требует вмешательства» придёт позже, чем ждёт оператор.
+        # Фатальным не делаем: оба значения — воля оператора, старт не падает.
+        if self.slot_max_attempts <= self.slot_pause_after:
+            logging.getLogger("app").warning(
+                "порог внимания не выше порога паузы: пара будет казаться "
+                "безнадёжной только после N циклов паузы; подними "
+                "SLOT_MAX_ATTEMPTS или снизь SLOT_PAUSE_AFTER",
+                extra={"event": "slot_attempts_below_pause"},
+            )
 
         # --- decision-слот (LSBN-F-12, arch §8): таймаут ≥ 1, потолок вопросов
         # в 1..64 (лимит модели), потолок меток ≥ 2, порог и зона в 0..1. При

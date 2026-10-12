@@ -7,11 +7,25 @@ FR-2.3/№39: «работа есть, но она не выполняется»
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import pytest
 
-from app.services.jobs import JobSpec, _log_queue_waiting
+from app.services.jobs import BackoffState, JobSpec, _log_queue_waiting, run_loop
+
+
+def patch_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Мгновенный `asyncio.sleep` с записью запрошенных пауз (back-off не ждём)."""
+    real_sleep = asyncio.sleep
+    delays: list[float] = []
+
+    async def spy(delay: float, *args: object, **kwargs: object) -> None:
+        delays.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", spy)
+    return delays
 
 
 async def _noop() -> int:
@@ -68,3 +82,43 @@ async def test_event_silent_on_fully_empty(caplog) -> None:
     with caplog.at_level(logging.INFO, logger="app"):
         await _log_queue_waiting(empty)
     assert _waiting_records(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_event_once_per_iteration_on_idle_run(monkeypatch, caplog) -> None:
+    """Холостой прогон: `queue_waiting` — ровно один раз на итерацию петли (№39).
+
+    Задание, которому слот отказывает, для петли не работа (no39-05): после
+    одного шанса на lost wakeup петля уходит в ожидание и пишет событие ОДИН раз
+    — иначе шквал `queue_waiting` был бы зеркалом холостого шторма 12.10.2026
+    (событие на каждый прогон без сна).
+    """
+    caplog.clear()
+    delays = patch_sleep(monkeypatch)
+    calls = {"runs": 0}
+
+    async def process() -> int:
+        calls["runs"] += 1
+        return 0
+
+    spec = JobSpec(
+        name="probe",
+        queue="probe",
+        interval_sec=30,
+        batch=None,
+        enabled=True,
+        process=process,
+        queue_empty=lambda: False,
+        wait_event=asyncio.Event(),
+        idle_hook=None,
+        queue_stat=lambda: {
+            "pending": 1, "oldest_pending_sec": 0, "waiting": 0, "attention": 0,
+        },
+    )
+    with caplog.at_level(logging.INFO, logger="app"):
+        await asyncio.wait_for(
+            run_loop(spec, lambda: len(delays) >= 2, BackoffState(30)), timeout=1.0
+        )
+    # Две итерации ожидания: по одному событию каждая (прогоны — 2 × lost wakeup).
+    assert calls["runs"] == 4
+    assert len(_waiting_records(caplog)) == 2

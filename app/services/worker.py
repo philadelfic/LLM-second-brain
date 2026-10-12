@@ -508,6 +508,13 @@ class BackgroundWorker:
         # (_create_job/_pending_jobs/_mark_job_done звали _ensure_job_table
         # на каждый вызов — 3 раза на работу).
         self._jobs_table_ready = False
+        # Тестовый крючок (no39-04): сколько раз слот снимал (пытался снять)
+        # работу с внимания, по причинам (`probe`/`edit`/`operator`/`startup`).
+        # Инвариант «пауза — на слот, счёт — на пару» проверяется тестом «стук
+        # не обнуляет»: успешный стук НЕ должен появляться тут с reason
+        # `probe` вовсе (`_reset_attention_for_slot(..., "probe")` из
+        # `_slot_gate` удалён, no39-04).
+        self._attention_resets: dict[str, int] = {}
         # Job-очереди по слотам (Фаза 11, решение №10): таблица создаётся
         # воркером лениво при первом обращении к очередям (схема — зона
         # воркера, не db.py). В __init__ не создаём: воркер собирается в
@@ -787,8 +794,15 @@ class BackgroundWorker:
             result = self._probe_slot(slot)
             self._log_slot_event("slot_probe", slot, effective_job, result=result)
             if result == CHECK_OK:
+                # Стук снимает разрыв СЛОТА, но НЕ снимает счёт ПАРЫ (no39-04,
+                # решение О. 2026-10-12): «слот ожил» ≠ «причина пары ушла».
+                # Здесь нет `_reset_attention_for_slot(slot, "probe")` — иначе
+                # успешный стук обнулял бы `attempts` и `attention_at` пары,
+                # порог `SLOT_MAX_ATTEMPTS` становился бы недостижим, и
+                # «требует вмешательства» не наступало бы никогда. Работу с
+                # внимания снимают только протоколы правки пары, оператора и
+                # смены отпечатка конфигурации (arch §6.8).
                 breaker.note_success()
-                self._reset_attention_for_slot(slot, "probe")
                 self._log_slot_event(
                     "slot_resumed",
                     slot,
@@ -978,7 +992,15 @@ class BackgroundWorker:
         detail: str | None = None,
         pair_stamp: str | None = None,
     ) -> dict:
-        """Зафиксировать исход попытки пары (№39, arch §6.8).
+        """Зафиксировать исход попытки пары (№39, arch §6.8; no39-04).
+
+        ИНВАРИАНТ «пауза — на слот, счёт — на пару»: состояние разрыва слота
+        здесь НЕ читается вовсе. Пауза — недоступность/отказ доступа СЛОТА
+        (back-off и пробный стук); счётчик `attempts` — собственная
+        безнадёжность ПАРЫ (заметка/кандидат). Поэтому нетранзиентные отказы
+        считаются независимо от того, открыт ли сейчас разрыв слота: пара
+        доходит до `SLOT_MAX_ATTEMPTS` через циклы «пауза → стук → снова
+        отказ», а не замирает на `SLOT_PAUSE_AFTER`.
 
         Транзиентный исход (`unavailable`/`timeout`/`auth`) обновляет только
         `last_outcome`/`last_error` — счётчик не растёт (ждать — нормальное
@@ -1110,10 +1132,14 @@ class BackgroundWorker:
     def _reset_attention_for_slot(self, slot: str, reason: str) -> int:
         """Снять внимание у заданий слота (`*` — у всех); число снятых.
 
-        Крючки «причина ушла» (arch §6.8/§13.3): успешный стук слота
-        (`probe`), старт со сменой отпечатка конфигурации (`startup`).
+        Единственный «оптовый» сброс «причина ушла» — старт со сменой отпечатка
+        конфигурации (`reason="startup"`, arch §6.8/§13.3). Успешный стук слота
+        (`reason="probe"`) сюда больше НЕ ведёт (no39-04): «слот ожил» — не
+        «причина пары ушла».
         """
         self._ensure_job_table()
+        # крючок наблюдаемости (тесты): попытки снятия по каждой причине
+        self._attention_resets[reason] = self._attention_resets.get(reason, 0) + 1
         with session(self._settings) as conn:
             if slot == "*":
                 rows = conn.execute(
@@ -1605,6 +1631,21 @@ class BackgroundWorker:
 
     # --- потерянный будильник: дешёвая перепроверка очереди перед сном (пул 6)
 
+    def _decision_blocks_work(self) -> bool:
+        """Может ли текущая работа быть взята: доступен ли decision (№39, §6.9).
+
+        Судья дедупа и классификатор `nodes` ходят в слот decision: если слот
+        недоступен (`can_decide()` ложно — погашен стартовой проверкой или
+        `disable()`) и переключение выключено (`DECISION_FALLBACK=false`),
+        решения не будет ни у одной пары/кандидата — такая работа петлёй не
+        берётся (она видна в `/health.queues[].waiting`). Проверка живёт в
+        памяти процесса: без SQL сверх существующего.
+        """
+        service = self._decision
+        if service is None or self._settings.decision_fallback:
+            return False
+        return not service.can_decide()
+
     def _summary_queue_empty(self) -> bool:
         """Пуста ли summary-очередь (дешёвый SELECT, пул 6, lost wakeup).
 
@@ -1630,7 +1671,13 @@ class BackgroundWorker:
             ).fetchone()
         # №39 (arch §6.9): при открытом разрыве слота петля партию не берёт —
         # очередь для неё пуста (иначе отложенное задание гонит busy-loop).
-        return int(row["c"]) == 0 or self._breakers[SLOT_SUMMARY].is_paused()
+        # То же — при недоступном decision и выключенном переключении: решение
+        # взять негде, работа ждёт (no39-05, `_decision_blocks_work`).
+        return (
+            int(row["c"]) == 0
+            or self._breakers[SLOT_SUMMARY].is_paused()
+            or self._decision_blocks_work()
+        )
 
     def _judge_queue_empty(self) -> bool:
         """Пуста ли judge-очередь (дешёвый SELECT, пул 6, lost wakeup).
@@ -1648,8 +1695,13 @@ class BackgroundWorker:
                 "AND attention_at IS NULL"
             ).fetchone()
         # №39 (arch §6.9): при открытом разрыве судьи партия не берётся —
-        # очередь для петли пуста (busy-loop'а нет).
-        return int(row[0]) == 0 or self._breakers[SLOT_JUDGE].is_paused()
+        # очередь для петли пуста (busy-loop'а нет); то же при недоступном
+        # decision с выключенным переключением (no39-05).
+        return (
+            int(row[0]) == 0
+            or self._breakers[SLOT_JUDGE].is_paused()
+            or self._decision_blocks_work()
+        )
 
     # --- наблюдаемость очередей (lsb-0014-03, FR-2.2) -------------------------
 
@@ -1671,17 +1723,25 @@ class BackgroundWorker:
     def _gated_queue_stat(self, slot: str, stat: dict) -> dict:
         """Снимок очереди с учётом разрыва слота (№39, arch §6.9).
 
-        Разрыв слота открыт (`SlotBreaker.is_paused`) — петля партию не берёт,
-        поэтому вся текущая работа из `pending` уезжает в `waiting`
-        (`pending=0`), а `oldest_pending_sec`/`attention` сохраняются: ожидание
-        видно в `/health.queues`, но петля не крутится вхолостую. Иначе —
-        снимок нормализуется как есть (возраст и внимание не пересчитываются).
+        Разрыв слота открыт (`SlotBreaker.is_paused`) или работа слота не
+        может быть взята (decision недоступен, `DECISION_FALLBACK=false` —
+        слоты `summary`/`judge` и классификатор `nodes`, no39-05) — петля
+        партию не берёт, поэтому вся текущая работа из `pending` уезжает в
+        `waiting` (`pending=0`), а `oldest_pending_sec`/`attention` сохраняются:
+        ожидание видно в `/health.queues`, но петля не крутится вхолостую.
+        Иначе — снимок нормализуется как есть (возраст и внимание не
+        пересчитываются).
         """
         pending = int(stat.get("pending", 0) or 0)
         waiting = int(stat.get("waiting", 0) or 0)
         attention = int(stat.get("attention", 0) or 0)
         breaker = self._breakers.get(slot)
-        if breaker is not None and breaker.is_paused():
+        gated = (
+            breaker is not None and breaker.is_paused()
+        ) or (
+            slot in (SLOT_SUMMARY, SLOT_JUDGE) and self._decision_blocks_work()
+        )
+        if gated:
             return queue_snapshot(
                 0,
                 stat.get("oldest_pending_sec"),

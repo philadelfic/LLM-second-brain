@@ -90,7 +90,9 @@ def _handle_decision_check(
     Осознанное отступление от фатальности auth генеративных слотов: у decision
     есть штатный генеративный путь, и ронять обязательный слот из-за
     необязательного нельзя (§13.6). Событие — `decision_check` (slot/model/result);
-    `ok` слот не трогает, иной исход — `disable()`.
+    `ok` слот не трогает, иной исход — `disable(outcome)`: `unsupported` даёт
+    причину переключения «модель не умеет», `unreachable`/`auth_failed` —
+    «слота сейчас нет» (§13.6, f12-04).
     """
     extra = {
         "event": "decision_check",
@@ -101,7 +103,7 @@ def _handle_decision_check(
     if outcome == DECISION_CHECK_OK:
         logger.info("стартовая проверка decision-слота пройдена", extra=extra)
         return
-    service.disable()
+    service.disable(outcome=outcome)
     logger.warning(
         f"decision-слот не подтверждён (result={outcome}) — слот погашен, "
         "решения идут генеративным путём; старт продолжается",
