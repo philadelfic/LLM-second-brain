@@ -22,8 +22,15 @@ from app.services.decision import (
     DecisionService,
     DecisionUnavailable,
 )
-from app.services.llm_client import LLMClient, SlotSpec
+from app.services.llm_client import (
+    DECISION_CHECK_AUTH_FAILED,
+    DECISION_CHECK_UNREACHABLE,
+    DECISION_CHECK_UNSUPPORTED,
+    LLMClient,
+    SlotSpec,
+)
 from app.services.prompts import PromptRegistry
+from app.services.slot_outcome import SlotOutcome
 
 STATE = "state text"
 
@@ -268,6 +275,78 @@ def test_disabled_by_startup_check_is_unavailable(monkeypatch) -> None:
     snapshot = service.snapshot()
     assert snapshot["enabled"] is True
     assert snapshot["ok"] is False
+    assert snapshot["by_reason"]["unavailable"] == 1
+    assert snapshot["by_reason"]["unsupported"] == 0
+    assert recorder.calls == 0
+
+
+def test_disabled_by_unsupported_check_is_unsupported(monkeypatch) -> None:
+    """Погашен проверкой с исходом `unsupported` → причина переключения `unsupported` (§13.6).
+
+    «Модель не умеет decision» — про контракт сервера, и оператор обязан видеть
+    её отдельно от «слота сейчас нет» (дефект приёмки 12.10.2026). Вызова
+    по-прежнему нет, растёт ровно счётчик `unsupported`, словарь — те же три
+    ключа.
+    """
+    service, recorder = make_service(
+        decision_settings(monkeypatch), [answers({"q": {"noul": 0.9}})]
+    )
+    service.disable(outcome=DECISION_CHECK_UNSUPPORTED)
+    assert service.can_decide() is False
+    with pytest.raises(DecisionUnavailable) as excinfo:
+        service.decide(STATE, [noul_question()], operation="judge")
+    assert excinfo.value.reason == "unsupported"
+    snapshot = service.snapshot()
+    assert snapshot["enabled"] is True
+    assert snapshot["ok"] is False
+    assert set(snapshot["by_reason"]) == {
+        "unavailable",
+        "unsupported",
+        "low_confidence",
+    }
+    assert snapshot["by_reason"]["unsupported"] == 1
+    assert snapshot["by_reason"]["unavailable"] == 0
+    assert snapshot["fallbacks"] == 1
+    assert recorder.calls == 0
+
+
+@pytest.mark.parametrize(
+    "outcome", (DECISION_CHECK_UNREACHABLE, DECISION_CHECK_AUTH_FAILED)
+)
+def test_disabled_by_transport_check_is_unavailable(monkeypatch, outcome) -> None:
+    """Погашен недоступностью (`unreachable`/`auth_failed`) → `unavailable` («слота сейчас нет»).
+
+    Сеть/таймаут/5xx и отказ авторизации не говорят ничего о контракте: причина
+    переключения — доступность, а не «модель не умеет decision» (f12-04).
+    """
+    service, recorder = make_service(
+        decision_settings(monkeypatch), [answers({"q": {"noul": 0.9}})]
+    )
+    service.disable(outcome=outcome)
+    with pytest.raises(DecisionUnavailable) as excinfo:
+        service.decide(STATE, [noul_question()], operation="judge")
+    assert excinfo.value.reason == "unavailable"
+    snapshot = service.snapshot()
+    assert snapshot["by_reason"]["unavailable"] == 1
+    assert snapshot["by_reason"]["unsupported"] == 0
+    assert recorder.calls == 0
+
+
+def test_paused_alive_slot_is_unavailable(monkeypatch) -> None:
+    """Разрыв ЖИВОГО слота → `unavailable`: пауза — не контракт и не «не умеет» (§13.6).
+
+    Слот включён и не погашен (`ok is True`), открыт только разрыв: причина
+    переключения остаётся `unavailable`, счётчик `unsupported` не трогается.
+    """
+    service, recorder = make_service(
+        decision_settings(monkeypatch), [answers({"q": {"noul": 0.9}})]
+    )
+    service._breaker.note_failure(SlotOutcome.AUTH)  # разрыв открыт, слот жив
+    with pytest.raises(DecisionUnavailable) as excinfo:
+        service.decide(STATE, [noul_question()], operation="judge")
+    assert excinfo.value.reason == "unavailable"
+    snapshot = service.snapshot()
+    assert snapshot["ok"] is True
     assert snapshot["by_reason"]["unavailable"] == 1
     assert snapshot["by_reason"]["unsupported"] == 0
     assert recorder.calls == 0
