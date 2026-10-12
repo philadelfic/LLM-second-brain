@@ -226,6 +226,41 @@ class TestNotesListFreshness:
         assert [item["id"] for item in result["items"]] == [2]
         assert result["total"] == 1
 
+    def test_list_updated_after_counts_the_boundary_note_on_a_full_page(
+        self, notes: NoteService
+    ) -> None:
+        """Граница включающая — заметка РОВНО на границе входит в окно и тогда,
+        когда страница полна: она просто последняя в окне, а не потеряна.
+
+        Почему: приёмочный сценарий №29 отодвигает пробу ровно НА границу
+        (2001-01-01) и спрашивает `memory_list` с limit=20. В окне свежести
+        живого контура больше двадцати записей, поэтому проба — самая
+        старая в окне — остаётся за страницей. Это пагинация, а не «строго
+        после»: граница видна в `total`, `has_more`/`next_offset` ведут к
+        ней. При сравнении `>` запись не попала бы ни в страницу, ни в
+        `total` — регресс на смену границы.
+        """
+        boundary = "2001-01-01T00:00:00Z"
+        older = "2000-01-01T00:00:00Z"
+        for i in range(MCP_LIMIT):  # полная страница записей свежее границы
+            notes.save(unique(f"note {i}"))
+        on_boundary = notes.save(unique("ровно на границе"))
+        stale = notes.save(unique("строго старее границы"))
+        self._set_updated_at(on_boundary["id"], boundary)
+        self._set_updated_at(stale["id"], older)
+
+        page = notes.list(limit=MCP_LIMIT, max_limit=MCP_LIMIT, updated_after=boundary)
+        assert on_boundary["id"] not in [item["id"] for item in page["items"]]
+        assert page["total"] == MCP_LIMIT + 1  # граница ВНУТРИ окна
+        assert page["has_more"] is True
+        assert page["next_offset"] == MCP_LIMIT
+        # вторая страница — это и есть заметка на границе (и ничего старше)
+        tail = notes.list(
+            limit=MCP_LIMIT, offset=MCP_LIMIT, max_limit=MCP_LIMIT,
+            updated_after=boundary,
+        )
+        assert [item["id"] for item in tail["items"]] == [on_boundary["id"]]
+
     def test_list_updated_after_combines_with_namespace(
         self, notes: NoteService
     ) -> None:

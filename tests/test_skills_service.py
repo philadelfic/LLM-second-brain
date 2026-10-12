@@ -154,6 +154,101 @@ class TestFormLimits:
         assert listed["total"] == 0
 
 
+class TestRaisedLimits:
+    """Новые лимиты формы навыка (решение О. 12.10.2026; канон §6/§3.8).
+
+    Лимиты подняты: `description` 250→400, `steps` 500→1000, `text` 4000→7500,
+    `example` 1000→2000, поле `extra` 500→1000 (сумма 2000→4000),
+    `instruction_template` 1000→2000; `name` (65) не трогали.
+
+    Числа заданы ЛИТЕРАЛАМИ, а не через настройки: тест ловит и «сервис читает
+    настройку», и «настройка равна согласованному числу». Прежняя граница
+    (250/500/4000/1000) теперь проходит молча — это и проверяется.
+    """
+
+    def test_description_300_saved_and_401_rejected(
+        self, service: SkillsService
+    ) -> None:
+        """Согласовано 400: 300 символов сохраняются, 401 — отказ с цифрой 400."""
+        assert service.save(**form(description="d" * 300))["created"] is True
+        with pytest.raises(SkillValidationError) as exc:
+            service.save(**form(description="d" * 401))
+        assert str(exc.value) == HINT_DESCRIPTION_LIMIT
+        assert "400 characters" in str(exc.value)
+
+    def test_steps_700_saved_and_1001_rejected(self, service: SkillsService) -> None:
+        """Согласовано 1000: 700 шагов сохраняются, 1001 — отказ с цифрой 1000."""
+        assert service.save(**form(steps="s" * 700))["created"] is True
+        with pytest.raises(SkillValidationError) as exc:
+            service.save(**form(steps="s" * 1001))
+        assert str(exc.value) == HINT_STEPS_LIMIT
+        assert "1000 characters" in str(exc.value)
+
+    def test_text_7000_saved_and_7501_rejected(self, service: SkillsService) -> None:
+        """Согласовано 7500: тело 7000 символов сохраняется, 7501 — отказ.
+
+        Прежний лимит 4000: до решения такое тело было отказом (пример
+        требования — «тексты скиллов в 7000 символов сохраняются»).
+        """
+        assert service.save(**form(text="t" * 7000))["created"] is True
+        with pytest.raises(SkillValidationError) as exc:
+            service.save(**form(text="t" * 7501))
+        assert str(exc.value) == HINT_TEXT_LIMIT
+        assert "7500 characters" in str(exc.value)
+
+    def test_example_1500_saved_and_2001_rejected(
+        self, service: SkillsService
+    ) -> None:
+        """Согласовано 2000: пример 1500 символов сохраняется, 2001 — отказ."""
+        assert service.save(**form(example="e" * 1500))["created"] is True
+        with pytest.raises(SkillValidationError) as exc:
+            service.save(**form(example="e" * 2001))
+        assert str(exc.value) == HINT_EXAMPLE_LIMIT
+        assert "2000 characters" in str(exc.value)
+
+    def test_extra_field_1000_saved_and_1001_rejected(
+        self, service: SkillsService
+    ) -> None:
+        """Согласовано 1000 на поле класса: 1000 — ок, 1001 — отказ (§3.1)."""
+        assert service.save(**form(extra={"trigger": "x" * 1000}))[
+            "created"
+        ] is True
+        with pytest.raises(SkillValidationError) as exc:
+            service.save(**form(extra={"trigger": "x" * 1001}))
+        assert str(exc.value) == HINT_EXTRA_LIMIT
+        assert "1000 characters" in str(exc.value) and "4000" in str(exc.value)
+
+    def test_extra_total_4000_saved_and_4001_rejected(
+        self, service: SkillsService
+    ) -> None:
+        """Согласовано 4000 на сумму полей: 4×1000 — ок, 4001 — отказ (§3.1)."""
+        extra = {
+            "trigger": "x" * 1000,
+            "preconditions": "x" * 1000,
+            "fallbacks": "x" * 1000,
+            "invariant": "x" * 1000,
+        }
+        assert sum(len(value) for value in extra.values()) == 4000
+        assert service.save(**form(extra=extra))["created"] is True
+        extra["exceptions"] = "x"  # сумма 4001 > 4000
+        with pytest.raises(SkillValidationError) as exc:
+            service.save(**form(extra=extra))
+        assert str(exc.value) == HINT_EXTRA_LIMIT
+
+    def test_instruction_template_1500_saved_and_2001_rejected(
+        self, service: SkillsService
+    ) -> None:
+        """Согласовано 2000: шаблон 1500 символов сохраняется, 2001 — отказ."""
+        assert service.set_instruction_template("x" * 1500) == {
+            "instruction_template": "x" * 1500,
+            "updated": True,
+        }
+        with pytest.raises(SkillValidationError) as exc:
+            service.set_instruction_template("x" * 2001)
+        assert str(exc.value) == HINT_TEMPLATE_LIMIT
+        assert "2000 characters" in str(exc.value)
+
+
 class TestExtra:
     """`extra` — один JSON-объект только из известных полей класса (§3.1)."""
 
@@ -187,28 +282,28 @@ class TestExtra:
             service.save(**form(extra=extra))
 
     def test_all_ten_fields_within_budget_ok(self, service: SkillsService) -> None:
-        """Сумма ровно 2000 — граница бюджета extra (§3.1), сохранение ок."""
+        """Сумма ровно 4000 — граница бюджета extra (§3.1), сохранение ок."""
         extra = {
-            "trigger": "x" * 500,
-            "preconditions": "x" * 500,
-            "fallbacks": "x" * 500,
-            "invariant": "x" * 500,
+            "trigger": "x" * 1000,
+            "preconditions": "x" * 1000,
+            "fallbacks": "x" * 1000,
+            "invariant": "x" * 1000,
         }
-        assert sum(len(value) for value in extra.values()) == 2000
+        assert sum(len(value) for value in extra.values()) == 4000
         assert service.save(**form(extra=extra))["created"] is True
 
     def test_field_over_limit_rejected(self, service: SkillsService) -> None:
         with pytest.raises(SkillValidationError) as exc:
-            service.save(**form(extra={"trigger": "x" * 501}))
+            service.save(**form(extra={"trigger": "x" * 1001}))
         assert str(exc.value) == HINT_EXTRA_LIMIT
 
     def test_total_over_limit_rejected(self, service: SkillsService) -> None:
         extra = {
-            "trigger": "x" * 500,
-            "preconditions": "x" * 500,
-            "fallbacks": "x" * 500,
-            "invariant": "x" * 500,
-            "exceptions": "x" * 1,  # сумма 2001 > 2000
+            "trigger": "x" * 1000,
+            "preconditions": "x" * 1000,
+            "fallbacks": "x" * 1000,
+            "invariant": "x" * 1000,
+            "exceptions": "x" * 1,  # сумма 4001 > 4000
         }
         with pytest.raises(SkillValidationError) as exc:
             service.save(**form(extra=extra))
@@ -430,14 +525,14 @@ class TestInstructionTemplate:
         service.set_instruction_template("Execute strictly in order.")
         assert service.get(1)["instruction_template"] == "Execute strictly in order."
 
-    @pytest.mark.parametrize("size", [1, 1000])
+    @pytest.mark.parametrize("size", [1, 2000])
     def test_boundary_sizes_ok(self, service: SkillsService, size: int) -> None:
         result = service.set_instruction_template("x" * size)
         assert result == {"instruction_template": "x" * size, "updated": True}
 
     def test_over_limit_rejected(self, service: SkillsService) -> None:
         with pytest.raises(SkillValidationError) as exc:
-            service.set_instruction_template("x" * 1001)
+            service.set_instruction_template("x" * 2001)
         assert str(exc.value) == HINT_TEMPLATE_LIMIT
         # Отказ ничего не изменил: в БД — сид.
         assert service.instruction_template() == {

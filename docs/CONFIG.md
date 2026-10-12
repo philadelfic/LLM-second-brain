@@ -208,13 +208,13 @@ limit.
 | Variable | Default | Meaning |
 |---|---|---|
 | `SKILL_NAME_MAX_CHARS` | `65` | skill name (≤ 5 words recommended) |
-| `SKILL_DESCRIPTION_MAX_CHARS` | `250` | what the skill does |
-| `SKILL_STEPS_MAX_CHARS` | `500` | the order of the steps |
-| `SKILL_TEXT_MAX_CHARS` | `4000` | what exactly each step does |
-| `SKILL_EXAMPLE_MAX_CHARS` | `1000` | optional example |
-| `SKILL_EXTRA_FIELD_MAX_CHARS` | `500` | one optional class field inside `extra` |
-| `SKILL_EXTRA_TOTAL_MAX_CHARS` | `2000` | all class fields together |
-| `INSTRUCTION_TEMPLATE_MAX_CHARS` | `1000` | global "how to execute steps" template |
+| `SKILL_DESCRIPTION_MAX_CHARS` | `400` | what the skill does |
+| `SKILL_STEPS_MAX_CHARS` | `1000` | the order of the steps |
+| `SKILL_TEXT_MAX_CHARS` | `7500` | what exactly each step does |
+| `SKILL_EXAMPLE_MAX_CHARS` | `2000` | optional example |
+| `SKILL_EXTRA_FIELD_MAX_CHARS` | `1000` | one optional class field inside `extra` |
+| `SKILL_EXTRA_TOTAL_MAX_CHARS` | `4000` | all class fields together |
+| `INSTRUCTION_TEMPLATE_MAX_CHARS` | `2000` | global "how to execute steps" template |
 | `SKILL_ANNOUNCE_MAX_CHARS` | `2000` | budget of the skills announce block in MCP instructions |
 | `SKILL_ANNOUNCE_DESCRIPTION_CHARS` | `120` | description cut inside the announce |
 | `SKILL_SYNONYM_SIMILARITY` | `0.90` | cosine above which a new skill is "too similar" to an existing one |

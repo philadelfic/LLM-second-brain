@@ -1740,3 +1740,104 @@ class TestFreshnessMCP:
             )).structured_content
         assert listed["items"] == [] and listed["total"] == 0
         assert listed["hint"] == HINT_INVALID_UPDATED_AFTER
+
+
+class TestFreshnessBoundaryMCP:
+    """№29 (FR-2.6): граница `updated_after` ВКЛЮЧАЮЩАЯ на обвих MCP-
+    поверхностях — листинг (`n.updated_at >= ?`) и поиск (обе стороны
+    гибрида: FTS и набор активных кандидатов вектора).
+
+    Почему отдельная проверка: приёмка №29 ставит пробе `updated_at` РАВНЫЙ
+    границе и ждёт её в выдаче. Идём в собственном узле изолированной БД и с
+    `namespace_exact`: окно свежести укладывается в одну страницу, поэтому
+    видна сама граница, а не хвост длинной выдачи; текст обеих проб несёт
+    один маркер, так что без фильтра поиск вернул бы обе.
+    """
+
+    node = "freshness-check"
+    boundary = "2001-01-01T00:00:00Z"
+    stale = "2000-01-01T00:00:00Z"
+
+    @staticmethod
+    def _set_updated_at(db_path: str, note_id: int, stamp: str) -> None:
+        """Прямая правка updated_at (триггер FTS — UPDATE OF text,title — не срабатывает)."""
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE notes SET updated_at = ? WHERE id = ?", (stamp, note_id)
+            )
+
+    async def _save_pair(
+        self, session: ClientSession, marker: str
+    ) -> tuple[int, int]:
+        """Две пробы в своём узле: одна ляжет ровно на границу, вторая — раньше."""
+        on_boundary = (await session.call_tool(
+            "memory_save",
+            {
+                "text": f"{marker} заметка ровно на границе свежести",
+                "title": "На границе",
+                "namespace": self.node,
+            },
+        )).structured_content
+        stale = (await session.call_tool(
+            "memory_save",
+            {
+                "text": f"{marker} заметка заведомо раньше границы",
+                "title": "Раньше границы",
+                "namespace": self.node,
+            },
+        )).structured_content
+        assert on_boundary["stored"] is True and stale["stored"] is True
+        return on_boundary["id"], stale["id"]
+
+    @pytest.mark.asyncio
+    async def test_memory_list_keeps_the_note_updated_at_the_boundary(
+        self, ns_url: str, ns_db: str
+    ) -> None:
+        """Заметка с `updated_at`, РАВНЫМ границе, остаётся; старее — нет."""
+        _register_namespace(
+            ns_db, self.node, "Узел проверки свежести. Тестовый узел приёмки."
+        )
+        marker = f"freshlist-{uuid.uuid4().hex[:8]}"
+        async with connect(ns_url) as session:
+            on_boundary, stale = await self._save_pair(session, marker)
+            self._set_updated_at(ns_db, on_boundary, self.boundary)
+            self._set_updated_at(ns_db, stale, self.stale)
+            listed = (await session.call_tool(
+                "memory_list",
+                {
+                    "limit": 20,
+                    "namespace": self.node,
+                    "namespace_exact": True,
+                    "updated_after": self.boundary,
+                },
+            )).structured_content
+        ids = [item["id"] for item in listed["items"]]
+        assert on_boundary in ids
+        assert stale not in ids
+        assert listed["total"] == len(ids) == 1
+
+    @pytest.mark.asyncio
+    async def test_memory_search_keeps_the_note_updated_at_the_boundary(
+        self, ns_url: str, ns_db: str
+    ) -> None:
+        """Тот же маркер у обеих проб: после фильтра остаётся только граница."""
+        _register_namespace(
+            ns_db, self.node, "Узел проверки свежести. Тестовый узел приёмки."
+        )
+        marker = f"freshsearch-{uuid.uuid4().hex[:8]}"
+        async with connect(ns_url) as session:
+            on_boundary, stale = await self._save_pair(session, marker)
+            self._set_updated_at(ns_db, on_boundary, self.boundary)
+            self._set_updated_at(ns_db, stale, self.stale)
+            found = (await session.call_tool(
+                "memory_search",
+                {
+                    "query": marker,
+                    "namespace": self.node,
+                    "namespace_exact": True,
+                    "updated_after": self.boundary,
+                },
+            )).structured_content
+        hit_ids = [row["id"] for row in found["results"]]
+        assert on_boundary in hit_ids
+        assert stale not in hit_ids

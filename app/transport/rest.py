@@ -219,7 +219,7 @@ class SkillUpdate(SkillCreate):
 class InstructionTemplate(BaseModel):
     """Тело PUT /skills/instruction-template: глобальный шаблон (§3.1).
 
-    Один шаблон на область («как исполнять шаги», ≤1000 символов); пустое
+    Один шаблон на область («как исполнять шаги», ≤2000 символов); пустое
     или слишком длинное значение → 422 с hint сервиса.
     """
 
@@ -1034,7 +1034,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
     async def put_instruction_template(
         payload: InstructionTemplate, request: Request
     ) -> dict:
-        """Правка глобального шаблона: пусто/длиннее 1000 симв. → 422 + hint."""
+        """Правка глобального шаблона: пусто/длиннее 2000 симв. → 422 + hint."""
         try:
             return await asyncio.to_thread(
                 _skills_service(request).set_instruction_template,

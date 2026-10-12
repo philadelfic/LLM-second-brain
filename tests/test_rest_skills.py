@@ -76,7 +76,7 @@ class TestSkillsCrud:
         assert long_name.status_code == 422
         assert long_name.json()["detail"] == HINT_NAME_LIMIT
         long_text = client.post(
-            "/skills", json=form(text="t" * 4001), headers=_headers(token)
+            "/skills", json=form(text="t" * 7501), headers=_headers(token)
         )
         assert long_text.status_code == 422
         assert long_text.json()["detail"] == HINT_TEXT_LIMIT
@@ -179,7 +179,7 @@ class TestSkillsCrud:
     ) -> None:
         _create(client, token)
         bad = client.put(
-            "/skills/1", json=form(steps="s" * 501), headers=_headers(token)
+            "/skills/1", json=form(steps="s" * 1001), headers=_headers(token)
         )
         assert bad.status_code == 422
         assert "steps limit" in bad.json()["detail"]
@@ -231,7 +231,7 @@ class TestSkillsInstructionTemplate:
     def test_validation_422(self, client: TestClient, token: str) -> None:
         long = client.put(
             "/skills/instruction-template",
-            json={"instruction_template": "x" * 1001},
+            json={"instruction_template": "x" * 2001},
             headers=_headers(token),
         )
         assert long.status_code == 422

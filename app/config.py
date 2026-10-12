@@ -375,14 +375,20 @@ class Settings(BaseSettings):
     # Лимиты формы и пороги сходства — из контрактов фич lsb-0007/0008/0009;
     # env-настраиваемые, валидируются при старте (см. _validate_ranges): лимиты
     # применяет сервис области (CHECK-констрейнты, как у заметок, не используем).
+    # Лимиты формы навыка подняты решением О. 12.10.2026 (канон §6): description
+    # 250→400, steps 500→1000, text 4000→7500, example 1000→2000, поле extra
+    # 500→1000 (сумма 2000→4000), instruction_template 1000→2000. Причина —
+    # реальные процедуры не влезали в прежние потолки, модель дробила навык.
+    # `name` (65 симв., ≤5 слов) не тронут: это рекомендация по имени, а не
+    # потолок содержания; бюджет анонса (2000) тоже не тронут — он про контекст.
     skill_name_max_chars: int = 65
-    skill_description_max_chars: int = 250
-    skill_steps_max_chars: int = 500
-    skill_text_max_chars: int = 4000
-    skill_example_max_chars: int = 1000
-    skill_extra_field_max_chars: int = 500  # одно поле класса навыка (JSON extra)
-    skill_extra_total_max_chars: int = 2000  # сумма всех полей extra
-    instruction_template_max_chars: int = 1000  # глобальный шаблон (skills_meta)
+    skill_description_max_chars: int = 400
+    skill_steps_max_chars: int = 1000
+    skill_text_max_chars: int = 7500
+    skill_example_max_chars: int = 2000
+    skill_extra_field_max_chars: int = 1000  # одно поле класса навыка (JSON extra)
+    skill_extra_total_max_chars: int = 4000  # сумма всех полей extra
+    instruction_template_max_chars: int = 2000  # глобальный шаблон (skills_meta)
     skill_announce_max_chars: int = 2000  # бюджет блока анонса скиллов
     skill_announce_description_chars: int = 120  # обрезка description в анонсе
     skill_synonym_similarity: float = 0.90  # антисинонимия создания навыка

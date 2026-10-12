@@ -77,15 +77,15 @@ ACTIONABLE_POINTERS = (
 # `hint`-ответы — в описаниях инструментов его быть не должно.
 LEGACY_NUMERIC_LIMITS = (
     "≤65 characters",
-    "description ≤250",
-    "steps ≤500",
-    "text ≤4000",
-    "example ≤1000",
+    "description ≤400",
+    "steps ≤1000",
+    "text ≤7500",
+    "example ≤2000",
     "term ≤100",
     "context ≤40",
     "definition ≤350",
     "body ≤1200",
-    "500 characters",
+    "1000 characters",
     "1200 characters",
     "≤250 chars",
 )

@@ -167,14 +167,15 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "MEMORY_SIMILAR_TEXT_CHARS": ("memory_similar_text_chars", 500),
     # Релиз 3.0.0, субстрат областей (постановка 00): лимиты формы и пороги
     # сходства skills/terms/user — из контрактов фич lsb-0007/0008/0009.
+    # Лимиты формы навыка подняты решением О. 12.10.2026 (канон §6); `name` — тот же.
     "SKILL_NAME_MAX_CHARS": ("skill_name_max_chars", 65),
-    "SKILL_DESCRIPTION_MAX_CHARS": ("skill_description_max_chars", 250),
-    "SKILL_STEPS_MAX_CHARS": ("skill_steps_max_chars", 500),
-    "SKILL_TEXT_MAX_CHARS": ("skill_text_max_chars", 4000),
-    "SKILL_EXAMPLE_MAX_CHARS": ("skill_example_max_chars", 1000),
-    "SKILL_EXTRA_FIELD_MAX_CHARS": ("skill_extra_field_max_chars", 500),
-    "SKILL_EXTRA_TOTAL_MAX_CHARS": ("skill_extra_total_max_chars", 2000),
-    "INSTRUCTION_TEMPLATE_MAX_CHARS": ("instruction_template_max_chars", 1000),
+    "SKILL_DESCRIPTION_MAX_CHARS": ("skill_description_max_chars", 400),
+    "SKILL_STEPS_MAX_CHARS": ("skill_steps_max_chars", 1000),
+    "SKILL_TEXT_MAX_CHARS": ("skill_text_max_chars", 7500),
+    "SKILL_EXAMPLE_MAX_CHARS": ("skill_example_max_chars", 2000),
+    "SKILL_EXTRA_FIELD_MAX_CHARS": ("skill_extra_field_max_chars", 1000),
+    "SKILL_EXTRA_TOTAL_MAX_CHARS": ("skill_extra_total_max_chars", 4000),
+    "INSTRUCTION_TEMPLATE_MAX_CHARS": ("instruction_template_max_chars", 2000),
     "SKILL_ANNOUNCE_MAX_CHARS": ("skill_announce_max_chars", 2000),
     "SKILL_ANNOUNCE_DESCRIPTION_CHARS": ("skill_announce_description_chars", 120),
     "SKILL_SYNONYM_SIMILARITY": ("skill_synonym_similarity", 0.90),
