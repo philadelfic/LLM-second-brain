@@ -757,6 +757,30 @@ def slot_ready(rest: httpx2.AsyncClient, slot: str,
     return predicate
 
 
+def slot_ok(rest: httpx2.AsyncClient, slot: str,
+            ) -> Callable[[], Awaitable[tuple[bool, str]]]:
+    """Predicate: the slot really answers again — the last attempt succeeded.
+
+    №39: маркер `slot_resumed` пишется только при снятии паузы В ТОМ ЖЕ процессе
+    (`app/services/worker.py`). Ветвь, чья «починка» пересоздаёт контейнер
+    (`scripts/slot_fake.sh on ok ...`), маркера не увидит: пауза жила в памяти и
+    при пересоздании её нет. Наблюдаемый факт «доступ вернулся» — успешная
+    последняя попытка слота (`/health.slots.<slot>.ok`) и снятый разрыв.
+    """
+
+    async def predicate() -> tuple[bool, str]:
+        snapshot = await health_snapshot(rest)
+        stat = slot_stat(snapshot, slot)
+        if stat is None:
+            return False, f"slot {slot} is not reported by /health.slots"
+        ok = stat.get("ok") is True and stat.get("paused_until") is None
+        return bool(ok), (f"slot {slot}: ok={stat.get('ok')!r}, "
+                          f"last_outcome={stat.get('last_outcome')!r}, "
+                          f"paused_until={stat.get('paused_until')!r}")
+
+    return predicate
+
+
 def probe_vectors_ready(note_ids: list[int],
                         ) -> Callable[[], Awaitable[tuple[bool, str]]]:
     """Predicate: every listed probe note carries a READY vector (DB, read-only).
@@ -1657,13 +1681,6 @@ async def scenario_3_auth_branch(c: Client, rest: httpx2.AsyncClient) -> None:
 
     slot = CFG["auth_slot"]
     queue = SLOT_QUEUE[slot]
-    # Своя работа в очереди: фаза открытого разрыва проверяется по факту «работа
-    # ЖДЁТ паузу», а пустая очередь не проверяет ничего. Вектор заметки успевает
-    # посчитаться здоровым embedding-слотом ещё до перевода фейка на 401, а выжимка
-    # ждёт закрытия разрыва — ровно то, что и проверяет ветвь.
-    if await save_probe_note(c, RUN["note_auth"], after_hook=True) is None:
-        info(f"[auth] the probe note of the branch is not created — the queue "
-             f"{queue} may stay empty")
     proc = await run_shell(slot_cmd(CFG["slot_auth_cmd"], slot))
     check(f"the fake provider is switched to 401 for {slot}", proc.returncode == 0,
           f"rc={proc.returncode}")
@@ -1672,6 +1689,24 @@ async def scenario_3_auth_branch(c: Client, rest: httpx2.AsyncClient) -> None:
     teardown_note(f"[{slot}] the fake provider was switched to 401 and fixed back")
     fixed = False
     try:
+        # Своя работа в очереди — ПОКА РАЗРЫВ ОТКРЫТ: фаза проверяется по факту
+        # «работа ЖДЁТ паузу», а пустая очередь не проверяет ничего. Заметку
+        # создаём ПОСЛЕ перевода фейка на 401: её выжимка не успевает закрыться
+        # здоровым штатным слотом до открытия разрыва (живой прогон 12.10.2026 —
+        # заметка, созданная до хука, была выжата штатным слотом, и очередь
+        # `summary` честно показывала 0/0/0). Текст ветви — СВОЙ: с общим текстом
+        # сценария 0 (`<tag> probe note text (observability acceptance).`) продукт
+        # отвечает «дословный дубль» и заметки не пишет, а ветвь мерила бы чужую
+        # (или пустую) очередь. Первый же реальный вызов заметки открывает разрыв
+        # (слот отвечает 401) — ровно та фаза, которую проверяет ветвь.
+        auth_text = (f"{RUN['tag']} {slot} auth-branch probe text — the summary is "
+                     f"deferred by the open break (observability acceptance).")
+        probe, probe_detail = await save_probe_note_result(
+            c, RUN["note_auth"], text=auth_text, after_hook=True, rest=rest)
+        if probe is None:
+            info(f"[auth] the probe note of the branch is not created "
+                 f"({probe_detail}) — the queue {queue} may stay empty")
+
         if CFG["logs_cmd"]:
             found, detail = await wait_until(
                 log_events("slot_paused"),
@@ -1716,12 +1751,18 @@ async def scenario_3_auth_branch(c: Client, rest: httpx2.AsyncClient) -> None:
                 warn("[auth] the fake provider could NOT be fixed by hand",
                      f"rc={undo.returncode}")
 
-    if CFG["logs_cmd"]:
-        found, detail = await wait_until(
-            log_events("slot_probe", "slot_resumed"),
-            "[auth] the probe and resume events appear in the log",
-            timeout=CFG["wait_sec"])
-        check("[auth] after the fix the probe and the resume are written", found, detail)
+    # Починка (LSB_SLOT_AUTH_FIX_CMD = `scripts/slot_fake.sh on ok ...`) ПЕРЕСОЗДАЁТ
+    # контейнер: разрыв живёт в памяти процесса (`app/services/slot_breaker.py`),
+    # при пересоздании он теряется, а маркер `slot_resumed` пишется только при
+    # снятии паузы В ТОМ ЖЕ процессе (`app/services/worker.py`) — после
+    # пересоздания его не будет никогда (ложный FAIL живого прогона 12.10.2026).
+    # Проверяем наблюдаемый факт «доступ вернулся»: слот снова отвечает (`ok`, разрыв
+    # снят) и отложенная работа уходит из очереди.
+    ok, detail = await wait_until(
+        slot_ok(rest, slot),
+        f"[auth] after the fix the {slot} slot answers again (ok, the break is gone)")
+    check(f"[auth] after the fix the {slot} slot is ok again — the access is restored",
+          ok, detail)
     ok, detail = await wait_until(queue_drained(rest, queue),
                                   f"[auth] the queue {queue} drains after the fix")
     check("[auth] the deferred work is done after the access is restored", ok, detail)
