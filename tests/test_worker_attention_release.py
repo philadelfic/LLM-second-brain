@@ -1,4 +1,4 @@
-"""Снятие «требует вмешательства» по смене конфигурации слота (lsbdef0008-02).
+"""Снятие «требует вмешательства» по смене конфигурации слота (lsbdef0008-02/-03).
 
 Старт воркера сравнивает текущий отпечаток конфигурации слотов
 (`slot_budget.slot_config_fingerprint`) с записанным в `meta` (блок 2,
@@ -6,19 +6,27 @@
 внимание снимается у заданий ВСЕХ слотов (`attention_at=NULL`, `attempts=0`),
 событие `job_attention_released` с `reason="startup"`; отпечаток тот же —
 ничего не снимаем. `SLOT_ATTENTION_RESET_ON_START=false` отключает шаг целиком
-(воля оператора). Счётчик попыток, back-off и наблюдаемость очередей — блок 2
-(no39-02), здесь не дублируются.
+(воля оператора). Отпечаток включает «думать / не думать» (`*_THINK`) и
+клиентский таймаут (`*_TIMEOUT_SEC`) — смена любого из них снимает внимание
+сама (дефект приёмки 12.10.2026: обход `JUDGE_THINK=false` + малый бюджет не
+размораживал пары). Счётчик попыток, back-off и наблюдаемость очередей —
+блок 2 (no39-02), здесь не дублируются.
 """
 
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 from fakes import FailingEmbedder
 
 from app.config import Settings, get_settings
-from app.services.slot_budget import slot_config_fingerprint
+from app.services.slot_budget import (
+    FINGERPRINT_DEFAULTS,
+    FINGERPRINT_FIELDS,
+    slot_config_fingerprint,
+)
 from app.services.worker import SLOT_CONFIG_META_KEY, BackgroundWorker
 from app.storage.db import init_db, session, transaction
 
@@ -81,6 +89,22 @@ def _stored_fingerprint(settings) -> str | None:
             "SELECT value FROM meta WHERE key = ?", (SLOT_CONFIG_META_KEY,)
         ).fetchone()
     return row["value"] if row is not None else None
+
+
+def _fingerprint_with(settings, **overrides: object) -> str:
+    """Отпечаток «прежней» конфигурации слота: поля из `Settings`, часть — с заменой.
+
+    Носитель строится по `FINGERPRINT_FIELDS` и читает значения из `Settings`
+    (дефолты — как в бою), поэтому тесту не нужен второй экземпляр настроек и
+    БД: он подаёт в `meta` отпечаток конфигурации «до правки», а воркер стартует
+    уже «после».
+    """
+    values = {
+        name: getattr(settings, name, FINGERPRINT_DEFAULTS.get(name, ""))
+        for name in FINGERPRINT_FIELDS
+    }
+    values.update(overrides)
+    return slot_config_fingerprint(SimpleNamespace(**values))
 
 
 def _job_row(settings, job_id: int) -> dict:
@@ -146,6 +170,85 @@ def test_same_fingerprint_keeps_attention(tmp_path, monkeypatch) -> None:
     row = _job_row(settings, job_id)
     assert row["attention_at"] is not None
     assert row["attempts"] == 8
+
+
+def test_think_change_releases_attention(tmp_path, monkeypatch, caplog) -> None:
+    """Смена «думать / не думать» на старте размораживает пары (дефект 12.10.2026).
+
+    Слоты стояли на временном обходе `SUMMARY_THINK=false` + `JUDGE_THINK=true`;
+    после возврата к штатному размышлению внимание снимается без ручных действий
+    (FR-2.3), отпечаток в `meta` перезаписывается текущим.
+    """
+    settings = _settings(tmp_path, monkeypatch)
+    caplog.set_level(logging.INFO, logger="app")
+    worker = _worker(settings)
+    job_id = _seed_job(settings, note_id=1)
+    _frozen_job(settings, job_id)
+    # конфигурация «до правки»: размышление выключено у summary и включено у judge
+    _write_fingerprint(
+        settings, _fingerprint_with(settings, summary_think=False, judge_think=True)
+    )
+
+    assert worker._startup_attention_reset() == 1
+
+    row = _job_row(settings, job_id)
+    assert row["attention_at"] is None
+    assert row["attempts"] == 0
+    assert row["status"] == "pending"
+    events = _events(caplog, "job_attention_released")
+    assert events and getattr(events[-1], "reason", None) == "startup"
+    assert _stored_fingerprint(settings) == slot_config_fingerprint(settings)
+
+
+def test_same_think_keeps_attention(tmp_path, monkeypatch) -> None:
+    """Тот же `THINK` → внимание не снимается (нет ложных сбросов)."""
+    settings = _settings(
+        tmp_path, monkeypatch, SUMMARY_THINK="true", JUDGE_THINK="true"
+    )
+    worker = _worker(settings)
+    job_id = _seed_job(settings, note_id=1)
+    _frozen_job(settings, job_id)
+    _write_fingerprint(settings, slot_config_fingerprint(settings))
+
+    assert worker._startup_attention_reset() == 0
+
+    row = _job_row(settings, job_id)
+    assert row["attention_at"] is not None
+    assert row["attempts"] == 8
+    # поле реально участвует в сверке: иначе тест «того же THINK» ничего не значит
+    assert _fingerprint_with(settings, judge_think=False) != _stored_fingerprint(
+        settings
+    )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"summary_timeout_sec": 120}, {"judge_timeout_sec": 60}],
+    ids=["summary", "judge"],
+)
+def test_timeout_change_releases_attention(
+    tmp_path, monkeypatch, caplog, override
+) -> None:
+    """Смена одного лишь `*_TIMEOUT_SEC` (без бюджета) тоже снимает внимание.
+
+    Таймаут меняет исход вызова (`timeout` вместо ответа) — это часть «причины
+    ушла», поэтому правка таймаута размораживает пару (arch §13.4).
+    """
+    settings = _settings(tmp_path, monkeypatch)
+    caplog.set_level(logging.INFO, logger="app")
+    worker = _worker(settings)
+    job_id = _seed_job(settings, note_id=1)
+    _frozen_job(settings, job_id)
+    _write_fingerprint(settings, _fingerprint_with(settings, **override))
+
+    assert worker._startup_attention_reset() == 1
+
+    row = _job_row(settings, job_id)
+    assert row["attention_at"] is None
+    assert row["attempts"] == 0
+    events = _events(caplog, "job_attention_released")
+    assert events and getattr(events[-1], "reason", None) == "startup"
+    assert _stored_fingerprint(settings) == slot_config_fingerprint(settings)
 
 
 def test_reset_disabled_by_flag(tmp_path, monkeypatch) -> None:
