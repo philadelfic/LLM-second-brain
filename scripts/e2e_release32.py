@@ -1470,16 +1470,39 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
     try:
         # Push work into the slot's queue so the wait is observable (a probe note
         # lands in vector+summary; the judge queue grows from the dedup hand-off).
-        # Текст — СВОЙ у каждой ветви и попытки: с общим текстом сценария 1
-        # (`<tag> probe note text (observability acceptance).`) продукт отвечает
-        # «дословный дубль» и заметки не пишет, а ветвь получала бы id ЧУЖОЙ
-        # заметки и мерила бы её очередь (живой прогон 10.10.2026, ветка [judge]).
-        probe_text = (f"{RUN['tag']} {slot} outage probe text "
-                      "(observability acceptance).")
-        probe, probe_detail = await save_probe_note_result(
-            c, RUN[f"note_outage_{slot}"], text=probe_text, after_hook=True,
-            rest=rest)
-        probe_ids = [probe] if probe is not None else []
+        # Ветви разные: `judge` просит пару-«почти-дубль» (судья спрашивается
+        # только про пару близких заметок), остальные — одну заметку.
+        if slot == "judge":
+            # Судье нужна ПАРА-«почти-дубль»: одной заметки мало — без близкого
+            # кандидата (cosine ≥ DEDUP_CANDIDATE_SIMILARITY = 0.80) судья не
+            # спрашивается, очередь `judge` остаётся пустой, и проверки «работа
+            # видна, ничего не теряется» читаются ложной краснотой (живой прогон
+            # 12.10.2026: очередь 0/0/0 и «the age of the oldest item grows»).
+            # Хелпер пишет пару своими текстами, различающимися хвостом (не
+            # дословный дубль — продукт их не отбивает), и сам ждёт вектор ПЕРВОЙ
+            # заметки: кандидат ищется по вектору, без него пары не находит никто.
+            title_one = RUN[f"note_outage_{slot}"]
+            pair_ids, vector_ready = await save_near_duplicate_pair(
+                c, title_one, f"{title_one} pair")
+            probe_ids = [item for item in pair_ids if item is not None]
+            probe = probe_ids[0] if probe_ids else None
+            probe_detail = (f"ids={pair_ids}, the first vector is ready: "
+                            f"{vector_ready}")
+            if probe is None or len(probe_ids) < 2:
+                warn("[judge] the near-duplicate pair of the branch is not usable",
+                     f"{probe_detail} — the judge may get no pair")
+        else:
+            # Текст — СВОЙ у каждой ветви и попытки: с общим текстом сценария 1
+            # (`<tag> probe note text (observability acceptance).`) продукт
+            # отвечает «дословный дубль» и заметки не пишет, а ветвь получала бы
+            # id ЧУЖОЙ заметки и мерила бы её очередь (живой прогон 10.10.2026,
+            # ветка [judge]).
+            probe_text = (f"{RUN['tag']} {slot} outage probe text "
+                          "(observability acceptance).")
+            probe, probe_detail = await save_probe_note_result(
+                c, RUN[f"note_outage_{slot}"], text=probe_text, after_hook=True,
+                rest=rest)
+            probe_ids = [probe] if probe is not None else []
         if probe is None:
             # Пробная заметка не создалась (ответ без `id`: отказ, разрыв,
             # дословный дубль). Очередь этого слота гарантированно пуста — её
@@ -1500,27 +1523,6 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
             check(f"[{slot}] the slot is started back by the contour hook",
                   back.returncode == 0, f"rc={back.returncode}")
             return
-        if slot == "judge":
-            # Судье нужна ПАРА-КАНДИДАТ: одной заметки мало — без близкого текста в
-            # том же узле очередь `judge` остаётся пустой, и проверять «работа
-            # видна, ничего не теряется» нечем. Текст отличается на хвост —
-            # значит запись не блокируется как дословный дубль, а косинус пары
-            # уходит выше порога кандидатов. Заметка-близнец создаётся тем же
-            # надёжным путём, что и пробная: без `id` в ответе очередь снова
-            # осталась бы пустой и ветка прочлась бы ложным FAIL.
-            twin, twin_detail = await save_probe_note_result(
-                c, f"{RUN[f'note_outage_{slot}']} twin",
-                # Почти дубль ТОЛЬКО пробной заметки этой ветви (кандидат для
-                # судьи): тот же текст плюс хвост — дословным дублем не является
-                # и заметку сценария 1 не задевает.
-                text=probe_text[:-1] + " — a near duplicate of the outage probe.",
-                after_hook=True, rest=rest)
-            if twin is not None:
-                probe_ids.append(twin)
-            else:
-                warn("[judge] the near-duplicate probe note was not created",
-                     twin_detail)
-
         # №39 (guard BEFORE the queue check): this queue counts a note only when
         # its vector is ready, so the embedding slot must have vectorised the
         # probe notes of the branch FIRST. Otherwise the queue honestly shows zero
