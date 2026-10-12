@@ -1304,21 +1304,28 @@ async def save_near_duplicate_pair(c: Client, title_first: str,
     """
     first, second = near_duplicate_texts(RUN["tag"], label=title_first)
     ids: list[int | None] = []
-    vector_ready = False
     for title, text in ((title_first, first), (title_second, second)):
         note_id, _detail = await save_probe_note_result(
             c, title, text=text, after_hook=True
         )
         ids.append(note_id)
-        if len(ids) == 1 and note_id is not None:
-            vector_ready, detail = await wait_until(
-                probe_vectors_ready([note_id]),
-                "the first note of the pair got its vector (the candidate is "
-                "searched by it)",
-                timeout=min(CFG["wait_sec"], 180.0))
-            if not vector_ready:
-                warn("the first note of the pair has no vector yet",
-                     f"id={note_id}, {detail} — the judge may get no pair")
+    saved_ids = [note_id for note_id in ids if note_id is not None]
+    # Вектор нужен ОБЕИМ заметкам, и прежде всего второй: кандидаты ищутся по её
+    # вектору в момент сохранения. Ждали только первую — и вторая не находила
+    # соседа, судья не получал пары вовсе (живой прогон №10: очередь judge пуста
+    # в ветви обрыва).
+    vector_ready = False
+    if saved_ids:
+        vector_ready, detail = await wait_until(
+            probe_vectors_ready(saved_ids),
+            "the notes of the pair got their vectors (the candidate is searched "
+            "by the second one)",
+            timeout=min(CFG["wait_sec"], 180.0))
+        if not vector_ready:
+            warn("the notes of the pair have no vector yet",
+                 f"ids={saved_ids}, {detail} - the judge may get no pair")
+    else:
+        warn("the pair is empty (neither note was saved)", f"ids={ids}")
     return ids, vector_ready
 
 
@@ -1617,7 +1624,12 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
 
     ok, detail = await wait_until(
         queue_drained(rest, queue),
-        f"[{slot}] the queue {queue} is drained after the slot is back")
+        f"[{slot}] the queue {queue} is drained after the slot is back",
+        # После обрыва словы эмбеддингов холодные, и пачка заметок кодируется
+        # дольше быстрого окна приёмки: этим двум проверкам нужно время модели,
+        # а не время слота (живой прогон №10: vector pending=5, summary pending=2
+        # на исходе 120 с).
+        timeout=max(float(CFG["wait_sec"]), 300.0))
     check(f"[{slot}] after the slot is back the queue drains within the guard (no restart)",
           ok, detail)
 
