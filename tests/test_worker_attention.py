@@ -290,7 +290,14 @@ def test_note_edit_resets(tmp_path, monkeypatch, caplog) -> None:
 
 
 def test_probe_success_releases_slot(tmp_path, monkeypatch) -> None:
-    """CHECK_OK на стуке снимает внимание у заданий слота."""
+    """Стук снимает разрыв СЛОТА, но НЕ снимает внимание ПАРЫ (no39-04).
+
+    «Слот ожил» — не «причина пары ушла»: успешный стук закрывает паузу
+    слота и пускает партию, но работу с `attention_at` снимают только
+    протоколы правки пары, оператора и смены отпечатка конфигурации. Здесь
+    закреплено решение О. 2026-10-12 (постановка no39-04), отменяющее прежнее
+    ожидание no39-02 — счёт пары стуком не обнуляется.
+    """
     settings = _settings(tmp_path, monkeypatch)
     job_id = _seed_job(settings, slot="judge", kind="dedup", note_id=1)
     _set_job(
@@ -306,11 +313,12 @@ def test_probe_success_releases_slot(tmp_path, monkeypatch) -> None:
     worker._breakers["judge"].note_failure(SlotOutcome.AUTH)
     assert worker._slot_gate("judge", "judge") is False  # стук ещё не наступил
     clock["t"] += settings.slot_pause_sec + 1
-    assert worker._slot_gate("judge", "judge") is True
+    assert worker._slot_gate("judge", "judge") is True  # разрыв слота снят
     assert judge.probe_calls == 1
+    assert worker._breakers["judge"].is_paused() is False
     row = _job_row(settings, job_id)
-    assert row["attention_at"] is None
-    assert row["attempts"] == 0
+    assert row["attention_at"] is not None  # внимание пары сохранено
+    assert row["attempts"] == 8
 
 
 def test_startup_resets_on_config_change(tmp_path, monkeypatch) -> None:

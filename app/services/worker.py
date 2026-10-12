@@ -508,6 +508,13 @@ class BackgroundWorker:
         # (_create_job/_pending_jobs/_mark_job_done звали _ensure_job_table
         # на каждый вызов — 3 раза на работу).
         self._jobs_table_ready = False
+        # Тестовый крючок (no39-04): сколько раз слот снимал (пытался снять)
+        # работу с внимания, по причинам (`probe`/`edit`/`operator`/`startup`).
+        # Инвариант «пауза — на слот, счёт — на пару» проверяется тестом «стук
+        # не обнуляет»: успешный стук НЕ должен появляться тут с reason
+        # `probe` вовсе (`_reset_attention_for_slot(..., "probe")` из
+        # `_slot_gate` удалён, no39-04).
+        self._attention_resets: dict[str, int] = {}
         # Job-очереди по слотам (Фаза 11, решение №10): таблица создаётся
         # воркером лениво при первом обращении к очередям (схема — зона
         # воркера, не db.py). В __init__ не создаём: воркер собирается в
@@ -787,8 +794,15 @@ class BackgroundWorker:
             result = self._probe_slot(slot)
             self._log_slot_event("slot_probe", slot, effective_job, result=result)
             if result == CHECK_OK:
+                # Стук снимает разрыв СЛОТА, но НЕ снимает счёт ПАРЫ (no39-04,
+                # решение О. 2026-10-12): «слот ожил» ≠ «причина пары ушла».
+                # Здесь нет `_reset_attention_for_slot(slot, "probe")` — иначе
+                # успешный стук обнулял бы `attempts` и `attention_at` пары,
+                # порог `SLOT_MAX_ATTEMPTS` становился бы недостижим, и
+                # «требует вмешательства» не наступало бы никогда. Работу с
+                # внимания снимают только протоколы правки пары, оператора и
+                # смены отпечатка конфигурации (arch §6.8).
                 breaker.note_success()
-                self._reset_attention_for_slot(slot, "probe")
                 self._log_slot_event(
                     "slot_resumed",
                     slot,
@@ -978,7 +992,15 @@ class BackgroundWorker:
         detail: str | None = None,
         pair_stamp: str | None = None,
     ) -> dict:
-        """Зафиксировать исход попытки пары (№39, arch §6.8).
+        """Зафиксировать исход попытки пары (№39, arch §6.8; no39-04).
+
+        ИНВАРИАНТ «пауза — на слот, счёт — на пару»: состояние разрыва слота
+        здесь НЕ читается вовсе. Пауза — недоступность/отказ доступа СЛОТА
+        (back-off и пробный стук); счётчик `attempts` — собственная
+        безнадёжность ПАРЫ (заметка/кандидат). Поэтому нетранзиентные отказы
+        считаются независимо от того, открыт ли сейчас разрыв слота: пара
+        доходит до `SLOT_MAX_ATTEMPTS` через циклы «пауза → стук → снова
+        отказ», а не замирает на `SLOT_PAUSE_AFTER`.
 
         Транзиентный исход (`unavailable`/`timeout`/`auth`) обновляет только
         `last_outcome`/`last_error` — счётчик не растёт (ждать — нормальное
@@ -1110,10 +1132,14 @@ class BackgroundWorker:
     def _reset_attention_for_slot(self, slot: str, reason: str) -> int:
         """Снять внимание у заданий слота (`*` — у всех); число снятых.
 
-        Крючки «причина ушла» (arch §6.8/§13.3): успешный стук слота
-        (`probe`), старт со сменой отпечатка конфигурации (`startup`).
+        Единственный «оптовый» сброс «причина ушла» — старт со сменой отпечатка
+        конфигурации (`reason="startup"`, arch §6.8/§13.3). Успешный стук слота
+        (`reason="probe"`) сюда больше НЕ ведёт (no39-04): «слот ожил» — не
+        «причина пары ушла».
         """
         self._ensure_job_table()
+        # крючок наблюдаемости (тесты): попытки снятия по каждой причине
+        self._attention_resets[reason] = self._attention_resets.get(reason, 0) + 1
         with session(self._settings) as conn:
             if slot == "*":
                 rows = conn.execute(
