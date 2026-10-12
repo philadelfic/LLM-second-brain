@@ -297,13 +297,20 @@ def test_failure_keeps_fallback_and_pending(dead_app, token) -> None:
 
 
 def test_failure_is_retried_by_worker(dead_app, token) -> None:
-    """Очередь не бросается при отказе: воркер продолжает попытки (back-off)."""
+    """Очередь не бросается при отказе: воркер продолжает попытки (back-off).
+
+    lsbdef-0010: ждём наблюдаемое состояние — счётчик попыток воркера дошёл до
+    двух, а не «плюс одна от снимка»: при PENDING_RETRY_SEC=0 очередь
+    выгребается мгновенно, и к моменту снимка разрыв слота summary уже мог
+    открыться (три нетранзиентных отказа → пауза 900 с). Тогда следующей
+    попытки в окне теста нет, снимок «до» устаревает и тест краснеет ложно.
+    До открытия разрыва попыток заведомо не меньше трёх — состояние наблюдаемо.
+    """
     _create(dead_app, token, NOTE_TEXT)
     assert _wait_until(lambda: _health(dead_app)["summarizer_ok"] is False)
     fake = dead_app.app.state.services.summary  # FailingSummarizer (DI)
-    calls_before = len(fake.calls)
     # следующая попытка не позднее back-off (PENDING_RETRY_SEC=0 — мгновенно)
-    assert _wait_until(lambda: len(fake.calls) > calls_before, timeout=3.0)
+    assert _wait_until(lambda: len(fake.calls) >= 2, timeout=3.0)
     note = dead_app.get(
         "/notes/1", headers={"Authorization": f"Bearer {token}"}
     ).json()
@@ -316,14 +323,23 @@ def test_failure_logs_summary_failed_event(dead_app, token, caplog) -> None:
     Наблюдаемость деградации: молчаливый `continue` не отличить в логах от
     пустой очереди; воркер теперь громко говорит, ЧТО и ДЛЯ какой заметки
     не смог сгенерировать (наблюдаемость E2E-находки F1).
+
+    lsbdef-0010: ждём САМО событие журнала (наблюдаемое состояние), а не новую
+    попытку «плюс одна от снимка»: при PENDING_RETRY_SEC=0 разрыв слота summary
+    мог открыться до снимка (пауза 900 с) — нового события в окне теста не
+    было бы. Контекст caplog открыт ДО сохранения: событие первого отказа
+    ловится детерминированно (оно есть всегда — до разрыва три отказа).
     """
-    _create(dead_app, token, NOTE_TEXT)
-    assert _wait_until(lambda: _health(dead_app)["summarizer_ok"] is False)
     with caplog.at_level(logging.WARNING, logger="app"):
-        fake = dead_app.app.state.services.summary  # FailingSummarizer (DI)
-        calls_before = len(fake.calls)
-        # воркер крутится с PENDING_RETRY_SEC=0 — следующая попытка мгновенно
-        assert _wait_until(lambda: len(fake.calls) > calls_before, timeout=3.0)
+        _create(dead_app, token, NOTE_TEXT)
+        assert _wait_until(lambda: _health(dead_app)["summarizer_ok"] is False)
+        # воркер крутится с PENDING_RETRY_SEC=0 — событие отказа мгновенно
+        assert _wait_until(
+            lambda: any(
+                r.__dict__.get("event") == "summary_failed" for r in caplog.records
+            ),
+            timeout=3.0,
+        ), "нет WARNING event=summary_failed при отказе генерации"
     events = [
         r for r in caplog.records if r.__dict__.get("event") == "summary_failed"
     ]

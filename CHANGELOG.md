@@ -25,6 +25,9 @@ Release 3.2.0 — "Hygiene, contour and slots": the memory becomes accountable. 
 * **Injected-text measurement and budget** (LSBN-F-11): one token counter (`cl100k_base`) and `scripts/measure_injected_text.py` measure the three places that cost context — instructions at connection, tool descriptions, call weight — and `tests/test_injection_budget.py` guards the budget (the surface must stay 31 tools).
 
 ### Changed
+- The save-time `similar` hint (№30) now needs Dice 0.74 over significant words
+  instead of 0.30: at 0.30 it fired on almost any note that shared a sixth of
+  its vocabulary, so the hint was noise rather than a signal.
 
 * **The injected text is shorter and measured** (LSBN-F-11): the instructions became a short EN core with actionable pointers, and all 31 tool descriptions were revised — 640 → 525 tokens for the instructions, 2702 → 2170 for the descriptions (−19.7%), with the mandatory rules kept verbatim; the node map is bounded (per-node description and total budget with a `(+N more …)` pointer), so a growing registry no longer inflates the instructions.
 * **One hint per search** (№38): `skills_search` answers with a single `skills_get` hint per call instead of one per item.
