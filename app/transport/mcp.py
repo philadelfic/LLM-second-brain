@@ -2543,15 +2543,15 @@ def build_mcp(
             ],
             description: Annotated[
                 str,
-                Field(description="What it does: ≤250 characters"),
+                Field(description="What it does: ≤400 characters"),
             ],
             steps: Annotated[
                 str,
-                Field(description="The order: what after what: ≤500 characters"),
+                Field(description="The order: what after what: ≤1000 characters"),
             ],
             text: Annotated[
                 str,
-                Field(description="What exactly each step does: ≤4000 characters"),
+                Field(description="What exactly each step does: ≤7500 characters"),
             ],
             id: Annotated[
                 int | None,
@@ -2559,15 +2559,15 @@ def build_mcp(
             ] = None,
             example: Annotated[
                 str | None,
-                Field(description="Optional example: ≤1000 characters"),
+                Field(description="Optional example: ≤2000 characters"),
             ] = None,
             extra: Annotated[
                 dict[str, str] | None,
                 Field(
                     description="Optional class fields (trigger, mode, preconditions, "
                     "fallbacks, invariant, exceptions, guardrails, references, "
-                    "output_contract, behavior_contract; each ≤500 characters, "
-                    "together ≤2000) — only when this skill class needs them",
+                    "output_contract, behavior_contract; each ≤1000 characters, "
+                    "together ≤4000) — only when this skill class needs them",
                 ),
             ] = None,
         ) -> dict[str, Any]:

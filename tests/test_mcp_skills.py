@@ -91,15 +91,15 @@ CANON_FIELD_DESCRIPTIONS = {
     "skills_get": {"id": "Skill id"},
     "skills_save": {
         "name": "Skill name: ≤65 characters (≤5 words recommended)",
-        "description": "What it does: ≤250 characters",
-        "steps": "The order: what after what: ≤500 characters",
-        "text": "What exactly each step does: ≤4000 characters",
+        "description": "What it does: ≤400 characters",
+        "steps": "The order: what after what: ≤1000 characters",
+        "text": "What exactly each step does: ≤7500 characters",
         "id": "Skill id to update; omitted — create a new skill",
-        "example": "Optional example: ≤1000 characters",
+        "example": "Optional example: ≤2000 characters",
         "extra": (
             "Optional class fields (trigger, mode, preconditions, fallbacks, "
             "invariant, exceptions, guardrails, references, output_contract, "
-            "behavior_contract; each ≤500 characters, together ≤2000) — only "
+            "behavior_contract; each ≤1000 characters, together ≤4000) — only "
             "when this skill class needs them"
         ),
     },
@@ -111,12 +111,12 @@ CANON_HINT_NAME_LIMIT = (
     "skill not saved: name limit is 65 characters (≤5 words recommended)"
 )
 CANON_HINT_DESCRIPTION_LIMIT = (
-    "skill not saved: description limit is 250 characters — shorten it"
+    "skill not saved: description limit is 400 characters — shorten it"
 )
-CANON_HINT_STEPS_LIMIT = "skill not saved: steps limit is 500 characters — shorten it"
-CANON_HINT_TEXT_LIMIT = "skill not saved: text limit is 4000 characters — shorten it"
+CANON_HINT_STEPS_LIMIT = "skill not saved: steps limit is 1000 characters — shorten it"
+CANON_HINT_TEXT_LIMIT = "skill not saved: text limit is 7500 characters — shorten it"
 CANON_HINT_EXAMPLE_LIMIT = (
-    "skill not saved: example limit is 1000 characters — shorten it"
+    "skill not saved: example limit is 2000 characters — shorten it"
 )
 CANON_HINT_NOT_FOUND = (
     "skill not found (possibly deleted); the actual list — skills_list"
@@ -280,6 +280,24 @@ class TestToolRegistry:
             assert set(props) == set(expected), tool_name
             for param, description in expected.items():
                 assert props[param]["description"] == description, (tool_name, param)
+
+    @pytest.mark.asyncio
+    async def test_field_descriptions_carry_new_limits(self, mcp_skills) -> None:
+        """Числа формы навыков в схеме — новые (решение О. 12.10.2026, канон §6).
+
+        Дословный зеркальный тест выше правится вместе со схемой и потому «оба
+        места по-старому» не ловит; здесь числа заданы литералами: description
+        400, steps 1000, text 7500, example 2000, поле класса 1000 / сумма 4000.
+        `name` (65) и бюджет анонса (2000) решением не трогали.
+        """
+        schemas = await _tool_schemas(mcp_skills)
+        props = schemas["skills_save"]["properties"]
+        assert "≤65 characters" in props["name"]["description"]
+        assert "≤400 characters" in props["description"]["description"]
+        assert "≤1000 characters" in props["steps"]["description"]
+        assert "≤7500 characters" in props["text"]["description"]
+        assert "≤2000 characters" in props["example"]["description"]
+        assert "each ≤1000 characters, together ≤4000" in props["extra"]["description"]
 
     @pytest.mark.asyncio
     async def test_required_params_and_bounds(self, mcp_skills) -> None:

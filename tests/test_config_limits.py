@@ -297,14 +297,15 @@ class TestAreaLimits:
     """
 
     DEFAULT_FIELDS = [
+        # Лимиты формы навыка — решение О. 12.10.2026 (канон §6); `name` не тронут.
         ("skill_name_max_chars", 65),
-        ("skill_description_max_chars", 250),
-        ("skill_steps_max_chars", 500),
-        ("skill_text_max_chars", 4000),
-        ("skill_example_max_chars", 1000),
-        ("skill_extra_field_max_chars", 500),
-        ("skill_extra_total_max_chars", 2000),
-        ("instruction_template_max_chars", 1000),
+        ("skill_description_max_chars", 400),
+        ("skill_steps_max_chars", 1000),
+        ("skill_text_max_chars", 7500),
+        ("skill_example_max_chars", 2000),
+        ("skill_extra_field_max_chars", 1000),
+        ("skill_extra_total_max_chars", 4000),
+        ("instruction_template_max_chars", 2000),
         ("skill_announce_max_chars", 2000),
         ("skill_announce_description_chars", 120),
         ("skill_synonym_similarity", 0.90),

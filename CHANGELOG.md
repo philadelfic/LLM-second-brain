@@ -31,6 +31,7 @@ Release 3.2.0 — "Hygiene, contour and slots": the memory becomes accountable. 
 * **`default` node description in English** (№34) with a one-time, idempotent backfill that never overwrites an operator's edit.
 * **A note with a lifetime is never merged with others** (№46): the note lifetime (a TTL in `expires_at`, deleted by the system itself) is now announced in the instructions, a note with a TTL is excluded from dedup candidates and from merging, and its links are removed when the note is physically deleted.
 * `/health` reports `areas`, `queues`, `slots`, `warnings`, `decision`, `backups`, `update` and the version, so one call answers "is the contour healthy and what is it doing".
+* **Skill form limits raised** (decision of 2026-10-12, canon §6): `description` 250→400, `steps` 500→1000, `text` 4000→7500, `example` 1000→2000, one `extra` class field 500→1000 (all fields together 2000→4000) and the global `instruction_template` 1000→2000. Real procedures did not fit into the 3.0.0 ceilings: the model split a skill and duplicated the "how to execute" wording instead of writing the procedure. `name` (65 characters) and the announce block keep their limits; the injected-text budgets are untouched — `skills_save` stays at 119 of 120 tokens.
 
 ### Fixed
 

@@ -100,20 +100,24 @@ SKILL_MODES: tuple[str, ...] = ("collaborative", "autonomous")
 
 # --- Hint'ы мягких отказов (канон §3.8: «дословные константы в коде») --------
 # Таблица лимитов канона; тексты — английские, модель читает их как подсказку.
+# Числа — от решения О. 12.10.2026 (канон §6): description 400, steps 1000,
+# text 7500, example 2000, поле extra 1000 (сумма 4000), шаблон 2000;
+# `name` (65) не менялся. Здесь число — ОТВЕТ («сколько можно»), источник
+# истины — настройка (`SKILL_*_MAX_CHARS`) и канон §6.
 HINT_NAME_LIMIT = (
     "skill not saved: name limit is 65 characters (≤5 words recommended)"
 )
 HINT_DESCRIPTION_LIMIT = (
-    "skill not saved: description limit is 250 characters — shorten it"
+    "skill not saved: description limit is 400 characters — shorten it"
 )
-HINT_STEPS_LIMIT = "skill not saved: steps limit is 500 characters — shorten it"
-HINT_TEXT_LIMIT = "skill not saved: text limit is 4000 characters — shorten it"
+HINT_STEPS_LIMIT = "skill not saved: steps limit is 1000 characters — shorten it"
+HINT_TEXT_LIMIT = "skill not saved: text limit is 7500 characters — shorten it"
 HINT_EXAMPLE_LIMIT = (
-    "skill not saved: example limit is 1000 characters — shorten it"
+    "skill not saved: example limit is 2000 characters — shorten it"
 )
 HINT_EXTRA_LIMIT = (
-    "skill not saved: an optional field limit is 500 characters, all optional "
-    "fields together — 2000"
+    "skill not saved: an optional field limit is 1000 characters, all optional "
+    "fields together — 4000"
 )
 HINT_NOT_FOUND = "skill not found (possibly deleted); the actual list — skills_list"
 
@@ -145,7 +149,7 @@ HINT_EXTRA_OBJECT = (
 )
 HINT_MODE = "skill not saved: mode must be collaborative or autonomous"
 HINT_TEMPLATE_LIMIT = (
-    "template not saved: instruction template limit is 1000 characters — shorten it"
+    "template not saved: instruction template limit is 2000 characters — shorten it"
 )
 
 
