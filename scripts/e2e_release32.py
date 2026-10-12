@@ -2602,15 +2602,23 @@ async def scenario_10_node_hint(c: Client, rest: httpx2.AsyncClient) -> None:
     check("the `similar` hint is a local FTS read — the save window stays fast "
           "(no slot work, №30/FR-1.6)",
           similar_latency < 3.0, f"memory_save took {similar_latency * 1000:.0f} ms")
+    # «Одинокая» проба — БЕЗ тега прогона (и в тексте, и в титуле): при пороге
+    # memory_similar_threshold = 0.30 заметка с тегом похожа на все ~20 проб
+    # прогона и проверка краснеет (прогон №7: id=493). Строка случайная —
+    # совпадать ей не с чем.
     lonely = await c.call("memory_save", {
-        "text": f"{RUN['tag']}qzvx zblorpt",
-        "title": f"{RUN['tag']}qzvx",
+        "text": f"qzvx {os.urandom(8).hex()} {os.urandom(4).hex()} nymq",
+        "title": f"qzvx {os.urandom(4).hex()}",
     })
     if lonely.get("id") is not None:
         RUN["notes"].append(lonely["id"])
     check("a note with nothing similar carries no `similar` field (№30, FR-3.4)",
           lonely.get("stored") is True and "similar" not in lonely,
           note_detail(lonely))
+    if lonely.get("id") is not None:
+        # Уборка по id: тега прогона в титуле нет, а префиксная уборка
+        # (`cleanup_own_data` ищет подстроку в титуле) её не найдёт.
+        await c.call("memory_delete", {"id": lonely["id"]})
     snapshot = await health_snapshot(rest)
     check("the contour stays healthy after the writes (the hint is a map read, "
           "not a job)", snapshot.get("status") == "ok",
@@ -3119,13 +3127,26 @@ async def scenario_13_injected_text(c: Client, rest: httpx2.AsyncClient,
 
     # Фоновые джобы: заметки прогона обрабатываются, очередь дренируется (FR-6.2).
     if note_id is not None:
-        count = len(RUN["notes"])
+        # Смоук отвечает на вопрос «фон жив после сокращения текстов», а не
+        # «успел ли он выжать ВСЕ ~20 проб приёмки»: ждём выжимку СОБСТВЕННЫХ
+        # заметок смоука (она тут одна). На всех пробах прогона окно истекает
+        # раньше, чем очередь доходит до конца (прогон №7: «14 of 20», хотя в
+        # базе у всех заметок summary_status='ok' и все задания summary — done).
+        smoke_notes = [note_id]
+        marks = ",".join("?" * len(smoke_notes))
+
+        async def smoke_summaries_ready() -> tuple[bool, str]:
+            ready = db_count(
+                "SELECT COUNT(*) AS c FROM notes WHERE deleted_at IS NULL "
+                f"AND summary_status = 'ok' AND id IN ({marks})",
+                tuple(smoke_notes),
+            )
+            return (ready is not None and ready >= len(smoke_notes)), \
+                f"smoke notes with summary_status='ok': {ready} of {len(smoke_notes)}"
+
         drained, detail = await wait_until(
-            own_summaries_ready(count),
-            f"the probe notes of this run get a summary ({count})",
-            # Контур думает: `SUMMARY_THINK=true` и бюджет 35 000 токенов — одна
-            # выжимка на пробной заметке идёт десятки секунд, поэтому девяти
-            # заметкам нужно больше общего окна, чем дефолтные 300 с.
+            smoke_summaries_ready,
+            f"the smoke note of this run gets a summary ({note_id})",
             timeout=max(float(CFG["wait_sec"]), 600.0),
         )
         numbers["summary_drained"] = drained
