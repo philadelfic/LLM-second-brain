@@ -96,7 +96,13 @@ FAKE_URL="http://${FAKE_HOST}:${FAKE_PORT}"
 # (причина `unavailable` в decision-слоте) — отключённый слот даёт другую
 # причину (`unsupported`), и задание под `DECISION_FALLBACK=false` не ждёт.
 DEAD_URL="${SLOT_FAKE_DEAD_URL:-http://127.0.0.1:9}"
-MODELS="${SLOT_FAKE_MODELS:-hf.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q6_K,fake-decision}"
+MODELS="${SLOT_FAKE_MODELS:-hf.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q6_K,ornith:35b,fake-decision}"
+# `ornith:35b` — имя модели, которое просит контур 3.2.0 (SUMMARY_MODEL/JUDGE_MODEL
+# в docker-compose.test.yml). Без него стартовая проверка и ПРОБНЫЙ СТУК дают
+# `model_missing`, и слот не выходит из разрыва никогда — живая проба 12.10.2026:
+# `provider_check_result slot=summary outcome=model_missing model=ornith:35b`
+# и `slot_probe result=model_missing`, работа висит в очереди, хотя заглушка
+# на прямой запрос отвечает корректно.
 PAUSE_SEC="${SLOT_FAKE_PAUSE_SEC:-60}"
 MAX_ATTEMPTS="${SLOT_FAKE_MAX_ATTEMPTS:-3}"
 TIGHT_MODEL_TYPE="${SLOT_FAKE_SUMMARY_MODEL_TYPE:-reasoning}"
