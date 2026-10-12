@@ -935,6 +935,51 @@ async def save_probe_note_result(c: Client, title: str, *, text: str | None = No
     return await _save_probe_once(c, args, reconnect=True)
 
 
+# --- пара-«почти-дубль» (сценарии 8 и 9: судья должен получить пару) -----------------
+# Пробы всех сценариев пишутся ОДНИМ текстом-заглушкой, поэтому вторая проба
+# отвергается продуктом как дословный дубль (`stored: false`) — и пара до судьи
+# не доходит. Прогон 12.10.2026: ветвь бюджета ждала «безнадёжную пару» 300 с
+# при пустой очереди judge, а шаг 3 ветви decision — задание, которое должно
+# ждать (№39), тоже смотрел в пустую очередь. Тексты пары обязаны быть
+# близкими по смыслу (кандидат от DEDUP_CANDIDATE_SIMILARITY = 0.80), но НЕ
+# совпадать дословно.
+NEAR_DUPLICATE_BODY = (
+    "Acceptance probe of the dedup hand-off: the contour keeps a pair of notes "
+    "of the same meaning, the candidate search finds the neighbour by cosine, "
+    "and the judge is asked for a verdict. This body is shared by both notes "
+    "of the pair on purpose — the pair must be close by meaning, while the "
+    "framing around it keeps the texts from being verbatim duplicates. "
+)
+
+
+def near_duplicate_texts(tag: str) -> tuple[str, str]:
+    """Два текста пары: близкие по смыслу, но не дословные дубли."""
+    return (
+        f"{tag} dedup hand-off pair, first note. {NEAR_DUPLICATE_BODY}"
+        "The pair is created by the acceptance run.",
+        f"{tag} dedup hand-off pair, second note. {NEAR_DUPLICATE_BODY}"
+        "The pair is checked by the acceptance run.",
+    )
+
+
+async def save_near_duplicate_pair(c: Client, title_first: str,
+                                   title_second: str) -> list[int | None]:
+    """Сохранить пару-«почти-дубль» → [id первого, id второго] (None — не создалась).
+
+    Пара нужна ветвям, которым нужен вердикт судьи: без кандидата (cosine ≥
+    0.80) судья не спрашивается, очередь judge пуста и проверки читаются
+    ложной краснотой.
+    """
+    first, second = near_duplicate_texts(RUN["tag"])
+    ids: list[int | None] = []
+    for title, text in ((title_first, first), (title_second, second)):
+        note_id, _detail = await save_probe_note_result(
+            c, title, text=text, after_hook=True
+        )
+        ids.append(note_id)
+    return ids
+
+
 async def save_probe_note(c: Client, title: str, *, after_hook: bool = False,
                           rest: httpx2.AsyncClient | None = None) -> int | None:
     """Create one probe note (marked by the run tag in its title); return its id.
@@ -1710,11 +1755,13 @@ async def scenario_8_budget_raise_release(c: Client, rest: httpx2.AsyncClient) -
                   "back by the scenario hook")
     fixed = False
     try:
-        # Push work into both queues: the probe note needs a summary, its dedup
+        # Push work into both queues: the notes need a summary, their dedup
         # hand-off needs a judge verdict (a hand-off pair is what freezes here).
-        probe_ids = [await save_probe_note(c, RUN["note_budget_break"], after_hook=True),
-                     await save_probe_note(c, RUN["note_budget_break_2"],
-                                           after_hook=True)]
+        # Пара обязана быть «почти-дублем»: дословно одинаковые тексты продукт
+        # отвергает (stored=false), и судья не получает ни одной пары.
+        probe_ids = await save_near_duplicate_pair(
+            c, RUN["note_budget_break"], RUN["note_budget_break_2"]
+        )
         probes = len([item for item in probe_ids if item is not None])
 
         ok, detail = await wait_until(queue_has_work(rest, "summary"),
@@ -1891,14 +1938,16 @@ async def scenario_9_decision_fallback(c: Client, rest: httpx2.AsyncClient) -> N
                "point the hooks at contour restarts: LSB_DECISION_ON_CMD "
                "(DECISION_ENABLED=true + a model able to /v1/systemone), "
                "LSB_DECISION_UNSUPPORTED_CMD (a model without /v1/systemone), "
-               "LSB_DECISION_OFF_CMD (the slot off + DECISION_FALLBACK=false), "
+               "LSB_DECISION_OFF_CMD (the slot enabled but unreachable + "
+               "DECISION_FALLBACK=false), "
                "LSB_DECISION_LOW_CONFIDENCE_CMD (a threshold+zone catching the "
                "probability), LSB_DECISION_RESTORE_CMD (the baseline back): "
                "/health must stay honest at every step. scripts/slot_fake.sh: "
                "LSB_DECISION_ON_CMD='scripts/slot_fake.sh on decision-ok', "
                "LSB_DECISION_UNSUPPORTED_CMD='scripts/slot_fake.sh on "
-               "decision-unsupported', LSB_DECISION_OFF_CMD='scripts/slot_fake.sh on "
-               "decision-off', LSB_DECISION_LOW_CONFIDENCE_CMD='scripts/slot_fake.sh "
+               "decision-unsupported', LSB_DECISION_OFF_CMD='scripts/slot_fake.sh "
+               "on decision-unavailable', LSB_DECISION_LOW_CONFIDENCE_CMD="
+               "'scripts/slot_fake.sh "
                "on decision-low-confidence', LSB_DECISION_RESTORE_CMD='scripts/"
                "slot_fake.sh off'")
         return
@@ -1954,9 +2003,14 @@ async def scenario_9_decision_fallback(c: Client, rest: httpx2.AsyncClient) -> N
         # 3. unavailable (the slot off) with DECISION_FALLBACK=false: the job waits
         #    by contract №39 and drains after the slot returns (no manual step).
         if not await restart("decision_off_cmd",
-                             "the slot off + DECISION_FALLBACK=false"):
+                             "the slot unreachable + DECISION_FALLBACK=false"):
             return
-        await save_probe_note(c, RUN["note_decision_unavailable"], after_hook=True)
+        # Задание ждёт только тогда, когда судья реально спрошен: нужна пара-«почти-дубль»
+        # (иначе очередь judge пуста и ожидание читается ложной краснотой).
+        await save_near_duplicate_pair(
+            c, RUN["note_decision_unavailable"],
+            f"{RUN['note_decision_unavailable']} pair"
+        )
         ok, detail = await wait_until(
             queue_has_work(rest, "judge"),
             "[decision] the job waits (contract №39, no lost work)",
