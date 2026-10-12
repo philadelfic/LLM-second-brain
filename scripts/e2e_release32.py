@@ -757,6 +757,30 @@ def slot_ready(rest: httpx2.AsyncClient, slot: str,
     return predicate
 
 
+def slot_ok(rest: httpx2.AsyncClient, slot: str,
+            ) -> Callable[[], Awaitable[tuple[bool, str]]]:
+    """Predicate: the slot really answers again — the last attempt succeeded.
+
+    №39: маркер `slot_resumed` пишется только при снятии паузы В ТОМ ЖЕ процессе
+    (`app/services/worker.py`). Ветвь, чья «починка» пересоздаёт контейнер
+    (`scripts/slot_fake.sh on ok ...`), маркера не увидит: пауза жила в памяти и
+    при пересоздании её нет. Наблюдаемый факт «доступ вернулся» — успешная
+    последняя попытка слота (`/health.slots.<slot>.ok`) и снятый разрыв.
+    """
+
+    async def predicate() -> tuple[bool, str]:
+        snapshot = await health_snapshot(rest)
+        stat = slot_stat(snapshot, slot)
+        if stat is None:
+            return False, f"slot {slot} is not reported by /health.slots"
+        ok = stat.get("ok") is True and stat.get("paused_until") is None
+        return bool(ok), (f"slot {slot}: ok={stat.get('ok')!r}, "
+                          f"last_outcome={stat.get('last_outcome')!r}, "
+                          f"paused_until={stat.get('paused_until')!r}")
+
+    return predicate
+
+
 def probe_vectors_ready(note_ids: list[int],
                         ) -> Callable[[], Awaitable[tuple[bool, str]]]:
     """Predicate: every listed probe note carries a READY vector (DB, read-only).
@@ -1657,13 +1681,6 @@ async def scenario_3_auth_branch(c: Client, rest: httpx2.AsyncClient) -> None:
 
     slot = CFG["auth_slot"]
     queue = SLOT_QUEUE[slot]
-    # Своя работа в очереди: фаза открытого разрыва проверяется по факту «работа
-    # ЖДЁТ паузу», а пустая очередь не проверяет ничего. Вектор заметки успевает
-    # посчитаться здоровым embedding-слотом ещё до перевода фейка на 401, а выжимка
-    # ждёт закрытия разрыва — ровно то, что и проверяет ветвь.
-    if await save_probe_note(c, RUN["note_auth"], after_hook=True) is None:
-        info(f"[auth] the probe note of the branch is not created — the queue "
-             f"{queue} may stay empty")
     proc = await run_shell(slot_cmd(CFG["slot_auth_cmd"], slot))
     check(f"the fake provider is switched to 401 for {slot}", proc.returncode == 0,
           f"rc={proc.returncode}")
@@ -1672,6 +1689,24 @@ async def scenario_3_auth_branch(c: Client, rest: httpx2.AsyncClient) -> None:
     teardown_note(f"[{slot}] the fake provider was switched to 401 and fixed back")
     fixed = False
     try:
+        # Своя работа в очереди — ПОКА РАЗРЫВ ОТКРЫТ: фаза проверяется по факту
+        # «работа ЖДЁТ паузу», а пустая очередь не проверяет ничего. Заметку
+        # создаём ПОСЛЕ перевода фейка на 401: её выжимка не успевает закрыться
+        # здоровым штатным слотом до открытия разрыва (живой прогон 12.10.2026 —
+        # заметка, созданная до хука, была выжата штатным слотом, и очередь
+        # `summary` честно показывала 0/0/0). Текст ветви — СВОЙ: с общим текстом
+        # сценария 0 (`<tag> probe note text (observability acceptance).`) продукт
+        # отвечает «дословный дубль» и заметки не пишет, а ветвь мерила бы чужую
+        # (или пустую) очередь. Первый же реальный вызов заметки открывает разрыв
+        # (слот отвечает 401) — ровно та фаза, которую проверяет ветвь.
+        auth_text = (f"{RUN['tag']} {slot} auth-branch probe text — the summary is "
+                     f"deferred by the open break (observability acceptance).")
+        probe, probe_detail = await save_probe_note_result(
+            c, RUN["note_auth"], text=auth_text, after_hook=True, rest=rest)
+        if probe is None:
+            info(f"[auth] the probe note of the branch is not created "
+                 f"({probe_detail}) — the queue {queue} may stay empty")
+
         if CFG["logs_cmd"]:
             found, detail = await wait_until(
                 log_events("slot_paused"),
@@ -1716,12 +1751,18 @@ async def scenario_3_auth_branch(c: Client, rest: httpx2.AsyncClient) -> None:
                 warn("[auth] the fake provider could NOT be fixed by hand",
                      f"rc={undo.returncode}")
 
-    if CFG["logs_cmd"]:
-        found, detail = await wait_until(
-            log_events("slot_probe", "slot_resumed"),
-            "[auth] the probe and resume events appear in the log",
-            timeout=CFG["wait_sec"])
-        check("[auth] after the fix the probe and the resume are written", found, detail)
+    # Починка (LSB_SLOT_AUTH_FIX_CMD = `scripts/slot_fake.sh on ok ...`) ПЕРЕСОЗДАЁТ
+    # контейнер: разрыв живёт в памяти процесса (`app/services/slot_breaker.py`),
+    # при пересоздании он теряется, а маркер `slot_resumed` пишется только при
+    # снятии паузы В ТОМ ЖЕ процессе (`app/services/worker.py`) — после
+    # пересоздания его не будет никогда (ложный FAIL живого прогона 12.10.2026).
+    # Проверяем наблюдаемый факт «доступ вернулся»: слот снова отвечает (`ok`, разрыв
+    # снят) и отложенная работа уходит из очереди.
+    ok, detail = await wait_until(
+        slot_ok(rest, slot),
+        f"[auth] after the fix the {slot} slot answers again (ok, the break is gone)")
+    check(f"[auth] after the fix the {slot} slot is ok again — the access is restored",
+          ok, detail)
     ok, detail = await wait_until(queue_drained(rest, queue),
                                   f"[auth] the queue {queue} drains after the fix")
     check("[auth] the deferred work is done after the access is restored", ok, detail)
@@ -2572,6 +2613,7 @@ async def scenario_10_node_hint(c: Client, rest: httpx2.AsyncClient) -> None:
 
 # ==== scenarios: 11. freshness filter (№29) ===================================
 FRESHNESS_BOUNDARY = "2001-01-01T00:00:00Z"
+FRESHNESS_AFTER_BOUNDARY = "2001-01-01T00:00:01Z"
 FRESHNESS_OLD = "2000-01-01T00:00:00Z"
 
 
@@ -2609,18 +2651,28 @@ async def scenario_11_freshness(c: Client, rest: httpx2.AsyncClient) -> None:
     db_write("UPDATE notes SET updated_at = ? WHERE id = ?",
              (FRESHNESS_BOUNDARY, fresh["id"]))
 
+    # Граница включающая: заметка, обновлённая РОВНО в границу, остаётся в срезе,
+    # а строго старше — выпадает. Проверяем СЧЁТОМ, а не вхождением в страницу:
+    # лимит MCP-листинга (list_max_limit_mcp = 20) меньше числа заметок в памяти,
+    # а проба намеренно самая старая — в первую страницу она не попадает, и
+    # вхождение проверяло бы лимит, а не фильтр (прогон 12.10.2026).
     listed = await c.call("memory_list", {
         "limit": 20, "updated_after": FRESHNESS_BOUNDARY})
-    ids = [item["id"] for item in listed.get("items", [])]
+    unfiltered = await c.call("memory_list", {"limit": 20})
     check("memory_list with `updated_after` keeps the fresh note (inclusive "
           "boundary) and drops the old one",
-          fresh["id"] in ids and old["id"] not in ids,
-          f"ids={ids}, fresh={fresh['id']}, old={old['id']}")
-    unfiltered = await c.call("memory_list", {"limit": 20})
-    check("the listing `total` follows the freshness filter (exactly the stale "
-          "note is excluded)",
           unfiltered.get("total") == listed.get("total", -1) + 1,
-          f"filtered={listed.get('total')}, all={unfiltered.get('total')}")
+          f"filtered={listed.get('total')}, all={unfiltered.get('total')}, "
+          f"fresh={fresh['id']}, old={old['id']}")
+    # Сдвиг границы на секунду вперёд обязан выкинуть и свежую заметку: значит она
+    # стояла РОВНО на границе (сравнение `>=`), а не «где-то после неё».
+    later = await c.call("memory_list", {
+        "limit": 20, "updated_after": FRESHNESS_AFTER_BOUNDARY})
+    check("one second after the boundary the fresh note falls out too (the "
+          "comparison is `>=`, not `>`)",
+          listed.get("total", -1) == later.get("total", -2) + 1,
+          f"at the boundary={listed.get('total')}, one second later="
+          f"{later.get('total')}")
 
     found = await c.call("memory_search", {
         "query": "TaskFlow деплой", "updated_after": FRESHNESS_BOUNDARY})
@@ -2633,12 +2685,16 @@ async def scenario_11_freshness(c: Client, rest: httpx2.AsyncClient) -> None:
           bad.get("items") == [] and "updated_after" in (bad.get("hint") or ""),
           f"hint={bad.get('hint')!r}")
 
-    r = await rest.get("/notes", params={"updated_after": FRESHNESS_BOUNDARY})
-    rest_ids = ([item["id"] for item in (r.json().get("items") or [])]
-                if r.status_code == 200 else [])
+    r = await rest.get("/notes", params={"updated_after": FRESHNESS_BOUNDARY,
+                                         "limit": 50})
+    r_all = await rest.get("/notes", params={"limit": 50})
+    rest_total = r.json().get("total") if r.status_code == 200 else None
+    rest_all = r_all.json().get("total") if r_all.status_code == 200 else None
     check("the REST surface filters GET /notes the same way",
-          r.status_code == 200 and fresh["id"] in rest_ids and old["id"] not in rest_ids,
-          f"http {r.status_code}, ids={rest_ids}")
+          r.status_code == 200 and rest_total is not None
+          and rest_all == rest_total + 1,
+          f"http {r.status_code}, filtered={rest_total}, all={rest_all}, "
+          f"fresh={fresh['id']}, old={old['id']}")
     r_bad = await rest.get("/notes", params={"updated_after": "за неделю"})
     check("REST answers an invalid `updated_after` with 422 (soft refusal, hint)",
           r_bad.status_code == 422 and "updated_after" in str(r_bad.json().get("detail")),

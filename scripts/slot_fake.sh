@@ -395,6 +395,15 @@ if [[ "$ACTION" == "on" ]]; then
         for slot in "${SLOTS[@]}"; do
             ENV["$(slot_prefix "$slot")_BASE_URL"]="$FAKE_URL"
         done
+        # Ветви 4 и 8 проверяют отказ ГЕНЕРАТИВНОГО судьи: иначе решение берёт
+        # живой decision-слот, и заглушка генеративного судьи не участвует
+        # (живой прогон 12.10.2026: пара создана, задание судьи status=done,
+        # attempts=0, очередь judge пуста). `DECISION_FALLBACK=true` — чтобы
+        # классификатор и судья честно шли генеративным путём, а не ждали решения.
+        if [[ "$MODE" == "offcontract" || "$MODE" == "empty-length" ]]; then
+            ENV["DECISION_ENABLED"]="false"
+            ENV["DECISION_FALLBACK"]="true"
+        fi
         if [[ "$MODE" == "empty-length" ]]; then
             ENV["SUMMARY_MODEL_TYPE"]="$TIGHT_MODEL_TYPE"
             ENV["SUMMARY_NUM_PREDICT"]="$TIGHT_NUM_PREDICT"
