@@ -219,7 +219,25 @@ def test_fallback_on_unavailable(monkeypatch, caplog) -> None:
 
 
 def test_fallback_on_unsupported(monkeypatch, caplog) -> None:
-    """Слот погашен (`can_decide()` ложно) → генеративный путь, `unsupported`."""
+    """Отказ по контракту (в ответе нет решения вопроса) → генеративный путь, `unsupported`."""
+    settings = decision_settings(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="app"):
+        judge, decider, decision, generative = make_judge(
+            settings, [systemone({})], [chat_body()]
+        )
+        assert judge.judge(TEXT_NEW, TEXT_CANDIDATE).verdict is True
+    assert generative.calls == 1
+    assert decision.calls == 1
+    records = events(caplog, "decision_fallback")
+    assert records and records[0].reason == "unsupported"
+
+
+def test_slot_disabled_by_check_is_unavailable(monkeypatch, caplog) -> None:
+    """Слот погашен стартовой проверкой (`can_decide()` ложно) → `unavailable`, НЕ `unsupported` (f12-04).
+
+    «Слота сейчас нет» и «модель не умеет» — разные вещи: оператор должен видеть
+    честную картину; вызова по-прежнему нет, счётчик переключения растёт.
+    """
     settings = decision_settings(monkeypatch)
     with caplog.at_level(logging.INFO, logger="app"):
         judge, decider, decision, generative = make_judge(
@@ -231,7 +249,10 @@ def test_fallback_on_unsupported(monkeypatch, caplog) -> None:
     assert generative.calls == 1
     assert decision.calls == 0
     records = events(caplog, "decision_fallback")
-    assert records and records[0].reason == "unsupported"
+    assert records and records[0].reason == "unavailable"
+    snapshot = decider.snapshot()
+    assert snapshot["by_reason"]["unavailable"] == 1
+    assert snapshot["by_reason"]["unsupported"] == 0
 
 
 def test_fallback_disabled_waits(monkeypatch, caplog) -> None:
@@ -243,6 +264,14 @@ def test_fallback_disabled_waits(monkeypatch, caplog) -> None:
         )
         with pytest.raises(JudgeError) as excinfo:
             judge.judge(TEXT_NEW, TEXT_CANDIDATE)
+        # Переключений не было — отказали один раз: счётчик и событие ровно одни.
+        fallbacks = [
+            record
+            for record in events(caplog, "decision_fallback")
+            if record.reason == "unavailable"
+        ]
+        assert len(fallbacks) == 1
+        assert decider.snapshot()["fallbacks"] == 1
     assert excinfo.value.outcome is SlotOutcome.UNAVAILABLE
     assert generative.calls == 0  # вердикт генеративного пути не взят — задание ждёт
 

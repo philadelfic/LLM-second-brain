@@ -158,10 +158,15 @@ def test_judge_decides_through_the_fake_slot(monkeypatch: pytest.MonkeyPatch) ->
             client.close()
 
 
-def test_low_confidence_and_unsupported_are_counted(
+def test_low_confidence_and_disabled_slot_are_counted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Вероятность в зоне → `low_confidence`; погашенный слот → `unsupported`."""
+    """Вероятность в зоне → `low_confidence`; слот, погашенный стартовой проверкой, → `unavailable`.
+
+    Заглушка в режиме `decision-unsupported` честно отвечает «не умеет decision»
+    — это контрактный исход проверки; сам же погашенный слот при вызове решения
+    читается оператором как «слота сейчас нет», т.е. `unavailable` (f12-04).
+    """
     with running_fake(MODE_LOW) as url:
         settings, client = decision_slot(monkeypatch, url)
         try:
@@ -188,11 +193,12 @@ def test_low_confidence_and_unsupported_are_counted(
             )
             service.disable()  # так делает main.py, прочитав исход проверки
             questions = service.questions_for("judge")
-            with pytest.raises(DecisionUnavailable) as unsupported:
+            with pytest.raises(DecisionUnavailable) as unavailable:
                 service.decide("TEXT 1: a\nTEXT 2: b", questions, operation="judge")
-            assert unsupported.value.reason == "unsupported"
+            assert unavailable.value.reason == "unavailable"
             snapshot = service.snapshot()
             assert snapshot["ok"] is False
-            assert snapshot["by_reason"]["unsupported"] == 1
+            assert snapshot["by_reason"]["unavailable"] == 1
+            assert snapshot["by_reason"]["unsupported"] == 0
         finally:
             client.close()

@@ -7,11 +7,19 @@
 
 Три причины переключения на генеративный слот (ровно эти, §13.6):
 
-- `unavailable` — сеть/5xx/таймаут/разрыв слота decision;
-- `unsupported` — сервер не знает `/v1/systemone`, не принимает тип вопроса,
-  меток больше `DECISION_MAX_LABELS`;
+- `unavailable` — слота СЕЙЧАС НЕТ: сеть/5xx/таймаут/разрыв слота decision,
+  пауза, погашенная стартовой проверкой или `disable()` модель, а равно
+  выключенный флагом `DECISION_ENABLED=false` путь (но выключенный флаг — не
+  переключение вовсе, счётчиков он не двигает, FR-4.4);
+- `unsupported` — контракт не сходится: сервер не знает `/v1/systemone`, не
+  принимает тип вопроса, меток больше `DECISION_MAX_LABELS`, либо в ответе нет
+  решения этого вопроса;
 - `low_confidence` — вероятность/уверенность в зоне неопределённости вокруг
   порога (`|p − threshold| < zone`) либо `choice` ниже `threshold + zone`.
+
+Словарь причин закрыт: чужое имя в `_fallback` — ошибка разработки
+(`ValueError`), а «решение не применимо» (у `choice` меньше двух кандидатов)
+переключением не считается (`decision_skipped`, `f12-02`).
 
 `DecisionService.decide` не бросает чужих исключений: любая причина переключения
 — `DecisionUnavailable` с полем `reason` (и `answer`, когда решение разобрано,
@@ -50,6 +58,10 @@ if TYPE_CHECKING:  # pragma: no cover — реестр инъектируетс�
 
 # Типы вопросов decision-модели (arch §6.4): иных не бывает.
 DECISION_KINDS = ("choice", "noul", "score")
+
+# Ровно три причины переключения (arch §13.6, FR-4.2): иных нет и быть не может —
+# причина проходит этот белый список в `_fallback`, чужое имя сразу ValueError.
+DECISION_REASONS = ("unavailable", "unsupported", "low_confidence")
 
 # Статусы отказа, означающие «ждать бессмысленно»: разрыв открывается сразу
 # (как AUTH генеративных слотов, блок 2).
@@ -187,11 +199,7 @@ class DecisionService:
         )
         self._answers = 0
         self._fallbacks = 0
-        self._by_reason: dict[str, int] = {
-            "unavailable": 0,
-            "unsupported": 0,
-            "low_confidence": 0,
-        }
+        self._by_reason: dict[str, int] = {reason: 0 for reason in DECISION_REASONS}
 
     # --- состояние -----------------------------------------------------------
 
@@ -209,14 +217,21 @@ class DecisionService:
             self._llm.close()
 
     def snapshot(self) -> dict:
-        """Снимок состояния слота для /health (arch §6.4/§7.1): только память."""
+        """Снимок состояния слота для /health (arch §6.4/§7.1): только память.
+
+        `by_reason` всегда несёт ровно три ключа (нулевые — тоже), так что
+        `fallbacks == sum(by_reason.values())` держится и при пустом слоте
+        (§7.3/FR-6.3): оператор видит честную картину причин.
+        """
         return {
             "enabled": self._enabled,
             "ok": self._ok,
             "breaker": self._breaker.snapshot(),
             "answers": self._answers,
             "fallbacks": self._fallbacks,
-            "by_reason": dict(self._by_reason),
+            "by_reason": {
+                reason: self._by_reason.get(reason, 0) for reason in DECISION_REASONS
+            },
         }
 
     # --- реестр вопросов -----------------------------------------------------
@@ -281,15 +296,26 @@ class DecisionService:
             "older_id": older_id,
             "candidate_id": candidate_id,
         }
+        if not self._settings.decision_enabled:
+            # Выключенный флагом путь — НЕ переключение (FR-4.4): ни счётчиков,
+            # ни события, ни разрыва. Защитная ветка: обычно сервис при
+            # выключенном флаге не собирается вовсе (`Services.decision is
+            # None`), но решение с неё обязано быть честным.
+            detail = "decision-слот выключен флагом DECISION_ENABLED"
+            raise DecisionUnavailable(detail, reason="unavailable")
         if not self.can_decide():
+            # Слот ВКЛЮЧЁН, но его сейчас нет: погашен стартовой проверкой
+            # (`check_decision() != ok`) или `disable()`. Это `unavailable`, а
+            # не `unsupported`: «модель не умеет» — про контракт, а не про
+            # доступность (дефект приёмки 12.10.2026).
             detail = (
-                "decision-слот выключен или погашен — решения идут "
+                "decision-слот недоступен (погашен проверкой) — решения идут "
                 "генеративным путём"
             )
             self._fallback(
-                "unsupported", operation=operation, detail=detail, ids=ids
+                "unavailable", operation=operation, detail=detail, ids=ids
             )
-            raise DecisionUnavailable(detail, reason="unsupported")
+            raise DecisionUnavailable(detail, reason="unavailable")
         assert self._llm is not None  # can_decide() гарантирует клиента
         if any(len(q.labels) > self._settings.decision_max_labels for q in questions):
             # Потолок вариантов (arch §8): список узлов больше лимита модели.
@@ -445,9 +471,17 @@ class DecisionService:
         Журнал пишет сам `DecisionService` (arch §7.2/§13.6): он единственный
         знает вопрос, вероятность и причину переключения. В событие уходят
         только цифры и фрагмент `detail` — тел ответов там нет (§7.2).
+
+        `reason` — ЕДИНСТВЕННАЯ точка инкремента счётчиков и записи события; имя
+        причины проходит белый список `DECISION_REASONS` (§13.6): чужое имя —
+        ошибка разработки, а не четвёртый счётчик.
         """
+        if reason not in DECISION_REASONS:
+            raise ValueError(
+                f"причина переключения decision вне словаря: {reason!r}"
+            )
         self._fallbacks += 1
-        self._by_reason[reason] = self._by_reason.get(reason, 0) + 1
+        self._by_reason[reason] += 1
         fields: dict[str, object] = {
             "operation": operation,
             "reason": reason,

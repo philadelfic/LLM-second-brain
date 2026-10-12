@@ -20,6 +20,7 @@ from app.services.worker import BackgroundWorker
 from fakes import FailingEmbedder
 
 from test_classifier_decision import (
+    GENERIC_LABEL,
     KNOWN,
     TEXT,
     chat_body as classify_body,
@@ -66,6 +67,44 @@ def test_dedup_behaviour_unchanged(monkeypatch) -> None:
             registry=PromptRegistry(None),
         )
         assert judge.judge(TEXT_NEW, TEXT_CANDIDATE).verdict is expected
+
+
+def test_decision_skipped_is_not_fallback(monkeypatch, caplog) -> None:
+    """«Решение не применимо» — не переключение: `decision_skipped`, счётчики и разрыв целы (FR-4.5).
+
+    У `choice`-вопроса один кандидат (выбирать не из чего): вызова решения нет,
+    событие `decision_skipped` (не `decision_fallback`), `fallbacks`/`by_reason`
+    и разрыв decision-слота не двигаются — сразу генеративный путь.
+    """
+    settings = decision_settings(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="app"):
+        classifier, decider, decision, generative = make_classifier(
+            settings,
+            [choice(GENERIC_LABEL, {GENERIC_LABEL: 0.9})],
+            [classify_body()],
+        )
+        classifier.classify(TEXT, [])
+    assert decision.calls == 0
+    assert generative.calls == 1
+    snapshot = decider.snapshot()
+    assert snapshot["fallbacks"] == 0
+    assert snapshot["by_reason"] == {
+        "unavailable": 0,
+        "unsupported": 0,
+        "low_confidence": 0,
+    }
+    assert snapshot["breaker"]["state"] == "closed"
+    skipped = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "decision_skipped"
+    ]
+    assert skipped and skipped[0].reason == "single_candidate"
+    assert not [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "decision_fallback"
+    ]
 
 
 def test_journal_backward_compatible(monkeypatch, caplog) -> None:
