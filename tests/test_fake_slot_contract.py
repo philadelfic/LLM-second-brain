@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+import time
 from collections.abc import Iterator
 
 import httpx
@@ -46,9 +47,9 @@ ZONE = "0.05"
 
 
 @contextlib.contextmanager
-def running_fake(mode: str) -> Iterator[str]:
+def running_fake(mode: str, *, delay: float = 0.0) -> Iterator[str]:
     """Поднять настоящую заглушку контура в потоке; yield — её базовый URL."""
-    server = FakeSlotServer(("127.0.0.1", 0), mode, DEFAULT_MODELS, False)
+    server = FakeSlotServer(("127.0.0.1", 0), mode, DEFAULT_MODELS, False, delay=delay)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -126,6 +127,36 @@ def test_fake_accepts_both_question_shapes() -> None:
         # Метки `choice` — ключи `criteria` (контракт сервера), а не поле `labels`.
         labels = httpx.post(f"{url}/v1/systemone", json=choice_form, timeout=5.0)
         assert labels.json()["answers"]["note_section"]["choice"] == "work"
+
+
+def test_chat_delay_keeps_the_queues_observable() -> None:
+    """Быстрый профиль: чат отвечает с задержкой, решение — без неё.
+
+    Мгновенные ответы делают проверки «работа видна в очереди, пока слот стоит»
+    слепыми (прогон приёмки №9, шесть красных в сценариях 2/4/8), поэтому у
+    заглушки есть `--delay`. Решение-слот задержки не получает: его проверки в
+    скорости не нуждаются, а лишние секунды в очереди судьи ломали бы их окна.
+    """
+    with running_fake(MODE_OK, delay=0.3) as url:
+        started = time.monotonic()
+        chat = httpx.post(f"{url}/api/chat",
+                          json={"model": "ornith:35b",
+                                "messages": [{"role": "user",
+                                              "content": "summarise the note"}]},
+                          timeout=10.0)
+        chat_elapsed = time.monotonic() - started
+        assert chat.status_code == 200, chat
+        assert chat_elapsed >= 0.3, chat_elapsed
+
+        started = time.monotonic()
+        decision = httpx.post(f"{url}/v1/systemone",
+                              json={"model": "fake-decision", "state": "probe",
+                                    "questions": {"probe": {"type": "noul",
+                                                            "instructions": "probe"}}},
+                              timeout=10.0)
+        decision_elapsed = time.monotonic() - started
+        assert decision.status_code == 200, decision
+        assert decision_elapsed < 0.3, decision_elapsed
 
 
 def test_judge_decides_through_the_fake_slot(monkeypatch: pytest.MonkeyPatch) -> None:
