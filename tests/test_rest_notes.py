@@ -400,6 +400,45 @@ class TestFreshnessFilter:
         assert bad_search.status_code == 422
         assert "updated_after" in bad_search.json()["detail"]
 
+    def test_rest_list_inclusive_boundary(
+        self, client: TestClient, token: str, test_env: dict[str, str]
+    ) -> None:
+        """№29 (FR-2.6/FR-2.7): граница `updated_after` включающая и на REST.
+
+        Почему: REST — та же сервисная ручка, что у MCP, но приёмка гоняет её
+        отдельно; расхождение границ между поверхностями оператор увидит как
+        «на REST фильтр режет иначе». Проверяем обе стороны границы: заметка,
+        изменённая РОВНО в секунду границы, видна в `GET /notes`, а заведомо
+        более старая — нет (ни в `items`, ни в `total`).
+        """
+        on_boundary = self._create(
+            client, token, unique("Рест: ровно на границе"), "Рест-граница"
+        )
+        stale = self._create(
+            client, token, unique("Рест: заведомо старее границы"), "Рест-старее"
+        )
+        db = test_env["DB_PATH"]
+        boundary = "2001-01-01T00:00:00Z"
+        self._set_updated_at(db, on_boundary["id"], boundary)
+        self._set_updated_at(db, stale["id"], "2000-01-01T00:00:00Z")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        listed = client.get(
+            "/notes", params={"updated_after": boundary}, headers=headers
+        ).json()
+        ids = [item["id"] for item in listed["items"]]
+        assert on_boundary["id"] in ids
+        assert stale["id"] not in ids
+        assert listed["total"] == 1
+
+        # граница на секунду позже — и «свежая» стала заведомо старее: нет
+        later = client.get(
+            "/notes", params={"updated_after": "2001-01-01T00:00:01Z"},
+            headers=headers,
+        ).json()
+        assert later["items"] == []
+        assert later["total"] == 0
+
 
 class TestCommentSearchRest:
     """no24-02 (3.2.0): отдельный поиск пометок на REST — `GET /notes/comments`."""
