@@ -103,7 +103,9 @@ MODELS="${SLOT_FAKE_MODELS:-hf.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q6_K,ornith:
 # `provider_check_result slot=summary outcome=model_missing model=ornith:35b`
 # и `slot_probe result=model_missing`, работа висит в очереди, хотя заглушка
 # на прямой запрос отвечает корректно.
-PAUSE_SEC="${SLOT_FAKE_PAUSE_SEC:-60}"
+# Пауза слота в ветвях: на тест-контуре короче боевой (60 с) — приёмка ждёт
+# возврата слота, и 60-секундная пауза съедает минуты на каждой ветви.
+PAUSE_SEC="${SLOT_FAKE_PAUSE_SEC:-20}"
 MAX_ATTEMPTS="${SLOT_FAKE_MAX_ATTEMPTS:-3}"
 TIGHT_MODEL_TYPE="${SLOT_FAKE_SUMMARY_MODEL_TYPE:-reasoning}"
 TIGHT_NUM_PREDICT="${SLOT_FAKE_SUMMARY_NUM_PREDICT:-128}"
