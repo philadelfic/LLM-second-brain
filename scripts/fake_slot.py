@@ -63,6 +63,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -276,6 +277,15 @@ class FakeSlotHandler(BaseHTTPRequestHandler):
         if path == DECISION_PATH:
             return self._decision()
         if path in CHAT_PATHS:
+            # Быстрый профиль приёмки: ответ приходит с заданной задержкой. Мгновенные
+            # ответы делают проверки «работа видна в очереди, пока слот стоит»
+            # слепыми — работа успевает завершиться до опроса (прогон №9: шесть
+            # красных в сценариях 2/4/8). Задержка возвращает наблюдаемость, а
+            # прогон всё равно в разы быстрее живых моделей. Решение-слот (ниже)
+            # задержки НЕ получает: его проверки в скорости не нуждаются.
+            delay = getattr(self.server, "delay", 0.0)
+            if delay > 0:
+                time.sleep(delay)
             return self._chat(path)
         if path in EMBED_PATHS:
             return self._error(501, "fake slot: the embedding slot is not emulated")
@@ -374,11 +384,12 @@ class FakeSlotServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address: tuple[str, int], mode: str, models: tuple[str, ...],
-                 verbose: bool) -> None:
+                 verbose: bool, *, delay: float = 0.0) -> None:
         super().__init__(address, FakeSlotHandler)
         self.mode = mode
         self.models = models
         self.verbose = verbose
+        self.delay = delay
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -395,10 +406,15 @@ def main(argv: list[str] | None = None) -> int:
                              "(repeatable; default: the test contour's names)")
     parser.add_argument("--verbose", action="store_true",
                         help="log every request to stderr")
+    parser.add_argument("--delay", type=float, default=0.0,
+                        help="answer delay for chat routes, seconds "
+                             "(the fast acceptance profile keeps the queues "
+                             "observable; decision routes are not delayed)")
     args = parser.parse_args(argv)
 
     models = tuple(args.model) or DEFAULT_MODELS
-    server = FakeSlotServer((args.host, args.port), args.mode, models, args.verbose)
+    server = FakeSlotServer((args.host, args.port), args.mode, models, args.verbose,
+                            delay=args.delay)
     print(f"fake slot: mode={args.mode} on {args.host}:{args.port}, "
           f"models={', '.join(models)}", flush=True)
     try:
