@@ -74,6 +74,20 @@ def make_worker(settings, embedding, summarizer=None) -> BackgroundWorker:
     return BackgroundWorker(settings, embedding, summarizer)
 
 
+def _wait_until(fn, timeout: float = 5.0) -> bool:
+    """Поллинг наблюдаемого состояния (поле/счётчик), а не паузы наугад.
+
+    lsbdef-0009/0010: ожидание события воркера (интервал back-off, счётчик
+    очереди, запись в БД) — детерминированная замена гонке по времени.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if fn():
+            return True
+        time.sleep(0.05)
+    return False
+
+
 # --- партии ------------------------------------------------------------------
 
 
@@ -327,6 +341,19 @@ async def test_stop_terminates_idle_loop(fast) -> None:
 # --- жизненный цикл приложения ------------------------------------------
 
 
+@pytest.fixture
+def fast_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Страховочный интервал воркера 1 с — «часы» его стартового прогона.
+
+    lsbdef-0009: тесту нужен наблюдаемый признак «embedding-петля прошла
+    стартовый прогон» — это рост её интервала back-off. Фикстура объявлена в
+    тесте ПЕРЕД `client`: pytest ставит фикстуры в порядке параметров, поэтому
+    окружение применяется до сборки приложения (иначе интервал был бы 30 с).
+    """
+    monkeypatch.setenv("PENDING_RETRY_SEC", "1")
+    get_settings.cache_clear()
+
+
 def test_app_lifespan_starts_and_stops_worker(client, test_env) -> None:
     """create_app: воркер живёт в lifespan и корректно гасится (TestClient)."""
     response = client.get("/health")
@@ -334,9 +361,21 @@ def test_app_lifespan_starts_and_stops_worker(client, test_env) -> None:
     assert response.json()["embedding_ok"] is None  # попыток не было
 
 
-def test_save_makes_no_embedding_attempt(client, token) -> None:
+def test_save_makes_no_embedding_attempt(fast_backoff, client, token) -> None:
     """Фаза 8: save не кодирует синхронно — embedding_ok остаётся None
-    (попыток кодирования не было), заметка стоит в очереди pending_vector."""
+    (попыток кодирования не было), заметка стоит в очереди pending_vector.
+
+    lsbdef-0009: перед сохранением ждём наблюдаемое состояние воркера —
+    embedding-петля прошла стартовый прогон и ушла в ожидание (её страховочный
+    интервал вырос). Без этого ожидания запрос гонялся со стартовым прогоном:
+    подхваченная им заметка давала реальную (неуспешную) попытку кодирования,
+    и /health отдавал embedding_ok=false — ложный красный полного прогона.
+    """
+    worker = client.app.state.worker
+    start_interval = float(get_settings().pending_retry_sec)
+    assert _wait_until(lambda: worker.interval > start_interval), (
+        "embedding-петля не ушла в ожидание — стартовый прогон не завершён"
+    )
     client.post(
         "/notes",
         # Фаза 11, follow-up 5b: REST strict — POST без title → 422;
@@ -597,7 +636,14 @@ async def test_backoff_independent_per_queue(slow) -> None:
             status = conn.execute(
                 "SELECT summary_status FROM notes WHERE id = 1"
             ).fetchone()[0]
-        if status == "ok":
+        # lsbdef-0010: успех виден по наблюдаемому состоянию — запись 'ok' в БД
+        # И сброшенный интервал своей очереди. Петля сбрасывает интервал уже
+        # ПОСЛЕ коммита записи (и может не успеть до task.cancel() — тогда
+        # мгновенный assert читал промежуточное состояние: под нагрузкой
+        # полного прогона 2.0 != 1.0).
+        if status == "ok" and worker.summary_interval == float(
+            slow.pending_retry_sec
+        ):
             break
         await asyncio.sleep(0.05)
     worker.stop()
