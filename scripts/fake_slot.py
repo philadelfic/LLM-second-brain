@@ -122,6 +122,50 @@ def _probability_of(mode: str, kind: str) -> float:
     return 0.9
 
 
+def _question_items(questions: Any) -> list[tuple[str, dict[str, Any]]] | None:
+    """Вопросы запроса `/v1/systemone` → [(имя, вопрос)]; None — контракт нарушен.
+
+    Фактический контракт сервера (ollama ≥ 0.35.1; сверено живым запросом
+    2026-10-10 и закреплено в `llm_client._systemone_payload`): `questions` —
+    ОБЪЕКТ «имя вопроса → вопрос», у вопроса `type` (`choice`/`noul`/`score`)
+    и `instructions`, а варианты `choice` — ключи `criteria`. Список вопросов
+    с полем `name` (форма пилота LSBN-T-13) принимается тоже: заглушка не
+    диктует контракт приложению, но и не молчит про чужую форму.
+
+    Ловушка, из-за которой ветви decision в приёмке 12.10.2026 читались ложной
+    краснотой: заглушка знала ТОЛЬКО список и отвечала 422 на объект;
+    `check_decision()` читает 422 как «модель не умеет decision» → слот
+    погашен (`/health.decision` = enabled=true, ok=false, answers=0) и ни один
+    вызов решения не делается.
+    """
+    items: list[tuple[str, dict[str, Any]]] = []
+    if isinstance(questions, dict):
+        for name, question in questions.items():
+            if isinstance(name, str) and name and isinstance(question, dict):
+                items.append((name, question))
+    elif isinstance(questions, list):
+        for question in questions:
+            if not isinstance(question, dict):
+                continue
+            name = question.get("name")
+            if isinstance(name, str) and name:
+                items.append((name, question))
+    else:
+        return None
+    return items or None
+
+
+def _question_labels(question: dict[str, Any]) -> list[str]:
+    """Варианты `choice`-вопроса: ключи `criteria` (контракт) либо `labels` (пилот)."""
+    criteria = question.get("criteria")
+    if isinstance(criteria, dict):
+        return [str(label) for label in criteria]
+    labels = question.get("labels")
+    if isinstance(labels, (list, tuple)):
+        return [str(label) for label in labels]
+    return []
+
+
 def _chat_answer(mode: str, prompt: str) -> tuple[str, str]:
     """(content, finish_reason) ответа chat-маршрута для режима и промпта."""
     if mode == "empty-length":
@@ -293,20 +337,13 @@ class FakeSlotHandler(BaseHTTPRequestHandler):
         payload = self._read_body()
         if payload is None:
             return self._error(400, "fake slot: the body is not a JSON object")
-        questions = payload.get("questions")
-        if not isinstance(questions, list) or not questions:
+        items = _question_items(payload.get("questions"))
+        if items is None:
             return self._error(422, "fake slot: the request carries no questions")
         answers: dict[str, DecisionAnswer] = {}
-        for question in questions:
-            if not isinstance(question, dict):
-                continue
-            name = question.get("name")
-            if not isinstance(name, str) or not name:
-                continue
+        for name, question in items:
             kind = str(question.get("type") or "noul")
-            answers[name] = self._decision_answer(kind, question.get("labels"))
-        if not answers:
-            return self._error(422, "fake slot: the questions carry no names")
+            answers[name] = self._decision_answer(kind, _question_labels(question))
         return self._send(200, {
             "model": payload.get("model"),
             "state": payload.get("state"),

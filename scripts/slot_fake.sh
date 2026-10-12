@@ -31,6 +31,11 @@
 #   decision-unsupported     step 2 — /v1/systemone answers 404 (the generative
 #                            path takes over, reason=unsupported);
 #   decision-off             step 3 — DECISION_ENABLED=false + DECISION_FALLBACK=false
+#   decision-unavailable     step 3 ветви приёмки: слот ВКЛЮЧЁН, но модель
+#                            недоступна (адрес — закрытый порт) + DECISION_FALLBACK=false:
+#                            задание ждёт (№39). Отдельный режим нужен потому, что
+#                            выключенный слот даёт другую причину (`unsupported`)
+#                            и до ожидания дело не доходит.
 #                            (the fake is not used; the job waits by contract №39);
 #   decision-low-confidence  step 4 — the probability lands in the uncertainty band.
 #
@@ -87,6 +92,10 @@ APP_PORT="${SLOT_FAKE_APP_PORT:-8080}"
 FAKE_HOST="${SLOT_FAKE_HOST:-lsb-fake}"
 FAKE_PORT="${SLOT_FAKE_PORT:-8080}"
 FAKE_URL="http://${FAKE_HOST}:${FAKE_PORT}"
+# Заведомо закрытый порт: нужен ветви «слот включён, но модель недоступна»
+# (причина `unavailable` в decision-слоте) — отключённый слот даёт другую
+# причину (`unsupported`), и задание под `DECISION_FALLBACK=false` не ждёт.
+DEAD_URL="${SLOT_FAKE_DEAD_URL:-http://127.0.0.1:9}"
 MODELS="${SLOT_FAKE_MODELS:-hf.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q6_K,fake-decision}"
 PAUSE_SEC="${SLOT_FAKE_PAUSE_SEC:-60}"
 MAX_ATTEMPTS="${SLOT_FAKE_MAX_ATTEMPTS:-3}"
@@ -98,7 +107,7 @@ DECISION_ZONE="${SLOT_FAKE_DECISION_ZONE:-0.05}"
 WAIT_SEC="${SLOT_FAKE_WAIT_SEC:-180}"
 
 SLOT_MODES=(ok auth empty-length offcontract)
-DECISION_MODES=(decision-ok decision-unsupported decision-low-confidence decision-off)
+DECISION_MODES=(decision-ok decision-unsupported decision-low-confidence decision-off decision-unavailable)
 
 # Шапка-usage — сам этот файл (заголовочный комментарий до первой строки кода).
 usage() {
@@ -136,7 +145,7 @@ done
 if [[ -z "$ACTION" && -n "$MODE" ]]; then
     case "$MODE" in
         ok|auth|empty-length|offcontract|decision-ok|decision-unsupported|\
-        decision-low-confidence|decision-off) ACTION="on" ;;
+        decision-low-confidence|decision-off|decision-unavailable) ACTION="on" ;;
     esac
 fi
 
@@ -366,6 +375,14 @@ if [[ "$ACTION" == "on" ]]; then
         if [[ "$MODE" == "decision-off" ]]; then
             ENV["DECISION_ENABLED"]="false"
             ENV["DECISION_FALLBACK"]="false"
+        elif [[ "$MODE" == "decision-unavailable" ]]; then
+            # Слот ВКЛЮЧЁН, но модель недоступна: адрес — закрытый порт. Шаг 3
+            # ветви приёмки: при `DECISION_FALLBACK=false` задание ждёт
+            # (контракт №39), а не уезжает на генеративный путь.
+            ENV["DECISION_ENABLED"]="true"
+            ENV["DECISION_FALLBACK"]="false"
+            ENV["DECISION_BASE_URL"]="$DEAD_URL"
+            ENV["DECISION_MODEL"]="${DECISION_MODEL}-unavailable"
         else
             ENV["DECISION_ENABLED"]="true"
             ENV["DECISION_BASE_URL"]="$FAKE_URL"
@@ -391,6 +408,7 @@ fake_mode_of() {
     case "$1" in
         auth) printf 'ok' ;;
         decision-off) printf 'ok' ;;
+        decision-unavailable) printf 'ok' ;;
         *) printf '%s' "$1" ;;
     esac
 }
