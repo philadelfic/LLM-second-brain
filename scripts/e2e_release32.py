@@ -157,6 +157,10 @@ SKIPS: list[str] = []
 MANUALS: list[str] = []
 SCENARIO: dict[str, Any] = {}
 REPORT: list[dict[str, Any]] = []
+# Сценарии прогона дошли до конца. Попытка, дошедшая сюда, состоялась: разрыв
+# транспорта на ЗАКРЫТИИ (чужой `cancel scope`) не обнуляет её и не запускает
+# повтор — иначе живые 20–40 минут прогона тратились бы трижды (12.10.2026).
+RUN_FINISHED = False
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
@@ -235,6 +239,25 @@ def note_detail(result: dict) -> str:
     return f"id=None, reason={reason}" if reason else "id=None (the tool gave no hint)"
 
 
+async def run_scenario(n: int, title: str,
+                       body: Callable[[], Awaitable[None]]) -> None:
+    """Один сценарий в обёртке: его падение не отменяет остальные (8–13).
+
+    До 12.10.2026 исключение сценария 8/9 обрывало прогон целиком: сценарии
+    10–13 и блок f11-03 `ACCEPTANCE.md` не выполнялись НИКОГДА. Отчёт пишется
+    независимо от исхода сценариев наблюдаемости, поэтому здесь — изоляция
+    (`warn` и продолжение), а не молчание: причина остаётся в отчёте.
+    """
+    try:
+        await body()
+    except Exception as exc:  # noqa: BLE001 — изолируем сценарий, не глотаем причину
+        if SCENARIO.get("n") != n:
+            scenario(n, title)  # сценарий упал до своего заголовка
+        warn("the scenario broke before its own checks", describe(exc))
+    finally:
+        close_scenario()
+
+
 def scenario(n: int, title: str) -> None:
     global SCENARIO
     close_scenario()
@@ -254,11 +277,12 @@ def close_scenario() -> None:
 def reset_counters() -> None:
     """Reset before a retry (a broken session must not zero the run)."""
     global PASS, FAIL, SKIP, WARN, FAILURES, WARNINGS, SKIPS, MANUALS, SCENARIO, REPORT
-    global WAITS, TEARDOWN
+    global WAITS, TEARDOWN, RUN_FINISHED
     PASS = FAIL = SKIP = WARN = 0
     FAILURES, WARNINGS, SKIPS, MANUALS = [], [], [], []
     SCENARIO, REPORT = {}, []
     WAITS, TEARDOWN = [], []
+    RUN_FINISHED = False
 
 
 def mask(token: str) -> str:
@@ -274,14 +298,36 @@ def describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def is_closing_cancel_scope(exc: BaseException) -> bool:
+    """Падение ЗАКРЫТИЯ MCP-сессии из-за чужого cancel scope — не дефект продукта.
+
+    anyio/asyncio бросает `RuntimeError: Attempted to exit a cancel scope ...`
+    (текст бывает и про другую задачу: `... in a different task than it was
+    entered in`), а `ExceptionGroup` несёт его первым корнем. Живой прогон
+    12.10.2026: это падение обрывало прогон на выходе — сценарии 10–13 и блок
+    f11-03 не выполнялись никогда, «Total:» не печатался. Такой разрыв считаем
+    наблюдением закрытия, а не ошибкой прогона.
+    """
+    if isinstance(exc, BaseExceptionGroup):
+        return any(is_closing_cancel_scope(inner) for inner in exc.exceptions)
+    if isinstance(exc, RuntimeError):
+        text = str(exc).lower()
+        return "cancel scope" in text or "different task" in text
+    return False
+
+
 def is_transport_break(exc: BaseException) -> bool:
     """Разрыв транспорта MCP, а не доменная ошибка продукта.
 
     Живой прогон 10.10.2026: разрыв приходит и как `ExceptionGroup: unhandled
     errors in a TaskGroup (1 sub-exception)` (anyio), поэтому группу разбираем
     рекурсивно — «транспортной» она считается, только если внутри транспорт.
+    Сюда же — разрыв закрытия сессии (чужой `cancel scope`): для вызывающего это
+    тот же обрыв транспорта, но не доменный отказ продукта.
     """
     if isinstance(exc, MCPError):
+        return True
+    if is_closing_cancel_scope(exc):
         return True
     if isinstance(exc, BaseExceptionGroup):
         return any(is_transport_break(inner) for inner in exc.exceptions)
@@ -363,32 +409,68 @@ class Client:
     def __init__(self, session: ClientSession, stack: AsyncExitStack | None = None):
         self.session = session
         self._stack = stack
+        # Сессии, открытые ПОСЛЕ рестарта контура (`reconnect`): их стеки живут до
+        # конца процесса и закрываются в `close()` — самая свежая первой.
+        self._keepalive: list[AsyncExitStack] = []
 
     async def call(self, tool: str, args: dict) -> dict:
         return extract(await self.session.call_tool(tool, args))
 
-    async def close(self) -> None:
-        """Close the session and its transport: idempotent, never fatal."""
-        stack, self._stack = self._stack, None
-        if stack is None:
-            return
-        try:
-            await stack.aclose()
-        except Exception as exc:  # noqa: BLE001 — closing is not a subject of checks
-            info(f"closing the MCP session: {describe(exc)}")
+    async def close(self, *, quiet: bool = False) -> None:
+        """Close every live session stack, newest first: idempotent, never fatal.
+
+        Порядок — обратный порядку открытия: `cancel scope` свежей сессии вложен
+        глубже всех, а выход из старого scope раньше нового и есть тот
+        `RuntimeError` про cancel scope, которым обрывался прогон (12.10.2026,
+        воспроизведено точечным прогоном). Разрыв закрытия — наблюдение
+        (`info` + одна строка teardown), не ошибка: сессия контура к этому
+        моменту уже не нужна.
+        """
+        stacks = [*self._keepalive[::-1], self._stack]
+        self._keepalive, self._stack = [], None
+        closed = 0
+        for stack in stacks:
+            if stack is None:
+                continue
+            closed += 1
+            try:
+                await stack.aclose()
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:  # noqa: BLE001 — закрытие не предмет проверок
+                note = (" (a cancel-scope break on the way out)"
+                        if is_closing_cancel_scope(exc) else "")
+                info(f"closing the MCP session: {describe(exc)}")
+                teardown_note(f"closing the MCP session raised {describe(exc)}{note}")
+        if closed and not quiet:
+            # След корректного закрытия в журнале прогона и в trace (те же задачи,
+            # что и у открытия: закрываем в своей задаче, до выхода из AsyncExitStack).
+            info("the MCP session is closed")
+            teardown_note("the MCP session is closed")
 
     async def reconnect(self) -> Any:
         """Re-open the MCP session after a contour restart (the old socket is dead).
 
         Сценарий 5 по своей сути перезапускает контейнер контура — сессия раннера
         при этом рвётся, и без переоткрытия весь прогон уходит в повторы попыток
-        и завершается FATAL, хотя продукт жив (проверено 10.10.2026). Новую сессию
-        держим в своём стеке на этом же клиенте: старый сокет уже закрыт контуром,
-        его половину закроет общий стек прогона при выходе.
+        и завершается FATAL, хотя продукт жив (проверено 10.10.2026).
+
+        Старую сессию закрываем ЗДЕСЬ, в этой же задаче и до открытия новой: её
+        сокет уже мёртв, а живой `AsyncExitStack` старой сессии, оставленный до
+        конца прогона, вкладывал cancel-scope'ы не по LIFO — закрытие на выходе
+        падало `RuntimeError: Attempted to exit cancel scope ...`, отменённый
+        scope «травил» задачу прогона, и сценарии 10–13 не выполнялись вовсе
+        (живой прогон 12.10.2026; воспроизведено точечными прогонами). Новую
+        сессию держим в `_keepalive` и закрываем в `close()`.
         """
+        await self.close(quiet=True)
         fresh, init = await fresh_session(AsyncExitStack(), own_stack=True)
-        self._keepalive = getattr(self, "_keepalive", [])
-        self._keepalive.append(fresh)  # стек новой сессии живёт до конца процесса
+        # В `_keepalive` кладём СТЕК сессии, а не сам `Client`: иначе стек некому
+        # закрыть, его асинхронный генератор доживает до сборки мусора — и та
+        # закрывает его в ЧУЖОЙ задаче (`Attempted to exit cancel scope in a
+        # different task...`), отменяя попытку прогона (живой прогон 12.10.2026:
+        # обрыв в сценарии 5, до сценариев 10–13 дело не дошло).
+        self._keepalive.append(fresh._stack)  # стек новой сессии живёт до close()
         self.session = fresh.session
         return init
 
@@ -551,6 +633,91 @@ def queue_drained(rest: httpx2.AsyncClient,
                      f"waiting={stat.get('waiting')}"
 
     return predicate
+
+
+def queue_waiting(rest: httpx2.AsyncClient, queue: str, *,
+                 min_waiting: int = 1) -> Callable[[], Awaitable[tuple[bool, str]]]:
+    """Predicate: работа ОТЛОЖЕНА причиной — видна в `waiting`, а не в `attention`.
+
+    Фаза открытого разрыва слота (№39 arch §6.9, no39-04): петля партию не
+    берёт, вся текущая работа уезжает из `pending` в `waiting`; `attention`
+    («требует человека») — подмножество `waiting` и появляется только после
+    `SLOT_MAX_ATTEMPTS` нетранзиентных отказов ПАРЫ. Ждать `attention` в этой
+    фазе — ложная краснота (живой прогон 12.10.2026: сценарий 8 краснел
+    «безнадёжная пара waits for a human»).
+    """
+
+    async def predicate() -> tuple[bool, str]:
+        snapshot = await health_snapshot(rest)
+        stat = queue_stat(snapshot, queue)
+        if stat is None:
+            return False, f"queue {queue} is not reported by /health"
+        pending = stat.get("pending") or 0
+        waiting = stat.get("waiting") or 0
+        attention = stat.get("attention") or 0
+        return bool(waiting >= min_waiting and pending == 0), (
+            f"queue {queue}: pending={pending}, waiting={waiting}, "
+            f"attention={attention}, oldest={stat.get('oldest_pending_sec')}"
+        )
+
+    return predicate
+
+
+def queue_deferred(rest: httpx2.AsyncClient, queue: str, *,
+                   min_work: int = 1) -> Callable[[], Awaitable[tuple[bool, str]]]:
+    """Predicate: пара ПЕРЕСТАЛА ЖЕЧЬ ВЫЗОВЫ — работа отложена причиной.
+
+    `waiting + attention >= min_work` и `pending == 0`: работа либо отложена
+    слотом, либо уже замерла в «требует человека» — в обоих случаях вызовы
+    модели не жгутся (FR-2.3/FR-5.1, no39-04). Жёсткое ожидание `attention`
+    вместо этого — предпосылка ветви, а не её факт.
+    """
+
+    async def predicate() -> tuple[bool, str]:
+        snapshot = await health_snapshot(rest)
+        stat = queue_stat(snapshot, queue)
+        if stat is None:
+            return False, f"queue {queue} is not reported by /health"
+        pending = stat.get("pending") or 0
+        waiting = stat.get("waiting") or 0
+        attention = stat.get("attention") or 0
+        return bool((waiting + attention) >= min_work and pending == 0), (
+            f"queue {queue}: pending={pending}, waiting={waiting}, "
+            f"attention={attention}, oldest={stat.get('oldest_pending_sec')}"
+        )
+
+    return predicate
+
+
+async def attention_jobs(rest: httpx2.AsyncClient) -> list[dict] | None:
+    """Задания, ждущие человека (`GET /jobs/attention`); None — ручка не ответила."""
+    try:
+        answer = await rest.get("/jobs/attention")
+    except Exception:  # noqa: BLE001 — транзиентная ошибка REST не ответ
+        return None
+    if answer.status_code != 200:
+        return None
+    return (answer.json() or {}).get("jobs") or []
+
+
+async def check_attention_threshold(rest: httpx2.AsyncClient, prefix: str) -> None:
+    """Проверка достижимости порога: `attention` — только после серии отказов (no39-04).
+
+    «Пауза — на слот, счёт — на пару»: в `attention` задание попадает, исчерпав
+    `SLOT_MAX_ATTEMPTS` НЕТРАНЗИЕНТНЫХ отказов пары, а не на первом же. Предел
+    в ветви заглушки ниже кодового (`scripts/slot_fake.sh` опускает его для
+    быстрой приёмки), поэтому сверяем факт задания (серия отказов), а не число из
+    env контура: сцену красным не делает ни один вариант окружения.
+    """
+    jobs = await attention_jobs(rest)
+    if jobs is None:
+        skip(f"{prefix} the attempt counter of the job in `attention`",
+             "GET /jobs/attention did not answer")
+        return
+    attempts = [int(job.get("attempts") or 0) for job in jobs]
+    check(f"{prefix} the human is asked only after a series of pair refusals, "
+          f"not on the first one (no39-04: `attention` после SLOT_MAX_ATTEMPTS)",
+          bool(attempts) and min(attempts) >= 2, f"attempts={attempts}")
 
 
 def slot_paused(rest: httpx2.AsyncClient, slot: str, outcome: str | None = None,
@@ -744,7 +911,29 @@ def acceptance_path() -> Path:
     return Path(CFG["repo_dir"]) / "release" / RELEASE / "ACCEPTANCE.md"
 
 
-def write_acceptance_block(block: str, lines: list[str]) -> str:
+def block_markers(text: str, start: str, end: str) -> tuple[int, int]:
+    """Границы блока по МАРКЕРАМ-СТРОКАМ: `(index начала, index конца)` или `(-1, -1)`.
+
+    Маркеры ищем целыми строками (`(?m)^…$`), а не подстроками: тело блока
+    `f12-03` само содержало слово-в-слово `<!-- f12-03:end -->`, поиск по подстроке
+    находил его раньше настоящего конца — и каждый прогон дописывал лишнюю
+    строку-маркер (живой дефект 12.10.2026: три дубля в `ACCEPTANCE.md`).
+    """
+    start_match = re.search(rf"(?m)^{re.escape(start)}$", text)
+    if start_match is None:
+        return -1, -1
+    # `re.search` не знает `pos=`: ищем конец в хвосте после начала и складываем смещения.
+    end_match = re.search(rf"(?m)^{re.escape(end)}$", text[start_match.end():])
+    if end_match is None:
+        return -1, -1
+    return start_match.start(), start_match.end() + end_match.end()
+
+
+MARKER_WORDS = {"f12-03": "HTML-маркеры блока — комментарии `f12-03:start` и `f12-03:end`"}
+
+
+def write_acceptance_block(block: str, lines: list[str], *,
+                           path: Path | None = None) -> str:
     """Write/replace the block of ONE postановка in `ACCEPTANCE.md` (idempotent).
 
     The block is fenced with HTML markers `<!-- <block>:start -->` /
@@ -752,21 +941,93 @@ def write_acceptance_block(block: str, lines: list[str]) -> str:
     instead of appending a second copy, so the second run of the E2E leaves the
     report byte-identical (идемпотентность прогона). The numbers live outside the
     code: the file is the evidence, the script only fills it.
+
+    Две защыты идемпотентности: (1) маркеры сверяются как ЦЕЛЫЕ СТРОКИ — тело
+    блока не может «прикинуться» концом (`block_markers`); (2) перед записью
+    проверяем, что маркеров в файле ровно два и блок не вырос по строкам: при
+    расхождении — `warn`, файл не трогаем (лучше старый отчёт, чем испорченный).
+    Тело блока обязано быть без дословных маркеров (`MARKER_WORDS` — словами).
     """
-    path = acceptance_path()
+    target = path or acceptance_path()
     start, end = f"<!-- {block}:start -->", f"<!-- {block}:end -->"
     section = "\n".join([start, *lines, end])
-    text = path.read_text(encoding="utf-8") if path.exists() else ""
-    if start in text and end in text:
-        head, rest = text.split(start, 1)
-        tail = rest.split(end, 1)[1]
-        text = head + section + tail
+    text = target.read_text(encoding="utf-8") if target.exists() else ""
+    body_words = "\n".join(lines)
+    if start in body_words or end in body_words:
+        hint = MARKER_WORDS.get(block, "write the markers as words")
+        warn(f"the body of the acceptance block {block} carries the literal markers",
+             f"{hint} — the file is left untouched")
+        return str(target)
+    head, tail = block_markers(text, start, end)
+    if head >= 0:
+        previous = text[head:tail].count("\n") + 1
+        updated = text[:head] + section + text[tail:]
     else:
-        head = text.rstrip() + "\n\n" if text.strip() else ""
-        text = head + section + "\n"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-    return str(path)
+        previous = 0
+        base = text.rstrip() + "\n\n" if text.strip() else ""
+        updated = base + section + "\n"
+    markers = updated.count(start) + updated.count(end)
+    grown = updated[head:head + len(section)].count("\n") + 1 if head >= 0 else 0
+    if markers != 2 or (head >= 0 and grown > previous):
+        warn(f"the acceptance block {block} was not written: it is not idempotent",
+             f"markers={markers} (2 expected), lines {previous} -> {grown}")
+        return str(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(updated, encoding="utf-8")
+    return str(target)
+
+
+def self_test_acceptance() -> int:
+    """Идемпотентность блока отчёта без контура (гейт этапа 6).
+
+    Пишем блок `f12-03` ДВАЖДЫ во временный файл и сверяем содержимое побайтово:
+    повтор обязан ЗАМЕНИТЬ блок, а не дописать его. Ловит и поиск маркеров
+    подстрокой (дефект 12.10.2026 — три дубля в `ACCEPTANCE.md`), и дословные
+    маркеры в теле блока, и соседние блоки (не должны расти от чужой записи).
+    Числа берём из пустого набора: проверяется идемпотентность, а не они.
+    """
+    print("=== self-test: the acceptance block of one постановка is idempotent "
+          "(the contour is not needed)")
+    failures: list[str] = []
+    # Самопроверке контур не нужен: подставляем минимальный контекст отчёта
+    # (иначе шапка блока читает `CFG['base_url']` и `RUN['tag']`).
+    CFG.setdefault("base_url", "http://lsb-test:8080 (self-test)")
+    RUN.setdefault("tag", "e2e32-self-test")
+    lines = _decision_acceptance_lines({})
+    with tempfile.TemporaryDirectory(prefix="e2e-acceptance-") as out_dir:
+        path = Path(out_dir) / "ACCEPTANCE.md"
+        write_acceptance_block("f12-03", lines, path=path)
+        once = path.read_text(encoding="utf-8")
+        write_acceptance_block("f12-03", lines, path=path)
+        twice = path.read_text(encoding="utf-8")
+        if once != twice:
+            failures.append("the second write changed the file: the block is not idempotent")
+        # Соседние блоки: запись f12-03 их не трогает и сама остаётся одна.
+        write_acceptance_block("lsbdef0008-02", ["### блок дефекта", "", "числа"], path=path)
+        write_acceptance_block("f11-03", ["### блок вшитого текста", "", "числа"], path=path)
+        write_acceptance_block("f12-03", lines, path=path)
+        again = path.read_text(encoding="utf-8")
+        if again.count("<!-- f12-03:start -->") != 1 or again.count("<!-- f12-03:end -->") != 1:
+            failures.append(
+                "the markers of the block occur "
+                f"{again.count('<!-- f12-03:start -->')}×start / "
+                f"{again.count('<!-- f12-03:end -->')}×end, not once each"
+            )
+        if "<!-- f12-03:start -->" in "\n".join(lines) \
+                or "<!-- f12-03:end -->" in "\n".join(lines):
+            failures.append("the body of the block carries the literal markers")
+        blocks = ["lsbdef0008-02", "f12-03", "f11-03"]
+        for block in blocks:
+            if again.count(f"<!-- {block}:start -->") != 1:
+                failures.append(f"the block {block} is not exactly one block")
+    if failures:
+        print("[FAIL] the acceptance block is not idempotent:")
+        for item in failures:
+            print(f"  - {item}")
+        return 1
+    print("[PASS] the second write is byte-identical, the block markers are exactly "
+          "two, the neighbouring blocks are untouched")
+    return 0
 
 
 # ==== probe data: marking, leftovers, teardown =================================
@@ -873,6 +1134,26 @@ async def _await_contour_ready(rest: httpx2.AsyncClient) -> None:
                      timeout=min(CFG["wait_sec"], 120.0))
 
 
+async def resume_after_hooks(c: Client, rest: httpx2.AsyncClient, where: str) -> None:
+    """Живая MCP-сессия сценария после хука контура (пересоздание рвёт сокет).
+
+    Ветви 3/4/8/9 пересоздают контейнер контура, а вместе с ним умирает и сокет
+    раннера: первая же ручка следующего сценария падала бы разрывом транспорта.
+    Сценарии 10–13 из-за этого не выполнялись НИКОГДА (живой прогон 12.10.2026).
+    Дешёвая проверка + одно переоткрытие сессии; живую сессию не трогаем.
+    """
+    try:
+        await c.call("memory_list", {"limit": 1, "detail": "titles"})
+        return
+    except Exception as exc:  # noqa: BLE001 — разрыв решаем по типу, не глотаем
+        if not is_transport_break(exc):
+            raise
+        info(f"{where}: the MCP session does not answer after a contour hook "
+             f"({describe(exc)}) — re-opening it")
+        await _await_contour_ready(rest)
+        await c.reconnect()
+
+
 async def _save_probe_once(c: Client, args: dict, *,
                            reconnect: bool = False) -> tuple[int | None, str]:
     """One `memory_save` of a probe note → `(id, detail)`; не глотает доменную ошибку.
@@ -963,21 +1244,41 @@ def near_duplicate_texts(tag: str) -> tuple[str, str]:
 
 
 async def save_near_duplicate_pair(c: Client, title_first: str,
-                                   title_second: str) -> list[int | None]:
-    """Сохранить пару-«почти-дубль» → [id первого, id второго] (None — не создалась).
+                                   title_second: str,
+                                   ) -> tuple[list[int | None], bool]:
+    """Сохранить пару-«почти-дубль» → `([id первого, id второго], vector_ready)`.
 
     Пара нужна ветвям, которым нужен вердикт судьи: без кандидата (cosine ≥
     0.80) судья не спрашивается, очередь judge пуста и проверки читаются
     ложной краснотой.
+
+    Кандидат ищется по ВЕКТОРУ первой заметки: пока её вектор не готов
+    (`vector_status='ok'`), соседа не находит никто, и второй заметке не с чем
+    образовать пару (проверено живьём 12.10.2026 — судья не получал пары вовсе).
+    Поэтому после первой заметки ждём её вектор и только потом сохраняем вторую.
+    `vector_ready` (готовность вектора первой заметки) отдаём наружу: вызывающий
+    отличает «пары нет» от «пара есть, но вектор не дождались» и оставляет
+    честный `skip`/`manual` вместо ложного FAIL. Нового доступа к БД не заводим:
+    используется тот же `probe_vectors_ready` (`db_count` по `vector_status='ok'`).
     """
     first, second = near_duplicate_texts(RUN["tag"])
     ids: list[int | None] = []
+    vector_ready = False
     for title, text in ((title_first, first), (title_second, second)):
         note_id, _detail = await save_probe_note_result(
             c, title, text=text, after_hook=True
         )
         ids.append(note_id)
-    return ids
+        if len(ids) == 1 and note_id is not None:
+            vector_ready, detail = await wait_until(
+                probe_vectors_ready([note_id]),
+                "the first note of the pair got its vector (the candidate is "
+                "searched by it)",
+                timeout=min(CFG["wait_sec"], 180.0))
+            if not vector_ready:
+                warn("the first note of the pair has no vector yet",
+                     f"id={note_id}, {detail} — the judge may get no pair")
+    return ids, vector_ready
 
 
 async def save_probe_note(c: Client, title: str, *, after_hook: bool = False,
@@ -1329,7 +1630,7 @@ async def scenario_2_models_outage(c: Client, rest: httpx2.AsyncClient) -> None:
 
 
 # ==== scenarios: 3. auth branch (401) ==========================================
-async def scenario_3_auth_branch(rest: httpx2.AsyncClient) -> None:
+async def scenario_3_auth_branch(c: Client, rest: httpx2.AsyncClient) -> None:
     scenario(3, "Access-failure branch: the slot answers 401 → pause, probe, resume")
     if not (CFG["slot_auth_cmd"] and CFG["slot_auth_fix_cmd"]):
         skip("the access-failure branch (fake provider returns 401)",
@@ -1349,6 +1650,13 @@ async def scenario_3_auth_branch(rest: httpx2.AsyncClient) -> None:
 
     slot = CFG["auth_slot"]
     queue = SLOT_QUEUE[slot]
+    # Своя работа в очереди: фаза открытого разрыва проверяется по факту «работа
+    # ЖДЁТ паузу», а пустая очередь не проверяет ничего. Вектор заметки успевает
+    # посчитаться здоровым embedding-слотом ещё до перевода фейка на 401, а выжимка
+    # ждёт закрытия разрыва — ровно то, что и проверяет ветвь.
+    if await save_probe_note(c, RUN["note_auth"], after_hook=True) is None:
+        info(f"[auth] the probe note of the branch is not created — the queue "
+             f"{queue} may stay empty")
     proc = await run_shell(slot_cmd(CFG["slot_auth_cmd"], slot))
     check(f"the fake provider is switched to 401 for {slot}", proc.returncode == 0,
           f"rc={proc.returncode}")
@@ -1370,6 +1678,21 @@ async def scenario_3_auth_branch(rest: httpx2.AsyncClient) -> None:
                                       f"[auth] /health.slots.{slot} shows auth + pause")
         check(f"[auth] /health.slots.{slot}.last_outcome='auth', paused_until set",
               ok, detail)
+        stat = slot_stat(await health_snapshot(rest), slot) or {}
+        check(f"[auth] /health.slots.{slot}.paused_until is filled by the break",
+              stat.get("paused_until") is not None, f"{stat}")
+
+        # Фаза открытого разрыва (arch §6.9, no39-04): петля партию не берёт, и вся
+        # текущая работа уезжает из `pending` в `waiting` — это и есть факт «работа
+        # ждёт паузу»; `attention` здесь нулевой, человека зовут только после
+        # SLOT_MAX_ATTEMPTS нетранзиентных отказов ПАРЫ, а 401 — исход транзиентный.
+        ok, detail = await wait_until(
+            queue_waiting(rest, queue),
+            f"[auth] the work deferred by the break is visible in `waiting` ({queue}), "
+            f"not in `attention`",
+            timeout=min(CFG["wait_sec"], 180.0))
+        check(f"[auth] in the phase of the open break the queue {queue} shows the work "
+              f"in `waiting` (`attention == 0`)", ok, detail)
 
         proc = await run_shell(slot_cmd(CFG["slot_auth_fix_cmd"], slot))
         fixed = True
@@ -1395,10 +1718,13 @@ async def scenario_3_auth_branch(rest: httpx2.AsyncClient) -> None:
     ok, detail = await wait_until(queue_drained(rest, queue),
                                   f"[auth] the queue {queue} drains after the fix")
     check("[auth] the deferred work is done after the access is restored", ok, detail)
+    stat = queue_stat(await health_snapshot(rest), queue) or {}
+    check(f"[auth] after the fix nothing is left in `waiting` ({queue})",
+          (stat.get("waiting") or 0) == 0, f"{stat}")
 
 
 # ==== scenarios: 4. attention pair (repeated off_contract) =====================
-async def scenario_4_attention_pair(rest: httpx2.AsyncClient) -> None:
+async def scenario_4_attention_pair(c: Client, rest: httpx2.AsyncClient) -> None:
     scenario(4, "Attention: a repeated off_contract answer stops retrying and waits "
                 "for a human, then is released")
     if not (CFG["offcontract_cmd"] and CFG["offcontract_fix_cmd"]):
@@ -1420,6 +1746,25 @@ async def scenario_4_attention_pair(rest: httpx2.AsyncClient) -> None:
                "fake — the outage of scenarios 2/5 would then stop being visible")
         return
 
+    # Своя работа ДЛЯ СУДЬИ: без пары-«почти-дубль» очередь judge пуста, и ветвь
+    # читалась ложной краснотой (12.10.2026 — «работа для судьи не создаётся»).
+    # Пару сохраняем ДО переключения фейка: вердикт судьи ставит фоновая рука дедупа,
+    # она приходит после вектора и выжимки обеих заметок — то есть уже при открытом
+    # разрыве (хелпер дожидается вектора первой заметки, иначе кандидата не найти).
+    pair_ids, vector_ready = await save_near_duplicate_pair(
+        c, RUN["note_attention_pair"], RUN["note_attention_pair_2"])
+    probes = len([item for item in pair_ids if item is not None])
+    if probes < 2 or not vector_ready:
+        skip("the repeated-off_contract branch (the judge has no pair)",
+             f"the pair of notes is not usable: ids={pair_ids}, "
+             f"first vector ready={vector_ready}")
+        manual("scenario 4 (№39 FR-3.4, no39-02)",
+               "the pair of nearly duplicate notes must be created and the vector of "
+               "its first note must be ready: without a candidate (cosine >= 0.80) "
+               "the judge is never asked, the queue `judge` stays empty and the "
+               "branch reads a false red")
+        return
+
     proc = await run_shell(CFG["offcontract_cmd"])
     check("the fake judge is switched to off-contract", proc.returncode == 0,
           f"rc={proc.returncode}")
@@ -1428,17 +1773,33 @@ async def scenario_4_attention_pair(rest: httpx2.AsyncClient) -> None:
     teardown_note("the fake judge was switched to off-contract and fixed back")
     fixed = False
     try:
+        # Фаза открытого разрыва (no39-04): пара отложена причиной и видна в
+        # `waiting`; `attention` — подмножество `waiting` («требует человека») и
+        # появляется только после SLOT_MAX_ATTEMPTS нетранзиентных отказов ПАРЫ.
+        ok, detail = await wait_until(
+            queue_waiting(rest, "judge"),
+            "[attention] the off-contract pair is deferred by the reason "
+            "(the judge queue shows `waiting`)",
+            timeout=min(CFG["wait_sec"], 180.0))
+        check("[attention] while the answer is off-contract the pair waits in "
+              "`waiting` instead of burning calls", ok, detail)
+        stat = queue_stat(await health_snapshot(rest), "judge") or {}
+        if stat.get("attention") or 0:
+            # Порог уже пройден (в ветви заглушки SLOT_MAX_ATTEMPTS опущен) —
+            # отдельная проверка достижимости порога no39-04.
+            await check_attention_threshold(rest, "[attention]")
+        else:
+            check("[attention] in the phase of the open break `attention == 0`: the "
+                  "pair is deferred, the human is not asked yet",
+                  (stat.get("waiting") or 0) >= 1, f"{stat}")
+
         attention = None
 
         async def has_attention() -> tuple[bool, str]:
             nonlocal attention
-            try:
-                r = await rest.get("/jobs/attention")
-                attention = r.json() if r.status_code == 200 else None
-            except Exception as exc:  # noqa: BLE001
-                return False, describe(exc)
-            jobs = (attention or {}).get("jobs") or []
-            return bool(jobs), f"attention jobs: {len(jobs)}"
+            jobs = await attention_jobs(rest)
+            attention = {"jobs": jobs} if jobs is not None else None
+            return bool(jobs), f"attention jobs: {len(jobs or [])}"
 
         ok, detail = await wait_until(has_attention,
                                       "a job lands in GET /jobs/attention",
@@ -1689,37 +2050,6 @@ def own_summaries_ready(count: int) -> Callable[[], Awaitable[tuple[bool, str]]]
     return predicate
 
 
-def judge_attention(rest: httpx2.AsyncClient,
-                    ) -> Callable[[], Awaitable[tuple[bool, str]]]:
-    """Predicate factory: the judge queue shows a pair waiting for a human.
-
-    The factory shape is the one of `queue_has_work`/`queue_drained`: the call
-    site passes `judge_attention(rest)` — a CALLABLE that `wait_until` awaits.
-    The earlier `async def judge_attention(...)` was handed over as an already
-    created coroutine (`wait_until(judge_attention(rest), ...)`), which
-    `wait_until` refuses with a TypeError — scenario 8 died outright (no
-    busy-loop).
-    """
-
-    async def predicate() -> tuple[bool, str]:
-        snapshot = await health_snapshot(rest)
-        stat = queue_stat(snapshot, "judge")
-        if stat is None:
-            return False, "the judge queue is not reported by /health"
-        try:
-            answer = await rest.get("/jobs/attention")
-            jobs = (answer.json() if answer.status_code == 200 else {}).get("jobs") or []
-        except Exception as exc:  # noqa: BLE001 — a transient error is not the answer
-            return False, describe(exc)
-        attention = stat.get("attention") or 0
-        return bool(attention and jobs), (
-            f"judge: pending={stat.get('pending')}, waiting={stat.get('waiting')}, "
-            f"attention={attention}, GET /jobs/attention={len(jobs)}"
-        )
-
-    return predicate
-
-
 async def scenario_8_budget_raise_release(c: Client, rest: httpx2.AsyncClient) -> None:
     """lsbdef-0008: reasoning eats the budget → truncation → attention → the
     budget is raised → the queues drain WITHOUT a manual step (FR-2.3/FR-5.1)."""
@@ -1759,10 +2089,14 @@ async def scenario_8_budget_raise_release(c: Client, rest: httpx2.AsyncClient) -
         # hand-off needs a judge verdict (a hand-off pair is what freezes here).
         # Пара обязана быть «почти-дублем»: дословно одинаковые тексты продукт
         # отвергает (stored=false), и судья не получает ни одной пары.
-        probe_ids = await save_near_duplicate_pair(
+        probe_ids, vector_ready = await save_near_duplicate_pair(
             c, RUN["note_budget_break"], RUN["note_budget_break_2"]
         )
         probes = len([item for item in probe_ids if item is not None])
+        if probes < 2 or not vector_ready:
+            warn("[budget] the pair of the branch is not usable",
+                 f"ids={probe_ids}, first vector ready={vector_ready} — the judge "
+                 f"may get no pair")
 
         ok, detail = await wait_until(queue_has_work(rest, "summary"),
                                       "[budget] notes without a summary pile up "
@@ -1770,11 +2104,23 @@ async def scenario_8_budget_raise_release(c: Client, rest: httpx2.AsyncClient) -
                                       timeout=min(CFG["wait_sec"], 240.0))
         check("[budget] while the budget is tight the summary queue grows", ok, detail)
 
-        ok, detail = await wait_until(judge_attention(rest),
-                                      "[budget] the judge pair lands in attention "
-                                      "(/health.queues + GET /jobs/attention)")
-        check("[budget] the hopeless pair waits for a human, not burning calls",
-              ok, detail)
+        # Фаза тесного бюджета (no39-04): пара ПЕРЕСТАЁТ ЖЕЧЬ ВЫЗОВЫ — работа
+        # отложена причиной (`waiting`/`attention`, при этом `pending == 0`).
+        # Жёсткое ожидание `judge_attention` здесь краснело: `attention` — не
+        # предпосылка ветви, а отдельная проверка достижимости порога.
+        ok, detail = await wait_until(
+            queue_deferred(rest, "judge"),
+            "[budget] the pair stops burning calls: the judge work is deferred "
+            "by the reason (waiting/attention, no pending)",
+            timeout=CFG["wait_sec"])
+        check("[budget] while the budget is tight the hopeless pair waits instead "
+              "of retrying (the calls are not burned)", ok, detail)
+        stat = queue_stat(await health_snapshot(rest), "judge") or {}
+        if stat.get("attention") or 0:
+            await check_attention_threshold(rest, "[budget]")
+        else:
+            info("[budget] the pair has not reached the limit of nontransient "
+                 f"refusals yet: it still waits ({stat.get('waiting')} in `waiting`)")
 
         snapshot_before = await health_snapshot(rest)
         before = {
@@ -2096,8 +2442,9 @@ def _decision_acceptance_lines(numbers: dict) -> list[str]:
         f"| Ожидание очереди `judge` при `unavailable` + `DECISION_FALLBACK=false` | "
         f"{numbers.get('waiting')} |",
         "",
-        "Прогон идемпотентен: повторный запуск заменяет этот блок (маркеры "
-        "`<!-- f12-03:start -->`/`<!-- f12-03:end -->`), числа берутся из "
+        "Прогон идемпотентен: повторный запуск заменяет этот блок ("
+        "HTML-маркеры блока — комментарии `f12-03:start` и `f12-03:end`), "
+        "числа берутся из "
         "`/health.decision` (счётчики памяти процесса), вероятности остаются "
         "только в журнале (`decision_answer`) — в БД их нет (FR-3.3).",
     ]
@@ -2120,6 +2467,8 @@ async def scenario_10_node_hint(c: Client, rest: httpx2.AsyncClient) -> None:
     не несёт; окно `save` остаётся локальным (без работы слотов)."""
     scenario(10, "№28: node hint on save without namespace — the note stays in "
                  "`default`, the answer points at a node, no model call on write")
+    # Хуки ветвей 3/4/8/9 пересоздали контур: сессия раннера мертва, переоткрываем.
+    await resume_after_hooks(c, rest, "scenario 10")
 
     created = await c.call("memory_namespace_create", {
         "path": NODE_HINT_PATH, "description": NODE_HINT_DESCRIPTION})
@@ -2225,6 +2574,7 @@ async def scenario_11_freshness(c: Client, rest: httpx2.AsyncClient) -> None:
     релевантная не проходит, невалидное значение даёт hint; та же ручка на
     REST-поверхности оператора работает так же."""
     scenario(11, "№29: freshness filter `updated_after` — search/list, MCP + REST")
+    await resume_after_hooks(c, rest, "scenario 11")
 
     fresh = await c.call("memory_save", {
         "text": f"{RUN['tag']} свежая заметка про TaskFlow деплой",
@@ -2298,6 +2648,7 @@ async def scenario_12_comment(c: Client, rest: httpx2.AsyncClient) -> None:
     текст, объём и дедуп заметки при этом не меняются.
     """
     scenario(12, "№24: the note `comment` field — edit path, reading, versions")
+    await resume_after_hooks(c, rest, "scenario 12")
 
     text = f"{RUN['tag']} заметка с пометкой про TaskFlow деплой"
     title = f"{RUN['tag']} заметка с пометкой"
@@ -2571,6 +2922,7 @@ async def scenario_13_injected_text(c: Client, rest: httpx2.AsyncClient,
                  "the agent smoke (notes, areas, queues)")
     numbers: dict[str, Any] = {}
 
+    await resume_after_hooks(c, rest, "scenario 13")
     module = budget_module()
     data: dict[str, Any] | None = None
     if module is not None:
@@ -2724,8 +3076,12 @@ async def scenario_13_injected_text(c: Client, rest: httpx2.AsyncClient,
 
 # ==== run ======================================================================
 async def run_all() -> None:
+    global RUN_FINISHED
     async with AsyncExitStack() as stack:
-        c, init = await fresh_session(stack)
+        # Сессию MCP открываем в СВОЁМ стеке (`own_stack`): закрывать её будем
+        # явно, в этой же задаче и до выхода из `AsyncExitStack`, а стек прогона
+        # остаётся REST-клиенту (у него cancel scope нет).
+        c, init = await fresh_session(AsyncExitStack(), own_stack=True)
         instructions = init.instructions or ""
         rest = await rest_client(stack)
 
@@ -2742,18 +3098,37 @@ async def run_all() -> None:
             await scenario_0_context(c, rest, instructions)
             await scenario_1_observability_baseline(rest)
             await scenario_2_models_outage(c, rest)
-            await scenario_3_auth_branch(rest)
-            await scenario_4_attention_pair(rest)
+            await scenario_3_auth_branch(c, rest)
+            await scenario_4_attention_pair(c, rest)
             await scenario_5_restart_inside_outage(c, rest)
             await scenario_6_regression()
-            await scenario_8_budget_raise_release(c, rest)
-            await scenario_9_decision_fallback(c, rest)
-            await scenario_10_node_hint(c, rest)
-            await scenario_11_freshness(c, rest)
-            await scenario_12_comment(c, rest)
-            await scenario_13_injected_text(c, rest, instructions)
+            # Сценарии 8–13: каждый в обёртке — падение одного не отменяет
+            # остальные, а блок f11-03 (сценарий 13) пишется независимо.
+            await run_scenario(8, "Reasoning eats the budget → truncation → attention "
+                                "→ the budget is raised → the queues drain by themselves",
+                               lambda: scenario_8_budget_raise_release(c, rest))
+            await run_scenario(9, "The decision slot decides, then falls back over three "
+                                "reasons (unsupported / unavailable / low_confidence) "
+                                "without losing jobs",
+                               lambda: scenario_9_decision_fallback(c, rest))
+            await run_scenario(10, "№28: node hint on save without namespace — the note "
+                                "stays in `default`, the answer points at a node, no "
+                                "model call on write",
+                               lambda: scenario_10_node_hint(c, rest))
+            await run_scenario(11, "№29: freshness filter `updated_after` — search/list, "
+                                "MCP + REST",
+                               lambda: scenario_11_freshness(c, rest))
+            await run_scenario(12, "№24: the note `comment` field — edit path, reading, "
+                                "versions",
+                               lambda: scenario_12_comment(c, rest))
+            await run_scenario(13, "LSBN-F-11: the injected-text budget (A/B/C) under the "
+                                "guard and the agent smoke (notes, areas, queues)",
+                               lambda: scenario_13_injected_text(c, rest, instructions))
             await future_block_todo()
             close_scenario()
+            # Все сценарии выполнены: попытка состоялась (отчёт есть, «Total:»
+            # печатается). Разрыв на закрытии ниже её уже не отменяет.
+            RUN_FINISHED = True
         finally:
             # Teardown always runs — also after a failed scenario (FR-3.2).
             try:
@@ -2761,6 +3136,16 @@ async def run_all() -> None:
             except Exception as exc:  # noqa: BLE001 — the trace must survive anyway
                 teardown_note(f"teardown raised {describe(exc)} — check the probe "
                               f"data with prefix {CFG['prefix']} by hand")
+            # Сессия MCP закрывается ЗДЕСЬ — в своей задаче, до выхода из
+            # `AsyncExitStack`, и с записью в trace: иначе падение на выходе
+            # обрывало прогон и «Total:» не печатался (12.10.2026).
+            try:
+                await c.close()
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:  # noqa: BLE001 — закрытие не предмет проверок
+                info(f"closing the MCP session: {describe(exc)}")
+                teardown_note(f"the MCP session was not closed cleanly ({describe(exc)})")
             ENV["db_size"] = db_size_text()
             path = write_teardown_trace()
             if path is not None:
@@ -2829,6 +3214,9 @@ def configure_probe_data(run_id: str, attempt: int) -> str:
         "note_outage_embedding": f"{tag} outage probe embedding",
         "note_outage_summary": f"{tag} outage probe summary",
         "note_outage_judge": f"{tag} outage probe judge",
+        "note_auth": f"{tag} auth branch probe",
+        "note_attention_pair": f"{tag} attention pair note one",
+        "note_attention_pair_2": f"{tag} attention pair note two",
         "note_budget_break": f"{tag} budget probe note one",
         "note_budget_break_2": f"{tag} budget probe note two",
         "note_decision": f"{tag} decision probe note",
@@ -2942,7 +3330,14 @@ async def main() -> int:
     parser.add_argument("--no-cleanup", action="store_true",
                         default=os.environ.get("LSB_KEEP", "") == "1",
                         help="do not remove the leftovers of a previous run (diagnostics)")
+    parser.add_argument("--self-test-acceptance", action="store_true",
+                        help="self-test of the acceptance block only: writes it twice "
+                             "into a temporary file and compares byte by byte "
+                             "(the contour and the token are not needed)")
     args = parser.parse_args()
+
+    if args.self_test_acceptance:
+        return self_test_acceptance()
 
     if not args.token:
         print("FATAL: the contour Bearer token is not set: export MCP_AUTH_TOKEN "
@@ -2997,20 +3392,38 @@ async def main() -> int:
         reset_counters()
         tag = configure_probe_data(run_id, attempts)
         print(f"\n=== attempt {attempts}: probe tag {tag} ===")
+        # Попытку запускаем ОТДЕЛЬНОЙ задачей: области anyio внутри MCP SDK
+        # живут в ней, и отменённая чужая область (живой прогон 12.10.2026:
+        # процесс умирал `CancelledError` на повторе, «Total:» не печатался)
+        # не отравляет задачу раннера — падает попытка, а не отчёт.
+        attempt = asyncio.create_task(run_all())
         try:
-            await run_all()
+            await attempt
             break
-        except MCPError as exc:
-            print(f"\n[retry] the MCP session broke (attempt {attempts}): {describe(exc)}")
-            await asyncio.sleep(5)
-        except (httpx2.HTTPError, httpx2.TransportError, OSError) as exc:
-            print(f"\n[retry] contour transport (attempt {attempts}): {describe(exc)}")
-            await asyncio.sleep(5)
-        except Exception as exc:
-            # Разрыв транспорта (в т.ч. `ExceptionGroup` anyio) — не ошибка продукта.
+        except asyncio.CancelledError as exc:
+            # Отмена пришла СНАРУЖИ (чужая область anyio в закрытии сессии):
+            # повторять в этом прогоне бессмысленно, но отчёт уже собран.
+            print(f"\n[retry] the attempt was cancelled by a foreign scope "
+                  f"(attempt {attempts}): {describe(exc)}")
+            break
+        except BaseException as exc:  # noqa: BLE001 — разрыв решаем по типу
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            # Разрыв транспорта (в т.ч. `ExceptionGroup` anyio и RuntimeError
+            # про чужой `cancel scope`) — не ошибка продукта.
             reason = "transport break" if is_transport_break(exc) else "run error"
             print(f"\n[retry] {reason} (attempt {attempts}): {describe(exc)}")
+            if RUN_FINISHED and reason == "transport break":
+                # Сценарии выполнены (сценарии 10–13, блок f11-03), а упало только
+                # закрытие сессии: повтор не запускаем — отчёт уже полный.
+                print("[retry] the run itself is complete: the close-time break does "
+                      "not zero it, the report stands")
+                break
             await asyncio.sleep(5)
+        finally:
+            if not attempt.done():
+                attempt.cancel()
+            await asyncio.gather(attempt, return_exceptions=True)
     else:
         print("\n[FATAL] the run did not finish within 3 attempts")
 
