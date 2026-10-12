@@ -1233,12 +1233,19 @@ NEAR_DUPLICATE_BODY = (
 )
 
 
-def near_duplicate_texts(tag: str) -> tuple[str, str]:
-    """Два текста пары: близкие по смыслу, но не дословные дубли."""
+def near_duplicate_texts(tag: str, label: str = "dedup hand-off pair") -> tuple[str, str]:
+    """Два текста пары: близкие по смыслу, но не дословные дубли.
+
+    `label` обязан быть СВОИМ у каждой пары прогона: дословно одинаковые тексты
+    продукт отвергает (`stored: false`), и вторая пара просто не создаётся —
+    ветвь читается ложной краснотой. Прогон 12.10.2026: шаг 3 сценария 9 получил
+    те же тексты, что и ветвь бюджета, вторые заметки не появились, и проверка
+    «задание ждёт» крутила guard в пустую очередь.
+    """
     return (
-        f"{tag} dedup hand-off pair, first note. {NEAR_DUPLICATE_BODY}"
+        f"{tag} {label}, first note. {NEAR_DUPLICATE_BODY}"
         "The pair is created by the acceptance run.",
-        f"{tag} dedup hand-off pair, second note. {NEAR_DUPLICATE_BODY}"
+        f"{tag} {label}, second note. {NEAR_DUPLICATE_BODY}"
         "The pair is checked by the acceptance run.",
     )
 
@@ -1261,7 +1268,7 @@ async def save_near_duplicate_pair(c: Client, title_first: str,
     честный `skip`/`manual` вместо ложного FAIL. Нового доступа к БД не заводим:
     используется тот же `probe_vectors_ready` (`db_count` по `vector_status='ok'`).
     """
-    first, second = near_duplicate_texts(RUN["tag"])
+    first, second = near_duplicate_texts(RUN["tag"], label=title_first)
     ids: list[int | None] = []
     vector_ready = False
     for title, text in ((title_first, first), (title_second, second)):
