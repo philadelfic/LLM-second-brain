@@ -163,7 +163,7 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "MEMORY_SIMILAR_ENABLED": ("memory_similar_enabled", True),
     "MEMORY_SIMILAR_LIMIT": ("memory_similar_limit", 2),
     "MEMORY_SIMILAR_POOL": ("memory_similar_pool", 5),
-    "MEMORY_SIMILAR_THRESHOLD": ("memory_similar_threshold", 0.30),
+    "MEMORY_SIMILAR_THRESHOLD": ("memory_similar_threshold", 0.60),
     "MEMORY_SIMILAR_TEXT_CHARS": ("memory_similar_text_chars", 500),
     # Релиз 3.0.0, субстрат областей (постановка 00): лимиты формы и пороги
     # сходства skills/terms/user — из контрактов фич lsb-0007/0008/0009.
