@@ -25,7 +25,7 @@ Release 3.2.0 — "Hygiene, contour and slots": the memory becomes accountable. 
 * **Injected-text measurement and budget** (LSBN-F-11): one token counter (`cl100k_base`) and `scripts/measure_injected_text.py` measure the three places that cost context — instructions at connection, tool descriptions, call weight — and `tests/test_injection_budget.py` guards the budget (the surface must stay 31 tools).
 
 ### Changed
-- The save-time `similar` hint (№30) now needs Dice 0.60 over significant words
+- The save-time `similar` hint (№30) now needs Dice 0.74 over significant words
   instead of 0.30: at 0.30 it fired on almost any note that shared a sixth of
   its vocabulary, so the hint was noise rather than a signal.
 
