@@ -1176,7 +1176,9 @@ async def test_summary_loop_rechecks_queue_before_sleep(slow) -> None:
 @pytest.mark.asyncio
 async def test_judge_loop_rechecks_queue_before_sleep(slow) -> None:
     """Пул 6 (lost wakeup) для judge-петли: notify во время обработки партии
-    не теряется — перед сном перепроверка очереди (_judge_queue_empty)."""
+    не теряется — перед сном перепроверка очереди (_judge_queue_empty) даёт
+    работе ОДИН немедленный прогон (№39, no39-05: прогон без прогресса —
+    не повод крутиться вхолостую: дальше back-off)."""
     worker = make_worker(slow, HashEmbedder(8))
     calls = {"n": 0}
 
@@ -1187,6 +1189,16 @@ async def test_judge_loop_rechecks_queue_before_sleep(slow) -> None:
             # — добавляем judge-работу + сигнал.
             worker._create_job("judge", "dedup", 999)
             worker.notify_judge_pending()
+            return 0
+        # Немедленный lost-wakeup прогон задание действительно берёт — и только
+        # он: дальше очередь пуста и петля спит по back-off.
+        if calls["n"] == 2:
+            with session(slow) as conn, transaction(conn):
+                conn.execute(
+                    "UPDATE worker_jobs SET status = 'done' "
+                    "WHERE slot = 'judge' AND kind = 'dedup' AND status = 'pending'"
+                )
+            return 1
         return 0
 
     worker.process_judge_pending = racy_batch
@@ -1206,13 +1218,14 @@ async def test_judge_loop_rechecks_queue_before_sleep(slow) -> None:
     try:
         task = asyncio.create_task(worker._run_judge())
         # петля продолжила БЕЗ сна: повторная итерация наступает сразу.
-        while calls["n"] < 3:
+        deadline = time.monotonic() + 2.0
+        while calls["n"] < 2 and time.monotonic() < deadline:
             await asyncio.sleep(0.01)
         worker.stop()
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-        assert calls["n"] >= 3
+        assert calls["n"] >= 2
     finally:
         asyncio.wait_for = orig_wait_for
 

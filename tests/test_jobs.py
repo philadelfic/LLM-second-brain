@@ -177,8 +177,45 @@ async def test_empty_runs_grow_backoff_to_cap(monkeypatch) -> None:
     assert next_interval(MAX_INTERVAL_SEC, 30) == MAX_INTERVAL_SEC
 
 
-# --- контракт надёжности ------------------------------------------------------
+@pytest.mark.asyncio
+async def test_zero_progress_does_not_spin_on_nonempty_queue(monkeypatch, caplog) -> None:
+    """Отказ джобы не считается прогрессом петли (№39, no39-05, класс lsbdef-0011).
 
+    Спека «по требованию» с непустой очередью: прогон вернул 0 — работа есть, но
+    джоба её не берёт (слот отказывает заданию, задание остаётся `pending`).
+    Один шанс на lost wakeup (перепроверка очереди после `clear()`) — и петля
+    уходит в ожидание по back-off, а не повторяет холостой прогон без сна.
+    Живой случай 12.10.2026 (`decision` недоступен + `DECISION_FALLBACK=false`):
+    ≈11 вызовов/с, 2687 событий `decision_fallback` за 4 минуты.
+    """
+    delays = patch_sleep(monkeypatch)
+    calls = 0
+
+    async def process() -> int:
+        nonlocal calls
+        calls += 1
+        return 0
+
+    spec = make_spec(
+        process,
+        interval_sec=30,
+        queue="judge",
+        wait_event=asyncio.Event(),
+        queue_empty=lambda: False,
+        queue_stat=lambda: {"pending": 1, "oldest_pending_sec": 0},
+    )
+    state = BackoffState(30)
+    with caplog.at_level(logging.INFO, logger="app"):
+        await asyncio.wait_for(
+            run_loop(spec, lambda: len(delays) >= 1, state), timeout=1.0
+        )
+    assert calls == 2             # обычный прогон + один немедленный (lost wakeup)
+    assert delays == [30.0]       # холостой прогон — пауза, а не повтор без сна
+    assert state.interval == 60.0  # пауза растёт по back-off: отказ — не прогресс
+    assert len(_queue_waiting_records(caplog)) == 1  # одно событие на итерацию
+
+
+# --- контракт надёжности ------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_iteration_failure_does_not_kill_loop(caplog) -> None:
@@ -253,13 +290,16 @@ async def test_wait_event_wakes_loop_immediately() -> None:
 
 
 @pytest.mark.asyncio
-async def test_queue_recheck_after_clear_keeps_work() -> None:
-    """Отсутствие события не теряет работу: непустая очередь не даёт петле спать.
+async def test_queue_recheck_before_sleep_does_not_spin(monkeypatch) -> None:
+    """Отсутствие события не теряет работу, а холостой прогон — не прогресс.
 
     Событие не выставлено ни разу — сигнала нет, но перепроверка очереди после
-    `clear()` видит незабранное задание и продолжает прогоны без ожидания
-    (lost wakeup закрыт: стирается только пустая очередь).
+    `clear()` видит незабранное задание: петля даёт ему ОДИН немедленный прогон
+    (lost wakeup закрыт) и уходит в ожидание по back-off. Прогон пуст (0) —
+    повторять его без сна нельзя (№39, no39-05: отказ джобы не считается
+    прогрессом — иначе слот, отказывающий заданию, крутил бы петлю вхолостую).
     """
+    delays = patch_sleep(monkeypatch)
     calls = 0
 
     async def process() -> int:
@@ -273,13 +313,16 @@ async def test_queue_recheck_after_clear_keeps_work() -> None:
         wait_event=asyncio.Event(),
         queue_empty=lambda: False,
     )
-    task = asyncio.create_task(run_loop(spec, lambda: False, BackoffState(3600)))
-    try:
-        await wait_until(lambda: calls >= 5, timeout=1.0)
-    finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+    state = BackoffState(3600)
+    await asyncio.wait_for(
+        run_loop(spec, lambda: len(delays) >= 2, state), timeout=1.0
+    )
+    # По два прогона на итерацию: обычный и один немедленный (lost wakeup),
+    # дальше — пауза вместо повторения (без неё тут были бы десятки прогонов).
+    assert calls == 4
+    # Потолок back-off — 15 мин: рост из стартового интервала упирается в него.
+    assert delays == [3600.0, float(MAX_INTERVAL_SEC)]
+    assert state.interval == float(MAX_INTERVAL_SEC)
 
 
 @pytest.mark.asyncio

@@ -1631,6 +1631,21 @@ class BackgroundWorker:
 
     # --- потерянный будильник: дешёвая перепроверка очереди перед сном (пул 6)
 
+    def _decision_blocks_work(self) -> bool:
+        """Может ли текущая работа быть взята: доступен ли decision (№39, §6.9).
+
+        Судья дедупа и классификатор `nodes` ходят в слот decision: если слот
+        недоступен (`can_decide()` ложно — погашен стартовой проверкой или
+        `disable()`) и переключение выключено (`DECISION_FALLBACK=false`),
+        решения не будет ни у одной пары/кандидата — такая работа петлёй не
+        берётся (она видна в `/health.queues[].waiting`). Проверка живёт в
+        памяти процесса: без SQL сверх существующего.
+        """
+        service = self._decision
+        if service is None or self._settings.decision_fallback:
+            return False
+        return not service.can_decide()
+
     def _summary_queue_empty(self) -> bool:
         """Пуста ли summary-очередь (дешёвый SELECT, пул 6, lost wakeup).
 
@@ -1656,7 +1671,13 @@ class BackgroundWorker:
             ).fetchone()
         # №39 (arch §6.9): при открытом разрыве слота петля партию не берёт —
         # очередь для неё пуста (иначе отложенное задание гонит busy-loop).
-        return int(row["c"]) == 0 or self._breakers[SLOT_SUMMARY].is_paused()
+        # То же — при недоступном decision и выключенном переключении: решение
+        # взять негде, работа ждёт (no39-05, `_decision_blocks_work`).
+        return (
+            int(row["c"]) == 0
+            or self._breakers[SLOT_SUMMARY].is_paused()
+            or self._decision_blocks_work()
+        )
 
     def _judge_queue_empty(self) -> bool:
         """Пуста ли judge-очередь (дешёвый SELECT, пул 6, lost wakeup).
@@ -1674,8 +1695,13 @@ class BackgroundWorker:
                 "AND attention_at IS NULL"
             ).fetchone()
         # №39 (arch §6.9): при открытом разрыве судьи партия не берётся —
-        # очередь для петли пуста (busy-loop'а нет).
-        return int(row[0]) == 0 or self._breakers[SLOT_JUDGE].is_paused()
+        # очередь для петли пуста (busy-loop'а нет); то же при недоступном
+        # decision с выключенным переключением (no39-05).
+        return (
+            int(row[0]) == 0
+            or self._breakers[SLOT_JUDGE].is_paused()
+            or self._decision_blocks_work()
+        )
 
     # --- наблюдаемость очередей (lsb-0014-03, FR-2.2) -------------------------
 
@@ -1697,17 +1723,25 @@ class BackgroundWorker:
     def _gated_queue_stat(self, slot: str, stat: dict) -> dict:
         """Снимок очереди с учётом разрыва слота (№39, arch §6.9).
 
-        Разрыв слота открыт (`SlotBreaker.is_paused`) — петля партию не берёт,
-        поэтому вся текущая работа из `pending` уезжает в `waiting`
-        (`pending=0`), а `oldest_pending_sec`/`attention` сохраняются: ожидание
-        видно в `/health.queues`, но петля не крутится вхолостую. Иначе —
-        снимок нормализуется как есть (возраст и внимание не пересчитываются).
+        Разрыв слота открыт (`SlotBreaker.is_paused`) или работа слота не
+        может быть взята (decision недоступен, `DECISION_FALLBACK=false` —
+        слоты `summary`/`judge` и классификатор `nodes`, no39-05) — петля
+        партию не берёт, поэтому вся текущая работа из `pending` уезжает в
+        `waiting` (`pending=0`), а `oldest_pending_sec`/`attention` сохраняются:
+        ожидание видно в `/health.queues`, но петля не крутится вхолостую.
+        Иначе — снимок нормализуется как есть (возраст и внимание не
+        пересчитываются).
         """
         pending = int(stat.get("pending", 0) or 0)
         waiting = int(stat.get("waiting", 0) or 0)
         attention = int(stat.get("attention", 0) or 0)
         breaker = self._breakers.get(slot)
-        if breaker is not None and breaker.is_paused():
+        gated = (
+            breaker is not None and breaker.is_paused()
+        ) or (
+            slot in (SLOT_SUMMARY, SLOT_JUDGE) and self._decision_blocks_work()
+        )
+        if gated:
             return queue_snapshot(
                 0,
                 stat.get("oldest_pending_sec"),
