@@ -69,11 +69,21 @@ Scenarios (this base version):
      neither lost nor duplicated (no restarts if no hook).
   6. Regression: unit tests + the existing E2E scripts — only with
      `--run-regression` (otherwise MANUAL).
-  7. TODO of the future blocks (slots/budget/decision, memory handles, assistant
-     logs, backups) — placeholders for the follow-up postановки.
+  7. TODO of the future blocks (slots/budget/decision, memory handles) —
+     placeholders for the follow-up postановки.
   8. lsbdef-0008 (defect): reasoning eats the budget → truncation → the pair
      lands in attention → the budget is raised → BOTH queues drain by themselves
      (no manual step), numbers before/after into `release/3.2.0/ACCEPTANCE.md`.
+  14. LSBN-F-10 (f10-02/03/04): the assistant-logs area — the entry is written and
+     read back by id, sliced by object in the list, found by the reason in the
+     search, edited and soft-deleted over MCP (with the REST operator mirror); the
+     linked object and its state are visible in the entry; memory search does NOT
+     mix the log in (isolation); a token-like value in the body never reaches the
+     contour journal. The scenario removes its own log entry (idempotent).
+  15. №14 (no14-01): the backups contour — `GET /backups` lists the snapshots,
+     `POST /backups/verify` opens the newest one as a working base (integrity +
+     vec0) READ-ONLY (size/mtime unchanged) and `/health.backups` carries
+     `last_verify`/`last_ship`; no snapshot → an honest SKIP, never a FAIL.
 
 Run (normally inside the test container):
     MCP_AUTH_TOKEN=... python scripts/e2e_release32.py
@@ -2035,12 +2045,6 @@ async def future_block_todo() -> None:
            "LSBN-F-11 is claimed by `tests/test_injection_budget.py` and "
            "`scenario_13_injected_text()`; the rest of the surface is claimed "
            "by the follow-up postановки")
-    # TODO(3.2.0 future blocks) — assistant logs:
-    manual("assistant logs: event names, masking, no secrets in the log",
-           "add a `scenario_10_logs()` here")
-    # TODO(3.2.0 future blocks) — backups:
-    manual("backups: snapshot, retention, restore drill",
-           "add a `scenario_11_backups()` here")
     warn("the future-block section is a base placeholder — claimed by the "
          "follow-up postановки", "see the TODO(3.2.0 future blocks) comments")
 
@@ -3137,6 +3141,360 @@ async def scenario_13_injected_text(c: Client, rest: httpx2.AsyncClient,
         warn("the acceptance block f11-03 was not written", describe(exc))
 
 
+# ==== scenarios: 14. assistant logs (LSBN-F-10) =================================
+# Маркер лежит ТОЛЬКО в причине записи лога: по нему ищем запись в области
+# (`logs_search`) и им же проверяем изоляцию — поиск заметок его не видит.
+LOGS_ONLY_MARKER = "zblorptlogsonly"
+LOGS_SECRET_PREFIX = "sk-"
+
+
+def _log_marker() -> str:
+    """Маркер попытки, пригодный и для FTS-разбора (одно слово, без дефисов)."""
+    return f"{LOGS_ONLY_MARKER}{re.sub(r'[^0-9A-Za-z]', '', RUN['tag'])}"
+
+
+def _fake_log_secret() -> str:
+    """Токеноподобная строка для проверки утечки (фальшивая, своя у попытки).
+
+    Значение НИГДЕ не печатается: проверяется только его ОТСУТСТВИЕ в журнале
+    контура, поэтому в отчёте о нём — ни символа.
+    """
+    tail = re.sub(r"[^0-9A-Za-z]", "", RUN["tag"]).ljust(32, "0")[:32]
+    return f"{LOGS_SECRET_PREFIX}{tail}"
+
+
+async def scenario_14_logs(c: Client, rest: httpx2.AsyncClient,
+                           instructions: str) -> None:
+    """LSBN-F-10 (f10-02/03/04): область «Логи ассистента» через MCP + REST.
+
+    Что проверяем (наблюдаемо, без моделей на пути записи):
+    * запись причины создаётся (`logs_save` → id, version=1) и читается по id
+      (`logs_get`), тело возвращается как записано;
+    * запись видит листинг со срезом по объекту (`logs_list(entity, entity_id)`)
+      и смысловой поиск (`logs_search`; при недоступном эмбеддере — FTS-only);
+    * правка (`logs_update`) меняет поле и не задевает связку с объектом;
+    * удаление мягкое и идемпотентное (`logs_delete`);
+    * связанный объект (заметка), её версия и состояние (`entity_state`) видны
+      в записи (f10-04/§11);
+    * область не подмешивается в поиск заметок (изоляция, FR-1.2);
+    * токеноподобная строка из тела никогда не попадает в журнал контура
+      (NFR-4/канон §6: в логи — длины и id, а не содержимое);
+    * `/health.areas.logs` показывает область включённой, раздел области есть
+      в инструкциях (№40/f10-04).
+
+    Идемпотентность: свою запись лога сценарий удаляет сам (в т.ч. при обрыве —
+    `finally`); пробная заметка убирается общим teardown'ом по префиксу.
+    """
+    scenario(14, "LSBN-F-10: assistant logs — write/read/list/search/update/"
+                 "delete, the entity link, isolation from memory, no secrets in "
+                 "the journal")
+    await resume_after_hooks(c, rest, "scenario 14")
+
+    snapshot = await health_snapshot(rest)
+    area = (snapshot.get("areas") or {}).get("logs")
+    check("/health.areas.logs reports the logs area as enabled (№40, f10-04)",
+          isinstance(area, dict) and area.get("enabled") is True, f"logs area={area}")
+    if not (isinstance(area, dict) and area.get("enabled") is True):
+        skip("the assistant-logs scenario",
+             "the logs area is OFF on this contour (AREA_LOGS_ENABLED=false): the "
+             "MCP handles are hidden and the write path is unavailable")
+        manual("scenario 14 (LSBN-F-10)",
+               "run with AREA_LOGS_ENABLED=true to exercise the logs area")
+        return
+    check("the logs area announces itself in the MCP instructions (f10-04, §10)",
+          "logs_save" in instructions and "logs_search" in instructions,
+          f"{len(instructions)} chars of instructions")
+
+    # Объект ссылки — своя пробная заметка (текст СВОЙ: общий текст пробы других
+    # сценариев продукт отверг бы как дословный дубль и объект ссылки не завёлся).
+    note_id, note_detail = await save_probe_note_result(
+        c, f"{RUN['tag']} logs entity probe",
+        text=f"{RUN['tag']} assistant-logs entity probe text (acceptance run).",
+        after_hook=True, rest=rest)
+    if note_id is None:
+        skip("the assistant-logs scenario",
+             f"the probe note (the linked object) was not created: {note_detail}")
+        return
+
+    marker = _log_marker()
+    secret = _fake_log_secret()
+    action = "set the note state during the acceptance run"
+    reason = f"the reason carries {marker} only; a token-like value is written too"
+    body = f"{reason} ({secret})"
+    saved = await c.call("logs_save", {
+        "action": action,
+        "reason": body,
+        "entity": "note", "entity_id": note_id, "entity_version": 1,
+        "outcome": "the entry is written by the acceptance run",
+        "verified": "written and read back",
+    })
+    log_id = saved.get("id")
+    if log_id is None:
+        skip("the assistant-logs scenario",
+             f"logs_save did not create an entry: {refusal(saved) or saved}")
+        return
+    check("logs_save creates the entry and answers {id, created: true, version: 1}",
+          saved.get("created") is True and saved.get("version") == 1,
+          f"answer={saved}")
+
+    cleaned = False
+    try:
+        got = await c.call("logs_get", {"id": log_id})
+        check("logs_get reads the entry by id (the body round-trips as written)",
+              got.get("action") == action and got.get("reason") == body,
+              f"id={log_id}, reason_chars={len(got.get('reason') or '')}")
+        check("the entry shows the linked object and its version "
+              "(entity=note, entity_id, entity_version)",
+              got.get("entity") == "note" and got.get("entity_id") == note_id
+              and got.get("entity_version") == 1,
+              f"entity={got.get('entity')!r}, entity_id={got.get('entity_id')!r}, "
+              f"entity_version={got.get('entity_version')!r}")
+        check("the entry exposes the state of the linked object "
+              "(entity_state='active', f10-04/§11)",
+              got.get("entity_state") == "active",
+              f"entity_state={got.get('entity_state')!r}")
+
+        listed = await c.call("logs_list",
+                              {"entity": "note", "entity_id": note_id, "limit": 20})
+        check("logs_list slices by object (entity+entity_id) and returns the entry",
+              log_id in [item.get("id") for item in listed.get("items", [])]
+              and (listed.get("total") or 0) >= 1,
+              f"total={listed.get('total')}, "
+              f"ids={[item.get('id') for item in listed.get('items', [])]}")
+
+        found = await c.call("logs_search", {"query": marker, "top_k": 5})
+        check("logs_search finds the entry by the reason (hybrid; FTS-only with a "
+              "warning when the embedder is unavailable, f10-03)",
+              log_id in [hit.get("id") for hit in found.get("results", [])],
+              f"hits={[hit.get('id') for hit in found.get('results', [])]}, "
+              f"warning={found.get('warning')!r}")
+        if found.get("warning"):
+            info(f"logs_search answered in the FTS-only mode: {found['warning']}")
+
+        r = await rest.get("/logs", params={"entity": "note", "entity_id": note_id,
+                                            "limit": REST_LIMIT})
+        rest_ids = ([item.get("id") for item in (r.json().get("items") or [])]
+                    if r.status_code == 200 else [])
+        check("REST GET /logs?entity=note&entity_id=… mirrors the same entry",
+              r.status_code == 200 and log_id in rest_ids,
+              f"http {r.status_code}, ids={rest_ids}")
+        r_one = await rest.get(f"/logs/{log_id}")
+        check("REST GET /logs/{id} returns the full entry to the operator",
+              r_one.status_code == 200 and r_one.json().get("action") == action,
+              f"http {r_one.status_code}")
+
+        # Изоляция (FR-1.2/§13.2): слово, лежащее ТОЛЬКО в причине лога, не
+        # находится поиском памяти. Поиск — подстрочный (`mode=title`): векторная
+        # сторона гибридного поиска отдаёт соседей независимо от слов.
+        mem = await c.call("memory_search", {"query": marker, "mode": "title"})
+        check("memory_search does NOT return the log text (the areas are isolated, "
+              "FR-1.2/§13.2)",
+              marker.lower() not in json.dumps(mem, ensure_ascii=False).lower(),
+              f"hits={len(mem.get('results', []))}")
+
+        new_reason = f"{reason} — edited by the acceptance run ({secret})"
+        updated = await c.call("logs_update", {"id": log_id, "reason": new_reason})
+        check("logs_update edits the entry in place and answers {id, updated: true}",
+              updated.get("id") == log_id and updated.get("updated") is True,
+              f"answer={updated}")
+        after = await c.call("logs_get", {"id": log_id})
+        check("the edited reason reads back while action and the entity link stay "
+              "untouched (only the passed field changes)",
+              after.get("reason") == new_reason and after.get("action") == action
+              and after.get("entity_id") == note_id,
+              f"reason_chars={len(after.get('reason') or '')}")
+
+        # Секреты — не в журнал (NFR-4/§6: маскировка 4 симв. + `***`):
+        # токеноподобная строка в теле записи в журнале контура не появляется.
+        text = await log_text()
+        if text:
+            seen = bool(log_lines(text, "tool_call", "logs_save"))
+            leaked = secret in text or secret[4:] in text
+            check("a token-like value in the entry body never reaches the contour "
+                  "journal (NFR-4/§6: the tool_call event carries lengths, not "
+                  "content)",
+                  seen and not leaked,
+                  f"the journal shows the logs_save event: {seen}, the value is "
+                  f"{'present' if leaked else 'absent'}")
+        else:
+            skip("a token-like value in the entry body never reaches the contour "
+                 "journal",
+                 "LSB_LOGS_CMD is not set (no log hook on this contour)")
+
+        deleted = await c.call("logs_delete", {"id": log_id})
+        cleaned = True
+        check("logs_delete removes the entry (soft) and answers {id, deleted: true}",
+              deleted.get("id") == log_id and deleted.get("deleted") is True,
+              f"answer={deleted}")
+        gone = await c.call("logs_get", {"id": log_id})
+        check("a deleted entry is not readable by the agent any more (hint, §7.3)",
+              "action" not in gone and bool(gone.get("hint")), f"answer={gone}")
+        again = await c.call("logs_delete", {"id": log_id})
+        check("a repeated logs_delete is idempotent (deleted: false + hint)",
+              again.get("deleted") is False and bool(again.get("hint")),
+              f"answer={again}")
+        after_list = await c.call("logs_list",
+                                  {"entity": "note", "entity_id": note_id, "limit": 20})
+        check("the deleted entry leaves the listing too",
+              log_id not in [item.get("id") for item in after_list.get("items", [])],
+              f"ids={[item.get('id') for item in after_list.get('items', [])]}")
+    finally:
+        if not cleaned:
+            try:
+                await c.call("logs_delete", {"id": log_id})
+                teardown_note(f"scenario 14 removed its log entry {log_id} in the "
+                              "teardown (the scenario did not reach its own delete)")
+            except Exception as exc:  # noqa: BLE001 — уборка не маскирует причину
+                warn("the probe log entry was not removed by the teardown",
+                     f"id={log_id} ({describe(exc)})")
+
+
+# ==== scenarios: 15. backups (№14) =============================================
+def backup_file_path(name: str) -> Path:
+    """Путь снапшота в BACKUP_DIR (раннер монтирует /data, как и контейнер).
+
+    Каталог — `--backup-dir` / `LSB_BACKUP_DIR`; по умолчанию он выводится из
+    пути БД (`<каталог БД>/backups`, как в compose).
+    """
+    return Path(CFG["backup_dir"]) / name
+
+
+async def scenario_15_backups(rest: httpx2.AsyncClient) -> None:
+    """№14 (no14-01, arch §6.1/§7.2): список снапшотов, проверка восстановления
+    свежайшего и наблюдаемость бэкапов в `/health`.
+
+    Что проверяем (только чтение и проверка — ни одна ручка не пишет в снапшот):
+    * `GET /backups` отдаёт список снапшотов с операторскими полями (file,
+      size_bytes, verified, bad, shipped) и согласованным `total`;
+    * `POST /backups/verify` по свежайшему снапшоту открывает его как рабочую
+      базу: `ok=true`, `checks.integrity == "ok"`, все обязательные таблицы и
+      vec0 доступны;
+    * проверка read-only — размер и mtime файла снапшота до и после совпадают;
+    * после проверки `GET /backups` помечает снапшот `verified=ok`, `bad=false`,
+      а `/health.backups` несёт `last_verify` (эта же копия, исход ok) и
+      `last_ship`.
+
+    Нет снапшота/каталога — честный SKIP с причиной (петля бэкапов ещё не сделала
+    копию или каталог не смонтирован в раннер), а не FAIL.
+    """
+    scenario(15, "№14: backups — the snapshot list, the restore verify of the "
+                 "newest snapshot (read-only) and /health.backups observability")
+
+    listing = await rest.get("/backups")
+    if listing.status_code != 200:
+        skip("the backups scenario (№14)",
+             f"GET /backups answered http {listing.status_code}: the operator "
+             "handles are unavailable on this contour")
+        return
+    body = listing.json() or {}
+    items = body.get("items")
+    listed_ok = isinstance(items, list)
+    check("GET /backups lists the snapshots with the operator fields "
+          "(file/size_bytes/verified/bad/shipped)",
+          listed_ok and body.get("total") == len(items)
+          and all({"file", "size_bytes", "verified", "bad"} <= set(item)
+                  for item in items),
+          f"total={body.get('total')}, "
+          f"items={len(items) if listed_ok else None}")
+    if not listed_ok or not items:
+        skip("the restore verify of the newest snapshot (№14, FR-2.2)",
+             "BACKUP_DIR holds no snapshot yet: the backup loop makes the first "
+             "copy right after the contour start (BACKUP_INTERVAL_SEC) — wait for "
+             "it or check the mounted BACKUP_DIR")
+        manual("scenario 15 (№14)",
+               "the restore verify needs a snapshot in BACKUP_DIR "
+               f"({CFG['backup_dir']}); the loop makes the first one at start")
+        return
+
+    newest = items[0]
+    name = newest.get("file")
+    if not (isinstance(name, str) and name):
+        skip("the restore verify of the newest snapshot (№14, FR-2.2)",
+             f"the newest entry carries no file name: {newest}")
+        return
+    check("the newest snapshot is a well-formed `notes-*.db` file",
+          name.startswith("notes-") and name.endswith(".db"),
+          f"newest={name!r}, size_bytes={newest.get('size_bytes')}")
+
+    snapshot = backup_file_path(name)
+    before: tuple[int, int] | None = None
+    try:
+        info_stat = snapshot.stat()
+        before = (info_stat.st_size, info_stat.st_mtime_ns)
+    except OSError as exc:
+        before = None
+        info(f"the snapshot file is not reachable from the runner ({snapshot}): "
+             f"{type(exc).__name__} — the mtime check will be skipped")
+
+    verified = await rest.post("/backups/verify", json={"file": name})
+    if verified.status_code != 200:
+        check("POST /backups/verify of the newest snapshot answers 200", False,
+              f"http {verified.status_code}")
+        return
+    result = verified.json() or {}
+    checks = result.get("checks") or {}
+    check("POST /backups/verify opens the newest snapshot as a working base "
+          "(ok=true, checks.integrity == 'ok')",
+          result.get("ok") is True and checks.get("integrity") == "ok",
+          f"file={result.get('file')!r}, ok={result.get('ok')!r}, "
+          f"integrity={checks.get('integrity')!r}, reason={result.get('reason')!r}")
+    check("every required table and every vec0 index opens inside the snapshot "
+          "(missing_tables/vec_unavailable are empty, arch §13.1)",
+          checks.get("missing_tables") == [] and checks.get("vec_unavailable") == [],
+          f"missing_tables={checks.get('missing_tables')!r}, "
+          f"vec_unavailable={checks.get('vec_unavailable')!r}")
+    info(f"the restore verify took {result.get('latency_ms')} ms")
+
+    # Read-only (FR-2.2): проверка открывает копию `mode=ro` и файл снапшота не
+    # меняет — размер и mtime до/после совпадают; копия остаётся на месте.
+    relisted = await rest.get("/backups")
+    after_items = ((relisted.json().get("items") or [])
+                   if relisted.status_code == 200 else [])
+    after_item = next((item for item in after_items if item.get("file") == name), None)
+    after_size = after_item.get("size_bytes") if after_item else None
+    after_verified = after_item.get("verified") if after_item else None
+    after_bad = after_item.get("bad") if after_item else None
+    check("the snapshot is NOT deleted or resized by the verify (still listed, "
+          "the same size — read-only)",
+          after_item is not None and after_size == newest.get("size_bytes"),
+          f"size_bytes {newest.get('size_bytes')} → {after_size}")
+    if before is not None:
+        try:
+            after_stat = snapshot.stat()
+        except OSError as exc:
+            skip("the snapshot mtime is unchanged by the verify (read-only)",
+                 f"the file is not reachable after the verify: {type(exc).__name__}")
+        else:
+            check("the snapshot mtime is unchanged by the verify (read-only: the "
+                  "copy is opened, never written)",
+                  after_stat.st_mtime_ns == before[1],
+                  f"mtime_ns {before[1]} → {after_stat.st_mtime_ns}")
+    else:
+        skip("the snapshot mtime is unchanged by the verify (read-only)",
+             f"the snapshot is not reachable from the runner ({snapshot}): point "
+             "--backup-dir / LSB_BACKUP_DIR at the mounted BACKUP_DIR to check "
+             "the mtime")
+
+    check("GET /backups marks the verified snapshot verified='ok', bad=false",
+          after_verified == "ok" and after_bad is False,
+          f"verified={after_verified!r}, bad={after_bad!r}")
+
+    health = await health_snapshot(rest)
+    backups = health.get("backups") or {}
+    check("/health.backups carries the backup observability "
+          "(count/bad/last_verify/last_ship, arch §7.2)",
+          {"count", "bad", "last_verify", "last_ship"} <= set(backups),
+          f"keys={sorted(backups)}")
+    last_verify = backups.get("last_verify")
+    check("after the verify /health.backups.last_verify records this very snapshot "
+          "as ok (the outcome survives a restart, arch §5.1)",
+          isinstance(last_verify, dict) and last_verify.get("file") == name
+          and last_verify.get("result") == "ok",
+          f"last_verify={last_verify}")
+    info(f"/health.backups: count={backups.get('count')}, bad={backups.get('bad')}, "
+         f"last_ship={backups.get('last_ship')!r}")
+
+
 # ==== run ======================================================================
 async def run_all() -> None:
     global RUN_FINISHED
@@ -3187,6 +3545,14 @@ async def run_all() -> None:
             await run_scenario(13, "LSBN-F-11: the injected-text budget (A/B/C) under the "
                                 "guard and the agent smoke (notes, areas, queues)",
                                lambda: scenario_13_injected_text(c, rest, instructions))
+            await run_scenario(14, "LSBN-F-10: assistant logs — write/read/list/search/"
+                                "update/delete, the entity link, isolation from "
+                                "memory, no secrets in the journal",
+                               lambda: scenario_14_logs(c, rest, instructions))
+            await run_scenario(15, "№14: backups — the snapshot list, the restore verify "
+                                "of the newest snapshot (read-only) and "
+                                "/health.backups observability",
+                               lambda: scenario_15_backups(rest))
             await future_block_todo()
             close_scenario()
             # Все сценарии выполнены: попытка состоялась (отчёт есть, «Total:»
@@ -3306,6 +3672,9 @@ async def main() -> int:
                         help="Bearer token (by default from the environment; never printed)")
     parser.add_argument("--db", default=os.environ.get("DB_PATH", "/data/notes.db"),
                         help="SQLite DB of the contour (wait predicates)")
+    parser.add_argument("--backup-dir", default=os.environ.get("LSB_BACKUP_DIR", ""),
+                        help="BACKUP_DIR of the contour as seen by the runner "
+                             "(scenario 15; empty — derived from --db)")
     parser.add_argument("--prefix", default=os.environ.get("LSB_E2E_PREFIX", "e2e32"),
                         help="run probe prefix (the pre-cleanup matches it)")
     parser.add_argument("--wait-sec", type=float,
@@ -3414,6 +3783,7 @@ async def main() -> int:
         "mcp_url": (args.mcp_url or (args.base_url.rstrip("/") + "/mcp")),
         "token": args.token,
         "db": args.db,
+        "backup_dir": args.backup_dir or str(Path(args.db).parent / "backups"),
         "prefix": args.prefix,
         "wait_sec": args.wait_sec,
         "poll_sec": args.poll_sec,
