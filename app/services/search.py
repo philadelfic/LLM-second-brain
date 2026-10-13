@@ -48,8 +48,9 @@ from typing import Any
 from app.config import Settings
 from app.services.embedding import Embedder, EmbeddingError, EmbeddingService
 from app.services.emit import snippet, summary_of
+from app.services.freshness import parse_updated_after
 from app.services.namespaces import NamespaceError, NamespaceService
-from app.services.ranking import fuse_rrf, match_expression
+from app.services.ranking import fuse_rrf, match_expression, significant_tokens
 from app.storage import chunks, vectors
 from app.storage.db import session
 
@@ -94,6 +95,13 @@ HINT_NO_RESULTS_TITLE = (
     "via memory_list; regular semantic search also searches by text"
 )
 
+# Пустой отдельный поиск ПОМЕТОК (no24-02, arch §13.6): пометки ищутся только
+# здесь — смысловой search их не видит; hint обучает модель различать ручки.
+HINT_NO_COMMENTS = (
+    "no notes with such a comment; comments are searched separately — "
+    "regular search looks at note text only"
+)
+
 
 class SearchValidationError(ValueError):
     """Нарушение доменных ограничений запроса (длина, top_k)."""
@@ -117,6 +125,7 @@ class SearchService:
         top_k: int | None = None,
         namespace: str | None = None,
         namespace_exact: bool = False,
+        updated_after: str | None = None,
     ) -> dict[str, Any]:
         """Гибридный поиск (ARCH §4.2 + Фаза 7); выдача FR-1 без полного текста.
 
@@ -126,6 +135,10 @@ class SearchService:
         узел — NamespaceError (транспорт Шага 3 обернёт в fail + hint).
         Каждый результат несёт свой `namespace` — модель видит, где нашлось
         (слой ориентирования № 3).
+        no29-01: `updated_after` — фильтр свежести (ISO-8601 UTC, граница
+        включающая): в выдачу входят только заметки с `updated_at >= значения`;
+        применяется к обеим сторонам гибрида, сортировка не меняется.
+        Невалидное значение — FreshnessValidationError (мягкий отказ транспорта).
         """
         query = self._validate_query(query)
         top_k = self._default_top_k() if top_k is None else top_k
@@ -136,15 +149,22 @@ class SearchService:
         query_vector = self._query_vector(query)
         expression = self._match_expression(query)
         ns_nodes = self._namespaces.filter_nodes(namespace, namespace_exact)
+        fresh = (
+            parse_updated_after(updated_after)
+            if updated_after is not None
+            else None
+        )
 
         with session(self._settings) as conn:
             vector_hits = (
-                self._vector_candidates(conn, query_vector, ns_nodes)
+                self._vector_candidates(conn, query_vector, ns_nodes, fresh)
                 if query_vector is not None
                 else []
             )
             fts_rows = (
-                self._fts_candidates(conn, expression, ns_nodes) if expression else []
+                self._fts_candidates(conn, expression, ns_nodes, fresh)
+                if expression
+                else []
             )
 
             # --- слияние RRF: score(d) = Σ 1/(RRF_K + rank) -----------------
@@ -183,6 +203,7 @@ class SearchService:
         top_k: int | None = None,
         namespace: str | None = None,
         namespace_exact: bool = False,
+        updated_after: str | None = None,
     ) -> dict[str, Any]:
         """Title-поиск memory_search (lsb-0001-01): FR-2.1/FR-2.2 + решения
         D2/D3 владельца.
@@ -211,7 +232,9 @@ class SearchService:
         search(); незарегистрированный узел — NamespaceError, пробрасывается
         как есть (MCP-транспорт подключит на шаге 03 релиза 2.2 и обернёт
         в fail + hint, как у search). warning в этом режиме не бывает —
-        эмбеддинг не используется.
+        эмбеддинг не используется. no29-01: `updated_after` — фильтр свежести
+        (та же включающая граница, что в search); ранжирование и выдача не
+        меняются.
         """
         query = self._validate_query(query)
         top_k = self._default_top_k() if top_k is None else top_k
@@ -225,6 +248,12 @@ class SearchService:
         if ns_nodes:
             ns_clause = " AND namespace IN (" + ",".join("?" * len(ns_nodes)) + ")"
             ns_params = list(ns_nodes)
+        fresh_clause = ""
+        fresh_params: list[object] = []
+        if updated_after is not None:
+            # no29-01: та же включающая граница свежести, что в search().
+            fresh_clause = " AND updated_at >= ?"
+            fresh_params = [parse_updated_after(updated_after)]
         with session(self._settings) as conn:
             # text — только вход summary_of (pending-fallback §5.5); в выдачу
             # полный текст не идёт (компактный контракт FR-2.2).
@@ -232,8 +261,8 @@ class SearchService:
                 "SELECT id, title, namespace, text, summary, summary_status, "
                 "       created_at, updated_at "
                 "FROM notes WHERE deleted_at IS NULL AND title IS NOT NULL"
-                f"{ns_clause}",
-                ns_params,
+                f"{ns_clause}{fresh_clause}",
+                [*ns_params, *fresh_params],
             ).fetchall()
         needle = query.lower()
         ranked: list[tuple[float, int, sqlite3.Row]] = []
@@ -263,6 +292,77 @@ class SearchService:
         ]
         if not results:
             return {"results": [], "hint": HINT_NO_RESULTS_TITLE}
+        return {"results": results}
+
+    def comment_search(
+        self,
+        query: str,
+        top_k: int | None = None,
+        namespace: str | None = None,
+        namespace_exact: bool = False,
+        updated_after: str | None = None,
+    ) -> dict[str, Any]:
+        """Отдельный поиск ПОМЕТОК (no24-02, arch §13.6): только по comment.
+
+        Ищет по ОТДЕЛЬНОЙ FTS-таблице `notes_comment_fts` (trigram/BM25) —
+        результаты НЕ смешиваются со смысловым `search` (тот смотрит только
+        title/text). Валидация как у `search`: `query` 1..max_query_chars,
+        `top_k` 1..MAX_TOP_K (дефолт default_top_k). `namespace` — узел
+        иерархии (поддерево; `namespace_exact` — только сам узел);
+        незарегистрированный узел — NamespaceError (транспорт даёт hint).
+        no29-01: `updated_after` — включающая граница свежести (n.updated_at).
+        Эмбеддинг не используется — `warning` не бывает (FTS/BM25). Выдача —
+        {id, title, namespace, comment, updated_at} (≤ top_k); пусто → hint.
+        """
+        query = self._validate_query(query)
+        top_k = self._default_top_k() if top_k is None else top_k
+        if not 1 <= top_k <= MAX_TOP_K:
+            raise SearchValidationError(
+                f"top_k: expected 1..{MAX_TOP_K}, got {top_k}"
+            )
+        expression = match_expression(query)
+        ns_nodes = self._namespaces.filter_nodes(namespace, namespace_exact)
+        fresh = (
+            parse_updated_after(updated_after)
+            if updated_after is not None
+            else None
+        )
+        if expression is None:  # все слова короче 3 символов — trigram слеп
+            return {"results": [], "hint": HINT_NO_COMMENTS}
+        params: list[object] = [expression]
+        ns_clause = ""
+        if ns_nodes:
+            ns_ph = ",".join("?" * len(ns_nodes))
+            ns_clause = f" AND n.namespace IN ({ns_ph})"
+            params.extend(ns_nodes)
+        fresh_clause = ""
+        if fresh is not None:
+            fresh_clause = " AND n.updated_at >= ?"
+            params.append(fresh)
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT n.id, n.title, n.namespace, n.comment, n.updated_at, "
+                "       bm25(notes_comment_fts, 1.0) AS badness "
+                "FROM notes_comment_fts "
+                "JOIN notes n ON n.id = notes_comment_fts.rowid "
+                "WHERE notes_comment_fts MATCH ? AND n.deleted_at IS NULL "
+                "AND n.comment IS NOT NULL"
+                f"{ns_clause}{fresh_clause} "
+                "ORDER BY badness, n.updated_at DESC, n.id DESC LIMIT ?",
+                (*params, CANDIDATE_LIMIT),
+            ).fetchall()
+        results = [
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "namespace": row["namespace"],
+                "comment": row["comment"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows[:top_k]
+        ]
+        if not results:
+            return {"results": [], "hint": HINT_NO_COMMENTS}
         return {"results": results}
 
     def similar_notes(
@@ -320,6 +420,67 @@ class SearchService:
         ]
         return results[:pool]
 
+    def similar_by_text(
+        self,
+        text: str,
+        title: str | None,
+        *,
+        exclude_ids: frozenset[int] = frozenset(),
+        limit: int,
+        pool: int,
+        threshold: float,
+        text_chars: int,
+    ) -> list[dict[str, Any]]:
+        """Подсказка «похожее» при записи (№30, arch §6.4/§8/§13.4).
+
+        БЕЗ эмбеддинга и вызовов моделей: вектор свежей заметки ещё не
+        построен (вектор на пути записи запрещён). Кандидаты — из уже
+        существующего FTS-индекса `notes_fts` (как в `DedupService`,
+        `CROSS JOIN` форсит внешний цикл по FTS), близость — **Dice** по
+        множествам значимых слов (`ranking.significant_tokens`) заголовка и
+        первых `text_chars` символов текста; остаются `score >= threshold`
+        (порог включительный), порядок — score DESC, тай-брейк id DESC, не
+        больше `limit`. Возврат — `[{"id", "title", "namespace"}]` (пустой
+        список — нормальный ответ: похожих нет). `exclude_ids` отсекает саму
+        свежую заметку и id чужих дословных дублей; сбой поиска — на совести
+        вызывающего (save оборачивает в try/except), здесь ошибки не глушатся.
+        """
+        head = " ".join(filter(None, [title, text[:text_chars]]))
+        expression = match_expression(head)
+        if expression is None:  # все слова короче 3 символов — trigram слеп
+            return []
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                "SELECT n.id, n.title, n.namespace, n.text "
+                "FROM notes_fts "
+                "CROSS JOIN notes n ON n.id = notes_fts.rowid "
+                "WHERE notes_fts MATCH ? AND n.deleted_at IS NULL "
+                "ORDER BY bm25(notes_fts, ?, 1.0), n.updated_at DESC, n.id DESC "
+                "LIMIT ?",
+                (expression, TITLE_FTS_WEIGHT, pool),
+            ).fetchall()
+        head_tokens = set(significant_tokens(head))
+        scored: list[tuple[float, int, str | None, str]] = []
+        for row in rows:
+            if row["id"] in exclude_ids:
+                continue
+            candidate = " ".join(
+                filter(None, [row["title"], (row["text"] or "")[:text_chars]])
+            )
+            candidate_tokens = set(significant_tokens(candidate))
+            if not head_tokens or not candidate_tokens:
+                continue
+            dice = 2 * len(head_tokens & candidate_tokens) / (
+                len(head_tokens) + len(candidate_tokens)
+            )
+            if dice >= threshold:
+                scored.append((dice, row["id"], row["title"], row["namespace"]))
+        scored.sort(key=lambda item: (-item[0], -item[1]))
+        return [
+            {"id": note_id, "title": cand_title, "namespace": namespace}
+            for _, note_id, cand_title, namespace in scored[:limit]
+        ]
+
     # --- источники кандидатов ------------------------------------------------
 
     def _vector_candidates(
@@ -327,6 +488,7 @@ class SearchService:
         conn: sqlite3.Connection,
         query_vector: list[float],
         ns_nodes: list[str] | None,
+        updated_after: str | None = None,
     ) -> list[tuple[int, float, str | None]]:
         """Векторные кандидаты: чанки → агрегация до заметок + fallback.
 
@@ -337,10 +499,12 @@ class SearchService:
         Возврат уже отсортирован по cosine (для ранга в RRF) и отфильтрован
         по активности и порогу.
         """
-        by_chunk_source = self._chunk_candidates(conn, query_vector, ns_nodes)
+        by_chunk_source = self._chunk_candidates(conn, query_vector, ns_nodes, updated_after)
         # Fallback Фазы 7: заметки, у которых нет готовых чанк-векторов
         # (legacy/пending), ищутся по полному тексту, как в Фазе 3.
-        for note_id, cosine in self._full_text_candidates(conn, query_vector, ns_nodes):
+        for note_id, cosine in self._full_text_candidates(
+            conn, query_vector, ns_nodes, updated_after
+        ):
             if note_id not in by_chunk_source:
                 by_chunk_source[note_id] = (cosine, None)
         ranked = sorted(
@@ -356,6 +520,7 @@ class SearchService:
         conn: sqlite3.Connection,
         query_vector: list[float],
         ns_nodes: list[str] | None,
+        updated_after: str | None = None,
     ) -> dict[int, tuple[float, str]]:
         """KNN по notes_chunks_vec (топ-50) → одна запись на заметку.
 
@@ -364,7 +529,8 @@ class SearchService:
         с cosine лучшего чанка (brief §6). Чанки trash-заметок отбрасываются
         пост-фильтром (vec0 не знает о notes). Фаза 10: KNN сканирует партиции
         узлов поддерева (ns_nodes) — или глобально; trash-окно считается
-        в тех же партициях.
+        в тех же партициях. no29-01: `updated_after` — включающая граница
+        свежести в наборе активных кандидатов (`active`-запрос).
         """
         if ns_nodes:
             ns_ph = ",".join("?" * len(ns_nodes))
@@ -373,6 +539,11 @@ class SearchService:
         else:
             ns_clause = ""
             ns_params = []
+        fresh_clause = ""
+        fresh_params: list[object] = []
+        if updated_after is not None:
+            fresh_clause = " AND n.updated_at >= ?"
+            fresh_params = [updated_after]
         trash = conn.execute(
             "SELECT COUNT(*) FROM notes_chunks_vec WHERE chunk_id IN "
             "(SELECT c.id FROM notes_chunks c JOIN notes n ON n.id = c.note_id "
@@ -391,8 +562,8 @@ class SearchService:
                 "SELECT c.id, c.note_id, c.text FROM notes_chunks c "
                 "JOIN notes n ON n.id = c.note_id "
                 f"WHERE n.deleted_at IS NULL AND c.id IN ({placeholders})"
-                f"{ns_clause}",
-                [chunk_id for chunk_id, _ in hits] + ns_params,
+                f"{ns_clause}{fresh_clause}",
+                [chunk_id for chunk_id, _ in hits] + ns_params + fresh_params,
             )
         }
         by_note: dict[int, tuple[float, str]] = {}
@@ -414,13 +585,15 @@ class SearchService:
         conn: sqlite3.Connection,
         query_vector: list[float],
         ns_nodes: list[str] | None,
+        updated_after: str | None = None,
     ) -> list[tuple[int, float]]:
         """Топ-50 активных по косинусу полного текста + гейт порога (FR-1).
 
         Окно KNN расширяется на число trash-векторов, пост-фильтр оставляет
         только активные. Заметки, уже попавшие в чанк-агрегацию, здесь
         отфильтруются наверху (они не fallback). Фаза 10: KNN — в партициях
-        узлов поддерева, активные — только из тех же узлов.
+        узлов поддерева, активные — только из тех же узлов. no29-01:
+        `updated_after` — включающая граница свежести в `active`-запросе.
         """
         if ns_nodes:
             ns_ph = ",".join("?" * len(ns_nodes))
@@ -429,6 +602,11 @@ class SearchService:
         else:
             ns_clause = ""
             ns_params = []
+        fresh_clause = ""
+        fresh_params: list[object] = []
+        if updated_after is not None:
+            fresh_clause = " AND updated_at >= ?"
+            fresh_params = [updated_after]
         trash = conn.execute(
             "SELECT COUNT(*) FROM notes_vec WHERE note_id IN "
             "(SELECT id FROM notes WHERE deleted_at IS NOT NULL"
@@ -443,8 +621,8 @@ class SearchService:
             row[0]
             for row in conn.execute(
                 f"SELECT id FROM notes WHERE deleted_at IS NULL "
-                f"{ns_clause} AND id IN ({placeholders})",
-                ns_params + [note_id for note_id, _ in hits],
+                f"{ns_clause}{fresh_clause} AND id IN ({placeholders})",
+                ns_params + fresh_params + [note_id for note_id, _ in hits],
             )
         }
         threshold = self._settings.score_threshold
@@ -459,11 +637,13 @@ class SearchService:
         conn: sqlite3.Connection,
         expression: str,
         ns_nodes: list[str] | None,
+        updated_after: str | None = None,
     ) -> list[sqlite3.Row]:
         """Топ-50 FTS5/BM25 по активным заметкам в узлах поддерева; rank с 1 —
         для RRF. Фаза 10: фильтр namespace — JOIN'ом на notes (FTS-индекс
         не пересоздаётся, бриф Шаг 1). lsb-0001-01 (FR-1.2): веса bm25
         (TITLE_FTS_WEIGHT, 1.0) — совпадение в title выше совпадения в text.
+        no29-01: `updated_after` — включающая граница свежести (`n.updated_at`).
         """
         if ns_nodes:
             ns_ph = ",".join("?" * len(ns_nodes))
@@ -474,12 +654,17 @@ class SearchService:
         else:
             ns_clause = ""
             params = [TITLE_FTS_WEIGHT, 1.0, expression]
+        fresh_clause = ""
+        if updated_after is not None:
+            fresh_clause = " AND n.updated_at >= ?"
+            params = [*params, updated_after]
         return conn.execute(
             "SELECT n.id, n.text, n.summary, n.summary_status, n.author, "
             "       n.namespace, n.created_at, n.updated_at, "
             "       bm25(notes_fts, ?, ?) AS badness "
             "FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid "
-            f"WHERE notes_fts MATCH ?{ns_clause} AND n.deleted_at IS NULL "
+            f"WHERE notes_fts MATCH ?{ns_clause} AND n.deleted_at IS NULL"
+            f"{fresh_clause} "
             "ORDER BY badness, n.updated_at DESC, n.id DESC LIMIT ?",
             (*params, CANDIDATE_LIMIT),
         ).fetchall()

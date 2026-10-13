@@ -2,7 +2,8 @@
 компактные выдачи, hint'ы мягких отказов, антисинонимия создания.
 
 ARCH lsb-0007 §3.3–3.4, §3.8: описания инструментов и hint'ы — дословный канон
-(сверяем литералами), выдачи компактны (тело навыка — только `skills_get`),
+(сверяем литералами), выдачи компактны (тело навыка — только `skills_get`) —
+№38 (3.2.0): подсказка поиска одна на ответ, в элементах `results` её нет,
 антисинонимия создания живёт в сервисном слое (её же обязан звать REST
 POST /skills) и проверяется здесь сквозь MCP-поверхность. Поверхность —
 in-process MCP (живой uvicorn — tests/test_mcp.py): caplog видит событие
@@ -43,38 +44,35 @@ CANON_TOOL_DESCRIPTIONS = {
         "skills are stored procedures (how-to), kept separately from notes. "
         "Empty result = there is no such skill — do not browse skills without "
         "reason. Returns short hits (id, name, description); the full "
-        "procedure — only via skills_get."
+        "procedure — only via `skills_get`."
     ),
     "skills_list": (
-        "List all available skills (id, name, description) — compact, without "
+        "List available skills (id, name, description) — compact, without "
         "bodies. Use it to see which routines this memory already has; many "
         "conversations need no skills at all."
     ),
     "skills_get": (
-        "Read a full skill by id: name + description + example (if any) + "
-        "steps (the order) + text (what exactly each step does), composed over "
-        "the global instruction_template (how to execute steps). Follow it as "
-        "a procedure when the task matches its description; if a step cannot "
-        "be executed, stop and report what is missing instead of skipping it."
+        "Read a full skill by id: description, example (if any), steps (the "
+        "order) and text (what exactly each step does), composed over the "
+        "global instruction_template. Follow it as a procedure when the task "
+        "matches its description; if a step cannot be executed, stop and "
+        "report what is missing instead of skipping it."
     ),
     "skills_save": (
         "Create a new skill or update an existing one by id. A skill is a "
-        "stored procedure: name ≤65 characters (≤5 words recommended), "
-        "description ≤250 (what it does), steps ≤500 (the order: what after "
-        "what), text ≤4000 (what exactly each step does); optional example "
-        "≤1000 and optional class fields (trigger, mode, preconditions, "
-        "fallbacks, invariant, exceptions, guardrails, references, "
-        "output_contract, behavior_contract) — only when this skill class "
-        "needs them. Run skills_search first: if a similar skill exists, "
-        "update it instead of creating a duplicate (a too-similar creation is "
-        "refused with a hint). Read the skill via skills_get before editing; "
-        "every update keeps the previous version as a copy automatically."
+        "stored procedure: name (short, ≤5 words recommended), description "
+        "(what it does), steps (the order: what after what), text (what "
+        "exactly each step does), plus optional example and class fields (see "
+        "the `extra` field) — only when this skill class needs them. Run "
+        "`skills_search` first: a similar skill is edited, not duplicated (a "
+        "too-similar creation is refused). Read the skill via `skills_get` "
+        "before editing; every update keeps the previous version as a copy."
     ),
     "skills_delete": (
         "Delete a skill by id (soft delete: it disappears from search, list "
-        "and the skills announce; restoring is the operator's job). Delete "
-        "only a skill that is factually wrong, fully duplicates another one "
-        "or was created by mistake."
+        "and the announce; restoring is the operator's job). Delete only a "
+        "skill that is factually wrong, fully duplicates another one or was "
+        "created by mistake."
     ),
 }
 
@@ -93,15 +91,15 @@ CANON_FIELD_DESCRIPTIONS = {
     "skills_get": {"id": "Skill id"},
     "skills_save": {
         "name": "Skill name: ≤65 characters (≤5 words recommended)",
-        "description": "What it does: ≤250 characters",
-        "steps": "The order: what after what: ≤500 characters",
-        "text": "What exactly each step does: ≤4000 characters",
+        "description": "What it does: ≤400 characters",
+        "steps": "The order: what after what: ≤1000 characters",
+        "text": "What exactly each step does: ≤7500 characters",
         "id": "Skill id to update; omitted — create a new skill",
-        "example": "Optional example: ≤1000 characters",
+        "example": "Optional example: ≤2000 characters",
         "extra": (
             "Optional class fields (trigger, mode, preconditions, fallbacks, "
             "invariant, exceptions, guardrails, references, output_contract, "
-            "behavior_contract; each ≤500 characters, together ≤2000) — only "
+            "behavior_contract; each ≤1000 characters, together ≤4000) — only "
             "when this skill class needs them"
         ),
     },
@@ -113,12 +111,12 @@ CANON_HINT_NAME_LIMIT = (
     "skill not saved: name limit is 65 characters (≤5 words recommended)"
 )
 CANON_HINT_DESCRIPTION_LIMIT = (
-    "skill not saved: description limit is 250 characters — shorten it"
+    "skill not saved: description limit is 400 characters — shorten it"
 )
-CANON_HINT_STEPS_LIMIT = "skill not saved: steps limit is 500 characters — shorten it"
-CANON_HINT_TEXT_LIMIT = "skill not saved: text limit is 4000 characters — shorten it"
+CANON_HINT_STEPS_LIMIT = "skill not saved: steps limit is 1000 characters — shorten it"
+CANON_HINT_TEXT_LIMIT = "skill not saved: text limit is 7500 characters — shorten it"
 CANON_HINT_EXAMPLE_LIMIT = (
-    "skill not saved: example limit is 1000 characters — shorten it"
+    "skill not saved: example limit is 2000 characters — shorten it"
 )
 CANON_HINT_NOT_FOUND = (
     "skill not found (possibly deleted); the actual list — skills_list"
@@ -127,6 +125,7 @@ CANON_HINT_SEARCH_EMPTY = (
     "no skill found for this task — do the task as usual; if you worked out a "
     "repeatable procedure, save it via skills_save"
 )
+CANON_HINT_SKILLS_BODY = "skill bodies are read only via skills_get"
 CANON_HINT_SIMILAR_SKILL = (
     "there is a similar skill: {id} — {name}; reuse or update it "
     "(skills_save with id=…) or make this skill clearly different"
@@ -143,6 +142,7 @@ MEMORY_TOOL_NAMES = frozenset(
         "memory_delete",
         "memory_namespaces",
         "memory_namespace_create",
+        "memory_comment_search",
     }
 )
 
@@ -155,6 +155,10 @@ USER_TOOL_NAMES = frozenset(
 
 # 3 ручки области terms (lsb-0008-02) — поверхность релиза 3.0.0 растёт.
 TERMS_TOOL_NAMES = frozenset({"terms_search", "terms_save", "terms_get"})
+# №41 (3.2.0): пара общих инструментов чтения истории (§13.14).
+HISTORY_TOOL_NAMES = frozenset({"history_list", "history_get"})
+# №12 (no12-02): одна точка чтения предупреждений — ядро поверхности.
+WARNINGS_TOOL_NAMES = frozenset({"warnings_list"})
 
 
 def form(**overrides: object) -> dict[str, object]:
@@ -247,9 +251,19 @@ class TestToolRegistry:
         assert set(CANON_TOOL_DESCRIPTIONS) <= names
         assert names - set(CANON_TOOL_DESCRIPTIONS) == (
             MEMORY_TOOL_NAMES | USER_TOOL_NAMES | TERMS_TOOL_NAMES
+            | HISTORY_TOOL_NAMES | WARNINGS_TOOL_NAMES
         )
-        assert set(TOOL_NAMES) == names
-        assert len(names) == 21
+        # Логи (f10-02/03) в этой DI-сборке не собраны (`services.logs is None`):
+        # их ручек в поверхности нет, остальное совпадает со словарём TOOL_NAMES.
+        assert set(TOOL_NAMES) - {
+            "logs_save",
+            "logs_get",
+            "logs_update",
+            "logs_delete",
+            "logs_search",
+            "logs_list",
+        } == names
+        assert len(names) == 25
 
     @pytest.mark.asyncio
     async def test_tool_descriptions_are_canon_verbatim(self, mcp_skills) -> None:
@@ -266,6 +280,24 @@ class TestToolRegistry:
             assert set(props) == set(expected), tool_name
             for param, description in expected.items():
                 assert props[param]["description"] == description, (tool_name, param)
+
+    @pytest.mark.asyncio
+    async def test_field_descriptions_carry_new_limits(self, mcp_skills) -> None:
+        """Числа формы навыков в схеме — новые (решение О. 12.10.2026, канон §6).
+
+        Дословный зеркальный тест выше правится вместе со схемой и потому «оба
+        места по-старому» не ловит; здесь числа заданы литералами: description
+        400, steps 1000, text 7500, example 2000, поле класса 1000 / сумма 4000.
+        `name` (65) и бюджет анонса (2000) решением не трогали.
+        """
+        schemas = await _tool_schemas(mcp_skills)
+        props = schemas["skills_save"]["properties"]
+        assert "≤65 characters" in props["name"]["description"]
+        assert "≤400 characters" in props["description"]["description"]
+        assert "≤1000 characters" in props["steps"]["description"]
+        assert "≤7500 characters" in props["text"]["description"]
+        assert "≤2000 characters" in props["example"]["description"]
+        assert "each ≤1000 characters, together ≤4000" in props["extra"]["description"]
 
     @pytest.mark.asyncio
     async def test_required_params_and_bounds(self, mcp_skills) -> None:
@@ -291,24 +323,29 @@ class TestToolRegistry:
         """Страховка к анонсу: перед рутиной — search/list, тело — только get."""
         search = CANON_TOOL_DESCRIPTIONS["skills_search"]
         assert "BEFORE doing a routine or repeatable task" in search
-        assert "the full procedure — only via skills_get" in search
+        assert "the full procedure — only via `skills_get`" in search
         assert "do not browse skills without reason" in search
         # save требует поиска перед созданием и чтения перед правкой.
         save = CANON_TOOL_DESCRIPTIONS["skills_save"]
-        assert "Run skills_search first" in save
-        assert "Read the skill via skills_get before editing" in save
+        assert "Run `skills_search` first" in save
+        assert "Read the skill via `skills_get` before editing" in save
         assert "skills_search" in TOOL_DESCRIPTIONS["skills_save"]
 
     def test_instructions_not_changed_by_this_pool(self, test_env: dict[str, str]) -> None:
-        """Анонс скиллов — отдельный пул 7-04: база и карта не тронуты."""
+        """Анонс скиллов — хвост: база переписана ядром F-11 (f11-02), карта та же.
+
+        lsb-0007-04 фиксировал, что тот пул базу не трогал; LSBN-F-11 (f11-02)
+        базу ПЕРЕПИСАЛ в короткое ядро — теперь она несёт указатели на области
+        (в т.ч. на навыки), а манифест и карта узлов остаются на месте.
+        """
         settings = get_settings()
         init_db(settings)
         services = _services(settings, HashEmbedder(DIM))
         instructions = build_instructions(services)
         assert instructions.startswith(SERVER_INSTRUCTIONS)
         assert "Node map (path: description)" in instructions
-        # В этом пуле тексты описаний инструментов и манифест не менялись.
-        assert "skill" not in SERVER_INSTRUCTIONS.lower()
+        assert "`skills_get`" in SERVER_INSTRUCTIONS
+        assert "`history_list`" in SERVER_INSTRUCTIONS
         # Блок анонса — хвост пула 7-04 (его регресс — test_skills_announce.py).
         assert "Available skills (id — name: description):" in instructions
 
@@ -387,11 +424,32 @@ class TestCompactOutputs:
         got = (
             await mcp_skills.call_tool("skills_search", {"query": "deploy the service"})
         ).structured_content
-        assert set(got) == {"results"}  # warning сервиса срезан
+        assert set(got) == {"results", "hint"}  # warning сервиса срезан
         hit = got["results"][0]
         assert hit["id"] == skill_id
         assert set(hit) == {"id", "name", "description", "score"}
         assert "text" not in hit and "steps" not in hit  # тела в выдаче нет
+
+    @pytest.mark.asyncio
+    async def test_compact_search_single_hint(self, mcp_skills) -> None:
+        """№38: подсказка поиска — одна на ответ (верхний уровень), не в элементах;
+
+        непустой → `HINT_SKILLS_BODY` (≤120 симв.), пустой → ровно один
+        `HINT_SEARCH_EMPTY` (второй подсказки нет).
+        """
+        assert (await _save(mcp_skills))["created"] is True
+        got = (
+            await mcp_skills.call_tool("skills_search", {"query": "deploy the service"})
+        ).structured_content
+        assert got["results"]
+        assert got["hint"] == CANON_HINT_SKILLS_BODY
+        assert len(got["hint"]) <= 120  # бюджет вшитого текста (F-11)
+        assert all("hint" not in hit for hit in got["results"])
+
+        empty = (
+            await mcp_skills.call_tool("skills_search", {"query": "нет такого навыка"})
+        ).structured_content
+        assert empty == {"results": [], "hint": CANON_HINT_SEARCH_EMPTY}
 
     @pytest.mark.asyncio
     async def test_delete_is_compact(self, mcp_skills) -> None:
@@ -409,7 +467,8 @@ class TestCompactOutputs:
                 "memory_save", {"text": "регресс выдач заметок", "title": "Регресс"}
             )
         ).structured_content
-        assert set(saved) == {"id", "stored", "summary_pending"}
+        # №28: save без `namespace` добавляет `namespace_hint` — поля-скелет те же.
+        assert {"id", "stored", "summary_pending"} <= set(saved)
         note_id = saved["id"]
         got = (
             await mcp_notes.call_tool("memory_get", {"ids": [note_id]})
@@ -422,6 +481,7 @@ class TestCompactOutputs:
             "updated_at",
             "namespace",
             "expires_at",
+            "comment",  # no24-01 (3.2.0)
         }
         listed = (await mcp_notes.call_tool("memory_list", {})).structured_content
         assert set(listed["items"][0]) == {

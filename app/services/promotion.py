@@ -293,8 +293,9 @@ class StructureJudgeService:
                         else "нет близких узлов"
                     ),
                 ),
-                num_predict=self._settings.judge_num_predict,
+                num_predict=self._settings.judge_num_predict or None,
                 think=self._think(),
+                operation="judge",  # №49: legacy-потолок/авто-бюджет слота judge
             )
         except LLMError as exc:
             # Текст клиента сохраняется: HTTP-статус, адрес слота, hint

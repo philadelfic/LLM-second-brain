@@ -74,6 +74,20 @@ def make_worker(settings, embedding, summarizer=None) -> BackgroundWorker:
     return BackgroundWorker(settings, embedding, summarizer)
 
 
+def _wait_until(fn, timeout: float = 5.0) -> bool:
+    """Поллинг наблюдаемого состояния (поле/счётчик), а не паузы наугад.
+
+    lsbdef-0009/0010: ожидание события воркера (интервал back-off, счётчик
+    очереди, запись в БД) — детерминированная замена гонке по времени.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if fn():
+            return True
+        time.sleep(0.05)
+    return False
+
+
 # --- партии ------------------------------------------------------------------
 
 
@@ -327,6 +341,19 @@ async def test_stop_terminates_idle_loop(fast) -> None:
 # --- жизненный цикл приложения ------------------------------------------
 
 
+@pytest.fixture
+def fast_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Страховочный интервал воркера 1 с — «часы» его стартового прогона.
+
+    lsbdef-0009: тесту нужен наблюдаемый признак «embedding-петля прошла
+    стартовый прогон» — это рост её интервала back-off. Фикстура объявлена в
+    тесте ПЕРЕД `client`: pytest ставит фикстуры в порядке параметров, поэтому
+    окружение применяется до сборки приложения (иначе интервал был бы 30 с).
+    """
+    monkeypatch.setenv("PENDING_RETRY_SEC", "1")
+    get_settings.cache_clear()
+
+
 def test_app_lifespan_starts_and_stops_worker(client, test_env) -> None:
     """create_app: воркер живёт в lifespan и корректно гасится (TestClient)."""
     response = client.get("/health")
@@ -334,9 +361,21 @@ def test_app_lifespan_starts_and_stops_worker(client, test_env) -> None:
     assert response.json()["embedding_ok"] is None  # попыток не было
 
 
-def test_save_makes_no_embedding_attempt(client, token) -> None:
+def test_save_makes_no_embedding_attempt(fast_backoff, client, token) -> None:
     """Фаза 8: save не кодирует синхронно — embedding_ok остаётся None
-    (попыток кодирования не было), заметка стоит в очереди pending_vector."""
+    (попыток кодирования не было), заметка стоит в очереди pending_vector.
+
+    lsbdef-0009: перед сохранением ждём наблюдаемое состояние воркера —
+    embedding-петля прошла стартовый прогон и ушла в ожидание (её страховочный
+    интервал вырос). Без этого ожидания запрос гонялся со стартовым прогоном:
+    подхваченная им заметка давала реальную (неуспешную) попытку кодирования,
+    и /health отдавал embedding_ok=false — ложный красный полного прогона.
+    """
+    worker = client.app.state.worker
+    start_interval = float(get_settings().pending_retry_sec)
+    assert _wait_until(lambda: worker.interval > start_interval), (
+        "embedding-петля не ушла в ожидание — стартовый прогон не завершён"
+    )
     client.post(
         "/notes",
         # Фаза 11, follow-up 5b: REST strict — POST без title → 422;
@@ -587,6 +626,9 @@ async def test_backoff_independent_per_queue(slow) -> None:
     assert worker.interval > 1.0  # векторная очередь в back-off
     # «чиним» суммаризатор на лету: summary-петля разгребает свою очередь
     worker._summarizer = FixedSummarizer("Позднее, но успешное суммари.")
+    # №39: отказы суммаризации открыли паузу слота summary (потолок back-off) —
+    # «починив» слот, снимаем разрыв так же, как это делает успешный стук.
+    worker._breakers["summary"].note_success()
     status = None
     deadline = time.monotonic() + 6.0
     while time.monotonic() < deadline:
@@ -594,7 +636,14 @@ async def test_backoff_independent_per_queue(slow) -> None:
             status = conn.execute(
                 "SELECT summary_status FROM notes WHERE id = 1"
             ).fetchone()[0]
-        if status == "ok":
+        # lsbdef-0010: успех виден по наблюдаемому состоянию — запись 'ok' в БД
+        # И сброшенный интервал своей очереди. Петля сбрасывает интервал уже
+        # ПОСЛЕ коммита записи (и может не успеть до task.cancel() — тогда
+        # мгновенный assert читал промежуточное состояние: под нагрузкой
+        # полного прогона 2.0 != 1.0).
+        if status == "ok" and worker.summary_interval == float(
+            slow.pending_retry_sec
+        ):
             break
         await asyncio.sleep(0.05)
     worker.stop()
@@ -1173,7 +1222,9 @@ async def test_summary_loop_rechecks_queue_before_sleep(slow) -> None:
 @pytest.mark.asyncio
 async def test_judge_loop_rechecks_queue_before_sleep(slow) -> None:
     """Пул 6 (lost wakeup) для judge-петли: notify во время обработки партии
-    не теряется — перед сном перепроверка очереди (_judge_queue_empty)."""
+    не теряется — перед сном перепроверка очереди (_judge_queue_empty) даёт
+    работе ОДИН немедленный прогон (№39, no39-05: прогон без прогресса —
+    не повод крутиться вхолостую: дальше back-off)."""
     worker = make_worker(slow, HashEmbedder(8))
     calls = {"n": 0}
 
@@ -1184,6 +1235,16 @@ async def test_judge_loop_rechecks_queue_before_sleep(slow) -> None:
             # — добавляем judge-работу + сигнал.
             worker._create_job("judge", "dedup", 999)
             worker.notify_judge_pending()
+            return 0
+        # Немедленный lost-wakeup прогон задание действительно берёт — и только
+        # он: дальше очередь пуста и петля спит по back-off.
+        if calls["n"] == 2:
+            with session(slow) as conn, transaction(conn):
+                conn.execute(
+                    "UPDATE worker_jobs SET status = 'done' "
+                    "WHERE slot = 'judge' AND kind = 'dedup' AND status = 'pending'"
+                )
+            return 1
         return 0
 
     worker.process_judge_pending = racy_batch
@@ -1203,13 +1264,14 @@ async def test_judge_loop_rechecks_queue_before_sleep(slow) -> None:
     try:
         task = asyncio.create_task(worker._run_judge())
         # петля продолжила БЕЗ сна: повторная итерация наступает сразу.
-        while calls["n"] < 3:
+        deadline = time.monotonic() + 2.0
+        while calls["n"] < 2 and time.monotonic() < deadline:
             await asyncio.sleep(0.01)
         worker.stop()
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-        assert calls["n"] >= 3
+        assert calls["n"] >= 2
     finally:
         asyncio.wait_for = orig_wait_for
 

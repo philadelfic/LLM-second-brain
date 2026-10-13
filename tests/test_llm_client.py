@@ -310,8 +310,11 @@ class TestAuthErrors:
     def test_401_ollama_is_plain_error_without_key_hint(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Ollama Bearer не шлёт — его 401 не про ключ: обычный LLMError,
-        hint про {SLOT}_API_KEY не вводит в заблуждение."""
+        """Ollama Bearer не шлёт — его 401 не про ключ: обычный LLMError
+        БЕЗ hint про {SLOT}_API_KEY, но с признаком `auth`: исход вызова —
+        AUTH (arch §6.1 «401/403 — ждать бессмысленно»; приёмка 13.10.2026,
+        ветвь auth сценария 3).
+        """
         settings = make_settings(monkeypatch, SUMMARY_PROVIDER="ollama")
         client, recorder = make_client(
             SlotSpec.for_summary(settings), [httpx.Response(401, text="denied")]
@@ -320,6 +323,25 @@ class TestAuthErrors:
             client.chat(SYSTEM, USER, num_predict=10)
         assert not isinstance(exc_info.value, LLMAuthError)
         assert "API_KEY" not in str(exc_info.value)
+        assert exc_info.value.transient is False
+        assert exc_info.value.auth is True
+        assert exc_info.value.status == 401
+        assert recorder.calls == 1
+
+    def test_403_ollama_is_plain_error_with_auth_flag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """403 у ollama-слота: тот же признак `auth` (отказ доступа — не
+        «ответ не по контракту»); одна попытка, без ретрая.
+        """
+        settings = make_settings(monkeypatch, JUDGE_PROVIDER="ollama")
+        client, recorder = make_client(
+            SlotSpec.for_judge(settings), [httpx.Response(403, text="denied")]
+        )
+        with pytest.raises(LLMError) as exc_info:
+            client.chat(SYSTEM, USER, num_predict=10)
+        assert not isinstance(exc_info.value, LLMAuthError)
+        assert exc_info.value.auth is True
         assert exc_info.value.transient is False
         assert recorder.calls == 1
 
@@ -365,6 +387,20 @@ class TestTransientErrors:
             assert exc_info.value.transient is True
             assert "недоступен" in str(exc_info.value)
             assert recorder.calls == 1
+
+    def test_timeout_flag_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Отдельный признак таймаута (№39 §6.3): транспортный таймаут помечен
+        и timeout, и transient — исход различается на границе клиента."""
+        settings = make_settings(monkeypatch)
+        client, recorder = make_client(
+            SlotSpec.for_summary(settings), [httpx.ReadTimeout("timed out")]
+        )
+        with pytest.raises(LLMError) as exc_info:
+            client.chat(SYSTEM, USER, num_predict=10)
+        assert exc_info.value.timeout is True
+        assert exc_info.value.transient is True
+        assert exc_info.value.empty is False
+        assert recorder.calls == 1
 
     def test_openai_429_transient_no_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """429 у openai — транзиент (эмбеддер ретраит), ретрая в клиенте нет."""
@@ -431,6 +467,17 @@ class TestChatParsing:
         )
         with pytest.raises(LLMError, match="пустой content"):
             client.chat(SYSTEM, USER, num_predict=10)
+
+    def test_empty_flag_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Пустой content помечен empty (№39 §6.3): «пусто» ≠ «недоступность»."""
+        settings = make_settings(monkeypatch)
+        client, _ = make_client(
+            SlotSpec.for_summary(settings), [ollama_chat_ok("   ")]
+        )
+        with pytest.raises(LLMError, match="пустой content") as exc_info:
+            client.chat(SYSTEM, USER, num_predict=10)
+        assert exc_info.value.empty is True
+        assert exc_info.value.transient is False
 
     def test_content_stripped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         settings = make_settings(monkeypatch)
@@ -677,7 +724,7 @@ class TestSlotsAndTimeouts:
             [],
         )
         assert openai_client._client.timeout.connect == CONNECT_TIMEOUT_SEC_OPENAI == 10.0
-        assert ollama_client._client.timeout.read == 60.0  # SUMMARY_TIMEOUT_SEC дефолт
+        assert ollama_client._client.timeout.read == 900.0  # SUMMARY_TIMEOUT_SEC дефолт (№49: было 60)
 
     def test_close_is_idempotent_enough(self, monkeypatch: pytest.MonkeyPatch) -> None:
         client, _ = make_client(SlotSpec.for_summary(make_settings(monkeypatch)), [])

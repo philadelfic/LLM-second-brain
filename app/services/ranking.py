@@ -21,9 +21,26 @@ from collections.abc import Sequence
 _TOKEN_SPLIT_RE = re.compile(r"[^0-9A-Za-zА-Яа-яЁё]+")
 
 
+def significant_tokens(text: str) -> list[str]:
+    """Значимые токены текста: слова ≥3 символов плюс ≥3-символьные части
+    составных токенов, в порядке текста, без дублей (BUG-001).
+
+    «open-webui» → «open-webui», «open», «webui» — FTS ловит тексты, где
+    написание отличается («Open WebUI»); «отчёт» → только «отчёт». Порядок
+    текста сохраняется (первое вхождение), повтор не добавляется.
+    """
+    tokens: list[str] = []
+    for word in text.split():
+        if len(word) >= 3:
+            tokens.append(word)
+        for part in _TOKEN_SPLIT_RE.split(word):
+            if len(part) >= 3 and part != word:
+                tokens.append(part)
+    return list(dict.fromkeys(tokens))
+
+
 def match_expression(query: str) -> str | None:
-    """Слова ≥3 символов (плюс ≥3-символьные части составных токенов) как
-    цитированные подстроки через OR.
+    """Значимые слова запроса как цитированные подстроки через OR (FTS).
 
     OR, а не AND (BUG-001): AND выкидывал заметку целиком, если хотя бы одно
     слово запроса не встречалось в её тексте. При OR BM25 ранжирует по
@@ -31,18 +48,11 @@ def match_expression(query: str) -> str | None:
     отсекается RRF-слиянием и top_k. None — нет ни одного слова, по которому
     trigram вообще может искать (все слова короче 3 символов).
     """
-    tokens: list[str] = []
-    for word in query.split():
-        if len(word) >= 3:
-            tokens.append(word)
-        for part in _TOKEN_SPLIT_RE.split(word):
-            if len(part) >= 3 and part != word:
-                tokens.append(part)
-    unique = dict.fromkeys(tokens)
-    if not unique:
+    tokens = significant_tokens(query)
+    if not tokens:
         return None
     return " OR ".join(
-        f'"{token.replace(chr(34), chr(34) * 2)}"' for token in unique
+        f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens
     )
 
 

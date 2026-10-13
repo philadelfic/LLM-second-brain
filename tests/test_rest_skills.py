@@ -76,7 +76,7 @@ class TestSkillsCrud:
         assert long_name.status_code == 422
         assert long_name.json()["detail"] == HINT_NAME_LIMIT
         long_text = client.post(
-            "/skills", json=form(text="t" * 4001), headers=_headers(token)
+            "/skills", json=form(text="t" * 7501), headers=_headers(token)
         )
         assert long_text.status_code == 422
         assert long_text.json()["detail"] == HINT_TEXT_LIMIT
@@ -145,9 +145,10 @@ class TestSkillsCrud:
         ).json()
         assert empty["results"] == [] and empty["hint"] == HINT_SEARCH_EMPTY
 
-    def test_update_keeps_version_in_archive(
+    def test_update_writes_history_not_legacy_archive(
         self, client: TestClient, token: str
     ) -> None:
+        """Правка пишет общую историю; legacy-архив больше не наполняется (§13.7)."""
         _create(client, token)
         updated = client.put(
             "/skills/1", json=form(text="Run make deploy v2."),
@@ -158,14 +159,15 @@ class TestSkillsCrud:
         assert client.get(
             "/skills/1", headers=_headers(token)
         ).json()["text"] == "Run make deploy v2."
+        # §13.7: псевдоним читает ОБЩУЮ историю и отдаёт прежнюю форму
+        # ответа — правка даёт вторую версию, обе реконструируются.
         archive = client.get(
             "/skills/1/versions", headers=_headers(token)
         ).json()
-        assert archive["id"] == 1 and len(archive["versions"]) == 1
-        copy = archive["versions"][0]
-        assert copy["version"] == 1  # номер прежней версии сохраняется
-        assert copy["text"] == "Run make deploy, then check /health."
-        assert copy["created_at"] and copy["extra"] is None
+        assert archive["id"] == 1
+        assert [v["version"] for v in archive["versions"]] == [2, 1]
+        assert archive["versions"][0]["text"] == "Run make deploy v2."
+        assert archive["versions"][1]["text"] == "Run make deploy, then check /health."
         # Архив не участвует в выдачах: листинг/поиск тел и копий не несут.
         assert client.get("/skills", headers=_headers(token)).json()["total"] == 1
         assert len(client.get(
@@ -177,7 +179,7 @@ class TestSkillsCrud:
     ) -> None:
         _create(client, token)
         bad = client.put(
-            "/skills/1", json=form(steps="s" * 501), headers=_headers(token)
+            "/skills/1", json=form(steps="s" * 1001), headers=_headers(token)
         )
         assert bad.status_code == 422
         assert "steps limit" in bad.json()["detail"]
@@ -229,7 +231,7 @@ class TestSkillsInstructionTemplate:
     def test_validation_422(self, client: TestClient, token: str) -> None:
         long = client.put(
             "/skills/instruction-template",
-            json={"instruction_template": "x" * 1001},
+            json={"instruction_template": "x" * 2001},
             headers=_headers(token),
         )
         assert long.status_code == 422

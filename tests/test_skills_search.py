@@ -19,6 +19,7 @@ from app.services.notes import NoteService
 from app.services.search import MAX_TOP_K, WARNING_FTS_ONLY, SearchService
 from app.services.skills import (
     HINT_SEARCH_EMPTY,
+    HINT_SKILLS_BODY,
     SkillValidationError,
     SkillsService,
 )
@@ -34,6 +35,10 @@ CANON_HINT_SEARCH_EMPTY = (
     "no skill found for this task — do the task as usual; if you worked out a "
     "repeatable procedure, save it via skills_save"
 )
+
+# №38: дословная короткая подсказка непустого поиска — «тело — только
+# `skills_get`» (EN, ≤120 симв.; правится только в арх-доке §7.4).
+CANON_HINT_SKILLS_BODY = "skill bodies are read only via skills_get"
 
 
 @pytest.fixture
@@ -99,7 +104,8 @@ class TestSearchHybrid:
         result = service.search("deploy the service")
         assert [hit["id"] for hit in result["results"]] == [created["id"]]
         assert result["warning"] is None
-        assert "hint" not in result
+        # №38: подсказка есть, но ровно одна — на верхнем уровне ответа.
+        assert result["hint"] == HINT_SKILLS_BODY
         hit = result["results"][0]
         # Проекция области + score: только id/name/description (тел нет).
         assert set(hit) == {"id", "name", "description", "score"}
@@ -212,6 +218,52 @@ class TestSearchEmpty:
         assert result["hint"] == CANON_HINT_SEARCH_EMPTY
 
 
+# --- одна подсказка на весь поиск (№38, arch §7.1/§7.4) ----------------------
+# Канон §3.8: у `skills_search` подсказка РОВНО одна и только на верхнем уровне
+# ответа (не в элементах `results`): непустой поиск → `HINT_SKILLS_BODY`
+# («тело — только `skills_get`»), пустой → `HINT_SEARCH_EMPTY`. Мягкий отказ
+# (`fail + hint` на транспорте) не подменяется — проверка идёт ДО поиска.
+
+
+class TestSearchSingleHint:
+    """№38: одна подсказка на ответ; в элементах выдачи её нет."""
+
+    def test_nonempty_search_has_one_hint(self, service: SkillsService) -> None:
+        service.save(**form())
+        result = service.search("deploy the service")
+        assert result["results"]
+        assert result["hint"] == CANON_HINT_SKILLS_BODY
+
+    def test_empty_search_has_one_hint(self, service: SkillsService) -> None:
+        """Пустой поиск — прежний единственный `HINT_SEARCH_EMPTY`, не два."""
+        result = service.search("deploy the service")
+        assert result["results"] == []
+        assert result["hint"] == CANON_HINT_SEARCH_EMPTY
+        assert result["hint"] != CANON_HINT_SKILLS_BODY
+
+    def test_items_have_no_hint(self, service: SkillsService) -> None:
+        service.save(**form())
+        result = service.search("deploy the service")
+        assert result["results"]
+        assert all("hint" not in hit for hit in result["results"])
+
+    def test_soft_refusal_keeps_fail_hint(self, service: SkillsService) -> None:
+        """Невалидный `top_k`/пустой запрос — отказ сервиса (транспорт отдаёт
+        его как `fail + hint`): текст прежний, подсказкой поиска не подменён."""
+        with pytest.raises(SkillValidationError) as bad_top_k:
+            service.search("deploy", top_k=0)
+        with pytest.raises(SkillValidationError) as bad_query:
+            service.search("")
+        for exc in (bad_top_k.value, bad_query.value):
+            assert str(exc) != CANON_HINT_SKILLS_BODY
+        assert "top_k" in str(bad_top_k.value)
+        assert "query" in str(bad_query.value)
+
+    def test_canon_hint_is_verbatim(self) -> None:
+        assert HINT_SKILLS_BODY == CANON_HINT_SKILLS_BODY
+        assert len(HINT_SKILLS_BODY) <= 120  # бюджет вшитого текста (F-11)
+
+
 # --- валидация --------------------------------------------------------------
 
 
@@ -251,7 +303,8 @@ class TestSearchDegradation:
         result = degraded.search("deploy the service")
         assert [hit["id"] for hit in result["results"]] == [skill_id]
         assert result["warning"] == WARNING_FTS_ONLY
-        assert "hint" not in result
+        # Деградация не меняет правило подсказки: одна, на верхнем уровне.
+        assert result["hint"] == HINT_SKILLS_BODY
 
     def test_fts_only_empty_keeps_warning_and_hint(self, settings) -> None:
         degraded = SkillsService(settings, FailingEmbedder())
@@ -342,7 +395,7 @@ class TestList:
     def test_items_without_bodies_and_archive(self, service: SkillsService) -> None:
         first = service.save(**form())["id"]
         second = service.save(**form(name="Rotate the API key"))["id"]
-        # Правка копирует прежнюю версию в skill_versions — в листинге её нет.
+        # Правка пишет версию в общую историю — в листинге её нет.
         service.save(**form(id=first, name="Deploy the service v2"))
 
         listed = service.list()

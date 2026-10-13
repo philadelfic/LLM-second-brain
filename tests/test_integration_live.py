@@ -269,7 +269,7 @@ def test_live_summary_quality_and_language(live_summary) -> None:
     for text, cyrillic_expected in ((RU_NOTE, True), (EN_NOTE, False)):
         summary = ""
         for _ in range(3):
-            summary = live_summary.summary.summarize(text)
+            summary = live_summary.summary.summarize(text).text
             has_cyrillic = any("\u0400" <= ch <= "\u04FF" for ch in summary)
             if has_cyrillic == cyrillic_expected:
                 break
@@ -286,7 +286,7 @@ def test_live_summary_think_disabled(live_summary) -> None:
     )
     service_no_think = SummaryService(settings_no_think)
     try:
-        summary = service_no_think.summarize(RU_NOTE)
+        summary = service_no_think.summarize(RU_NOTE).text
         assert 0 < len(summary) <= settings_no_think.max_summary_chars
     finally:
         service_no_think.close()
@@ -295,7 +295,7 @@ def test_live_summary_think_disabled(live_summary) -> None:
 def test_live_summary_latency_report(live_summary) -> None:
     """Латентность фоновой генерации: замер печатается (бриф Ф4 п.6)."""
     t0 = time.monotonic()
-    summary = live_summary.summary.summarize(RU_NOTE)
+    summary = live_summary.summary.summarize(RU_NOTE).text
     elapsed = time.monotonic() - t0
     print(f"\n[live-summary] латентность generate: {elapsed:.2f} с ({len(summary)} симв)")
     assert elapsed > 0

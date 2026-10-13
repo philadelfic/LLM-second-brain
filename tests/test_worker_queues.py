@@ -194,7 +194,9 @@ def test_queues_health_empty_queues_are_null(settings) -> None:
     queues = make_worker(settings).queues_health()
     assert set(queues) == {"vector", "summary", "judge", "areas", "links", "nodes"}
     for stat in queues.values():
-        assert stat == {"pending": 0, "oldest_pending_sec": None}
+        assert stat == {
+            "pending": 0, "oldest_pending_sec": None, "waiting": 0, "attention": 0
+        }
 
 
 def test_queues_health_matches_direct_sql(settings) -> None:

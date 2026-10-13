@@ -7,6 +7,8 @@ REST — внутренняя поверхность оператора: те ж
 
 from __future__ import annotations
 
+import sqlite3
+
 from fastapi.testclient import TestClient
 
 
@@ -29,7 +31,13 @@ class TestNotesCrud:
         result = self._create(client, token, "Рест: заметка о деплое", title="Рест-деплой")
         # Фаза 8: векторизация всегда фоновая — pending это штатное состояние
         # новой заметки, а не деградация, поэтому warning в контракте нет.
-        assert result == {"id": 1, "stored": True, "summary_pending": True}
+        # №28: ответ несёт `namespace_hint` — полный контракт сервиса (REST
+        # `namespace` не принимает, заметка уходит в `default`).
+        assert {"id", "stored", "summary_pending"} <= set(result)
+        assert result["id"] == 1
+        assert result["stored"] is True
+        assert result["summary_pending"] is True
+        assert "namespace_hint" in result
 
     def test_create_duplicate_rejected_by_text_fallback(
         self, client: TestClient, token: str
@@ -135,6 +143,38 @@ class TestNotesCrud:
             "/notes/1", json={"text": ""}, headers={"Authorization": f"Bearer {token}"}
         )
         assert put.status_code == 422
+
+    def test_rest_put_comment_presence(self, client: TestClient, token: str) -> None:
+        """no24-01: `comment` в PUT — по `model_fields_set` (опущено/null/лимит)."""
+        self._create(client, token, "Рест: пометка", title="Рест-пометка")
+        headers = {"Authorization": f"Bearer {token}"}
+        # поле опущено → комментарий не трогается
+        only_text = client.put(
+            "/notes/1", json={"text": "Рест: пометка"}, headers=headers
+        )
+        assert only_text.status_code == 200
+        assert client.get("/notes/1", headers=headers).json()["comment"] is None
+        # поле передано (без text — правка только пометки) → записано
+        written = client.put(
+            "/notes/1", json={"comment": "пригодится к задаче X"}, headers=headers
+        )
+        assert written.status_code == 200
+        assert written.json()["updated"] is True
+        note = client.get("/notes/1", headers=headers).json()
+        assert note["comment"] == "пригодится к задаче X"
+        assert note["text"] == "Рест: пометка"  # текст не перезаписан
+        # null → сброс
+        cleared = client.put("/notes/1", json={"comment": None}, headers=headers)
+        assert cleared.status_code == 200
+        assert client.get("/notes/1", headers=headers).json()["comment"] is None
+        # >250 → 422; прежняя пометка цела
+        client.put("/notes/1", json={"comment": "пометка"}, headers=headers)
+        too_long = client.put(
+            "/notes/1", json={"comment": "х" * 251}, headers=headers
+        )
+        assert too_long.status_code == 422
+        assert "250" in too_long.json()["detail"]
+        assert client.get("/notes/1", headers=headers).json()["comment"] == "пометка"
 
 
 class TestTitleRest:
@@ -301,3 +341,150 @@ class TestHealthCounters:
         client.delete("/notes/1", headers={"Authorization": f"Bearer {token}"})
         assert health()["notes_count"] == 0
         assert health()["pending_vector"] == 0  # trash не в счётчиках
+
+
+class TestFreshnessFilter:
+    """no29-01: `updated_after` на REST-поверхности оператора (GET /notes, /search)."""
+
+    def _create(self, client: TestClient, token: str, text: str, title: str) -> dict:
+        response = client.post(
+            "/notes", json={"text": text, "title": title},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 201, response.text
+        return response.json()
+
+    def _set_updated_at(self, db_path: str, note_id: int, stamp: str) -> None:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE notes SET updated_at = ? WHERE id = ?", (stamp, note_id)
+            )
+
+    def test_rest_search_and_list_updated_after(
+        self, client: TestClient, token: str, test_env: dict[str, str]
+    ) -> None:
+        first = self._create(
+            client, token, "Рест: свежая заметка про TaskFlow деплой", "Рест-свежая"
+        )
+        second = self._create(
+            client, token, "Рест: старая заметка про TaskFlow деплой", "Рест-старая"
+        )
+        db = test_env["DB_PATH"]
+        self._set_updated_at(db, second["id"], "2026-01-01T00:00:00Z")
+        self._set_updated_at(db, first["id"], "2026-03-01T00:00:00Z")
+        headers = {"Authorization": f"Bearer {token}"}
+        boundary = "2026-02-01T00:00:00Z"
+
+        listed = client.get(
+            "/notes", params={"updated_after": boundary}, headers=headers
+        ).json()
+        assert [item["id"] for item in listed["items"]] == [first["id"]]
+        assert listed["total"] == 1
+
+        found = client.get(
+            "/search",
+            params={"q": "TaskFlow деплой", "updated_after": boundary},
+            headers=headers,
+        ).json()
+        assert [r["id"] for r in found["results"]] == [first["id"]]
+
+        bad_list = client.get(
+            "/notes", params={"updated_after": "за неделю"}, headers=headers
+        )
+        assert bad_list.status_code == 422
+        assert "updated_after" in bad_list.json()["detail"]
+        bad_search = client.get(
+            "/search", params={"q": "TaskFlow", "updated_after": "xx"},
+            headers=headers,
+        )
+        assert bad_search.status_code == 422
+        assert "updated_after" in bad_search.json()["detail"]
+
+    def test_rest_list_inclusive_boundary(
+        self, client: TestClient, token: str, test_env: dict[str, str]
+    ) -> None:
+        """№29 (FR-2.6/FR-2.7): граница `updated_after` включающая и на REST.
+
+        Почему: REST — та же сервисная ручка, что у MCP, но приёмка гоняет её
+        отдельно; расхождение границ между поверхностями оператор увидит как
+        «на REST фильтр режет иначе». Проверяем обе стороны границы: заметка,
+        изменённая РОВНО в секунду границы, видна в `GET /notes`, а заведомо
+        более старая — нет (ни в `items`, ни в `total`).
+        """
+        on_boundary = self._create(
+            client, token, unique("Рест: ровно на границе"), "Рест-граница"
+        )
+        stale = self._create(
+            client, token, unique("Рест: заведомо старее границы"), "Рест-старее"
+        )
+        db = test_env["DB_PATH"]
+        boundary = "2001-01-01T00:00:00Z"
+        self._set_updated_at(db, on_boundary["id"], boundary)
+        self._set_updated_at(db, stale["id"], "2000-01-01T00:00:00Z")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        listed = client.get(
+            "/notes", params={"updated_after": boundary}, headers=headers
+        ).json()
+        ids = [item["id"] for item in listed["items"]]
+        assert on_boundary["id"] in ids
+        assert stale["id"] not in ids
+        assert listed["total"] == 1
+
+        # граница на секунду позже — и «свежая» стала заведомо старее: нет
+        later = client.get(
+            "/notes", params={"updated_after": "2001-01-01T00:00:01Z"},
+            headers=headers,
+        ).json()
+        assert later["items"] == []
+        assert later["total"] == 0
+
+
+class TestCommentSearchRest:
+    """no24-02 (3.2.0): отдельный поиск пометок на REST — `GET /notes/comments`."""
+
+    def _create(
+        self, client: TestClient, token: str, text: str, title: str
+    ) -> dict:
+        response = client.post(
+            "/notes", json={"text": text, "title": title},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 201, response.text
+        return response.json()
+
+    def test_rest_comment_search_route(self, client: TestClient, token: str) -> None:
+        """`GET /notes/comments?q=...` отдаёт пометки; объявлен до /notes/{id}."""
+        headers = {"Authorization": f"Bearer {token}"}
+        note = self._create(client, token, "Рест: заметка с пометкой", "Рест-пометка")
+        client.put(
+            f"/notes/{note['id']}", json={"comment": "уникальнаяпометка рест"},
+            headers=headers,
+        )
+
+        found = client.get(
+            "/notes/comments", params={"q": "уникальнаяпометка"}, headers=headers
+        )
+        assert found.status_code == 200, found.text
+        hits = found.json()["results"]
+        assert [h["id"] for h in hits] == [note["id"]]
+        assert hits[0]["comment"] == "уникальнаяпометка рест"
+
+        # маршрут объявлен РАНЬШЕ /notes/{note_id}: сегмент не «съеден» как id
+        empty = client.get(
+            "/notes/comments", params={"q": "неттакогослова"}, headers=headers
+        )
+        assert empty.json()["results"] == []
+        assert client.get("/notes/abc", headers=headers).status_code == 422
+
+        # невалидные q и updated_after → 422 (доменная валидация)
+        assert client.get(
+            "/notes/comments", params={"q": ""}, headers=headers
+        ).status_code == 422
+        bad = client.get(
+            "/notes/comments",
+            params={"q": "пометка", "updated_after": "за неделю"},
+            headers=headers,
+        )
+        assert bad.status_code == 422
+        assert "updated_after" in bad.json()["detail"]

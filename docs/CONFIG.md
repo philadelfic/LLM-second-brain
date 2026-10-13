@@ -174,6 +174,9 @@ visible in `/health`.
 | `BACKUP_DIR` | `/data/backups` | backup snapshot directory |
 | `BACKUP_INTERVAL_SEC` | `86400` | snapshot interval (daily) |
 | `BACKUP_KEEP` | `7` | snapshots kept (rotation) |
+| `BACKUP_VERIFY_EVERY` | `1` | verify the restore of every Nth snapshot; `0` = manual only (`POST /backups/verify`) |
+| `BACKUP_SHIP_CMD` | *(empty)* | operator command that ships a verified snapshot off the box; gets `LSB_BACKUP_FILE`/`LSB_BACKUP_NAME` in env and must print `size=<N>` — destination and credentials live OUTSIDE this repository |
+| `BACKUP_SHIP_TIMEOUT_SEC` | `300` | timeout of the ship command, seconds |
 
 `/health` (no token) also reports `version` and `queues`: for each background
 queue, the number of `pending` jobs and `oldest_pending_sec` — the age of the
@@ -205,13 +208,13 @@ limit.
 | Variable | Default | Meaning |
 |---|---|---|
 | `SKILL_NAME_MAX_CHARS` | `65` | skill name (≤ 5 words recommended) |
-| `SKILL_DESCRIPTION_MAX_CHARS` | `250` | what the skill does |
-| `SKILL_STEPS_MAX_CHARS` | `500` | the order of the steps |
-| `SKILL_TEXT_MAX_CHARS` | `4000` | what exactly each step does |
-| `SKILL_EXAMPLE_MAX_CHARS` | `1000` | optional example |
-| `SKILL_EXTRA_FIELD_MAX_CHARS` | `500` | one optional class field inside `extra` |
-| `SKILL_EXTRA_TOTAL_MAX_CHARS` | `2000` | all class fields together |
-| `INSTRUCTION_TEMPLATE_MAX_CHARS` | `1000` | global "how to execute steps" template |
+| `SKILL_DESCRIPTION_MAX_CHARS` | `400` | what the skill does |
+| `SKILL_STEPS_MAX_CHARS` | `1000` | the order of the steps |
+| `SKILL_TEXT_MAX_CHARS` | `7500` | what exactly each step does |
+| `SKILL_EXAMPLE_MAX_CHARS` | `2000` | optional example |
+| `SKILL_EXTRA_FIELD_MAX_CHARS` | `1000` | one optional class field inside `extra` |
+| `SKILL_EXTRA_TOTAL_MAX_CHARS` | `4000` | all class fields together |
+| `INSTRUCTION_TEMPLATE_MAX_CHARS` | `2000` | global "how to execute steps" template |
 | `SKILL_ANNOUNCE_MAX_CHARS` | `2000` | budget of the skills announce block in MCP instructions |
 | `SKILL_ANNOUNCE_DESCRIPTION_CHARS` | `120` | description cut inside the announce |
 | `SKILL_SYNONYM_SIMILARITY` | `0.90` | cosine above which a new skill is "too similar" to an existing one |

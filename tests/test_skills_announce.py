@@ -26,6 +26,8 @@ from app.storage.db import CREATOR_SKILL_SEED_KEY, init_db, session
 from app.transport.mcp import (
     SERVER_INSTRUCTIONS,
     InstructionsRefresher,
+    _logs_section,
+    _note_lifetime_section,
     _skills_announce,
     build_instructions,
     build_mcp,
@@ -45,13 +47,13 @@ CANON_CREATOR = {
     "text": (
         "1) Call skills_search with the task wording: a similar skill exists → "
         "update it (skills_save with id), never create a duplicate. 2) name ≤65 "
-        "characters (≤5 words recommended); description ≤250 — what the "
-        "procedure does. 3) steps ≤500 — the order (what after what); text "
-        "≤4000 — what exactly each step does (result/format/rule); keep the "
+        "characters (≤5 words recommended); description ≤400 — what the "
+        "procedure does. 3) steps ≤1000 — the order (what after what); text "
+        "≤7500 — what exactly each step does (result/format/rule); keep the "
         '"how to execute" wording in the global instruction_template, never '
         "duplicate it per skill. 4) Optional class fields (trigger, mode, "
         "preconditions, fallbacks, invariant, exceptions, guardrails, "
-        "references, output_contract, behavior_contract) and example (≤1000) — "
+        "references, output_contract, behavior_contract) and example (≤2000) — "
         "only when this skill class needs them. 5) skills_save, then skills_get "
         "to check that the procedure reads as a ready-to-execute routine. "
         "6) Self-improvement: when you are sure a skill can be improved, "
@@ -145,14 +147,20 @@ class TestAnnounceBlock:
 
     def test_block_is_tail_and_base_unchanged(self, setup) -> None:
         settings, services = setup
+        tail = _logs_section(services, settings)  # f10-04 §10: хвост области логов
+        # no46-02: САМЫМ последним хвостом — строка про lifetime заметки.
+        lifetime = _note_lifetime_section(services, settings)
         base = build_instructions(_services(settings, HashEmbedder(DIM), skills=False))
         full = build_instructions(services)
-        # Регресс: манифест и карта — те же, блок лишь дописан хвостом.
+        # Регресс: манифест и карта — те же, блок лишь дописан хвостом; после
+        # анонса идёт только статический раздел области логов (f10-04, §10)
+        # и строка про lifetime заметки (no46-02).
         assert base.startswith(SERVER_INSTRUCTIONS)
         assert "Node map (path: description)" in base
         assert ANNOUNCE_HEAD not in base
-        assert full == base + _skills_announce(services)
-        assert full.startswith(base)
+        core = base[: -len(tail + lifetime)]
+        assert full == core + _skills_announce(services) + tail + lifetime
+        assert full.startswith(core)
 
     def test_empty_registry_has_no_block(self, setup) -> None:
         settings, services = setup
@@ -188,8 +196,10 @@ class TestAnnounceBlock:
                     (f"Skill {index:02d}", "d" * 140),
                 )
         block = _skills_announce(services)
+        tail = _logs_section(services, settings)
+        lifetime = _note_lifetime_section(services, settings)
         assert len(block) <= settings.skill_announce_max_chars == 2000
-        assert build_instructions(services).endswith(block)
+        assert build_instructions(services).endswith(block + tail + lifetime)
         rows = [line for line in block.splitlines() if line.startswith("  - ")]
         more = re.search(r"\(\+(\d+) more — skills_list\)$", block)
         assert more is not None and block.rstrip().endswith("more — skills_list)")

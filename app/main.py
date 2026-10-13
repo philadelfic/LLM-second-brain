@@ -29,8 +29,16 @@ from fastapi import FastAPI
 from app import __version__
 from app.config import ConfigError, Settings, get_settings
 from app.observability import setup_logging
-from app.services import Services, build_services
-from app.services.llm_client import CHECK_AUTH_FAILED, CHECK_OK, LLMClient
+from app.services import Services, WarningsService, build_services
+from app.services.decision import DecisionService
+from app.services.llm_client import (
+    CHECK_AUTH_FAILED,
+    CHECK_OK,
+    DECISION_CHECK_OK,
+    LLMClient,
+)
+from app.services.slot_budget import resolve_output_budget
+from app.services.update_check import UpdateChecker
 from app.services.worker import BackgroundWorker
 from app.storage.db import StorageError, init_db
 from app.transport.auth import BearerAuthMiddleware
@@ -57,7 +65,50 @@ def _startup_slots(services: Services) -> list[tuple[str, LLMClient, object]]:
             ("judge", services.llm_judge, services.judge),
         )
         if client is not None
-    ]
+    ] + _decision_slot(services)
+
+
+def _decision_slot(services: Services) -> list[tuple[str, LLMClient, DecisionService]]:
+    """Пара decision-слота стартовой проверки — только когда она собрана.
+
+    LSBN-F-12: при выключенном слоте пары нет (Services.decision is None) —
+    стартовая проверка его не видит вообще.
+    """
+    if services.llm_decision is not None and services.decision is not None:
+        return [("decision", services.llm_decision, services.decision)]
+    return []
+
+
+def _handle_decision_check(
+    service: DecisionService,
+    client: LLMClient,
+    outcome: str,
+    logger: logging.Logger,
+) -> None:
+    """Исход проверки decision-слота (LSBN-F-12): WARN + гашение, старт жив.
+
+    Осознанное отступление от фатальности auth генеративных слотов: у decision
+    есть штатный генеративный путь, и ронять обязательный слот из-за
+    необязательного нельзя (§13.6). Событие — `decision_check` (slot/model/result);
+    `ok` слот не трогает, иной исход — `disable(outcome)`: `unsupported` даёт
+    причину переключения «модель не умеет», `unreachable`/`auth_failed` —
+    «слота сейчас нет» (§13.6, f12-04).
+    """
+    extra = {
+        "event": "decision_check",
+        "slot": "decision",
+        "model": client.spec.model,
+        "result": outcome,
+    }
+    if outcome == DECISION_CHECK_OK:
+        logger.info("стартовая проверка decision-слота пройдена", extra=extra)
+        return
+    service.disable(outcome=outcome)
+    logger.warning(
+        f"decision-слот не подтверждён (result={outcome}) — слот погашен, "
+        "решения идут генеративным путём; старт продолжается",
+        extra=extra,
+    )
 
 
 async def _provider_startup_check(services: Services) -> None:
@@ -94,9 +145,17 @@ async def _provider_startup_check(services: Services) -> None:
             },
         )
     outcomes = await asyncio.gather(
-        *[asyncio.to_thread(client.check) for _slot, client, _service in slots]
+        *[
+            asyncio.to_thread(
+                client.check_decision if slot == "decision" else client.check
+            )
+            for slot, client, _service in slots
+        ]
     )
     for (slot, client, service), outcome in zip(slots, outcomes):
+        if slot == "decision":
+            _handle_decision_check(service, client, outcome, logger)
+            continue
         provider = client.spec.provider
         extra = {
             "event": "provider_check_result",
@@ -132,6 +191,37 @@ async def _provider_startup_check(services: Services) -> None:
                 "(деградация, воркер догонит по pending-очередям)",
                 extra=extra,
             )
+        # №49 (arch §13.5): предупреждения конфигурации слота — WARN и старт
+        # продолжается (фатален только auth_failed, см. выше); пишутся и при
+        # unreachable/model_missing — они про конфигурацию, не про сеть. У
+        # слота векторизации нет бюджета вывода и *_CONTEXT_TOKENS, а у
+        # decision нет ни бюджета, ни *_CONTEXT_TOKENS (LSBN-F-12).
+        if slot == "embedding":
+            continue
+        warnings = LLMClient.slot_config_warnings(client.spec)
+        if warnings:
+            budget, _budget_source = resolve_output_budget(
+                operation=slot,
+                prompt_tokens=0,
+                explicit=client.spec.num_predict or None,
+                context_tokens=client.spec.context_tokens,
+                reserve_tokens=client.spec.prompt_reserve_tokens,
+                defensive_cap=client.spec.max_output_tokens,
+            )
+            for code, text in warnings:
+                logger.warning(
+                    text,
+                    extra={
+                        "event": "slot_config_warning",
+                        "slot": slot,
+                        "code": code,
+                        "model_type": client.spec.model_type,
+                        "budget": budget,
+                        "context_tokens": client.spec.context_tokens,
+                        "timeout_sec": int(client.spec.read_timeout),
+                        "text": text,
+                    },
+                )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -155,7 +245,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # JSON-логи stdout (NFR-4): включаются при сборке приложения (импорт
     # app.main / тесты / uvicorn — один и тот же идемпотентный setup).
     setup_logging(settings.log_level)
-    mcp = build_mcp(settings, services)
     # §3.4: две очереди — векторы (Фаза 3) и summary (Фаза 4, режим «Б»);
     # суммаризатор из DI — тот же экземпляр, что в /health.summarizer_ok.
     # Судья дедупа (Фаза 8, Этап 3.1) — тоже DI из services, один экземпляр
@@ -167,6 +256,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         judge=services.judge,
         classifier=services.classifier,
         promoter=services.promotion,
+        terms=services.terms,
+        decision=services.decision,
     )
     # Суммаризация стартует сразу при save/update: NoteService сигналит
     # воркеру, тот немедленно догоняет pending_summary (не ждёт back-off).
@@ -177,6 +268,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Событие только ускоряет — задание живёт в статусе заметки (gate
     # 2026-09-19, прецедент summary-нотификатора).
     services.notes.set_vector_notifier(worker.notify_embedding_pending)
+    # №12 (3.2.0): правка заметки инвалидирует её предупреждение — в той же
+    # транзакции (FR-4.4). Снятию классификатор не нужен (только SQL), поэтому
+    # сервис собирается без него — узкая инъекция без циклических импортов.
+    services.notes.set_warnings_resolver(
+        WarningsService(
+            settings, classifier=None, namespaces=worker._namespaces
+        ).resolve_for_subject
+    )
     # Область навыков (3.0.0): save/правка сигналит петле areas — вектора
     # записи догоняются сразу, а не по выросшему back-off (прецедент
     # summary-нотификатора). None — DI-сборка тестов без области навыков.
@@ -184,17 +283,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         services.skills.set_areas_notifier(worker.notify_areas_pending)
     # Область «user» (3.0.0, lsb-0009): запись/правка/удаление факта будит
     # петлю areas тем же сигналом — вектора записи догоняются сразу, а не по
-    # выросшему back-off (прецедент области навыков). Сервис обязателен в
-    # контейнере — проверки на None не требуется.
-    services.user_facts.set_areas_notifier(worker.notify_areas_pending)
+    # выросшему back-off (прецедент области навыков). Проверка на None — как
+    # у области навыков: поле может быть пустым в DI-сборках тестов (№40).
+    if services.user_facts is not None:
+        services.user_facts.set_areas_notifier(worker.notify_areas_pending)
     # Область terms (3.0.0, lsb-0008): запись/правка/удаление термина будит
     # петлю areas тем же сигналом — вектора записи догоняются сразу, а не по
-    # выросшему back-off (прецедент областей навыков и «user»). Сервис
-    # обязателен в контейнере — проверки на None не требуется.
-    services.terms.set_areas_notifier(worker.notify_areas_pending)
+    # выросшему back-off (прецедент областей навыков и «user»). Проверка на
+    # None — симметрично прочим областям (№40).
+    if services.terms is not None:
+        services.terms.set_areas_notifier(worker.notify_areas_pending)
+    # Область логов (3.2.0, LSBN-F-10, f10-02): запись/правка/удаление лога будит ту
+    # же петлю areas — вектор записи (непустые action + reason + outcome, §5.3)
+    # догоняется сразу, а не по выросшему back-off. Проверка на None — как у
+    # прочих областей (№40).
+    if services.logs is not None:
+        services.logs.set_areas_notifier(worker.notify_areas_pending)
     # Внутренний маршрут MCP-сервера — ровно MCP_PATH. host="0.0.0.0" — не
     # localhost, поэтому SDK не включает DNS-rebinding protection (сервис
     # живёт в LAN за Bearer-токеном; Open WebUI ходит с не-localhost Host).
+    # MCP собирается после воркера (№39, FR-4.4): миддлварь хинта о сломанном
+    # слоте берёт снимок разрывов из воркера (`slot_states`). №45 (FR-45.8):
+    # чекер версии создаётся здесь и передаётся в MCP — миддлварь `update_hint`
+    # читает только его кеш; фоновая петля стартует в lifespan (если включено).
+    update_checker = UpdateChecker(settings)
+    mcp = build_mcp(settings, services, worker=worker, update_checker=update_checker)
     mcp_app = mcp.streamable_http_app(
         streamable_http_path=settings.mcp_path,
         host="0.0.0.0",
@@ -223,6 +336,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "db_path": settings.db_path,
             },
         )
+        # №40 (FR-4.3): состав включённых областей — из журнала старта видно,
+        # какие области активны (диагностика не гадает). Флаг гейтит только
+        # поверхность/фон; данные и REST остаются доступны и у выключенной.
+        logging.getLogger("app").info(
+            "areas enabled",
+            extra={
+                "event": "areas_enabled",
+                "areas": {
+                    "skills": settings.area_skills_enabled,
+                    "terms": settings.area_terms_enabled,
+                    "user_facts": settings.area_user_facts_enabled,
+                    # LSBN-F-10 (f10-02): область логов активна тем же реестром;
+                    # ключ добавлен минимально, реестровый рефакторинг события —
+                    # отдельная позиция (f10-04).
+                    "logs": settings.area_logs_enabled,
+                },
+            },
+        )
         # Жизненный цикл MCP-сессий Streamable HTTP = жизни процесса.
         async with mcp.session_manager.run():
             # Фоновый воркер: очереди pending живут в БД — после рестарта
@@ -234,6 +365,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             backup_task = asyncio.create_task(
                 services.backup.run(), name="backup-snapshots"
             )
+            # №45 (FR-45.3): фоновая проверка версии — только когда включена;
+            # первый опрос сразу после старта, далее по интервалу.
+            update_task: asyncio.Task[None] | None = None
+            if settings.update_check_enabled:
+                update_task = asyncio.create_task(
+                    update_checker.run(), name="update-check"
+                )
             try:
                 yield
             finally:
@@ -245,6 +383,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 backup_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await backup_task
+                if update_task is not None:
+                    update_checker.stop()
+                    update_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await update_task
 
     app = FastAPI(
         title="LLM Second Brain",
@@ -261,6 +404,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Воркер нужен REST-ручке /health: снимки очередей (queues, FR-2.2)
     # собираются по реестру джоб — только SQL, без обращений к моделям.
     app.state.worker = worker
+    # №45 (FR-4.4): снимок версии для /health.update — из памяти чекера.
+    app.state.update_checker = update_checker
     # Монтирование в корень: MCP_PATH задаёт точный путь MCP-эндпоинта;
     # маршруты FastAPI (/health и будущие REST) матчатся раньше mount.
     app.mount("/", mcp_app)

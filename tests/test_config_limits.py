@@ -50,9 +50,7 @@ class TestIntLimits:
             ("MAX_GET_BATCH", "0"),
             ("RRF_K", "0"),
             ("EMBEDDING_DIM", "0"),
-            ("SUMMARY_NUM_PREDICT", "0"),
             ("SUMMARY_TIMEOUT_SEC", "0"),
-            ("JUDGE_NUM_PREDICT", "0"),
             ("JUDGE_TIMEOUT_SEC", "-30"),
             ("DEDUP_CANDIDATE_TOP_N", "0"),
             ("BACKUP_INTERVAL_SEC", "0"),
@@ -123,6 +121,45 @@ class TestRangeLimits:
             load_env(monkeypatch, SCORE_THRESHOLD="1.5")
         with pytest.raises(ConfigError, match="dedup_similarity"):
             load_env(monkeypatch, DEDUP_SIMILARITY="-0.1")
+
+    def test_node_hint_invalid_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """№28: потолок узлов 1..2 (FR-1.1) и текст для сравнения ≥1 — оба
+        нарушения собираются в один отчёт (NFR-6)."""
+        with pytest.raises(ConfigError) as exc:
+            load_env(
+                monkeypatch,
+                MEMORY_NODE_HINT_MAX_NODES="5",
+                MEMORY_NODE_HINT_TEXT_CHARS="0",
+            )
+        message = str(exc.value)
+        assert "memory_node_hint_max_nodes" in message
+        assert "memory_node_hint_text_chars" in message
+        with pytest.raises(ConfigError, match="memory_node_hint_min_score"):
+            load_env(monkeypatch, MEMORY_NODE_HINT_MIN_SCORE="-0.1")
+
+    def test_similar_params_invalid_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """№30: пул меньше лимита и порог > 1 — оба нарушения в один отчёт
+        (NFR-6); потолок подсказок 1..3."""
+        with pytest.raises(ConfigError) as exc:
+            load_env(
+                monkeypatch,
+                MEMORY_SIMILAR_POOL="1",
+                MEMORY_SIMILAR_LIMIT="2",
+                MEMORY_SIMILAR_THRESHOLD="1.5",
+            )
+        message = str(exc.value)
+        assert "memory_similar_pool" in message
+        assert "memory_similar_threshold" in message
+        with pytest.raises(ConfigError, match="memory_similar_limit"):
+            load_env(monkeypatch, MEMORY_SIMILAR_LIMIT="4")
+
+    def test_comment_max_chars_invalid_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """no24-01: COMMENT_MAX_CHARS — доменный лимит пометки; 0 фатален."""
+        with pytest.raises(ConfigError, match="comment_max_chars"):
+            load_env(monkeypatch, COMMENT_MAX_CHARS="0")
+        with pytest.raises(ConfigError, match="comment_max_chars"):
+            load_env(monkeypatch, COMMENT_MAX_CHARS="-5")
+        assert load_env(monkeypatch, COMMENT_MAX_CHARS="250").comment_max_chars == 250
 
     def test_dedup_candidate_range_is_fatal(
         self, monkeypatch: pytest.MonkeyPatch
@@ -260,14 +297,15 @@ class TestAreaLimits:
     """
 
     DEFAULT_FIELDS = [
+        # Лимиты формы навыка — решение О. 12.10.2026 (канон §6); `name` не тронут.
         ("skill_name_max_chars", 65),
-        ("skill_description_max_chars", 250),
-        ("skill_steps_max_chars", 500),
-        ("skill_text_max_chars", 4000),
-        ("skill_example_max_chars", 1000),
-        ("skill_extra_field_max_chars", 500),
-        ("skill_extra_total_max_chars", 2000),
-        ("instruction_template_max_chars", 1000),
+        ("skill_description_max_chars", 400),
+        ("skill_steps_max_chars", 1000),
+        ("skill_text_max_chars", 7500),
+        ("skill_example_max_chars", 2000),
+        ("skill_extra_field_max_chars", 1000),
+        ("skill_extra_total_max_chars", 4000),
+        ("instruction_template_max_chars", 2000),
         ("skill_announce_max_chars", 2000),
         ("skill_announce_description_chars", 120),
         ("skill_synonym_similarity", 0.90),

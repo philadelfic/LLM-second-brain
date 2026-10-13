@@ -69,20 +69,23 @@ update, каскад + самолечение сирот при физическ
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Callable
 from typing import Any
 
 from app.config import TITLE_MAX_WORDS, Settings
+from app.services import history
 from app.services.dedup import DeduplicationService, duplicate_response
 from app.services.embedding import Embedder, EmbeddingService
 from app.services.emit import summary_of
+from app.services.freshness import parse_updated_after
 from app.services.jobs import queue_snapshot
 from app.services.listing import page_fields
 from app.services.namespaces import NamespaceService
 from app.services.splitter import split_text
 from app.storage import chunks, expirations, vectors
-from app.storage.db import session, transaction
+from app.storage.db import DEFAULT_NAMESPACE, session, transaction
 
 # Maximum number of chunks per one memory_get call (lsb-0003, decision of O.,
 # 2026-09-08). Listing ceilings (lsb-0013) are env parameters of the surfaces
@@ -92,6 +95,8 @@ MAX_READ_CHUNKS = 3
 # Название заметки (Фаза 11, решение №9): клиент-модель называет заметку при
 # записи; отсутствие/невалидность — отказ записи с этим hint (§5.3).
 TITLE_HINT = "set a title ≤5 words"
+# no24-01 (3.2.0): канонический текст отказа пометки (доменный лимит 250).
+COMMENT_HINT = "comment: up to 250 characters"
 
 # Сентинел «title не передан»: прямой вызов NoteService.save без транспорта
 # (миграция, скрипты, тесты) — легаси-путь, заметка пишется с title=NULL
@@ -118,6 +123,12 @@ _UNSET_SUMMARY: str = "__LSB_UNSET_SUMMARY__"
 # pydantic не ругается на несеризуемый дефолт (NFR-4). Сравнение в сервисе —
 # по идентичности (is), коллизия с реальным TTL невозможна.
 _UNSET_EXPIRES_AT: str = "__LSB_UNSET_EXPIRES_AT__"
+# Сентинел `comment` (no24-01, 3.2.0): «не передано» = оставить (update) /
+# пусто (save), null или пустая строка = сбросить. JSON-серизуемая строка (как
+# _UNSET_SUMMARY/_UNSET_EXPIRES_AT): дефолт параметра MCP-инструмента, pydantic
+# не ругается на несеризуемый дефолт (NFR-4). Сравнение в сервисе — по
+# идентичности (is), коллизия с реальной пометкой невозможна.
+_UNSET_COMMENT: str = "__LSB_UNSET_COMMENT__"
 
 
 def is_valid_title(title: str | None) -> bool:
@@ -147,6 +158,16 @@ class TitleValidationError(NoteValidationError):
     узле): REST ловит родительский NoteValidationError → 422, MCP-транспорт
     ловит TitleValidationError → fail + hint с TITLE_HINT. Заметка НЕ
     создаётся.
+    """
+
+
+class CommentValidationError(NoteValidationError):
+    """Нарушение контракта пометки (no24-01, 3.2.0): комментарий длиннее
+    COMMENT_MAX_CHARS (250) символов.
+
+    Мягкий отказ (как TitleValidationError): REST ловит родительский
+    NoteValidationError → 422, MCP-транспорт → fail + hint. Заметка (в том
+    числе прежний комментарий) НЕ меняется — частичной записи нет (FR-5.8).
     """
 
 
@@ -182,6 +203,15 @@ class NoteService:
         # в самом статусе заметки (`vector_status='pending'`), контракт
         # надёжности не меняется.
         self._vector_notifier = vector_notifier
+        # №12 (3.2.0): снятие предупреждений заметки при правке (FR-4.4) —
+        # узкая инъекция (`WarningsService.resolve_for_subject`), без
+        # циклических импортов; в юнит-тестах может отсутствовать.
+        self._warnings_resolver: Callable[..., int] | None = None
+        # №30 (3.2.0): подсказка «похожее» при записи (arch §13.4) — узкая
+        # инъекция `SearchService.similar_by_text` (FTS+Dice, без модели),
+        # без импорта search в notes (нет цикла); в юнит-тестах может
+        # отсутствовать — тогда поля `similar` в ответе нет.
+        self._similar_finder: Callable[..., list[dict[str, Any]]] | None = None
 
     def set_summary_notifier(self, notifier: Callable[[], None]) -> None:
         """Подключить сигнал пробуждения воркера суммаризации (main.py)."""
@@ -191,15 +221,37 @@ class NoteService:
         """Подключить сигнал пробуждения embedding-петли воркера (main.py)."""
         self._vector_notifier = notifier
 
+    def set_warnings_resolver(self, resolver: Callable[..., int]) -> None:
+        """Подключить снятие предупреждений заметки при правке (№12, main.py).
+
+        `resolver(subject_type, subject_id, *, conn)` — обычно
+        `WarningsService.resolve_for_subject`: правка инвалидирует открытое
+        предупреждение заметки в ТОЙ ЖЕ транзакции.
+        """
+        self._warnings_resolver = resolver
+
+    def set_similar_finder(
+        self, finder: Callable[..., list[dict[str, Any]]] | None
+    ) -> None:
+        """Подключить поиск похожих при save (№30, build_services).
+
+        `finder(text, title, *, exclude_ids, limit, pool, threshold, text_chars)`
+        — обычно `SearchService.similar_by_text`: FTS-кандидаты + Dice
+        значимых слов, БЕЗ вызова модели (§13.4). `None` (по умолчанию) —
+        подсказка выключена.
+        """
+        self._similar_finder = finder
+
     # --- FR-4 memory_save (ARCH §4.1) --------------------------------------
 
     def save(
         self,
         text: str,
         author: str | None = None,
-        namespace: str = "default",
+        namespace: str | None = None,
         title: str | None = _UNSET_TITLE,
         expires_at: str | None = _UNSET_EXPIRES_AT,
+        comment: str | None = _UNSET_COMMENT,
     ) -> dict[str, Any]:
         """Валидация (текст, title) → дословный дедуп → INSERT транзакцией.
 
@@ -222,14 +274,26 @@ class NoteService:
         Фаза 10 (§5.7): `namespace` — целевой узел записи (только
         зарегистрированный; не указан — `default`); незарегистрированный
         узел — NamespaceError (транспорт Шага 3 обернёт в fail + hint).
-        Дедуп при save — в пределах этого же неймспейса (меж-узловые
+        №28 (3.2.0, arch §13.1/§13.2): `None` = «не передан» — узел
+        `default`, и после успешной вставки ответ несёт короткую подсказку
+        `namespace_hint` (по карте узлов и словам заметки, БЕЗ вызова модели).
+        Подсказка не двигает заметку и не блокирует запись; явный `namespace`
+        подсказок не даёт. Дедуп при save — в пределах этого же неймспейса
+        (меж-узловые
         дубли легитимны): дословный дубль в своём узле блокирует запись
         (duplicated); дубль в ЧУЖОМ узле запись не блокирует — ответ
         получает hint «похожее есть в <ns>» (US-8, слой ориентирования).
         """
         self._validate_text(text)
         note_title = self._validated_save_title(title)
-        ns = self._namespaces.validate_placement(namespace)
+        # no24-01 (3.2.0): пометка — необязательна (решение О. 2026-10-08):
+        # значение 1..COMMENT_MAX_CHARS → записать, сентинел/null/пусто → NULL.
+        comment_value = (
+            None if comment is _UNSET_COMMENT else self._checked_comment(comment)
+        )
+        ns = self._namespaces.validate_placement(
+            namespace if namespace is not None else DEFAULT_NAMESPACE
+        )
         # expires_at (lsb-0004-02): передан → распарсить в абсолютный ISO-8601
         # UTC (TTLValidationError — мягкий отказ ДО записи); не передан
         # (сентинел) → None — постоянная заметка, в note_expirations не пишем.
@@ -246,6 +310,7 @@ class NoteService:
         # ответ duplicate_response после её закрытия.
         duplicate = None
         foreign_hint = None
+        foreign_id: int | None = None
         with session(self._settings) as conn, transaction(conn):
             duplicate = self._dedup.find_by_text(text, namespace=ns, conn=conn)
             if duplicate is None:
@@ -255,19 +320,30 @@ class NoteService:
                 # ориентированию: hint в ответе.
                 foreign = self._dedup.find_by_text(text, namespace=None, conn=conn)
                 if foreign is not None:
+                    foreign_id = int(foreign["id"])
                     foreign_hint = (
                         f"a similar one exists in «{foreign['namespace']}»; writing here is not "
                         "blocked — cross-node duplicates are legitimate"
                     )
                 note_id = self._insert(
                     conn, text, author, vector_status="pending", namespace=ns,
-                    title=note_title, expires_at=expires_value,
+                    title=note_title, expires_at=expires_value, comment=comment_value,
                 )
                 if expires_value is not None:
                     # TTL задан: синхронизируем очередь удаления (одна запись
                     # на заметку, PK note_id).
                     expirations.upsert(conn, note_id, expires_value)
                 self._store_chunks(conn, note_id, chunks_data, None)
+                # №41 (§13.5): baseline-версия пишется ТОЙ ЖЕ транзакцией, что и
+                # INSERT, — состояния «заметка есть, истории нет» не бывает.
+                row = conn.execute(
+                    "SELECT text, title, namespace, expires_at, comment FROM notes "
+                    "WHERE id = ?",
+                    (note_id,),
+                ).fetchone()
+                history.record_initial(
+                    conn, history.ENTITY_NOTE, note_id, history.note_projection(row)
+                )
         if duplicate is not None:
             return duplicate_response(duplicate)
         self._notify_summary_pending()
@@ -281,7 +357,72 @@ class NoteService:
         }
         if foreign_hint is not None:
             result["hint"] = foreign_hint  # слой ориентирования, не warning
+        # №28: запись без `namespace` — короткая подсказка узла (только когда
+        # узел не указан и выключатель включён). Сбой подсказки запись не
+        # роняет: поле просто не добавляется, событие — в лог (§13.2).
+        if namespace is None and self._settings.memory_node_hint_enabled:
+            try:
+                result["namespace_hint"] = self._namespace_hint(note_title, text)
+            except Exception:  # noqa: BLE001 — подсказка не роняет запись
+                logging.getLogger("app").warning(
+                    "save hint failed",
+                    extra={"event": "save_hint_failed", "hint": "namespace"},
+                )
+        # №30 (3.2.0): подсказка «похожее» — 1–2 ближайших по тексту заметки
+        # (FTS+Dice, БЕЗ модели) для решения «дополнить или создать» (arch
+        # §13.4). Считается ТОЛЬКО на успешной записи (не при duplicated);
+        # свежая заметка уже в индексе — исключаем её id и id чужого
+        # дословного дубля (он уже дан `hint`-ом — не дублируем сигнал).
+        # Сбой поиска запись НЕ роняет: поле не добавляется, событие в лог.
+        if self._settings.memory_similar_enabled and self._similar_finder is not None:
+            try:
+                similar = self._similar_finder(
+                    text,
+                    note_title,
+                    exclude_ids=frozenset(
+                        candidate_id
+                        for candidate_id in (note_id, foreign_id)
+                        if candidate_id is not None
+                    ),
+                    limit=self._settings.memory_similar_limit,
+                    pool=self._settings.memory_similar_pool,
+                    threshold=self._settings.memory_similar_threshold,
+                    text_chars=self._settings.memory_similar_text_chars,
+                )
+            except Exception:  # noqa: BLE001 — подсказка не роняет запись
+                logging.getLogger("app").warning(
+                    "save hint failed",
+                    extra={"event": "save_hint_failed", "hint": "similar"},
+                )
+            else:
+                if similar:
+                    result["similar"] = similar
         return result
+
+    def _namespace_hint(self, title: str | None, text: str) -> str:
+        """Подсказка узла для записи без `namespace` (№28, arch §13.1/§13.2).
+
+        Сравниваем слова заголовка и первых `memory_node_hint_text_chars`
+        символов текста с картой узлов (`NamespaceService.suggest`); при
+        непустом списке — «saved to `default`; looks like «a» / «b»», иначе —
+        явное «no node matched — see memory_namespaces» (FR-1.4). Строка
+        короткая (бюджет F-11, ≤ ~120 символов), заметку не двигает.
+        """
+        terms = " ".join(
+            filter(
+                None,
+                [title, text[: self._settings.memory_node_hint_text_chars]],
+            )
+        )
+        candidates = self._namespaces.suggest(
+            terms,
+            limit=self._settings.memory_node_hint_max_nodes,
+            min_score=self._settings.memory_node_hint_min_score,
+        )
+        if candidates:
+            paths = " / ".join(f"«{candidate['path']}»" for candidate in candidates)
+            return f"saved to `default`; looks like {paths}"
+        return "saved to `default`; no node matched — see memory_namespaces"
 
     def _insert(
         self,
@@ -292,19 +433,23 @@ class NoteService:
         namespace: str = "default",
         title: str | None = None,
         expires_at: str | None = None,
+        comment: str | None = None,
     ) -> int:
         """INSERT строки заметки (внутри открытой транзакции).
 
         title (решение №9) — проверен/нормализован вызывающим (_validated_save_title);
         None — легаси-путь миграции (название догенерирует воркер).
         expires_at (lsb-0004-02) — абсолютный ISO-8601 UTC (распарсен
-        вызывающим); None — постоянная заметка (без TTL)."""
+        вызывающим); None — постоянная заметка (без TTL).
+        comment (no24-01) — проверен/нормализован вызывающим (_checked_comment);
+        None — комментария нет."""
         cursor = conn.execute(
-            "INSERT INTO notes (text, title, author, vector_status, namespace, "
-            "expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO notes (text, title, comment, author, vector_status, "
+            "namespace, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 text,
                 title,
+                comment,
                 author if author else self._settings.author_default,
                 vector_status,
                 namespace,
@@ -437,6 +582,7 @@ class NoteService:
         namespace: str | None = None,
         namespace_exact: bool = False,
         max_limit: int | None = None,
+        updated_after: str | None = None,
     ) -> dict[str, Any]:
         """Обзор памяти: краткие содержания по свежести + total (FR-2).
 
@@ -449,6 +595,11 @@ class NoteService:
         the single one shared by all listings. Page fields come from the shared
         `page_fields` helper and are present in every branch of the answer;
         ordering, filters and `total` are unchanged.
+
+        no29-01: `updated_after` (ISO-8601 UTC, граница включающая) сужает и
+        страницу, и `total` одним и тем же условием `updated_at >= ?`; порядок
+        `updated_at DESC, id DESC` не меняется. Невалидное значение —
+        FreshnessValidationError (транспорт даёт 422 / мягкий отказ с hint).
         """
         max_limit = (
             self._settings.list_max_limit_rest if max_limit is None else max_limit
@@ -468,18 +619,25 @@ class NoteService:
         else:
             ns_clause = ""
             ns_params = []
+        if updated_after is not None:
+            fresh_clause = " AND updated_at >= ?"
+            fresh_params: list[object] = [parse_updated_after(updated_after)]
+        else:
+            fresh_clause = ""
+            fresh_params = []
         with session(self._settings) as conn:
             rows = conn.execute(
                 "SELECT id, title, namespace, summary, summary_status, author, "
                 "created_at, updated_at, expires_at, text "
                 "FROM notes WHERE deleted_at IS NULL"
-                f"{ns_clause} "
+                f"{ns_clause}{fresh_clause} "
                 "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
-                [*ns_params, limit, offset],
+                [*ns_params, *fresh_params, limit, offset],
             ).fetchall()
             total = conn.execute(
-                f"SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL{ns_clause}",
-                ns_params,
+                f"SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL"
+                f"{ns_clause}{fresh_clause}",
+                [*ns_params, *fresh_params],
             ).fetchone()[0]
         items = [
             {
@@ -520,6 +678,7 @@ class NoteService:
         title: str | None = None,
         summary: str | None = _UNSET_SUMMARY,
         expires_at: str | None = _UNSET_EXPIRES_AT,
+        comment: str | None = _UNSET_COMMENT,
     ) -> dict[str, Any]:
         """UPDATE заметки по контракту lsb-0004-01 (решение О. 2026-09-09):
         «не передано» = оставить, null = сбросить. text опционален — можно
@@ -568,6 +727,12 @@ class NoteService:
         if text_changed:
             self._validate_text(text)
         note_title = None if title is None else self._checked_title(title)
+        # no24-01 (3.2.0): пометка правится ОТДЕЛЬНЫМ путём (сентинел-семантика
+        # как у summary/expires_at): не передан → оставить (колонку не трогаем);
+        # значение 1..COMMENT_MAX_CHARS → записать; None/пусто/пробелы → сброс
+        # (NULL). Проверка — ДО любой записи: мягкий отказ без частичной записи.
+        comment_touched = comment is not _UNSET_COMMENT
+        comment_value = self._checked_comment(comment) if comment_touched else None
         # Быстрая проверка до записи: несуществующий id не трогаем.
         with session(self._settings) as conn:
             row = conn.execute(
@@ -636,6 +801,12 @@ class NoteService:
         if note_title is not None:
             sets.append("title = ?")
             params.append(note_title)
+        if comment_touched:
+            # Только комментарий (и updated_at): text/title/summary/
+            # summary_status/vector_status/разметка/links_at/node_order_at,
+            # чанки и notes_vec НЕ трогаются (no24-01, FR-5.3).
+            sets.append("comment = ?")
+            params.append(comment_value)
         sets.append("namespace = ?")
         params.append(ns)
         if summary_touched:
@@ -673,6 +844,27 @@ class NoteService:
                 # участвует только в FTS-поиске (ARCH §3.3), старый вектор по
                 # прежнему тексту не кормит ни векторный поиск, ни косинус-дедуп.
                 vectors.drop(conn, note_id)
+            if updated:
+                # №41 (§13.5): версия-правка — ТОЙ ЖЕ транзакцией, проекция
+                # читается после UPDATE. `summary` входит только при ЯВНОЙ
+                # передаче (§13.3): авто-перегенерация версий не создаёт.
+                row = conn.execute(
+                    "SELECT text, title, namespace, expires_at, comment, summary "
+                    "FROM notes WHERE id = ?",
+                    (note_id,),
+                ).fetchone()
+                history.record_change(
+                    conn,
+                    history.ENTITY_NOTE,
+                    note_id,
+                    history.note_projection(
+                        row, explicit_summary=summary is not _UNSET_SUMMARY
+                    ),
+                )
+                # №12 (FR-4.4): правка заметки инвалидирует её предупреждения
+                # — в ТОЙ ЖЕ транзакции (предупреждение не переживёт откат).
+                if self._warnings_resolver is not None:
+                    self._warnings_resolver("note", note_id, conn=conn)
         if not updated:
             return self._not_found(note_id)
         if text_changed:
@@ -706,6 +898,11 @@ class NoteService:
                 # Только если soft delete сматчился: снимаем TTL-строку той же
                 # транзакцией (идемпотентно — отсутствующей строки нет).
                 expirations.delete(conn, note_id)
+                # №41 (FR-6.1): мягкое удаление — версия-событие в той же
+                # транзакции; повторное/несуществующее удаление версии не даёт.
+                history.record_event(
+                    conn, history.ENTITY_NOTE, note_id, "delete"
+                )
         if not deleted:
             return {
                 "id": note_id,
@@ -773,6 +970,34 @@ class NoteService:
                     (newer_id,),
                 )
                 deleted = cursor.rowcount > 0
+                # №41 (FR-7.1, §13.5): обе записи — в ТОЙ ЖЕ транзакции.
+                # Выжившая: контент-версия с источником `merge`; поглощённая:
+                # версия-событие удаления (история читается и после soft delete).
+                older_row = conn.execute(
+                    "SELECT text, title, namespace, expires_at, comment FROM notes "
+                    "WHERE id = ?",
+                    (older_id,),
+                ).fetchone()
+                history.record_change(
+                    conn,
+                    history.ENTITY_NOTE,
+                    older_id,
+                    history.note_projection(older_row),
+                    source="merge",
+                )
+                if deleted:
+                    history.record_event(
+                        conn,
+                        history.ENTITY_NOTE,
+                        newer_id,
+                        "delete",
+                        source="merge",
+                    )
+                # №12 (FR-4.4): сшивание инвалидирует предупреждения ОБЕИХ
+                # заметок — в ТОЙ ЖЕ транзакции (правка пары).
+                if self._warnings_resolver is not None:
+                    self._warnings_resolver("note", older_id, conn=conn)
+                    self._warnings_resolver("note", newer_id, conn=conn)
         if merged:
             self._notify_summary_pending()
             # Сшивание переписало текст ранней заметки и вернуло её в очередь
@@ -928,6 +1153,23 @@ class NoteService:
         assert title is not None  # is_valid_title отсёк None — для типизации
         return title.strip()
 
+    def _checked_comment(self, comment: str | None) -> str | None:
+        """Пометка заметки (no24-01): None/пусто/пробелы → None (сброс), иначе
+        нормализованное значение (краевые пробелы сняты). Длина после strip —
+        1..COMMENT_MAX_CHARS (250); иначе CommentValidationError — мягкий
+        отказ, заметка не меняется."""
+        if comment is None:
+            return None
+        stripped = comment.strip()
+        if not stripped:
+            return None
+        if not 1 <= len(stripped) <= self._settings.comment_max_chars:
+            raise CommentValidationError(
+                f"comment: up to {self._settings.comment_max_chars} characters, "
+                f"got {len(stripped)}"
+            )
+        return stripped
+
     def _validate_text(self, text: str) -> None:
         """1..MAX_NOTE_CHARS — доменное правило REQUIREMENTS FR-4/FR-5."""
         if not 1 <= len(text) <= self._settings.max_note_chars:
@@ -958,4 +1200,5 @@ class NoteService:
             "updated_at": row["updated_at"],
             "namespace": row["namespace"],
             "expires_at": row["expires_at"],
+            "comment": row["comment"],  # no24-01 (3.2.0): пометка заметки
         }

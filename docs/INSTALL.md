@@ -133,3 +133,31 @@ or edit it to add both markers (see [Configuration](CONFIG.md) → Prompts).
   are kept.
 - **Direct DB access**: `sqlite3 data/notes.db` (see Requirements §3).
 - **Stop**: `docker compose down`.
+
+## Restore from a snapshot
+
+Snapshots are plain SQLite files in `BACKUP_DIR` (default `/data/backups`,
+inside the `./data` volume); the file name carries the UTC timestamp.
+
+1. Pick the newest `notes-*.db`. `GET /backups` (or `POST /backups/verify`)
+   reports `verified` per snapshot — prefer one that is `ok`; a snapshot marked
+   `failed` also carries a `<file>.bad` sidecar.
+2. Stop the service: `docker compose down` — nothing must write to the file you
+   are about to replace.
+3. Put the snapshot in place of the live database (`DB_PATH`, default
+   `data/notes.db`), e.g. `cp data/backups/notes-<stamp>.db data/notes.db`, and
+   remove the stale `notes.db-wal` / `notes.db-shm` beside it if any. To keep the
+   old file untouched, copy the snapshot next to it and point `DB_PATH` at the
+   copy instead.
+4. Start it again: `docker compose up -d`, then check `/health` — `status` is
+   `ok`, `notes_count` matches the snapshot and `embedding_ok` becomes `true`
+   after the first successful call to the embedding slot.
+5. If the snapshot was taken with a different embedding model (the verification
+   note `embedding_mismatch`), a full reindex starts by itself: wait for
+   `pending_vector` in `/health` to reach `0` before searching.
+
+Shipping a verified copy off the box is optional and driven by
+`BACKUP_SHIP_CMD` (empty by default: shipping is off). The command itself — and
+its output — never reaches the logs; keep the destination and the credentials
+outside this repository (see `scripts/backup_ship.sh` for a secret-free
+template and [Configuration](CONFIG.md)).

@@ -65,6 +65,7 @@ CRUD (валидации, статусы, soft delete) — в `app.services.note
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sqlite3
@@ -110,6 +111,7 @@ CREATE TABLE IF NOT EXISTS notes (
   id             INTEGER PRIMARY KEY,
   text           TEXT    NOT NULL CHECK(length(text) BETWEEN 1 AND {max_note_chars}),
   title          TEXT    NULL,
+  comment        TEXT    NULL,
   summary        TEXT    NOT NULL DEFAULT '',
   author         TEXT    NOT NULL DEFAULT 'unknown',
   vector_status  TEXT    NOT NULL DEFAULT 'pending',
@@ -123,7 +125,8 @@ CREATE TABLE IF NOT EXISTS notes (
   confidence     REAL    NULL,
   expires_at     TEXT    NULL,
   links_at       TEXT    NULL,
-  node_order_at  TEXT    NULL
+  node_order_at  TEXT    NULL,
+  warnings_at    TEXT    NULL
 )
 """
 
@@ -205,6 +208,41 @@ CREATE TABLE IF NOT EXISTS links (
 # стороны (`note_a = ? OR note_b = ?`), PRIMARY KEY покрывает только note_a.
 _LINKS_INDEX_DDL = "CREATE INDEX IF NOT EXISTS idx_links_b ON links(note_b)"
 
+# Таблица предупреждений (№12 + №32, arch §5.1): ОДНА общая поверхность
+# предупреждений памяти и терминов, читаемая без вызова модели. Субстрат
+# (прецедент общей `meta`): доступ по ключу `(subject_type, subject_id)`,
+# SQL изоляции областей её не адресует. Не более одного ОТКРЫТОГО
+# предупреждения на (субъект, вид) — повторный прогон джобы обновляет
+# `updated_at`/`payload`, а не плодит строки (§13.7).
+_WARNINGS_DDL = """
+CREATE TABLE IF NOT EXISTS warnings (
+  id           INTEGER PRIMARY KEY,
+  kind         TEXT    NOT NULL,
+  subject_type TEXT    NOT NULL,
+  subject_id   INTEGER NOT NULL,
+  message      TEXT    NOT NULL,
+  payload      TEXT    NOT NULL DEFAULT '{}',
+  status       TEXT    NOT NULL DEFAULT 'open' CHECK(status IN ('open','dismissed')),
+  created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  resolved_at  TEXT    NULL
+)
+"""
+
+# Частичный уникальный индекс: не более одного ОТКРЫТОГО предупреждения на
+# (субъект, вид) — идемпотентность upsert'а (§5.1, §13.7).
+_WARNINGS_UNIQUE_INDEX_DDL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_warnings_open_unique "
+    "ON warnings(subject_type, subject_id, kind) "
+    "WHERE status = 'open' AND resolved_at IS NULL"
+)
+
+# Рабочий индекс листинга/агрегатов (/health.warnings, GET /warnings).
+_WARNINGS_STATUS_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_warnings_status_kind "
+    "ON warnings(status, kind, id)"
+)
+
 # Вектора (Фаза 3): физическая схема в `app.storage.vectors` (размерность и
 # cosine-метрика — там же); в init_db — создание/сверка при старте. Модель
 # эмбеддинга, на которой построен индекс, — в таблице meta (см. ниже):
@@ -234,6 +272,34 @@ _TRIGGERS = (
     """,
 )
 
+# №24 (no24-02, 3.2.0): ОТДЕЛЬНЫЙ FTS-индекс пометок (arch §5.2). Смысловой
+# `notes_fts` индексирует title/text и пометок НЕ видит: пометки ищутся
+# отдельным поиском (MCP `memory_comment_search` / REST `GET /notes/comments`)
+# — результаты не смешиваются (§13.6).
+_COMMENT_FTS_DDL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_comment_fts USING fts5(
+  comment, content='notes', content_rowid='id', tokenize='trigram'
+)
+"""
+
+# Синхронизация индекса пометок с notes (по образцу _TRIGGERS): INSERT всегда
+# (в т.ч. comment IS NULL — «пометки нет»), UPDATE OF comment — спец-команда
+# 'delete' со СТАРЫМ значением + вставка нового. DELETE-триггера нет: заметки
+# soft-delete, физического удаления в штатном пути нет (как у notes_fts).
+_COMMENT_TRIGGERS = (
+    """
+    CREATE TRIGGER IF NOT EXISTS notes_comment_fts_ai AFTER INSERT ON notes BEGIN
+      INSERT INTO notes_comment_fts(rowid, comment) VALUES (new.id, new.comment);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS notes_comment_fts_au AFTER UPDATE OF comment ON notes BEGIN
+      INSERT INTO notes_comment_fts(notes_comment_fts, rowid, comment) VALUES ('delete', old.id, old.comment);
+      INSERT INTO notes_comment_fts(rowid, comment) VALUES (new.id, new.comment);
+    END
+    """,
+)
+
 
 # --- области 3.0.0 (субстрат: skills / terms / user) ----------------------
 
@@ -249,8 +315,21 @@ USER_FACTS_TABLE = "user_facts"
 USER_FACTS_FTS_TABLE = "user_facts_fts"
 USER_FACTS_FTS_COLUMNS = ("name", "body")
 
+# Область «Логи ассистента» (LSBN-F-10, релиз 3.2.0, arch §5.1/§5.2): одна
+# таблица записей + FTS5-индекс тех же смысловых текстовых полей. Структурные
+# фильтры (`entity*`, `source`, `session`, `created_at`) — обычные колонки и в
+# FTS не входят.
+ASSISTANT_LOGS_TABLE = "assistant_logs"
+ASSISTANT_LOGS_FTS_TABLE = "assistant_logs_fts"
+ASSISTANT_LOGS_FTS_COLUMNS = ("action", "reason", "entity_ref", "outcome", "verified")
+
 # Записи областей (без vec-таблиц): общие колонки + поля конкретной области.
-AREA_RECORD_TABLES = (SKILLS_TABLE, TERMS_TABLE, USER_FACTS_TABLE)
+AREA_RECORD_TABLES = (
+    SKILLS_TABLE,
+    TERMS_TABLE,
+    USER_FACTS_TABLE,
+    ASSISTANT_LOGS_TABLE,
+)
 
 # (таблица записей, FTS-таблица, индексируемые колонки) — реестр FTS/триггеров:
 # один DDL и один набор триггеров на каждую область (без копипасты по областям).
@@ -258,6 +337,38 @@ _AREA_FTS_SPECS = (
     (SKILLS_TABLE, SKILLS_FTS_TABLE, SKILLS_FTS_COLUMNS),
     (TERMS_TABLE, TERMS_FTS_TABLE, TERMS_FTS_COLUMNS),
     (USER_FACTS_TABLE, USER_FACTS_FTS_TABLE, USER_FACTS_FTS_COLUMNS),
+    (ASSISTANT_LOGS_TABLE, ASSISTANT_LOGS_FTS_TABLE, ASSISTANT_LOGS_FTS_COLUMNS),
+)
+
+# Обязательные таблицы «ядра» для проверки снапшота (no14-01, релиз 3.2.0):
+# имена всех не-векторных таблиц, которые `init_db` создаёт в боевой БД (ядро
+# заметок + записи/FTS областей). Векторные (vec0) таблицы живут в своих
+# реестрах (`vectors.VEC_TABLE`, `chunks.CHUNKS_VEC_TABLE`, `area_vectors.VEC_TABLES`)
+# и здесь не перечисляются: `BackupService.verify` собирает обязательный
+# набор из всех реестров `app.storage`, а не хардкодит его. Единый источник
+# имён ядра — этот кортеж.
+CORE_TABLES: tuple[str, ...] = (
+    "notes",
+    "notes_fts",
+    "notes_comment_fts",
+    "namespaces",
+    "promotions",
+    "note_expirations",
+    "links",
+    "warnings",
+    "meta",
+    chunks.CHUNKS_TABLE,
+    "record_versions",
+    SKILLS_TABLE,
+    SKILLS_FTS_TABLE,
+    "skill_versions",
+    "skills_meta",
+    TERMS_TABLE,
+    TERMS_FTS_TABLE,
+    USER_FACTS_TABLE,
+    USER_FACTS_FTS_TABLE,
+    ASSISTANT_LOGS_TABLE,
+    ASSISTANT_LOGS_FTS_TABLE,
 )
 
 # Поля записей — по архитектурам фич lsb-0007/0008/0009; общее у всех —
@@ -326,6 +437,25 @@ CREATE TABLE IF NOT EXISTS user_facts (
   deleted_at    TEXT    NULL
 )
 """,
+    """
+CREATE TABLE IF NOT EXISTS assistant_logs (
+  id             INTEGER PRIMARY KEY,
+  action         TEXT    NOT NULL DEFAULT '',   -- что сделано (обязательно, <= LOGS_ACTION_MAX_CHARS)
+  reason         TEXT    NOT NULL DEFAULT '',   -- почему (обязательно, <= LOGS_REASON_MAX_CHARS)
+  entity         TEXT    NULL,                  -- тип объекта изменения (закрытый словарь, §5.4)
+  entity_id      INTEGER NULL,                  -- id объекта в своей области (версионные сущности)
+  entity_version INTEGER NULL,                  -- версия объекта на момент записи (№41)
+  entity_ref     TEXT    NULL,                  -- текстовая ссылка/путь (объекты без id; <= LOGS_ENTITY_REF_MAX_CHARS)
+  outcome        TEXT    NULL,                  -- результат (что получилось; <= LOGS_OUTCOME_MAX_CHARS)
+  verified       TEXT    NULL,                  -- что проверено (<= LOGS_VERIFIED_MAX_CHARS)
+  source         TEXT    NOT NULL DEFAULT 'mcp',-- источник записи: mcp|rest|job:<name>|merge|migration
+  session        TEXT    NULL,                  -- идентификатор вызова/агента, не имя человека
+  vector_status  TEXT    NOT NULL DEFAULT 'pending',
+  created_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  updated_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  deleted_at     TEXT    NULL
+)
+""",
 )
 
 # Глобальный шаблон области навыков (lsb-0007 §3.1/§3.8): одна запись
@@ -359,13 +489,13 @@ CREATOR_SKILL_STEPS = (
 CREATOR_SKILL_TEXT = (
     "1) Call skills_search with the task wording: a similar skill exists → "
     "update it (skills_save with id), never create a duplicate. 2) name ≤65 "
-    "characters (≤5 words recommended); description ≤250 — what the procedure "
-    "does. 3) steps ≤500 — the order (what after what); text ≤4000 — what "
+    "characters (≤5 words recommended); description ≤400 — what the procedure "
+    "does. 3) steps ≤1000 — the order (what after what); text ≤7500 — what "
     "exactly each step does (result/format/rule); keep the \"how to execute\" "
     "wording in the global instruction_template, never duplicate it per skill. "
     "4) Optional class fields (trigger, mode, preconditions, fallbacks, "
     "invariant, exceptions, guardrails, references, output_contract, "
-    "behavior_contract) and example (≤1000) — only when this skill class needs "
+    "behavior_contract) and example (≤2000) — only when this skill class needs "
     "them. 5) skills_save, then skills_get to check that the procedure reads "
     "as a ready-to-execute routine. 6) Self-improvement: when you are sure a "
     "skill can be improved, propose the exact edit (what and why) and ask the "
@@ -380,6 +510,40 @@ _TERMS_ACTIVE_KEY_INDEX_DDL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_terms_key_active "
     "ON terms(term_norm, context_norm) WHERE deleted_at IS NULL"
 )
+
+# Индексы обратного запроса области логов (arch §5.1, FR-4.1/FR-5.2): оба
+# частичные — только по активным записям (прецедент idx_terms_key_active).
+# Первый — «почему изменился объект»; второй — срез по абсолютной дате.
+# Отдельных индексов по session/source нет: домен узкий, объём мал (§4).
+_ASSISTANT_LOGS_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_assistant_logs_entity_active "
+    "ON assistant_logs(entity, entity_id, created_at DESC) WHERE deleted_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_assistant_logs_created_active "
+    "ON assistant_logs(created_at DESC) WHERE deleted_at IS NULL",
+)
+
+# История версий (№41, релиз 3.2.0, substrate-versioning §5.1): одна общая
+# таблица на все сущности, PK `(entity, entity_id, version)` — покрывает
+# lookup по записи и обратный порядок (от новых к старым). Индексов сверх PK
+# НЕ заводится (решение §5.1). `version=1` — baseline (`snapshot` заполнен,
+# `delta` NULL); `version≥2` — дельта, кроме перебазированной после prune.
+_RECORD_VERSIONS_DDL = """
+CREATE TABLE IF NOT EXISTS record_versions (
+  entity       TEXT    NOT NULL,                     -- 'note'|'skill'|'skill_template'|'term'|'user_fact'
+  entity_id    INTEGER NOT NULL,                     -- id строки живой таблицы; для skill_template — 0
+  version      INTEGER NOT NULL,                     -- 1..N, baseline = 1
+  event        TEXT    NOT NULL DEFAULT 'content'
+               CHECK(event IN ('baseline','content','delete','restore','rollback')),
+  source       TEXT    NOT NULL,                     -- 'mcp'|'rest'|'job:<имя>'|'merge'|'migration'
+  session      TEXT    NULL,                         -- идентификатор вызова/агента, не имя человека
+  changed      TEXT    NOT NULL DEFAULT '[]',        -- JSON-массив имён изменившихся полей
+  snapshot     TEXT    NULL,                         -- JSON-объект: поля целиком (baseline / после prune)
+  delta        TEXT    NULL,                         -- JSON-объект: поле → значение/строки (§5.2)
+  restore_from INTEGER NULL,                         -- откат: номер восстановленной версии
+  created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  PRIMARY KEY (entity, entity_id, version)
+)
+"""
 
 
 def _area_fts_ddl(table: str, fts_table: str, columns: tuple[str, ...]) -> str:
@@ -434,6 +598,8 @@ def _create_area_schema(conn: sqlite3.Connection, settings: Settings) -> None:
         for trigger in _area_trigger_ddls(table, fts_table, columns):
             conn.execute(trigger)
     conn.execute(_TERMS_ACTIVE_KEY_INDEX_DDL)
+    for ddl in _ASSISTANT_LOGS_INDEX_DDL:
+        conn.execute(ddl)
     area_vectors.create_vec_tables(conn, settings.embedding_dim)
 
 
@@ -601,6 +767,13 @@ def init_db(settings: Settings) -> None:
             # ДО title-миграции FTS: к моменту _sync_fts_title_index колонка
             # title уже существует — перелив индекса читает notes.title.
             _migrate_title_column(conn)
+            # Пометка заметки (№24, 3.2.0): notes.comment TEXT (nullable).
+            # Колонка нужна до вставок/чтений сервиса; FTS пометок — no24-02.
+            _migrate_comment_column(conn)
+            # FTS пометок (№24, no24-02): отдельная таблица notes_comment_fts
+            # + триггеры — сразу после колонки comment и ДО сверки эмбеддинга
+            # (таблицу не адресует). Rebuild не нужен: комментариев ещё нет.
+            _migrate_comment_fts(conn)
             # Неймспейсы (Фаза 10): колонки notes + реестр + дефолт-узел.
             _migrate_namespace_columns(conn)
             _migrate_classification_columns(conn)
@@ -619,6 +792,10 @@ def init_db(settings: Settings) -> None:
             # — идемпотентно; у существующих заметок NULL (первый прогон джобы
             # `nodes` разбирает накопленный default — ретро-прогон, arch §4).
             _migrate_node_order_columns(conn)
+            # Предупреждения (№12, 3.2.0): служебный маркер notes.warnings_at
+            # — идемпотентно; у существующих заметок NULL (первый прогон
+            # джобы `warnings` проверяет накопленное).
+            _migrate_warnings_columns(conn)
             # Лимит длины саммари (гейт 3.1.0, 2026-09-19): готовые саммари
             # длиннее MAX_SUMMARY_CHARS → pending (перегенерация фоном).
             _migrate_summary_length(conn, settings)
@@ -628,6 +805,10 @@ def init_db(settings: Settings) -> None:
             conn.execute(_INDEX_DELETED_UPDATED_DDL)
             conn.execute(_INDEX_NS_DELETED_UPDATED_DDL)
             _ensure_default_namespace(conn)
+            # №34 (3.2.0): описание `default` — EN; существующие БД доводятся
+            # одноразово и только если текст точно равен прежнему RU-дефолту
+            # (правка оператора сохраняется). Штамп в `meta` — см. функцию.
+            _migrate_default_namespace_description(conn)
             conn.execute(_PROMOTIONS_DDL)
             # lsb-0005-03: ключ promotions (domain, subdomain) → единый
             # hint_path; миграция старых вердиктов (идемпотентно).
@@ -648,12 +829,22 @@ def init_db(settings: Settings) -> None:
             # до сверки модели/размерности: её ветка дропает area-vec и
             # пересоздаёт их под текущую размерность (_reset_area_vectors).
             _create_area_schema(conn, settings)
+            # Предупреждения (№12/№32): общая таблица `warnings` + индексы —
+            # субстрат, ни на что не влияет, моделей не трогает; ДО сверки
+            # эмбеддинга (arch §5.4).
+            _migrate_warnings_schema(conn)
             # Сид глобального шаблона навыков (lsb-0007 §3.8): сразу после
             # создания skills_meta, идемпотентно, существующее не трогаем.
             _ensure_skills_meta(conn)
             # Сид skill-создателя (lsb-0007 §3.6/§3.8): сразу после шаблона,
             # идемпотентно, с маркером в skills_meta (удалённый — не воскреснет).
             _ensure_creator_skill(conn)
+            # История версий (№41, 3.2.0, substrate-versioning §5.1/§5.4): таблица
+            # record_versions, baseline существующих записей и перенос архива
+            # skill_versions в общую форму — идемпотентно, ПОСЛЕ сидов областей
+            # (сид навыка получает baseline) и ДО сверки эмбеддинга: история —
+            # про контент, векторных таблиц не адресует вовсе.
+            _migrate_history_schema(conn, settings)
             # Вектора (Фаза 3 + решение 2026-08-29; Фаза 7: + вектора чанков):
             # создание при первом старте; при несовпадении зафиксированной
             # конфигурации (модель/размерность) с env — полная автореиндексация
@@ -673,7 +864,15 @@ def init_db(settings: Settings) -> None:
 # --- неймспейсы (Фаза 10) --------------------------------------------------
 
 DEFAULT_NAMESPACE = "default"
-DEFAULT_NAMESPACE_DESCRIPTION = "общие заметки, не привязанные к доменам"
+# Описание системного узла — модельный текст, значит EN (№34, 3.2.0). Прежний
+# RU-дефолт остаётся отдельной константой: по нему одноразовая миграция
+# отличает «сид» от правки оператора (см. _migrate_default_namespace_description).
+DEFAULT_NAMESPACE_DESCRIPTION = "general notes not tied to any domain"
+DEFAULT_NAMESPACE_DESCRIPTION_LEGACY = "общие заметки, не привязанные к доменам"
+
+# Штамп одноразового доведения описания `default` (№34, 3.2.0): ключ в `meta`.
+DEFAULT_DESCRIPTION_META_KEY = "default_description_version"
+DEFAULT_DESCRIPTION_VERSION = "en-v1"
 
 
 def _migrate_title_column(conn: sqlite3.Connection) -> None:
@@ -686,6 +885,32 @@ def _migrate_title_column(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
     if "title" not in columns:
         conn.execute("ALTER TABLE notes ADD COLUMN title TEXT")
+
+
+def _migrate_comment_column(conn: sqlite3.Connection) -> None:
+    """Нулевая миграция №24 (3.2.0): notes.comment TEXT (nullable).
+
+    Свежие БД получают колонку из _NOTES_DDL; унаследованные — ALTER TABLE
+    ADD COLUMN (идемпотентно, применимо с любой предыдущей версии; NULL =
+    комментария нет). Лимит 250 в схеме НЕ CHECK — валидация доменная
+    (CommentValidationError), как у `title`.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
+    if "comment" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN comment TEXT")
+
+
+def _migrate_comment_fts(conn: sqlite3.Connection) -> None:
+    """FTS-индекс пометок (no24-02, 3.2.0): таблица + оба триггера.
+
+    Идемпотентно (IF NOT EXISTS) — повторный старт no-op. Rebuild НЕ делается:
+    на момент миграции комментариев нет (колонка только что создана
+    _migrate_comment_column), а последующие установки пометки идут через
+    `AFTER UPDATE OF comment`. Смысловой `notes_fts` не трогается.
+    """
+    conn.execute(_COMMENT_FTS_DDL)
+    for trigger in _COMMENT_TRIGGERS:
+        conn.execute(trigger)
 
 
 # Индексы list-выдач (фаза 2, пул 15; замер 50k: LIST p95 204 мс):
@@ -826,6 +1051,33 @@ def _migrate_node_order_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE notes ADD COLUMN node_order_at TEXT")
 
 
+def _migrate_warnings_columns(conn: sqlite3.Connection) -> None:
+    """Нулевая миграция №12 (3.2.0) поверх живых БД: маркер notes.warnings_at.
+
+    Свежие БД получают колонку из `_NOTES_DDL`; унаследованные — ALTER TABLE
+    ADD COLUMN (warnings_at NULL у всех заметок: первый прогон джобы `warnings`
+    естественно проверяет их). Маркер — служебный (планирование обхода):
+    версий не создаёт, в выдачи MCP/REST не выходит, предупреждение в заметке
+    НЕ хранится (только строка в `warnings`, arch §5.3). Идемпотентно:
+    повторный запуск (рестарт сервиса) — no-op.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
+    if "warnings_at" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN warnings_at TEXT")
+
+
+def _migrate_warnings_schema(conn: sqlite3.Connection) -> None:
+    """Нулевая миграция №12 (3.2.0): таблица `warnings` + оба индекса (§5.1).
+
+    Общая поверхность предупреждений памяти и терминов (№12 + №32).
+    CREATE TABLE/INDEX IF NOT EXISTS — идемпотентно, повторный старт no-op;
+    моделей и прочих таблиц не касается (arch §5.4).
+    """
+    conn.execute(_WARNINGS_DDL)
+    conn.execute(_WARNINGS_UNIQUE_INDEX_DDL)
+    conn.execute(_WARNINGS_STATUS_INDEX_DDL)
+
+
 def _migrate_link_columns(conn: sqlite3.Connection) -> None:
     """Нулевая миграция lsb-0010-02 поверх живых БД: таблица links, индекс
     idx_links_b и маркер расчёта notes.links_at.
@@ -938,6 +1190,187 @@ def _ensure_creator_skill(conn: sqlite3.Connection) -> None:
     )
 
 
+# --- история версий (№41, релиз 3.2.0) --------------------------------------
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    """Существует ли объект-таблица в БД (идемпотентность шагов по наличию)."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _history_projection(entity: str, row: sqlite3.Row, fields: tuple[str, ...]) -> dict:
+    """Проекция записи для истории (§5.3): поля как есть, `extra` — объектом.
+
+    `extra` навыка в живой таблице — JSON-текст полей класса; в версии он живёт
+    распарсенным объектом (одна форма у baseline и дельт), пусто — `None`.
+    """
+    projection: dict = {}
+    for field in fields:
+        value = row[field]
+        if entity == "skill" and field == "extra":
+            value = None if not value else json.loads(value)
+        projection[field] = value
+    return projection
+
+
+def _insert_baseline(
+    conn: sqlite3.Connection, entity: str, entity_id: int, projection: dict
+) -> None:
+    """`INSERT … WHERE NOT EXISTS`: baseline только там, где истории ещё нет.
+
+    Само-лечаще: строка, появившаяся после baseline-миграции, добирает baseline
+    при следующем старте; повторный проход — no-op (§5.4).
+    """
+    conn.execute(
+        "INSERT INTO record_versions (entity, entity_id, version, event, source, "
+        "changed, snapshot) SELECT ?, ?, 1, 'baseline', 'migration', '[]', ? "
+        "WHERE NOT EXISTS (SELECT 1 FROM record_versions WHERE entity = ? "
+        "AND entity_id = ?)",
+        (entity, entity_id, json.dumps(projection, ensure_ascii=False), entity, entity_id),
+    )
+
+
+def _backfill_history_baseline(conn: sqlite3.Connection) -> None:
+    """Baseline всех существующих записей: `version=1` = текущее содержимое.
+
+    Проекция собирается в Python (`json.dumps`) — без зависимости от SQLite
+    json1; проход по каждой сущности отдельный, `WHERE NOT EXISTS` держит
+    идемпотентность (FR-8.1/FR-8.2, §5.4). Записи в trash тоже получают
+    baseline: история — операторская, мягкое удаление её не отменяет.
+    """
+    from app.services.history import (
+        CONTENT_FIELDS,
+        ENTITY_ASSISTANT_LOG,
+        ENTITY_NOTE,
+        ENTITY_SKILL,
+        ENTITY_SKILL_TEMPLATE,
+        ENTITY_TERM,
+        ENTITY_USER_FACT,
+    )
+
+    entity_tables = {
+        ENTITY_NOTE: "notes",
+        ENTITY_SKILL: "skills",
+        ENTITY_TERM: "terms",
+        ENTITY_USER_FACT: "user_facts",
+        ENTITY_ASSISTANT_LOG: ASSISTANT_LOGS_TABLE,
+    }
+    for entity, table in entity_tables.items():
+        fields = CONTENT_FIELDS[entity]
+        columns = ", ".join(("id", *fields))
+        for row in conn.execute(f"SELECT {columns} FROM {table}").fetchall():
+            _insert_baseline(
+                conn,
+                entity,
+                int(row["id"]),
+                _history_projection(entity, row, fields),
+            )
+    # Глобальный шаблон навыков — отдельная сущность истории (id 0, ключ
+    # skills_meta.instruction_template, §5.3).
+    template = conn.execute(
+        "SELECT value FROM skills_meta WHERE key = ?", (INSTRUCTION_TEMPLATE_KEY,)
+    ).fetchone()
+    if template is not None:
+        _insert_baseline(
+            conn, ENTITY_SKILL_TEMPLATE, 0, {"instruction_template": template["value"]}
+        )
+
+
+def _merge_skill_versions(conn: sqlite3.Connection, settings: Settings) -> None:
+    """Перенести архив `skill_versions` в общую форму истории (§5.4, §13.7).
+
+    Цепочка `1..N`: v1 — самая ранняя архивная копия целиком (`snapshot`,
+    `event='baseline'`, `source='migration'`), промежуточные — дельты,
+    посчитанные из архивных копий на месте переноса, vN — текущая строка
+    `skills` (дельта от предыдущей). Номера — из `skill_versions.version` и
+    `skills.version`; недостающие звенья не выдумываются — дельта считается
+    между соседними ИМЕЮЩИМИСЯ версиями. Перенос идёт одной транзакцией
+    вызывающего; таблица `skill_versions` остаётся legacy-слепком (§13.7) и
+    кодом больше не читается. Навык, у которого история уже есть, пропускается:
+    шаг идемпотентен; таблицы нет — no-op.
+    """
+    from app.services.history import CONTENT_FIELDS, ENTITY_SKILL, encode_delta
+
+    if not _table_exists(conn, "skill_versions"):
+        return
+    fields = CONTENT_FIELDS[ENTITY_SKILL]
+    skill_ids = [
+        int(row[0])
+        for row in conn.execute("SELECT DISTINCT skill_id FROM skill_versions")
+    ]
+    for skill_id in skill_ids:
+        has_history = conn.execute(
+            "SELECT 1 FROM record_versions WHERE entity = ? AND entity_id = ? LIMIT 1",
+            (ENTITY_SKILL, skill_id),
+        ).fetchone()
+        if has_history is not None:
+            continue
+        chain: dict[int, dict] = {}
+        for row in conn.execute(
+            "SELECT * FROM skill_versions WHERE skill_id = ? ORDER BY version",
+            (skill_id,),
+        ).fetchall():
+            chain[int(row["version"])] = _history_projection(ENTITY_SKILL, row, fields)
+        live = conn.execute("SELECT * FROM skills WHERE id = ?", (skill_id,)).fetchone()
+        if live is not None:
+            chain[int(live["version"])] = _history_projection(ENTITY_SKILL, live, fields)
+        if not chain:
+            continue
+        previous: dict | None = None
+        for version in sorted(chain):
+            current = chain[version]
+            if previous is None:
+                conn.execute(
+                    "INSERT INTO record_versions (entity, entity_id, version, event, "
+                    "source, changed, snapshot) VALUES (?, ?, ?, 'baseline', "
+                    "'migration', '[]', ?)",
+                    (
+                        ENTITY_SKILL,
+                        skill_id,
+                        version,
+                        json.dumps(current, ensure_ascii=False),
+                    ),
+                )
+            else:
+                delta, changed = encode_delta(
+                    previous, current, inline_max=settings.history_delta_inline_max
+                )
+                conn.execute(
+                    "INSERT INTO record_versions (entity, entity_id, version, event, "
+                    "source, changed, delta) VALUES (?, ?, ?, 'content', "
+                    "'migration', ?, ?)",
+                    (
+                        ENTITY_SKILL,
+                        skill_id,
+                        version,
+                        json.dumps(changed, ensure_ascii=False),
+                        json.dumps(delta, ensure_ascii=False),
+                    ),
+                )
+            previous = current
+
+
+def _migrate_history_schema(conn: sqlite3.Connection, settings: Settings) -> None:
+    """Схема истории + baseline существующих записей + перенос skill_versions.
+
+    Шаги постановки no41-01: (а) `CREATE TABLE IF NOT EXISTS record_versions`
+    (§5.1 — точно как в архитектуре, без индексов сверх PK); (б) перенос архива
+    навыков в общую форму; (в) baseline всех существующих записей. Порядок
+    «перенос → бэкфилл» обязателен: у навыка с архивом baseline — самая ранняя
+    архивная копия, а не текущая строка (иначе v1 был бы перезаписан текущим
+    содержимым и цепочка архива стала бы недостижима). Всё одной транзакцией,
+    идемпотентно и применимо с любой предыдущей версии.
+    """
+    with transaction(conn):
+        conn.execute(_RECORD_VERSIONS_DDL)
+        _merge_skill_versions(conn, settings)
+        _backfill_history_baseline(conn)
+
+
 def _ensure_default_namespace(conn: sqlite3.Connection) -> None:
     """Узел 'default' существует всегда (идемпотентно): описание — дефолт,
     оператор может править его через REST (Шаг 6)."""
@@ -1001,6 +1434,49 @@ def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
+
+
+def _migrate_default_namespace_description(conn: sqlite3.Connection) -> None:
+    """Довести описание узла `default` до EN (№34, 3.2.0): одноразово.
+
+    Свежая БД получает EN-текст из `_ensure_default_namespace` — для неё
+    миграция no-op (текст не равен прежнему RU-дефолту), но штамп всё равно
+    ставится. Унаследованная БД правится ТОЛЬКО если описание точно равно
+    прежнему русскому дефолту (DEFAULT_NAMESPACE_DESCRIPTION_LEGACY): любая
+    иная, в том числе русская, правка оператора сохраняется — «сид» и
+    «правка» различаются сравнением текста, новой колонки не заводится.
+
+    Одноразовость даёт штамп DEFAULT_DESCRIPTION_META_KEY в `meta`: он
+    ставится НЕЗАВИСИМО от исхода (обновлена строка или нет), поэтому
+    повторный `init_db` ничего не ищет и ничего не меняет. Вызывается в
+    `init_db` сразу после `_ensure_default_namespace`.
+    """
+    conn.execute(_META_DDL)  # meta может ещё не существовать у древних БД —
+    # штатно таблица создаётся позже, в _sync_embedding_meta (см. init_db)
+    if _get_meta(conn, DEFAULT_DESCRIPTION_META_KEY) is not None:
+        return  # доведено ранее — идемпотентно
+    with transaction(conn):
+        cursor = conn.execute(
+            "UPDATE namespaces SET description = ?, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            "WHERE path = ? AND description = ?",
+            (
+                DEFAULT_NAMESPACE_DESCRIPTION,
+                DEFAULT_NAMESPACE,
+                DEFAULT_NAMESPACE_DESCRIPTION_LEGACY,
+            ),
+        )
+        if cursor.rowcount == 1:
+            logging.getLogger("app").info(
+                "default namespace description migrated to english",
+                extra={
+                    "event": "default_description_migrated",
+                    "path": DEFAULT_NAMESPACE,
+                    "old": DEFAULT_NAMESPACE_DESCRIPTION_LEGACY,
+                    "new": DEFAULT_NAMESPACE_DESCRIPTION,
+                },
+            )
+        _set_meta(conn, DEFAULT_DESCRIPTION_META_KEY, DEFAULT_DESCRIPTION_VERSION)
 
 
 # --- title-индекс (lsb-0001-01) ---------------------------------------------
@@ -1374,10 +1850,17 @@ def delete_note_physical(conn: sqlite3.Connection, note_id: int) -> None:
 
     Полное физическое удаление (НЕ soft delete): просроченная заметка должна
     исчезнуть из всех индексов — notes + notes_chunks + notes_chunks_vec +
-    notes_vec + notes_fts + note_expirations. Композиция существующих
+    notes_vec + notes_fts + note_expirations + links. Композиция существующих
     примитивов слоя (chunks.drop_note_chunks, vectors.drop, expirations.delete)
     + явный DELETE из notes_fts (внешний контент: DELETE-триггера нет, индекс
     не чистится каскадом) и notes.
+
+    Связи (3.2.0, no46-03): `links` заметки сносятся здесь же, в ТОЙ ЖЕ
+    транзакции вызывающего (`DELETE FROM links WHERE note_a = ? OR note_b = ?` —
+    обе стороны пары, идемпотентно). Фоновый свип `purge_orphans` (idle-ветка
+    джобы `links`) остаётся страховкой, а не единственной чисталкой. Soft
+    delete связи НЕ трогает: заметка восстанавливаема — её строки `links`
+    живут (arch §3.2).
 
     Идемпотентно и безопасно: отсутствующей заметки нет — каждый DELETE
     просто не матчит ничего; повторный вызов не падает. Вызывается внутри
@@ -1390,3 +1873,8 @@ def delete_note_physical(conn: sqlite3.Connection, note_id: int) -> None:
     conn.execute("DELETE FROM notes_fts WHERE rowid = ?", (note_id,))
     conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
     expirations.delete(conn, note_id)  # note_expirations
+    # 3.2.0 (no46-03): связи заметки уходят вместе с ней — обе стороны пары,
+    # в той же транзакции (идемпотентно: повторный вызов просто не матчит).
+    conn.execute(
+        "DELETE FROM links WHERE note_a = ? OR note_b = ?", (note_id, note_id)
+    )

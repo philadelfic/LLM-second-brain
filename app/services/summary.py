@@ -79,17 +79,38 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
 import httpx
 
 from app.config import Settings
-from app.services.llm_client import LLMClient, LLMError, SlotSpec
+from app.services.llm_client import ChatMeta, ChatResult, LLMClient, LLMError, SlotSpec
 from app.services.prompts import PromptRegistry
+from app.services.slot_outcome import SlotOutcome, classify_llm_error
 
 
 class SummaryError(RuntimeError):
-    """Суммаризация не выполнена: сервер недоступен или ответ некорректен."""
+    """Суммаризация не выполнена: сервер недоступен или ответ некорректен.
+
+    `outcome` — единый тип исхода вызова слота (№39, arch §6.4): сервис
+    ставит его при отказе клиента (`classify_llm_error`), а при «маркер/
+    структура не найдены» — явно `OFF_CONTRACT` (дефолт). Воркер читает
+    исход через `slot_outcome.outcome_of` и пишет его в журнал.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        outcome: SlotOutcome = SlotOutcome.OFF_CONTRACT,
+        meta: ChatMeta | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.outcome = outcome
+        # Метаданные состоявшегося вызова (№49/№50): отказ после ответа модели
+        # несёт их воркеру — причина обрезки видна в журнале (§7.2).
+        self.meta = meta
 
 
 # Многоточие усечённого саммари: один символ — бюджет лимита тратится на текст
@@ -139,6 +160,19 @@ TITLE_PROMPT = (
 )
 
 
+@dataclass(frozen=True)
+class SummaryResult:
+    """Результат суммаризации вместе с метаданными вызова (№49, §6.3).
+
+    `text` — содержимое ответа (как раньше возвращал сервис); `meta` —
+    бюджет, счётчики, причина завершения и длительность вызова (для журнала
+    `slot_call` воркером).
+    """
+
+    text: str
+    meta: ChatMeta
+
+
 class Summarizer(Protocol):
     """Контракт суммаризатора: природы реализации он не знает.
 
@@ -146,18 +180,24 @@ class Summarizer(Protocol):
     (tests/fakes.py) — воркер зависит от протокола, а не от класса клиента.
     """
 
-    def summarize(self, text: str) -> str:
+    def summarize(self, text: str) -> SummaryResult:
         """Сгенерировать краткое содержание одного текста."""
         ...
 
-    def title(self, text: str) -> str:
+    def title(self, text: str) -> SummaryResult:
         """Название заметки ≤5 слов (Фаза 11, решение №9: title-доген
         миграционных заметок; думающий вызов слота summary, промпт зашит
         TITLE_PROMPT, обрезку делает воркер)."""
         ...
 
-    def merge(self, text_a: str, text_b: str) -> str:
+    def merge(self, text_a: str, text_b: str) -> SummaryResult:
         """Объединить пару текстов-дубликатов в один (дедуп, Этап 2.2)."""
+        ...
+
+    def probe(self) -> str:
+        """Дешёвый пробный стук слота (№39, arch §6.4): `check()` без генерации;
+        исход — CheckResult из llm_client (`ok`/`auth_failed`/`unreachable`/
+        `model_missing`)."""
         ...
 
     def close(self) -> None:
@@ -189,8 +229,11 @@ class SummaryService:
         )
         # None — попыток не было (health не врёт до первых данных).
         self.last_attempt_ok: bool | None = None
+        # Метаданные последнего вызова (№49/№50): диагностика в /health.slots
+        # без чтения журнала (None — вызова ещё не было).
+        self.last_meta: ChatMeta | None = None
 
-    def summarize(self, text: str) -> str:
+    def summarize(self, text: str) -> SummaryResult:
         """Суммаризовать текст заметки; любой отказ — SummaryError."""
         if not text or not text.strip():
             raise ValueError("summarize: пустой текст заметки")
@@ -198,14 +241,20 @@ class SummaryService:
             # max_chars = None: транспорт отдаёт content модели как есть (без
             # обрезки) — жёсткий лимит саммари применяется в точке сохранения
             # (воркер, cap_summary), merge режется сам — max_note_chars.
-            summary = self._chat(self._prompts.summary_system, text)
+            # num_predict 0/None — авто-бюджет (№49): «сколько влезет».
+            result = self._chat(
+                self._prompts.summary_system,
+                text,
+                operation="summary",
+                num_predict=self._settings.summary_num_predict or None,
+            )
         except SummaryError:
             self.last_attempt_ok = False  # деградация станет видна в /health
             raise
         self.last_attempt_ok = True
-        return summary
+        return SummaryResult(text=result.content, meta=result.meta)
 
-    def title(self, text: str) -> str:
+    def title(self, text: str) -> SummaryResult:
         """Название заметки ≤5 слов (Фаза 11, решение №9: title-доген
         миграционных заметок — единственный потребитель, воркер). Думающий
         вызов слота summary с зашитым TITLE_PROMPT; обрезку до TITLE_MAX_WORDS
@@ -214,14 +263,19 @@ class SummaryService:
         if not text or not text.strip():
             raise ValueError("title: пустой текст заметки")
         try:
-            name = self._chat(TITLE_PROMPT, text)
+            result = self._chat(
+                TITLE_PROMPT,
+                text,
+                operation="title",
+                num_predict=self._settings.summary_num_predict or None,
+            )
         except SummaryError:
             self.last_attempt_ok = False  # деградация станет видна в /health
             raise
         self.last_attempt_ok = True
-        return name
+        return SummaryResult(text=result.content, meta=result.meta)
 
-    def merge(self, text_a: str, text_b: str) -> str:
+    def merge(self, text_a: str, text_b: str) -> SummaryResult:
         """Слить два текста-дубликата в один; любой отказ — SummaryError.
 
         Вариант B дедупа (Фаза 8, Этап 2.2): модель объединяет тексты
@@ -234,21 +288,27 @@ class SummaryService:
         if not text_a or not text_a.strip() or not text_b or not text_b.strip():
             raise ValueError("merge: пустая заметка недопустима")
         try:
-            merged = self._chat(
+            result = self._chat(
                 self._prompts.summary_merge_system,
                 self._prompts.merge_user.format(text_a=text_a, text_b=text_b),
+                operation="merge",
+                num_predict=self._settings.merge_num_predict or None,
                 max_chars=self._settings.max_note_chars,
-                num_predict=self._settings.merge_num_predict,
             )
         except SummaryError:
             self.last_attempt_ok = False  # деградация станет видна в /health
             raise
         self.last_attempt_ok = True
-        return merged
+        return SummaryResult(text=result.content, meta=result.meta)
 
     def close(self) -> None:
         """Закрыть HTTP-пул (чистое завершение процесса)."""
         self._llm.close()
+
+    def probe(self) -> str:
+        """Дешёвый пробный стук слота summary (№39, arch §6.4): `check()`
+        без генерации. Исход отдаётся как есть (CheckResult)."""
+        return self._llm.check()
 
     # --- внутреннее ---------------------------------------------------------
 
@@ -256,31 +316,41 @@ class SummaryService:
         self,
         system_prompt: str,
         user_text: str,
+        *,
+        operation: str,
+        num_predict: int | None,
         max_chars: int | None = None,
-        num_predict: int | None = None,
-    ) -> str:
+    ) -> ChatResult:
         """Один вызов chat слота summary (без ретраев — повтор решает воркер).
 
         system_prompt/user_text — различия summarize/merge; num_predict —
-        раздельный потолок (решение О. 2026-08-30): выжимка —
+        раздельный потолок (решение О. 2026-08-30): выжимка/title —
         SUMMARY_NUM_PREDICT, слияние дублей — MERGE_NUM_PREDICT (текст
-        может быть значительно длиннее выжимки). think — флаг слота
-        (SUMMARY_THINK); keep_alive не отправляется (решение №6).
+        может быть значительно длиннее выжимки); None — авто-бюджет
+        «сколько влезет» (№49). think — флаг слота (SUMMARY_THINK);
+        keep_alive не отправляется (решение №6).
         """
-        if num_predict is None:
-            num_predict = self._settings.summary_num_predict
         try:
-            content = self._llm.chat(
-                system_prompt, user_text, num_predict=num_predict
+            result = self._llm.chat_result(
+                system_prompt,
+                user_text,
+                num_predict=num_predict,
+                operation=operation,
             )
         except LLMError as exc:
             # Текст клиента сохраняется: HTTP-статус, адрес слота, hint
-            # про {SLOT}_API_KEY у auth-отказа (решение №4).
-            raise SummaryError(str(exc)) from exc
-        # Поле thinking/reasoning_content отброшено клиентом в принципе:
+            # про {SLOT}_API_KEY у auth-отказа (решение №4). Исход вызова
+            # (№39, arch §6.4) — единый тип исхода на границе сервиса.
+            self.last_meta = exc.meta  # метаданные вызова для диагностики
+            raise SummaryError(
+                str(exc), outcome=classify_llm_error(exc), meta=exc.meta
+            ) from exc
+        self.last_meta = result.meta
+        # Поле thinking/reasoning_content идёт только в метаданные вызова:
         # читаем только content. Символьная страховка здесь осталась только
         # у merge: её результат — будущий ТЕКСТ заметки, обязан проходить
         # CHECK(MAX_NOTE_CHARS). Лимит саммари держит вызывающий (воркер) —
         # cap_summary в точке сохранения (решение гейта 3.1.0, 2026-09-19).
-        summary = content.strip()
-        return summary if max_chars is None else summary[:max_chars]
+        if max_chars is None:
+            return result
+        return ChatResult(content=result.content[:max_chars], meta=result.meta)

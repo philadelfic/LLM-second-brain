@@ -37,7 +37,9 @@ from app.transport.mcp import (
     TOOL_DESCRIPTIONS,
     TOOL_NAMES,
     _NS_RULES,
+    _logs_section,
     _namespace_map,
+    _note_lifetime_section,
     _skills_announce,
     build_instructions,
     build_mcp,
@@ -54,22 +56,22 @@ CANON_TOOL_DESCRIPTIONS = {
         "senses of the term together with their contexts: one term means "
         "different things in different contexts — never pick a single sense "
         "silently, choose by the context of the conversation, and if it is "
-        "unclear, ask the user instead of guessing. If there is no exact term, "
-        "the closest senses by meaning are returned (not an exact match). There "
-        "is no listing — search is the only way to a definition."
+        "unclear, ask the user instead of guessing. Without an exact term "
+        "the closest senses by meaning are returned. There is no listing — "
+        "search is the only way to a definition."
     ),
     "terms_save": (
-        "Save a term with a MANDATORY context: term ≤100 characters, context "
-        "≤40 (always filled in — even when the term has a single sense), "
-        "definition ≤350. The key is (term + context): the same key updates the "
-        "record; the same term with a new context creates a NEW sense and never "
-        "overwrites the old one. Reuse one of the contexts already used in this "
-        "memory (the response lists them) instead of inventing a near-duplicate "
-        "wording — a too-close context is refused with a hint that points to the "
-        "existing context. The response also lists the senses this term already "
-        "has."
+        "Save a term with a MANDATORY context (always filled in — even when "
+        "the term has a single sense). The key is (term + context): the same "
+        "key updates the record; the same term with a new context creates a "
+        "NEW sense and never overwrites the old one. Reuse one of the "
+        "contexts already used in this memory (the response lists them) "
+        "instead of inventing a near-duplicate wording — a too-close context "
+        "is refused with a hint pointing to the existing context."
     ),
-    "terms_get": "Read one term record by id: term, context, definition.",
+    "terms_get": (
+        "Read one term record by id: term, context, definition."
+    ),
 }
 
 # Field-описания параметров (EN): канон §3.7 задаёт тексты инструментов и
@@ -127,6 +129,7 @@ MEMORY_TOOL_NAMES = frozenset(
         "memory_delete",
         "memory_namespaces",
         "memory_namespace_create",
+        "memory_comment_search",
     }
 )
 SKILL_TOOL_NAMES = frozenset(
@@ -135,6 +138,10 @@ SKILL_TOOL_NAMES = frozenset(
 USER_TOOL_NAMES = frozenset(
     {"user_search", "user_save", "user_update", "user_delete", "user_get"}
 )
+# №41 (3.2.0): пара общих инструментов чтения истории (§13.14).
+HISTORY_TOOL_NAMES = frozenset({"history_list", "history_get"})
+# №12 (no12-02): одна точка чтения предупреждений — ядро поверхности.
+WARNINGS_TOOL_NAMES = frozenset({"warnings_list"})
 
 TERM = "ГЗ"
 CONTEXT_A = "студенты МГУ"
@@ -218,9 +225,19 @@ class TestToolRegistry:
         assert set(CANON_TOOL_DESCRIPTIONS) <= names
         assert names - set(CANON_TOOL_DESCRIPTIONS) == (
             MEMORY_TOOL_NAMES | SKILL_TOOL_NAMES | USER_TOOL_NAMES
+            | HISTORY_TOOL_NAMES | WARNINGS_TOOL_NAMES
         )
-        assert set(TOOL_NAMES) == names
-        assert len(names) == 21  # листинга terms нет: только search/save/get
+        # Логи (f10-02/03) в этой DI-сборке не собраны (`services.logs is None`):
+        # их ручек в поверхности нет, остальное совпадает со словарём TOOL_NAMES.
+        assert set(TOOL_NAMES) - {
+            "logs_save",
+            "logs_get",
+            "logs_update",
+            "logs_delete",
+            "logs_search",
+            "logs_list",
+        } == names
+        assert len(names) == 25  # листинга terms нет: только search/save/get
 
     @pytest.mark.asyncio
     async def test_tool_descriptions_are_canon_verbatim(self, mcp_terms) -> None:
@@ -273,8 +290,9 @@ class TestToolRegistry:
     def test_instructions_have_no_terms_block_and_unchanged(self, settings) -> None:
         """Инъекции нет (arch §2): блока «terms» нет и текст не изменился.
 
-        Хвост анонса навыков — существующий (lsb-0007-04); всё остальное —
-        база + правило неймспейсов + карта, как до этого пула.
+        Хвост анонса навыков — существующий (lsb-0007-04), за ним — статический
+        раздел области логов (f10-04 §10); всё остальное — база + правило
+        неймспейсов + карта, как до этого пула.
         """
         services = _services(settings, HashEmbedder(DIM))
         expected = (
@@ -282,6 +300,8 @@ class TestToolRegistry:
             + _NS_RULES
             + _namespace_map(services)
             + _skills_announce(services)
+            + _logs_section(services, settings)
+            + _note_lifetime_section(services, settings)
         )
         text = build_instructions(services)
         assert text == expected
@@ -468,7 +488,7 @@ class TestOtherOutputsRegression:
             "memory_save",
             {"text": "Regression note for the terms-area pool.", "title": "Regression note"},
         )
-        assert set(note) == {"id", "stored", "summary_pending"}
+        assert {"id", "stored", "summary_pending"} <= set(note)  # №28: + namespace_hint
         found = await _call(mcp_full, "memory_search", {"query": "regression"})
         assert set(found["results"][0]) == {
             "id",

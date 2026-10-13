@@ -89,7 +89,7 @@ def test_judge_true_on_duplicate(monkeypatch) -> None:
     """`**ДУБЛЬ**` в content (markdown-жирный) → True; thinking отброшен."""
     settings = make_settings(monkeypatch)
     service, _ = make_service(settings, [httpx.Response(200, json=ok_body())])
-    assert service.judge(TEXT_NEW, TEXT_CANDIDATE) is True
+    assert service.judge(TEXT_NEW, TEXT_CANDIDATE).verdict is True
     assert service.last_attempt_ok is True
     service.close()
 
@@ -101,7 +101,7 @@ def test_judge_false_on_not_duplicate(monkeypatch) -> None:
         settings,
         [httpx.Response(200, json=ok_body("**NOT DUPLICATE**\n\nNotes about different things."))],
     )
-    assert service.judge(TEXT_NEW, TEXT_CANDIDATE) is False
+    assert service.judge(TEXT_NEW, TEXT_CANDIDATE).verdict is False
     assert service.last_attempt_ok is True
     service.close()
 
@@ -112,7 +112,7 @@ def test_verdict_without_markdown_bold(monkeypatch) -> None:
     service, _ = make_service(
         settings, [httpx.Response(200, json=ok_body("DUPLICATE: meaning identical."))]
     )
-    assert service.judge(TEXT_NEW, TEXT_CANDIDATE) is True
+    assert service.judge(TEXT_NEW, TEXT_CANDIDATE).verdict is True
     service.close()
 
 
@@ -122,7 +122,7 @@ def test_verdict_is_case_insensitive(monkeypatch) -> None:
     service, _ = make_service(
         settings, [httpx.Response(200, json=ok_body("not duplicate — different events"))]
     )
-    assert service.judge(TEXT_NEW, TEXT_CANDIDATE) is False
+    assert service.judge(TEXT_NEW, TEXT_CANDIDATE).verdict is False
     service.close()
 
 
@@ -187,7 +187,7 @@ def test_stream_disabled_and_generation_params(monkeypatch) -> None:
     service.judge(TEXT_NEW, TEXT_CANDIDATE)
     payload = last_payload(recorder)
     assert payload["stream"] is False
-    assert payload["num_predict"] == settings.judge_num_predict == 256
+    assert payload["num_predict"] == 256  # №49: legacy-потолок (контекст неизвестен)
     assert payload["temperature"] == 0.1
     assert "keep_alive" not in payload  # решение №6: моделью управляет сервер
 
@@ -211,7 +211,7 @@ def test_ollama_payload_bytes_minus_keep_alive(monkeypatch) -> None:
             },
         ],
         "stream": False,
-        "num_predict": settings.judge_num_predict,
+        "num_predict": 256,  # №49: legacy-потолок (контекст неизвестен)
         "temperature": 0.1,
         "think": False,
     }

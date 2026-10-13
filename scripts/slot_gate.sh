@@ -26,14 +26,15 @@
 #     secrets are never read or printed — only the address keys of the env file.
 #
 # Usage:
-#   scripts/slot_gate.sh off|on [embedding|summary|judge|all] [--dry-run]
-#   scripts/slot_gate.sh status [embedding|summary|judge|all] [--dry-run]
+#   scripts/slot_gate.sh off|on [embedding|summary|judge|decision|all] [--dry-run]
+#   scripts/slot_gate.sh status [embedding|summary|judge|decision|all] [--dry-run]
 #
 #   off       — close the gate (the models are unreachable for the test contour)
 #   on        — open the gate (docker: start the stopped slot proxies, or unpause
 #               them with SLOT_GATE_ACTION=pause; iptables: remove exactly the rules
 #               installed by `off` — foreign rules in the chain are never touched)
-#   status    — docker: the state of every slot proxy — `running` is on; `exited` /
+#   status    — docker: the state of every slot proxy (включая канал `decision` —
+#               `all` для `off|on` его не трогает) — `running` is on; `exited` /
 #               `created` is off for the default stop action, `paused` is off for the
 #               pause action; `missing` means the contour is not up; iptables: which
 #               rules are standing right now
@@ -50,9 +51,21 @@
 #                    fallback needs a longer acceptance window
 #   SLOT_GATE_PROXY_EMBED_CONTAINER  (docker only) proxy container of the embedding
 #                    slot (default: lsb-test-model-proxy-embed)
-#   SLOT_GATE_PROXY_GEN_CONTAINER    (docker only) proxy container of the summary
-#                    AND judge slots (default: lsb-test-model-proxy-gen): in the
-#                    test contour the two generative slots share one proxy
+#   SLOT_GATE_PROXY_SUMMARY_CONTAINER (docker only) proxy container of the summary
+#                    slot (default: lsb-test-model-proxy-summary)
+#   SLOT_GATE_PROXY_JUDGE_CONTAINER  (docker only) proxy container of the judge
+#                    slot (default: lsb-test-model-proxy-judge): every slot has
+#                    its OWN proxy container, so muting one slot never closes
+#                    the channel of another one
+#   SLOT_GATE_PROXY_DEC_CONTAINER    (docker only) proxy container of the DECISION
+#                    slot (default: lsb-test-model-proxy-dec). Ветвь `judge`
+#                    сценария 2 глушит его вместе с судьёй: решение по паре
+#                    «судья дедупа» может принять decision-слот (LSBN-F-12), и
+#                    тогда одно лишь глушение генеративного судьи ничего не
+#                    меряет — очередь `judge` пустеет (живой прогон 13.10.2026).
+#                    С перерезанным каналом decision продукт по контракту уходит
+#                    на генеративный путь (`decision_fallback
+#                    reason=unavailable`) и упирается в выключенного судью.
 #   SLOT_GATE_ENV    (iptables only) env file with the slot addresses
 #                    (default: ./.env.test, i.e. beside the contour working copy —
 #                    run the script from there)
@@ -78,7 +91,9 @@ ACTION="${SLOT_GATE_ACTION:-stop}"
 
 # docker-режим: имена прокси-контейнеров слотов (адресов и токенов в файле нет).
 PROXY_EMBED_CONTAINER="${SLOT_GATE_PROXY_EMBED_CONTAINER:-lsb-test-model-proxy-embed}"
-PROXY_GEN_CONTAINER="${SLOT_GATE_PROXY_GEN_CONTAINER:-lsb-test-model-proxy-gen}"
+PROXY_SUMMARY_CONTAINER="${SLOT_GATE_PROXY_SUMMARY_CONTAINER:-lsb-test-model-proxy-summary}"
+PROXY_JUDGE_CONTAINER="${SLOT_GATE_PROXY_JUDGE_CONTAINER:-lsb-test-model-proxy-judge}"
+PROXY_DEC_CONTAINER="${SLOT_GATE_PROXY_DEC_CONTAINER:-lsb-test-model-proxy-dec}"
 
 # iptables-режим (запасной путь): адреса берутся только из окружения/env-файла.
 CHAIN="DOCKER-USER"
@@ -86,11 +101,12 @@ ENV_FILE="${SLOT_GATE_ENV:-./.env.test}"
 CONTAINER="${SLOT_GATE_CONTAINER:-lsb-test}"
 IPTABLES_BIN="${SLOT_GATE_IPTABLES:-iptables}"
 
-SLOT_ORDER=(embedding summary judge)
+SLOT_ORDER=(embedding summary judge decision)
 declare -A SLOT_KEY=(
     [embedding]=EMBEDDING_BASE_URL
     [summary]=SUMMARY_BASE_URL
     [judge]=JUDGE_BASE_URL
+    [decision]=DECISION_BASE_URL
 )
 
 # Шапка-usage — сам этот файл (заголовочный комментарий до первой строки кода).
@@ -114,7 +130,7 @@ for arg in "$@"; do
                 exit 2
             fi
             MODE="$arg" ;;
-        embedding|summary|judge|all)
+        embedding|summary|judge|decision|all)
             TARGET="$arg" ;;
         -*)
             echo "ERROR: unknown option: $arg" >&2
@@ -152,9 +168,20 @@ case "$ACTION" in
         exit 2 ;;
 esac
 
+# `all` — три СЛОТА МОДЕЛЕЙ (embedding/summary/judge): `decision` в него не входит
+# нарочно — выключатель «модели недоступны» его не трогает (у decision свой
+# маршрут решения и свой прокси, и не на всяком контуре он есть), а ветвь `judge`
+# зовёт его по имени явно.
 WANTED=(embedding summary judge)
 if [[ "$TARGET" != "all" ]]; then
     WANTED=("$TARGET")
+elif [[ "$MODE" == "status" && "$BACKEND" == "docker" ]]; then
+    # `status` обещает состояние ВСЕХ каналов слота — в том числе decision (иначе
+    # выключенный канал решения не виден оператору). `off|on all` его по-прежнему
+    # не трогает: выключатель «модели недоступны» — про три слота моделей.
+    # В iptables-режиме decision не добавляем: там нужен DECISION_BASE_URL из
+    # env-файла, и его отсутствие уронило бы `status`.
+    WANTED+=(decision)
 fi
 
 # --- адреса слотов (iptables-режим) ------------------------------------------
@@ -231,13 +258,16 @@ ipt_text() {
 # Бэкенд по умолчанию: выключение прокси-контейнеров слотов (docker stop/start)
 # =============================================================================
 
-# Контейнер-прокси слота: embedding — свой, summary и judge делят один
-# (в тест-контуре оба генеративных слота смотрят на одну модель).
+# Контейнер-прокси слота: у КАЖДОГО слота свой прокси, поэтому глушение одного
+# слота не задевает соседний. summary и judge могут смотреть на одну и ту же
+# модель (в тест-контуре обе живут на .112), но идут через разные контейнеры.
 proxy_for_slot() {
     case "$1" in
-        embedding)     printf '%s' "$PROXY_EMBED_CONTAINER" ;;
-        summary|judge) printf '%s' "$PROXY_GEN_CONTAINER" ;;
-        *)             return 1 ;;
+        embedding) printf '%s' "$PROXY_EMBED_CONTAINER" ;;
+        summary)   printf '%s' "$PROXY_SUMMARY_CONTAINER" ;;
+        judge)     printf '%s' "$PROXY_JUDGE_CONTAINER" ;;
+        decision)  printf '%s' "$PROXY_DEC_CONTAINER" ;;
+        *)         return 1 ;;
     esac
 }
 

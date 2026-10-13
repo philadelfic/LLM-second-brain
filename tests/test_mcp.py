@@ -29,6 +29,8 @@ from mcp.client.streamable_http import (
 
 from app.services.dedup import DEDUP_HINT
 from app.transport.mcp import (
+    HINT_INVALID_MODE,
+    HINT_INVALID_UPDATED_AFTER,
     SERVER_INSTRUCTIONS,
     SERVER_NAME,
     TOOL_DESCRIPTIONS,
@@ -156,12 +158,13 @@ class TestHandshake:
 
 class TestToolsList:
     @pytest.mark.asyncio
-    async def test_twenty_one_tools(self, server_url: str) -> None:
-        """lsb-0008-02: поверхность = 8 ручек заметок/узлов + 5 навыков +
-        5 user + 3 terms."""
+    async def test_thirty_one_tools(self, server_url: str) -> None:
+        """№12 (no12-02) + no24-02 + LSBN-F-10 (f10-02/03): поверхность = 8 ручек
+        заметок/узлов (+ memory_comment_search = 9) + 1 предупреждения + 5
+        навыков + 5 user + 3 terms + 2 общих ручки чтения истории + 6 логов."""
         async with connect(server_url) as session:
             tools = await session.list_tools()
-        assert len(tools.tools) == 21
+        assert len(tools.tools) == 31
         assert {tool.name for tool in tools.tools} == TOOL_NAMES
 
     @pytest.mark.asyncio
@@ -241,7 +244,7 @@ class TestToolsList:
         namespace_exact; delete без namespace (по id)."""
         async with connect(server_url) as session:
             tools = {t.name: t for t in (await session.list_tools()).tools}
-        assert tools["memory_save"].input_schema["properties"]["namespace"]["default"] == "default"
+        assert tools["memory_save"].input_schema["properties"]["namespace"]["default"] is None
         assert tools["memory_update"].input_schema["properties"]["namespace"]["default"] is None
         srch = tools["memory_search"].input_schema["properties"]
         assert srch["namespace"]["default"] is None
@@ -251,6 +254,15 @@ class TestToolsList:
         assert lst["namespace_exact"]["default"] is False
         assert "namespace" not in tools["memory_delete"].input_schema["properties"]
         assert "namespace" not in tools["memory_get"].input_schema["properties"]
+
+    @pytest.mark.asyncio
+    async def test_memory_save_default_namespace_in_schema(self, server_url: str) -> None:
+        """№28: дефолт `namespace` в схеме save — None (не «default»):
+        «не передан» отличим от явного узла и даёт подсказку узла."""
+        async with connect(server_url) as session:
+            tools = {t.name: t for t in (await session.list_tools()).tools}
+        namespace = tools["memory_save"].input_schema["properties"]["namespace"]
+        assert namespace["default"] is None
 
     @pytest.mark.asyncio
     async def test_search_schema_mode(self, server_url: str) -> None:
@@ -392,7 +404,7 @@ class TestMemoryFlow:
         assert note["text"] == text
         assert note["created_at"].endswith("Z") and note["updated_at"].endswith("Z")
         # Компактный контракт Фазы 9: get — белый список из пяти полей (+namespace Фаза 10).
-        assert set(note) == {"id", "text", "chars", "created_at", "updated_at", "namespace", "expires_at"}
+        assert set(note) == {"id", "text", "chars", "created_at", "updated_at", "namespace", "expires_at", "comment"}
         assert note["chars"] == len(text)  # lsb-0010-04: объём полного текста
         assert note["namespace"] == "default"  # save без узла → default (§5.7)
         assert "title" not in note  # Фаза 11: get без названия (там полный текст)
@@ -695,6 +707,25 @@ class TestMemoryFlow:
         assert [note["text"] for note in notes] == [first_text, second_text]
         assert "hint" not in got  # успешный ответ — без hint (Фаза 9)
 
+    @pytest.mark.asyncio
+    async def test_memory_save_similar_in_response(self, server_url: str) -> None:
+        """№30: save доносит `similar` с id лексически близкой заметки рядом с
+        id/stored/summary_pending; сама заметка при этом создана."""
+        first_text = f"{self.marker}: реестр зарплат СУБО и чек-лист деплоя"
+        second_text = f"{self.marker}: реестр зарплат СУБО, чек-лист деплоя и контакты"
+        async with connect(server_url) as session:
+            first = (await session.call_tool(
+                "memory_save", {"text": first_text, "title": "СУБО реестр"}
+            )).structured_content
+            assert first["stored"] is True
+            second = (await session.call_tool(
+                "memory_save", {"text": second_text, "title": "СУБО реестр"}
+            )).structured_content
+        assert second["stored"] is True
+        assert second["id"] != first["id"]
+        assert {"id", "stored", "summary_pending"} <= set(second)
+        assert first["id"] in [item["id"] for item in second["similar"]]
+
 
 class TestTitleMCP:
     """Фаза 11 (решение №9): title в save/update и выдачах — по живому серверу.
@@ -809,6 +840,148 @@ class TestTitleMCP:
         assert "title" not in got["notes"][0]
 
 
+class TestCommentSearchMCP:
+    """no24-02 (3.2.0): отдельная ручка memory_comment_search — только пометки.
+
+    Не режим memory_search: результаты не смешиваются со смысловым поиском;
+    выдача компактна ({id, title, namespace, comment, updated_at}); невалидный
+    updated_after и неизвестный узел — мягкий отказ с hint.
+    """
+
+    marker = f"csearch-{uuid.uuid4().hex[:8]}"
+
+    @pytest.mark.asyncio
+    async def test_memory_comment_search_tool(self, server_url: str) -> None:
+        """Ручка зарегистрирована, компактна; невалидный updated_after/узел → hint."""
+        text = f"{self.marker}: заметка для отдельного поиска пометок"
+        async with connect(server_url) as session:
+            note_id = await _saved_id(session, text, title="Пометки поиск")
+            comment = f"{self.marker} пригодится к задаче"
+            await session.call_tool(
+                "memory_update", {"id": note_id, "comment": comment}
+            )
+            found = (await session.call_tool(
+                "memory_comment_search", {"query": self.marker}
+            )).structured_content
+            bad = (await session.call_tool(
+                "memory_comment_search",
+                {"query": self.marker, "updated_after": "за неделю"},
+            )).structured_content
+            unknown = (await session.call_tool(
+                "memory_comment_search",
+                {"query": self.marker, "namespace": "nope"},
+            )).structured_content
+        hit = next(r for r in found["results"] if r["id"] == note_id)
+        assert set(hit) == {"id", "title", "namespace", "comment", "updated_at"}
+        assert hit["comment"] == comment
+        assert bad["results"] == [] and bad["hint"] == HINT_INVALID_UPDATED_AFTER
+        assert unknown["results"] == [] and "nope" in unknown["hint"]
+
+    @pytest.mark.asyncio
+    async def test_memory_search_has_no_comment_mode(self, server_url: str) -> None:
+        """Пометки — отдельная ручка, а не режим: mode='comment' → мягкий отказ."""
+        async with connect(server_url) as session:
+            found = (await session.call_tool(
+                "memory_search", {"query": "тест", "mode": "comment"}
+            )).structured_content
+        assert found["results"] == []
+        assert found["hint"] == HINT_INVALID_MODE
+
+
+class TestCommentMCP:
+    """no24-01 (3.2.0): `comment` — правка/запись/чтение, вне листингов и поиска."""
+
+    marker = f"commentmarker-{uuid.uuid4().hex[:8]}"
+
+    @pytest.mark.asyncio
+    async def test_memory_update_comment_and_get(self, server_url: str) -> None:
+        """memory_update с comment → {id, updated}; memory_get несёт comment."""
+        text = f"{self.marker}: заметка для комментария"
+        async with connect(server_url) as session:
+            note_id = await _saved_id(session, text, title="Комментарий MCP")
+            updated = (await session.call_tool(
+                "memory_update", {"id": note_id, "comment": "пригодится к задаче X"}
+            )).structured_content
+            assert updated == {"id": note_id, "updated": True}
+            got = (await session.call_tool(
+                "memory_get", {"ids": [note_id]}
+            )).structured_content
+        note = got["notes"][0]
+        assert note["comment"] == "пригодится к задаче X"
+        assert note["text"] == text  # text не перезаписан
+
+    @pytest.mark.asyncio
+    async def test_memory_save_comment_and_get(self, server_url: str) -> None:
+        """memory_save принимает comment сразу (решение О. 2026-10-08)."""
+        text = f"{self.marker}: заметка с пометкой при записи"
+        async with connect(server_url) as session:
+            saved = (await session.call_tool("memory_save", {
+                "text": text, "title": "Пометка при записи", "comment": "почему записал",
+            })).structured_content
+            assert saved["stored"] is True
+            got = (await session.call_tool(
+                "memory_get", {"ids": [saved["id"]]}
+            )).structured_content
+        assert got["notes"][0]["comment"] == "почему записал"
+
+    @pytest.mark.asyncio
+    async def test_memory_update_comment_too_long_hint(self, server_url: str) -> None:
+        """251 символ → мягкий отказ {id, updated: False, hint}, без исключения."""
+        async with connect(server_url) as session:
+            note_id = await _saved_id(session, f"{self.marker}: лимит пометки")
+            upd = (await session.call_tool("memory_update", {
+                "id": note_id, "comment": "х" * 251,
+            })).structured_content
+            got = (await session.call_tool(
+                "memory_get", {"ids": [note_id]}
+            )).structured_content
+        assert upd == {
+            "id": note_id, "updated": False,
+            "hint": "comment: up to 250 characters, got 251",
+        }
+        assert got["notes"][0]["comment"] is None  # заметка не тронута
+
+    @pytest.mark.asyncio
+    async def test_memory_get_has_no_comment_in_chunk_mode(self, server_url: str) -> None:
+        """Chunk-режим memory_get комментарий не отдаёт (там чанки)."""
+        text = f"{self.marker}: " + ("длинный текст для чанков " * 60)
+        async with connect(server_url) as session:
+            note_id = await _saved_id(session, text, title="Чанк и комментарий")
+            await session.call_tool(
+                "memory_update", {"id": note_id, "comment": "не в чанках"}
+            )
+            got = (await session.call_tool(
+                "memory_get", {"id": note_id, "chunk": 0}
+            )).structured_content
+        assert got["chunks"]
+        assert "comment" not in got
+        assert all("comment" not in chunk for chunk in got["chunks"])
+
+    @pytest.mark.asyncio
+    async def test_memory_list_and_search_have_no_comment(self, server_url: str) -> None:
+        """Листинг (summaries/titles) и смысловой поиск пометку не несут."""
+        text = f"{self.marker}: заметка для листинга"
+        async with connect(server_url) as session:
+            note_id = await _saved_id(session, text, title="Листинг и пометка")
+            await session.call_tool(
+                "memory_update", {"id": note_id, "comment": "в листинг не идёт"}
+            )
+            listed = (await session.call_tool(
+                "memory_list", {"limit": 5}
+            )).structured_content
+            titled = (await session.call_tool(
+                "memory_list", {"limit": 5, "detail": "titles"}
+            )).structured_content
+            found = (await session.call_tool(
+                "memory_search", {"query": self.marker}
+            )).structured_content
+        assert listed["items"] and titled["items"]
+        for item in listed["items"] + titled["items"]:
+            assert "comment" not in item
+        for hit in found["results"]:
+            assert "comment" not in hit
+
+
 class TestNamespaceMCP:
     """Фаза 10 (Шаг 3): namespace-параметры и memory_namespaces по живому серверу.
     Изолированная БД (ns_url/ns_db) — общая память других тестов не трогается."""
@@ -904,6 +1077,27 @@ class TestNamespaceMCP:
             )).structured_content
         assert upd["updated"] is True
         assert got["notes"][0]["namespace"] == "work"
+
+    @pytest.mark.asyncio
+    async def test_memory_save_namespace_hint_in_response(
+        self, ns_url: str, ns_db: str
+    ) -> None:
+        """№28: save без namespace несёт `namespace_hint` рядом с id/stored,
+        а дедуп-`hint` чужого узла при этом сохраняется."""
+        _register_namespace(ns_db, "noding", "Реестр зарплат СУБО и доступы")
+        text = f"{self.marker}: реестр зарплат СУБО"
+        async with connect(ns_url) as session:
+            first = (await session.call_tool(
+                "memory_save", {"text": text, "title": "СУБО реестр",
+                                "namespace": "noding"}
+            )).structured_content
+            assert first["stored"] is True
+            saved = (await session.call_tool(
+                "memory_save", {"text": text, "title": "СУБО реестр"}
+            )).structured_content
+        assert {"id", "stored", "summary_pending"} <= set(saved)
+        assert "noding" in saved["namespace_hint"]
+        assert "noding" in saved["hint"]
 
     @pytest.mark.asyncio
     async def test_save_foreign_duplicate_gives_hint(self, ns_url: str, ns_db: str) -> None:
@@ -1381,3 +1575,269 @@ class TestInstructionsBudget:
         # бюджет §2: грубая оценка токенов ≈ длина/4; ~10 узлов — далеко
         # до ~1300 (база сама по себе ~300 токенов).
         assert len(instructions.encode("utf-8")) / 4 <= 1300
+
+
+    def test_instructions_have_no_russian(self, test_env: dict[str, str]) -> None:
+        """LSBN-F-11 (f11-02): статика инъекции — EN-only.
+
+        Требование «EN-only» относится к СТАТИЧЕСКИМ частям: ядро, правила,
+        манифест анонса, раздел логов, строка про lifetime и тексты описаний
+        инструментов. Данные оператора — описания узлов в карте
+        (`_namespace_map`) и строки анонса навыков — приходят из БД и бывают
+        русскими: их не трогаем (см. test_map_in_instructions_within_budget).
+        """
+        from app.transport.mcp import (
+            SERVER_INSTRUCTIONS,
+            TOOL_DESCRIPTIONS,
+            _LOGS_SECTION,
+            _NS_RULES,
+            _NOTE_LIFETIME_SECTION,
+            _SKILLS_ANNOUNCE_MORE,
+            _SKILLS_ANNOUNCE_RULES,
+        )
+
+        static = (
+            SERVER_INSTRUCTIONS,
+            _NS_RULES,
+            _LOGS_SECTION,
+            _NOTE_LIFETIME_SECTION,
+            _SKILLS_ANNOUNCE_RULES,
+            _SKILLS_ANNOUNCE_MORE,
+            *TOOL_DESCRIPTIONS.values(),
+        )
+        for text in static:
+            assert not any("\u0400" <= char <= "\u04FF" for char in text), text[:80]
+
+    def test_instructions_carry_english_default(self, test_env: dict[str, str]) -> None:
+        """Карта узлов несёт EN-описание `default` и не несёт прежний RU-дефолт.
+
+        №34 (3.2.0): описание — модельный текст, значит английский; строка
+        берётся из реестра как есть, второй копии текста в `mcp.py` нет.
+        """
+        from app.config import get_settings
+        from app.services import build_services
+        from app.storage.db import (
+            DEFAULT_NAMESPACE_DESCRIPTION,
+            DEFAULT_NAMESPACE_DESCRIPTION_LEGACY,
+            init_db,
+        )
+        from app.transport.mcp import build_instructions
+
+        settings = get_settings()
+        init_db(settings)
+        instructions = build_instructions(build_services(settings))
+        assert f"- default: {DEFAULT_NAMESPACE_DESCRIPTION}" in instructions
+        assert DEFAULT_NAMESPACE_DESCRIPTION_LEGACY not in instructions
+
+    def test_instructions_carry_note_lifetime(self, test_env: dict[str, str]) -> None:
+        """№46 (no46-02): инструкции несут строку про lifetime заметки (TTL).
+
+        Модель при подключении видит: что передаётся (`expires_at` с TTL-примерами),
+        что делает LSB (удаляет заметку сам по истечении) и что заметка с lifetime
+        не сливается с другими. Строка обезличенная — без имён и «оператора».
+        """
+        from app.config import get_settings
+        from app.services import build_services
+        from app.storage.db import init_db
+        from app.transport.mcp import _NOTE_LIFETIME_SECTION, build_instructions
+
+        settings = get_settings()
+        init_db(settings)
+        instructions = build_instructions(build_services(settings))
+        assert _NOTE_LIFETIME_SECTION in instructions
+        assert "`expires_at`" in instructions
+        assert "`memory_save`" in instructions
+        for ttl in ("«1d»", "«2h»", "«30m»", "«45s»", "«2w»"):
+            assert ttl in instructions
+        assert "LSB deletes the note when it expires" in instructions
+        assert "never merged with other notes" in instructions
+        assert "operator" not in instructions.lower()
+
+    def test_instructions_lifetime_is_the_tail(self, test_env: dict[str, str]) -> None:
+        """Порядок слагаемых зафиксирован: «логи → lifetime», lifetime — последний."""
+        from app.config import get_settings
+        from app.services import build_services
+        from app.storage.db import init_db
+        from app.transport.mcp import (
+            _NOTE_LIFETIME_SECTION,
+            _logs_section,
+            _note_lifetime_section,
+            build_instructions,
+        )
+
+        settings = get_settings()
+        init_db(settings)
+        services = build_services(settings)
+        text = build_instructions(services, settings)
+        lifetime = _note_lifetime_section(services, settings)
+        assert lifetime == _NOTE_LIFETIME_SECTION
+        # Хвост целиком: раздел логов (если включён) + строка про lifetime.
+        assert text.endswith(_logs_section(services, settings) + lifetime)
+        logs = _logs_section(services, settings)
+        if logs:
+            assert text.index(logs) < text.index(lifetime)
+
+    def test_instructions_lifetime_canon_verbatim(self) -> None:
+        """Константа — дословный литерал канона постановки no46-02."""
+        from app.transport.mcp import _NOTE_LIFETIME_SECTION
+
+        canon = (
+            "\n\nNotes can carry a lifetime: pass `expires_at` (a TTL like «1d», «2h», "
+            "«30m», «45s», «2w») to `memory_save` — LSB deletes the note when it "
+            "expires. A note with a lifetime is never merged with other notes."
+        )
+        assert _NOTE_LIFETIME_SECTION == canon
+
+    def test_instructions_lifetime_within_budget(self, test_env: dict[str, str]) -> None:
+        """Строка про lifetime влезает в бюджет §2 и не вытесняет соседние слагаемые."""
+        from app.config import get_settings
+        from app.services import build_services
+        from app.storage.db import init_db
+        from app.transport.mcp import (
+            _NS_RULES,
+            _NOTE_LIFETIME_SECTION,
+            build_instructions,
+        )
+
+        settings = get_settings()
+        init_db(settings)
+        instructions = build_instructions(build_services(settings))
+        # Бюджет §2 (LSBN-F-11): грубая оценка токенов ≈ длина/4, лимит 1300.
+        assert len(instructions.encode("utf-8")) / 4 <= 1300
+        assert _NOTE_LIFETIME_SECTION in instructions
+        # Строка не вытесняет правила неймспейсов и анонс навыков.
+        assert _NS_RULES in instructions
+        assert "Hierarchical namespaces are large sections" in instructions
+        assert "Skills are stored procedures" in instructions
+        assert len(_NOTE_LIFETIME_SECTION) <= 300
+
+
+class TestFreshnessMCP:
+    """no29-01: невалидное `updated_after` — мягкий отказ с хинтом (fail+hint)."""
+
+    @pytest.mark.asyncio
+    async def test_memory_search_invalid_updated_after_hint(
+        self, server_url: str
+    ) -> None:
+        """Оба режима: без исключения, с единственным хинтом свежести."""
+        async with connect(server_url) as session:
+            for mode in ("semantic", "title"):
+                found = (await session.call_tool(
+                    "memory_search",
+                    {"query": "что-то", "mode": mode, "updated_after": "за неделю"},
+                )).structured_content
+                assert found["results"] == []
+                assert found["hint"] == HINT_INVALID_UPDATED_AFTER
+
+    @pytest.mark.asyncio
+    async def test_memory_list_invalid_updated_after_hint(
+        self, server_url: str
+    ) -> None:
+        """Листинг: пустая выдача с хинтом (как неизвестный detail)."""
+        async with connect(server_url) as session:
+            listed = (await session.call_tool(
+                "memory_list", {"updated_after": "xx"}
+            )).structured_content
+        assert listed["items"] == [] and listed["total"] == 0
+        assert listed["hint"] == HINT_INVALID_UPDATED_AFTER
+
+
+class TestFreshnessBoundaryMCP:
+    """№29 (FR-2.6): граница `updated_after` ВКЛЮЧАЮЩАЯ на обвих MCP-
+    поверхностях — листинг (`n.updated_at >= ?`) и поиск (обе стороны
+    гибрида: FTS и набор активных кандидатов вектора).
+
+    Почему отдельная проверка: приёмка №29 ставит пробе `updated_at` РАВНЫЙ
+    границе и ждёт её в выдаче. Идём в собственном узле изолированной БД и с
+    `namespace_exact`: окно свежести укладывается в одну страницу, поэтому
+    видна сама граница, а не хвост длинной выдачи; текст обеих проб несёт
+    один маркер, так что без фильтра поиск вернул бы обе.
+    """
+
+    node = "freshness-check"
+    boundary = "2001-01-01T00:00:00Z"
+    stale = "2000-01-01T00:00:00Z"
+
+    @staticmethod
+    def _set_updated_at(db_path: str, note_id: int, stamp: str) -> None:
+        """Прямая правка updated_at (триггер FTS — UPDATE OF text,title — не срабатывает)."""
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE notes SET updated_at = ? WHERE id = ?", (stamp, note_id)
+            )
+
+    async def _save_pair(
+        self, session: ClientSession, marker: str
+    ) -> tuple[int, int]:
+        """Две пробы в своём узле: одна ляжет ровно на границу, вторая — раньше."""
+        on_boundary = (await session.call_tool(
+            "memory_save",
+            {
+                "text": f"{marker} заметка ровно на границе свежести",
+                "title": "На границе",
+                "namespace": self.node,
+            },
+        )).structured_content
+        stale = (await session.call_tool(
+            "memory_save",
+            {
+                "text": f"{marker} заметка заведомо раньше границы",
+                "title": "Раньше границы",
+                "namespace": self.node,
+            },
+        )).structured_content
+        assert on_boundary["stored"] is True and stale["stored"] is True
+        return on_boundary["id"], stale["id"]
+
+    @pytest.mark.asyncio
+    async def test_memory_list_keeps_the_note_updated_at_the_boundary(
+        self, ns_url: str, ns_db: str
+    ) -> None:
+        """Заметка с `updated_at`, РАВНЫМ границе, остаётся; старее — нет."""
+        _register_namespace(
+            ns_db, self.node, "Узел проверки свежести. Тестовый узел приёмки."
+        )
+        marker = f"freshlist-{uuid.uuid4().hex[:8]}"
+        async with connect(ns_url) as session:
+            on_boundary, stale = await self._save_pair(session, marker)
+            self._set_updated_at(ns_db, on_boundary, self.boundary)
+            self._set_updated_at(ns_db, stale, self.stale)
+            listed = (await session.call_tool(
+                "memory_list",
+                {
+                    "limit": 20,
+                    "namespace": self.node,
+                    "namespace_exact": True,
+                    "updated_after": self.boundary,
+                },
+            )).structured_content
+        ids = [item["id"] for item in listed["items"]]
+        assert on_boundary in ids
+        assert stale not in ids
+        assert listed["total"] == len(ids) == 1
+
+    @pytest.mark.asyncio
+    async def test_memory_search_keeps_the_note_updated_at_the_boundary(
+        self, ns_url: str, ns_db: str
+    ) -> None:
+        """Тот же маркер у обеих проб: после фильтра остаётся только граница."""
+        _register_namespace(
+            ns_db, self.node, "Узел проверки свежести. Тестовый узел приёмки."
+        )
+        marker = f"freshsearch-{uuid.uuid4().hex[:8]}"
+        async with connect(ns_url) as session:
+            on_boundary, stale = await self._save_pair(session, marker)
+            self._set_updated_at(ns_db, on_boundary, self.boundary)
+            self._set_updated_at(ns_db, stale, self.stale)
+            found = (await session.call_tool(
+                "memory_search",
+                {
+                    "query": marker,
+                    "namespace": self.node,
+                    "namespace_exact": True,
+                    "updated_after": self.boundary,
+                },
+            )).structured_content
+        hit_ids = [row["id"] for row in found["results"]]
+        assert on_boundary in hit_ids
+        assert stale not in hit_ids
