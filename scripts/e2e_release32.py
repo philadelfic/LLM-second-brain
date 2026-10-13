@@ -144,6 +144,10 @@ SLOT_QUEUE = {"embedding": "vector", "summary": "summary", "judge": "judge"}
 # №39 + LSBN-F-12: слот решения (`/health.slots.decision`) — не «слот модели», но у
 # него свой канал: ветвь `judge` сценария 2 глушит и его (см. `_outage_for_slot`).
 SLOT_DECISION = "decision"
+# Регрессия сценария 6: у этих старых E2E есть ключи адреса и базы; остальные
+# (`e2e_release22`, `e2e_lsb0004/0005/0006`) жёстко ходят на `localhost:8080` и
+# потому запускаются в сети контура (см. `legacy_e2e_cmd`).
+LEGACY_ARG_SCRIPTS = ("e2e_release31.py", "e2e_release30.py")
 # №39: the outage walk of scenario 2 — only the slots that OWN a queue, and the
 # ORDER MATTERS. `embedding` goes LAST: its own queue `vector` needs no embedding
 # at all, while the `summary`/`judge` queues count ONLY the notes whose vector is
@@ -2109,17 +2113,42 @@ async def scenario_6_regression() -> None:
                "e2e_lsb0004.py, e2e_lsb0005.py, e2e_lsb0006.py")
         return
 
-    proc = await run_shell(f"cd {CFG['repo_dir']} && {CFG['python']} -m pytest -q",
-                           timeout=3600.0)
+    # Юниты — с ИЗОЛИРОВАННОЙ базой. Раннеру смонтирован /data контура (он нужен
+    # проверкам свежести), а тесты берут `db_path` из окружения: на живой базе
+    # контура весь прогон сыпется (живой прогон 13.10.2026 — 110 failed из 2136:
+    # чужая схема/блокировки). Своя временная база — и результат совпадает с
+    # хостовым: 2136 passed, 13 skipped, 0 failed.
+    proc = await run_shell(
+        f"cd {CFG['repo_dir']} && DB_PATH=\"$(mktemp -d)/unit-notes.db\" "
+        f"{CFG['python']} -m pytest -q",
+        timeout=3600.0)
     tail = "\n".join(proc.stdout.strip().splitlines()[-3:])
     check("unit regression is green (0 failed)", proc.returncode == 0, tail)
     for name in (n.strip() for n in CFG["regression_scripts"].split(",")):
         if not name:
             continue
-        proc = await run_shell(
-            f"cd {CFG['repo_dir']} && {CFG['python']} scripts/{name}", timeout=3600.0)
+        proc = await run_shell(legacy_e2e_cmd(name), timeout=3600.0)
         tail = "\n".join(proc.stdout.strip().splitlines()[-2:])
         check(f"the existing E2E script {name} is green", proc.returncode == 0, tail)
+
+
+def legacy_e2e_cmd(name: str) -> str:
+    """Команда прогона старого E2E-скрипта в регрессии (сценарий 6).
+
+    Два вида: у `e2e_release31/30` есть ключи адреса и базы — зовём их из раннера
+    с адресом контура; `e2e_release22` и `e2e_lsb0004/0005/0006` жёстко ходят на
+    `http://localhost:8080` и рассчитаны на запуск ИЗНУТРИ контура — их запускаем в
+    его СЕТЕВОМ пространстве (`--network container:<имя>`), иначе `localhost` ведёт
+    в пустоту раннера (живой прогон 13.10.2026: четыре из шести падали на адресе).
+    """
+    if name in LEGACY_ARG_SCRIPTS:
+        return (f"cd {CFG['repo_dir']} && {CFG['python']} scripts/{name} "
+                f"--base-url {CFG['base_url']} --db {CFG['db']} "
+                f'--token "$MCP_AUTH_TOKEN"')
+    return (f"docker run --rm --network container:{CFG['container']} "
+            f"-v {CFG['repo_dir']}:/w -w /w "
+            f'-e MCP_AUTH_TOKEN="$MCP_AUTH_TOKEN" '
+            f"{CFG['image']} {CFG['python']} scripts/{name}")
 
 
 # ==== scenarios: 7. TODO of the future blocks ==================================
@@ -3893,6 +3922,10 @@ async def main() -> int:
                         help="run the unit regression and the existing E2E scripts (long)")
     parser.add_argument("--python", default=os.environ.get("LSB_PYTHON", "python"),
                         help="interpreter for the regression run")
+    parser.add_argument("--container",
+                        default=os.environ.get("LSB_CONTAINER", "lsb-test"),
+                        help="contour container name (the legacy E2E that call "
+                             "localhost:8080 run inside its netns)")
     parser.add_argument("--repo-dir", default=os.environ.get("LSB_REPO_DIR", ""),
                         help="repository directory for the regression (empty — the script root)")
     parser.add_argument("--regression-scripts",
@@ -3953,6 +3986,7 @@ async def main() -> int:
         "run_regression": args.run_regression,
         "python": args.python,
         "repo_dir": args.repo_dir or str(Path(__file__).resolve().parents[1]),
+        "container": args.container,
         "regression_scripts": args.regression_scripts,
         "no_cleanup": args.no_cleanup,
     })
