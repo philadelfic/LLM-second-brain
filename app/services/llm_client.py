@@ -32,8 +32,9 @@ v2.1: каждый из трёх слотов (embedding, summary, judge) пол
   (решение №4). 401/403 у openai — `LLMAuthError` без ретрая, с hint:
   пустой ключ — «задай {SLOT}_API_KEY в docker-compose и перезапусти»,
   заданный (неверный) — «ключ отклонён API». Ollama-провайдер Bearer не
-  ходит, поэтому его 401/403 — обычная статусная ошибка (hint про ключ
-  не вводит в заблуждение).
+  ходит, поэтому его 401/403 — обычная статусная ошибка БЕЗ hint про ключ,
+  но с признаком `auth`: исход вызова в обоих случаях `AUTH` (arch §6.1:
+  «401/403 — ждать бессмысленно»; FR-4.3 — пауза сразу, а не после серии).
 - 429/5xx/транспорт/таймаут — `LLMError.transient = True`: эмбеддер
   ретраит (429 — транзиент, решение №4), чат не ретраит. Сам клиент не
   ретраит никогда — решение о повторе принимает вызывающий по флагу.
@@ -162,7 +163,8 @@ class LLMError(RuntimeError):
     `status` — HTTP-статус ответа, если ошибка от сервера. `transient` —
     сбой временный (429/5xx/транспорт/таймаут): сигнал для единственного
     ретрая эмбеддера (ARCH §3.2); чат по флагу не ретраит (NFR-3).
-    `auth` — 401/403 при задействованном Bearer (см. LLMAuthError).
+    `auth` — 401/403 у ЛЮБОГО провайдера (openai несёт ещё и `LLMAuthError`
+    с hint про ключ): исход вызова — `AUTH` (`slot_outcome.classify_llm_error`).
     `timeout`/`empty`/`truncated` — признаки причины (№39, §6.3): исход
     вызова различается на границе клиента (`slot_outcome.classify_llm_error`),
     а не по тексту сообщения. `truncated` заполняет блок №49 (finish_reason).
@@ -899,11 +901,26 @@ class LLMClient:
             raise LLMError(f"не-JSON ответ от {path}: {exc}") from exc
 
     def _raise_for_status(self, response: httpx.Response, path: str) -> None:
-        """Не-200 → типизированная ошибка (401/403 — только у openai-auth)."""
+        """Не-200 → типизированная ошибка.
+
+        401/403 — отказ доступа у ЛЮБОГО провайдера (arch §6.1: `AUTH` =
+        «401/403 — ждать бессмысленно»): у openai-слота это `LLMAuthError` с
+        hint про `{SLOT}_API_KEY`, у ollama-слота (Bearer не ходит) — обычный
+        `LLMError` с признаком `auth`. Исход вызова в обоих случаях `AUTH`
+        (FR-4.3) — разница только в тексте: hint про ключ остаётся там, где
+        ключ действительно есть (решение №4), и не вводит в заблуждение.
+        """
         status = response.status_code
-        if status in STATUS_UNAUTHORIZED and self.spec.provider == PROVIDER_OPENAI:
-            raise LLMAuthError(self._auth_message(status), status=status)
         body = " ".join(response.text[:_ERROR_BODY_CHARS].split())
+        if status in STATUS_UNAUTHORIZED:
+            if self.spec.provider == PROVIDER_OPENAI:
+                raise LLMAuthError(self._auth_message(status), status=status)
+            raise LLMError(
+                f"HTTP {status} от {path}: {body}",
+                status=status,
+                transient=False,
+                auth=True,
+            )
         raise LLMError(
             f"HTTP {status} от {path}: {body}",
             status=status,

@@ -28,6 +28,19 @@ def test_auth_maps_to_auth() -> None:
     assert classify_llm_error(exc) is SlotOutcome.AUTH
 
 
+def test_auth_flag_maps_to_auth() -> None:
+    """401 у ollama-слота (признак `auth` без LLMAuthError) — исход AUTH.
+
+    Приёмка 3.2.0, живой прогон 13.10.2026: 401 от провайдера слота summary
+    шёл как `off_contract`, разрыв открывался лишь после трёх отказов и с
+    чужой причиной — ветвь auth сценария 3 не могла стать зелёной.
+    """
+    exc = LLMError(
+        "HTTP 401 от /api/chat: denied", status=401, transient=False, auth=True
+    )
+    assert classify_llm_error(exc) is SlotOutcome.AUTH
+
+
 def test_timeout_wins_over_transient() -> None:
     """Таймаут помечен и transient, и timeout — исход TIMEOUT, не UNAVAILABLE."""
     exc = LLMError("read timeout", transient=True, timeout=True)

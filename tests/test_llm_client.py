@@ -310,8 +310,11 @@ class TestAuthErrors:
     def test_401_ollama_is_plain_error_without_key_hint(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Ollama Bearer не шлёт — его 401 не про ключ: обычный LLMError,
-        hint про {SLOT}_API_KEY не вводит в заблуждение."""
+        """Ollama Bearer не шлёт — его 401 не про ключ: обычный LLMError
+        БЕЗ hint про {SLOT}_API_KEY, но с признаком `auth`: исход вызова —
+        AUTH (arch §6.1 «401/403 — ждать бессмысленно»; приёмка 13.10.2026,
+        ветвь auth сценария 3).
+        """
         settings = make_settings(monkeypatch, SUMMARY_PROVIDER="ollama")
         client, recorder = make_client(
             SlotSpec.for_summary(settings), [httpx.Response(401, text="denied")]
@@ -320,6 +323,25 @@ class TestAuthErrors:
             client.chat(SYSTEM, USER, num_predict=10)
         assert not isinstance(exc_info.value, LLMAuthError)
         assert "API_KEY" not in str(exc_info.value)
+        assert exc_info.value.transient is False
+        assert exc_info.value.auth is True
+        assert exc_info.value.status == 401
+        assert recorder.calls == 1
+
+    def test_403_ollama_is_plain_error_with_auth_flag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """403 у ollama-слота: тот же признак `auth` (отказ доступа — не
+        «ответ не по контракту»); одна попытка, без ретрая.
+        """
+        settings = make_settings(monkeypatch, JUDGE_PROVIDER="ollama")
+        client, recorder = make_client(
+            SlotSpec.for_judge(settings), [httpx.Response(403, text="denied")]
+        )
+        with pytest.raises(LLMError) as exc_info:
+            client.chat(SYSTEM, USER, num_predict=10)
+        assert not isinstance(exc_info.value, LLMAuthError)
+        assert exc_info.value.auth is True
         assert exc_info.value.transient is False
         assert recorder.calls == 1
 
