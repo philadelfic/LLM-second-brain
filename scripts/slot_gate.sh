@@ -33,7 +33,8 @@
 #   on        — open the gate (docker: start the stopped slot proxies, or unpause
 #               them with SLOT_GATE_ACTION=pause; iptables: remove exactly the rules
 #               installed by `off` — foreign rules in the chain are never touched)
-#   status    — docker: the state of every slot proxy — `running` is on; `exited` /
+#   status    — docker: the state of every slot proxy (включая канал `decision` —
+#               `all` для `off|on` его не трогает) — `running` is on; `exited` /
 #               `created` is off for the default stop action, `paused` is off for the
 #               pause action; `missing` means the contour is not up; iptables: which
 #               rules are standing right now
@@ -174,6 +175,13 @@ esac
 WANTED=(embedding summary judge)
 if [[ "$TARGET" != "all" ]]; then
     WANTED=("$TARGET")
+elif [[ "$MODE" == "status" && "$BACKEND" == "docker" ]]; then
+    # `status` обещает состояние ВСЕХ каналов слота — в том числе decision (иначе
+    # выключенный канал решения не виден оператору). `off|on all` его по-прежнему
+    # не трогает: выключатель «модели недоступны» — про три слота моделей.
+    # В iptables-режиме decision не добавляем: там нужен DECISION_BASE_URL из
+    # env-файла, и его отсутствие уронило бы `status`.
+    WANTED+=(decision)
 fi
 
 # --- адреса слотов (iptables-режим) ------------------------------------------
