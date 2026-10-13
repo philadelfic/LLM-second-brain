@@ -29,7 +29,13 @@ WORKDIR /srv
 # the chunk token splitter).
 COPY pyproject.toml ./
 COPY app ./app
-RUN pip install --no-cache-dir .
+# Тест-зависимости (`[dev]`: pytest/pytest-asyncio) — только для ПРИЁМОЧНОГО
+# образа: сценарий 6 приёмки гоняет юнит-регрессию изнутри раннера
+# (`python -m pytest -q` в дереве /w), а продуктовому образу pytest не нужен.
+# Пусто (по умолчанию) — прежняя установка; `--build-arg INSTALL_DEV=dev`
+# (см. scripts/build_image.sh) добавляет extra из pyproject.
+ARG INSTALL_DEV=""
+RUN pip install --no-cache-dir ".${INSTALL_DEV:+[${INSTALL_DEV}]}"
 
 # Prebuild the tiktoken BPE dictionary (cl100k_base) into the image layer:
 # without a cache the first get_encoding call at runtime downloads the

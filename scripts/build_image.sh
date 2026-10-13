@@ -28,10 +28,15 @@ if ! git -C "$ROOT" diff --quiet || ! git -C "$ROOT" diff --cached --quiet; then
     DIRTY="-dirty"  # uncommitted changes: the revision alone is not the code
 fi
 VERSION="$(git -C "$ROOT" describe --tags --always 2>/dev/null || echo unknown)"
+# Приёмочный образ несёт и тест-зависимости (`[dev]`: pytest/pytest-asyncio):
+# сценарий 6 приёмки гоняет юнит-регрессию изнутри раннера. Пустое значение
+# переменной extra отключает: LSB_INSTALL_DEV= scripts/build_image.sh
+DEV_EXTRA="${LSB_INSTALL_DEV-dev}"
 
 docker build \
     --build-arg "GIT_COMMIT=${COMMIT}${DIRTY}" \
     --build-arg "APP_VERSION=${VERSION}" \
+    --build-arg "INSTALL_DEV=${DEV_EXTRA}" \
     -t "$IMAGE" "$ROOT"
 
 echo "built $IMAGE — revision ${COMMIT}${DIRTY}, version ${VERSION}"
