@@ -91,8 +91,9 @@ Requires Open WebUI **v0.6.31+** (native MCP Streamable HTTP support).
    - **Type**: `MCP Streamable HTTP`;
    - **URL**: `http://<host>:8080/mcp` (the `MCP_PATH`, default `/mcp`);
    - **Auth**: `Bearer`; **token** — your `MCP_AUTH_TOKEN`.
-3. Save. All 21 MCP tools appear and are available to all models: 8
-   `memory_*`, 5 `skills_*`, 5 `user_*` and 3 `terms_*` (the surface is
+3. Save. All 31 MCP tools appear and are available to all models: 9
+   `memory_*`, 5 `skills_*`, 5 `user_*`, 3 `terms_*`, 6 `logs_*`,
+   `history_list` / `history_get` and `warnings_list` (the surface is
    described in the [README](../README.md)).
 4. Test in a chat: "find in memory …" → the model calls `memory_search`.
 
@@ -109,7 +110,7 @@ curl -s http://localhost:8080/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
 ```
 
-`tools/list` returns all 21 tools (the same surface as the
+`tools/list` returns all 31 tools (the same surface as the
 [README](../README.md)); without a token or with a wrong one — `401`.
 
 ## Upgrading
