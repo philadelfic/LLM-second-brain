@@ -141,6 +141,9 @@ HEALTH_QUEUES = ("vector", "summary", "judge", "areas", "links", "nodes",
 SLOTS = ("embedding", "summary", "judge", "decision")
 # Queue that belongs to each slot for the "queue grows while the slot is down".
 SLOT_QUEUE = {"embedding": "vector", "summary": "summary", "judge": "judge"}
+# №39 + LSBN-F-12: слот решения (`/health.slots.decision`) — не «слот модели», но у
+# него свой канал: ветвь `judge` сценария 2 глушит и его (см. `_outage_for_slot`).
+SLOT_DECISION = "decision"
 # №39: the outage walk of scenario 2 — only the slots that OWN a queue, and the
 # ORDER MATTERS. `embedding` goes LAST: its own queue `vector` needs no embedding
 # at all, while the `summary`/`judge` queues count ONLY the notes whose vector is
@@ -1514,6 +1517,46 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
         return
     teardown_note(f"[{slot}] the slot was stopped and started back by the scenario hook")
 
+    # №39 + LSBN-F-12 (живой прогон 13.10.2026): очередь `judge` наполняет пара
+    # «судья дедупа», и решение по ней может принять decision-слот — тогда
+    # генеративный судья не вызывается вовсе, работа завершается за секунды и
+    # очередь честно пустеет: проверки «работа видна» и «возраст старейшего
+    # растёт» читаются ложной краснотой (прогон №13, 12.10.2026 — единственный
+    # оставшийся красный). Ветвь мерит ГЕНЕРАТИВНЫЙ путь, поэтому вместе с судьёй
+    # глушится и канал decision: продукт уходит на генеративный путь по контракту
+    # переключения (`decision_fallback reason=unavailable`) и упирается в
+    # выключенного судью — работа ЖДЁТ (замер 13.10.2026: oldest 3 → 77 с,
+    # `queue_waiting` записан, после возврата каналов очередь дренируется). Контур
+    # при этом не пересоздаётся: тот же хук, тот же способ, только вторая цель.
+    decision_cut = False
+    if slot == "judge":
+        decision_stat = slot_stat(await health_snapshot(rest), SLOT_DECISION) or {}
+        if decision_stat.get("enabled"):
+            cut = await run_shell(slot_cmd(CFG["slot_off_cmd"], SLOT_DECISION))
+            decision_cut = cut.returncode == 0
+            if decision_cut:
+                teardown_note(f"[{slot}] the decision channel was stopped and "
+                              f"started back by the scenario hook")
+            else:
+                # Хук не знает цель `decision` (чужой контур со старым
+                # scripts/slot_gate.sh): ветвь честно пропускается — иначе она
+                # мерит не тот канал и краснеет ложно. Слот поднимаем обратно.
+                back = await run_shell(slot_cmd(CFG["slot_on_cmd"], slot))
+                teardown_note(f"[{slot}] the slot was started back (the branch "
+                              "was left before its probe notes)")
+                skip(f"[{slot}] the generative judge is really the only path",
+                     "при включённом decision-слоте пару решает ОН, а канал decision "
+                     f"перерезать не удалось (rc={cut.returncode})")
+                manual(f"scenario 2, branch [{slot}] (№39 FR-1/FR-2/FR-5.1)",
+                       "решение по паре «судья дедупа» может принять decision-слот "
+                       "(LSBN-F-12), и очередь `judge` пустеет без вызова "
+                       "генеративного судьи. Дай хуку цель `decision` "
+                       "(`scripts/slot_gate.sh off|on decision`) или гони контур с "
+                       "DECISION_ENABLED=false — тогда ветвь мерит генеративный путь")
+                check(f"[{slot}] the slot is started back by the contour hook",
+                      back.returncode == 0, f"rc={back.returncode}")
+                return
+
     released = False
     try:
         # Push work into the slot's queue so the wait is observable (a probe note
@@ -1651,6 +1694,10 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
         released = True
         check(f"[{slot}] the slot is started back by the contour hook",
               proc.returncode == 0, f"rc={proc.returncode}")
+        if decision_cut:
+            back = await run_shell(slot_cmd(CFG["slot_on_cmd"], SLOT_DECISION))
+            check(f"[{slot}] the decision channel is started back",
+                  back.returncode == 0, f"rc={back.returncode}")
     finally:
         if not released:
             undo = await run_shell(slot_cmd(CFG["slot_on_cmd"], slot))
@@ -1662,6 +1709,14 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
             else:
                 warn(f"[{slot}] the slot could NOT be released — remove the block by hand",
                      f"rc={undo.returncode}")
+            if decision_cut:
+                restored = await run_shell(slot_cmd(CFG["slot_on_cmd"], SLOT_DECISION))
+                if restored.returncode == 0:
+                    teardown_note(f"[{slot}] the decision channel was started back "
+                                  f"by the teardown hook")
+                else:
+                    warn(f"[{slot}] the decision channel could NOT be started back — "
+                         f"start it by hand", f"rc={restored.returncode}")
 
     ok, detail = await wait_until(
         queue_drained(rest, queue),

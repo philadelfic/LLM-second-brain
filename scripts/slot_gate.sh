@@ -26,8 +26,8 @@
 #     secrets are never read or printed — only the address keys of the env file.
 #
 # Usage:
-#   scripts/slot_gate.sh off|on [embedding|summary|judge|all] [--dry-run]
-#   scripts/slot_gate.sh status [embedding|summary|judge|all] [--dry-run]
+#   scripts/slot_gate.sh off|on [embedding|summary|judge|decision|all] [--dry-run]
+#   scripts/slot_gate.sh status [embedding|summary|judge|decision|all] [--dry-run]
 #
 #   off       — close the gate (the models are unreachable for the test contour)
 #   on        — open the gate (docker: start the stopped slot proxies, or unpause
@@ -56,6 +56,15 @@
 #                    slot (default: lsb-test-model-proxy-judge): every slot has
 #                    its OWN proxy container, so muting one slot never closes
 #                    the channel of another one
+#   SLOT_GATE_PROXY_DEC_CONTAINER    (docker only) proxy container of the DECISION
+#                    slot (default: lsb-test-model-proxy-dec). Ветвь `judge`
+#                    сценария 2 глушит его вместе с судьёй: решение по паре
+#                    «судья дедупа» может принять decision-слот (LSBN-F-12), и
+#                    тогда одно лишь глушение генеративного судьи ничего не
+#                    меряет — очередь `judge` пустеет (живой прогон 13.10.2026).
+#                    С перерезанным каналом decision продукт по контракту уходит
+#                    на генеративный путь (`decision_fallback
+#                    reason=unavailable`) и упирается в выключенного судью.
 #   SLOT_GATE_ENV    (iptables only) env file with the slot addresses
 #                    (default: ./.env.test, i.e. beside the contour working copy —
 #                    run the script from there)
@@ -83,6 +92,7 @@ ACTION="${SLOT_GATE_ACTION:-stop}"
 PROXY_EMBED_CONTAINER="${SLOT_GATE_PROXY_EMBED_CONTAINER:-lsb-test-model-proxy-embed}"
 PROXY_SUMMARY_CONTAINER="${SLOT_GATE_PROXY_SUMMARY_CONTAINER:-lsb-test-model-proxy-summary}"
 PROXY_JUDGE_CONTAINER="${SLOT_GATE_PROXY_JUDGE_CONTAINER:-lsb-test-model-proxy-judge}"
+PROXY_DEC_CONTAINER="${SLOT_GATE_PROXY_DEC_CONTAINER:-lsb-test-model-proxy-dec}"
 
 # iptables-режим (запасной путь): адреса берутся только из окружения/env-файла.
 CHAIN="DOCKER-USER"
@@ -90,11 +100,12 @@ ENV_FILE="${SLOT_GATE_ENV:-./.env.test}"
 CONTAINER="${SLOT_GATE_CONTAINER:-lsb-test}"
 IPTABLES_BIN="${SLOT_GATE_IPTABLES:-iptables}"
 
-SLOT_ORDER=(embedding summary judge)
+SLOT_ORDER=(embedding summary judge decision)
 declare -A SLOT_KEY=(
     [embedding]=EMBEDDING_BASE_URL
     [summary]=SUMMARY_BASE_URL
     [judge]=JUDGE_BASE_URL
+    [decision]=DECISION_BASE_URL
 )
 
 # Шапка-usage — сам этот файл (заголовочный комментарий до первой строки кода).
@@ -118,7 +129,7 @@ for arg in "$@"; do
                 exit 2
             fi
             MODE="$arg" ;;
-        embedding|summary|judge|all)
+        embedding|summary|judge|decision|all)
             TARGET="$arg" ;;
         -*)
             echo "ERROR: unknown option: $arg" >&2
@@ -156,6 +167,10 @@ case "$ACTION" in
         exit 2 ;;
 esac
 
+# `all` — три СЛОТА МОДЕЛЕЙ (embedding/summary/judge): `decision` в него не входит
+# нарочно — выключатель «модели недоступны» его не трогает (у decision свой
+# маршрут решения и свой прокси, и не на всяком контуре он есть), а ветвь `judge`
+# зовёт его по имени явно.
 WANTED=(embedding summary judge)
 if [[ "$TARGET" != "all" ]]; then
     WANTED=("$TARGET")
@@ -243,6 +258,7 @@ proxy_for_slot() {
         embedding) printf '%s' "$PROXY_EMBED_CONTAINER" ;;
         summary)   printf '%s' "$PROXY_SUMMARY_CONTAINER" ;;
         judge)     printf '%s' "$PROXY_JUDGE_CONTAINER" ;;
+        decision)  printf '%s' "$PROXY_DEC_CONTAINER" ;;
         *)         return 1 ;;
     esac
 }
