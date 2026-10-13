@@ -1530,7 +1530,11 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
     # при этом не пересоздаётся: тот же хук, тот же способ, только вторая цель.
     decision_cut = False
     if slot == "judge":
-        decision_stat = slot_stat(await health_snapshot(rest), SLOT_DECISION) or {}
+        # «Включён ли decision-слот» читаем у агрегата `/health.decision.enabled`:
+        # у `/health.slots.decision` поля `enabled` НЕТ (модель `SlotStat` его не
+        # несёт — прогон 13.10.2026: условие молча не сработало, канал decision
+        # остался живым, пару снова решил он, ветвь краснела).
+        decision_stat = (await health_snapshot(rest)).get("decision") or {}
         if decision_stat.get("enabled"):
             cut = await run_shell(slot_cmd(CFG["slot_off_cmd"], SLOT_DECISION))
             decision_cut = cut.returncode == 0
@@ -1718,9 +1722,16 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
                     warn(f"[{slot}] the decision channel could NOT be started back — "
                          f"start it by hand", f"rc={restored.returncode}")
 
+    # Гард дренажа — ДЛИННЕЕ общего (`wait_sec`): после обрыва работа пары уходит в
+    # back-off (10 → 20 → … с) и возвращается к делу не мгновенно, а живая модель
+    # считает выжимку секундами. Живой прогон 13.10.2026: очередь ДОшла, но на
+    # ~1–2 минуты позже 120-секундного гарда (и `summary`, и `vector`) — ложная
+    # краснота. Быстрый профиль не страдает: там очередь пустеет за секунды и
+    # ожидание возвращается сразу (то же решение, что в смоуке F-11 с его окном 600 с).
     ok, detail = await wait_until(
         queue_drained(rest, queue),
-        f"[{slot}] the queue {queue} is drained after the slot is back")
+        f"[{slot}] the queue {queue} is drained after the slot is back",
+        timeout=max(CFG["wait_sec"], 300.0))
     check(f"[{slot}] after the slot is back the queue drains within the guard (no restart)",
           ok, detail)
 
