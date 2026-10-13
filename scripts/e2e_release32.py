@@ -2138,13 +2138,14 @@ async def scenario_6_regression() -> None:
                "e2e_lsb0004.py, e2e_lsb0005.py, e2e_lsb0006.py")
         return
 
-    # Юниты — с ИЗОЛИРОВАННОЙ базой. Раннеру смонтирован /data контура (он нужен
-    # проверкам свежести), а тесты берут `db_path` из окружения: на живой базе
-    # контура весь прогон сыпется (живой прогон 13.10.2026 — 110 failed из 2136:
-    # чужая схема/блокировки). Своя временная база — и результат совпадает с
-    # хостовым: 2136 passed, 13 skipped, 0 failed.
+    # Юниты — в ЧИСТОМ окружении и со своей временной базой. Раннер живёт с env
+    # контура: живой прогон 13.10.2026 — с чужим `MCP_AUTH_TOKEN` в окружении
+    # 110 тестов из 2136 падают (тестовый клиент шлёт свой токен, а приложение
+    # берёт внешний — `POST /notes` → 401); с `env -u` и изолированной базой
+    # результат совпадает с хостовым: 2136 passed, 13 skipped, 0 failed.
     proc = await run_shell(
-        f"cd {CFG['repo_dir']} && DB_PATH=\"$(mktemp -d)/unit-notes.db\" "
+        f"cd {CFG['repo_dir']} && env -u MCP_AUTH_TOKEN "
+        f"DB_PATH=\"$(mktemp -d)/unit-notes.db\" "
         f"{CFG['python']} -m pytest -q",
         timeout=3600.0)
     tail = "\n".join(proc.stdout.strip().splitlines()[-3:])
@@ -2181,13 +2182,18 @@ def legacy_e2e_cmd(name: str) -> str:
     `http://localhost:8080` и рассчитаны на запуск ИЗНУТРИ контура — их запускаем в
     его СЕТЕВОМ пространстве (`--network container:<имя>`), иначе `localhost` ведёт
     в пустоту раннера (живой прогон 13.10.2026: четыре из шести падали на адресе).
+
+    Монтируем ХОСТОВЫЙ путь дерева (`--host-root`/LSB_HOST_ROOT): `-v /w:/w` без
+    этого резолвится демоном на хосте, где такого каталога нет, — вложенный
+    контейнер получал пустую папку и падал с кодом 2.
     """
+    tree = CFG["host_root"] or CFG["repo_dir"]
     if name in LEGACY_ARG_SCRIPTS:
         return (f"cd {CFG['repo_dir']} && {CFG['python']} scripts/{name} "
                 f"--base-url {CFG['base_url']} --db {CFG['db']} "
                 f'--token "$MCP_AUTH_TOKEN"')
     return (f"docker run --rm --network container:{CFG['container']} "
-            f"-v {CFG['repo_dir']}:/w -w /w "
+            f"-v {tree}:/w -v {tree}/test/data-test:/data -w /w "
             f'-e MCP_AUTH_TOKEN="$MCP_AUTH_TOKEN" '
             f"{CFG['image']} {CFG['python']} scripts/{name}")
 
@@ -3967,6 +3973,10 @@ async def main() -> int:
                         default=os.environ.get("LSB_CONTAINER", "lsb-test"),
                         help="contour container name (the legacy E2E that call "
                              "localhost:8080 run inside its netns)")
+    parser.add_argument("--host-root", default=os.environ.get("LSB_HOST_ROOT", ""),
+                        help="the tree path ON THE HOST (docker resolves nested "
+                             "`-v` against the host, not against the runner); "
+                             "empty — the repo dir itself")
     parser.add_argument("--repo-dir", default=os.environ.get("LSB_REPO_DIR", ""),
                         help="repository directory for the regression (empty — the script root)")
     parser.add_argument("--regression-scripts",
@@ -4028,6 +4038,7 @@ async def main() -> int:
         "python": args.python,
         "repo_dir": args.repo_dir or str(Path(__file__).resolve().parents[1]),
         "container": args.container,
+        "host_root": args.host_root.rstrip("/"),
         "regression_scripts": args.regression_scripts,
         "no_cleanup": args.no_cleanup,
     })
