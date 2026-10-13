@@ -1520,6 +1520,8 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
     if proc.returncode != 0:
         return
     teardown_note(f"[{slot}] the slot was stopped and started back by the scenario hook")
+    # Окно журнальных проверок ветви (для ветви `judge` — ниже).
+    judge_started = utc_now_iso()
 
     # №39 + LSBN-F-12 (живой прогон 13.10.2026): очередь `judge` наполняет пара
     # «судья дедупа», и решение по ней может принять decision-слот — тогда
@@ -1655,30 +1657,53 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
                       back.returncode == 0, f"rc={back.returncode}")
                 return
 
-        ok, detail = await wait_until(
-            queue_has_work(rest, queue),
-            f"[{slot}] the queue {queue} shows work while the slot is down",
-            timeout=min(CFG["wait_sec"], 180.0))
-        check(f"[{slot}] with the slot down the work stays visible (nothing is lost)",
-              ok, detail)
-        if not ok:
-            # Диагностика (живой прогон 10.10.2026): очередь честно пуста, если
-            # обрыв НЕ перерезал канал слота — контур ходит к другому провайдеру,
-            # и работа ветви завершается за секунды. Типичная причина — остатки
-            # ветви отказа от прерванного прогона: `scripts/slot_fake.sh` оставил
-            # слот на заглушке, а глушится прокси, к которому контур не ходит.
-            snapshot = await health_snapshot(rest)
-            stat = slot_stat(snapshot, slot) or {}
-            warn(f"[{slot}] the outage did not cut the channel of the slot: the "
-                 f"work of the branch was finished, not deferred",
-                 f"/health.slots.{slot}={stat}; check the contour: "
-                 f"'scripts/slot_fake.sh status' (a leftover fake provider) and "
-                 f"'scripts/slot_gate.sh status {slot}'")
+        if slot == "judge":
+            # Очередь `judge` держит ПАРУ-«почти-дубль», и её задание живёт не вечно:
+            # неразрешимая пара закрывается и ставится заново (в журнале
+            # «retry queued»), поэтому мгновенный снимок очереди — не
+            # доказательство (живой прогон №17: работа уехала в новый job между
+            # опросами, и обе проверки очереди прочлись ложной краснотой, хотя
+            # отсрочка была честной). Мерим сам факт отсрочки — журналом: отказ
+            # слота с ИСХОДОМ (а не вердикт) значит, что пару отложили, а не
+            # выполнили чужим каналом.
+            if not CFG["logs_cmd"]:
+                skip(f"[{slot}] the outage defers the judge work (an outcome, "
+                     f"not a verdict)",
+                     "LSB_LOGS_CMD is not set (no log hook on this contour)")
+            else:
+                ok, detail = await wait_until(
+                    log_slot_event("dedup_judge_failed", slot=slot,
+                                   outcome="unavailable", since=judge_started),
+                    f"[{slot}] the outage defers the judge work (an outcome, "
+                    f"not a verdict)",
+                    timeout=min(CFG["wait_sec"], 180.0))
+                check(f"[{slot}] with the slot down the pair fails by the outage "
+                      f"instead of being decided elsewhere", ok, detail)
+        else:
+            ok, detail = await wait_until(
+                queue_has_work(rest, queue),
+                f"[{slot}] the queue {queue} shows work while the slot is down",
+                timeout=min(CFG["wait_sec"], 180.0))
+            check(f"[{slot}] with the slot down the work stays visible (nothing is lost)",
+                  ok, detail)
+            if not ok:
+                # Диагностика (живой прогон 10.10.2026): очередь честно пуста, если
+                # обрыв НЕ перерезал канал слота — контур ходит к другому провайдеру,
+                # и работа ветви завершается за секунды. Типичная причина — остатки
+                # ветви отказа от прерванного прогона: `scripts/slot_fake.sh` оставил
+                # слот на заглушке, а глушится прокси, к которому контур не ходит.
+                snapshot = await health_snapshot(rest)
+                stat = slot_stat(snapshot, slot) or {}
+                warn(f"[{slot}] the outage did not cut the channel of the slot: the "
+                     f"work of the branch was finished, not deferred",
+                     f"/health.slots.{slot}={stat}; check the contour: "
+                     f"'scripts/slot_fake.sh status' (a leftover fake provider) and "
+                     f"'scripts/slot_gate.sh status {slot}'")
 
-        ok, detail = await wait_until(
-            queue_has_work(rest, queue, min_age=10),
-            f"[{slot}] the age of the oldest item in {queue} grows")
-        check(f"[{slot}] the age of the oldest item grows (/health.queues)", ok, detail)
+            ok, detail = await wait_until(
+                queue_has_work(rest, queue, min_age=10),
+                f"[{slot}] the age of the oldest item in {queue} grows")
+            check(f"[{slot}] the age of the oldest item grows (/health.queues)", ok, detail)
 
         alive = await health_snapshot(rest)
         check(f"[{slot}] /health answers while the slot is down (the service is alive)",
