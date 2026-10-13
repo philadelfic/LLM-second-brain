@@ -106,6 +106,7 @@ import sys
 import tempfile
 import time
 from contextlib import AsyncExitStack
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -892,6 +893,53 @@ def log_events(*needles: str) -> Callable[[], Awaitable[tuple[bool, str]]]:
             if not found:
                 return False, "; ".join(details)
         return True, "; ".join(details)
+
+    return predicate
+
+
+def utc_now_iso() -> str:
+    """Момент в ISO-8601 UTC — окно «после начала ветви» для журнальных проверок."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+
+
+def log_slot_event(event: str, *, slot: str, outcome: str,
+                   since: str | None = None,
+                   ) -> Callable[[], Awaitable[tuple[bool, str]]]:
+    """Predicate: the contour log carries THIS event of THIS slot with THIS cause.
+
+    Строка журнала — JSON (`ts`/`event`/`slot`/`outcome`), поэтому проверка
+    читает ПОЛЯ, а не подстроку: `log_events("slot_paused")` находил событие
+    любой ветви прогона (окно хука — 2 часа) и объявлял PASS даже когда причина
+    была чужой — живой прогон 13.10.2026: `slot_paused` с
+    `outcome=off_contract` прошёл как «событие с причиной», хотя ветвь ждёт
+    `auth`. `since` (UTC ISO, секунды) сужает окно до начала ветви.
+    """
+
+    async def predicate() -> tuple[bool, str]:
+        if not CFG["logs_cmd"]:
+            return False, "LSB_LOGS_CMD is not set"
+        try:
+            proc = await run_shell(CFG["logs_cmd"], timeout=120.0)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+        if proc.returncode != 0:
+            return False, f"log hook failed: rc={proc.returncode}"
+        seen: list[str] = []
+        for line in proc.stdout.splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("event") != event or record.get("slot") != slot:
+                continue
+            stamp = str(record.get("ts") or "")
+            if since and stamp and stamp[:19] < since[:19]:
+                continue
+            seen.append(f"{stamp[:19]} outcome={record.get('outcome')!r}")
+            if record.get("outcome") == outcome:
+                return True, f"{event} slot={slot} outcome={outcome} — {seen[-1]}"
+        detail = seen[-3:] if seen else "no such event in the log window"
+        return False, f"{event} slot={slot} outcome={outcome!r} not found; seen: {detail}"
 
     return predicate
 
@@ -1698,6 +1746,10 @@ async def scenario_3_auth_branch(c: Client, rest: httpx2.AsyncClient) -> None:
           f"rc={proc.returncode}")
     if proc.returncode != 0:
         return
+    # Окно журнальных проверок ветви: раньше этого момента событий ветви быть
+    # не может (хук пересоздаёт контейнер — старые строки пропадают, а с чужим
+    # исходом `slot_paused` из соседней ветви больше не считается своим).
+    branch_started = utc_now_iso()
     teardown_note(f"[{slot}] the fake provider was switched to 401 and fixed back")
     fixed = False
     try:
@@ -1721,7 +1773,8 @@ async def scenario_3_auth_branch(c: Client, rest: httpx2.AsyncClient) -> None:
 
         if CFG["logs_cmd"]:
             found, detail = await wait_until(
-                log_events("slot_paused"),
+                log_slot_event("slot_paused", slot=slot, outcome="auth",
+                               since=branch_started),
                 "[auth] the slot_paused event appears in the log",
                 timeout=min(CFG["wait_sec"], 120.0))
             check("[auth] the slot_paused event is written with the cause", found, detail)

@@ -7,9 +7,9 @@
 один формат события на все слоты.
 
 `classify_llm_error` — ЕДИНСТВЕННАЯ точка сопоставления ошибки клиента с
-исходом; порядок проверок обязателен (`LLMAuthError` → `exc.timeout` →
-`exc.empty` → `exc.truncated` → `exc.transient` → `OFF_CONTRACT`), иначе
-`transient=True` у таймаута съел бы `TIMEOUT`. Исход НЕ выводится из текста
+исходом; порядок проверок обязателен (`LLMAuthError`/`exc.auth` →
+`exc.timeout` → `exc.empty` → `exc.truncated` → `exc.transient` →
+`OFF_CONTRACT`), иначе `transient=True` у таймаута съел бы `TIMEOUT`. Исход НЕ выводится из текста
 сообщения — клиент ставит явные признаки (`app/services/llm_client.py`).
 
 Модуль не импортирует домен и транспорт: `LLMError`/`LLMAuthError` — граница
@@ -46,11 +46,18 @@ def classify_llm_error(exc: LLMError) -> SlotOutcome:
     """Отобразить ошибку LLM-клиента в исход вызова слота (arch §6.1, §13.1).
 
     Порядок проверок строго фиксирован: AUTH → TIMEOUT → EMPTY → TRUNCATED →
-    UNAVAILABLE → OFF_CONTRACT. Признаки `timeout`/`empty`/`truncated`
+    UNAVAILABLE → OFF_CONTRACT. Признаки `timeout`/`empty`/`truncated`/`auth`
     заполняет сам клиент (`LLMError`); `truncated` до постановки блока №49
     недостижим, но классификатор его уже читает через `getattr`.
+
+    `auth` (arch §6.1: AUTH = «401/403 — ждать бессмысленно») приходит
+    ДВУМЯ путями: `LLMAuthError` — 401/403 у openai-слота (ключ не задан или
+    отклонён), признак `auth` — 401/403 у ollama-слота, где Bearer не ходит
+    (приёмка 3.2.0, живой прогон 13.10.2026: 401 от провайдера слота
+    summary классифицировался как `off_contract`, разрыв открывался после
+    трёх отказов и с чужой причиной).
     """
-    if isinstance(exc, LLMAuthError):
+    if isinstance(exc, LLMAuthError) or getattr(exc, "auth", False):
         return SlotOutcome.AUTH
     if getattr(exc, "timeout", False):
         return SlotOutcome.TIMEOUT
