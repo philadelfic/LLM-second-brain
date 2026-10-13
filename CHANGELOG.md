@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.2.0] - 2026-10-10
+## [3.2.0] - 2026-10-13
 
 Release 3.2.0 — "Hygiene, contour and slots": the memory becomes accountable. Every change to a note, an area record or an assistant log is versioned with line-level deltas and can be rolled back by the operator; a new area keeps the assistant's own "what I did and why"; the slots learn to distinguish a broken call from a slow thinker and to wait instead of failing; and the text the server injects into the agent is measured, shortened and guarded by a budget.
 

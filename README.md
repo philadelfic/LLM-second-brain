@@ -6,17 +6,19 @@
 
 A self-hosted **long-term memory server** for LLMs running in harnesses
 (primarily Open WebUI). Models get MCP access to a shared knowledge store —
-notes, plus three knowledge areas (skills, terms, facts about the user): they
-can search it (hybrid vector + full-text), read, write, update and delete
-records.
+notes, three knowledge areas (skills, terms, facts about the user) and the
+assistant log: they can search it (hybrid vector + full-text), read, write,
+update and delete records, and follow the version history of what changed.
 
 ## What it is
 
 - **One Docker container**, self-hosted, non-root.
 - **MCP Streamable HTTP** (`/mcp`, natively supported by Open WebUI) with a
   Bearer token.
-- **21 MCP tools**: 8 `memory_*` for notes and namespaces, plus three
-  knowledge areas — 5 `skills_*`, 5 `user_*` and 3 `terms_*`.
+- **31 MCP tools**: 9 `memory_*` for notes, comments and namespaces; 5
+  `skills_*`, 5 `user_*` and 3 `terms_*` for the knowledge areas; 6 `logs_*`
+  for the assistant log; `history_list` / `history_get` for version history;
+  `warnings_list` for the "notes not in their place" job.
 - **Storage**: one SQLite database + `sqlite-vec` (vector search) + FTS5
   (full-text), merged via Reciprocal Rank Fusion; every knowledge area has
   its own tables and indexes, isolated from notes and from each other.
@@ -25,6 +27,32 @@ records.
   **terms** — terminology keyed by (term + context), every sense returned and
   never overwritten; **user** — atomic facts about the user with dedup hints.
   Each area has MCP tools and operator REST mirrors.
+- **Assistant log next to notes** (since v3.2): the assistant's own record of
+  "what I did, when and why" — the changed object and the result, what was
+  checked; its own tables and indexes, its own `logs_*` tools, a compose flag,
+  isolated from note search.
+- **Version history** (since v3.2): every content change to a note, an area
+  record or an assistant log is versioned with line-level deltas for long texts
+  and a full baseline for the first version; the operator reads it over REST
+  (`GET /history/<entity>/<id>`) and can roll back — a rollback writes a NEW
+  version and never rewrites history; the agent gets `history_list` and
+  `history_get`.
+- **Slots that wait instead of failing** (since v3.2): every slot call has a
+  typed outcome (`unavailable` / `auth` / `timeout` / `empty` / `truncated` /
+  `off_contract`); a broken slot opens a break, does one cheap probe per pause
+  and resumes by itself, while its work stays visible as `waiting` instead of
+  burning calls. `decision` is a third slot type: the model answers structured
+  questions instead of generating text, and the product falls back to the
+  generative path on `unavailable` / `unsupported` / `low_confidence`.
+- **Output budget "as much as fits"** (since v3.2): a slot spends the model's
+  context minus the prompt (a reserve plus a protective ceiling) instead of a
+  fixed small cap; `done_reason` / `finish_reason`, thinking tokens and the
+  applied budget land in the journal, and an empty answer is distinguished from
+  a truncated one.
+- **Measured injected text** (since v3.2): one token counter measures and guards
+  everything the server injects into the agent — the instructions core, the tool
+  descriptions and the call weight (`app/services/injection_budget.py`), so the
+  surface cannot grow silently.
 - **Vectorization & summarization** are external LLM calls. Each of the three
   slots (embedding / summary / judge) is configured independently with its own
   provider (`ollama` or an OpenAI-compatible API), base URL, model and optional
@@ -42,9 +70,11 @@ records.
   scheduled maintenance jobs (related-notes recompute, default-namespace
   tidy-up) run on their own intervals; failures never break CRUD (pending
   states + back-off retry).
-- **Observability** (since v3.1): `/health` (no token) reports the running
-  application `version` and `queues` — how many jobs wait in each background
-  queue and how long the oldest has waited.
+- **Observability** (since v3.1, extended in v3.2): `/health` (no token) reports
+  the running application `version`, `queues` (how many jobs wait in each
+  background queue, how long the oldest has waited, and how many need a human),
+  `slots` (the last outcome and the pause of every slot, plus call diagnostics),
+  `decision`, `areas`, `warnings`, `update` and `backups`.
 - **Backups**: periodic online SQLite snapshots with rotation.
 
 ## Why
@@ -52,8 +82,9 @@ records.
 1. **Distributed knowledge with fast access.** Knowledge lives in a separate
    store, not in the system prompt or chat history; the model fetches only what
    is relevant, on demand.
-2. **Token economy.** Instead of a monolithic context — a fixed small overhead
-   for the tool spec (~1200 tokens), a compact skills announce (budget 2000
+2. **Token economy.** Instead of a monolithic context — a measured, guarded
+   overhead for the tool spec (the instructions core 525 tokens, the 31 tool
+   descriptions 2170 tokens), a compact skills announce (budget 2000
    characters, refreshed on every connect) and targeted retrieval of **short
    summaries**, not full texts.
 
