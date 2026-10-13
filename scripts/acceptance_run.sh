@@ -93,7 +93,7 @@ docker run --rm --user root --network lsb-test_default \
   -e LSB_RESTART_CMD="docker restart lsb-test" \
   -e LSB_LOGS_CMD="docker logs --since 2h lsb-test" \
   -e LSB_CONTAINER="lsb-test" \
-  -e LSB_HOST_ROOT="${HOST_ROOT}" \
+  -e LSB_HOST_ROOT="${HOST_ROOT}/test" \
   -e E2E_WAIT_SEC="${LSB_E2E_WAIT_SEC:-120}" \
   llm-second-brain:test python scripts/e2e_release32.py \
   --base-url http://lsb-test:8080 "$@"

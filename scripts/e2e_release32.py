@@ -2193,7 +2193,7 @@ def legacy_e2e_cmd(name: str) -> str:
                 f"--base-url {CFG['base_url']} --db {CFG['db']} "
                 f'--token "$MCP_AUTH_TOKEN"')
     return (f"docker run --rm --network container:{CFG['container']} "
-            f"-v {tree}:/w -v {tree}/test/data-test:/data -w /w "
+            f"-v {tree}:/w -v {tree}/data-test:/data -w /w "
             f'-e MCP_AUTH_TOKEN="$MCP_AUTH_TOKEN" '
             f"{CFG['image']} {CFG['python']} scripts/{name}")
 
