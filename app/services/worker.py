@@ -125,6 +125,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
+import threading
 import time
 
 from app.config import TITLE_MAX_WORDS, Settings
@@ -508,6 +510,13 @@ class BackgroundWorker:
         # (_create_job/_pending_jobs/_mark_job_done звали _ensure_job_table
         # на каждый вызов — 3 раза на работу).
         self._jobs_table_ready = False
+        # Лок ленивой миграции (lsbdef-0013): check-then-act на голом флаге
+        # выше пропускал два потока в ALTER одновременно — петли джоб гоняют
+        # синхронный SQL через `asyncio.to_thread`, а стартовое снятие
+        # внимания (`run`) идёт параллельно им; второй ALTER падал на
+        # `duplicate column name` и ронял итерацию петли. Быстрый выход по
+        # флагу остаётся без лока; сам DDL — под локом.
+        self._jobs_table_lock = threading.Lock()
         # Тестовый крючок (no39-04): сколько раз слот снимал (пытался снять)
         # работу с внимания, по причинам (`probe`/`edit`/`operator`/`startup`).
         # Инвариант «пауза — на слот, счёт — на пару» проверяется тестом «стук
@@ -1490,53 +1499,69 @@ class BackgroundWorker:
         `PRAGMA table_info(worker_jobs)` для живой базы предыдущей версии;
         индекс `idx_worker_jobs_attention` обслуживает выборку «требует
         вмешательства».
+
+        DDL — под локом (lsbdef-0013): два потока (петля через
+        `asyncio.to_thread` + стартовое снятие внимания в `run`) одновременно
+        видели флаг `False` и колонку отсутствующей — второй ALTER падал на
+        `duplicate column name`. Двойная проверка флага внутри лока; ALTER
+        вдобавок терпит `duplicate column name`: лок закрывает только потоки
+        одного процесса, конкурирующий процесс воркера — не он.
         """
         if self._jobs_table_ready:
             return
-        with session(self._settings) as conn:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS worker_jobs ("
-                "  id           INTEGER PRIMARY KEY,"
-                "  slot         TEXT NOT NULL,"
-                "  kind         TEXT NOT NULL,"
-                "  note_id      INTEGER NOT NULL,"
-                "  payload      TEXT,"
-                "  status       TEXT NOT NULL DEFAULT 'pending',"
-                "  created_at   TEXT NOT NULL DEFAULT "
-                "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
-                "  updated_at   TEXT NOT NULL DEFAULT "
-                "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
-                "  attempts     INTEGER NOT NULL DEFAULT 0,"
-                "  last_outcome TEXT,"
-                "  last_error   TEXT,"
-                "  attention_at TEXT"
-                ")"
-            )
-            existing = {
-                row["name"]
-                for row in conn.execute(
-                    "PRAGMA table_info(worker_jobs)"
-                ).fetchall()
-            }
-            for name, ddl in (
-                ("attempts", "INTEGER NOT NULL DEFAULT 0"),
-                ("last_outcome", "TEXT"),
-                ("last_error", "TEXT"),
-                ("attention_at", "TEXT"),
-            ):
-                if name not in existing:
-                    conn.execute(
-                        f"ALTER TABLE worker_jobs ADD COLUMN {name} {ddl}"
-                    )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_worker_jobs_queue "
-                "ON worker_jobs(slot, kind, status, id)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_worker_jobs_attention "
-                "ON worker_jobs(status, attention_at)"
-            )
-        self._jobs_table_ready = True
+        with self._jobs_table_lock:
+            if self._jobs_table_ready:  # другой поток уже отмигрировал
+                return
+            with session(self._settings) as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS worker_jobs ("
+                    "  id           INTEGER PRIMARY KEY,"
+                    "  slot         TEXT NOT NULL,"
+                    "  kind         TEXT NOT NULL,"
+                    "  note_id      INTEGER NOT NULL,"
+                    "  payload      TEXT,"
+                    "  status       TEXT NOT NULL DEFAULT 'pending',"
+                    "  created_at   TEXT NOT NULL DEFAULT "
+                    "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
+                    "  updated_at   TEXT NOT NULL DEFAULT "
+                    "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
+                    "  attempts     INTEGER NOT NULL DEFAULT 0,"
+                    "  last_outcome TEXT,"
+                    "  last_error   TEXT,"
+                    "  attention_at TEXT"
+                    ")"
+                )
+                existing = {
+                    row["name"]
+                    for row in conn.execute(
+                        "PRAGMA table_info(worker_jobs)"
+                    ).fetchall()
+                }
+                for name, ddl in (
+                    ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+                    ("last_outcome", "TEXT"),
+                    ("last_error", "TEXT"),
+                    ("attention_at", "TEXT"),
+                ):
+                    if name not in existing:
+                        try:
+                            conn.execute(
+                                f"ALTER TABLE worker_jobs ADD COLUMN {name} {ddl}"
+                            )
+                        except sqlite3.OperationalError as exc:
+                            # Колонку успел добавить конкурирующий процесс
+                            # (lsbdef-0013): не падаем, миграция продолжается.
+                            if "duplicate column name" not in str(exc):
+                                raise
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_worker_jobs_queue "
+                    "ON worker_jobs(slot, kind, status, id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_worker_jobs_attention "
+                    "ON worker_jobs(status, attention_at)"
+                )
+            self._jobs_table_ready = True
 
     def _purge_done_jobs(self) -> None:
         """Вычистить done-работы старше retention-окна (пул 5, гигиена).
