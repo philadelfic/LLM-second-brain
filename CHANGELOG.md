@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.0] - 2026-10-16
+
+Release 3.3.0 — "Job contour reliability": the first start over a database of a previous version no longer races its own job table into an error, and the behaviour of a queue whose model is unavailable is pinned by a reproducing test instead of being taken on trust.
+
+### Fixed
+
+* **lsbdef-0013** — the lazy migration of the `worker_jobs` table used to race itself on the first start over a database of a previous version: the `_jobs_table_ready` flag was checked without a lock (check-then-act) and nothing guarded the window between `PRAGMA table_info(worker_jobs)` and `ALTER TABLE … ADD COLUMN`, so the `judge` and `nodes` loops both saw a missing column, both ran the ALTER, and the second one failed with `duplicate column name` — the startup attention reset failed with it (found on the production deploy of 3.2.0, 2026-10-13). The whole DDL now runs under a `threading.Lock` with a double-checked flag, and the `ALTER` tolerates `duplicate column name`: the lock covers the threads of one process only, a competing process is not its business. Regression test: two threads — and, separately, two migrators racing the startup attention reset — work on a database without the attention columns at the same moment; no exceptions, the schema comes out complete, the reset goes through.
+
+### Changed
+
+* **A queue behind an unavailable model is verified, not assumed** (№39): with the slot down the work moves to `waiting` (`pending = 0`), nothing is lost and the counters stay honest; when the slot answers, the queue drains. `tests/test_worker_queue_unavailable_models.py` pins both a transient refusal and an auth break, draining in batches (five jobs, a batch of two, at least three loop iterations, then a zero drain). No product code changed — the behaviour was already correct, the release makes it provable.
+* Version bumped to 3.3.0 in `app.__version__` and `pyproject.toml`, so `/health.version` matches the release tag.
+
 ## [3.2.0] - 2026-10-13
 
 Release 3.2.0 — "Hygiene, contour and slots": the memory becomes accountable. Every change to a note, an area record or an assistant log is versioned with line-level deltas and can be rolled back by the operator; a new area keeps the assistant's own "what I did and why"; the slots learn to distinguish a broken call from a slow thinker and to wait instead of failing; and the text the server injects into the agent is measured, shortened and guarded by a budget.
