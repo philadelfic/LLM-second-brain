@@ -8,8 +8,10 @@ check-then-act на голом флаге `_jobs_table_ready` пропускал
 (`job_attention_reset_failed`). Прод-деплой 3.2.0, 2026-10-13.
 
 Миграция под локом + терпимый ALTER: два потока на старой схеме (до 3.2.0,
-без колонок внимания) — ни один не бросает исключений, схема полная,
-стартовое снятие внимания отрабатывает.
+без колонок внимания) — ни один не бросает исключений, схема полная.
+Второй тест — стартовое снятие внимания (`_startup_attention_reset`) само
+соревнуется за миграцию с двумя миграторами: как на проде, где его симптомом
+было `job_attention_reset_failed`.
 """
 
 from __future__ import annotations
@@ -32,6 +34,10 @@ RACE_ROUNDS = 20
 def settings(tmp_path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     monkeypatch.setenv("EMBEDDING_DIM", "8")
+    # Стартовый путь второго теста выключается целиком этой переменной
+    # (app/config.py, `slot_attention_reset_on_start`): фиксируем включённой,
+    # чтобы значение из окружения запуска не отсекло путь молча.
+    monkeypatch.setenv("SLOT_ATTENTION_RESET_ON_START", "true")
     get_settings.cache_clear()
     resolved = get_settings()
     init_db(resolved)
@@ -109,28 +115,84 @@ def test_migration_race_two_threads(settings) -> None:
     assert "idx_worker_jobs_attention" in _indexes(settings)
 
 
-def test_startup_attention_reset_after_race(settings) -> None:
-    """Стартовое снятие внимания на отмигрированной БД не падает.
+def test_startup_attention_reset_races_migration(settings) -> None:
+    """Стартовое снятие внимания соревнуется за миграцию с двумя миграторами.
 
-    Свежая база: отпечатка конфигурации в `meta` нет («сброшен») — сверка
-    снимает внимание (пусто → 0), пишет отпечаток и возвращает число.
+    На проде (3.2.0, 2026-10-13) петли джоб (синхронный SQL через
+    `asyncio.to_thread`) и стартовое снятие внимания (петля `run`) одновременно
+    видели несмигрированную схему — отваливалась и стартовая сверка
+    (`job_attention_reset_failed`). Здесь то же соревнование: три потока на
+    `threading.Barrier(3)` — два мигратора (`_ensure_job_table`) и
+    `_startup_attention_reset`, чей `_reset_attention_for_slot("*", "startup")`
+    сам зовёт `_ensure_job_table` — третий участник гонки. Отпечаток
+    конфигурации удалён перед каждым раундом, чтобы снятие шло по рабочему
+    пути (сверка → снятие → запись отпечатка), а не выходило по совпадению
+    отпечатка.
     """
     worker = BackgroundWorker(settings, _NoopEmbedder())
-    worker._ensure_job_table()
-    with session(settings) as conn, transaction(conn):
-        conn.execute(
-            "DELETE FROM meta WHERE key = ?", (SLOT_CONFIG_META_KEY,)
+    errors: list[BaseException] = []
+    released: list[int] = []
+
+    for _ in range(RACE_ROUNDS):
+        _create_old_schema(settings)
+        worker._jobs_table_ready = False  # все три видят «миграции не было»
+        # без отпечатка сверка уходит в снятие внимания — рабочий путь
+        with session(settings) as conn, transaction(conn):
+            conn.execute(
+                "DELETE FROM meta WHERE key = ?", (SLOT_CONFIG_META_KEY,)
+            )
+
+        barrier = threading.Barrier(3)
+
+        def _migrate() -> None:
+            try:
+                barrier.wait()
+                worker._ensure_job_table()
+            except BaseException as exc:  # noqa: BLE001 — гонку собираем, не роняем
+                errors.append(exc)
+
+        def _startup_reset() -> None:
+            try:
+                barrier.wait()
+                released.append(worker._startup_attention_reset())
+            except BaseException as exc:  # noqa: BLE001 — гонку собираем, не роняем
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_migrate, name=f"migrator-{n}")
+            for n in range(2)
+        ]
+        threads.append(
+            threading.Thread(
+                target=_startup_reset, name="startup-attention-reset"
+            )
         )
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
 
-    released = worker._startup_attention_reset()
-
-    assert isinstance(released, int)
-    assert released == 0
+    assert errors == []  # в т.ч. не случается `job_attention_reset_failed`
+    # рабочий путь исполнился в каждом раунде (не отсечён ни флагом,
+    # ни совпавшим отпечатком) и вернул int без исключения
+    assert worker._attention_resets.get("startup") == RACE_ROUNDS
+    assert all(isinstance(n, int) for n in released)
+    assert len(released) == RACE_ROUNDS
+    # схема полная: 4 колонки внимания (№39) + индекс выборки «требует
+    # вмешательства»
+    assert {
+        "attempts",
+        "last_outcome",
+        "last_error",
+        "attention_at",
+    } <= _columns(settings)
+    assert "idx_worker_jobs_attention" in _indexes(settings)
+    # отпечаток конфигурации записан стартовой сверкой
     with session(settings) as conn:
         row = conn.execute(
             "SELECT value FROM meta WHERE key = ?", (SLOT_CONFIG_META_KEY,)
         ).fetchone()
-    assert row is not None  # отпечаток перезаписан
+    assert row is not None
 
 
 class _NoopEmbedder:
