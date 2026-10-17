@@ -179,8 +179,12 @@ visible in `/health`.
 | `BACKUP_SHIP_TIMEOUT_SEC` | `300` | timeout of the ship command, seconds |
 
 `/health` (no token) also reports `version` and `queues`: for each background
-queue, the number of `pending` jobs and `oldest_pending_sec` — the age of the
-oldest one (`null` when the queue is idle).
+queue — `pending` (jobs the loop can take right now), `waiting` (deferred by a
+broken slot or a missing dependency), `attention` (a subset of `waiting` that
+needs a human) and `oldest_pending_sec` — the age of the oldest job **still
+waiting for execution** (`pending` or `waiting`); it is `null` only when both
+categories are empty, so the wait stays visible while a slot is down
+(release 3.3.1).
 
 ### Namespaces (Phase 10)
 
