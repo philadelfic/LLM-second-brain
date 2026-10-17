@@ -1752,7 +1752,9 @@ class BackgroundWorker:
         может быть взята (decision недоступен, `DECISION_FALLBACK=false` —
         слоты `summary`/`judge` и классификатор `nodes`, no39-05) — петля
         партию не берёт, поэтому вся текущая работа из `pending` уезжает в
-        `waiting` (`pending=0`), а `oldest_pending_sec`/`attention` сохраняются:
+        `waiting` (`pending=0`), а `oldest_pending_sec`/`attention` сохраняются
+        (3.3.1: `queue_snapshot` гасит возраст только при пустых
+        pending+waiting — сохранение теперь фактическое, включая разрыв слота):
         ожидание видно в `/health.queues`, но петля не крутится вхолостую.
         Иначе — снимок нормализуется как есть (возраст и внимание не
         пересчитываются).
@@ -1837,10 +1839,12 @@ class BackgroundWorker:
 
         `pending` — dedup-работы слота judge БЕЗ внимания (берущееся сейчас,
         драйвер `_judge_queue_empty`); `attention` — с вниманием (no39-02),
-        `waiting = attention`: у судьи отложено именно замороженное. Возраст —
-        `now - MIN(created_at)` по берущемуся. При открытом разрыве judge —
-        `_gated_queue_stat`. Таблица создаётся лениво (`_ensure_job_table`),
-        моделей не зовём.
+        `waiting = attention`: у судьи отложено именно замороженное. Возраст
+        (3.3.1, LSBN-S-3) — `now - MIN(created_at)` по ВСЕМ pending джобы
+        (attention-работа тоже ждёт исполнения; иначе attention-only состояние
+        `pending=0, waiting>0` давало бы `null` вопреки определению). При
+        открытом разрыве judge — `_gated_queue_stat`. Таблица создаётся лениво
+        (`_ensure_job_table`), моделей не зовём.
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
@@ -1850,7 +1854,7 @@ class BackgroundWorker:
                 "AS pending, "
                 "COALESCE(SUM(status = 'pending' AND attention_at IS NOT NULL), 0) "
                 "AS attention, "
-                "MAX(CASE WHEN status = 'pending' AND attention_at IS NULL "
+                "MAX(CASE WHEN status = 'pending' "
                 "  THEN CAST(strftime('%s','now') AS INTEGER) - "
                 "  CAST(strftime('%s', created_at) AS INTEGER) END) "
                 "AS oldest_pending_sec "

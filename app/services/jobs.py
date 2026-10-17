@@ -32,7 +32,8 @@ lost wakeup; так `summary`, `judge`, `areas`, `links` и `nodes`
 крутилась бы вхолостую без back-off.
 
 Наблюдаемость очередей (lsb-0014-03, FR-2.2/FR-2.3): очередь описывает сама
-джоба (`JobSpec.queue_stat` — снимок `{"pending", "oldest_pending_sec"}`),
+джоба (`JobSpec.queue_stat` — снимок `{"pending", "oldest_pending_sec"}`,
+возраст — по pending+waiting, 3.3.1),
 каркас лишь собирает объект по реестру и пишет событие `queue_waiting`,
 когда петля уходит в ожидание при непустой своей очереди — «работа есть, но
 она не выполняется» видно в журнале, а не только в `/health`.
@@ -72,9 +73,10 @@ def queue_snapshot(
     Единая форма для всех джоб: `{"pending": int, "oldest_pending_sec":
     int | null, "waiting": int, "attention": int}`. Возраст — секунды,
     посчитанные в SQL (`now - MIN(ts)`), поэтому его отдаёт вызывающая сторона
-    уже числом; `null` — очередь пуста (у неё нет «старейшего» задания).
-    Защита от расхождения часов и неожиданного NULL у непустой очереди —
-    `max(0, ...)`/`null`.
+    уже числом; 3.3.1 (LSBN-S-3): возраст — по pending+waiting (вся работа,
+    ждущая исполнения), `null` — обе категории пусты (или возраст не передан
+    вызывавшей стороной). Защита от расхождения часов и неожиданного NULL у
+    непустой очереди — `max(0, ...)`/`null`.
 
     `waiting`/`attention` — обратно совместимое расширение №39: `pending` —
     работа, которую петля может взять **сейчас**; `waiting` — отложено слотом
@@ -84,7 +86,10 @@ def queue_snapshot(
     нулевые.
     """
     count = int(pending or 0)
-    if count == 0 or oldest_pending_sec is None:
+    # 3.3.1 (LSBN-S-3): при разрыве слота работа переезжает pending → waiting
+    # (возраст тот же) — гасить его только когда ждущая исполнения работа
+    # кончилась совсем (pending == 0 И waiting == 0) или не передана.
+    if (count == 0 and int(waiting or 0) == 0) or oldest_pending_sec is None:
         oldest = None
     else:
         oldest = max(0, int(oldest_pending_sec))
@@ -111,7 +116,8 @@ class JobSpec:
     интервал остаётся страховкой, с ним — перепроверка очереди после
     `clear()`); `idle_hook` — гигиена в idle-ветке (например
     retention `worker_jobs`); `queue_stat` — снимок своей очереди
-    `{"pending": int, "oldest_pending_sec": int | null}` для `/health.queues`;
+    `{"pending": int, "oldest_pending_sec": int | null}` для `/health.queues`
+    (возраст — по pending+waiting, 3.3.1);
     `slot` — LLM-слот джобы (№39, arch §6.2): `embedding`/`summary`/`judge`
     или None (разрыва нет; `nodes` объявляет `summary` — его классификатор
     ходит в слот summary).
