@@ -1862,6 +1862,13 @@ def delete_note_physical(conn: sqlite3.Connection, note_id: int) -> None:
     delete связи НЕ трогает: заметка восстанавливаема — её строки `links`
     живут (arch §3.2).
 
+    История (lsbdef-0014): физическое удаление уносит и версии заметки из
+    `record_versions` — `notes.id` без AUTOINCREMENT переиспользуется, и
+    оставшийся baseline переиспользованного id ронял `record_initial` новой
+    заметки на UNIQUE `(entity, entity_id, version)` → падал `memory_save`.
+    Soft delete историю СОХРАНЯЕТ (заметка в trash восстановима, версии
+    остаются) — не путать.
+
     Идемпотентно и безопасно: отсутствующей заметки нет — каждый DELETE
     просто не матчит ничего; повторный вызов не падает. Вызывается внутри
     открытой транзакции вызывающего (transaction()).
@@ -1877,4 +1884,13 @@ def delete_note_physical(conn: sqlite3.Connection, note_id: int) -> None:
     # в той же транзакции (идемпотентно: повторный вызов просто не матчит).
     conn.execute(
         "DELETE FROM links WHERE note_a = ? OR note_b = ?", (note_id, note_id)
+    )
+    # История заметки (lsbdef-0014): версии уходят вместе с заметкой, в той же
+    # транзакции — иначе освобождённый `notes.id` после переиспользования
+    # наследовал чужой baseline и `memory_save` падал на UNIQUE. Только
+    # ФИЗИЧЕСКОЕ удаление чистит историю; soft delete её сохраняет
+    # (заметка восстановима).
+    conn.execute(
+        "DELETE FROM record_versions WHERE entity = 'note' AND entity_id = ?",
+        (note_id,),
     )
