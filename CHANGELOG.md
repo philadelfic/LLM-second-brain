@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.1] - 2026-10-17
+
+Release 3.3.1 — "Contour hotfix: history and observability": physically deleted notes no longer leave orphan version history that breaks the next writer of a reused id, and the age of the oldest waiting work stays visible exactly when a slot is down.
+
+### Fixed
+
+* **lsbdef-0014** — the hard deletion of a note (TTL cleanup, the `expiration` job) removed it from `notes`, chunks, vectors, FTS and links but not from `record_versions`; `notes.id` is not `AUTOINCREMENT`, so the freed id was reused by the next note and `record_initial` failed with `UNIQUE constraint failed: record_versions(entity, entity_id, version)` — `memory_save` stayed broken until the orphan rows were removed by hand (test contour, 2026-10-15). `delete_note_physical` now purges the note's history rows in the same transaction; a soft delete keeps them (a trashed note is restorable). Regression test: a hard delete leaves no history rows, a reused id survives save and update over the full `NoteService` path, and the deleted note's history does not resurrect.
+
+### Changed
+
+* **`oldest_pending_sec` covers `waiting`** (LSBN-S-3): the age of the oldest work waiting for execution is computed over `pending` OR `waiting` and is `null` only when both categories are empty. With a slot breaker open the whole queue moves to `waiting` (`pending = 0`) and the age used to disappear exactly in the state it exists for (the 3.3.0 caveat is lifted). The judge queue's age now includes attention-frozen jobs as well, so an attention-only queue reads an age instead of `null`. An empty queue still reads `null` — the snapshot never invents an age.
+* Version bumped to 3.3.1 in `app.__version__` and `pyproject.toml`, so `/health.version` matches the release tag.
+* **Parallel unit suite** (T-1, decision of О. 2026-10-17): `pytest-xdist` joins the dev dependencies and the full suite runs with `pytest -n auto` — 2147 tests drop from ~150 s serial to ~28–30 s on 12 workers, the passed/skip set verified identical to the serial run three times over (dev and inside the acceptance image). The only parallelization hazard found was fixed: the session fixtures of `test_mcp.py`/`test_logging.py` held fixed server ports (18765–18767) and collided across workers — ports are now allocated per `PYTEST_XDIST_WORKER`; outside xdist nothing changes. The serial run stays the default; switching the default over is a later call.
+
 ## [3.3.0] - 2026-10-16
 
 Release 3.3.0 — "Job contour reliability": the first start over a database of a previous version no longer races its own job table into an error, and the behaviour of a queue whose model is unavailable is pinned by a reproducing test instead of being taken on trust.

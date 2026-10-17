@@ -4,6 +4,10 @@
 `queue_snapshot(n, age)` остаётся валидным, а снимок несёт ещё `waiting`
 (отложено слотом/готовностью) и `attention` (подмножество `waiting`, ждущее
 человека). Пустая очередь — нули и `oldest_pending_sec=None`.
+
+3.3.1 (LSBN-S-3): возраст — по pending+waiting (вся работа, ждущая
+исполнения) — при разрыве слота работа переезжает pending → waiting, и
+возраст больше не гаснет; null — только когда обе категории пусты.
 """
 
 from __future__ import annotations
@@ -45,4 +49,35 @@ def test_snapshot_passes_counters() -> None:
         "oldest_pending_sec": None,
         "waiting": 2,
         "attention": 1,
+    }
+
+
+def test_snapshot_age_survives_waiting_only_queue() -> None:
+    """Суть фикса 3.3.1 (LSBN-S-3): pending=0, waiting>0 — возраст сохранён.
+
+    При разрыве слота работа переезжает pending → waiting (возраст тот же),
+    поэтому гасить его при пустом pending — ложное «очередь пуста»: возраст
+    гаснет, только когда ждущая исполнения работа кончилась совсем.
+    """
+    assert queue_snapshot(0, 42, waiting=3) == {
+        "pending": 0,
+        "oldest_pending_sec": 42,
+        "waiting": 3,
+        "attention": 0,
+    }
+
+
+def test_snapshot_age_hidden_only_when_both_empty() -> None:
+    """Старые вызовы без waiting ведут себя как раньше (регресс).
+
+    `queue_snapshot(0, age)` → null (обе категории пусты); `queue_snapshot(5,
+    age)` → возраст (непустой pending сохраняет его, как и до 3.3.1).
+    """
+    assert queue_snapshot(0, 42)["oldest_pending_sec"] is None
+    assert queue_snapshot(None, 42)["oldest_pending_sec"] is None
+    assert queue_snapshot(5, 42) == {
+        "pending": 5,
+        "oldest_pending_sec": 42,
+        "waiting": 0,
+        "attention": 0,
     }
