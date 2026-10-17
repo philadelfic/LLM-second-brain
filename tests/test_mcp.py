@@ -39,9 +39,17 @@ from app.transport.mcp import (
 from tests.conftest import TEST_ENV
 
 TOKEN = TEST_ENV["MCP_AUTH_TOKEN"]
-SERVER_PORT = 18765
-CUSTOM_PORT = 18766
-NS_PORT = 18767
+# Порты — уникальные на xdist-воркера (PYTEST_XDIST_WORKER = "gw<N>"; вне xdist
+# переменной нет → индекс 0, порты прежние). Session-фикстуры ниже под xdist
+# живут per-worker: фиксированные порты сталкивались между воркерами (тесты
+# коннектились к чужому серверу/БД). Шаг 4 = 3 порта этого файла + 1 слот
+# module-фикстуре test_logging.py, чтобы и между файлами порты не пересекались.
+_XDIST_WORKER = os.environ.get("PYTEST_XDIST_WORKER", "")
+_WORKER_INDEX = int(_XDIST_WORKER[2:]) if _XDIST_WORKER else 0
+PORT_STRIDE = 4
+SERVER_PORT = 18765 + PORT_STRIDE * _WORKER_INDEX
+CUSTOM_PORT = 18766 + PORT_STRIDE * _WORKER_INDEX
+NS_PORT = 18767 + PORT_STRIDE * _WORKER_INDEX
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
