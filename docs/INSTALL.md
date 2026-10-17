@@ -62,17 +62,22 @@ curl -s http://localhost:8080/health | python -m json.tool
 ```json
 {"status":"ok","version":"<app version>","embedding_ok":null,"summarizer_ok":null,"judge_ok":null,
  "notes_count":0,"pending_vector":0,"pending_summary":0,
- "queues":{"vector":{"pending":0,"oldest_pending_sec":null},
-           "summary":{"pending":0,"oldest_pending_sec":null},
-           "judge":{"pending":0,"oldest_pending_sec":null},
-           "areas":{"pending":0,"oldest_pending_sec":null},
-           "links":{"pending":0,"oldest_pending_sec":null},
-           "nodes":{"pending":0,"oldest_pending_sec":null}}}
+ "queues":{"vector":{"pending":0,"oldest_pending_sec":null,"waiting":0,"attention":0},
+           "summary":{"pending":0,"oldest_pending_sec":null,"waiting":0,"attention":0},
+           "judge":{"pending":0,"oldest_pending_sec":null,"waiting":0,"attention":0},
+           "areas":{"pending":0,"oldest_pending_sec":null,"waiting":0,"attention":0},
+           "links":{"pending":0,"oldest_pending_sec":null,"waiting":0,"attention":0},
+           "nodes":{"pending":0,"oldest_pending_sec":null,"waiting":0,"attention":0}}}
 ```
 
 `version` is the running application version (compared with the release tag at
-acceptance). `queues` gives one entry per background queue — `pending` jobs and
-`oldest_pending_sec`, the age of the oldest (`null` when the queue is idle).
+acceptance). `queues` gives one entry per background queue: `pending` — jobs the
+loop can take right now; `waiting` — deferred by a broken slot or a missing
+dependency; `attention` — a subset of `waiting` that needs a human; and
+`oldest_pending_sec` — the age of the oldest job **still waiting for execution**
+(`pending` or `waiting`). It is `null` only when both categories are empty, so
+the wait stays visible while a slot is down (release 3.3.1) — zeroes in `pending`
+do not mean "there is no work" (release 3.3.0).
 
 `embedding_ok` / `summarizer_ok` / `judge_ok` reflect the outcome of the last
 real attempt (`null` — none yet). On startup the service runs a lightweight
