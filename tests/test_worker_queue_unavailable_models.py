@@ -36,6 +36,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from fakes import FailingEmbedder, FixedSummarizer, HashEmbedder, RecordingDedup, fake_meta
 
@@ -92,6 +94,24 @@ def _freeze(monkeypatch, start: float = 1000.0) -> dict:
     clock = {"t": start}
     monkeypatch.setattr("app.services.slot_breaker.time.time", lambda: clock["t"])
     return clock
+
+
+def _backdate_judge_jobs(settings, seconds_ago: int) -> None:
+    """Удревнить judge-работы (паттерн `_backdate` из test_worker_queues).
+
+    Работы создаются только что — их возраст в снимке очереди 0 с; проверке
+    «возраст старейшей ждущей работы > 0» (3.3.1, LSBN-S-3) нужна
+    детерминированная ненулевая старость.
+    """
+    moment = (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    with session(settings) as conn, transaction(conn):
+        conn.execute(
+            "UPDATE worker_jobs SET created_at = ?, updated_at = ? "
+            "WHERE slot = 'judge' AND kind = 'dedup'",
+            (moment, moment),
+        )
 
 
 def _worker_with_five_judge_jobs(settings, judge: FlakyJudge) -> BackgroundWorker:
@@ -197,6 +217,7 @@ async def test_auth_outage_breaker_waits_then_probe_drains(
     clock = _freeze(monkeypatch)
     judge = FlakyJudge(fail_outcome=SlotOutcome.AUTH)
     worker = _worker_with_five_judge_jobs(settings, judge)
+    _backdate_judge_jobs(settings, 120)  # старейшая работа — 120 с (детерминизм возраста)
 
     # --- отказ доступа: разрыв открывается сразу, партия не берётся ---------
     assert await worker._process_judge() == 0
@@ -219,11 +240,12 @@ async def test_auth_outage_breaker_waits_then_probe_drains(
     assert stat["pending"] == 0
     assert stat["waiting"] == 5
     assert stat["attention"] == 0
-    # Оговорка №1 отчёта T2-no39: в состоянии разрыва возраст ожидания НЕ
-    # виден — `queue_snapshot` гасит `oldest_pending_sec` при pending=0
-    # (docstring `_gated_queue_stat` обещает «сохраняются»). Фиксируем
-    # фактическое поведение: null при непустом waiting.
-    assert stat["oldest_pending_sec"] is None
+    # Возраст ожидания в разрыве слота ВИДЕН (3.3.1, LSBN-S-3): оговорка №1
+    # отчёта T2-no39 («в состоянии разрыва возраст НЕ виден») снята релизом
+    # 3.3.1 — `queue_snapshot` гасит `oldest_pending_sec` только при пустых
+    # pending+waiting, а работа в разрыве живёт в waiting (возраст тот же).
+    assert isinstance(stat["oldest_pending_sec"], int)
+    assert stat["oldest_pending_sec"] > 0
     assert worker.slots_health()["judge"]["state"] == "paused"
 
     # --- пауза истекла: стук снимает разрыв — дренаж партиями по батчу 2 ----
