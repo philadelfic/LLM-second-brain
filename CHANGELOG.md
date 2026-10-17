@@ -17,6 +17,7 @@ Release 3.3.1 — "Contour hotfix: history and observability": physically delete
 
 * **`oldest_pending_sec` covers `waiting`** (LSBN-S-3): the age of the oldest work waiting for execution is computed over `pending` OR `waiting` and is `null` only when both categories are empty. With a slot breaker open the whole queue moves to `waiting` (`pending = 0`) and the age used to disappear exactly in the state it exists for (the 3.3.0 caveat is lifted). The judge queue's age now includes attention-frozen jobs as well, so an attention-only queue reads an age instead of `null`. An empty queue still reads `null` — the snapshot never invents an age.
 * Version bumped to 3.3.1 in `app.__version__` and `pyproject.toml`, so `/health.version` matches the release tag.
+* **Parallel unit suite** (T-1, decision of О. 2026-10-17): `pytest-xdist` joins the dev dependencies and the full suite runs with `pytest -n auto` — 2147 tests drop from ~150 s serial to ~28–30 s on 12 workers, the passed/skip set verified identical to the serial run three times over (dev and inside the acceptance image). The only parallelization hazard found was fixed: the session fixtures of `test_mcp.py`/`test_logging.py` held fixed server ports (18765–18767) and collided across workers — ports are now allocated per `PYTEST_XDIST_WORKER`; outside xdist nothing changes. The serial run stays the default; switching the default over is a later call.
 
 ## [3.3.0] - 2026-10-16
 
