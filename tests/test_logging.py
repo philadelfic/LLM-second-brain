@@ -41,7 +41,12 @@ from app.observability import (
 )
 from tests.conftest import TEST_ENV
 
-LOG_SERVER_PORT = 18767
+# Порт — уникальный на xdist-воркера (PYTEST_XDIST_WORKER = "gw<N>"; вне xdist
+# индекс 0 → 18768). Module-фикстура ниже поднимает живой сервер: под xdist она
+# может быть активна одновременно с session-фикстурами test_mcp.py другого
+# воркера, раньше порт 18767 у них был общий. Шаг 4 согласован с test_mcp.py.
+_XDIST_WORKER = os.environ.get("PYTEST_XDIST_WORKER", "")
+LOG_SERVER_PORT = 18768 + 4 * (int(_XDIST_WORKER[2:]) if _XDIST_WORKER else 0)
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Уникальные подстроки, которые НИ В КОЕМ случае не должны появиться в логах.
