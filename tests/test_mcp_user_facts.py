@@ -46,11 +46,12 @@ DIM = 64
 
 CANON_TOOL_DESCRIPTIONS = {
     "user_search": (
-        "Search the user area: atomic facts about the user (steady preferences, "
+        "Search the user area: atomic facts about the user (tastes and "
+        "preferences, hobbies, monthly spending and subscriptions with amounts, "
         "working habits, agreements — ONE FACT PER RECORD, never a list). Returns "
-        "{id, name, excerpt}; the full body — via `user_get`. Search here when the "
-        "answer depends on the user's preferences or arrangements; do not invent "
-        "what might be stored — search first."
+        "{id, name, excerpt}; the full body — via `user_get`. Questions about the "
+        "person himself — likes, money, habits — start here, before notes or chat "
+        "history: do not invent what might be stored."
     ),
     "user_save": (
         "Save ONE atomic durable fact about the user: a short name plus a compact "
