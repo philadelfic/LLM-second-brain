@@ -25,7 +25,6 @@ from app.services.notes import (
     NoteService,
     NoteValidationError,
 )
-from app.services.summary import MERGE_TRUNCATION_MARKER
 from app.storage.db import init_db, session
 from app.transport.mcp import SERVER_INSTRUCTIONS, TOOL_DESCRIPTIONS
 
@@ -133,7 +132,11 @@ class TestVisibility:
         assert f"{NOTE_TEXT_LIMIT} characters" in SERVER_INSTRUCTIONS
         assert "several self-contained notes" in SERVER_INSTRUCTIONS
 
-    def test_merge_marker_declares_limit(self) -> None:
-        assert MERGE_TRUNCATION_MARKER.format(limit=NOTE_TEXT_LIMIT).startswith(
-            "\n\n[truncated:"
-        )
+    def test_merge_truncation_marker_gone(self) -> None:
+        """F-23 заменил временный маркер усечения S-1 списком частей:
+        усечённого слияния больше не существует — неполное слияние не
+        сохраняется вовсе (дозапрос → откладывание пары, пп. 2/6 F-23)."""
+        import app.services.summary as summary_module
+
+        assert not hasattr(summary_module, "MERGE_TRUNCATION_MARKER")
+        assert summary_module.MERGE_MAX_ROUNDS == 2
