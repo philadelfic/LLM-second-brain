@@ -78,7 +78,7 @@ MAX_NOTE_CHARS (не MAX_SUMMARY_CHARS), чтобы он всегда прохо
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -215,18 +215,30 @@ class SummaryService:
         | Callable[[httpx.Request], httpx.Response]
         | None = None,
         *,
-        llm: LLMClient | None = None,
+        llm: LLMClient | Mapping[str, LLMClient] | None = None,
         registry: PromptRegistry | None = None,
     ) -> None:
         self._settings = settings
         self._prompts = registry if registry is not None else PromptRegistry()
-        # DI сборки (общий клиент слота summary) или свой клиент с
-        # transport-инъекцией для юнит-тестов (MockTransport).
-        self._llm = (
-            llm
-            if llm is not None
-            else LLMClient(SlotSpec.for_summary(settings), transport=transport)
-        )
+        # Клиенты ПО ОПЕРАЦИЯМ (LSBN-F-34): плоский env SUMMARIZE_/TITLE_/MERGE_*
+        # переопределяет модель/провайдера/адрес/ключ/таймаут/бюджет одного
+        # процесса поверх слота summary; без переопределения specs одинаковы
+        # (сборка делит один клиент). DI: один клиент (прочие интерфейсы) —
+        # для всех операций; отображение — для точечных подмен тестами.
+        if llm is None:
+            self._llms: dict[str, LLMClient] = {
+                operation: LLMClient(
+                    SlotSpec.for_operation(operation, settings)[0],
+                    transport=transport,
+                )
+                for operation in ("summarize", "title", "merge")
+            }
+        elif isinstance(llm, Mapping):
+            self._llms = dict(llm)
+        else:
+            self._llms = {"summarize": llm, "title": llm, "merge": llm}
+        # Основной клиент (summarize) — прежнее поле DI-сборок и тестов.
+        self._llm = self._llms["summarize"]
         # None — попыток не было (health не врёт до первых данных).
         self.last_attempt_ok: bool | None = None
         # Метаданные последнего вызова (№49/№50): диагностика в /health.slots
@@ -241,13 +253,8 @@ class SummaryService:
             # max_chars = None: транспорт отдаёт content модели как есть (без
             # обрезки) — жёсткий лимит саммари применяется в точке сохранения
             # (воркер, cap_summary), merge режется сам — max_note_chars.
-            # num_predict 0/None — авто-бюджет (№49): «сколько влезет».
-            result = self._chat(
-                self._prompts.summary_system,
-                text,
-                operation="summary",
-                num_predict=self._settings.summary_num_predict or None,
-            )
+            # Бюджет — цепочка операции (SUMMARIZE_NUM_PREDICT → слот → авто).
+            result = self._chat(self._prompts.summary_system, text, operation="summarize")
         except SummaryError:
             self.last_attempt_ok = False  # деградация станет видна в /health
             raise
@@ -263,12 +270,7 @@ class SummaryService:
         if not text or not text.strip():
             raise ValueError("title: пустой текст заметки")
         try:
-            result = self._chat(
-                TITLE_PROMPT,
-                text,
-                operation="title",
-                num_predict=self._settings.summary_num_predict or None,
-            )
+            result = self._chat(TITLE_PROMPT, text, operation="title")
         except SummaryError:
             self.last_attempt_ok = False  # деградация станет видна в /health
             raise
@@ -284,6 +286,8 @@ class SummaryService:
         портить обе заметки (NFR-3) — воркер ловит SummaryError и
         повторяет по back-off. Лимит результата — MAX_NOTE_CHARS: это
         будущий ТЕКСТ заметки (CHECK(length(text) ...)), а не суммари.
+        Бюджет — MERGE_NUM_PREDICT (0 = авто; историческое поле поглощено
+        цепочкой операции merge, поведение прежнее).
         """
         if not text_a or not text_a.strip() or not text_b or not text_b.strip():
             raise ValueError("merge: пустая заметка недопустима")
@@ -292,7 +296,6 @@ class SummaryService:
                 self._prompts.summary_merge_system,
                 self._prompts.merge_user.format(text_a=text_a, text_b=text_b),
                 operation="merge",
-                num_predict=self._settings.merge_num_predict or None,
                 max_chars=self._settings.max_note_chars,
             )
         except SummaryError:
@@ -302,8 +305,12 @@ class SummaryService:
         return SummaryResult(text=result.content, meta=result.meta)
 
     def close(self) -> None:
-        """Закрыть HTTP-пул (чистое завершение процесса)."""
-        self._llm.close()
+        """Закрыть HTTP-пулы клиентов операций (без дублей по объекту)."""
+        closed: list[int] = []
+        for client in self._llms.values():
+            if id(client) not in closed:
+                client.close()
+                closed.append(id(client))
 
     def probe(self) -> str:
         """Дешёвый пробный стук слота summary (№39, arch §6.4): `check()`
@@ -318,23 +325,21 @@ class SummaryService:
         user_text: str,
         *,
         operation: str,
-        num_predict: int | None,
         max_chars: int | None = None,
     ) -> ChatResult:
-        """Один вызов chat слота summary (без ретраев — повтор решает воркер).
+        """Один вызов chat КЛИЕНТОМ ОПЕРАЦИИ (без ретраев — повтор решает воркер).
 
-        system_prompt/user_text — различия summarize/merge; num_predict —
-        раздельный потолок (решение О. 2026-08-30): выжимка/title —
-        SUMMARY_NUM_PREDICT, слияние дублей — MERGE_NUM_PREDICT (текст
-        может быть значительно длиннее выжимки); None — авто-бюджет
-        «сколько влезет» (№49). think — флаг слота (SUMMARY_THINK);
-        keep_alive не отправляется (решение №6).
+        system_prompt/user_text — различия summarize/merge; клиент выбирается
+        по реестру операций (LSBN-F-34): его spec уже несёт эффективную
+        цепочку env операции → env слота → дефолт, включая потолок вывода
+        (`SUMMARIZE_/TITLE_/MERGE_NUM_PREDICT`; None — авто-бюджет «сколько
+        влезет», №49). think — флаг spec; keep_alive не отправляется
+        (решение №6).
         """
         try:
-            result = self._llm.chat_result(
+            result = self._llms[operation].chat_result(
                 system_prompt,
                 user_text,
-                num_predict=num_predict,
                 operation=operation,
             )
         except LLMError as exc:
