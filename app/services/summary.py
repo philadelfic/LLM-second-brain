@@ -24,16 +24,15 @@ pending_summary, а с Фазы 8 Этапа 2.2 — и петля слияни�
 синхронного пути записи — save/update не блокируются (REQUIREMENTS §5.5,
 NFR-5: тёплый вызов с reasoning — секунды).
 
-`merge(text_a, text_b)` (Фаза 8, Этап 2.2 — вариант B дедупа): пара
-дубликатов не выбрасывается, а **сливается** — оба текста уходят одним
-вызовом с merge-промптом «объедини два текста в один, сохрани все факты/
-имена/числа/даты», результат заменяет текст ранней заметки, поздняя
-уходит в trash. Слот, параметры и SUMMARY_*-env — те же, что у
-`summarize`; отличаются системный промпт, состав user-сообщения и
-страховка длины: результат — **текст заметки**, держится в мягком лимите
-NOTE_TEXT_LIMIT (1500, LSBN-S-1), чтобы он всегда проходил валидацию
-`NoteService.merge_pair`; механика среза прежняя, но усечение НЕ молча —
-хвост несёт `MERGE_TRUNCATION_MARKER` (правило F-23 до её постановки).
+`merge(text_a, text_b)` (Фаза 8, Этап 2.2 — вариант B дедупа; контракт
+LSBN-F-23): пара дубликатов не выбрасывается, а **сливается** — оба текста
+уходят одним вызовом с merge-промптом, ответ — **список самодостаточных
+частей** (JSON `{"parts": [{"title", "text"}, ...]}`), у каждой части свой
+title (≤5 слов) и текст ≤ NOTE_TEXT_LIMIT (1500, LSBN-S-1). Полнота
+(сумма частей покрывает исходники по нормализованному тексту) и лимиты
+проверяются кодом: часть длиннее лимита или неполный ответ — ОДИН дозапрос
+в том же контексте, максимум 2 раунда; не сошлось —
+`MergeIncompleteError`, пара откладывается воркером (обе заметки живы).
 Вызывает только воркер (сведение
 дедупа) — синхронный путь записи не блокируется.
 
@@ -59,8 +58,8 @@ NOTE_TEXT_LIMIT (1500, LSBN-S-1), чтобы он всегда проходил 
   гарантирует сам `LLMClient.chat`; символьный лимит саммари держат
   двое: промпт (≤ 150 символов) и код — `cap_summary` в точке сохранения
   (воркер) усекает ответ модели по границе слова с многоточием;
-  страховка merge остаётся своей — её результат обязан пройти мягкий лимит
-  NOTE_TEXT_LIMIT (1500) валидации merge_pair; жёсткий CHECK
+  страховка merge остаётся своей: части обязаны пройти проверки лимита и
+  полноты (`_incomplete_reason`) до отдачи результата воркеру; жёсткий CHECK
   (MAX_NOTE_CHARS=35000) при этом не меняется.
 - Отказ — `SummaryError`, и только она: текст ошибки клиента (включая
   HTTP-статус и hint про {SLOT}_API_KEY у auth-отказа, решение №4)
@@ -80,27 +79,58 @@ NOTE_TEXT_LIMIT (1500, LSBN-S-1), чтобы он всегда проходил 
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from typing import Protocol
+from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 import httpx
 
-from app.config import Settings
+from app.config import TITLE_MAX_WORDS, Settings
 from app.services.llm_client import ChatMeta, ChatResult, LLMClient, LLMError, SlotSpec
 from app.services.notes import NOTE_TEXT_LIMIT
 from app.services.prompts import PromptRegistry
 from app.services.slot_outcome import SlotOutcome, classify_llm_error
 
-#: Явный признак усечения слияния (LSBN-S-1): до постановки F-23 результат
-#: merge режется прежней механикой (срез), но НЕ молча — в хвост текста
-#: пишется маркер с лимитом. Маркер входит в лимит: итог всегда
-#: ≤ NOTE_TEXT_LIMIT, иначе merge_pair отклонит текст валидацией.
-MERGE_TRUNCATION_MARKER = (
-    "\n\n[truncated: merge result exceeded the {limit}-character note "
-    "limit — the tail was cut; full pre-merge texts remain in history]"
-)
+# --- контракт слияния (LSBN-F-23) -------------------------------------------
+#
+#: Максимум раундов слияния: основной вызов + ОДИН дозапрос с историей.
+MERGE_MAX_ROUNDS = 2
+#: Требуемая доля значимых токенов исходников в нормализованном тексте
+#: частей (проверка полноты, п. 4 постановки): «сумма частей покрывает
+#: слитый текст; не покрывает — не сохраняем, идём в дозапрос» — контракт
+#: СТРОГИЙ, полное покрытие после нормализации (решение пилота 2026-10-26;
+#: порог 0.9 осиротевшего захода — баг, не канон). Нормализация снимает
+#: шум формы: регистр, пунктуацию и деление составных слов, — поэтому
+#: допуск не нужен; «не хватает» значимого токена = потеря факта/имени/
+#: числа (молчаливое обрезание запрещено).
+MERGE_COVERAGE_MIN = 1.0
+
+
+@dataclass(frozen=True)
+class MergePart:
+    """Одна самодостаточная часть слияния: свой title (≤5 слов) и текст,
+    укладывающийся в мягкий лимит заметки NOTE_TEXT_LIMIT (LSBN-S-1)."""
+
+    title: str
+    text: str
+
+
+@dataclass(frozen=True)
+class MergeResult:
+    """Результат слияния списком частей + метаданные вызовов (для журнала).
+
+    `parts` — части ответа модели; `meta` — вызов ПОСЛЕДНЕГО раунда (в
+    `/health.last_meta` идёт он), `metas` — все состоявшиеся вызовы по
+    раундам (журнал джоб пишет `slot_call` на каждый); `rounds` — сколько
+    раундов вышло фактически (1 — дозапрос не понадобился).
+    """
+
+    parts: list[MergePart]
+    meta: ChatMeta
+    metas: list[ChatMeta] = field(default_factory=list)
+    rounds: int = 1
 
 
 class SummaryError(RuntimeError):
@@ -126,9 +156,97 @@ class SummaryError(RuntimeError):
         self.meta = meta
 
 
+class MergeIncompleteError(SummaryError):
+    """Слияние не сошлось за MERGE_MAX_ROUNDS раундов (LSBN-F-23, п. 6).
+
+    Отличается от транзиентного `SummaryError` (тот повторяется по back-off):
+    исходники не менялись — повтор даст те же два раунда, поэтому пара
+    ОТКЛАДЫВАЕТСЯ: воркер снимает merge-работу, оставляет обе заметки живыми,
+    пишет событие в журнал джоб и запись в `warnings`. «Молчаливое
+    обрезание» запрещено — несохранение лучше потери текста.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        metas: list[ChatMeta] | None = None,
+        rounds: int = MERGE_MAX_ROUNDS,
+    ) -> None:
+        last = metas[-1] if metas else None
+        super().__init__(message, outcome=SlotOutcome.OFF_CONTRACT, meta=last)
+        self.metas = list(metas or [])
+        self.rounds = rounds
+
+
 # Многоточие усечённого саммари: один символ — бюджет лимита тратится на текст
 # (U+2026; «...» съел бы три символа из тех же 150).
 _ELLIPSIS = "…"
+
+
+def merge_coverage(source: str, parts: list[str]) -> float:
+    """Доля значимых токенов исходников, найденных в тексте частей (F-23, п. 4).
+
+    Нормализация ОБЕИХ сторон одинаковая: casefold + разбор на
+    алфавитно-цифровые прогоны ≥3 символов (тот же класс знаков, что у
+    канонных значимых токенов поиска: «open-webui» → «open», «webui»;
+    пунктуация и регистр шумом формы не считаются — «домой.» и «домой;»
+    это один токен). Проверка — вхождение КАЖДОГО токена исходника в
+    объединённый текст частей: связный пересказ легитимно меняет порядок
+    и служебные слова, терять факты/имена/числа — нет. Источник без
+    значимых токенов (вырожденный случай) считаем покрытым. Порог —
+    MERGE_COVERAGE_MIN (1.0, строгое покрытие: не хватает токена = потерян
+    факт; дозапрос, затем откладывание пары — пп. 2/4/6 постановки).
+    """
+    source_tokens = _significant_normalized(source)
+    if not source_tokens:
+        return 1.0
+    parts_tokens = _significant_normalized(" ".join(parts))
+    return len(source_tokens & parts_tokens) / len(source_tokens)
+
+
+#: Класс знаков значимого токена — как в ranking._TOKEN_SPLIT_RE (слова и
+#: части составных на кириллице/латинице/цифрах).
+_TOKEN_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
+
+
+def _significant_normalized(text: str) -> set[str]:
+    """Значимые токены нормализованного текста: алфавитно-цифровые прогоны
+    ≥3 символов casefold-текста, без дублей (нормализация merge_coverage)."""
+    return {
+        token
+        for token in _TOKEN_RE.findall(text.casefold())
+        if len(token) >= 3
+    }
+
+
+def _parse_merge_parts(content: str) -> list[MergePart]:
+    """Разобрать JSON-ответ слияния в список частей (F-23, п. 1).
+
+    Контракт: ровно один JSON-объект ``{"parts": [{"title", "text"}, ...]}``.
+    Нарушения (не-JSON, «parts» не список/пуст, у части нет title или
+    текста) — `SummaryError` OFF_CONTRACT: ответ вне контракта целиком,
+    повтор решает back-off воркера, не дозапрос. Title длиннее TITLE_MAX_WORDS
+    слов НЕ отклоняет часть — срезается до лимита (прецедент title-догена:
+    обрезку делает код, воркер валидирует на записи).
+    """
+    data = SummaryService._extract_json(content)
+    raw_parts = data.get("parts") if isinstance(data, dict) else None
+    if not isinstance(raw_parts, list) or not raw_parts:
+        raise SummaryError("merge: в ответе модели нет списка частей")
+    parts: list[MergePart] = []
+    for item in raw_parts:
+        if not isinstance(item, dict):
+            raise SummaryError("merge: часть ответа не объект JSON")
+        title = str(item.get("title") or "").strip()
+        text = str(item.get("text") or "").strip()
+        if not title or not text:
+            raise SummaryError("merge: у части нет title или текста")
+        words = title.split()
+        if len(words) > TITLE_MAX_WORDS:
+            title = " ".join(words[:TITLE_MAX_WORDS])
+        parts.append(MergePart(title=title, text=text))
+    return parts
 
 
 def cap_summary(text: str, limit: int) -> str:
@@ -203,8 +321,9 @@ class Summarizer(Protocol):
         TITLE_PROMPT, обрезку делает воркер)."""
         ...
 
-    def merge(self, text_a: str, text_b: str) -> SummaryResult:
-        """Объединить пару текстов-дубликатов в один (дедуп, Этап 2.2)."""
+    def merge(self, text_a: str, text_b: str) -> MergeResult:
+        """Слить пару текстов-дубликатов в список самодостаточных частей
+        (дедуп, Этап 2.2; LSBN-F-23)."""
         ...
 
     def probe(self) -> str:
@@ -290,39 +409,129 @@ class SummaryService:
         self.last_attempt_ok = True
         return SummaryResult(text=result.content, meta=result.meta)
 
-    def merge(self, text_a: str, text_b: str) -> SummaryResult:
-        """Слить два текста-дубликата в один; любой отказ — SummaryError.
+    def merge(self, text_a: str, text_b: str) -> MergeResult:
+        """Слить два текста-дубликата в список самодостаточных частей.
 
-        Вариант B дедупа (Фаза 8, Этап 2.2): модель объединяет тексты
-        «ранней + поздней» заметки; результат уйдёт в merge_pair (обновление
-        ранней), поздняя будет soft-deleted. Отказ суммаризатора не должен
-        портить обе заметки (NFR-3) — воркер ловит SummaryError и
-        повторяет по back-off. Лимит результата — мягкий лимит заметки
-        NOTE_TEXT_LIMIT (1500, LSBN-S-1): это будущий ТЕКСТ заметки, а не
-        суммари; механика среза прежняя, но усечение помечается явным
-        маркером (до постановки F-23). Бюджет — MERGE_NUM_PREDICT
-        (0 = авто; историческое поле поглощено цепочкой операции merge,
-        поведение прежнее).
+        LSBN-F-23: результат — не строка, а СПИСОК частей, у каждой свой
+        title (≤5 слов) и текст ≤ мягкого лимита заметки NOTE_TEXT_LIMIT
+        (1500, LSBN-S-1). Ответ модели — структурированный JSON
+        ``{"parts": [{"title", "text"}, ...]}`` (канон реестра промптов).
+
+        Проверки перед отдачей результата (постановка, пп. 1/4):
+        - каждая часть ≤ NOTE_TEXT_LIMIT;
+        - полнота: сумма частей покрывает исходники по нормализованному
+          тексту (`merge_coverage` ≥ MERGE_COVERAGE_MIN). Молчаливое
+          обрезание запрещено.
+
+        Не сошлось — ОДИН дозапрос в том же контексте (п. 2): исходники →
+        первый ответ → «часть N слишком длинная / ответ неполный». Максимум
+        MERGE_MAX_ROUNDS раундов; не помогло — `MergeIncompleteError`
+        (пара откладывается воркером, обе заметки живы). Транзиентные отказы
+        транспорта/структуры — `SummaryError` (повтор по back-off, NFR-3).
+        Бюджет — MERGE_NUM_PREDICT (0 = авто; цепочка операции merge).
         """
         if not text_a or not text_a.strip() or not text_b or not text_b.strip():
             raise ValueError("merge: пустая заметка недопустима")
         try:
-            result = self._chat(
-                self._prompts.summary_merge_system,
-                self._prompts.merge_user.format(text_a=text_a, text_b=text_b),
-                operation="merge",
-            )
+            metas: list[ChatMeta] = []
+            system = self._prompts.summary_merge_system
+            base_user = self._prompts.merge_user.format(text_a=text_a, text_b=text_b)
+            parts, raw, meta = self._merge_round(system, base_user)
+            metas.append(meta)
+            rounds = 1
+            issue = self._incomplete_reason(parts, text_a, text_b)
+            if issue is not None:
+                # Дозапрос в том же контексте (п. 2): исходники уже в промпте,
+                # поэтому дешевле нового вызова. Один повтор, больше раундов нет.
+                followup_user = (
+                    f"{base_user}\n\nYOUR ANSWER:\n{raw}\n\n{issue}\n"
+                    "Return the FULL corrected set of parts as one JSON object."
+                )
+                parts, _raw, meta = self._merge_round(system, followup_user)
+                metas.append(meta)
+                rounds = 2
+                issue = self._incomplete_reason(parts, text_a, text_b)
+                if issue is not None:
+                    raise MergeIncompleteError(
+                        f"merge incomplete after {MERGE_MAX_ROUNDS} rounds: {issue}",
+                        metas=metas,
+                        rounds=rounds,
+                    )
         except SummaryError:
             self.last_attempt_ok = False  # деградация станет видна в /health
             raise
         self.last_attempt_ok = True
-        text = result.content
-        if len(text) > NOTE_TEXT_LIMIT:
-            # Не молча (LSBN-S-1): хвост уходит, вместо него — маркер с
-            # лимитом; итог (текст + маркер) укладывается в NOTE_TEXT_LIMIT.
-            marker = MERGE_TRUNCATION_MARKER.format(limit=NOTE_TEXT_LIMIT)
-            text = text[: NOTE_TEXT_LIMIT - len(marker)] + marker
-        return SummaryResult(text=text, meta=result.meta)
+        return MergeResult(parts=parts, meta=meta, metas=metas, rounds=rounds)
+
+    # --- внутреннее ---------------------------------------------------------
+
+    def _merge_round(
+        self, system_prompt: str, user_text: str
+    ) -> tuple[list[MergePart], str, ChatMeta]:
+        """Один раунд слияния: chat → разбор JSON-контракта частей.
+
+        Возвращает (части, сырой content, метаданные вызова). Нарушение
+        структуры (не-JSON, нет списка частей, у части нет title/текста) —
+        `SummaryError` OFF_CONTRACT: это отказ ответа, а не «часть длинная» —
+        лечится повтором по back-off, не дозапросом (см. merge).
+        """
+        result = self._chat(system_prompt, user_text, operation="merge")
+        return _parse_merge_parts(result.content), result.content, result.meta
+
+    @staticmethod
+    def _incomplete_reason(
+        parts: list[MergePart], text_a: str, text_b: str
+    ) -> str | None:
+        """Причина неполного слияния или None (постановка, пп. 1/4).
+
+        «Часть N длиннее лимита» приоритетнее «ответ неполный»: обе идут в
+        ОДИН дозапрос, формулировка — про главную из проблем.
+        """
+        long_parts = [
+            number
+            for number, part in enumerate(parts, start=1)
+            if len(part.text) > NOTE_TEXT_LIMIT
+        ]
+        if long_parts:
+            listed = ", ".join(map(str, long_parts))
+            return (
+                f"part {listed} exceeds the {NOTE_TEXT_LIMIT}-character note "
+                "limit — split it into several self-contained parts"
+            )
+        coverage = merge_coverage(f"{text_a}\n{text_b}", [p.text for p in parts])
+        if coverage < MERGE_COVERAGE_MIN:
+            return (
+                "the parts do not cover the source texts — key content "
+                f"(facts, names, numbers, dates) is missing (coverage "
+                f"{coverage:.2f}); rewrite the parts so that together they "
+                "preserve every fact"
+            )
+        return None
+
+    @staticmethod
+    def _extract_json(content: str) -> Any:
+        """Вынуть JSON-объект из ответа (устойчиво к код-фенсам и обвязке).
+
+        Тот же приём, что у классификатора (`ClassifierService._extract_json`):
+        срез обвязки thinking/response до json.loads — модель может завернуть
+        JSON в рассуждения, где есть фигурные скобки.
+        """
+        text = content.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end > start:
+            text = text[start : end + 1]
+        try:
+            return json.loads(text)
+        except ValueError as exc:
+            raise SummaryError("merge: не-JSON объект в ответе модели") from exc
 
     def close(self) -> None:
         """Закрыть HTTP-пулы клиентов операций (без дублей по объекту)."""
@@ -336,8 +545,6 @@ class SummaryService:
         """Дешёвый пробный стук слота summary (№39, arch §6.4): `check()`
         без генерации. Исход отдаётся как есть (CheckResult)."""
         return self._llm.check()
-
-    # --- внутреннее ---------------------------------------------------------
 
     def _chat(
         self,
@@ -373,7 +580,7 @@ class SummaryService:
         self.last_meta = result.meta
         # Поле thinking/reasoning_content идёт только в метаданные вызова:
         # читаем только content. Символьная страховка здесь больше не нужна:
-        # merge держит мягкий лимит NOTE_TEXT_LIMIT сам (с маркером усечения),
-        # лимит саммари держит вызывающий (воркер) — cap_summary в точке
-        # сохранения (решение гейта 3.1.0, 2026-09-19).
+        # merge держит лимит частей сам (проверки полноты/лимита — пп. 1/4
+        # F-23), лимит саммари держит вызывающий (воркер) — cap_summary в
+        # точке сохранения (решение гейта 3.1.0, 2026-09-19).
         return result

@@ -40,6 +40,7 @@ from pathlib import Path
 
 from app.config import ConfigError
 from app.services.decision import DECISION_KINDS, DecisionQuestion
+from app.services.notes import NOTE_TEXT_LIMIT
 
 
 def _build_decision_questions(
@@ -143,13 +144,23 @@ SUMMARY_SYSTEM_PROMPT = (
 )
 
 # summary.py::MERGE_SYSTEM_PROMPT — слияние дубликатов (системный).
+# Канон LSBN-F-23: слияние отдаёт СПИСОК самодостаточных частей (JSON) —
+# «лучше несколько самодостаточных заметок, чем одна обрезанная». Лимит
+# части — мягкий лимит заметки (NOTE_TEXT_LIMIT, LSBN-S-1); контракт
+# структурированный, чтобы полноту проверял код, а не «на глаз».
 SUMMARY_MERGE_SYSTEM_PROMPT = (
-    "You have two versions of the same note. Merge them into a single "
-    "text: combine all information from both — facts, names, numbers, "
-    "dates, statuses, configs and paths; state each fact once, omit "
-    "repetitions. Do not drop anything and do not add anything of your "
-    "own. Write coherently, no headings, intros, quotes, or explanations. "
-    "Respond in the language of the notes."
+    "You have two versions of the same note. Merge them into one or several "
+    "SELF-CONTAINED notes (parts): combine all information from both — facts, "
+    "names, numbers, dates, statuses, configs and paths; state each fact once, "
+    "omit repetitions; do not drop anything and do not add anything of your "
+    "own. Every part must be readable on its own, without references to other "
+    "parts. Use ONE part only if the merged text fits the "
+    f"{NOTE_TEXT_LIMIT}-character note limit; otherwise split the content into "
+    "several parts, each within the same limit. Give each part its own `title`: "
+    "a meaningful name of at most 5 words. Write coherently, no headings, "
+    "intros, quotes, or explanations. Respond in the language of the notes. "
+    "Answer with exactly one JSON object, no explanations: "
+    '{"parts": [{"title": "...", "text": "..."}, ...]}'
 )
 
 # judge.py::JUDGE_SYSTEM_PROMPT — определение одинаковости заметок
@@ -244,9 +255,10 @@ _PROMPT_FILE_SUFFIX = ".txt"
 
 # Version of the current prompt canon (seed stamp). Bumped on every canon
 # change of the editable prompts; used for auto-migration of untouched
-# legacy seeds (lsbdef-0006). Текущий канон — 3.1.0 (саммари ≤ 150 символов,
-# решение гейта 2026-09-19).
-SEED_VERSION = "3.1.0"
+# legacy seeds (lsbdef-0006). Текущий канон — 3.4.0 (слияние отдаёт список
+# самодостаточных частей, JSON-контракт — LSBN-F-23; ранее 3.1.0 — саммари
+# ≤ 150 символов, решение гейта 2026-09-19).
+SEED_VERSION = "3.4.0"
 
 # Name of the seed-stamp sidecar file in prompts_dir: version + SHA-256 of
 # the seeded content per editable prompt.
