@@ -94,10 +94,12 @@ class TestRegistryApi:
         with pytest.raises(KeyError):
             PromptRegistry().get("no_such_prompt")
 
-    def test_editable_are_exactly_three(self) -> None:
+    def test_editable_are_exactly_four(self) -> None:
+        """4 редактируемых: + summary_split_system (LSBN-F-22 M2)."""
         assert EDITABLE_PROMPTS == (
             "summary_system",
             "summary_merge_system",
+            "summary_split_system",
             "judge_system",
         )
 
@@ -127,14 +129,15 @@ def _read(dirpath: pathlib.Path, name: str) -> str:
 
 
 class TestFileMechanics:
-    def test_seed_creates_three_editable_files(self, tmp_path: pathlib.Path) -> None:
-        """Первый старт с prompts_dir: ровно 3 редактируемых файла-дефолта."""
+    def test_seed_creates_four_editable_files(self, tmp_path: pathlib.Path) -> None:
+        """Первый старт с prompts_dir: ровно 4 редактируемых файла-дефолта."""
         registry = PromptRegistry(prompts_dir=tmp_path)
         files = sorted(p.name for p in tmp_path.iterdir())
         assert files == [
             "judge_system.txt",
             "seed_meta.json",
             "summary_merge_system.txt",
+            "summary_split_system.txt",
             "summary_system.txt",
         ]
         # Содержимое seed-файлов — встроенные тексты (стартовый дефолт).
@@ -142,6 +145,10 @@ class TestFileMechanics:
         assert (
             _read(tmp_path, "summary_merge_system")
             == registry.summary_merge_system
+        )
+        assert (
+            _read(tmp_path, "summary_split_system")
+            == registry.summary_split_system
         )
         assert _read(tmp_path, "judge_system") == registry.judge_system
 

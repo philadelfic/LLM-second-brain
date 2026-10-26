@@ -358,23 +358,29 @@ class SummaryService:
     ) -> None:
         self._settings = settings
         self._prompts = registry if registry is not None else PromptRegistry()
-        # Клиенты ПО ОПЕРАЦИЯМ (LSBN-F-34): плоский env SUMMARIZE_/TITLE_/MERGE_*
-        # переопределяет модель/провайдера/адрес/ключ/таймаут/бюджет одного
-        # процесса поверх слота summary; без переопределения specs одинаковы
-        # (сборка делит один клиент). DI: один клиент (прочие интерфейсы) —
-        # для всех операций; отображение — для точечных подмен тестами.
+        # Клиенты ПО ОПЕРАЦИЯМ (LSBN-F-34): плоский env SUMMARIZE_/TITLE_/
+        # MERGE_/SPLIT_* переопределяет модель/провайдера/адрес/ключ/таймаут/
+        # бюджет одного процесса поверх слота summary; без переопределения
+        # specs одинаковы (сборка делит один клиент). DI: один клиент (прочие
+        # интерфейсы) — для всех операций; отображение — для точечных подмен
+        # тестами. "split" — нарезка миграции (LSBN-F-22 M2).
         if llm is None:
             self._llms: dict[str, LLMClient] = {
                 operation: LLMClient(
                     SlotSpec.for_operation(operation, settings)[0],
                     transport=transport,
                 )
-                for operation in ("summarize", "title", "merge")
+                for operation in ("summarize", "title", "merge", "split")
             }
         elif isinstance(llm, Mapping):
             self._llms = dict(llm)
         else:
-            self._llms = {"summarize": llm, "title": llm, "merge": llm}
+            self._llms = {
+                "summarize": llm,
+                "title": llm,
+                "merge": llm,
+                "split": llm,
+            }
         # Основной клиент (summarize) — прежнее поле DI-сборок и тестов.
         self._llm = self._llms["summarize"]
         # None — попыток не было (health не врёт до первых данных).

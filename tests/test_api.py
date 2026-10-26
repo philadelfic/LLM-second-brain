@@ -68,7 +68,8 @@ class TestHealth:
             "pending_summary": 0,
             "queues": {
                 queue: {"pending": 0, "oldest_pending_sec": None, "waiting": 0, "attention": 0}
-                for queue in ("vector", "summary", "judge", "areas", "links", "nodes", "warnings", "terms-normalize")
+                # migration — очередь нарезки (LSBN-F-22 M2).
+                for queue in ("vector", "summary", "judge", "areas", "links", "nodes", "warnings", "terms-normalize", "migration")
             },
             "slots": {
                 slot: {
@@ -146,6 +147,7 @@ class TestHealth:
             "nodes",
             "warnings",
             "terms-normalize",
+            "migration",  # LSBN-F-22 M2: очередь нарезки
         }
         for stat in body["queues"].values():
             assert set(stat) == {"pending", "oldest_pending_sec", "waiting", "attention"}

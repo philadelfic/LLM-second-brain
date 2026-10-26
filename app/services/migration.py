@@ -42,7 +42,7 @@ from app.services.summary import (
     MergeIncompleteError,
     SummaryError,
 )
-from app.storage.db import session
+from app.storage.db import StorageError, session
 from app.storage.migration import MIGRATION_NOTES_TABLE, read_state
 
 if TYPE_CHECKING:  # только для аннотаций — модуль остаётся чистым
@@ -101,17 +101,20 @@ class MigrationService:
 
         Возраст — по `updated_at` взятого статуса (штамп двигают и нарезка,
         и карантин) — та же семантика «возраст по pending+waiting» (3.3.1).
+        Таблицы migration_notes нет (миграции не было) — очередь пуста.
         """
-        with session(self._settings) as conn:
-            row = conn.execute(
-                f"SELECT COUNT(*) AS pending, "
-                f"CAST(strftime('%s','now') AS INTEGER) - "
-                f"CAST(strftime('%s', MIN(updated_at)) AS INTEGER) AS age "
-                f"FROM {MIGRATION_NOTES_TABLE} WHERE status IN (?, ?)",
-                _TAKEN_STATUSES,
-            ).fetchone()
-        age = row["age"]
-        return {"pending": int(row["pending"]), "oldest_pending_sec": age}
+        try:
+            with session(self._settings) as conn:
+                row = conn.execute(
+                    f"SELECT COUNT(*) AS pending, "
+                    f"CAST(strftime('%s','now') AS INTEGER) - "
+                    f"CAST(strftime('%s', MIN(updated_at)) AS INTEGER) AS age "
+                    f"FROM {MIGRATION_NOTES_TABLE} WHERE status IN (?, ?)",
+                    _TAKEN_STATUSES,
+                ).fetchone()
+        except (sqlite3.Error, StorageError):
+            return {"pending": 0, "oldest_pending_sec": None}
+        return {"pending": int(row["pending"]), "oldest_pending_sec": row["age"]}
 
     def queue_empty(self) -> bool:
         """Пуста ли очередь нарезки (дешёвая перепроверка очереди, пул 6)."""
@@ -244,7 +247,7 @@ class MigrationService:
         try:
             with session(self._settings) as conn:
                 return read_state(conn)
-        except sqlite3.Error:
+        except (sqlite3.Error, StorageError):
             return None
 
     def _legacy_path(self, state: dict) -> str | None:
@@ -280,7 +283,7 @@ class MigrationService:
         try:
             with session(self._settings) as conn:
                 return conn.execute(query, _TAKEN_STATUSES).fetchall()
-        except sqlite3.Error:
+        except (sqlite3.Error, StorageError):
             return []  # таблицы migration_notes нет — миграции не было
 
     @staticmethod
