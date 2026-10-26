@@ -45,6 +45,60 @@ EXPECTED_FINGERPRINT_FIELDS: tuple[str, ...] = (
     "judge_num_predict",
     "judge_context_tokens",
     "judge_timeout_sec",
+    # LSBN-F-34: плоские поля операций (7 на генеративную операцию,
+    # 3 у embed) — правка env операции тоже «причина ушла».
+    "summarize_model",
+    "summarize_provider",
+    "summarize_model_type",
+    "summarize_think",
+    "summarize_num_predict",
+    "summarize_context_tokens",
+    "summarize_timeout_sec",
+    "title_model",
+    "title_provider",
+    "title_model_type",
+    "title_think",
+    "title_num_predict",
+    "title_context_tokens",
+    "title_timeout_sec",
+    "merge_model",
+    "merge_provider",
+    "merge_model_type",
+    "merge_think",
+    "merge_num_predict",
+    "merge_context_tokens",
+    "merge_timeout_sec",
+    "split_model",
+    "split_provider",
+    "split_model_type",
+    "split_think",
+    "split_num_predict",
+    "split_context_tokens",
+    "split_timeout_sec",
+    "classify_model",
+    "classify_provider",
+    "classify_model_type",
+    "classify_think",
+    "classify_num_predict",
+    "classify_context_tokens",
+    "classify_timeout_sec",
+    "describe_model",
+    "describe_provider",
+    "describe_model_type",
+    "describe_think",
+    "describe_num_predict",
+    "describe_context_tokens",
+    "describe_timeout_sec",
+    "structure_judge_model",
+    "structure_judge_provider",
+    "structure_judge_model_type",
+    "structure_judge_think",
+    "structure_judge_num_predict",
+    "structure_judge_context_tokens",
+    "structure_judge_timeout_sec",
+    "embed_model",
+    "embed_provider",
+    "embed_timeout_sec",
     "decision_enabled",
     "decision_model",
     "decision_threshold",
@@ -165,6 +219,32 @@ def test_fingerprint_changes_with_timeout(tmp_path, monkeypatch) -> None:
     assert len({base, summary, judge}) == 3
     assert _parts(summary)["summary_timeout_sec"] == "120"
     assert _parts(judge)["judge_timeout_sec"] == "60"
+
+
+def test_fingerprint_changes_with_operation_env(tmp_path, monkeypatch) -> None:
+    """Плоское env операции меняет отпечаток (LSBN-F-34, решение №7 брифа).
+
+    Правка MERGE_MODEL/TITLE_TIMEOUT_SEC — тоже «причина ушла»: без
+    операционных слагаемых смена конфигурации одного процесса не снимала бы
+    «требует вмешательства» у заданий (lsbdef0008-02).
+    """
+    base = slot_config_fingerprint(_settings(tmp_path, monkeypatch))
+    merged = slot_config_fingerprint(
+        _settings(tmp_path, monkeypatch, MERGE_MODEL="merge-x")
+    )
+    timeout = slot_config_fingerprint(
+        _settings(tmp_path, monkeypatch, TITLE_TIMEOUT_SEC="120")
+    )
+    assert merged != base
+    assert timeout != base
+    assert _parts(merged)["merge_model"] == "merge-x"
+    assert _parts(timeout)["title_timeout_sec"] == "120"
+
+
+def test_fingerprint_has_no_operation_secrets() -> None:
+    """Ключи и адреса операций в отпечатке отсутствуют (LSBN-F-34)."""
+    assert not [name for name in FINGERPRINT_FIELDS if name.endswith("api_key")]
+    assert not [name for name in FINGERPRINT_FIELDS if name.endswith("base_url")]
 
 
 def test_fingerprint_changes_with_decision_params(tmp_path, monkeypatch) -> None:

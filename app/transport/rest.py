@@ -84,6 +84,8 @@ from app.services.notes import (
     _UNSET_TEXT,
     NoteValidationError,
 )
+# LSBN-F-34: снимок /health.operations (модель/провайдер/источник по операции).
+from app.services.operations import operations_health
 from app.services.search import SearchValidationError
 from app.services.skills import (
     HINT_NOT_FOUND as HINT_SKILL_NOT_FOUND,
@@ -420,6 +422,11 @@ class HealthResponse(BaseModel):
     # №39 (arch §7.2): по слоту {ok, last_outcome, paused_until, attention} —
     # причина и пауза разрыва слота, число заданий в внимании. Только SQL/память.
     slots: dict[str, SlotStat]
+    # LSBN-F-34 (решение №4 брифа): по операции {model, provider, source} —
+    # эффективная модель/провайдер и источник конфигурации (op|slot|default).
+    # БЕЗ адресов и ключей: /health открыт наружу (NFR-2); адрес живёт только
+    # в журнале (`slot_call`) и в событии джобы при ошибке.
+    operations: dict[str, dict[str, str]]
     # №40 (FR-4.3): по каждой области {enabled, pending} — по ВСЕМ областям,
     # включая выключенные (их накопление видно). Собирает воркер, только SQL.
     areas: dict[str, dict]
@@ -664,6 +671,9 @@ def build_rest_router(settings: Settings) -> APIRouter:
             pending_summary=counts["pending_summary"],
             queues=queues,
             slots=slots,
+            # LSBN-F-34: блок operations — из реестра и настроек, без I/O
+            # и без вызовов моделей (модель/провайдер/источник по операции).
+            operations=operations_health(settings),
             areas=areas,
             warnings=warnings,
             decision=decision,
