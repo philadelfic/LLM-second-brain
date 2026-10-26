@@ -69,6 +69,7 @@ update, каскад + самолечение сирот при физическ
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from collections.abc import Callable
@@ -86,6 +87,11 @@ from app.services.namespaces import NamespaceService
 from app.services.splitter import split_text
 from app.storage import chunks, expirations, vectors
 from app.storage.db import DEFAULT_NAMESPACE, session, transaction
+from app.storage.migration import (
+    MIGRATION_NOTES_TABLE,
+    SOURCE_MIGRATION_SPLIT,
+    ensure_migration_schema,
+)
 
 # Maximum number of chunks per one memory_get call (lsb-0003, decision of O.,
 # 2026-09-08). Listing ceilings (lsb-0013) are env parameters of the surfaces
@@ -1189,8 +1195,86 @@ class NoteService:
             "deleted": deleted,
         }
 
-    # --- NFR-4 /health ------------------------------------------------------
+    def save_migration_parts(
+        self,
+        old_id: int,
+        namespace: str,
+        parts: list[tuple[str, str]],
+    ) -> dict[str, Any]:
+        """Сохранить части нарезки одной транзакцией (LSBN-F-22, M2).
 
+        Миграция длинной заметки (design F-22 §4, фаза 4): части — НОВЫЕ
+        заметки активной базы (по образцу merge_into_parts F-23: title
+        части, namespace исходника — передаётся джобой из прежней базы;
+        vector/summary — pending, своими очередями; TTL нет — no46-03),
+        контент-версия каждой части сразу в истории с source=
+        "migration_split" — ПО ЭТОМУ source обратный перелив (storage.
+        migration.reverse_pour, M1) узнаёт части и не тащит их при откате.
+        Исходник НЕ трогается: текст живёт в прежней базе, статус заметки
+        в миграции — та же транзакция: migration_notes → 'нарезана' +
+        new_ids (JSON) — возобновляемость и карта отката (design §3).
+
+        Возврат — ``{"old_id", "split": True, "parts": [{"id", "title"}]}``.
+        Отказ валидации части (`NoteValidationError`) откатывает транзакцию
+        цело: полусостояние «часть создана, статус старый» исключено.
+        Notify после транзакции. Метод внутренний (джоба migration) —
+        контракты REST/MCP не меняются.
+        """
+        if not parts:
+            raise NoteValidationError("save_migration_parts: пустой список частей")
+        prepared: list[tuple[str, str, list[tuple[str, int]]]] = []
+        for title, text in parts:
+            self._validate_text(text)
+            checked_title = self._checked_title(title)
+            prepared.append((checked_title or "", text, self._chunks_of(text)))
+        new_ids: list[int] = []
+        with session(self._settings) as conn, transaction(conn):
+            # Таблица миграции может не существовать в DI-сборках тестов
+            # (активная база без миграции) — идемпотентно, штамп не мешает.
+            ensure_migration_schema(conn)
+            created: list[dict[str, Any]] = []
+            for title, text, chunks_data in prepared:
+                part_id = self._insert(
+                    conn,
+                    text,
+                    None,
+                    vector_status="pending",
+                    namespace=namespace,
+                    title=title,
+                )
+                self._store_chunks(conn, part_id, chunks_data, None)
+                part_row = conn.execute(
+                    "SELECT text, title, namespace, expires_at, comment "
+                    "FROM notes WHERE id = ?",
+                    (part_id,),
+                ).fetchone()
+                history.record_change(
+                    conn,
+                    history.ENTITY_NOTE,
+                    part_id,
+                    history.note_projection(part_row),
+                    source=SOURCE_MIGRATION_SPLIT,
+                )
+                created.append({"id": part_id, "title": title})
+                new_ids.append(part_id)
+            # Статус исходника — той же транзакцией (design §3): 'нарезана' +
+            # new_ids; upsert — прямой вызов без пройденной джобы не теряется.
+            conn.execute(
+                f"INSERT INTO {MIGRATION_NOTES_TABLE} "
+                "(old_id, status, new_ids, reason, updated_at) "
+                "VALUES (?, 'нарезана', ?, NULL, "
+                "strftime('%Y-%m-%dT%H:%M:%SZ','now')) "
+                "ON CONFLICT(old_id) DO UPDATE SET "
+                "status = 'нарезана', new_ids = excluded.new_ids, "
+                "reason = NULL, updated_at = excluded.updated_at",
+                (old_id, json.dumps(new_ids)),
+            )
+        self._notify_summary_pending()
+        # Части ждут векторизации — будим embedding-петлю, не дожидаясь back-off.
+        self._notify_vector_pending()
+        return {"old_id": old_id, "split": True, "parts": created}
+
+    # --- NFR-4 /health ------------------------------------------------------
     def health_counts(self) -> dict[str, int]:
         """Счётчики для /health: активные заметки и pending-статусы.
 
