@@ -220,28 +220,29 @@ def _significant_normalized(text: str) -> set[str]:
     }
 
 
-def _parse_merge_parts(content: str) -> list[MergePart]:
-    """Разобрать JSON-ответ слияния в список частей (F-23, п. 1).
+def _parse_merge_parts(content: str, label: str = "merge") -> list[MergePart]:
+    """Разобрать JSON-ответ (слияние/нарезка) в список частей (F-23, п. 1).
 
     Контракт: ровно один JSON-объект ``{"parts": [{"title", "text"}, ...]}``.
     Нарушения (не-JSON, «parts» не список/пуст, у части нет title или
-    текста) — `SummaryError` OFF_CONTRACT: ответ вне контракта целиком,
-    повтор решает back-off воркера, не дозапрос. Title длиннее TITLE_MAX_WORDS
-    слов НЕ отклоняет часть — срезается до лимита (прецедент title-догена:
-    обрезку делает код, воркер валидирует на записи).
+    текста, ПУСТОЙ content — lsbdef-0008) — `SummaryError` OFF_CONTRACT:
+    ответ вне контракта целиком, повтор решает back-off воркера, не дозапрос.
+    Title длиннее TITLE_MAX_WORDS слов НЕ отклоняет часть — срезается до
+    лимита (прецедент title-догена: обрезку делает код, воркер валидирует
+    на записи).
     """
     data = SummaryService._extract_json(content)
     raw_parts = data.get("parts") if isinstance(data, dict) else None
     if not isinstance(raw_parts, list) or not raw_parts:
-        raise SummaryError("merge: в ответе модели нет списка частей")
+        raise SummaryError(f"{label}: в ответе модели нет списка частей")
     parts: list[MergePart] = []
     for item in raw_parts:
         if not isinstance(item, dict):
-            raise SummaryError("merge: часть ответа не объект JSON")
+            raise SummaryError(f"{label}: часть ответа не объект JSON")
         title = str(item.get("title") or "").strip()
         text = str(item.get("text") or "").strip()
         if not title or not text:
-            raise SummaryError("merge: у части нет title или текста")
+            raise SummaryError(f"{label}: у части нет title или текста")
         words = title.split()
         if len(words) > TITLE_MAX_WORDS:
             title = " ".join(words[:TITLE_MAX_WORDS])
@@ -324,6 +325,11 @@ class Summarizer(Protocol):
     def merge(self, text_a: str, text_b: str) -> MergeResult:
         """Слить пару текстов-дубликатов в список самодостаточных частей
         (дедуп, Этап 2.2; LSBN-F-23)."""
+        ...
+
+    def split(self, text: str) -> MergeResult:
+        """Нарезать длинную заметку на самодостаточные части ≤ лимита
+        (самомиграция, LSBN-F-22 M2; операция `split` — SPLIT_* env)."""
         ...
 
     def probe(self) -> str:
@@ -463,26 +469,86 @@ class SummaryService:
         self.last_attempt_ok = True
         return MergeResult(parts=parts, meta=meta, metas=metas, rounds=rounds)
 
+    def split(self, text: str) -> MergeResult:
+        """Нарезать длинную заметку на самодостаточные части (F-22, M2).
+
+        Тот же контракт частей, что у слияния (нарезка идёт через F-23 —
+        второй потребитель одного механизма), но источник — ОДНА длинная
+        заметка и операция `split` реестра F-34: клиент операции строится
+        по SPLIT_* env с наследованием слота summary (дефолт локальный —
+        в промпт уходят личные заметки, решение О. 15.10.2026).
+
+        Проверки перед отдачей результата — как у merge (постановка F-22,
+        фаза 4): каждая часть ≤ NOTE_TEXT_LIMIT; полнота — сумма частей
+        покрывает исходник (`merge_coverage` ≥ MERGE_COVERAGE_MIN, строго).
+        Не сошлось — ОДИН дозапрос в том же контексте; за MERGE_MAX_ROUNDS
+        раундов не сошлось — `MergeIncompleteError` (заметка уходит в
+        карантин джобой миграции, повтор по back-off). Транзиентные отказы
+        транспорта/структуры — `SummaryError` (повтор по back-off, NFR-3);
+        ПУСТОЙ content — отказ (lsbdef-0008), не тихий пустой список.
+        Бюджет — SPLIT_NUM_PREDICT (0 = авто; цепочка операции split).
+        """
+        if not text or not text.strip():
+            raise ValueError("split: пустая заметка недопустима")
+        try:
+            metas: list[ChatMeta] = []
+            system = self._prompts.summary_split_system
+            base_user = self._prompts.split_user.format(text=text)
+            parts, raw, meta = self._merge_round(system, base_user, operation="split")
+            metas.append(meta)
+            rounds = 1
+            issue = self._incomplete_reason(parts, text)
+            if issue is not None:
+                followup_user = (
+                    f"{base_user}\n\nYOUR ANSWER:\n{raw}\n\n{issue}\n"
+                    "Return the FULL corrected set of parts as one JSON object."
+                )
+                parts, _raw, meta = self._merge_round(
+                    system, followup_user, operation="split"
+                )
+                metas.append(meta)
+                rounds = 2
+                issue = self._incomplete_reason(parts, text)
+                if issue is not None:
+                    raise MergeIncompleteError(
+                        f"split incomplete after {MERGE_MAX_ROUNDS} rounds: {issue}",
+                        metas=metas,
+                        rounds=rounds,
+                    )
+        except SummaryError:
+            self.last_attempt_ok = False  # деградация станет видна в /health
+            raise
+        self.last_attempt_ok = True
+        return MergeResult(parts=parts, meta=meta, metas=metas, rounds=rounds)
+
     # --- внутреннее ---------------------------------------------------------
 
     def _merge_round(
-        self, system_prompt: str, user_text: str
+        self,
+        system_prompt: str,
+        user_text: str,
+        *,
+        operation: str = "merge",
     ) -> tuple[list[MergePart], str, ChatMeta]:
-        """Один раунд слияния: chat → разбор JSON-контракта частей.
+        """Один раунд слияния/нарезки: chat → разбор JSON-контракта частей.
 
         Возвращает (части, сырой content, метаданные вызова). Нарушение
         структуры (не-JSON, нет списка частей, у части нет title/текста) —
         `SummaryError` OFF_CONTRACT: это отказ ответа, а не «часть длинная» —
-        лечится повтором по back-off, не дозапросом (см. merge).
+        лечится повтором по back-off, не дозапросом (см. merge/split).
         """
-        result = self._chat(system_prompt, user_text, operation="merge")
-        return _parse_merge_parts(result.content), result.content, result.meta
+        result = self._chat(system_prompt, user_text, operation=operation)
+        return (
+            _parse_merge_parts(result.content, label=operation),
+            result.content,
+            result.meta,
+        )
 
     @staticmethod
     def _incomplete_reason(
-        parts: list[MergePart], text_a: str, text_b: str
+        parts: list[MergePart], *sources: str
     ) -> str | None:
-        """Причина неполного слияния или None (постановка, пп. 1/4).
+        """Причина неполного слияния/нарезки или None (постановки F-23/F-22).
 
         «Часть N длиннее лимита» приоритетнее «ответ неполный»: обе идут в
         ОДИН дозапрос, формулировка — про главную из проблем.
@@ -498,7 +564,7 @@ class SummaryService:
                 f"part {listed} exceeds the {NOTE_TEXT_LIMIT}-character note "
                 "limit — split it into several self-contained parts"
             )
-        coverage = merge_coverage(f"{text_a}\n{text_b}", [p.text for p in parts])
+        coverage = merge_coverage("\n".join(sources), [p.text for p in parts])
         if coverage < MERGE_COVERAGE_MIN:
             return (
                 "the parts do not cover the source texts — key content "

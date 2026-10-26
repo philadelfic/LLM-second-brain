@@ -1,22 +1,22 @@
 """PromptRegistry — реестр промптов (Фаза 11, решение №7).
 
-Все тексты промптов собираются в одном месте. Десять промптов делятся на
-две группы (решение О. 2026-09-04: «часть промптов — наша задача довести
+Все тексты промптов собираются в одном месте. Двенадцать промптов делятся
+на две группы (решение О. 2026-09-04: «часть промптов — наша задача довести
 до ума, их не правит никто»):
 
-- **3 редактируемых** (`summary_system`, `summary_merge_system`,
-  `judge_system`): при заданном `prompts_dir` выносятся в файлы
-  (seed-if-missing — создаются с встроенным дефолтом как стартовым
-  текстом) и правятся оператором без пересборки образа; существующие
-  operator-edited files are NEVER overwritten; an empty file = the
-  built-in default; a non-empty file wins. Auto-migration (lsbdef-0006):
-  a file byte-identical to a previously seeded text (seed_meta.json) or
-  to a known legacy seed (LEGACY_SEEDS) is rewritten with the current
-  canon when the seed version changes;
-- **7 зашитых** (`merge_user`, `judge_user`, `classifier_system`,
-  `describe_system`, `describe_user`, `structure_judge_system`,
-  `structure_judge_user`): только константы в коде, файлами не создаются
-  никогда.
+- **4 редактируемых** (`summary_system`, `summary_merge_system`,
+  `summary_split_system`, `judge_system`): при заданном `prompts_dir`
+  выносятся в файлы (seed-if-missing — создаются с встроенным дефолтом
+  как стартовым текстом) и правятся оператором без пересборки образа;
+  существующие operator-edited files are NEVER overwritten; an empty file
+  = the built-in default; a non-empty file wins. Auto-migration
+  (lsbdef-0006): a file byte-identical to a previously seeded text
+  (seed_meta.json) or to a known legacy seed (LEGACY_SEEDS) is rewritten
+  with the current canon when the seed version changes;
+- **8 зашитых** (`merge_user`, `split_user`, `judge_user`,
+  `classifier_system`, `describe_system`, `describe_user`,
+  `structure_judge_system`, `structure_judge_user`): только константы
+  в коде, файлами не создаются никогда.
 
 Контрактная защита: финальный `judge_system` (встроенный или из файла)
 обязан содержать маркеры «ДУБЛЬ» и «НЕ ДУБЛЬ» — вердикты дедупа парсятся
@@ -163,6 +163,25 @@ SUMMARY_MERGE_SYSTEM_PROMPT = (
     '{"parts": [{"title": "...", "text": "..."}, ...]}'
 )
 
+# summary.py::SPLIT_SYSTEM_PROMPT — нарезка длинной заметки (системный).
+# Канон LSBN-F-22 (M2): тот же контракт списка частей, что у слияния, но
+# источник — ОДНА длинная заметка; требование самодостаточности части
+# усилено постановкой (шаг «Нарезка идёт через F-23»): каждая часть несёт
+# СВОИ имена, числа, даты — читается без исходника и остальных частей.
+SUMMARY_SPLIT_SYSTEM_PROMPT = (
+    "You are given ONE long note that exceeds the note limit. Split it into "
+    "one or several SELF-CONTAINED notes (parts): preserve every fact — "
+    "names, numbers, dates, statuses, configs and paths; do not drop "
+    "anything and do not add anything of your own. Every part must be "
+    f"readable on its own, carrying ITS OWN names, numbers and dates — no "
+    "references to the source or to other parts. Parts may be up to "
+    f"{NOTE_TEXT_LIMIT} characters each. Give each part its own `title`: a "
+    "meaningful name of at most 5 words. Write coherently, no headings, "
+    "intros, quotes, or explanations. Respond in the language of the note. "
+    "Answer with exactly one JSON object, no explanations: "
+    '{"parts": [{"title": "...", "text": "..."}, ...]}'
+)
+
 # judge.py::JUDGE_SYSTEM_PROMPT — определение одинаковости заметок
 # (ДУБЛЬ/НЕ ДУБЛЬ).
 JUDGE_SYSTEM_PROMPT = (
@@ -176,6 +195,9 @@ JUDGE_SYSTEM_PROMPT = (
 
 # summary.py::MERGE_USER_TEMPLATE ({text_a}, {text_b}).
 SUMMARY_MERGE_USER_TEMPLATE = "TEXT 1:\n{text_a}\n\nTEXT 2:\n{text_b}"
+
+# summary.py::SPLIT_USER_TEMPLATE ({text}) — нарезка длинной заметки (F-22 M2).
+SUMMARY_SPLIT_USER_TEMPLATE = "TEXT:\n{text}"
 
 # judge.py::JUDGE_USER_TEMPLATE ({text_new}, {text_candidate}).
 JUDGE_USER_TEMPLATE = "TEXT 1:\n{text_new}\n\nTEXT 2:\n{text_candidate}"
@@ -234,8 +256,10 @@ STRUCTURE_JUDGE_USER_TEMPLATE = (
 BUILTIN_PROMPTS: dict[str, str] = {
     "summary_system": SUMMARY_SYSTEM_PROMPT,
     "summary_merge_system": SUMMARY_MERGE_SYSTEM_PROMPT,
+    "summary_split_system": SUMMARY_SPLIT_SYSTEM_PROMPT,
     "judge_system": JUDGE_SYSTEM_PROMPT,
     "merge_user": SUMMARY_MERGE_USER_TEMPLATE,
+    "split_user": SUMMARY_SPLIT_USER_TEMPLATE,
     "judge_user": JUDGE_USER_TEMPLATE,
     "classifier_system": CLASSIFIER_SYSTEM_PROMPT,
     "describe_system": DESCRIBE_SYSTEM_PROMPT,
@@ -244,10 +268,11 @@ BUILTIN_PROMPTS: dict[str, str] = {
     "structure_judge_user": STRUCTURE_JUDGE_USER_TEMPLATE,
 }
 
-# Редактируемые: только эти имена выносятся в файлы (зашитые 7 — никогда).
+# Редактируемые: только эти имена выносятся в файлы (зашитые — никогда).
 EDITABLE_PROMPTS: tuple[str, ...] = (
     "summary_system",
     "summary_merge_system",
+    "summary_split_system",
     "judge_system",
 )
 
@@ -255,10 +280,11 @@ _PROMPT_FILE_SUFFIX = ".txt"
 
 # Version of the current prompt canon (seed stamp). Bumped on every canon
 # change of the editable prompts; used for auto-migration of untouched
-# legacy seeds (lsbdef-0006). Текущий канон — 3.4.0 (слияние отдаёт список
-# самодостаточных частей, JSON-контракт — LSBN-F-23; ранее 3.1.0 — саммари
-# ≤ 150 символов, решение гейта 2026-09-19).
-SEED_VERSION = "3.4.0"
+# legacy seeds (lsbdef-0006). Текущий канон — 3.4.1 (LSBN-F-22 M2: добавлен
+# редактируемый `summary_split_system` — нарезка длинной заметки списком
+# самодостаточных частей; 3.4.0 — слияние списком частей, LSBN-F-23; ранее
+# 3.1.0 — саммари ≤ 150 символов, решение гейта 2026-09-19).
+SEED_VERSION = "3.4.1"
 
 # Name of the seed-stamp sidecar file in prompts_dir: version + SHA-256 of
 # the seeded content per editable prompt.
@@ -354,7 +380,7 @@ _DECISION_QUESTIONS_FILENAME = "decision_questions.json"
 
 
 class PromptRegistry:
-    """Встроенные константы всех 10 промптов + файловые переопределения.
+    """Встроенные константы всех 12 промптов + файловые переопределения.
 
     Конструирование = полная подготовка к работе: seed-if-missing (при
     заданном `prompts_dir`), чтение переопределений и контрактная проверка
@@ -362,8 +388,9 @@ class PromptRegistry:
     обязан прерваться (см. docstring модуля).
 
     Доступ — по именам промптов (свойства, как в задании пула 3):
-    редактируемые `summary_system`, `summary_merge_system`, `judge_system` и
-    зашитые `merge_user`, `judge_user`, `classifier_system`, `describe_system`,
+    редактируемые `summary_system`, `summary_merge_system`,
+    `summary_split_system`, `judge_system` и зашитые `merge_user`,
+    `split_user`, `judge_user`, `classifier_system`, `describe_system`,
     `describe_user`, `structure_judge_system`, `structure_judge_user`;
     универсальный `get(name)` — для обхода по списку `BUILTIN_PROMPTS`.
     """
@@ -404,6 +431,11 @@ class PromptRegistry:
         return self._texts["summary_merge_system"]
 
     @property
+    def summary_split_system(self) -> str:
+        """Системный промпт нарезки длинной заметки (редактируемый, F-22 M2)."""
+        return self._texts["summary_split_system"]
+
+    @property
     def judge_system(self) -> str:
         """Системный промпт судьи дедупа ДУБЛЬ/НЕ ДУБЛЬ (редактируемый)."""
         return self._texts["judge_system"]
@@ -412,6 +444,11 @@ class PromptRegistry:
     def merge_user(self) -> str:
         """User-шаблон слияния: {text_a}, {text_b} (зашитый)."""
         return self._texts["merge_user"]
+
+    @property
+    def split_user(self) -> str:
+        """User-шаблон нарезки: {text} (зашитый, F-22 M2)."""
+        return self._texts["split_user"]
 
     @property
     def judge_user(self) -> str:
