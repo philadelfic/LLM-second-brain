@@ -351,6 +351,10 @@ def create_new_base(
             src.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
         )
         with transaction(dst):
+            # Таблица migration_notes + штамп CHECK: init_db о миграции не
+            # знает (схема релиза), а 'ожидает' пишутся ниже в эту же
+            # транзакцию. Идемпотентно.
+            ensure_migration_schema(dst)
             # Строки: справочники → notes (FTS строят триггеры) → зависимости
             # → реестры; мета переливается как есть, миграционные ключи
             # переставляются ниже явно.
@@ -376,14 +380,21 @@ def create_new_base(
                     {"file": prev_name, "note_chars": _live_limit_or(src, target)},
                 ],
             )
-            # Невлезающие → 'ожидает' (текст остаётся в прежней базе).
-            cursor = dst.execute(
+            # Невлезающие → 'ожидает' (текст остаётся в прежней базе): id
+            # берутся из ИСТОЧНИКА — в новой базе их уже нет, длинные не
+            # перелились. Кросс-коннект в одном INSERT невозможен — перенос.
+            long_ids = [
+                int(row[0])
+                for row in src.execute(
+                    "SELECT id FROM notes WHERE length(text) > ?", (target,)
+                ).fetchall()
+            ]
+            dst.executemany(
                 f"INSERT INTO {MIGRATION_NOTES_TABLE}(old_id, status, reason) "
-                f"SELECT id, 'ожидает', 'длиннее цели миграции' FROM notes "
-                f"WHERE length(text) > ?",
-                (target,),
+                "VALUES (?, 'ожидает', 'длиннее цели миграции')",
+                [(old_id,) for old_id in long_ids],
             )
-            pending = cursor.rowcount if cursor.rowcount > 0 else 0
+            pending = len(long_ids)
             counters = {
                 "old_total": old_total,
                 "poured": int(
@@ -551,7 +562,8 @@ def reverse_pour(
             ("meta", "1=1", ()),  # миграционные ключи переставляются ниже
         )
         vec_specs: tuple[tuple[str, str, str, tuple], ...] = (
-            (vectors.VEC_TABLE, "note_id", notes_where, notes_params),
+            # Ключ vec-таблицы — note_id (не notes.id!), фильтр свой.
+            (vectors.VEC_TABLE, "note_id", *_where_not_in("note_id", ids=part_notes)),
             (
                 chunks.CHUNKS_VEC_TABLE,
                 "chunk_id",
@@ -562,6 +574,9 @@ def reverse_pour(
 
         counters = {"poured": 0, "kept_parts": len(part_notes)}
         with transaction(src):
+            # Приёмник мог быть создан до LSBN-F-22: таблицы migration_notes
+            # и штампа в нём может не быть (идемпотентно).
+            ensure_migration_schema(src)
             for table, where, params in specs:
                 counters["poured"] += _copy_rows(active, src, table, where, params)
             for table, key_column, where, params in vec_specs:
