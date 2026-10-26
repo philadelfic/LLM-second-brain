@@ -175,6 +175,7 @@ from app.services.output_budget import (
     GET_BUDGET_CHARS_DEFAULT,
     HINT_INVALID_BUDGET,
     LIST_BUDGET_CHARS_DEFAULT,
+    MAP_BUDGET_CHARS_DEFAULT,
     SEARCH_BUDGET_CHARS_DEFAULT,
     fit_within_budget,
     truncation_hint,
@@ -649,12 +650,13 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "only fresh notes."
     ),
     "memory_get": (
-        "Read notes. A single id (or a one-item ids batch) returns the FULL "
-        "text plus `links` — related notes from OTHER namespaces; a longer "
-        "batch returns headers {id, title, namespace, chars} within "
-        "`budget_chars` (default 2000) — read point-wise by id. Long notes: "
-        "add `query` (relevant chunks by meaning) or `chunk=N` (navigate "
-        "N±1); `limit` — how many chunks in a row."
+        "Read notes. Single id (or one-item ids): FULL text plus `links` — "
+        "related notes from OTHER namespaces. `map=true`: a neighbor map, "
+        "line per neighbor {id, title, namespace, kind, direction (mention "
+        "only)}; reply: `map_level_used`, `total`. Longer batch: headers "
+        "{id, title, namespace, chars} within `budget_chars` (default 2000) "
+        "— read point-wise by id. Long notes: `query` (chunks by meaning), "
+        "`chunk=N` (navigate N±1), `limit` — chunks per row."
     ),
     "memory_save": (
         "Save atomic durable facts useful in the future: one self-contained note — "
@@ -883,7 +885,26 @@ TOOL_NAMES = frozenset(TOOL_DESCRIPTIONS)
 _LIST_ITEM = ("id", "title", "summary", "chars", "created_at", "updated_at", "namespace", "expires_at")
 _GET_NOTE = ("id", "text", "chars", "created_at", "updated_at", "namespace", "expires_at", "comment")
 _LINK_ITEM = ("id", "title", "namespace", "chars")
+# LSBN-F-16: строка карты окружения — свой белый список. `direction` (только
+# mention) и `truncated` (деградация бюджета, F-13) — опциональные ключи, их
+# добирает `_map_row` при наличии (в базовом белом списке их нет).
+_MAP_ITEM = ("id", "title", "namespace", "kind")
 _NS_ITEM = ("path", "description", "status", "notes_count", "subtree_count", "updated_at")
+
+# Диапазоны и дефолты параметров карты окружения (LSBN-F-16): константы кода,
+# не env (по прецеденту бюджетов F-13). map_limit 1..20 — свой потолок карты,
+# не LIMIT_TOP: карта — обзор, страница точечного чтения больше не нужна.
+MAP_LIMIT_MIN = 1
+MAP_LIMIT_MAX = 20
+MAP_LIMIT_DEFAULT = 8
+
+# Мягкие отказы параметров карты (как mode/detail: fail + hint, не ошибки).
+HINT_MAP_SINGLE_ID = "map works on a single id — pass a single id (not a list)"
+HINT_INVALID_MAP_LEVEL = "map_level must be one of: auto, 1, 0"
+HINT_INVALID_MAP_LIMIT = (
+    f"map_limit out of range; expected {MAP_LIMIT_MIN}..{MAP_LIMIT_MAX}"
+)
+HINT_INVALID_MAP_OFFSET = "map_offset must be >= 0"
 
 # LSBN-F-13 (3.4.0, решение О. 21.10): сокращение выдачи — ПОВЕДЕНИЕ ПО
 # УМОЛЧАНИЮ. Дефолтные выдачи чтения — ШАПКИ в бюджете символов; полный
@@ -912,6 +933,53 @@ async def _links_of(services: Services, note_id: int) -> list[dict[str, Any]]:
         return []
     links = await asyncio.to_thread(services.links.related, note_id)
     return [_pick(item, _LINK_ITEM) for item in links]
+
+
+def _map_row(item: dict[str, Any]) -> dict[str, Any]:
+    """Строка карты окружения: белый список + опциональные ключи (LSBN-F-16).
+
+    Базовые поля — `_MAP_ITEM`; `direction` (только у `mention`) и
+    `truncated` (деградация бюджета, F-13) копируются при наличии — ключи
+    необязательны, поэтому мимо `_pick` (тот падает громко на пропаже).
+    """
+    row = _pick(item, _MAP_ITEM)
+    for extra in ("direction", "truncated"):
+        if extra in item:
+            row[extra] = item[extra]
+    return row
+
+
+async def _map_of(
+    services: Services, note_id: int, level: str, limit: int, offset: int
+) -> dict[str, Any]:
+    """Карта окружения заметки для MCP-выдачи (LSBN-F-16).
+
+    Замена перечня `links` при `map=true` одиночного чтения: сосед построчно,
+    источник и страница — в `LinksService.neighborhood` (NoteService о связях
+    не знает, arch §3.5), форма — на транспорте. Синхронный SQL уводим в
+    поток. Строки влезают в свой потолок символов `MAP_BUDGET_CHARS_DEFAULT`
+    (`budget_chars` к одиночному чтению не применяется — F-13): не влезающая
+    строка деградирует до шапки с `"truncated": true`, одна hint «read
+    point-wise» — как в F-13. Пустая карта (нет связей) — `neighbors: []`
+    без ошибки и без `hint` (FR-3.3). `Services.links` в DI-сборках тестов
+    может быть None — деградируем до пустой карты (как `_links_of`).
+    """
+    if services.links is None:
+        return {"neighbors": [], "map_level_used": 0, "total": 0}
+    data = await asyncio.to_thread(
+        services.links.neighborhood, note_id, level, limit, offset
+    )
+    fitted, cut, _ = fit_within_budget(
+        data["neighbors"], MAP_BUDGET_CHARS_DEFAULT
+    )
+    out: dict[str, Any] = {
+        "neighbors": [_map_row(item) for item in fitted],
+        "map_level_used": data["level_used"],
+        "total": data["total"],
+    }
+    if cut:
+        out["hint"] = truncation_hint(cut, MAP_BUDGET_CHARS_DEFAULT)
+    return out
 
 
 def _pick(source: dict, fields: tuple[str, ...]) -> dict[str, Any]:
@@ -2113,6 +2181,34 @@ def build_mcp(
                 "returns the full text",
             ),
         ] = None,
+        map: Annotated[
+            bool,
+            Field(
+                description="Replace `links` with a neighborhood map "
+                "(single id only): one line per neighbor; rows are capped "
+                "by a char budget, overflow degrades to headers with a "
+                "truncation hint",
+            ),
+        ] = False,
+        map_level: Annotated[
+            str,
+            Field(
+                description="Map source: auto — stored links with KNN "
+                "fallback (default), 1 — stored links only (no fallback), "
+                "0 — KNN by vector (kind=cosine)",
+            ),
+        ] = "auto",
+        map_limit: Annotated[
+            int,
+            Field(
+                description="Map page size, "
+                f"{MAP_LIMIT_MIN}..{MAP_LIMIT_MAX} (default {MAP_LIMIT_DEFAULT})",
+            ),
+        ] = MAP_LIMIT_DEFAULT,
+        map_offset: Annotated[
+            int,
+            Field(description="Map page start, 0-based (default 0)"),
+        ] = 0,
     ) -> dict[str, Any]:
         # FR-3: id (int) — алиас одного id (оборачивается в список).
         # Неоднозначный ввод (оба параметра) отклоняется громко — модель
@@ -2137,6 +2233,30 @@ def build_mcp(
             budget_chars if budget_chars is not None
             else GET_BUDGET_CHARS_DEFAULT
         )
+        # LSBN-F-16: карта окружения — ТОЛЬКО при одиночном чтении (там же,
+        # где `links`); batch карту не носит. Диапазоны параметров — мягкие
+        # отказы (как budget_chars/mode/detail), не исключения.
+        if map:
+            if len(ids) > 1:
+                log_tool_call(
+                    "memory_get", started, failed=True, reason="map read multi id"
+                )
+                return {"notes": [], "hint": HINT_MAP_SINGLE_ID}
+            if map_level not in ("auto", "1", "0"):
+                log_tool_call(
+                    "memory_get", started, failed=True, reason="invalid map_level"
+                )
+                return {"notes": [], "hint": HINT_INVALID_MAP_LEVEL}
+            if not (MAP_LIMIT_MIN <= map_limit <= MAP_LIMIT_MAX):
+                log_tool_call(
+                    "memory_get", started, failed=True, reason="invalid map_limit"
+                )
+                return {"notes": [], "hint": HINT_INVALID_MAP_LIMIT}
+            if map_offset < 0:
+                log_tool_call(
+                    "memory_get", started, failed=True, reason="invalid map_offset"
+                )
+                return {"notes": [], "hint": HINT_INVALID_MAP_OFFSET}
         chunk_mode = query is not None or chunk is not None
         if not chunk_mode:
             # Без query/chunk — чтение списком id. Одиночный id (или список
@@ -2157,6 +2277,16 @@ def build_mcp(
             )
             if len(ids) == 1 and result["notes"]:
                 out = _compact_get(result)
+                if map:
+                    # LSBN-F-16: карта вместо перечня `links` — сосед построчно
+                    # с типом связи (и направлением у mention); свой потолок
+                    # символов (`budget_chars` тут не действует — F-13).
+                    out.update(
+                        await _map_of(
+                            services, ids[0], map_level, map_limit, map_offset
+                        )
+                    )
+                    return out
                 # Связи — только при одиночном чтении (FR-3.2): batch экономит
                 # контекст, поля `links` в нём нет вовсе.
                 out["links"] = await _links_of(services, ids[0])

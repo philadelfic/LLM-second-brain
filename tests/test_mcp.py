@@ -220,13 +220,19 @@ class TestToolsList:
     async def test_get_schema_batch(self, server_url: str) -> None:
         """Контракт FR-3 (lsb-0003): ids — список 1..20 (MAX_GET_BATCH),
         id — алиас; query/chunk/limit — чтение чанка; F-13 (3.4.0) добавляет
-        `budget_chars` — все опциональны."""
+        `budget_chars`; F-16 (3.4.0) — карту окружения `map*` — все
+        опциональны."""
         async with connect(server_url) as session:
             tools = {t.name: t for t in (await session.list_tools()).tools}
         schema = tools["memory_get"].input_schema
         assert set(schema["properties"]) == {
             "ids", "id", "query", "chunk", "limit", "budget_chars",
+            "map", "map_level", "map_limit", "map_offset",
         }
+        assert schema["properties"]["map"]["default"] is False
+        assert schema["properties"]["map_level"]["default"] == "auto"
+        assert schema["properties"]["map_limit"]["default"] == 8
+        assert schema["properties"]["map_offset"]["default"] == 0
         assert schema.get("required") is None
         ids = schema["properties"]["ids"]["anyOf"][0]
         assert ids["maxItems"] == 20  # MAX_GET_BATCH
