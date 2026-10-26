@@ -484,16 +484,8 @@ class TestCompactOutputs:
             "comment",  # no24-01 (3.2.0)
         }
         listed = (await mcp_notes.call_tool("memory_list", {})).structured_content
-        assert set(listed["items"][0]) == {
-            "id",
-            "title",
-            "summary",
-            "chars",
-            "created_at",
-            "updated_at",
-            "namespace",
-            "expires_at",
-        }
+        # F-13 (3.4.0): дефолтная деталь листинга — titles.
+        assert set(listed["items"][0]) == {"id", "title", "namespace"}
 
 
 class TestFormLimits:

@@ -278,15 +278,15 @@ class TestMCPUnchanged:
 
     @pytest.mark.asyncio
     async def test_memory_search_schema_unchanged(self, mcp_server) -> None:
-        """Входы поиска: те же параметры и потолок top_k; no29-01 добавляет
-        только `updated_after` (свежесть) — остальной контракт не тронут."""
+        """Входы поиска: те же параметры и потолок top_k; F-13 (3.4.0)
+        добавляет `budget_chars` — остальной контракт не тронут."""
         schemas = {
             tool.name: tool.input_schema for tool in await mcp_server.list_tools()
         }
         props = schemas["memory_search"]["properties"]
         assert set(props) == {
             "query", "top_k", "namespace", "namespace_exact", "mode",
-            "updated_after",
+            "updated_after", "budget_chars",
         }
         assert props["top_k"]["maximum"] == 20
 

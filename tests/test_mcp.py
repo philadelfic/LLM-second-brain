@@ -219,11 +219,14 @@ class TestToolsList:
     @pytest.mark.asyncio
     async def test_get_schema_batch(self, server_url: str) -> None:
         """Контракт FR-3 (lsb-0003): ids — список 1..20 (MAX_GET_BATCH),
-        id — алиас; query/chunk/limit — чтение чанка, все опциональны."""
+        id — алиас; query/chunk/limit — чтение чанка; F-13 (3.4.0) добавляет
+        `budget_chars` — все опциональны."""
         async with connect(server_url) as session:
             tools = {t.name: t for t in (await session.list_tools()).tools}
         schema = tools["memory_get"].input_schema
-        assert set(schema["properties"]) == {"ids", "id", "query", "chunk", "limit"}
+        assert set(schema["properties"]) == {
+            "ids", "id", "query", "chunk", "limit", "budget_chars",
+        }
         assert schema.get("required") is None
         ids = schema["properties"]["ids"]["anyOf"][0]
         assert ids["maxItems"] == 20  # MAX_GET_BATCH
@@ -283,11 +286,11 @@ class TestToolsList:
 
     @pytest.mark.asyncio
     async def test_list_schema_detail(self, server_url: str) -> None:
-        """FR-4.1: detail в схеме memory_list, дефолт 'summaries'."""
+        """FR-4.1: detail в схеме memory_list; F-13 (3.4.0): дефолт 'titles'."""
         async with connect(server_url) as session:
             tools = {t.name: t for t in (await session.list_tools()).tools}
         props = tools["memory_list"].input_schema["properties"]
-        assert props["detail"]["default"] == "summaries"
+        assert props["detail"]["default"] == "titles"
 
 
 class TestToolCalls:
@@ -484,33 +487,35 @@ class TestMemoryFlow:
 
     @pytest.mark.asyncio
     async def test_search_returns_no_full_text(self, server_url: str) -> None:
-        """FR-1 (Фаза 9): компактные хиты без snippet/оценок; warning срезан."""
+        """FR-1 (Фаза 9): компактные хиты без snippet/оценок; warning срезан.
+        F-13 (3.4.0): дефолт — шапки {id, title, namespace, chars, score}."""
         text = f"{self.marker}: квантовый кулер в стойке 192.168.7.7"
         async with connect(server_url) as session:
             await _saved_id(session, text)
             found = (await session.call_tool(
                 "memory_search", {"query": "квантовый кулер"}
             )).structured_content
-        # Тестовая среда без семантики: fallback-усечение summary начинается
-        # с маркера — по нему и выбираем хит (ранее выбор шёл по snippet).
-        hit = next(
-            r for r in found["results"] if r["summary"].startswith(f"{self.marker}")
-        )
+        # Тестовая среда без семантики; шапки без summary — хит выбираем
+        # по объёму полного текста (chars = len текста нашей заметки).
+        hit = next(r for r in found["results"] if r["chars"] == len(text))
         assert set(hit) == {
-            "id", "summary", "chars", "created_at", "updated_at", "namespace", "title",
-        }  # Фаза 11 (решение №9): +title (ключ резервируется — search.py вне пула 5)
+            "id", "title", "namespace", "chars", "score",
+        }  # F-13 (решение О. 21.10): шапки вместо саммари; title — soft-ключ
         assert hit["chars"] == len(text)  # lsb-0010-04: chars — полный текст
+        assert hit["title"] == "Тестовая заметка"  # title — soft-ключ шапки
         assert hit["namespace"] == "default"
         assert "snippet" not in hit
         assert "cosine" not in hit
-        assert "rrf_score" not in hit
+        assert "rrf_score" not in hit  # в выдаче score (округлён), не rrf_score
+        assert "summary" not in hit  # саммари — точечным чтением по id
         assert "summary_status" not in hit
         assert "author" not in hit
         assert "text" not in hit
         assert "warning" not in found  # warning срезан даже при деградации
 
     @pytest.mark.asyncio
-    async def test_list_shows_summaries_only(self, server_url: str) -> None:
+    async def test_list_default_shows_titles_only(self, server_url: str) -> None:
+        """F-13 (3.4.0): дефолтная деталь листинга — titles (компактно)."""
         async with connect(server_url) as session:
             await _saved_id(session, f"{self.marker}: для списка")
             listed = (await session.call_tool(
@@ -519,10 +524,8 @@ class TestMemoryFlow:
         assert listed["total"] >= 1
         assert listed["items"]  # среди первой страницы есть наша
         for item in listed["items"]:
-            assert set(item) == {
-                "id", "summary", "chars", "created_at", "updated_at", "namespace", "title",
-                "expires_at",  # lsb-0004-02
-            }  # Фаза 11 (решение №9): +title; lsb-0010-04: +chars
+            assert set(item) == {"id", "title", "namespace"}  # F-13: titles
+            assert "summary" not in item  # саммари — явная деталь summaries
             assert "summary_status" not in item
             assert "author" not in item
 
@@ -543,21 +546,18 @@ class TestMemoryFlow:
         assert "created_at" not in hit
 
     @pytest.mark.asyncio
-    async def test_search_semantic_mode_unchanged(self, server_url: str) -> None:
-        """FR-3.2: mode='semantic' — как раньше (компактный контракт semantic)."""
+    async def test_search_semantic_mode_headers(self, server_url: str) -> None:
+        """FR-3.2: mode='semantic' явно — дефолтные шапки F-13 (3.4.0)."""
         text = f"{self.marker}: семантический режим явно"
         async with connect(server_url) as session:
             await _saved_id(session, text)
             found = (await session.call_tool(
                 "memory_search", {"query": "семантический режим", "mode": "semantic"}
             )).structured_content
-        hit = next(
-            r for r in found["results"] if r["summary"].startswith(f"{self.marker}")
-        )
-        assert set(hit) == {
-            "id", "summary", "chars", "created_at", "updated_at", "namespace", "title",
-        }
-        assert "score" not in hit
+        hit = next(r for r in found["results"] if r["chars"] == len(text))
+        assert set(hit) == {"id", "title", "namespace", "chars", "score"}
+        assert "summary" not in hit
+        assert "created_at" not in hit
 
     @pytest.mark.asyncio
     async def test_search_invalid_mode_soft_fail(self, server_url: str) -> None:
@@ -712,7 +712,12 @@ class TestMemoryFlow:
             )).structured_content
         notes = got["notes"]
         assert [note["id"] for note in notes] == [id1, id2]  # порядок запроса
-        assert [note["text"] for note in notes] == [first_text, second_text]
+        # F-13 (3.4.0): batch — шапки; объём полного текста подтверждает
+        # порядок так же, как раньше делал текст.
+        assert [note["chars"] for note in notes] == [
+            len(first_text), len(second_text),
+        ]
+        assert all("text" not in note for note in notes)
         assert "hint" not in got  # успешный ответ — без hint (Фаза 9)
 
     @pytest.mark.asyncio
@@ -833,7 +838,8 @@ class TestTitleMCP:
         assert upd["updated"] is False
         assert upd["hint"] == "set a title ≤5 words"
         item = next(i for i in listed["items"] if i["id"] == note_id)
-        assert item["summary"].startswith(f"{self.marker}: апдейт плохого названия")
+        # Заметка не тронута: невалидное название не записалось (дефолтное на месте).
+        assert item["title"] == "Тестовая заметка"
 
     @pytest.mark.asyncio
     async def test_get_note_has_no_title(self, server_url: str) -> None:

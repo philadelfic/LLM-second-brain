@@ -490,14 +490,13 @@ class TestOtherOutputsRegression:
         )
         assert {"id", "stored", "summary_pending"} <= set(note)  # №28: + namespace_hint
         found = await _call(mcp_full, "memory_search", {"query": "regression"})
+        # F-13 (3.4.0): дефолт semantic-поиска — шапки с score.
         assert set(found["results"][0]) == {
             "id",
-            "summary",
-            "chars",
-            "created_at",
-            "updated_at",
-            "namespace",
             "title",
+            "namespace",
+            "chars",
+            "score",
         }
         skill = await _call(
             mcp_full,
