@@ -393,6 +393,8 @@ class LinksService:
         решение гейта 4A: без него строки устарели), `"0"` — только KNN-пул.
         Отданный источник виден в `level_used` (0|1); у уровня 0 вида у соседа
         нет — достраивается `"kind": "cosine"` (это и есть способ уровня 0).
+        Для `"1"` источник — всегда 1: и когда связей нет, и когда маркер
+        `links_at` сброшен (устаревшие строки не отдаются, фолбэка нет).
         У вида `mention` строка получает `direction` (`_mention_directions`):
         «out» — название соседа в text этой заметки, «in» — наоборот;
         симметричным видам (`entities`/`cosine`) направления нет. Страница —
@@ -413,6 +415,8 @@ class LinksService:
         rows: list[dict[str, Any]] = []
         total = 0
         level_used = 0
+        if level == "1":
+            level_used = 1  # источник — хранимые связи, даже если отдали пусто
         if level in ("1", "auto") and links_at is not None:
             rows, total = self._neighborhood_level1(
                 note_id, own_namespace, limit, offset
