@@ -32,6 +32,10 @@ from app.services.judge import JudgeService
 from app.services.links import LinksService
 from app.services.llm_client import LLMClient, SlotSpec
 from app.services.logs import LogsService
+# LSBN-F-22 (M2): импорт модуля регистрирует джобу `migration` в реестре
+# каркаса (`jobs.JOB_BUILDERS`) — как `warnings`/`terms_normalize`
+# (импорт односторонний: migration → jobs).
+from app.services.migration import MigrationService
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
 from app.services.operations import OPERATIONS
@@ -58,6 +62,7 @@ __all__ = [
     "LinksService",
     "LLMClient",
     "LogsService",
+    "MigrationService",
     "NamespaceService",
     "NoteService",
     "PromotionService",
@@ -222,7 +227,9 @@ def build_services(
                 settings,
                 llm={
                     operation: operation_clients[operation]
-                    for operation in ("summarize", "title", "merge")
+                    # "split" — нарезка миграции (LSBN-F-22 M2): тот же
+                    # реестр операций, SPLIT_* env → наследование слота.
+                    for operation in ("summarize", "title", "merge", "split")
                 },
                 registry=registry,
             )
