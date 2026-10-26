@@ -323,7 +323,10 @@ class Settings(BaseSettings):
     job_terms_contexts_excess: int = 5
 
     # --- лимиты (NFR-6: env-переопределяемы, валидируются; см. _validate_ranges) ---
-    max_note_chars: int = 35000  # 2000→20000 (Фаза 7) → 35000 (решение О. 2026-08-30)
+    # LSBN-F-22 (решение О. 15.10.2026): 35000 → 1500 — после S-1 мягкий
+    # лимит заметки 1500 стал и целью схемы; расхождение env с живым CHECK
+    # больше не фатально — стартует самомиграция (app/storage/migration.py).
+    max_note_chars: int = 1500  # 2000→20000 (Фаза 7) → 35000 (2026-08-30) → 1500 (F-22)
     max_query_chars: int = 512
     # no24-01 (3.2.0): лимит пометки заметки `comment` (доменная валидация,
     # не CHECK схемы; мягкий отказ CommentValidationError).
