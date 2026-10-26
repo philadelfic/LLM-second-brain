@@ -37,6 +37,23 @@ class TestHealth:
         assert backups["count"] in (0, 1)
         assert backups["bad"] == 0
         assert backups["total_bytes"] >= 0
+        # LSBN-F-34 (решение №4 брифа): модель/провайдер/источник по операции,
+        # БЕЗ адресов и ключей (форма проверяется здесь, значения — в
+        # tests/test_api_health_slots.py).
+        operations = body.pop("operations")
+        assert set(operations) == {
+            "summarize",
+            "title",
+            "merge",
+            "split",
+            "classify",
+            "describe",
+            "judge",
+            "structure_judge",
+            "embed",
+        }
+        for snapshot in operations.values():
+            assert set(snapshot) == {"model", "provider", "source"}
         assert body == {
             "status": "ok",
             "version": __version__,
@@ -104,6 +121,7 @@ class TestHealth:
             "pending_summary",
             "queues",
             "slots",
+            "operations",
             "areas",
             "warnings",
             "decision",

@@ -216,12 +216,20 @@ _SLOT_JOB_NAMES = {
 
 
 def _call_meta_fields(meta: ChatMeta) -> dict[str, object]:
-    """Поля вызова для события отказа (§7.2): цифры/признаки, без секретов."""
+    """Поля вызова для события отказа (§7.2): цифры/признаки, без секретов.
+
+    LSBN-F-34 (решение №4 брифа): адрес слота (`base_url`) и источник
+    конфигурации операции (`config_source`: op|slot|default) идут в журнал —
+    в успешный `slot_call` (через `_call_log_fields`) и в событие джобы при
+    ошибке. Наружные поверхности (/health) адреса не показывают.
+    """
     return {
         "operation": meta.operation,
         "model_type": meta.model_type,
         "budget": meta.budget,
         "budget_source": meta.budget_source,
+        "base_url": meta.base_url,
+        "config_source": meta.config_source,
         "prompt_tokens": meta.prompt_tokens,
         "completion_tokens": meta.completion_tokens,
         "reasoning_tokens": meta.reasoning_tokens,

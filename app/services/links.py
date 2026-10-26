@@ -34,6 +34,12 @@
 сброшены правкой `text`/`title`), значит хранимые строки устарели — сразу
 фолбэк на уровень 0 (решение гейта 4A). Форму компактной выдачи для модели
 собирает транспорт (`mcp.py`), полный контракт — `rest.py`.
+
+Карта окружения (LSBN-F-16, релиз 3.4.0) — компрессор того же графа:
+`neighborhood` отдаёт по строке на соседа (`{id, title, namespace, kind}` +
+`direction` у вида `mention`), с уровнем-источником (`auto`/`1`/`0`),
+страницей (`limit`/`offset`) и `total` того же фильтра; источник отдаётся
+как `level_used`, уровень 0 достраивается `"kind": "cosine"`.
 """
 
 from __future__ import annotations
@@ -98,15 +104,29 @@ _QUEUE_STAT_SQL = (
 # строка с высшим приоритетом) → `score` DESC → свежесть → id DESC; потолок —
 # параметр LIMIT. Запрос зовётся только когда у заметки проставлен маркер
 # `links_at` (решение гейта 4A): без маркера хранимые строки устарели.
+# LSBN-F-16: `l.kind AS kind` — тип связи в строке карты окружения (перечень
+# `related` поле игнорирует), OFFSET — страница карты (`map_offset`).
 _RELATED_SQL = (
     "SELECT n.id AS id, n.title AS title, n.namespace AS namespace, "
-    "n.text AS text FROM links l JOIN notes n ON n.id = "
+    "l.kind AS kind, n.text AS text FROM links l JOIN notes n ON n.id = "
     "CASE WHEN l.note_a = ? THEN l.note_b ELSE l.note_a END "
     "WHERE (l.note_a = ? OR l.note_b = ?) AND n.deleted_at IS NULL "
     "AND n.namespace != ? "
     "AND n.namespace IN (SELECT path FROM namespaces) "
     "ORDER BY CASE l.kind WHEN 'mention' THEN 3 WHEN 'entities' THEN 2 "
-    "ELSE 1 END DESC, l.score DESC, n.updated_at DESC, n.id DESC LIMIT ?"
+    "ELSE 1 END DESC, l.score DESC, n.updated_at DESC, n.id DESC "
+    "LIMIT ? OFFSET ?"
+)
+
+# Тот же фильтр, что у `_RELATED_SQL`, без порядка и страницы — `total`
+# карты окружения (LSBN-F-16): пагинация `map_limit`/`map_offset` считает
+# «сколько всего», а не только размер отданной страницы.
+_RELATED_COUNT_SQL = (
+    "SELECT COUNT(*) AS total FROM links l JOIN notes n ON n.id = "
+    "CASE WHEN l.note_a = ? THEN l.note_b ELSE l.note_a END "
+    "WHERE (l.note_a = ? OR l.note_b = ?) AND n.deleted_at IS NULL "
+    "AND n.namespace != ? "
+    "AND n.namespace IN (SELECT path FROM namespaces)"
 )
 
 # Стоп-слова значимых слов (ru+en) — константа кода, не env (arch §3.3).
@@ -287,7 +307,8 @@ class LinksService:
         """
         with session(self._settings) as conn:
             rows = conn.execute(
-                _RELATED_SQL, (note_id, note_id, note_id, own_namespace, top)
+                _RELATED_SQL,
+                (note_id, note_id, note_id, own_namespace, top, 0),
             ).fetchall()
         return [
             {
@@ -302,10 +323,22 @@ class LinksService:
     def _related_level0(
         self, note_id: int, own_namespace: str, top: int
     ) -> list[dict[str, Any]]:
-        """Уровень 0 (arch §3.1): пул `LINK_POOL` из KNN по полному вектору заметки
-        (без фильтра неймспейса) → отсечения (свой неймспейс, soft-deleted,
-        заметки удалённых узлов) → потолок `LINK_TOP`. Сортировка — по убыванию
-        близости (порядок `similar_notes`)."""
+        """Уровень 0 (arch §3.1): полный пул после отсечений, срезанный до
+        `top` (потолок `LINK_TOP`). Порядок — по убыванию близости."""
+        if top < 1:
+            return []
+        return self._related_level0_pool(note_id, own_namespace)[:top]
+
+    def _related_level0_pool(
+        self, note_id: int, own_namespace: str
+    ) -> list[dict[str, Any]]:
+        """Полный отсечённый пул уровня 0 (arch §3.1) — база `related` (режется
+        `LINK_TOP`) и карты окружения (режется страницей `map_offset`, F-16).
+
+        Пул `LINK_POOL` из KNN по полному вектору заметки (без фильтра
+        неймспейса) → отсечения (свой неймспейс, soft-deleted, заметки
+        удалённых узлов). Сортировка — по убыванию близости (порядок
+        `similar_notes`)."""
         candidates = self._search.similar_notes(
             note_id,
             self._settings.link_pool,
@@ -342,9 +375,132 @@ class LinksService:
                     "chars": len(row["text"]),
                 }
             )
-            if len(result) >= top:
-                break
         return result
+
+    # --- карта окружения заметки (LSBN-F-16, релиз 3.4.0) --------------------
+
+    def neighborhood(
+        self, note_id: int, level: str, limit: int, offset: int
+    ) -> dict[str, Any]:
+        """Карта окружения заметки: по строке на соседа, с типом связи.
+
+        Компрессор чтения (LSBN-F-16): вместо перечня `related` (объём каждой
+        заметки, «открой и посмотри») — построчная карта `{id, title,
+        namespace, kind}`, по которой агент раскрывает 1–2 заметки точечным
+        чтением. Источник задаёт `level`: `"auto"` — как `related` (уровень 1
+        при проставленном маркере `links_at`, иначе и фолбэком — уровень 0),
+        `"1"` — только хранимые связи (без фолбэка; тоже лишь при маркере —
+        решение гейта 4A: без него строки устарели), `"0"` — только KNN-пул.
+        Отданный источник виден в `level_used` (0|1); у уровня 0 вида у соседа
+        нет — достраивается `"kind": "cosine"` (это и есть способ уровня 0).
+        Для `"1"` источник — всегда 1: и когда связей нет, и когда маркер
+        `links_at` сброшен (устаревшие строки не отдаются, фолбэка нет).
+        У вида `mention` строка получает `direction` (`_mention_directions`):
+        «out» — название соседа в text этой заметки, «in» — наоборот;
+        симметричным видам (`entities`/`cosine`) направления нет. Страница —
+        `limit`/`offset`, `total` — размер ТОГО же фильтра без страницы
+        (пагинация карты). Диапазоны `limit`/`offset` и значение `level`
+        проверяет транспорт (мягкие отказы ручки). Отсутствие связей —
+        нормальный ответ: `neighbors: []` без ошибки. Нет активной заметки с
+        таким id — пустая карта, `level_used: 0`.
+        """
+        if level not in ("auto", "1", "0"):
+            raise ValueError(f"unknown neighborhood level: {level!r}")
+        if limit < 1 or offset < 0:
+            return {"neighbors": [], "level_used": 0, "total": 0}
+        own = self._note_state(note_id)
+        if own is None:
+            return {"neighbors": [], "level_used": 0, "total": 0}
+        own_namespace, links_at = own
+        rows: list[dict[str, Any]] = []
+        total = 0
+        level_used = 0
+        if level == "1":
+            level_used = 1  # источник — хранимые связи, даже если отдали пусто
+        if level in ("1", "auto") and links_at is not None:
+            rows, total = self._neighborhood_level1(
+                note_id, own_namespace, limit, offset
+            )
+            level_used = 1
+        if level != "1" and not rows:
+            pool = self._related_level0_pool(note_id, own_namespace)
+            total = len(pool)
+            rows = pool[offset : offset + limit]
+            level_used = 0
+        neighbors = [
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "namespace": row["namespace"],
+                "kind": row["kind"] if level_used == 1 else "cosine",
+            }
+            for row in rows
+        ]
+        if level_used == 1:
+            self._mention_directions(note_id, neighbors)
+        return {"neighbors": neighbors, "level_used": level_used, "total": total}
+
+    def _neighborhood_level1(
+        self, note_id: int, own_namespace: str, limit: int, offset: int
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Страница связей уровня 1 + `total` того же фильтра (LSBN-F-16).
+
+        Тот же запрос, что у `_related_level1` (`_RELATED_SQL`: отсечения при
+        выдаче, порядок «приоритет вида → score → свежесть → id»), со страницей
+        LIMIT/OFFSET; отдельный `COUNT(*)` того же фильтра без страницы даёт
+        `total` для пагинации карты. Зовётся только для заметки с маркером
+        `links_at` (решение гейта 4A, см. `neighborhood`).
+        """
+        with session(self._settings) as conn:
+            rows = conn.execute(
+                _RELATED_SQL,
+                (note_id, note_id, note_id, own_namespace, limit, offset),
+            ).fetchall()
+            total = int(
+                conn.execute(
+                    _RELATED_COUNT_SQL,
+                    (note_id, note_id, note_id, own_namespace),
+                ).fetchone()["total"]
+            )
+        return (
+            [
+                {
+                    "id": row["id"],
+                    "title": row["title"],
+                    "namespace": row["namespace"],
+                    "kind": row["kind"],
+                }
+                for row in rows
+            ],
+            total,
+        )
+
+    def _mention_directions(
+        self, note_id: int, neighbors: list[dict[str, Any]]
+    ) -> None:
+        """Достроить `direction` строкам вида `mention` (LSBN-F-16, на месте).
+
+        «out» — название соседа встречается в text этой заметки (эта заметка
+        упоминает соседа), «in» — наоборот (связь помнит другая сторона: её
+        пересчёт нашёл название этой заметки в text соседа). Дёшево: одна
+        выборка text заметки на вызов, дальше casefold-подстроки по названиям;
+        симметричным видам (`entities`/`cosine`) направления не достраивается —
+        сущность выдумывать нечестно (решение по вопросу №3).
+        """
+        mention = [row for row in neighbors if row["kind"] == "mention"]
+        if not mention:
+            return
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT text FROM notes WHERE id = ? AND deleted_at IS NULL",
+                (note_id,),
+            ).fetchone()
+        haystack = row["text"].casefold() if row is not None else ""
+        for item in mention:
+            title = (item["title"] or "").strip()
+            item["direction"] = (
+                "out" if title and title.casefold() in haystack else "in"
+            )
 
     # --- уровень 1: расчёт и гигиена ---------------------------------------
 

@@ -64,12 +64,18 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import httpx
 
 from app.config import Settings
+from app.services.operations import (
+    OPERATIONS,
+    OPERATION_FIELD_DEFAULTS,
+    SPEC_FIELDS,
+    resolve_operation,
+)
 from app.services.ollama_gate import ollama_slot
 from app.services.slot_budget import resolve_output_budget
 from app.services.splitter import count_tokens
@@ -239,6 +245,11 @@ class SlotSpec:
     reasoning_min_output_tokens: int = 4096
     num_predict: int = 0
     min_timeout_sec: int = 300
+    # LSBN-F-34: источник МОДЕЛИ этого spec (`op` | `slot` | `default`) —
+    # плоское env операции, env слота или дефолт. Заполняет for_operation;
+    # слот-фабрики оставляют «slot» (их модель — env слота). Идёт в ChatMeta
+    # (журнал) и /health.operations; адрес/ключ здесь не дублируются.
+    model_source: str = "slot"
 
     @classmethod
     def for_embedding(cls, settings: Settings) -> SlotSpec:
@@ -293,6 +304,50 @@ class SlotSpec:
         )
 
     @classmethod
+    def for_operation(
+        cls, operation: str, settings: Settings
+    ) -> tuple[SlotSpec, dict[str, str]]:
+        """Эффективный spec ОПЕРАЦИИ (LSBN-F-34) + источник каждого поля.
+
+        Цепочка разрешения по каждому полю: плоский env операции
+        (`<ОПЕРАЦИЯ>_<ПОЛЕ>`) → env слот-группы → дефолт (значения слот-
+        фабрики выше). Возвращает `(SlotSpec, sources)`, где `sources` —
+        полное покрытие `OPERATION_FIELDS` значениями `op` | `slot` |
+        `default`; поля слоя `op` в словаре значений содержат ТОЛЬКО
+        переопределённые. Операция, чьё имя совпадает со слот-группой
+        (`judge`), отдельного слоя не имеет — её env и есть env слота.
+        Кодовые дефолты операций (`OPERATION_FIELD_DEFAULTS`, например
+        бюджет описания 128) применяются, когда не заданы ни операция,
+        ни слот. Резервный слот (decision, механика F-12) здесь не участвует:
+        переопределение операции действует только на основном пути.
+        """
+        slot = OPERATIONS.get(operation)
+        if slot is None:
+            raise ValueError(
+                f"неизвестная операция: {operation} (реестр: "
+                + ", ".join(sorted(OPERATIONS))
+                + ")"
+            )
+        factory = {
+            "embedding": cls.for_embedding,
+            "summary": cls.for_summary,
+            "judge": cls.for_judge,
+        }[slot]
+        base = factory(settings)
+        values, sources = resolve_operation(operation, settings)
+        updates: dict[str, object] = {}
+        for field, value in values.items():
+            updates[SPEC_FIELDS[field]] = (
+                float(value) if field == "timeout_sec" else value
+            )
+        for field, default in OPERATION_FIELD_DEFAULTS.items():
+            op_name, op_field = field
+            if op_name == operation and op_field not in values and sources.get(op_field) == "default":  # noqa: E501
+                updates[SPEC_FIELDS[op_field]] = default
+        spec = replace(base, **updates, model_source=sources["model"])
+        return spec, sources
+
+    @classmethod
     def for_decision(cls, settings: Settings) -> SlotSpec:
         """Слот решения (LSBN-F-12): нативный ollama-маршрут `/v1/systemone`.
 
@@ -340,6 +395,12 @@ class ChatMeta:
     finish_reason: str | None
     truncated: bool
     duration_ms: int
+    # LSBN-F-34: адрес слота и источник конфигурации операции (`op`/`slot`/
+    # `default`) — решение №4 брифа: наружу (/health) адрес не отдаётся,
+    # в журнал (`slot_call`) и в событие джобы при ошибке — да. Адрес не
+    # секрет (в отличие от ключа, который сюда не попадает никогда).
+    base_url: str = ""
+    config_source: str = "slot"
 
 
 @dataclass(frozen=True)
@@ -408,6 +469,10 @@ class LLMClient:
         # операции (юниты, простые вызовы), а деградация бюджета требует ключа.
         operation = operation or self.spec.name
         prompt_tokens = count_tokens(system_prompt) + count_tokens(user_text)
+        # Явный бюджет вызывающего старше; не задан — действует операционный
+        # потолок spec (LSBN-F-34: плоский env операции → env слота → 0/авто).
+        if num_predict is None:
+            num_predict = self.spec.num_predict or None
         budget, budget_source = resolve_output_budget(
             operation=operation,
             prompt_tokens=prompt_tokens,
@@ -462,6 +527,8 @@ class LLMClient:
             finish_reason=finish_reason,
             truncated=truncated,
             duration_ms=duration_ms,
+            base_url=self.spec.base_url,
+            config_source=self.spec.model_source,
         )
         try:
             content = self._parse_chat_content(data, path, truncated=truncated)

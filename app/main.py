@@ -36,7 +36,9 @@ from app.services.llm_client import (
     CHECK_OK,
     DECISION_CHECK_OK,
     LLMClient,
+    SlotSpec,
 )
+from app.services.operations import OPERATIONS, unknown_operation_warnings
 from app.services.slot_budget import resolve_output_budget
 from app.services.update_check import UpdateChecker
 from app.services.worker import BackgroundWorker
@@ -111,7 +113,86 @@ def _handle_decision_check(
     )
 
 
-async def _provider_startup_check(services: Services) -> None:
+def _log_operation_config_warning(
+    logger: logging.Logger,
+    *,
+    operation: str,
+    slot: str,
+    code: str,
+    text: str,
+    spec: SlotSpec,
+) -> None:
+    """Одно предупреждение конфигурации ОПЕРАЦИИ (LSBN-F-34, arch §13.5).
+
+    Тот же контракт события `slot_config_warning`, что у слотов (main.py
+    пишет, сервис стартует): `slot` — слот-группа операции, `operation` —
+    имя операции из реестра. Эффективный бюджет — тем же
+    `resolve_output_budget`, что и в вызове.
+    """
+    budget, _source = resolve_output_budget(
+        operation=spec.name,
+        prompt_tokens=0,
+        explicit=spec.num_predict or None,
+        context_tokens=spec.context_tokens,
+        reserve_tokens=spec.prompt_reserve_tokens,
+        defensive_cap=spec.max_output_tokens,
+    )
+    logger.warning(
+        text,
+        extra={
+            "event": "slot_config_warning",
+            "slot": slot,
+            "operation": operation,
+            "code": code,
+            "model_type": spec.model_type,
+            "budget": budget,
+            "context_tokens": spec.context_tokens,
+            "timeout_sec": int(spec.read_timeout),
+            "text": text,
+        },
+    )
+
+
+def _operations_config_warnings(logger: logging.Logger, settings: Settings) -> None:
+    """Предупреждения конфигурации операций (LSBN-F-34; решение №4 брифа).
+
+    Те же правила `slot_config_warnings` (таймаут/бюджет/контекст), что у
+    слотов, но по эффективному spec ПЕРЕОПРЕДЕЛЁННОЙ операции — операция без
+    плоского env уже покрыта предупреждениями своего слота, дублей не
+    создаём. Плюс WARN об env с неизвестным именем операции (опечатка вида
+    `MERG_MODEL`) — не фатально, сервис стартует. Вызывается при старте
+    (lifespan), после проверки слотов.
+    """
+    for operation in OPERATIONS:
+        spec, sources = SlotSpec.for_operation(operation, settings)
+        if "op" not in sources.values():
+            continue
+        for code, text in LLMClient.slot_config_warnings(spec):
+            _log_operation_config_warning(
+                logger,
+                operation=operation,
+                slot=spec.name,
+                code=code,
+                text=text,
+                spec=spec,
+            )
+    # Неизвестное имя операции — отдельное событие БЕЗ слота: контракт
+    # `slot_config_warning` (всегда со слотом) не ломается (см.
+    # test_main_startup_warnings).
+    for _code, text in unknown_operation_warnings():
+        logger.warning(
+            text,
+            extra={
+                "event": "unknown_operation_warning",
+                "code": "unknown_operation",
+                "text": text,
+            },
+        )
+
+
+async def _provider_startup_check(
+    services: Services, settings: Settings | None = None
+) -> None:
     """Стартовая проверка трёх LLM-слотов (решение №5) — в lifespan.
 
     После init_db, ДО старта воркера: лёгкий GET к каждому слоту (без
@@ -130,6 +211,8 @@ async def _provider_startup_check(services: Services) -> None:
     (слот, провайдер, исход — аудит в стиле Фазы 10).
     """
     logger = logging.getLogger("app")
+    if settings is None:
+        settings = get_settings()
     slots = _startup_slots(services)
     if not slots:
         # DI-сборка без клиентов слотов (фейки вместо сервисов): проверка —
@@ -222,6 +305,10 @@ async def _provider_startup_check(services: Services) -> None:
                         "text": text,
                     },
                 )
+    # LSBN-F-34 (решение №4 брифа): предупреждения конфигурации операций —
+    # переопределённые плоским env (те же правила, что у слотов) + WARN о
+    # неизвестном имени операции. Сервис стартует (не фатально).
+    _operations_config_warnings(logger, settings)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -325,7 +412,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Стартовая проверка трёх LLM-слотов (решение №5): после init_db,
         # ДО старта воркера — лёгкий GET без генерации, параллельно;
         # отказ авторизации фатален, недоступность — WARN + деградация.
-        await _provider_startup_check(services)
+        # LSBN-F-34: settings переданы явно — предупреждения операций считаются
+        # по тому же снимку настроек, что собрал процесс.
+        await _provider_startup_check(services, settings)
         logging.getLogger("app").info(
             "service started",
             extra={

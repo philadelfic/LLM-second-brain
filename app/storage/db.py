@@ -284,8 +284,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS notes_comment_fts USING fts5(
 
 # Синхронизация индекса пометок с notes (по образцу _TRIGGERS): INSERT всегда
 # (в т.ч. comment IS NULL — «пометки нет»), UPDATE OF comment — спец-команда
-# 'delete' со СТАРЫМ значением + вставка нового. DELETE-триггера нет: заметки
-# soft-delete, физического удаления в штатном пути нет (как у notes_fts).
+# 'delete' со СТАРЫМ значением + вставка нового. DELETE-триггера нет (как у
+# notes_fts): заметки soft-delete; физическое удаление — джоба зачистки TTL
+# (lsb-0004-02), индекс пометок чистится там же спец-командой 'delete' в
+# `delete_note_physical` (LSBN-D-8, 3.4.0).
 _COMMENT_TRIGGERS = (
     """
     CREATE TRIGGER IF NOT EXISTS notes_comment_fts_ai AFTER INSERT ON notes BEGIN
@@ -1850,10 +1852,10 @@ def delete_note_physical(conn: sqlite3.Connection, note_id: int) -> None:
 
     Полное физическое удаление (НЕ soft delete): просроченная заметка должна
     исчезнуть из всех индексов — notes + notes_chunks + notes_chunks_vec +
-    notes_vec + notes_fts + note_expirations + links. Композиция существующих
-    примитивов слоя (chunks.drop_note_chunks, vectors.drop, expirations.delete)
-    + явный DELETE из notes_fts (внешний контент: DELETE-триггера нет, индекс
-    не чистится каскадом) и notes.
+    notes_vec + notes_fts + notes_comment_fts + note_expirations + links.
+    Композиция существующих примитивов слоя (chunks.drop_note_chunks,
+    vectors.drop, expirations.delete) + явный DELETE из notes_fts (внешний
+    контент: DELETE-триггера нет, индекс не чистится каскадом) и notes.
 
     Связи (3.2.0, no46-03): `links` заметки сносятся здесь же, в ТОЙ ЖЕ
     транзакции вызывающего (`DELETE FROM links WHERE note_a = ? OR note_b = ?` —
@@ -1877,6 +1879,20 @@ def delete_note_physical(conn: sqlite3.Connection, note_id: int) -> None:
     # notes_chunks_vec без FK, каскад от notes его не тронет.
     chunks.drop_note_chunks(conn, note_id)
     vectors.drop(conn, note_id)  # notes_vec
+    # LSBN-D-8 (3.4.0): FTS пометок — внешний контент без DELETE-триггера;
+    # спец-команда 'delete' со СТАРЫМ значением comment (образец —
+    # _COMMENT_TRIGGERS), пока строка notes ещё не удалена. Отсутствующей
+    # заметки нет — пропускаем (идемпотентно), остальные DELETE ниже просто
+    # не матчат ничего.
+    comment_row = conn.execute(
+        "SELECT comment FROM notes WHERE id = ?", (note_id,)
+    ).fetchone()
+    if comment_row is not None:
+        conn.execute(
+            "INSERT INTO notes_comment_fts(notes_comment_fts, rowid, comment) "
+            "VALUES ('delete', ?, ?)",
+            (note_id, comment_row["comment"]),
+        )
     conn.execute("DELETE FROM notes_fts WHERE rowid = ?", (note_id,))
     conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
     expirations.delete(conn, note_id)  # note_expirations

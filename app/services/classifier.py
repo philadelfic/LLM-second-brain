@@ -140,11 +140,16 @@ class ClassificationService:
         # LSBN-F-12: decision-слот (None — выключен, поведение v3.1.0).
         self._decider = decider
         # DI сборки (общий клиент слота summary) или свой клиент с
-        # transport-инъекцией для юнит-тестов (MockTransport).
+        # transport-инъекцией для юнит-тестов (MockTransport). Операция
+        # `classify` (LSBN-F-34): плоский env CLASSIFY_* переопределяет
+        # конфигурацию разметки поверх слота summary; decision-резерв
+        # (LSBN-F-12) остаётся на своих DECISION_*.
         self._llm = (
             llm
             if llm is not None
-            else LLMClient(SlotSpec.for_summary(settings), transport=transport)
+            else LLMClient(
+                SlotSpec.for_operation("classify", settings)[0], transport=transport
+            )
         )
         # None — попыток не было (health не врёт до первых данных).
         self.last_attempt_ok: bool | None = None

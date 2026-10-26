@@ -85,6 +85,56 @@ def test_physical_delete_purges_history_soft_delete_keeps_it(
     assert [int(row["version"]) for row in _versions(ENTITY_NOTE, trashed_id)] == [1, 2]
 
 
+def test_physical_delete_purges_comment_fts_soft_delete_keeps_it(
+    service: NoteService,
+) -> None:
+    """LSBN-D-8: физическое удаление чистит FTS пометок, soft delete — нет.
+
+    `notes_comment_fts` — внешний контент без DELETE-триггера: до 3.4.0
+    термы пометки удалённой заметки оставались в файле (замер 17.10.2026),
+    нарушая обещание жёсткого удаления «данных нет» (TTL-заметки с
+    чувствительной пометкой). Soft delete пометку и её индекс хранит —
+    заметка восстановима вместе с пометкой.
+    """
+    settings = get_settings()
+    marker = "ксилофонограмма"
+    gone_id = int(
+        service.save(unique("Пометка: физическое удаление"), title="Пометка")["id"]
+    )
+    assert (
+        service.update(gone_id, comment=f"пометка уходит {marker}")["updated"] is True
+    )
+    trashed_id = int(
+        service.save(unique("Пометка: soft delete"), title="Пометка две")["id"]
+    )
+    assert (
+        service.update(trashed_id, comment=f"пометка остаётся {marker}")["updated"]
+        is True
+    )
+
+    def fts_hits() -> int:
+        with session(settings) as conn:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM notes_comment_fts "
+                    "WHERE notes_comment_fts MATCH ?",
+                    (f'"{marker}"',),
+                ).fetchone()[0]
+            )
+
+    assert fts_hits() == 2  # обе пометки индексированы
+
+    _physical_delete(settings, gone_id)
+
+    # Физическое удаление: термы пометки ушли из FTS (осталась только
+    # мягко удалённая — её строка и индекс сохранены).
+    assert fts_hits() == 1
+    with session(settings) as conn:
+        assert conn.execute(
+            "SELECT comment FROM notes WHERE id = ?", (trashed_id,)
+        ).fetchone()["comment"] == f"пометка остаётся {marker}"
+
+
 def test_reused_id_full_save_update_history_path(service: NoteService) -> None:
     """lsbdef-0014: после физического удаления id переиспользуется — полный путь жив.
 

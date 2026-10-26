@@ -119,6 +119,97 @@ class Settings(BaseSettings):
     slot_reasoning_min_output_tokens: int = 4096
     slot_min_timeout_sec: int = 300
 
+    # --- операции поверх слотов (LSBN-F-34, релиз 3.4.0; канон 4.2.8) --------
+    # Плоские env `<ОПЕРАЦИЯ>_<ПОЛЕ>` (без префикса OP_, решение О. 21.10.2026)
+    # переопределяют конфигурацию ОДНОГО процесса поверх слот-группы: цепочка
+    # разрешения по каждому полю — env операции → env слота → дефолт. None =
+    # «не задано» — наследуется слот, частичное переопределение (только
+    # MERGE_MODEL) — норма; операции без переопределения ведут себя как
+    # раньше. Реестр операций — app/services/operations.py; поля: MODEL,
+    # PROVIDER, BASE_URL, API_KEY, THINK, NUM_PREDICT, TIMEOUT_SEC,
+    # CONTEXT_TOKENS, MODEL_TYPE. Секреты (API_KEY) в /health и отпечаток
+    # конфигурации не попадают. Исторический `merge_num_predict` — уже
+    # операционный env: поглощён механизмом, поведение прежнее (0 = авто,
+    # наследование слота для merge не включается).
+    summarize_model: str | None = None
+    summarize_provider: str | None = None
+    summarize_base_url: str | None = None
+    summarize_api_key: str | None = None
+    summarize_think: bool | None = None
+    summarize_num_predict: int | None = None
+    summarize_timeout_sec: int | None = None
+    summarize_context_tokens: int | None = None
+    summarize_model_type: str | None = None
+
+    title_model: str | None = None
+    title_provider: str | None = None
+    title_base_url: str | None = None
+    title_api_key: str | None = None
+    title_think: bool | None = None
+    title_num_predict: int | None = None
+    title_timeout_sec: int | None = None
+    title_context_tokens: int | None = None
+    title_model_type: str | None = None
+
+    merge_model: str | None = None
+    merge_provider: str | None = None
+    merge_base_url: str | None = None
+    merge_api_key: str | None = None
+    merge_think: bool | None = None
+    merge_timeout_sec: int | None = None
+    merge_context_tokens: int | None = None
+    merge_model_type: str | None = None
+
+    split_model: str | None = None
+    split_provider: str | None = None
+    split_base_url: str | None = None
+    split_api_key: str | None = None
+    split_think: bool | None = None
+    split_num_predict: int | None = None
+    split_timeout_sec: int | None = None
+    split_context_tokens: int | None = None
+    split_model_type: str | None = None
+
+    classify_model: str | None = None
+    classify_provider: str | None = None
+    classify_base_url: str | None = None
+    classify_api_key: str | None = None
+    classify_think: bool | None = None
+    classify_num_predict: int | None = None
+    classify_timeout_sec: int | None = None
+    classify_context_tokens: int | None = None
+    classify_model_type: str | None = None
+
+    describe_model: str | None = None
+    describe_provider: str | None = None
+    describe_base_url: str | None = None
+    describe_api_key: str | None = None
+    describe_think: bool | None = None
+    describe_num_predict: int | None = None
+    describe_timeout_sec: int | None = None
+    describe_context_tokens: int | None = None
+    describe_model_type: str | None = None
+
+    structure_judge_model: str | None = None
+    structure_judge_provider: str | None = None
+    structure_judge_base_url: str | None = None
+    structure_judge_api_key: str | None = None
+    structure_judge_think: bool | None = None
+    structure_judge_num_predict: int | None = None
+    structure_judge_timeout_sec: int | None = None
+    structure_judge_context_tokens: int | None = None
+    structure_judge_model_type: str | None = None
+
+    embed_model: str | None = None
+    embed_provider: str | None = None
+    embed_base_url: str | None = None
+    embed_api_key: str | None = None
+    embed_think: bool | None = None
+    embed_num_predict: int | None = None
+    embed_timeout_sec: int | None = None
+    embed_context_tokens: int | None = None
+    embed_model_type: str | None = None
+
     # --- выдача ---
     snippet_chars: int = 120
     max_get_batch: int = 20
@@ -159,6 +250,11 @@ class Settings(BaseSettings):
     judge_timeout_sec: int = 900  # клиентский таймаут вызова судьи
     judge_context_tokens: int = 0  # заявленный контекст модели judge (0 — неизвестен)
     rrf_k: int = 60
+    # Бусты ранжирования после RRF (LSBN-F-14, релиз 3.4.0): операторский
+    # выключатель (false — порядок выдачи ровно как до бустов; доп. SQL по
+    # links не выполняется). Веса бустов — константы кода
+    # app/services/ranking.py, НЕ env (фиксация в каноне через changes.md).
+    ranking_boosts_enabled: bool = True
 
     # --- связи заметок, уровень 0 (lsb-0010, релиз 3.1.0) ---
     # LINK_TOP — потолок связей на заметку (FR-1.1); LINK_LAZY_THRESHOLD —
@@ -472,6 +568,61 @@ class Settings(BaseSettings):
             raise ValueError("LOG_LEVEL — один из " + ", ".join(sorted(LOG_LEVELS)))
         return level
 
+    # --- операции поверх слотов (LSBN-F-34): валидация при задании -----------
+    # Опциональные поля операций (None = «не задано» — наследуется слот)
+    # валидируются теми же правилами, что и слот-поля: провайдер ∈ {ollama,
+    # openai}, тип модели ∈ {reasoning, generation} (decision — отдельный
+    # слот, у операций запрещён).
+    @field_validator(
+        "summarize_provider",
+        "title_provider",
+        "merge_provider",
+        "split_provider",
+        "classify_provider",
+        "describe_provider",
+        "structure_judge_provider",
+        "embed_provider",
+    )
+    @classmethod
+    def _validate_operation_provider(cls, value: str | None) -> str | None:
+        """Провайдер операции — ollama|openai, когда задан (None — слот)."""
+        if value is None:
+            return None
+        provider = value.strip().lower()
+        if provider not in LLM_PROVIDERS:
+            raise ValueError(
+                "провайдер операции — один из " + ", ".join(sorted(LLM_PROVIDERS))
+            )
+        return provider
+
+    @field_validator(
+        "summarize_model_type",
+        "title_model_type",
+        "merge_model_type",
+        "split_model_type",
+        "classify_model_type",
+        "describe_model_type",
+        "structure_judge_model_type",
+        "embed_model_type",
+    )
+    @classmethod
+    def _validate_operation_model_type(cls, value: str | None) -> str | None:
+        """Тип модели операции — reasoning|generation, когда задан."""
+        if value is None:
+            return None
+        model_type = value.strip().lower()
+        if model_type == "decision":
+            raise ValueError(
+                "decision — отдельный слот: enable the decision slot via "
+                "DECISION_ENABLED instead"
+            )
+        if model_type not in LLM_MODEL_TYPES:
+            raise ValueError(
+                "тип модели операции — один из "
+                + ", ".join(sorted(LLM_MODEL_TYPES))
+            )
+        return model_type
+
     @model_validator(mode="after")
     def _validate_ranges(self) -> Settings:
         """Диапазоны всех лимитов и полей, влияющих на поведение (NFR-6).
@@ -663,6 +814,37 @@ class Settings(BaseSettings):
                     f"{self.slot_prompt_reserve_tokens} не меньше контекста "
                     f"{context_field} ({context}) — авто-бюджет всегда упирался бы в минимум"
                 )
+
+        # --- операции поверх слотов (LSBN-F-34): правила слотов, поля опций ---
+        # Заданные плоские env операций валидируются как слот-поля: бюджет ≥ 0
+        # (0 = авто), таймаут ≥ 1, контекст ≥ 0 и запас не съедает контекст.
+        # None = «не задано» — проверять нечего (наследуется слот).
+        for prefix in (
+            "summarize",
+            "title",
+            "merge",
+            "split",
+            "classify",
+            "describe",
+            "structure_judge",
+            "embed",
+        ):
+            num_predict = getattr(self, f"{prefix}_num_predict")
+            if num_predict is not None:
+                need_low(f"{prefix}_num_predict", num_predict, 0)
+            timeout_sec = getattr(self, f"{prefix}_timeout_sec")
+            if timeout_sec is not None:
+                need_low(f"{prefix}_timeout_sec", timeout_sec, 1)
+            context_tokens = getattr(self, f"{prefix}_context_tokens")
+            if context_tokens is not None:
+                need_low(f"{prefix}_context_tokens", context_tokens, 0)
+                if self.slot_prompt_reserve_tokens >= context_tokens:
+                    errors.append(
+                        f"  - slot_prompt_reserve_tokens: запас "
+                        f"{self.slot_prompt_reserve_tokens} не меньше контекста "
+                        f"{prefix}_context_tokens ({context_tokens}) — "
+                        "авто-бюджет всегда упирался бы в минимум"
+                    )
 
         # --- чанковая индексация (Фаза 7) ---
         if self.text_splitter.strip().lower() != "tiktoken":

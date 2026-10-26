@@ -67,11 +67,12 @@ from app.storage.db import DEFAULT_NAMESPACE, session, transaction
 # Описания кандидата строятся по суммари: топ по confidence, детерминированно.
 SUMMARIES_PER_CANDIDATE = 3
 
-# Параметры вызова, не настраиваемые env: маленький бюджет описания
-# (think:false — короткий ответ). Таймауты/температура — уровень клиента
-# слота (LLMClient, Фаза 11): read-таймаут per-slot из Settings;
-# keep_alive не отправляется никому (решение №6 — моделью управляет сервер).
-DESCRIBE_NUM_PREDICT = 512
+# Параметры вызова описания (бюджет 512, think:false) с LSBN-F-34 живут в
+# реестре операций (app/services/operations.OPERATION_FIELD_DEFAULTS —
+# кодовые дефолты операции `describe`) и переопределяются плоским env
+# DESCRIBE_NUM_PREDICT / DESCRIBE_THINK. Таймауты/температура — уровень
+# клиента слота (LLMClient): read-таймаут — цепочка операции; keep_alive
+# не отправляется никому (решение №6 — моделью управляет сервер).
 
 
 def _l2_norm(vec: list[float]) -> float:
@@ -156,12 +157,16 @@ class DescriptionService:
     ) -> None:
         self._settings = settings
         self._prompts = registry if registry is not None else PromptRegistry()
-        # DI сборки (общий клиент слота summary) или свой клиент с
-        # transport-инъекцией для юнит-тестов (MockTransport).
+        # DI сборки или свой клиент с transport-инъекцией для юнит-тестов.
+        # Операция `describe` (LSBN-F-34): плоский env DESCRIBE_* поверх слота
+        # summary; кодовые дефолты операции — бюджет 128 и think=False
+        # (operations.OPERATION_FIELD_DEFAULTS, бывшие DESCRIBE_NUM_PREDICT).
         self._llm = (
             llm
             if llm is not None
-            else LLMClient(SlotSpec.for_summary(settings), transport=transport)
+            else LLMClient(
+                SlotSpec.for_operation("describe", settings)[0], transport=transport
+            )
         )
         # None — попыток не было (health не врёт до первых данных).
         self.last_attempt_ok: bool | None = None
@@ -178,8 +183,7 @@ class DescriptionService:
                     slug=slug,
                     summaries="\n".join(f"- {s}" for s in summaries),
                 ),
-                num_predict=DESCRIBE_NUM_PREDICT,
-                think=False,  # короткое описание без рассуждений
+                operation="describe",  # LSBN-F-34: бюджет/think — цепочка операции
             )
         except LLMError as exc:
             # Текст клиента сохраняется: HTTP-статус, адрес слота, hint
@@ -257,11 +261,17 @@ class StructureJudgeService:
         self._settings = settings
         self._prompts = registry if registry is not None else PromptRegistry()
         # DI сборки (общий клиент слота judge) или свой клиент с
-        # transport-инъекцией для юнит-тестов (MockTransport).
+        # transport-инъекцией для юнит-тестов (MockTransport). Операция
+        # `structure_judge` (LSBN-F-34): плоский env STRUCTURE_JUDGE_* поверх
+        # слота judge; NAMESPACE_JUDGE_THINK остаётся старшим каналом think
+        # (None — цепочка операции: STRUCTURE_JUDGE_THINK → JUDGE_THINK).
         self._llm = (
             llm
             if llm is not None
-            else LLMClient(SlotSpec.for_judge(settings), transport=transport)
+            else LLMClient(
+                SlotSpec.for_operation("structure_judge", settings)[0],
+                transport=transport,
+            )
         )
         self.last_attempt_ok: bool | None = None
 
@@ -293,9 +303,13 @@ class StructureJudgeService:
                         else "нет близких узлов"
                     ),
                 ),
-                num_predict=self._settings.judge_num_predict or None,
+                # Бюджет/think — цепочка операции (LSBN-F-34):
+                # STRUCTURE_JUDGE_NUM_PREDICT → JUDGE_NUM_PREDICT → авто;
+                # think: NAMESPACE_JUDGE_THINK → STRUCTURE_JUDGE_THINK →
+                # JUDGE_THINK (None — флаг spec клиента).
+                num_predict=None,
                 think=self._think(),
-                operation="judge",  # №49: legacy-потолок/авто-бюджет слота judge
+                operation="structure_judge",
             )
         except LLMError as exc:
             # Текст клиента сохраняется: HTTP-статус, адрес слота, hint
@@ -317,14 +331,14 @@ class StructureJudgeService:
     # --- внутреннее ---------------------------------------------------------
 
     def _think(self) -> bool | None:
-        """Флаг think судьи структуры: NAMESPACE_JUDGE_THINK, None —
-        наследует JUDGE_THINK (дедум-конфиг). Флаг отделён от дедуп-судьи
+        """Флаг think судьи структуры: NAMESPACE_JUDGE_THINK — старший канал
+        (None — цепочка операции LSBN-F-34: STRUCTURE_JUDGE_THINK →
+        JUDGE_THINK через spec клиента). Флаг отделён от дедуп-судьи
         (E2E Шага 7 — думающий судья структуры «залипал» на парах-
         близнецах при 20 ток/с, голодая суммаризацию на общем слоте;
         бездумный вердикт — 10–50 токенов).
         """
-        think = self._settings.namespace_judge_think
-        return think if think is not None else self._settings.judge_think
+        return self._settings.namespace_judge_think
 
     @staticmethod
     def _parse(content: str) -> Verdict:

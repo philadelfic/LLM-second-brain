@@ -129,8 +129,12 @@ class TestMCPChars:
             await mcp_server.call_tool("memory_search", {"query": mark})
         ).structured_content
         hit = next(r for r in found["results"] if r["id"] == note_id)
+        # F-13 (3.4.0): дефолт листинга — titles (без chars); `chars` в
+        # листинге живёт в явной детали summaries — согласование проверяем на ней.
         listed = (
-            await mcp_server.call_tool("memory_list", {"limit": 5})
+            await mcp_server.call_tool(
+                "memory_list", {"limit": 5, "detail": "summaries"}
+            )
         ).structured_content
         item = next(i for i in listed["items"] if i["id"] == note_id)
         got = (
@@ -270,10 +274,12 @@ class TestCompactnessBudgets:
 
     @pytest.mark.asyncio
     async def test_list_within_budget(self, seeded, mcp_server) -> None:
-        """memory_list — в бюджете 1.5 КБ (новая метрика §3.7)."""
+        """memory_list — в бюджете 1.5 КБ (новая метрика §3.7); F-13 (3.4.0):
+        дефолт — titles, элементы без `chars` (сам текст не таскают)."""
         got = (
             await mcp_server.call_tool("memory_list", {"limit": 20})
         ).structured_content
-        assert got["items"] and all(i["chars"] > 0 for i in got["items"])
+        assert got["items"] and all(i["title"] for i in got["items"])
+        assert all("chars" not in i for i in got["items"])  # titles без chars
         size = payload_size(got)
         assert size <= LIST_BUDGET_BYTES, f"memory_list: {size} B"
