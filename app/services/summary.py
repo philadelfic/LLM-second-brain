@@ -30,9 +30,11 @@ NFR-5: тёплый вызов с reasoning — секунды).
 имена/числа/даты», результат заменяет текст ранней заметки, поздняя
 уходит в trash. Слот, параметры и SUMMARY_*-env — те же, что у
 `summarize`; отличаются системный промпт, состав user-сообщения и
-страховка длины: результат — **текст заметки**, обрезается до
-MAX_NOTE_CHARS (не MAX_SUMMARY_CHARS), чтобы он всегда проходил валидацию
-и CHECK-лимит `NoteService.update`. Вызывает только воркер (сведение
+страховка длины: результат — **текст заметки**, держится в мягком лимите
+NOTE_TEXT_LIMIT (1500, LSBN-S-1), чтобы он всегда проходил валидацию
+`NoteService.merge_pair`; механика среза прежняя, но усечение НЕ молча —
+хвост несёт `MERGE_TRUNCATION_MARKER` (правило F-23 до её постановки).
+Вызывает только воркер (сведение
 дедупа) — синхронный путь записи не блокируется.
 
 Ключевые решения:
@@ -57,8 +59,9 @@ MAX_NOTE_CHARS (не MAX_SUMMARY_CHARS), чтобы он всегда прохо
   гарантирует сам `LLMClient.chat`; символьный лимит саммари держат
   двое: промпт (≤ 150 символов) и код — `cap_summary` в точке сохранения
   (воркер) усекает ответ модели по границе слова с многоточием;
-  страховка merge остаётся своей — её результат обязан пройти
-  CHECK(MAX_NOTE_CHARS) при memory_update.
+  страховка merge остаётся своей — её результат обязан пройти мягкий лимит
+  NOTE_TEXT_LIMIT (1500) валидации merge_pair; жёсткий CHECK
+  (MAX_NOTE_CHARS=35000) при этом не меняется.
 - Отказ — `SummaryError`, и только она: текст ошибки клиента (включая
   HTTP-статус и hint про {SLOT}_API_KEY у auth-отказа, решение №4)
   сохраняется; воркер сам решает деградацию (fallback-усечение уже в
@@ -86,8 +89,18 @@ import httpx
 
 from app.config import Settings
 from app.services.llm_client import ChatMeta, ChatResult, LLMClient, LLMError, SlotSpec
+from app.services.notes import NOTE_TEXT_LIMIT
 from app.services.prompts import PromptRegistry
 from app.services.slot_outcome import SlotOutcome, classify_llm_error
+
+#: Явный признак усечения слияния (LSBN-S-1): до постановки F-23 результат
+#: merge режется прежней механикой (срез), но НЕ молча — в хвост текста
+#: пишется маркер с лимитом. Маркер входит в лимит: итог всегда
+#: ≤ NOTE_TEXT_LIMIT, иначе merge_pair отклонит текст валидацией.
+MERGE_TRUNCATION_MARKER = (
+    "\n\n[truncated: merge result exceeded the {limit}-character note "
+    "limit — the tail was cut; full pre-merge texts remain in history]"
+)
 
 
 class SummaryError(RuntimeError):
@@ -281,13 +294,15 @@ class SummaryService:
         """Слить два текста-дубликата в один; любой отказ — SummaryError.
 
         Вариант B дедупа (Фаза 8, Этап 2.2): модель объединяет тексты
-        «ранней + поздней» заметки; результат уйдёт в memory_update
-        ранней, поздняя будет soft-deleted. Отказ суммаризатора не должен
+        «ранней + поздней» заметки; результат уйдёт в merge_pair (обновление
+        ранней), поздняя будет soft-deleted. Отказ суммаризатора не должен
         портить обе заметки (NFR-3) — воркер ловит SummaryError и
-        повторяет по back-off. Лимит результата — MAX_NOTE_CHARS: это
-        будущий ТЕКСТ заметки (CHECK(length(text) ...)), а не суммари.
-        Бюджет — MERGE_NUM_PREDICT (0 = авто; историческое поле поглощено
-        цепочкой операции merge, поведение прежнее).
+        повторяет по back-off. Лимит результата — мягкий лимит заметки
+        NOTE_TEXT_LIMIT (1500, LSBN-S-1): это будущий ТЕКСТ заметки, а не
+        суммари; механика среза прежняя, но усечение помечается явным
+        маркером (до постановки F-23). Бюджет — MERGE_NUM_PREDICT
+        (0 = авто; историческое поле поглощено цепочкой операции merge,
+        поведение прежнее).
         """
         if not text_a or not text_a.strip() or not text_b or not text_b.strip():
             raise ValueError("merge: пустая заметка недопустима")
@@ -296,13 +311,18 @@ class SummaryService:
                 self._prompts.summary_merge_system,
                 self._prompts.merge_user.format(text_a=text_a, text_b=text_b),
                 operation="merge",
-                max_chars=self._settings.max_note_chars,
             )
         except SummaryError:
             self.last_attempt_ok = False  # деградация станет видна в /health
             raise
         self.last_attempt_ok = True
-        return SummaryResult(text=result.content, meta=result.meta)
+        text = result.content
+        if len(text) > NOTE_TEXT_LIMIT:
+            # Не молча (LSBN-S-1): хвост уходит, вместо него — маркер с
+            # лимитом; итог (текст + маркер) укладывается в NOTE_TEXT_LIMIT.
+            marker = MERGE_TRUNCATION_MARKER.format(limit=NOTE_TEXT_LIMIT)
+            text = text[: NOTE_TEXT_LIMIT - len(marker)] + marker
+        return SummaryResult(text=text, meta=result.meta)
 
     def close(self) -> None:
         """Закрыть HTTP-пулы клиентов операций (без дублей по объекту)."""
@@ -325,7 +345,6 @@ class SummaryService:
         user_text: str,
         *,
         operation: str,
-        max_chars: int | None = None,
     ) -> ChatResult:
         """Один вызов chat КЛИЕНТОМ ОПЕРАЦИИ (без ретраев — повтор решает воркер).
 
@@ -334,7 +353,8 @@ class SummaryService:
         цепочку env операции → env слота → дефолт, включая потолок вывода
         (`SUMMARIZE_/TITLE_/MERGE_NUM_PREDICT`; None — авто-бюджет «сколько
         влезет», №49). think — флаг spec; keep_alive не отправляется
-        (решение №6).
+        (решение №6). Content отдаётся как есть: символьные лимиты держат
+        точки сохранения (cap_summary — воркер; NOTE_TEXT_LIMIT — merge).
         """
         try:
             result = self._llms[operation].chat_result(
@@ -352,10 +372,8 @@ class SummaryService:
             ) from exc
         self.last_meta = result.meta
         # Поле thinking/reasoning_content идёт только в метаданные вызова:
-        # читаем только content. Символьная страховка здесь осталась только
-        # у merge: её результат — будущий ТЕКСТ заметки, обязан проходить
-        # CHECK(MAX_NOTE_CHARS). Лимит саммари держит вызывающий (воркер) —
-        # cap_summary в точке сохранения (решение гейта 3.1.0, 2026-09-19).
-        if max_chars is None:
-            return result
-        return ChatResult(content=result.content[:max_chars], meta=result.meta)
+        # читаем только content. Символьная страховка здесь больше не нужна:
+        # merge держит мягкий лимит NOTE_TEXT_LIMIT сам (с маркером усечения),
+        # лимит саммари держит вызывающий (воркер) — cap_summary в точке
+        # сохранения (решение гейта 3.1.0, 2026-09-19).
+        return result

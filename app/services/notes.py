@@ -98,6 +98,23 @@ TITLE_HINT = "set a title ≤5 words"
 # no24-01 (3.2.0): канонический текст отказа пометки (доменный лимит 250).
 COMMENT_HINT = "comment: up to 250 characters"
 
+# Мягкий лимит текста заметки (LSBN-S-1, решение О. 15.10.2026): целевая
+# длина заметки — 1500 символов; больше — это несколько самодостаточных
+# заметок. Число-дефолт живёт В КОДЕ, не в env (по прецеденту F-13/F-34):
+# это рабочее ограничение валидации сохранения/правки и слияния (merge).
+# Оно СОЗНАТЕЛЬНО строже жёсткого CHECK(length(text) <= MAX_NOTE_CHARS =
+# 35000): env и DDL держат паритет при старте (`_assert_note_chars_limit`),
+# их смена — F-22 (самомиграция), мягкий лимит заметки не трогает.
+NOTE_TEXT_LIMIT = 1500
+
+# Канонический текст мягкого отказа «текст длиннее лимита»: называет лимит,
+# фактическую длину и правило разбиения (MCP — fail + hint, REST — 422).
+HINT_NOTE_TOO_LONG = (
+    "text: {actual} characters — over the {limit}-character note limit; "
+    "split it into several self-contained notes, each carrying its own "
+    "names, numbers and dates"
+)
+
 # Сентинел «title не передан»: прямой вызов NoteService.save без транспорта
 # (миграция, скрипты, тесты) — легаси-путь, заметка пишется с title=NULL
 # (без названия остаются только миграционные заметки, название догенерирует
@@ -1171,11 +1188,22 @@ class NoteService:
         return stripped
 
     def _validate_text(self, text: str) -> None:
-        """1..MAX_NOTE_CHARS — доменное правило REQUIREMENTS FR-4/FR-5."""
-        if not 1 <= len(text) <= self._settings.max_note_chars:
+        """1..NOTE_TEXT_LIMIT — мягкий лимит заметки (LSBN-S-1; доменное
+        правило REQUIREMENTS FR-4/FR-5).
+
+        Верхняя граница — НЕ settings.max_note_chars (35000): тот держит
+        паритет env ↔ живой CHECK (`_assert_note_chars_limit`) и не меняется.
+        Длиннее лимита — отказ с правилом «разбей на несколько самодостаточных
+        заметок»; жёсткий CHECK на 1500 ставит только самомиграция (F-22).
+        """
+        if len(text) > NOTE_TEXT_LIMIT:
             raise NoteValidationError(
-                "text: length must be 1.."
-                f"{self._settings.max_note_chars} characters, got {len(text)}"
+                HINT_NOTE_TOO_LONG.format(actual=len(text), limit=NOTE_TEXT_LIMIT)
+            )
+        if len(text) < 1:
+            raise NoteValidationError(
+                f"text: length must be 1..{NOTE_TEXT_LIMIT} characters, "
+                f"got {len(text)}"
             )
 
     def _full_note(self, row: sqlite3.Row) -> dict[str, Any]:

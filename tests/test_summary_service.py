@@ -18,7 +18,7 @@ import pytest
 from app.config import get_settings
 from app.services.llm_client import CONNECT_TIMEOUT_SEC_OLLAMA
 from app.services.prompts import PromptRegistry
-from app.services.summary import SummaryError, SummaryService
+from app.services.summary import NOTE_TEXT_LIMIT, SummaryError, SummaryService
 
 
 def make_settings(monkeypatch: pytest.MonkeyPatch, **env: str):
@@ -406,14 +406,30 @@ def test_merge_system_prompt_and_marked_texts(monkeypatch) -> None:
     service.close()
 
 
-def test_merge_result_truncated_to_max_note_chars(monkeypatch) -> None:
-    """Страховка длины дедупа: результат — будущий ТЕКСТ заметки, лимит
-    MAX_NOTE_CHARS (не MAX_SUMMARY_CHARS) — не сломает memory_update."""
+def test_merge_result_truncated_to_note_limit_with_marker(monkeypatch) -> None:
+    """Страховка длины дедупа (LSBN-S-1): результат — будущий ТЕКСТ заметки,
+    держится в мягком лимите NOTE_TEXT_LIMIT (1500); усечение НЕ молча —
+    хвост несёт явный маркер с лимитом (механика F-23 до её постановки)."""
     settings = make_settings(monkeypatch)
-    long_content = "ф" * (settings.max_note_chars + 70)
+    long_content = "ф" * (settings.max_note_chars + 70)  # намного больше 1500
     service, _ = make_service(settings, [httpx.Response(200, json=ok_body(long_content))])
     merged = service.merge(TEXT_A, TEXT_B)
-    assert len(merged.text) == settings.max_note_chars == 35000
+    assert len(merged.text) == NOTE_TEXT_LIMIT
+    assert merged.text.startswith("ф")  # усечение — срез исходного content
+    assert f"exceeded the {NOTE_TEXT_LIMIT}-character note limit" in merged.text
+    assert merged.text.endswith("remain in history]")
+    service.close()
+
+
+def test_merge_result_within_limit_untouched(monkeypatch) -> None:
+    """Результат короче мягкого лимита — отдаётся как есть, без маркера."""
+    settings = make_settings(monkeypatch)
+    service, _ = make_service(
+        settings, [httpx.Response(200, json=ok_body("Короткое слияние."))]
+    )
+    merged = service.merge(TEXT_A, TEXT_B)
+    assert merged.text == "Короткое слияние."
+    assert "truncated" not in merged.text
     service.close()
 
 

@@ -50,6 +50,7 @@ PORT_STRIDE = 4
 SERVER_PORT = 18765 + PORT_STRIDE * _WORKER_INDEX
 CUSTOM_PORT = 18766 + PORT_STRIDE * _WORKER_INDEX
 NS_PORT = 18767 + PORT_STRIDE * _WORKER_INDEX
+CHUNK_PORT = 18768 + PORT_STRIDE * _WORKER_INDEX
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -108,6 +109,23 @@ def custom_path_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
 def ns_db(tmp_path_factory: pytest.TempPathFactory) -> str:
     """Отдельная БД для namespace-тестов (изоляция от общей памяти)."""
     return str(tmp_path_factory.mktemp("mcp-ns") / "notes.db")
+
+
+@pytest.fixture(scope="session")
+def chunk_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+    """Сервер с мелким окном чанка: многочанковая заметка умещается в мягкий
+    лимит NOTE_TEXT_LIMIT (LSBN-S-1) — дефолтные 1024 токена требуют текст
+    заметно длиннее 1500 символов, что мягкий лимит больше не разрешает."""
+    db = tmp_path_factory.mktemp("mcp-chunk") / "notes.db"
+    yield from _start_server(
+        CHUNK_PORT,
+        {
+            "DB_PATH": str(db),
+            "CHUNK_SIZE": "64",
+            "CHUNK_OVERLAP": "16",
+            "CHUNK_MIN_TARGET": "8",
+        },
+    )
 
 
 @pytest.fixture(scope="session")
@@ -316,6 +334,24 @@ class TestToolCalls:
         assert "string_too_long" in call.content[0].text
 
     @pytest.mark.asyncio
+    async def test_note_over_soft_limit_soft_fail_with_hint(
+        self, server_url: str
+    ) -> None:
+        """LSBN-S-1: текст 1501..35000 проходит схему (max_length остаётся
+        35000 — паритет env ↔ DDL), но отклоняется сервисом мягко:
+        fail + hint с лимитом, фактической длиной и правилом разбиения."""
+        async with connect(server_url) as session:
+            call = await session.call_tool(
+                "memory_save",
+                {"text": "x" * 1501, "title": "Слишком длинная заметка"},
+            )
+        assert call.is_error is False
+        body = call.structured_content
+        assert body["stored"] is False
+        assert "1500-character note limit" in body["hint"]
+        assert "1501 characters" in body["hint"]
+
+    @pytest.mark.asyncio
     async def test_schema_rejects_too_many_ids(self, server_url: str) -> None:
         async with connect(server_url) as session:
             call = await session.call_tool("memory_get", {"ids": list(range(1, 30))})
@@ -435,10 +471,10 @@ class TestMemoryFlow:
         assert got["notes"][0]["id"] == note_id
 
     @pytest.mark.asyncio
-    async def test_chunk_read_by_index(self, server_url: str) -> None:
+    async def test_chunk_read_by_index(self, chunk_url: str) -> None:
         """lsb-0003: memory_get с chunk=N возвращает чанки заметки (списком)."""
-        text = f"{self.marker}: " + ("длинный текст заметки для нескольких чанков " * 60)
-        async with connect(server_url) as session:
+        text = f"{self.marker}: " + ("длинный текст заметки для нескольких чанков " * 25)
+        async with connect(chunk_url) as session:
             note_id = await _saved_id(session, text, title="Чанк чтение")
             got = (
                 await session.call_tool("memory_get", {"id": note_id, "chunk": 0})
@@ -962,10 +998,10 @@ class TestCommentMCP:
         assert got["notes"][0]["comment"] is None  # заметка не тронута
 
     @pytest.mark.asyncio
-    async def test_memory_get_has_no_comment_in_chunk_mode(self, server_url: str) -> None:
+    async def test_memory_get_has_no_comment_in_chunk_mode(self, chunk_url: str) -> None:
         """Chunk-режим memory_get комментарий не отдаёт (там чанки)."""
-        text = f"{self.marker}: " + ("длинный текст для чанков " * 60)
-        async with connect(server_url) as session:
+        text = f"{self.marker}: " + ("длинный текст для чанков " * 30)
+        async with connect(chunk_url) as session:
             note_id = await _saved_id(session, text, title="Чанк и комментарий")
             await session.call_tool(
                 "memory_update", {"id": note_id, "comment": "не в чанках"}

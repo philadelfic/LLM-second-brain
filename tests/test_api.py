@@ -62,6 +62,8 @@ class TestHealth:
             "judge_ok": None,
             "decision_ok": None,
             "notes_count": 0,
+            # LSBN-S-1: мягкий лимит заметки — константа кода, виден оператору.
+            "note_chars_limit": 1500,
             "pending_vector": 0,
             "pending_summary": 0,
             "queues": {
@@ -117,6 +119,7 @@ class TestHealth:
             "judge_ok",
             "decision_ok",
             "notes_count",
+            "note_chars_limit",
             "pending_vector",
             "pending_summary",
             "queues",

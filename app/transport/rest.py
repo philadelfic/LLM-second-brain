@@ -82,6 +82,7 @@ from app.services.namespaces import NamespaceError, NamespaceValidationError
 from app.services.notes import (
     _UNSET_COMMENT,
     _UNSET_TEXT,
+    NOTE_TEXT_LIMIT,
     NoteValidationError,
 )
 # LSBN-F-34: снимок /health.operations (модель/провайдер/источник по операции).
@@ -416,6 +417,10 @@ class HealthResponse(BaseModel):
     # проверки не было; False — стартовая проверка/вызов погасили слот).
     decision_ok: bool | None
     notes_count: int
+    # LSBN-S-1: мягкий лимит текста заметки (валидация save/update/merge).
+    # НЕ settings.max_note_chars (35000): тот — паритет env ↔ живой CHECK.
+    # Число-дефолт кода — app.services.notes.NOTE_TEXT_LIMIT.
+    note_chars_limit: int
     pending_vector: int
     pending_summary: int
     queues: dict[str, QueueStat]  # lsb-0014-03: ожидание по каждой очереди
@@ -667,6 +672,8 @@ def build_rest_router(settings: Settings) -> APIRouter:
             judge_ok=services.judge.last_attempt_ok,
             decision_ok=decision_ok,
             notes_count=counts["notes_count"],
+            # LSBN-S-1: мягкий лимит заметки виден оператору (константа кода).
+            note_chars_limit=NOTE_TEXT_LIMIT,
             pending_vector=counts["pending_vector"],
             pending_summary=counts["pending_summary"],
             queues=queues,

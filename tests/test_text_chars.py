@@ -165,10 +165,17 @@ class TestMCPChars:
 
     @pytest.mark.asyncio
     async def test_chunk_mode_keeps_chunk_sum_and_total_chunks(
-        self, settings_and_services: tuple[Settings, Services], mcp_server
+        self,
+        settings_and_services: tuple[Settings, Services],
+        mcp_server,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Chunk-режим: `chars` = сумма символов ОТДАННЫХ чанков (lsb-0003),
         `total_chunks` на месте — полный объём не подменяет прежний смысл."""
+        # Многочанковый текст длиннее мягкого лимита заметки (LSBN-S-1):
+        # поднимаем его до прежнего потолка — механика `chars` от лимита
+        # записи не зависит (границу тестируют test_note_soft_limit).
+        monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)
         _, services = settings_and_services
         text = long_text()
         note_id = services.notes.save(text, title="Длинная заметка")["id"]
