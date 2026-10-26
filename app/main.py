@@ -336,6 +336,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # суммаризатор из DI — тот же экземпляр, что в /health.summarizer_ok.
     # Судья дедупа (Фаза 8, Этап 3.1) — тоже DI из services, один экземпляр
     # на процесс (вердикты по кандидатам — Задача 3.2).
+    # №12 (3.2.0): один сервис предупреждений на процесс — им воркер пишет
+    # «слияние отложено» (F-23 п. 6), а NoteService инвалидирует
+    # предупреждения при правке (ниже). Снятию классификатор не нужен
+    # (только SQL) — узкая инъекция без циклических импортов.
+    warnings_service = WarningsService(
+        settings, classifier=None, namespaces=services.namespaces
+    )
     worker = BackgroundWorker(
         settings,
         services.embedding,
@@ -345,6 +352,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         promoter=services.promotion,
         terms=services.terms,
         decision=services.decision,
+        warnings=warnings_service,
     )
     # Суммаризация стартует сразу при save/update: NoteService сигналит
     # воркеру, тот немедленно догоняет pending_summary (не ждёт back-off).
@@ -355,14 +363,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Событие только ускоряет — задание живёт в статусе заметки (gate
     # 2026-09-19, прецедент summary-нотификатора).
     services.notes.set_vector_notifier(worker.notify_embedding_pending)
-    # №12 (3.2.0): правка заметки инвалидирует её предупреждение — в той же
-    # транзакции (FR-4.4). Снятию классификатор не нужен (только SQL), поэтому
-    # сервис собирается без него — узкая инъекция без циклических импортов.
-    services.notes.set_warnings_resolver(
-        WarningsService(
-            settings, classifier=None, namespaces=worker._namespaces
-        ).resolve_for_subject
-    )
+    # №12 (FR-4.4): правка заметки инвалидирует её предупреждение — в той же
+    # транзакции.
+    services.notes.set_warnings_resolver(warnings_service.resolve_for_subject)
     # Область навыков (3.0.0): save/правка сигналит петле areas — вектора
     # записи догоняются сразу, а не по выросшему back-off (прецедент
     # summary-нотификатора). None — DI-сборка тестов без области навыков.

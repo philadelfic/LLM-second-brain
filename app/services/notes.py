@@ -1027,6 +1027,168 @@ class NoteService:
             "deleted": deleted,
         }
 
+    def merge_into_parts(
+        self,
+        older_id: int,
+        newer_id: int,
+        parts: list[tuple[str, str]],
+    ) -> dict[str, Any]:
+        """Заменить пару дубликатов списком частей ОДНОЙ транзакцией (F-23, п. 5).
+
+        Контракт слияния LSBN-F-23: результат — НЕ обновлённый текст ранней,
+        а несколько самодостаточных заметок-частей. Одной транзакцией (пул 6):
+        1) каждая часть INSERT-ится новой заметкой (title части, namespace
+        ранней — пара дубликатов живёт в одном узле; vector/summary — pending,
+        своими очередями; TTL нет — заметка с таймером сюда не доходит,
+        no46-03); контент-версия части — сразу в истории (source="merge");
+        2) части НАСЛЕДУЮТ связи ОБЕИХ исходных (каждая строка links, где
+        сторона — исходник, переписывается на каждую часть, kind/score
+        сохраняются) и ССЫЛАЮТСЯ на исходники явной mention-связью —
+        происхождение части видно в карте окружения;
+        3) ОБЕ исходные уходят в корзину штатным soft delete (guard
+        `deleted_at IS NULL` — операторский delete не перебивается) и остаются
+        в истории: версия-событие delete (source="merge") на каждую; TTL-строка
+        снимается той же транзакцией (прецедент delete, lsb-0004-02);
+        4) предупреждения обеих исходных инвалидируются (№12, в той же
+        транзакции).
+
+        Схема БД не меняется (это F-22): части — обычные заметки, корзина и
+        история — штатные механизмы. Откат транзакции целен: полусостояние
+        «часть создана, исходные живы» исключено.
+
+        Возврат — ``{"older_id", "newer_id", "merged", "parts":
+        [{"id", "title"}, ...], "deleted": {"older", "newer"}}``;
+        ``merged=False`` — активной ранней нет (оператор удалил между
+        вычиткой и сведением), ничего не пишется. Notify после транзакции.
+        Метод внутренний (merge-путь воркера) — контракты REST/MCP не меняются.
+        """
+        if not parts:
+            raise NoteValidationError("merge_into_parts: пустой список частей")
+        prepared: list[tuple[str, str, list[tuple[str, int]]]] = []
+        for title, text in parts:
+            self._validate_text(text)
+            checked_title = self._checked_title(title)
+            prepared.append((checked_title or "", text, self._chunks_of(text)))
+        with session(self._settings) as conn, transaction(conn):
+            older = conn.execute(
+                "SELECT namespace FROM notes WHERE id = ? AND deleted_at IS NULL",
+                (older_id,),
+            ).fetchone()
+            if older is None:
+                # Ранней активной нет — слияние не состоялось, ничего не пишем
+                # (прецедент merge_pair: поздняя не трогается).
+                return {
+                    "older_id": older_id,
+                    "newer_id": newer_id,
+                    "merged": False,
+                    "parts": [],
+                    "deleted": {"older": False, "newer": False},
+                }
+            source_ids = (older_id, newer_id)
+            # Наследуемые связи исходников — снимок ДО вставки частей.
+            inherited = conn.execute(
+                "SELECT note_a, note_b, kind, score FROM links "
+                "WHERE note_a IN (?, ?) OR note_b IN (?, ?)",
+                (*source_ids, *source_ids),
+            ).fetchall()
+            # 1) Части — новые заметки (vector/summary — pending, свои очереди).
+            created: list[dict[str, Any]] = []
+            for title, text, chunks_data in prepared:
+                part_id = self._insert(
+                    conn,
+                    text,
+                    None,
+                    vector_status="pending",
+                    namespace=older["namespace"],
+                    title=title,
+                )
+                self._store_chunks(conn, part_id, chunks_data, None)
+                part_row = conn.execute(
+                    "SELECT text, title, namespace, expires_at, comment "
+                    "FROM notes WHERE id = ?",
+                    (part_id,),
+                ).fetchone()
+                history.record_change(
+                    conn,
+                    history.ENTITY_NOTE,
+                    part_id,
+                    history.note_projection(part_row),
+                    source="merge",
+                )
+                created.append({"id": part_id, "title": title})
+            # 2) Наследование связей обеих исходных + явная mention-связь
+            # «часть → исходник» (происхождение части в карте окружения).
+            # links держит ОДНУ строку на пару (PK note_a<note_b) — канон
+            # «высший приоритет mention > entities > cosine»: конфликт пары
+            # решается приоритетным upsert (как в LinksService), не IGNORE.
+            _kind_upsert = (
+                "INSERT INTO links (note_a, note_b, kind, score) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(note_a, note_b) DO UPDATE SET "
+                "kind = excluded.kind, score = excluded.score "
+                "WHERE (CASE excluded.kind WHEN 'mention' THEN 3 "
+                "WHEN 'entities' THEN 2 ELSE 1 END) "
+                "> (CASE links.kind WHEN 'mention' THEN 3 "
+                "WHEN 'entities' THEN 2 ELSE 1 END)"
+            )
+            for part in created:
+                part_id = int(part["id"])
+                for row in inherited:
+                    other = (
+                        row["note_b"]
+                        if row["note_a"] in source_ids
+                        else row["note_a"]
+                    )
+                    if other == part_id:
+                        continue
+                    conn.execute(
+                        _kind_upsert,
+                        (
+                            min(part_id, other),
+                            max(part_id, other),
+                            row["kind"],
+                            row["score"],
+                        ),
+                    )
+                for source_id in source_ids:
+                    conn.execute(
+                        _kind_upsert,
+                        (min(part_id, source_id), max(part_id, source_id), "mention", 1.0),
+                    )
+            # 3) Обе исходные — в корзину; TTL-строки туда же; версия-событие
+            # delete — в историю (читается и после soft delete, №41).
+            deleted = {"older": False, "newer": False}
+            for key, source_id in (("older", older_id), ("newer", newer_id)):
+                cursor = conn.execute(
+                    "UPDATE notes SET deleted_at = "
+                    "strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+                    "WHERE id = ? AND deleted_at IS NULL",
+                    (source_id,),
+                )
+                deleted[key] = cursor.rowcount > 0
+                if deleted[key]:
+                    expirations.delete(conn, source_id)
+                    history.record_event(
+                        conn,
+                        history.ENTITY_NOTE,
+                        source_id,
+                        "delete",
+                        source="merge",
+                    )
+            # 4) №12: сшивание инвалидирует предупреждения ОБЕИХ исходных.
+            if self._warnings_resolver is not None:
+                self._warnings_resolver("note", older_id, conn=conn)
+                self._warnings_resolver("note", newer_id, conn=conn)
+        self._notify_summary_pending()
+        # Части ждут векторизации — будим embedding-петлю, не дожидаясь back-off.
+        self._notify_vector_pending()
+        return {
+            "older_id": older_id,
+            "newer_id": newer_id,
+            "merged": True,
+            "parts": created,
+            "deleted": deleted,
+        }
+
     # --- NFR-4 /health ------------------------------------------------------
 
     def health_counts(self) -> dict[str, int]:

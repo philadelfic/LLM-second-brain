@@ -54,7 +54,13 @@ from app.services.promotion import (
     StructureJudgeError,
     Verdict,
 )
-from app.services.summary import SummaryError, SummaryResult
+from app.services.summary import (
+    MergeIncompleteError,
+    MergePart,
+    MergeResult,
+    SummaryError,
+    SummaryResult,
+)
 from app.services.worker import BackgroundWorker
 from app.storage.db import CREATOR_SKILL_NAME, session, transaction
 
@@ -178,6 +184,7 @@ class FixedSummarizer:
         self.merge_result = merged
         self.calls: list[str] = []
         self.merge_calls: list[tuple[str, str]] = []
+        self.merge_rounds: int = 1  # раунды слияния в MergeResult (F-23 п. 7)
         self.last_attempt_ok: bool | None = None  # для /health.summarizer_ok
 
     def summarize(self, text: str) -> SummaryResult:
@@ -192,11 +199,18 @@ class FixedSummarizer:
         self.last_attempt_ok = True
         return SummaryResult(text=self.summary, meta=fake_meta("summary", "title"))
 
-    def merge(self, text_a: str, text_b: str) -> SummaryResult:
-        """Слияние дубликатов (Этап 2.2): фиксированный ответ, журнал пар."""
+    def merge(self, text_a: str, text_b: str) -> MergeResult:
+        """Слияние дубликатов (Этап 2.2; контракт F-23): фиксированный ответ —
+        одна самодостаточная часть, журнал пар."""
         self.merge_calls.append((text_a, text_b))
         self.last_attempt_ok = True
-        return SummaryResult(text=self.merge_result, meta=fake_meta("summary", "merge"))
+        meta = fake_meta("summary", "merge")
+        return MergeResult(
+            parts=[MergePart(title="Объединённая заметка", text=self.merge_result)],
+            meta=meta,
+            metas=[meta],
+            rounds=self.merge_rounds,
+        )
 
     def close(self) -> None:  # интерфейс-совместимость с SummaryService
         return None
@@ -281,14 +295,29 @@ class MergeFailingSummarizer(FixedSummarizer):
         self.merge_result = merged
         self.merge_calls: list[tuple[str, str]] = []
         self.fail: bool = True  # False — слияние восстановилось
+        # F-23 п. 6: True — восстановившееся слияние не добирает полноту
+        # (MergeIncompleteError, пара откладывается), а не SummaryError.
+        self.incomplete: bool = False
 
-    def merge(self, text_a: str, text_b: str) -> SummaryResult:
+    def merge(self, text_a: str, text_b: str) -> MergeResult:
         self.merge_calls.append((text_a, text_b))
         if self.fail:
             self.last_attempt_ok = False
             raise SummaryError("слияние недоступно")
         self.last_attempt_ok = True
-        return SummaryResult(text=self.merge_result, meta=fake_meta("summary", "merge"))
+        if self.incomplete:
+            raise MergeIncompleteError(
+                "merge incomplete after 2 rounds: coverage 0.42",
+                metas=[fake_meta("summary", "merge")],
+                rounds=2,
+            )
+        meta = fake_meta("summary", "merge")
+        return MergeResult(
+            parts=[MergePart(title="Объединённая заметка", text=self.merge_result)],
+            meta=meta,
+            metas=[meta],
+            rounds=1,
+        )
 
 
 class FixedClassifier:
