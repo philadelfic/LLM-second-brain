@@ -159,6 +159,11 @@ class Settings(BaseSettings):
     judge_timeout_sec: int = 900  # клиентский таймаут вызова судьи
     judge_context_tokens: int = 0  # заявленный контекст модели judge (0 — неизвестен)
     rrf_k: int = 60
+    # Бусты ранжирования после RRF (LSBN-F-14, релиз 3.4.0): операторский
+    # выключатель (false — порядок выдачи ровно как до бустов; доп. SQL по
+    # links не выполняется). Веса бустов — константы кода
+    # app/services/ranking.py, НЕ env (фиксация в каноне через changes.md).
+    ranking_boosts_enabled: bool = True
 
     # --- связи заметок, уровень 0 (lsb-0010, релиз 3.1.0) ---
     # LINK_TOP — потолок связей на заметку (FR-1.1); LINK_LAZY_THRESHOLD —
