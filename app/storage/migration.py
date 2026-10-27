@@ -139,6 +139,22 @@ def _write_state(conn: sqlite3.Connection, state: dict) -> None:
     )
 
 
+def set_state_phase(conn: sqlite3.Connection, phase: str) -> dict | None:
+    """Сменить фазу состояния миграции (остальные поля не тронуты).
+
+    Публичная точка для сервиса (M3): «стоп джобы» прерывания пишет
+    phase=aborted ДО reverse-pour (следующая партия нарезки видит её и
+    берёт ноль заметок), фаза 7 ставит done. None — состояния нет
+    (база миграцию не касалась), писать нечего.
+    """
+    state = read_state(conn)
+    if state is None:
+        return None
+    state["phase"] = phase
+    _write_state(conn, state)
+    return state
+
+
 def ensure_migration_schema(conn: sqlite3.Connection) -> None:
     """Таблица migration_notes + штамп schema.note_chars (идемпотентно).
 
@@ -497,6 +513,7 @@ def reverse_pour(
     away_file: str,
     target: int,
     reason: str,
+    phase: str = "done",
 ) -> dict:
     """Обратный перелив: дельта активной базы → прежняя (с CHECK = цели).
 
@@ -505,8 +522,10 @@ def reverse_pour(
     в прежней базе длинные заметки возвращаются целыми, частей там нет и
     быть не должно. Апсерт по PK (REPLACE ломает FTS), вектора — построчно.
     Одна транзакция на приёмнике: строки + вектора + мета (цепочка получает
-    уходящую базу, state → phase=done — нарезка не нужна, всё вернулось
-    целым). Swap — отдельным вызовом.
+    уходящую базу, state → phase=`phase`: done при возврате вверх — нарезка
+    не нужна, всё вернулось целым; aborted при прерывании миграции вниз,
+    M3 — части возвращаются в исходники, сервис остаётся на прежней базе).
+    Swap — отдельным вызовом.
     """
     with session(settings) as active, session(
         settings.model_copy(update={"db_path": source_path})
@@ -583,9 +602,10 @@ def reverse_pour(
                 counters["poured"] += _copy_vec_rows(
                     active, src, table, key_column, where, params
                 )
-            # Уходящая база встаёт в конец цепочки; state → done: возврат 1:1
-            # без нарезки, migration_notes приёмника не тронуты (после прямого
-            # перелива 'ожидает' писались в уходящую базу, не в приёмник).
+            # Уходящая база встаёт в конец цепочки; state → phase (done при
+            # возврате вверх, aborted при прерывании — M3): migration_notes
+            # приёмника не тронуты (после прямого перелива 'ожидает' писались
+            # в уходящую базу, не в приёмник).
             away_name = Path(away_file).name
             _set_meta(src, META_SCHEMA_NOTE_CHARS, str(target))
             write_chain(
@@ -598,7 +618,7 @@ def reverse_pour(
             _write_state(
                 src,
                 {
-                    "phase": "done",
+                    "phase": phase,
                     "target": target,
                     "prev_file": away_name,
                     "prev_limit": live,
@@ -616,11 +636,12 @@ def startup_plan(settings: Settings) -> dict:
     """Фаза 0: сверка env с живым CHECK → план старта (design §4).
 
     Режимы: `none` — миграция не нужна (файла нет — его только что создал
-    init_db, CHECK нет, env совпал); `down` — цель меньше живого CHECK,
-    новая база и перелив влезающего; `up_chain` — цель больше, в цепочке
-    есть база с таким CHECK — дельта возвращается в неё (откат 1:1, части
-    исключаются); `up_new` — цель больше, родственной базы нет — новая база
-    вбирает всё (тоже без модели).
+    init_db, CHECK нет, env совпал, либо миграция была прервана оператором —
+    phase=aborted, автостарт не возобновляется); `down` — цель меньше живого
+    CHECK, новая база и перелив влезающего; `up_chain` — цель больше, в
+    цепочке есть база с таким CHECK — дельта возвращается в неё (откат 1:1,
+    части исключаются); `up_new` — цель больше, родственной базы нет — новая
+    база вбирает всё (тоже без модели).
     """
     path = Path(settings.db_path)
     target = settings.max_note_chars
@@ -628,6 +649,19 @@ def startup_plan(settings: Settings) -> dict:
         return {"mode": "none", "target": target, "schema_limit": None, "pending": 0}
     with session(settings) as conn:
         live = note_chars_limit(conn)
+        # Прерывание (M3, design §4): оператор остановил миграцию — автостарт
+        # НЕ возобновляется при рестарте с тем же env («сервис остаётся на
+        # прежней базе»); повторный запуск — сознательное действие (вопрос
+        # «дожать миграцию» открыт, design §6).
+        state = read_state(conn)
+        if state is not None and str(state.get("phase")) == "aborted":
+            return {
+                "mode": "none",
+                "target": target,
+                "schema_limit": live,
+                "pending": 0,
+                "aborted": True,
+            }
         if live is None or live == target:
             return {
                 "mode": "none",
