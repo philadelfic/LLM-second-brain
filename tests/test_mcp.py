@@ -258,19 +258,27 @@ class TestToolsList:
 
     @pytest.mark.asyncio
     async def test_save_update_schema(self, server_url: str) -> None:
-        """Контракты FR-4/FR-5: text 1..MAX_NOTE_CHARS (35000), id обязателен;
-        title (Фаза 11, решение №9) — опционален в схеме: отказ за сервисом
+        """Контракты FR-4/FR-5 + M1/M2 (3.4.0): maxLength текста — дефолт
+        MAX_NOTE_CHARS (1500); text в save стал опционален (default "") ради
+        массива `notes` (F-23, п. 3) — 1..SAVE_NOTES_MAX (20) самодостаточных
+        заметок одним вызовом, обязательных аргументов в save нет; title
+        (Фаза 11, решение №9) — опционален в схеме: отказ за сервисом
         (fail+hint «set a title ≤5 words»), не схемой. lsb-0004-01: text в
-        memory_update стал опционален (можно править title/summary/namespace
-        без перезаписи текста) — обязателен только id.
+        memory_update опционален — обязателен только id.
         """
         async with connect(server_url) as session:
             tools = {t.name: t for t in (await session.list_tools()).tools}
-        save_text = tools["memory_save"].input_schema["properties"]["text"]
-        assert save_text["maxLength"] == 35000
-        assert tools["memory_save"].input_schema["required"] == ["text"]
+        save_schema = tools["memory_save"].input_schema
+        save_text = save_schema["properties"]["text"]
+        assert save_text["maxLength"] == 1500  # дефолт MAX_NOTE_CHARS (M1)
+        assert save_text["default"] == ""  # text необязателен (M2: notes)
+        assert save_schema.get("required") is None  # text или notes — любой
+        notes = save_schema["properties"]["notes"]["anyOf"][0]
+        assert notes["type"] == "array"
+        assert notes["minItems"] == 1
+        assert notes["maxItems"] == 20  # SAVE_NOTES_MAX
         assert tools["memory_update"].input_schema["required"] == ["id"]
-        assert tools["memory_save"].input_schema["properties"]["title"]["default"] is None
+        assert save_schema["properties"]["title"]["default"] is None
         assert tools["memory_update"].input_schema["properties"]["title"]["default"] is None
 
     @pytest.mark.asyncio
@@ -337,19 +345,26 @@ class TestToolCalls:
     async def test_note_over_soft_limit_soft_fail_with_hint(
         self, server_url: str
     ) -> None:
-        """LSBN-S-1: текст 1501..35000 проходит схему (max_length остаётся
-        35000 — паритет env ↔ DDL), но отклоняется сервисом мягко:
-        fail + hint с лимитом, фактической длиной и правилом разбиения."""
+        """LSBN-S-1 + M2: заметка длиннее мягкого лимита (1500) отклоняется
+        мягко, с хинтом (лимит + фактическая длина + правило разбиения).
+        Через скалярный `text` путь недостижим (схема несёт maxLength=1500 —
+        M1), поэтому элемент массива `notes` (элементы без maxLength):
+        {stored: false, hint} у ЭТОГО элемента, соседний сохраняется."""
         async with connect(server_url) as session:
             call = await session.call_tool(
                 "memory_save",
-                {"text": "x" * 1501, "title": "Слишком длинная заметка"},
+                {"notes": [
+                    {"text": "x" * 1501, "title": "Слишком длинная заметка"},
+                    {"text": "короткая заметка рядом с длинной", "title": "Короткая"},
+                ]},
             )
         assert call.is_error is False
         body = call.structured_content
-        assert body["stored"] is False
-        assert "1500-character note limit" in body["hint"]
-        assert "1501 characters" in body["hint"]
+        assert body["stored_count"] == 1
+        assert body["notes"][0]["stored"] is False
+        assert "1500-character note limit" in body["notes"][0]["hint"]
+        assert "1501 characters" in body["notes"][0]["hint"]
+        assert body["notes"][1]["stored"] is True
 
     @pytest.mark.asyncio
     async def test_schema_rejects_too_many_ids(self, server_url: str) -> None:
