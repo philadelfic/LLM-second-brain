@@ -51,6 +51,8 @@ from app.storage.migration import (
     run_startup_migration,
     startup_plan,
 )
+# LSBN-F-22 (M3): union-контекст чтения (holder — services.migration).
+from app.services.migration import refresh_migration_context
 from app.transport.auth import BearerAuthMiddleware
 from app.transport.mcp import build_mcp
 from app.transport.rest import build_rest_router
@@ -496,6 +498,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         plan = startup_plan(settings)
         if plan["mode"] != "none":
             _run_startup_migration(settings, plan, services.backup)
+        # LSBN-F-22 (M3): union-контекст чтения (search/notes/dedup) — по
+        # состоянию миграции активной базы: phase pour/split и живой
+        # prev_file → вторая сессия по прежней базе (в т.ч. возобновление —
+        # рестарт середины миграции); done/aborted/нет — None (нулевой
+        # оверхед, пути прежние).
+        refresh_migration_context(settings)
         # Стартовая проверка трёх LLM-слотов (решение №5): после init_db,
         # ДО старта воркера — лёгкий GET без генерации, параллельно;
         # отказ авторизации фатален, недоступность — WARN + деградация.

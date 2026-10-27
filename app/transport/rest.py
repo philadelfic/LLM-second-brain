@@ -78,6 +78,9 @@ from app.services import Services
 from app.services import history
 from app.services.backup import BackupService
 from app.services.freshness import FreshnessValidationError
+# LSBN-F-22 (M3): блок /health.migration (фаза/причина/прогресс/инвариант)
+# и операторское прерывание миграции (POST /migration/abort).
+from app.services.migration import abort_migration, migration_health
 from app.services.namespaces import NamespaceError, NamespaceValidationError
 from app.services.notes import (
     _UNSET_COMMENT,
@@ -88,6 +91,8 @@ from app.services.notes import (
 # LSBN-F-34: снимок /health.operations (модель/провайдер/источник по операции).
 from app.services.operations import operations_health
 from app.services.search import SearchValidationError
+from app.storage.db import StorageError
+from app.storage.migration import MigrationError
 from app.services.skills import (
     HINT_NOT_FOUND as HINT_SKILL_NOT_FOUND,
     SkillValidationError,
@@ -438,6 +443,11 @@ class HealthResponse(BaseModel):
     # №12 (no12-02, §7.1/§7.2): агрегаты открытых предупреждений — {by_kind,
     # total} по общей таблице `warnings` (память и термины). Только SQL.
     warnings: dict[str, Any]
+    # LSBN-F-22 (M3, design §4 фаза 7): блок миграции — {phase, target,
+    # reason, counters{old_total, poured, split_notes, parts, quarantine,
+    # expired, waiting}, invariant_ok} — причина и прогресс видны оператору
+    # (постановка п. 2), счётчики — ЗАМЕТКИ (решение пилота). Только SQL.
+    migration: dict[str, Any]
     # LSBN-F-12 (arch §7.1): агрегаты decision-слота — {enabled, ok, answers,
     # fallbacks, by_reason:{unavailable,unsupported,low_confidence}} из памяти
     # процесса (вероятности наружу не отдаются — только журнал).
@@ -617,6 +627,8 @@ def build_rest_router(settings: Settings) -> APIRouter:
         Легаси-поля (`pending_vector`/`pending_summary`) сохранены.
         `version` — версия приложения (FR-4.2, techdebt-0036): оператор
         сверяет её с тегом релиза при приёмке.
+        `migration` — LSBN-F-22 (M3): фаза/причина/прогресс самомиграции
+        ({"phase": None} — базу миграция не касалась).
         """
         services = _services(request)
         worker = request.app.state.worker  # type: ignore[attr-defined]
@@ -664,6 +676,9 @@ def build_rest_router(settings: Settings) -> APIRouter:
             if backup is None
             else BackupStat(**await asyncio.to_thread(backup.status))
         )
+        # LSBN-F-22 (M3): фаза/причина/прогресс миграции — только SQL
+        # (постановка п. 2: «причина и прогресс видны в /health»).
+        migration = await asyncio.to_thread(migration_health, settings)
         return HealthResponse(
             status="ok",
             version=__version__,
@@ -686,6 +701,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
             decision=decision,
             update=update,
             backups=backups,
+            migration=migration,
         )
 
     @rest_router.post("/notes", status_code=201)
@@ -1797,6 +1813,32 @@ def build_rest_router(settings: Settings) -> APIRouter:
                 status_code=404, detail="job is not waiting for attention"
             )
         return result
+
+    # --- самомиграция: прерывание (LSBN-F-22, M3, design §4) ----------------
+    # Операторская ручка «миграцию можно прервать без потерь» (постановка
+    # п. 2): сервис остаётся на прежней базе, ничего не удаляется. Не в MCP —
+    # структуры/миграции рулит оператор (§13.6, как /namespaces).
+
+    @rest_router.post("/migration/abort")
+    async def abort_migration_route(request: Request) -> dict:
+        """Прервать самомиграцию: стоп джобы нарезки, reverse-pour дельты
+        в прежнюю базу (части исключаются), swap назад, phase=aborted.
+
+        `{aborted: True, phase, prev_file, counters}` — прервано этим
+        вызовом; `{aborted: False, hint}` — мягкий отказ (миграции нет /
+        уже прервана / очереди нарезки нет — возврат «вверх» завершается
+        при старте). Сбой перелива/swap — 500: активная база цела
+        (контракт MigrationError), вызов можно повторить (reverse_pour
+        идемпотентен, phase=aborted уже стоит — джоба стоит).
+        """
+        try:
+            return await asyncio.to_thread(abort_migration, settings)
+        except (MigrationError, StorageError, OSError) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"migration abort failed — service keeps running on "
+                f"the current base: {exc}",
+            ) from exc
 
     # --- бэкапы: наблюдаемость и проверка восстановления (№14, arch §7.2) ---
     # Операторские ручки: список снапшотов и проверка по вызову. Чтение
