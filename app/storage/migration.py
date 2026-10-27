@@ -514,6 +514,7 @@ def reverse_pour(
     target: int,
     reason: str,
     phase: str = "done",
+    exclude_note_ids: set[int] | None = None,
 ) -> dict:
     """Обратный перелив: дельта активной базы → прежняя (с CHECK = цели).
 
@@ -526,11 +527,21 @@ def reverse_pour(
     не нужна, всё вернулось целым; aborted при прерывании миграции вниз,
     M3 — части возвращаются в исходники, сервис остаётся на прежней базе).
     Swap — отдельным вызовом.
+
+    `exclude_note_ids` (M3, abort): id, чьи строки приёмника НЕЛЬЗЯ
+    трогать дельтой. Прерывание передаёт все old_id из migration_notes:
+    активная база выдаёт новым заметкам max(id)+1, что может совпасть
+    с id исходника — апсерт по такому id ЗАТИРАЛ бы оригинал прежней базы
+    посторонней заметкой (потеря исходника). Затенённые заметки остаются
+    только в уходящей базе (файл не удаляется). Зависимости (связи, чанки,
+    TTL, история, вектора) исключаются тем же множеством.
     """
     with session(settings) as active, session(
         settings.model_copy(update={"db_path": source_path})
     ) as src:
         part_notes = _migration_part_ids(active)
+        if exclude_note_ids:
+            part_notes = part_notes | set(exclude_note_ids)
         part_chunks = (
             {
                 int(chunk_id)

@@ -150,13 +150,18 @@ def legacy_visible_ids(settings: Settings) -> set[int]:
     Статусы 'ожидает'/'карантин' (текст ещё в прежней базе); 'нарезана' и
     'expired' НЕ входят — исходник заменён частями либо закрыт, union его
     не показывает (design §4: «исключая id 'нарезана'/'expired'»).
-    Таблицы migration_notes нет (миграции не было) — множество пусто.
+    Затенённые id исключаются: активная база выдаёт новым заметкам
+    max(id)+1, что может совпасть с id ждущего исходника — такая заметка
+    в активной базе СВОЯ, а не исходник (иначе union склеил бы разные
+    заметки по одному id). Таблицы migration_notes нет (миграции не было)
+    — множество пусто.
     """
     try:
         with session(settings) as conn:
             rows = conn.execute(
                 f"SELECT old_id FROM {MIGRATION_NOTES_TABLE} "
-                "WHERE status IN ('ожидает', 'карантин')"
+                "WHERE status IN ('ожидает', 'карантин') "
+                "AND old_id NOT IN (SELECT id FROM notes)"
             ).fetchall()
     except (sqlite3.Error, StorageError):
         return set()
@@ -548,6 +553,9 @@ def abort_migration(settings: Settings) -> dict:
             set_state_phase(conn, "aborted")
     # 2) Дельта активной базы → прежняя (части исключаются); target = CHECK
     # приёмника (prev_limit): штамп schema.note_chars остаётся её собственным.
+    # exclude — все old_id миграции: новый заметке активная база может
+    # выдать id исходника (max+1), апсерт затер бы оригинал прежней базы;
+    # такая заметка остаётся только в уходящем файле (он не удаляется).
     counters = reverse_pour(
         settings,
         source_path=legacy_path,
@@ -555,6 +563,7 @@ def abort_migration(settings: Settings) -> dict:
         target=int(state.get("prev_limit") or live or 0),
         reason="миграция прервана оператором",
         phase="aborted",
+        exclude_note_ids=_migration_note_ids(settings),
     )
     # 3) Swap назад: новая база уходит под имя своего CHECK (не удаляется),
     # прежняя возвращается на db_path — следующие session() открывают её.
@@ -594,6 +603,23 @@ def _pending_count(settings: Settings) -> int:
     except (sqlite3.Error, StorageError):
         return 0
     return int(row[0])
+
+
+def _migration_note_ids(settings: Settings) -> set[int]:
+    """Все old_id миграции (любой статус) — запрет апсерта в прежнюю базу.
+
+    Для reverse-pour прерывания: id исходника в прежней базе занят его
+    собственной строкой, а активная база могла выдать его новой заметке
+    (sqlite: max(id)+1) — апсерт по такому id затёр бы оригинал.
+    """
+    try:
+        with session(settings) as conn:
+            rows = conn.execute(
+                f"SELECT old_id FROM {MIGRATION_NOTES_TABLE}"
+            ).fetchall()
+    except (sqlite3.Error, StorageError):
+        return set()
+    return {int(row[0]) for row in rows}
 
 
 # --- фаза 7: сверка для /health (M3, design §4/§7) ---------------------------
