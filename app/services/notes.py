@@ -86,7 +86,12 @@ from app.services.listing import page_fields
 from app.services.namespaces import NamespaceService
 from app.services.splitter import split_text
 from app.storage import chunks, expirations, vectors
-from app.storage.db import DEFAULT_NAMESPACE, session, transaction
+from app.storage.db import (
+    DEFAULT_NAMESPACE,
+    note_chars_limit,
+    session,
+    transaction,
+)
 from app.storage.migration import (
     MIGRATION_NOTES_TABLE,
     SOURCE_MIGRATION_SPLIT,
@@ -119,6 +124,16 @@ HINT_NOTE_TOO_LONG = (
     "text: {actual} characters — over the {limit}-character note limit; "
     "split it into several self-contained notes, each carrying its own "
     "names, numbers and dates"
+)
+
+# LSBN-F-22 (M3): мягкий отказ правки/удаления ИСХОДНИКА после нарезки —
+# содержание живёт в частях, правка исходника их разъехалась бы с ним
+# (design §4: «после 'нарезана' — мягкий отказ с hint»). 'expired' — тот же
+# отказ: заметка закрыта миграцией, штатная зачистка её уберёт.
+HINT_SOURCE_SPLIT = (
+    "this note was split into self-contained parts during migration; the "
+    "source is read-only — edit or delete the parts instead (find them via "
+    "memory_search)"
 )
 
 # Сентинел «title не передан»: прямой вызов NoteService.save без транспорта
@@ -264,6 +279,51 @@ class NoteService:
         подсказка выключена.
         """
         self._similar_finder = finder
+
+    def _migration_write_route(self, note_id: int) -> dict[str, Any] | None:
+        """Маршрут записи заметки во время миграции (LSBN-F-22, M3).
+
+        Правки ждущих нарезку заметок ('ожидает'/'карантин') идут в ПРЕЖНЮЮ
+        базу — их текст живёт там (design §4/§6.3: «правки идут в старую
+        базу», гонка «правка ↔ нарезка» разрежена статусами). Ответ:
+        - None — обычный путь (миграции нет / заметка не миграционная /
+          в прежней базе уже нет — штатный not-found);
+        - {"refusal": hint} — исходник 'нарезана'/'expired': мягкий отказ
+          (содержание переехало в части, правка разъехалась бы с ними);
+        - {"settings", "limit"} — писать по legacy-настройкам, мягкий лимит
+          текста = живой CHECK прежней базы (у активной — константа кода).
+        """
+        # Ленивый импорт: services.migration тянет summary → notes (цикл),
+        # прецедент — notes.py ↔ ttl.py.
+        from app.services.migration import migration_context
+
+        context = migration_context()
+        if context is None:
+            return None
+        with session(self._settings) as conn:
+            row = conn.execute(
+                f"SELECT status FROM {MIGRATION_NOTES_TABLE} WHERE old_id = ?",
+                (note_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if str(row["status"]) in ("нарезана", "expired"):
+            return {"refusal": HINT_SOURCE_SPLIT}
+        legacy_settings = self._settings.model_copy(
+            update={"db_path": context.legacy_path}
+        )
+        with session(legacy_settings) as legacy_conn:
+            live = legacy_conn.execute(
+                "SELECT id FROM notes WHERE id = ? AND deleted_at IS NULL",
+                (note_id,),
+            ).fetchone()
+            limit = note_chars_limit(legacy_conn)
+        if live is None:
+            return None  # исходника в прежней базе нет — штатный not-found
+        return {
+            "settings": legacy_settings,
+            "limit": int(limit) if limit is not None else NOTE_TEXT_LIMIT,
+        }
 
     # --- FR-4 memory_save (ARCH §4.1) --------------------------------------
 
@@ -488,6 +548,10 @@ class NoteService:
 
         Отсутствующие/удалённые id пропускаются (FR-3); повтор id в запросе
         вернёт заметку один раз. Пусто → мягкий ответ с hint (§5.3).
+        LSBN-F-22 (M3): во время миграции — fallback по id в прежнюю базу
+        (union, design §4): 'ожидает'/'карантин' существуют только там;
+        'нарезана'/'expired' не отдаются — исходник заменён частями.
+        Контекста нет — ровно прежний путь.
         """
         if not 1 <= len(ids) <= self._settings.max_get_batch:
             raise NoteValidationError(
@@ -503,6 +567,30 @@ class NoteService:
                 wanted,
             ).fetchall()
         by_id = {row["id"]: row for row in rows}
+        # Ленивый импорт: services.migration тянет summary → notes (цикл),
+        # прецедент — notes.py ↔ ttl.py.
+        from app.services.migration import legacy_visible_ids, migration_context
+
+        context = migration_context()
+        if context is not None:
+            visible = legacy_visible_ids(self._settings)
+            legacy_missing = [
+                note_id for note_id in wanted if note_id not in by_id
+                and note_id in visible
+            ]
+            if legacy_missing:
+                legacy_marks = ",".join("?" * len(legacy_missing))
+                with session(
+                    self._settings.model_copy(
+                        update={"db_path": context.legacy_path}
+                    )
+                ) as legacy_conn:
+                    legacy_rows = legacy_conn.execute(
+                        f"SELECT * FROM notes WHERE deleted_at IS NULL "
+                        f"AND id IN ({legacy_marks})",
+                        legacy_missing,
+                    ).fetchall()
+                by_id.update({row["id"]: row for row in legacy_rows})
         notes = [
             self._full_note(by_id[note_id]) for note_id in wanted if note_id in by_id
         ]
@@ -623,6 +711,11 @@ class NoteService:
         страницу, и `total` одним и тем же условием `updated_at >= ?`; порядок
         `updated_at DESC, id DESC` не меняется. Невалидное значение —
         FreshnessValidationError (транспорт даёт 422 / мягкий отказ с hint).
+        LSBN-F-22 (M3): во время миграции — слияние с прежней базой (union):
+        ждущие нарезку ('ожидает'/'карантин') существуют только там, общая
+        сортировка по updated_at/id, `total` — сумма обеих баз; 'нарезана'/
+        'expired' не показываются (исходник заменён частями). Контекста нет —
+        ровно прежний путь.
         """
         max_limit = (
             self._settings.list_max_limit_rest if max_limit is None else max_limit
@@ -662,6 +755,49 @@ class NoteService:
                 f"{ns_clause}{fresh_clause}",
                 [*ns_params, *fresh_params],
             ).fetchone()[0]
+        # LSBN-F-22 (M3): union-страница. Из прежней базы берутся только
+        # ждущие нарезку (у остальных id есть в активной — их отдаёт она);
+        # верх (offset+limit) каждой базы достаточен для общего top-N слияния.
+        # Ленивый импорт: services.migration тянет summary → notes (цикл),
+        # прецедент — notes.py ↔ ttl.py.
+        from app.services.migration import legacy_visible_ids, migration_context
+
+        context = migration_context()
+        legacy_rows: list = []
+        if context is not None:
+            visible = legacy_visible_ids(self._settings)
+            if visible:
+                visible_marks = ",".join("?" * len(visible))
+                visible_clause = f" AND id IN ({visible_marks})"
+                with session(
+                    self._settings.model_copy(
+                        update={"db_path": context.legacy_path}
+                    )
+                ) as legacy_conn:
+                    legacy_rows = legacy_conn.execute(
+                        "SELECT id, title, namespace, summary, summary_status, "
+                        "author, created_at, updated_at, expires_at, text "
+                        "FROM notes WHERE deleted_at IS NULL"
+                        f"{ns_clause}{fresh_clause}{visible_clause} "
+                        "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+                        [
+                            *ns_params,
+                            *fresh_params,
+                            *visible,
+                            offset + limit,
+                            0,
+                        ],
+                    ).fetchall()
+                    total += legacy_conn.execute(
+                        f"SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL"
+                        f"{ns_clause}{fresh_clause}{visible_clause}",
+                        [*ns_params, *fresh_params, *visible],
+                    ).fetchone()[0]
+        rows = sorted(
+            [*rows, *legacy_rows],
+            key=lambda row: (row["updated_at"], row["id"]),
+            reverse=True,
+        )[offset : offset + limit]
         items = [
             {
                 "id": row["id"],
@@ -745,10 +881,24 @@ class NoteService:
         Обратная совместимость: вызов update(note_id, text) без
         title/summary/namespace работает как раньше — текст заменяется,
         summary перегенерируется (summary_pending=True).
+
+        LSBN-F-22 (M3): во время миграции правки ждущих нарезку заметок
+        ('ожидает'/'карантин') идут в ПРЕЖНЮЮ базу, где живёт их текст
+        (мягкий лимит текста — живой CHECK той базы); после 'нарезана'/
+        'expired' — мягкий отказ с hint (см. `_migration_write_route`).
         """
         text_changed = text is not _UNSET_TEXT
+        route = self._migration_write_route(note_id)
+        if route is not None and "refusal" in route:
+            return {"id": note_id, "updated": False, "hint": route["refusal"]}
+        write_settings = (
+            route["settings"] if route is not None else self._settings
+        )
         if text_changed:
-            self._validate_text(text)
+            self._validate_text(
+                text,
+                limit=route["limit"] if route is not None else NOTE_TEXT_LIMIT,
+            )
         note_title = None if title is None else self._checked_title(title)
         # no24-01 (3.2.0): пометка правится ОТДЕЛЬНЫМ путём (сентинел-семантика
         # как у summary/expires_at): не передан → оставить (колонку не трогаем);
@@ -757,7 +907,7 @@ class NoteService:
         comment_touched = comment is not _UNSET_COMMENT
         comment_value = self._checked_comment(comment) if comment_touched else None
         # Быстрая проверка до записи: несуществующий id не трогаем.
-        with session(self._settings) as conn:
+        with session(write_settings) as conn:
             row = conn.execute(
                 "SELECT id, namespace FROM notes "
                 "WHERE id = ? AND deleted_at IS NULL",
@@ -847,7 +997,7 @@ class NoteService:
         )
         params.append(note_id)
         chunks_data = self._chunks_of(text) if text_changed else None
-        with session(self._settings) as conn, transaction(conn):
+        with session(write_settings) as conn, transaction(conn):
             cursor = conn.execute(sql, params)
             updated = cursor.rowcount  # 0 = нет такой активной заметки
             if updated and expires_touched:
@@ -908,8 +1058,16 @@ class NoteService:
         note_expirations (expirations.delete) в той же транзакции — чтобы
         удалённая заметка не «висела» в очереди до фоновой зачистки.
         Если заметка не найдена (deleted=False) — строку не трогаем.
+        LSBN-F-22 (M3): удаление ждущей нарезку заметки идёт в прежнюю базу
+        (там её строка); после 'нарезана'/'expired' — мягкий отказ с hint.
         """
-        with session(self._settings) as conn, transaction(conn):
+        route = self._migration_write_route(note_id)
+        if route is not None and "refusal" in route:
+            return {"id": note_id, "deleted": False, "hint": route["refusal"]}
+        write_settings = (
+            route["settings"] if route is not None else self._settings
+        )
+        with session(write_settings) as conn, transaction(conn):
             cursor = conn.execute(
                 "UPDATE notes SET deleted_at = "
                 "strftime('%Y-%m-%dT%H:%M:%SZ','now') "
@@ -1433,22 +1591,25 @@ class NoteService:
             )
         return stripped
 
-    def _validate_text(self, text: str) -> None:
-        """1..NOTE_TEXT_LIMIT — мягкий лимит заметки (LSBN-S-1; доменное
+    def _validate_text(self, text: str, limit: int = NOTE_TEXT_LIMIT) -> None:
+        """1..limit — мягкий лимит заметки (LSBN-S-1; доменное
         правило REQUIREMENTS FR-4/FR-5).
 
-        Верхняя граница — НЕ settings.max_note_chars (35000): тот держит
-        паритет env ↔ живой CHECK (`_assert_note_chars_limit`) и не меняется.
-        Длиннее лимита — отказ с правилом «разбей на несколько самодостаточных
-        заметок»; жёсткий CHECK на 1500 ставит только самомиграция (F-22).
+        Верхняя граница по умолчанию — НЕ settings.max_note_chars (35000):
+        тот держит паритет env ↔ живой CHECK (`_assert_note_chars_limit`) и
+        не меняется. Длиннее лимита — отказ с правилом «разбей на несколько
+        самодостаточных заметок»; жёсткий CHECK на 1500 ставит только
+        самомиграция (F-22). LSBN-F-22 (M3): правка ждущей нарезку заметки
+        идёт в прежнюю базу — её живой CHECK и есть потолок (передаёт
+        `_migration_write_route`).
         """
-        if len(text) > NOTE_TEXT_LIMIT:
+        if len(text) > limit:
             raise NoteValidationError(
-                HINT_NOTE_TOO_LONG.format(actual=len(text), limit=NOTE_TEXT_LIMIT)
+                HINT_NOTE_TOO_LONG.format(actual=len(text), limit=limit)
             )
         if len(text) < 1:
             raise NoteValidationError(
-                f"text: length must be 1..{NOTE_TEXT_LIMIT} characters, "
+                f"text: length must be 1..{limit} characters, "
                 f"got {len(text)}"
             )
 
