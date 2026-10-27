@@ -147,6 +147,7 @@ from app.services.jobs import (
     BackoffState,
     JobSpec,
     build_job_specs,
+    next_interval,
     queue_snapshot,
     run_loop,
 )
