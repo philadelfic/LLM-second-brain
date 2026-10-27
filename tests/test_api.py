@@ -107,6 +107,8 @@ class TestHealth:
                 "checked_at": None,
                 "hint_shown_at": None,
             },
+            # LSBN-F-22 (M3): база без миграции — блок только с фазой-заглушкой.
+            "migration": {"phase": None},
         }
 
     def test_contract_fields(self, client: TestClient) -> None:
@@ -131,6 +133,7 @@ class TestHealth:
             "decision",
             "update",
             "backups",
+            "migration",  # LSBN-F-22 M3: фаза/причина/прогресс самомиграции
         }
         assert body["status"] == "ok"
         # techdebt-0036 (FR-4.2): версия — из приложения, не из окружения.
