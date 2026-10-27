@@ -1,4 +1,5 @@
-"""Самомиграция схемы, фаза 4 — джоба нарезки (LSBN-F-22, M2).
+"""Самомиграция схемы, фаза 4 — джоба нарезки (LSBN-F-22, M2) и M3:
+union-контекст чтения, прерывание, сверка для /health.
 
 Невлезающие заметки (migration_notes 'ожидает', M1) нарезаются моделью
 на самодостаточные части по мере обработки — «обработалось, стало
@@ -8,6 +9,14 @@
 (операция `split` — SPLIT_* env, слот нарезки отдельный, дефолт локальный)
 и `NoteService.save_migration_parts` — одна транзакция на заметку:
 части + история source="migration_split" + статус 'нарезана'+new_ids.
+
+M3 (design §4): процессный `MigrationContext` (legacy_path|None, holder
+здесь, дефолт None) — search/notes/dedup читают вторым соединением
+прежнюю базу, пока phase ∈ {pour, split}; `abort_migration` — стоп джобы
+(phase=aborted в активной базе), reverse-pour дельты в прежнюю (части
+исключаются), swap назад — сервис остаётся на прежней базе; фаза 7:
+обнуление очереди нарезки → phase=done; `migration_health` — счётчики
+сверки (old_total/poured — ЗАМЕТКИ, решение пилота) для /health.
 
 Статусы (design F-22 §3/§4):
 - TTL-истекла (или исходник исчез из прежней базы) → 'expired' — модель
@@ -31,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -42,8 +52,21 @@ from app.services.summary import (
     MergeIncompleteError,
     SummaryError,
 )
-from app.storage.db import StorageError, session
-from app.storage.migration import MIGRATION_NOTES_TABLE, read_state
+from app.storage.db import StorageError, note_chars_limit, session, transaction
+from app.storage.migration import (
+    MIGRATION_NOTES_TABLE,
+    SOURCE_MIGRATION_SPLIT,
+    MigrationError,
+    read_state,
+    reverse_pour,
+    set_state_phase,
+    sibling_db_path,
+    swap,
+)
+
+#: Фазы, при которых union-чтение включено (design §4: фазы 3–7; после
+#: обнуления — done, после прерывания — aborted — обе выключают union).
+_UNION_PHASES = ("pour", "split")
 
 if TYPE_CHECKING:  # только для аннотаций — модуль остаётся чистым
     from app.services.notes import NoteService
@@ -64,6 +87,80 @@ SPLIT_DEFERRED_WARNING = "split_deferred"
 _TAKEN_STATUSES = ("ожидает", "карантин")
 
 logger = logging.getLogger("app")
+
+
+# --- union-контекст чтения (M3, design §4) -----------------------------------
+
+
+@dataclass(frozen=True)
+class MigrationContext:
+    """Процессный union-контекст: где лежит прежняя база и фаза миграции.
+
+    Holder — переменная `_CONTEXT` ниже, дефолт None: без миграции
+    потребители (search/notes/dedup) работают ровно по прежним путям —
+    нулевой оверхед (ни второго соединения, ни лишнего SQL). Контекст
+    выставляет `refresh_migration_context` (lifespan после фаз 0–3, джоба
+    при phase=done, abort после swap) — потребители только читают.
+    """
+
+    legacy_path: str  # абсолютный путь прежней базы (migration.state.prev_file)
+    phase: str  # pour|split — читающие поверхности по ней не различаются
+
+
+_CONTEXT: MigrationContext | None = None
+
+
+def migration_context() -> MigrationContext | None:
+    """Текущий union-контекст процесса; None — миграции нет/выключена."""
+    return _CONTEXT
+
+
+def refresh_migration_context(settings: Settings) -> None:
+    """Синхронизировать контекст с состоянием миграции активной базы.
+
+    Включает union (phase ∈ {pour, split} и prev_file существует) или
+    выключает (нет состояния, done/aborted, файл исчез). Вызывается из
+    lifespan после фаз 0–3 (в т.ч. при возобновлении — рестарт середины
+    миграции поднимает union без нового перелива), джобой при phase=done
+    и abort'ом после swap. Идемпотентно; сбой чтения — union выключен.
+    """
+    global _CONTEXT
+    _CONTEXT = None
+    try:
+        with session(settings) as conn:
+            state = read_state(conn)
+    except (sqlite3.Error, StorageError):
+        return
+    if not state or str(state.get("phase")) not in _UNION_PHASES:
+        return
+    prev_file = str(state.get("prev_file") or "")
+    if not prev_file:
+        return
+    candidate = Path(settings.db_path).parent / prev_file
+    if not candidate.is_file():
+        return
+    _CONTEXT = MigrationContext(
+        legacy_path=str(candidate), phase=str(state["phase"])
+    )
+
+
+def legacy_visible_ids(settings: Settings) -> set[int]:
+    """id заметок, чья единственная живая копия — прежняя база.
+
+    Статусы 'ожидает'/'карантин' (текст ещё в прежней базе); 'нарезана' и
+    'expired' НЕ входят — исходник заменён частями либо закрыт, union его
+    не показывает (design §4: «исключая id 'нарезана'/'expired'»).
+    Таблицы migration_notes нет (миграции не было) — множество пусто.
+    """
+    try:
+        with session(settings) as conn:
+            rows = conn.execute(
+                f"SELECT old_id FROM {MIGRATION_NOTES_TABLE} "
+                "WHERE status IN ('ожидает', 'карантин')"
+            ).fetchall()
+    except (sqlite3.Error, StorageError):
+        return set()
+    return {int(row[0]) for row in rows}
 
 
 def _now() -> str:
@@ -131,14 +228,20 @@ class MigrationService:
         постановка п. 4: сервис работает, нарезка ждёт).
         """
         # 1) Активна ли миграция и где прежняя база (design §3: state).
+        # phase=done/aborted — джоба стоит (M3): после прерывания и после
+        # обнуления нарезать нечего и нельзя (сервис уже на прежней базе).
         state = self._read_state()
-        if state is None:
+        if state is None or str(state.get("phase")) not in _UNION_PHASES:
             return 0
         legacy_path = self._legacy_path(state)
         if legacy_path is None:
             return 0
         rows = self._taken_rows(limit)
         if not rows:
+            # Фаза 7 (M3): очередь нарезки пуста — сверка обнулена,
+            # phase=done (union выключается; state остаётся — migration_notes
+            # карта отката). Идемпотентно: следующий прогон — холостой.
+            self._close_if_drained(state)
             return 0
         done = 0
         legacy_settings = self._settings.model_copy(update={"db_path": legacy_path})
@@ -179,6 +282,30 @@ class MigrationService:
         return done
 
     # --- внутреннее ----------------------------------------------------------
+
+    def _close_if_drained(self, state: dict) -> None:
+        """Фаза 7: очередь пуста → phase=done и union выключен (M3).
+
+        Вызывается на пустом прогоне при активной фазе: 'ожидает' и
+        'карантин' кончились — каждая заметка либо перелита 1:1, либо
+        нарезана, либо expired. State не снимается (design §3/§7):
+        migration_notes остаётся картой отката, счётчики — в /health.
+        """
+        try:
+            with session(self._settings) as conn, transaction(conn):
+                set_state_phase(conn, "done")
+        except (sqlite3.Error, StorageError):
+            return  # сверка переживает рестарт — done поставит следующий прогон
+        refresh_migration_context(self._settings)
+        logger.info(
+            "migration: split queue drained — counters reconciled, phase=done",
+            extra={
+                "event": "migration_done",
+                "job": MIGRATION_JOB,
+                "target": state.get("target"),
+                "counters": state.get("counters"),
+            },
+        )
 
     def _split_one(
         self,
@@ -356,6 +483,229 @@ class MigrationService:
                 if value is not None:
                     payload[key] = value
         logger.info(message, extra=payload)
+
+
+# --- прерывание (M3, design §4 «Прерывание») ---------------------------------
+
+
+#: Мягкие отказы POST /migration/abort: прерывать нечего / уже прервано.
+ABORT_HINT_NONE = (
+    "no migration to abort: the base is not mid-migration "
+    "(phase is done/aborted or there is no migration state)"
+)
+ABORT_HINT_ALREADY = (
+    "migration is already aborted — the service is on the previous base"
+)
+ABORT_HINT_NOTHING_TO_SPLIT = (
+    "nothing to abort: the split queue is empty (up-migrations complete "
+    "at startup, nothing waits for the model)"
+)
+
+
+def abort_migration(settings: Settings) -> dict:
+    """Прервать миграцию без потерь: сервис остаётся на прежней базе.
+
+    Порядок (design §4): 1) «стоп джобы» — phase=aborted в активной базе,
+    следующая партия нарезки берёт ноль заметок (идущая партия успевает
+    только дописать части в уходящую базу — они исключаются из перелива,
+    дизайн риска 5: короткие сессии + снапшот фазы 1); 2) reverse-pour
+    дельты активной базы в прежнюю — апсерт UPDATE-else-INSERT (REPLACE
+    ломает FTS внешнего контента), части (record_versions
+    source='migration_split') и их зависимости исключаются — «id вне
+    отображения частей»; 3) swap: активная (новая) база уходит под имя
+    своего CHECK, прежняя возвращается на db_path — НЕ удаляется;
+    4) phase=aborted в восстановленной базе (ставит reverse_pour) и
+    union-контекст выключен. Повторный вызов после сбоя между (1) и (3)
+    возобновляет abort: reverse_pour идемпотентен (апсерт).
+
+    Возврат: {"aborted": True, ...} — прервано этим вызовом; мягкий отказ
+    {"aborted": False, "hint": ...} — прерывать нечего/уже прервано.
+    Прерывание применимо к миграции «вниз» (есть очередь нарезки):
+    возврат «вверх» завершается при старте синхронно — прерывать нечего.
+    """
+    with session(settings) as conn:
+        state = read_state(conn)
+        live = note_chars_limit(conn)
+    if state is None or str(state.get("phase")) not in (*_UNION_PHASES, "aborted"):
+        return {"aborted": False, "hint": ABORT_HINT_NONE}
+    prev_name = str(state.get("prev_file") or "")
+    if not prev_name or prev_name == Path(settings.db_path).name:
+        # Уже на прежней базе (swap после abort состоялся): prev_file
+        # указывает на уходящую базу, т.е. на сам db_path.
+        return {"aborted": False, "hint": ABORT_HINT_ALREADY}
+    legacy_path = str(Path(settings.db_path).parent / prev_name)
+    if not Path(legacy_path).is_file():
+        raise MigrationError(f"файл прежней базы не найден: {prev_name}")
+    if str(state.get("phase")) in _UNION_PHASES:
+        pending = _pending_count(settings)
+        if pending == 0:
+            # Возврат «вверх»/обнулённая очередь: нарезка не нужна, обратно
+            # переливать нечего (всё и так в обеих базах) — не трогаем.
+            return {"aborted": False, "hint": ABORT_HINT_NOTHING_TO_SPLIT}
+        # 1) Стоп джобы: phase=aborted ДО перелива (джоба видит на следующей
+        # партии; юнион-чтение ещё работает — прежняя база целa до swap).
+        with session(settings) as conn, transaction(conn):
+            set_state_phase(conn, "aborted")
+    # 2) Дельта активной базы → прежняя (части исключаются); target = CHECK
+    # приёмника (prev_limit): штамп schema.note_chars остаётся её собственным.
+    counters = reverse_pour(
+        settings,
+        source_path=legacy_path,
+        away_file=str(settings.db_path),
+        target=int(state.get("prev_limit") or live or 0),
+        reason="миграция прервана оператором",
+        phase="aborted",
+    )
+    # 3) Swap назад: новая база уходит под имя своего CHECK (не удаляется),
+    # прежняя возвращается на db_path — следующие session() открывают её.
+    swap(
+        settings,
+        away_file=sibling_db_path(settings.db_path, int(live or 0)),
+        incoming_file=legacy_path,
+    )
+    # 4) Состояние восстановленной базы — phase=aborted (reverse_pour);
+    # union-чтение выключается.
+    refresh_migration_context(settings)
+    logger.info(
+        "migration aborted — service stays on the previous base",
+        extra={
+            "event": "migration_aborted",
+            "job": MIGRATION_JOB,
+            "prev_file": prev_name,
+            **counters,
+        },
+    )
+    return {
+        "aborted": True,
+        "phase": "aborted",
+        "prev_file": prev_name,
+        "counters": counters,
+    }
+
+
+def _pending_count(settings: Settings) -> int:
+    """Число заметок в очереди нарезки ('ожидает' + 'карантин')."""
+    try:
+        with session(settings) as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM {MIGRATION_NOTES_TABLE} "
+                "WHERE status IN ('ожидает', 'карантин')"
+            ).fetchone()
+    except (sqlite3.Error, StorageError):
+        return 0
+    return int(row[0])
+
+
+# --- фаза 7: сверка для /health (M3, design §4/§7) ---------------------------
+
+
+def migration_health(settings: Settings) -> dict:
+    """Блок `migration` для /health: фаза, причина, прогресс, инвариант.
+
+    Счётчики — ЗАМЕТКИ (решение пилота): old_total — заметки прежней базы
+    (живой COUNT — сверковая база), poured — перелитые 1:1 при старте
+    (зафиксирован в state.counters переливом; после abort'а — всё
+    вернувшееся целым), split_notes/parts/quarantine/expired/waiting —
+    живые статусы migration_notes и история частей. Инвариант сверки:
+    old_total = poured + split_notes + waiting + quarantine + expired
+    (расхождение = прежнюю базу правили в обход миграции — удаление
+    исходника оператором); после abort'а parts=0 и очередь пуста.
+    Без состояния миграции — {"phase": None}.
+    """
+    try:
+        with session(settings) as conn:
+            state = read_state(conn)
+            statuses = _status_counts(conn)
+            parts = _part_count(conn)
+    except (sqlite3.Error, StorageError):
+        return {"phase": None}
+    if state is None:
+        return {"phase": None}
+    phase = str(state.get("phase"))
+    waiting = statuses.get("ожидает", 0)
+    split_notes = statuses.get("нарезана", 0)
+    quarantine = statuses.get("карантин", 0)
+    expired = statuses.get("expired", 0)
+    old_total = _legacy_total(settings, state, phase)
+    if old_total is None:
+        poured = None
+        invariant_ok = None
+    elif phase == "aborted":
+        # После прерывания всё вернулось целым: прежняя база снова полная,
+        # state.counters от reverse_pour (строки перелива) — не про заметки.
+        poured = old_total
+        invariant_ok = old_total == poured + split_notes + waiting + quarantine + expired
+    else:
+        poured = int(state.get("counters", {}).get("poured", 0))
+        invariant_ok = (
+            old_total == poured + split_notes + waiting + quarantine + expired
+        )
+    return {
+        "phase": phase,
+        "target": state.get("target"),
+        "reason": state.get("reason"),
+        "counters": {
+            "old_total": old_total,
+            "poured": poured,
+            "split_notes": split_notes,
+            "parts": parts,
+            "quarantine": quarantine,
+            "expired": expired,
+            "waiting": waiting,
+        },
+        "invariant_ok": invariant_ok,
+    }
+
+
+def _status_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Статусы migration_notes → {статус: число}; таблицы нет — пусто."""
+    try:
+        rows = conn.execute(
+            f"SELECT status, COUNT(*) AS n FROM {MIGRATION_NOTES_TABLE} "
+            "GROUP BY status"
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    return {str(row["status"]): int(row["n"]) for row in rows}
+
+
+def _part_count(conn: sqlite3.Connection) -> int:
+    """Число частей нарезки в активной базе (источник record_versions)."""
+    try:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT entity_id) FROM record_versions "
+            "WHERE entity = 'note' AND source = ?",
+            (SOURCE_MIGRATION_SPLIT,),
+        ).fetchone()
+    except sqlite3.Error:
+        return 0
+    return int(row[0])
+
+
+def _legacy_total(settings: Settings, state: dict, phase: str) -> int | None:
+    """Живое число заметок базы-источника сверки; нет файла — None.
+
+    Во время миграции (pour/split/done) прежняя база — рядом под именем из
+    state.prev_file; после abort'а она и есть активная (prev_file указывает
+    на уходящую базу) — считаем db_path.
+    """
+    prev_file = str(state.get("prev_file") or "")
+    if phase == "aborted":
+        target_path = settings.db_path
+    elif prev_file and prev_file != Path(settings.db_path).name:
+        candidate = Path(settings.db_path).parent / prev_file
+        if not candidate.is_file():
+            return None
+        target_path = str(candidate)
+    else:
+        return None
+    try:
+        with session(
+            settings.model_copy(update={"db_path": target_path})
+        ) as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0])
+    except (sqlite3.Error, StorageError):
+        return None
 
 
 def build_migration_job(
