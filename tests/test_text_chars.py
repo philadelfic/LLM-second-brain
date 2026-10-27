@@ -66,6 +66,17 @@ METRIC_TITLES = [
 
 
 @pytest.fixture
+def _long_notes_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Многочанковый текст — механика `chars`/чанков, не лимита записи:
+    боевой MAX_NOTE_CHARS (CHECK у новой БД берётся из настроек при init_db)
+    и мягкий NOTE_TEXT_LIMIT подняты до прежнего потолка; границу 1500/1501
+    тестируют TestSave и tests/test_note_soft_limit.py (LSBN-S-1 + M1)."""
+    monkeypatch.setenv("MAX_NOTE_CHARS", "35000")
+    monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)
+    get_settings.cache_clear()
+
+
+@pytest.fixture
 def settings_and_services(
     test_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Settings, Services]:
@@ -166,16 +177,12 @@ class TestMCPChars:
     @pytest.mark.asyncio
     async def test_chunk_mode_keeps_chunk_sum_and_total_chunks(
         self,
+        _long_notes_allowed: None,
         settings_and_services: tuple[Settings, Services],
         mcp_server,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Chunk-режим: `chars` = сумма символов ОТДАННЫХ чанков (lsb-0003),
         `total_chunks` на месте — полный объём не подменяет прежний смысл."""
-        # Многочанковый текст длиннее мягкого лимита заметки (LSBN-S-1):
-        # поднимаем его до прежнего потолка — механика `chars` от лимита
-        # записи не зависит (границу тестируют test_note_soft_limit).
-        monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)
         _, services = settings_and_services
         text = long_text()
         note_id = services.notes.save(text, title="Длинная заметка")["id"]

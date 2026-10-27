@@ -650,9 +650,13 @@ class TestGetChunk:
     @pytest.fixture(autouse=True)
     def _long_notes_allowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Многочанковые тексты (9000 симв.) — механика чанков, не лимита:
-        мягкий лимит заметки (LSBN-S-1) поднят до прежнего потолка; границу
+        мягкий лимит заметки (LSBN-S-1) поднят до прежнего потолка, боевой
+        MAX_NOTE_CHARS тоже (M1 сделал 1500 дефолтом настроек и CHECK-лимитом
+        новых баз — env поднимаем до init_db фикстуры `service`); границу
         1500/1501 тестируют TestSave и tests/test_note_soft_limit.py."""
+        monkeypatch.setenv("MAX_NOTE_CHARS", "35000")
         monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)
+        get_settings.cache_clear()
 
     @staticmethod
     def _vectorize(note_id: int) -> None:
@@ -747,9 +751,13 @@ class TestUpdateMetadata:
 
     @pytest.fixture(autouse=True)
     def _long_notes_allowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Многочанковые тексты — механика чанков: мягкий лимит поднят
-        (границу 1500/1501 тестируют TestSave и test_note_soft_limit)."""
+        """Многочанковые тексты — механика чанков: мягкий лимит поднят,
+        боевой MAX_NOTE_CHARS тоже (M1: 1500 — дефолт настроек и CHECK новых
+        баз; env поднимаем до init_db фикстуры `service`; границу 1500/1501
+        тестируют TestSave и test_note_soft_limit)."""
+        monkeypatch.setenv("MAX_NOTE_CHARS", "35000")
         monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)
+        get_settings.cache_clear()
 
     @staticmethod
     def _processed_note(service: NoteService, text: str, title: str) -> int:
@@ -1053,9 +1061,13 @@ class TestComment:
 
     @pytest.fixture(autouse=True)
     def _long_notes_allowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Многочанковые тексты — механика чанков: мягкий лимит поднят
-        (границу 1500/1501 тестируют TestSave и test_note_soft_limit)."""
+        """Многочанковые тексты — механика чанков: мягкий лимит поднят,
+        боевой MAX_NOTE_CHARS тоже (M1: 1500 — дефолт настроек и CHECK новых
+        баз; env поднимаем до init_db фикстуры `service`; границу 1500/1501
+        тестируют TestSave и test_note_soft_limit)."""
+        monkeypatch.setenv("MAX_NOTE_CHARS", "35000")
         monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)
+        get_settings.cache_clear()
 
     # Поля, которые правка комментария НЕ трогает (включая служебные).
     _UNTOUCHED = (
