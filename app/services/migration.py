@@ -123,9 +123,14 @@ def refresh_migration_context(settings: Settings) -> None:
     lifespan после фаз 0–3 (в т.ч. при возобновлении — рестарт середины
     миграции поднимает union без нового перелива), джобой при phase=done
     и abort'ом после swap. Идемпотентно; сбой чтения — union выключен.
+    Файла базы нет — union выключен БЕЗ открытия соединения: sqlite3.connect
+    создаёт пустой файл, а это побочный эффект, которого у чтения быть не
+    должно (свежая база до init_db).
     """
     global _CONTEXT
     _CONTEXT = None
+    if not Path(settings.db_path).is_file():
+        return
     try:
         with session(settings) as conn:
             state = read_state(conn)

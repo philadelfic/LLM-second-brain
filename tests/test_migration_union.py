@@ -10,7 +10,6 @@ union-контекст — refresh_migration_context (в юнит-тестах l
 from __future__ import annotations
 
 import pathlib
-from collections.abc import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
@@ -48,14 +47,8 @@ def _env(monkeypatch: pytest.MonkeyPatch, limit: int) -> None:
     get_settings.cache_clear()
 
 
-@pytest.fixture(autouse=True)
-def _clean_union_context(test_env: dict) -> Iterator[None]:
-    """Сбросить процессный union-контекст: holder переживает тесты
-    (переменная модуля) — без сброса соседний тест видел бы чужую legacy."""
-    refresh_migration_context(get_settings())
-    assert migration_context() is None
-    yield
-    refresh_migration_context(get_settings())
+# Сброс процессного union-контекста между тестами делает autouse test_env
+# (conftest): holder переживает тесты, lifespan миграционных его ставит.
 
 
 def _seed_legacy(settings) -> None:

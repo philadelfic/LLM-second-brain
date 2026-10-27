@@ -540,6 +540,9 @@ def reverse_pour(
         settings.model_copy(update={"db_path": source_path})
     ) as src:
         part_notes = _migration_part_ids(active)
+        # kept_parts — семантика частей (нарезка), exclude в неё не мешается:
+        # счётчик прерывания/отката показывает именно неперелитые части.
+        kept_parts = len(part_notes)
         if exclude_note_ids:
             part_notes = part_notes | set(exclude_note_ids)
         part_chunks = (
@@ -602,7 +605,7 @@ def reverse_pour(
             *((table, key, "1=1", ()) for table, key in area_vectors.VEC_TABLES),
         )
 
-        counters = {"poured": 0, "kept_parts": len(part_notes)}
+        counters = {"poured": 0, "kept_parts": kept_parts}
         with transaction(src):
             # Приёмник мог быть создан до LSBN-F-22: таблицы migration_notes
             # и штампа в нём может не быть (идемпотентно).

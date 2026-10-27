@@ -58,6 +58,13 @@ def test_env(
     monkeypatch.setenv("BACKUP_DIR", str(backup_dir))
     env = {**TEST_ENV, "DB_PATH": str(db_path), "BACKUP_DIR": str(backup_dir)}
     get_settings.cache_clear()
+    # LSBN-F-22 (M3): сбросить процессный union-контекст — holder переживает
+    # тесты (lifespan миграционных тестов его ставит на свою tmp-базу), а
+    # соседним тестам он чужой: search/notes/dedup ходили бы в ту базу.
+    # Импорт локально: шапка conftest выше setdefault env (E402 — канон).
+    from app.services.migration import refresh_migration_context
+
+    refresh_migration_context(get_settings())
     yield env
     get_settings.cache_clear()
 

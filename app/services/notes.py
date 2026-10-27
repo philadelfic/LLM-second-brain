@@ -742,13 +742,17 @@ class NoteService:
             fresh_clause = ""
             fresh_params = []
         with session(self._settings) as conn:
+            # Активная страница берётся С НАЧАЛА (LIMIT offset+limit OFFSET 0):
+            # union-слияние режет общую страницу по (updated_at, id) —
+            # верх каждой базы достаточен; без миграции это ровно прежняя
+            # страница (срез одного списка эквивалентен OFFSET).
             rows = conn.execute(
                 "SELECT id, title, namespace, summary, summary_status, author, "
                 "created_at, updated_at, expires_at, text "
                 "FROM notes WHERE deleted_at IS NULL"
                 f"{ns_clause}{fresh_clause} "
                 "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
-                [*ns_params, *fresh_params, limit, offset],
+                [*ns_params, *fresh_params, offset + limit, 0],
             ).fetchall()
             total = conn.execute(
                 f"SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL"
@@ -1591,7 +1595,7 @@ class NoteService:
             )
         return stripped
 
-    def _validate_text(self, text: str, limit: int = NOTE_TEXT_LIMIT) -> None:
+    def _validate_text(self, text: str, limit: int | None = None) -> None:
         """1..limit — мягкий лимит заметки (LSBN-S-1; доменное
         правило REQUIREMENTS FR-4/FR-5).
 
@@ -1601,8 +1605,12 @@ class NoteService:
         самодостаточных заметок»; жёсткий CHECK на 1500 ставит только
         самомиграция (F-22). LSBN-F-22 (M3): правка ждущей нарезку заметки
         идёт в прежнюю базу — её живой CHECK и есть потолок (передаёт
-        `_migration_write_route`).
+        `_migration_write_route`). `limit=None` читает константу модуля
+        В МОМЕНТ вызова — monkeypatch лимита тестами (прецедент af42491)
+        продолжает работать (default-параметр связался бы при определении).
         """
+        if limit is None:
+            limit = NOTE_TEXT_LIMIT
         if len(text) > limit:
             raise NoteValidationError(
                 HINT_NOTE_TOO_LONG.format(actual=len(text), limit=limit)
