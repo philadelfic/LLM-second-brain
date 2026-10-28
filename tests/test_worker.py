@@ -857,9 +857,9 @@ def test_merge_job_created_after_judge_verdict(settings) -> None:
     assert worker.process_merge_pending() == 1
 
 
-def test_merge_preserves_earlier_title(settings) -> None:
-    """Merge сохраняет title ранней (решение №9): update без title не затирает
-    название ранней заметки."""
+def test_merge_parts_carry_own_title(settings) -> None:
+    """F-23 (п. 1): у каждой части свой title — название ранней больше не
+    наследуется; исходные уходят в корзину, текст живёт в части."""
     notes = NoteService(settings, FailingEmbedder())
     first = notes.save("ранняя заметка про бэкапы", title="Ранняя заметка")
     notes.save("поздняя заметка про деплои", title="Поздняя заметка")
@@ -873,11 +873,15 @@ def test_merge_preserves_earlier_title(settings) -> None:
     worker.process_judge_pending()
     worker.process_merge_pending()
     with session(settings) as conn:
-        row = conn.execute(
-            "SELECT title, text FROM notes WHERE id = ?", (first["id"],)
-        ).fetchone()
-    assert row["title"] == "Ранняя заметка"  # title ранней сохранён
-    assert row["text"] == "слитый текст"
+        rows = conn.execute(
+            "SELECT id, title, text, deleted_at FROM notes ORDER BY id"
+        ).fetchall()
+    assert [(r["title"], r["deleted_at"] is not None) for r in rows[:2]] == [
+        ("Ранняя заметка", True),
+        ("Поздняя заметка", True),
+    ]  # исходники в корзине со своими названиями
+    assert rows[2]["title"] == "Объединённая заметка"  # title части из слияния
+    assert rows[2]["text"] == "слитый текст" and rows[2]["deleted_at"] is None
 
 
 def test_summary_loop_serializes_jobs(settings) -> None:

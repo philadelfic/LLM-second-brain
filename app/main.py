@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -36,11 +37,22 @@ from app.services.llm_client import (
     CHECK_OK,
     DECISION_CHECK_OK,
     LLMClient,
+    SlotSpec,
 )
+from app.services.operations import OPERATIONS, unknown_operation_warnings
+from app.services.backup import BackupService
 from app.services.slot_budget import resolve_output_budget
 from app.services.update_check import UpdateChecker
 from app.services.worker import BackgroundWorker
 from app.storage.db import StorageError, init_db
+from app.storage.migration import (
+    MigrationError,
+    ensure_startup_schema,
+    run_startup_migration,
+    startup_plan,
+)
+# LSBN-F-22 (M3): union-контекст чтения (holder — services.migration).
+from app.services.migration import refresh_migration_context
 from app.transport.auth import BearerAuthMiddleware
 from app.transport.mcp import build_mcp
 from app.transport.rest import build_rest_router
@@ -111,7 +123,151 @@ def _handle_decision_check(
     )
 
 
-async def _provider_startup_check(services: Services) -> None:
+def _log_operation_config_warning(
+    logger: logging.Logger,
+    *,
+    operation: str,
+    slot: str,
+    code: str,
+    text: str,
+    spec: SlotSpec,
+) -> None:
+    """Одно предупреждение конфигурации ОПЕРАЦИИ (LSBN-F-34, arch §13.5).
+
+    Тот же контракт события `slot_config_warning`, что у слотов (main.py
+    пишет, сервис стартует): `slot` — слот-группа операции, `operation` —
+    имя операции из реестра. Эффективный бюджет — тем же
+    `resolve_output_budget`, что и в вызове.
+    """
+    budget, _source = resolve_output_budget(
+        operation=spec.name,
+        prompt_tokens=0,
+        explicit=spec.num_predict or None,
+        context_tokens=spec.context_tokens,
+        reserve_tokens=spec.prompt_reserve_tokens,
+        defensive_cap=spec.max_output_tokens,
+    )
+    logger.warning(
+        text,
+        extra={
+            "event": "slot_config_warning",
+            "slot": slot,
+            "operation": operation,
+            "code": code,
+            "model_type": spec.model_type,
+            "budget": budget,
+            "context_tokens": spec.context_tokens,
+            "timeout_sec": int(spec.read_timeout),
+            "text": text,
+        },
+    )
+
+
+def _operations_config_warnings(logger: logging.Logger, settings: Settings) -> None:
+    """Предупреждения конфигурации операций (LSBN-F-34; решение №4 брифа).
+
+    Те же правила `slot_config_warnings` (таймаут/бюджет/контекст), что у
+    слотов, но по эффективному spec ПЕРЕОПРЕДЕЛЁННОЙ операции — операция без
+    плоского env уже покрыта предупреждениями своего слота, дублей не
+    создаём. Плюс WARN об env с неизвестным именем операции (опечатка вида
+    `MERG_MODEL`) — не фатально, сервис стартует. Вызывается при старте
+    (lifespan), после проверки слотов.
+    """
+    for operation in OPERATIONS:
+        spec, sources = SlotSpec.for_operation(operation, settings)
+        if "op" not in sources.values():
+            continue
+        for code, text in LLMClient.slot_config_warnings(spec):
+            _log_operation_config_warning(
+                logger,
+                operation=operation,
+                slot=spec.name,
+                code=code,
+                text=text,
+                spec=spec,
+            )
+    # Неизвестное имя операции — отдельное событие БЕЗ слота: контракт
+    # `slot_config_warning` (всегда со слотом) не ломается (см.
+    # test_main_startup_warnings).
+    for _code, text in unknown_operation_warnings():
+        logger.warning(
+            text,
+            extra={
+                "event": "unknown_operation_warning",
+                "code": "unknown_operation",
+                "text": text,
+            },
+        )
+
+
+def _run_startup_migration(
+    settings: Settings, plan: dict, backup: BackupService
+) -> None:
+    """LSBN-F-22 (M1), фазы 1–3: журнал → снапшот → перелив и swap.
+
+    Вызывается из lifespan, когда `startup_plan` увидел расхождение env с
+    живым CHECK (фаза 0). Порядок фазы 1 (постановка: «старт, видимость,
+    снапшот»): ПЕРВАЯ строка журнала джоб с причиной и объёмом, затем
+    снапшот прежней базы — без него перелив не начинается (решение M1:
+    отказ снапшота — WARN, сервис остаётся на прежней базе и переживёт
+    рестарт с тем же расхождением). Сбой перелива/swap тоже не роняет
+    старт: активная база цела (`run_startup_migration` гарантирует
+    восстановление указателя), расхождение остаётся видимым в журнале.
+    """
+    logger = logging.getLogger("app")
+    logger.info(
+        f"миграция: env={plan['target']}, схема={plan['schema_limit']}, "
+        f"цель {plan['target']}, к обработке {plan['pending']}",
+        extra={
+            "event": "migration_started",
+            "job": "migration",
+            "mode": plan["mode"],
+            "env_limit": plan["target"],
+            "schema_limit": plan["schema_limit"],
+            "target": plan["target"],
+            "pending": plan["pending"],
+            "reason": plan["reason"],
+        },
+    )
+    try:
+        backup.snapshot()
+    except (sqlite3.Error, OSError) as exc:
+        logger.error(
+            "снапшот прежней базы не удался — миграция отложена",
+            extra={
+                "event": "migration_snapshot_failed",
+                "job": "migration",
+                "error": str(exc),
+            },
+        )
+        return
+    try:
+        counters = run_startup_migration(settings, plan)
+    except (MigrationError, StorageError, OSError) as exc:
+        logger.error(
+            "перелив/swap не состоялись — сервис остаётся на прежней базе",
+            extra={
+                "event": "migration_failed",
+                "job": "migration",
+                "mode": plan["mode"],
+                "error": str(exc),
+            },
+        )
+        return
+    logger.info(
+        "миграция: перелив и swap выполнены — сервис на новой базе",
+        extra={
+            "event": "migration_swapped",
+            "job": "migration",
+            "mode": plan["mode"],
+            **counters,
+        },
+    )
+
+
+async def _provider_startup_check(
+    services: Services, settings: Settings | None = None
+) -> None:
     """Стартовая проверка трёх LLM-слотов (решение №5) — в lifespan.
 
     После init_db, ДО старта воркера: лёгкий GET к каждому слоту (без
@@ -130,6 +286,8 @@ async def _provider_startup_check(services: Services) -> None:
     (слот, провайдер, исход — аудит в стиле Фазы 10).
     """
     logger = logging.getLogger("app")
+    if settings is None:
+        settings = get_settings()
     slots = _startup_slots(services)
     if not slots:
         # DI-сборка без клиентов слотов (фейки вместо сервисов): проверка —
@@ -222,6 +380,10 @@ async def _provider_startup_check(services: Services) -> None:
                         "text": text,
                     },
                 )
+    # LSBN-F-34 (решение №4 брифа): предупреждения конфигурации операций —
+    # переопределённые плоским env (те же правила, что у слотов) + WARN о
+    # неизвестном имени операции. Сервис стартует (не фатально).
+    _operations_config_warnings(logger, settings)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -249,6 +411,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # суммаризатор из DI — тот же экземпляр, что в /health.summarizer_ok.
     # Судья дедупа (Фаза 8, Этап 3.1) — тоже DI из services, один экземпляр
     # на процесс (вердикты по кандидатам — Задача 3.2).
+    # №12 (3.2.0): один сервис предупреждений на процесс — им воркер пишет
+    # «слияние отложено» (F-23 п. 6), а NoteService инвалидирует
+    # предупреждения при правке (ниже). Снятию классификатор не нужен
+    # (только SQL) — узкая инъекция без циклических импортов.
+    warnings_service = WarningsService(
+        settings, classifier=None, namespaces=services.namespaces
+    )
     worker = BackgroundWorker(
         settings,
         services.embedding,
@@ -258,6 +427,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         promoter=services.promotion,
         terms=services.terms,
         decision=services.decision,
+        warnings=warnings_service,
     )
     # Суммаризация стартует сразу при save/update: NoteService сигналит
     # воркеру, тот немедленно догоняет pending_summary (не ждёт back-off).
@@ -268,14 +438,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Событие только ускоряет — задание живёт в статусе заметки (gate
     # 2026-09-19, прецедент summary-нотификатора).
     services.notes.set_vector_notifier(worker.notify_embedding_pending)
-    # №12 (3.2.0): правка заметки инвалидирует её предупреждение — в той же
-    # транзакции (FR-4.4). Снятию классификатор не нужен (только SQL), поэтому
-    # сервис собирается без него — узкая инъекция без циклических импортов.
-    services.notes.set_warnings_resolver(
-        WarningsService(
-            settings, classifier=None, namespaces=worker._namespaces
-        ).resolve_for_subject
-    )
+    # №12 (FR-4.4): правка заметки инвалидирует её предупреждение — в той же
+    # транзакции.
+    services.notes.set_warnings_resolver(warnings_service.resolve_for_subject)
     # Область навыков (3.0.0): save/правка сигналит петле areas — вектора
     # записи догоняются сразу, а не по выросшему back-off (прецедент
     # summary-нотификатора). None — DI-сборка тестов без области навыков.
@@ -319,13 +484,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # схема создаётся/сверяется до первого запроса; ошибка — фатальна.
         try:
             init_db(settings)
+            # LSBN-F-22: таблица migration_notes + штамп schema.note_chars
+            # на каждой старте (идемпотентно; наблюдаемость — design §3).
+            ensure_startup_schema(settings)
         except StorageError as exc:
             print(f"FATAL: {exc}", file=sys.stderr)
             raise SystemExit(2) from exc
+        # LSBN-F-22 (M1), фазы 0–3: env разошёлся с живым CHECK — сервис сам
+        # строит новую базу, переливает влезающее 1:1 и переключается файловым
+        # swap (автостарт без предохранителя — вариант C постановки; без
+        # простоя: старт продолжается на уже новой базе). Сбой не роняет старт:
+        # активная база цела, причина — в журнале джоб (первая строка миграции).
+        plan = startup_plan(settings)
+        if plan["mode"] != "none":
+            _run_startup_migration(settings, plan, services.backup)
+        # LSBN-F-22 (M3): union-контекст чтения (search/notes/dedup) — по
+        # состоянию миграции активной базы: phase pour/split и живой
+        # prev_file → вторая сессия по прежней базе (в т.ч. возобновление —
+        # рестарт середины миграции); done/aborted/нет — None (нулевой
+        # оверхед, пути прежние).
+        refresh_migration_context(settings)
         # Стартовая проверка трёх LLM-слотов (решение №5): после init_db,
         # ДО старта воркера — лёгкий GET без генерации, параллельно;
         # отказ авторизации фатален, недоступность — WARN + деградация.
-        await _provider_startup_check(services)
+        # LSBN-F-34: settings переданы явно — предупреждения операций считаются
+        # по тому же снимку настроек, что собрал процесс.
+        await _provider_startup_check(services, settings)
         logging.getLogger("app").info(
             "service started",
             extra={

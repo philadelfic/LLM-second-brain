@@ -6,12 +6,20 @@ WAL + busy_timeout; CHECK-лимит; идемпотентная инициал�
 
 from __future__ import annotations
 
+import logging
+import pathlib
 import sqlite3
 
 import pytest
 
 from app.config import Settings, get_settings
-from app.storage.db import BUSY_TIMEOUT_MS, StorageError, init_db, session
+from app.storage.db import (
+    BUSY_TIMEOUT_MS,
+    StorageError,
+    init_db,
+    note_chars_limit,
+    session,
+)
 
 
 @pytest.fixture
@@ -183,25 +191,51 @@ class TestSchemaCreated:
             with pytest.raises(sqlite3.IntegrityError):
                 conn.execute("INSERT INTO notes(text) VALUES (?)", ("x" * 11,))
 
-    def test_start_fails_when_max_note_chars_diverged(
-        self, monkeypatch: pytest.MonkeyPatch
+    def test_start_survives_max_note_chars_diverged(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Смена MAX_NOTE_CHARS поверх готовой БД — фатальный отказ старта.
+        """Расхождение env с готовой БД больше НЕ фатально (LSBN-F-22).
 
-        Лимит «запечён» в CHECK при первом создании; запуск сервиса с другим
-        значением невозможен — крупные заметки падали бы в рантайме с
-        невнятным IntegrityError (Фаза 5: аналог гейта EMBEDDING_DIM).
+        До F-22 запуск с другим MAX_NOTE_CHARS валил старт (StorageError).
+        Решение О. 15.10.2026: `_assert_note_chars_limit` возвращает живой
+        CHECK-лимит (решение о переливе — `app.storage.migration` в lifespan),
+        расхождение — warning `note_chars_mismatch` в журнале старта.
         """
         monkeypatch.setenv("MAX_NOTE_CHARS", "10")
         get_settings.cache_clear()
         init_db(get_settings())  # БД создана с лимитом 10
         monkeypatch.setenv("MAX_NOTE_CHARS", "500")
         get_settings.cache_clear()
-        with pytest.raises(StorageError, match="MAX_NOTE_CHARS") as exc_info:
-            init_db(get_settings())
-        # Сообщение называет оба значения — оператор сразу видит конфликт.
-        assert "10" in str(exc_info.value)
-        assert "500" in str(exc_info.value)
+        init_db(get_settings())  # прежнее поведение — StorageError; теперь нет
+        settings = get_settings()
+        with session(settings) as conn:
+            assert note_chars_limit(conn) == 10
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="app"):
+            init_db(get_settings())  # ещё один прогон — warning воспроизводим
+        mismatches = [
+            record
+            for record in caplog.records
+            if getattr(record, "event", None) == "note_chars_mismatch"
+        ]
+        assert len(mismatches) == 1
+        assert mismatches[0].schema_limit == 10
+        assert mismatches[0].env_limit == 500
+
+    def test_note_chars_limit_fresh_and_checkless(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Нет таблицы или CHECK — `note_chars_limit` вернёт None (сверять не с чем)."""
+        monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
+        get_settings.cache_clear()
+        settings = get_settings()
+        init_db(settings)
+        with session(settings) as conn:
+            conn.execute("DROP TABLE notes")
+            conn.execute(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT)"
+            )  # рукотворная схема без CHECK
+            assert note_chars_limit(conn) is None
 
     def test_start_ok_with_same_limit(self) -> None:
         """Перезапуск с тем же лимитом — сверка не мешает (идемпотентность)."""

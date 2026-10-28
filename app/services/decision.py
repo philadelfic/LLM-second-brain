@@ -475,6 +475,8 @@ class DecisionService:
             finish_reason=None,
             truncated=False,
             duration_ms=duration_ms,
+            base_url=spec.base_url,
+            config_source="slot",
         )
 
     def _fallback(

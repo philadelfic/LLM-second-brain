@@ -32,8 +32,13 @@ from app.services.judge import JudgeService
 from app.services.links import LinksService
 from app.services.llm_client import LLMClient, SlotSpec
 from app.services.logs import LogsService
+# LSBN-F-22 (M2): импорт модуля регистрирует джобу `migration` в реестре
+# каркаса (`jobs.JOB_BUILDERS`) — как `warnings`/`terms_normalize`
+# (импорт односторонний: migration → jobs).
+from app.services.migration import MigrationService
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
+from app.services.operations import OPERATIONS
 from app.services.promotion import DescriptionService, PromotionService, StructureJudgeService
 from app.services.prompts import PromptRegistry
 from app.services.search import SearchService
@@ -57,6 +62,7 @@ __all__ = [
     "LinksService",
     "LLMClient",
     "LogsService",
+    "MigrationService",
     "NamespaceService",
     "NoteService",
     "PromotionService",
@@ -167,6 +173,19 @@ def build_services(
     llm_embedding = LLMClient(SlotSpec.for_embedding(settings))
     llm_summary = LLMClient(SlotSpec.for_summary(settings))
     llm_judge = LLMClient(SlotSpec.for_judge(settings))
+    # Клиенты ОПЕРАЦИЙ (LSBN-F-34): плоский env `<ОПЕРАЦИЯ>_<ПОЛЕ>` (цепочка
+    # env операции → env слота → дефолт) поверх слот-групп. Одинаковые specs
+    # (операции без переопределения) делят один HTTP-пул — раскладка по
+    # клиентам меняется только там, где оператор переопределил процесс.
+    operation_clients: dict[str, LLMClient] = {}
+    by_spec: dict[SlotSpec, LLMClient] = {}
+    for operation in OPERATIONS:
+        spec, _sources = SlotSpec.for_operation(operation, settings)
+        client = by_spec.get(spec)
+        if client is None:
+            client = LLMClient(spec)
+            by_spec[spec] = client
+        operation_clients[operation] = client
     # LSBN-F-12: пара decision собирается только при включённом слоте
     # (выключенный не делает ни одного вызова — FR-1.1).
     llm_decision: LLMClient | None = None
@@ -174,7 +193,7 @@ def build_services(
     if settings.decision_enabled:
         llm_decision = LLMClient(SlotSpec.for_decision(settings))
         decision = DecisionService(settings, llm=llm_decision, registry=registry)
-    embedding = EmbeddingService(settings, llm=llm_embedding)
+    embedding = EmbeddingService(settings, llm=operation_clients["embed"])
     dedup = DeduplicationService(settings)
     namespaces = NamespaceService(settings)
     search = SearchService(settings, embedding)
@@ -184,8 +203,12 @@ def build_services(
     promotion = PromotionService(
         settings,
         embedding=embedding,
-        describer=DescriptionService(settings, llm=llm_summary, registry=registry),
-        judge=StructureJudgeService(settings, llm=llm_judge, registry=registry),
+        describer=DescriptionService(
+            settings, llm=operation_clients["describe"], registry=registry
+        ),
+        judge=StructureJudgeService(
+            settings, llm=operation_clients["structure_judge"], registry=registry
+        ),
         namespaces=namespaces,
     )
     # №30 (3.2.0): save получает подсказку «похожее» — той же точкой поиска,
@@ -200,13 +223,25 @@ def build_services(
         summary=(
             summary
             if summary is not None
-            else SummaryService(settings, llm=llm_summary, registry=registry)
+            else SummaryService(
+                settings,
+                llm={
+                    operation: operation_clients[operation]
+                    # "split" — нарезка миграции (LSBN-F-22 M2): тот же
+                    # реестр операций, SPLIT_* env → наследование слота.
+                    for operation in ("summarize", "title", "merge", "split")
+                },
+                registry=registry,
+            )
         ),
         judge=(
             judge
             if judge is not None
             else JudgeService(
-                settings, llm=llm_judge, registry=registry, decider=decision
+                settings,
+                llm=operation_clients["judge"],
+                registry=registry,
+                decider=decision,
             )
         ),
         backup=BackupService(settings, namespaces=namespaces),
@@ -215,7 +250,7 @@ def build_services(
         # `decider` (выключенный слот — None, поведение v3.1.0); вероятности
         # решений видны только в журнале (пишет сам DecisionService).
         classifier=ClassificationService(
-            settings, llm=llm_summary, registry=registry, decider=decision
+            settings, llm=operation_clients["classify"], registry=registry, decider=decision
         ),
         promotion=promotion,
         llm_embedding=llm_embedding,

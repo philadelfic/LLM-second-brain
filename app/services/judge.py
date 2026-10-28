@@ -148,11 +148,17 @@ class JudgeService:
         # LSBN-F-12: decision-слот (None — выключен, поведение v3.1.0).
         self._decider = decider
         # DI сборки (общий клиент слота judge) или свой клиент с
-        # transport-инъекцией для юнит-тестов (MockTransport).
+        # transport-инъекцией для юнит-тестов (MockTransport). Операция
+        # `judge` (LSBN-F-34): её env и есть env слота — цепочка не добавляет
+        # слоя, spec совпадает с for_judge; переопределение операции действует
+        # только на этом генеративном пути (резервный decision-слот — со
+        # своими DECISION_*).
         self._llm = (
             llm
             if llm is not None
-            else LLMClient(SlotSpec.for_judge(settings), transport=transport)
+            else LLMClient(
+                SlotSpec.for_operation("judge", settings)[0], transport=transport
+            )
         )
         # None — попыток не было (health не врёт до первых данных).
         self.last_attempt_ok: bool | None = None
@@ -225,7 +231,7 @@ class JudgeService:
                 self._prompts.judge_user.format(
                     text_new=text_new, text_candidate=text_candidate
                 ),
-                num_predict=self._settings.judge_num_predict or None,
+                # Бюджет — цепочка операции (JUDGE_NUM_PREDICT; 0 = авто, №49).
                 operation="judge",
             )
         except LLMError as exc:

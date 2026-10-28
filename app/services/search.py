@@ -43,14 +43,21 @@ SearchService.search_title: строгий поиск по названиям (�
 from __future__ import annotations
 
 import sqlite3
+from contextlib import ExitStack
 from typing import Any
 
 from app.config import Settings
 from app.services.embedding import Embedder, EmbeddingError, EmbeddingService
 from app.services.emit import snippet, summary_of
 from app.services.freshness import parse_updated_after
-from app.services.namespaces import NamespaceError, NamespaceService
-from app.services.ranking import fuse_rrf, match_expression, significant_tokens
+from app.services.namespaces import NamespaceService
+from app.services.ranking import (
+    apply_boosts,
+    fuse_rrf,
+    match_expression,
+    significant_tokens,
+    utc_now_iso,
+)
 from app.storage import chunks, vectors
 from app.storage.db import session
 
@@ -154,8 +161,17 @@ class SearchService:
             if updated_after is not None
             else None
         )
+        # LSBN-F-22 (M3): union-чтение — во время миграции кандидаты берутся
+        # и из ПРЕЖНЕЙ базы ('ожидает'/'карантин': их единственная копия там;
+        # 'нарезана'/'expired' — исключены, исходник заменён частями).
+        # Ленивый импорт: services.migration тянет summary → notes (цикл),
+        # прецедент — notes.py ↔ ttl.py. Контекст None — путей прежних,
+        # нулевой оверхед: ни второго соединения, ни лишнего SQL.
+        from app.services.migration import legacy_visible_ids, migration_context
 
-        with session(self._settings) as conn:
+        context = migration_context()
+
+        with session(self._settings) as conn, ExitStack() as stack:
             vector_hits = (
                 self._vector_candidates(conn, query_vector, ns_nodes, fresh)
                 if query_vector is not None
@@ -166,12 +182,40 @@ class SearchService:
                 if expression
                 else []
             )
+            legacy_conn = None
+            if context is not None:
+                visible = legacy_visible_ids(self._settings)
+                if visible:
+                    legacy_conn = stack.enter_context(
+                        session(
+                            self._settings.model_copy(
+                                update={"db_path": context.legacy_path}
+                            )
+                        )
+                    )
+                    if query_vector is not None:
+                        vector_hits += [
+                            hit
+                            for hit in self._vector_candidates(
+                                legacy_conn, query_vector, ns_nodes, fresh
+                            )
+                            if hit[0] in visible
+                        ]
+                    if expression:
+                        fts_rows += [
+                            row
+                            for row in self._fts_candidates(
+                                legacy_conn, expression, ns_nodes, fresh
+                            )
+                            if row["id"] in visible
+                        ]
 
             # --- слияние RRF: score(d) = Σ 1/(RRF_K + rank) -----------------
             # Векторный источник — уже агрегированный список заметок
             # (лучший чанк задал cosine и snippet), Фаза 3 — полный вектор.
             # Слияние — общий примитив app.services.ranking.fuse_rrf (тот же
-            # счёт у поиска внутри области, субстрат 3.0.0).
+            # счёт у поиска внутри области, субстрат 3.0.0); во время
+            # миграции ранжированные списки обеих баз сливаются им же.
             cosine_by_id: dict[int, float] = {}
             snippet_source: dict[int, str | None] = {}
             for note_id, cosine, chunk_text in vector_hits:
@@ -186,7 +230,42 @@ class SearchService:
             )
 
             rows = self._fetch_rows(conn, list(scores))
-        results = self._merge(scores, cosine_by_id, snippet_source, rows)[:top_k]
+            if legacy_conn is not None:
+                # Заметки 'ожидает' есть только в прежней базе: метаданные
+                # добираются из неё (активная копия для общих id — выше).
+                missing = [note_id for note_id in scores if note_id not in rows]
+                if missing:
+                    rows.update(self._fetch_rows(legacy_conn, missing))
+            # --- бусты ранжирования (релиз 3.4.0, LSBN-F-14) -----------------
+            # Только ПОРЯДОК выдачи: ключ сортировки в _merge — бустовый
+            # score, поле rrf_score элемента остаётся сырым RRF (контракт
+            # §4.2.6 / шапки F-13 не меняются). Выключатель —
+            # RANKING_BOOSTS_ENABLED; при false доп. SQL по links не ходит.
+            # LINKED_BOOST — один заход по списку кандидатов ДО сортировки
+            # и топ-реза. Title-режим и comment_search бустов не касаются.
+            order: dict[int, float] = scores
+            if scores and self._settings.ranking_boosts_enabled:
+                linked_ids = self._linked_ids(conn, list(rows))
+                if legacy_conn is not None:
+                    # Связи 'ожидает'-заметок остались в прежней базе.
+                    linked_ids |= self._linked_ids(legacy_conn, list(rows))
+                order = apply_boosts(
+                    scores,
+                    {
+                        note_id: {
+                            "query": query,
+                            "title": row["title"],
+                            "updated_at": row["updated_at"],
+                            "has_links": note_id in linked_ids,
+                        }
+                        for note_id, row in rows.items()
+                    },
+                    now=utc_now_iso(),
+                    enabled=True,
+                )
+        results = self._merge(scores, cosine_by_id, snippet_source, rows, order)[
+            :top_k
+        ]
         warning = None if query_vector is not None else WARNING_FTS_ONLY
         if not results:
             hint = (
@@ -234,7 +313,8 @@ class SearchService:
         в fail + hint, как у search). warning в этом режиме не бывает —
         эмбеддинг не используется. no29-01: `updated_after` — фильтр свежести
         (та же включающая граница, что в search); ранжирование и выдача не
-        меняются.
+        меняются. LSBN-F-22 (M3): во время миграции заголовки ждущих нарезку
+        заметок ищутся и в прежней базе (union, design §4).
         """
         query = self._validate_query(query)
         top_k = self._default_top_k() if top_k is None else top_k
@@ -264,6 +344,29 @@ class SearchService:
                 f"{ns_clause}{fresh_clause}",
                 [*ns_params, *fresh_params],
             ).fetchall()
+        # LSBN-F-22 (M3): union — заголовки ждущих нарезку заметок живут в
+        # прежней базе ('нарезана'/'expired' не показываются — исходник
+        # заменён частями). Ленивый импорт — цикл (см. search()).
+        from app.services.migration import legacy_visible_ids, migration_context
+
+        context = migration_context()
+        if context is not None:
+            visible = legacy_visible_ids(self._settings)
+            if visible:
+                marks = ",".join("?" * len(visible))
+                with session(
+                    self._settings.model_copy(
+                        update={"db_path": context.legacy_path}
+                    )
+                ) as legacy_conn:
+                    rows += legacy_conn.execute(
+                        "SELECT id, title, namespace, text, summary, "
+                        "       summary_status, created_at, updated_at "
+                        "FROM notes WHERE deleted_at IS NULL "
+                        f"AND title IS NOT NULL AND id IN ({marks})"
+                        f"{ns_clause}{fresh_clause}",
+                        [*visible, *ns_params, *fresh_params],
+                    ).fetchall()
         needle = query.lower()
         ranked: list[tuple[float, int, sqlite3.Row]] = []
         for row in rows:
@@ -671,6 +774,24 @@ class SearchService:
 
     # --- слияние и выдача ------------------------------------------------------
 
+    @staticmethod
+    def _linked_ids(conn: sqlite3.Connection, ids: list[int]) -> set[int]:
+        """id кандидатов, у которых есть строка в links (любая сторона).
+
+        LSBN-F-14: один SELECT на вызов поиска, по списку id кандидатов
+        (до сортировки и топ-реза). Возврат может содержать id вне `ids`
+        (партнёр пары) — не страшно: буст ищется только для кандидатов.
+        """
+        if not ids:
+            return set()
+        placeholders = ",".join("?" * len(ids))
+        found = conn.execute(
+            f"SELECT note_a, note_b FROM links "
+            f"WHERE note_a IN ({placeholders}) OR note_b IN ({placeholders})",
+            [*ids, *ids],
+        ).fetchall()
+        return {row["note_a"] for row in found} | {row["note_b"] for row in found}
+
     def _fetch_rows(
         self, conn: sqlite3.Connection, ids: list[int]
     ) -> dict[int, sqlite3.Row]:
@@ -692,15 +813,28 @@ class SearchService:
         cosine_by_id: dict[int, float],
         snippet_source: dict[int, str | None],
         rows: dict[int, sqlite3.Row],
+        order: dict[int, float] | None = None,
     ) -> list[dict[str, Any]]:
-        """Сортировка: rrf_score DESC → updated_at DESC → id DESC; сборка FR-1."""
+        """Сортировка: score DESC → updated_at DESC → id DESC; сборка FR-1.
+
+        LSBN-F-14: `order` — бустовые score (apply_boosts) задают ТОЛЬКО
+        порядок; прежние tie-break'и (updated_at DESC, id DESC) сохранены.
+        Поле rrf_score элемента — сырой RRF из `scores`, контракт выдачи
+        (§4.2.6, шапки F-13) не меняется. `order is None` — сортировка по
+        `scores` (поведение до бустов).
+        """
+        keys = scores if order is None else order
         candidates = [
-            (scores[note_id], row)
+            (keys[note_id], scores[note_id], row)
             for note_id, row in rows.items()
             if note_id in scores
         ]
         candidates.sort(
-            key=lambda pair: (pair[0], pair[1]["updated_at"], pair[1]["id"]),
+            key=lambda triple: (
+                triple[0],
+                triple[2]["updated_at"],
+                triple[2]["id"],
+            ),
             reverse=True,
         )
         # Совместимость: rrf_score по итоговому слиянию; cosine — только у
@@ -713,7 +847,7 @@ class SearchService:
                 cosine_by_id.get(row["id"]),
                 snippet_source.get(row["id"]),
             )
-            for score, row in candidates
+            for _key, score, row in candidates
         ]
 
     def _result(

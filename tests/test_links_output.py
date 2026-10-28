@@ -73,6 +73,17 @@ TITLE_MAX_CHARS = 60
 
 
 @pytest.fixture
+def _long_notes_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Многочанковый текст — механика `links`/чанков, не лимита записи:
+    боевой MAX_NOTE_CHARS (CHECK у новой БД берётся из настроек при init_db)
+    и мягкий NOTE_TEXT_LIMIT подняты до прежнего потолка; границу 1500/1501
+    тестируют TestSave и tests/test_note_soft_limit.py (LSBN-S-1 + M1)."""
+    monkeypatch.setenv("MAX_NOTE_CHARS", "35000")
+    monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)
+    get_settings.cache_clear()
+
+
+@pytest.fixture
 def settings(test_env: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> Settings:
     """БД с узлами work/projects и заметками с явными векторами."""
     monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
@@ -349,7 +360,8 @@ class TestMCPLinks:
 
     @pytest.mark.asyncio
     async def test_chunk_mode_adds_links_without_touching_chars(
-        self, settings: Settings, services: Services, mcp_server
+        self, _long_notes_allowed: None, settings: Settings, services: Services,
+        mcp_server,
     ) -> None:
         """Chunk-режим: `links` рядом с чанками, верхний `chars` не подменён."""
         text = "\n".join(

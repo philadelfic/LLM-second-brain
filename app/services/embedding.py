@@ -121,10 +121,15 @@ class EmbeddingService:
         self._settings = settings
         # DI сборки (build_services передаёт общий клиент слота) или свой
         # клиент с transport-инъекцией для юнит-тестов (MockTransport).
+        # Операция `embed` (LSBN-F-34): плоский env EMBED_* переопределяет
+        # модель/провайдера/адрес/ключ/таймаут кодирования поверх слота
+        # embedding (у которого своего таймаута нет — дефолт 720 с).
         self._llm = (
             llm
             if llm is not None
-            else LLMClient(SlotSpec.for_embedding(settings), transport=transport)
+            else LLMClient(
+                SlotSpec.for_operation("embed", settings)[0], transport=transport
+            )
         )
         # None — попыток не было (health не врёт до первых данных).
         self.last_attempt_ok: bool | None = None

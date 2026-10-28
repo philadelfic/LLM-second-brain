@@ -178,6 +178,9 @@ def test_plain_notes_still_merge(dim8) -> None:
         rows = conn.execute(
             "SELECT id, text, deleted_at FROM notes ORDER BY id"
         ).fetchall()
-    assert rows[0]["text"] == "слитый текст"       # ранняя обновлена
-    assert rows[0]["deleted_at"] is None
-    assert rows[1]["deleted_at"] is not None       # поздняя в trash
+    assert len(rows) == 3  # две исходные + часть (F-23)
+    assert rows[0]["text"] == "ранняя заметка про бэкапы"  # исходники целы
+    assert rows[0]["deleted_at"] is not None       # ранняя — в корзине (п. 5)
+    assert rows[1]["deleted_at"] is not None       # поздняя — тоже
+    assert rows[2]["text"] == "слитый текст"       # текст живёт в части
+    assert rows[2]["deleted_at"] is None

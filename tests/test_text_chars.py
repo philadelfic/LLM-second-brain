@@ -66,6 +66,17 @@ METRIC_TITLES = [
 
 
 @pytest.fixture
+def _long_notes_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Многочанковый текст — механика `chars`/чанков, не лимита записи:
+    боевой MAX_NOTE_CHARS (CHECK у новой БД берётся из настроек при init_db)
+    и мягкий NOTE_TEXT_LIMIT подняты до прежнего потолка; границу 1500/1501
+    тестируют TestSave и tests/test_note_soft_limit.py (LSBN-S-1 + M1)."""
+    monkeypatch.setenv("MAX_NOTE_CHARS", "35000")
+    monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)
+    get_settings.cache_clear()
+
+
+@pytest.fixture
 def settings_and_services(
     test_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Settings, Services]:
@@ -129,8 +140,12 @@ class TestMCPChars:
             await mcp_server.call_tool("memory_search", {"query": mark})
         ).structured_content
         hit = next(r for r in found["results"] if r["id"] == note_id)
+        # F-13 (3.4.0): дефолт листинга — titles (без chars); `chars` в
+        # листинге живёт в явной детали summaries — согласование проверяем на ней.
         listed = (
-            await mcp_server.call_tool("memory_list", {"limit": 5})
+            await mcp_server.call_tool(
+                "memory_list", {"limit": 5, "detail": "summaries"}
+            )
         ).structured_content
         item = next(i for i in listed["items"] if i["id"] == note_id)
         got = (
@@ -161,7 +176,10 @@ class TestMCPChars:
 
     @pytest.mark.asyncio
     async def test_chunk_mode_keeps_chunk_sum_and_total_chunks(
-        self, settings_and_services: tuple[Settings, Services], mcp_server
+        self,
+        _long_notes_allowed: None,
+        settings_and_services: tuple[Settings, Services],
+        mcp_server,
     ) -> None:
         """Chunk-режим: `chars` = сумма символов ОТДАННЫХ чанков (lsb-0003),
         `total_chunks` на месте — полный объём не подменяет прежний смысл."""
@@ -270,10 +288,12 @@ class TestCompactnessBudgets:
 
     @pytest.mark.asyncio
     async def test_list_within_budget(self, seeded, mcp_server) -> None:
-        """memory_list — в бюджете 1.5 КБ (новая метрика §3.7)."""
+        """memory_list — в бюджете 1.5 КБ (новая метрика §3.7); F-13 (3.4.0):
+        дефолт — titles, элементы без `chars` (сам текст не таскают)."""
         got = (
             await mcp_server.call_tool("memory_list", {"limit": 20})
         ).structured_content
-        assert got["items"] and all(i["chars"] > 0 for i in got["items"])
+        assert got["items"] and all(i["title"] for i in got["items"])
+        assert all("chars" not in i for i in got["items"])  # titles без chars
         size = payload_size(got)
         assert size <= LIST_BUDGET_BYTES, f"memory_list: {size} B"

@@ -126,6 +126,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+from typing import TYPE_CHECKING
 import threading
 import time
 
@@ -158,7 +159,16 @@ from app.services.promotion import PromotionService
 from app.services.slot_breaker import SlotBreaker
 from app.services.slot_budget import slot_config_fingerprint
 from app.services.slot_outcome import SlotOutcome, outcome_of
-from app.services.summary import Summarizer, SummaryError, cap_summary
+
+if TYPE_CHECKING:  # только аннотация DI: warnings → worker круга нет
+    from app.services.warnings import WarningsService
+from app.services.summary import (
+    MERGE_MAX_ROUNDS,
+    MergeIncompleteError,
+    Summarizer,
+    SummaryError,
+    cap_summary,
+)
 from app.services.terms import TermsService
 from app.storage import area_vectors, chunks, vectors
 from app.storage.db import delete_note_physical, session, transaction
@@ -198,6 +208,10 @@ SLOT_NAMES = (SLOT_EMBEDDING, SLOT_SUMMARY, SLOT_JUDGE)
 # реклассификация ставится заданием.
 NODES_RECLASS_KIND = "reclass"
 
+#: Вид предупреждения отложенной пары слияния (LSBN-F-23, п. 6): за 2 раунда
+#: модель не дала полное покрытие — обе заметки живы, пара ждёт внимания.
+MERGE_DEFERRED_WARNING = "merge_deferred"
+
 # Счётчик попыток пары и состояние «требует вмешательства» (№39, arch §6.8):
 # нетранзиентные исходы замораживают пару — задание перестаёт браться
 # (вызовы модели не жгутся), но остаётся `pending`. `unavailable`/`timeout`/
@@ -216,12 +230,20 @@ _SLOT_JOB_NAMES = {
 
 
 def _call_meta_fields(meta: ChatMeta) -> dict[str, object]:
-    """Поля вызова для события отказа (§7.2): цифры/признаки, без секретов."""
+    """Поля вызова для события отказа (§7.2): цифры/признаки, без секретов.
+
+    LSBN-F-34 (решение №4 брифа): адрес слота (`base_url`) и источник
+    конфигурации операции (`config_source`: op|slot|default) идут в журнал —
+    в успешный `slot_call` (через `_call_log_fields`) и в событие джобы при
+    ошибке. Наружные поверхности (/health) адреса не показывают.
+    """
     return {
         "operation": meta.operation,
         "model_type": meta.model_type,
         "budget": meta.budget,
         "budget_source": meta.budget_source,
+        "base_url": meta.base_url,
+        "config_source": meta.config_source,
         "prompt_tokens": meta.prompt_tokens,
         "completion_tokens": meta.completion_tokens,
         "reasoning_tokens": meta.reasoning_tokens,
@@ -394,6 +416,7 @@ class BackgroundWorker:
         promoter: PromotionService | None = None,
         terms: TermsService | None = None,
         decision: DecisionService | None = None,
+        warnings: "WarningsService | None" = None,
     ) -> None:
         self._settings = settings
         self._embedding = embedding
@@ -412,15 +435,15 @@ class BackgroundWorker:
         self._dedup = (
             dedup if dedup is not None else DeduplicationService(settings)
         )
-        # Сведение дублей (Этап 2.2) идёт штатной NOTE-логикой: update
-        # раннего (ре-векторизация/ре-суммаризация своими очередями) и
-        # soft delete позднего. Сервис собирается из тех же deps, что и
-        # воркер (embedding — DI-фейк в юнит-тестах); save-пути здесь не
-        # используются, notifier суммаризации не нужен — после слияния воркер
-        # будит свою же суммаризационную петлю (notify_summary_pending).
-        # Вектор-нотификатор этому сервису подключается ниже, после создания
-        # событий: `merge_pair` возвращает раннюю заметку в очередь
-        # векторизации, и петлю будит её же сигнал (notify_embedding_pending).
+        # Поверхность предупреждений (№12): F-23 п. 6 пишет «слияние
+        # отложено» в warnings; None — DI-сборки тестов (только журнал).
+        self._warnings = warnings
+        # Сведение дублей (Этап 2.2 → F-23) идёт штатной NOTE-логикой:
+        # части-заметки создаются, обе исходные уходят в корзину
+        # (NoteService.merge_into_parts, одна транзакция). Сервис собирается
+        # из тех же deps, что и воркер (embedding — DI-фейк в юнит-тестах);
+        # notifier суммаризации ему не нужен — после слияния воркер будит
+        # свои петли (notify_summary_pending/notify_embedding_pending).
         self._notes = NoteService(settings, embedding=embedding)
         # Причёска (Фаза 10, Шаг 4): классификатор default-заметок после
         # суммаризации; None — тестовый режим без классификации.
@@ -2360,22 +2383,59 @@ class BackgroundWorker:
                 self._set_job_payload(job["id"], payload)
             try:
                 merge_result = self._summarizer.merge(older["text"], newer["text"])
-                self._log_slot_call(
-                    SUMMARY_JOB,
-                    SLOT_SUMMARY,
-                    merge_result.meta,
-                    older_id=older_id,
-                    note_id=note_id,
+                # Наблюдаемость (F-23 п. 7): slot_call на КАЖДЫЙ вызов —
+                # дозапрос (2-й раунд) виден в журнале отдельной строкой.
+                for meta in merge_result.metas or [merge_result.meta]:
+                    self._log_slot_call(
+                        SUMMARY_JOB,
+                        SLOT_SUMMARY,
+                        meta,
+                        older_id=older_id,
+                        note_id=note_id,
+                    )
+                outcome = self._notes.merge_into_parts(
+                    older_id,
+                    note_id,
+                    [(part.title, part.text) for part in merge_result.parts],
                 )
-                outcome = self._notes.merge_pair(older_id, merge_result.text, note_id)
                 if not outcome["merged"]:
                     # Ранняя исчезла (оператор удалил) между вычиткой и
                     # сведением — слияние не состоялось, работа снимается;
-                    # поздняя при этом не трогается (merge_pair ничего не
-                    # пишет, если ранней активной заметки нет).
+                    # поздняя при этом не трогается (merge_into_parts ничего
+                    # не пишет, если ранней активной заметки нет).
                     self._mark_job_done(job["id"])
                     done += 1
                     continue
+            except MergeIncompleteError as exc:
+                # F-23 п. 6: за MERGE_MAX_ROUNDS слияние не сошлось (модель
+                # теряет содержание). Повтор даст те же два раунда — пара
+                # ОТКЛАДЫВАЕТСЯ: работа снимается, ОБЕ заметки живы, событие
+                # в журнал джоб и запись в warnings (subject — ранняя пары,
+                # payload несёт позднюю и причину).
+                self._mark_job_done(job["id"])
+                done += 1
+                self._log_slot_failure(
+                    SUMMARY_JOB,
+                    SLOT_SUMMARY,
+                    outcome_of(exc),
+                    event="dedup_merge_deferred",
+                    message=(
+                        "dedup: merge incomplete after "
+                        f"{getattr(exc, 'rounds', MERGE_MAX_ROUNDS)} rounds — "
+                        "pair deferred, both notes kept"
+                    ),
+                    older_id=older_id,
+                    note_id=note_id,
+                    detail=str(exc),
+                    meta=getattr(exc, "meta", None),
+                )
+                self._defer_merge_pair(
+                    older_id,
+                    note_id,
+                    reason=str(exc),
+                    rounds=int(getattr(exc, "rounds", MERGE_MAX_ROUNDS)),
+                )
+                continue
             except SummaryError as exc:
                 self._log_slot_failure(
                     SUMMARY_JOB,
@@ -2395,29 +2455,70 @@ class BackgroundWorker:
                 )
                 continue  # работа остаётся pending — повтор по back-off
             logging.getLogger("app").info(
-                "dedup: duplicate merged into earlier note",
+                "dedup: duplicate merged into self-contained parts",
                 extra={
                     "event": "dedup_merged",
                     "job": SUMMARY_JOB,
                     "older_id": older_id,
                     "note_id": note_id,
                     "cosine": payload.get("cosine"),
+                    # F-23 п. 7: раунды, модель, число частей — в журнале джоб.
+                    "rounds": merge_result.rounds,
+                    "model": merge_result.meta.model,
+                    "parts": len(merge_result.parts),
+                    "part_ids": [part["id"] for part in outcome["parts"]],
                 },
             )
             self._mark_job_done(job["id"])
             done += 1
-            # Реклассификация объединённой заметки (lsb-0012, arch §3.5): узел
-            # ранней мог не подойти новому содержанию — ставим задание слоту
-            # `nodes` (объединённая заметка может лежать в любом узле — обход
-            # `default` её не найдёт) и будим его петлю сразу, не дожидаясь
-            # часового интервала. Неудачная постановка/обработка данные не
-            # портит: заметка остаётся в текущем узле, `classified_at` — NULL.
-            self._ensure_job(NODES_JOB, NODES_RECLASS_KIND, older_id)
+            # Размещение частей (lsb-0012, arch §3.5): каждая часть — новая
+            # заметка — кандидат обхода узлов (classified_at NULL); задаём
+            # слоту `nodes` по заданию на часть и будим его петлю сразу, не
+            # дожидаясь часового интервала. Неудачная постановка/обработка
+            # данные не портит: часть остаётся в узле ранней.
+            for part in outcome["parts"]:
+                self._ensure_job(NODES_JOB, NODES_RECLASS_KIND, int(part["id"]))
             self.notify_nodes_pending()
-            # Ранняя заметка обновлена (summary pending) — будим свою же петлю
-            # суммаризации, не дожидаясь back-off.
+            # Части ждут суммаризацию и векторизацию — будим свои петли,
+            # не дожидаясь back-off.
             self.notify_summary_pending()
+            self.notify_embedding_pending()
         return done
+
+    def _defer_merge_pair(
+        self, older_id: int, note_id: int, *, reason: str, rounds: int
+    ) -> None:
+        """Отложить пару слияния (F-23 п. 6): запись в warnings.
+
+        Открытое предупреждение kind=`merge_deferred` на ранней пары (upsert:
+        повторное откладывание той же пары двигает updated_at, не плодит
+        строки); payload несёт позднюю, число раундов и причину. Сервис
+        warnings недоступен (DI-сборки тестов) — откладывание остаётся
+        только событием журнала, данные не портит.
+        """
+        if self._warnings is None:
+            return
+        try:
+            self._warnings.open(
+                MERGE_DEFERRED_WARNING,
+                "note",
+                older_id,
+                (
+                    f"merge deferred after {rounds} rounds: parts do not fully "
+                    "cover the sources — both notes kept"
+                ),
+                {"newer_id": note_id, "rounds": rounds, "reason": reason[:500]},
+            )
+        except Exception:  # noqa: BLE001 — предупреждение не ломает петлю
+            logging.getLogger("app").warning(
+                "dedup: failed to record merge_deferred warning",
+                extra={
+                    "event": "warning_open_failed",
+                    "job": SUMMARY_JOB,
+                    "older_id": older_id,
+                    "note_id": note_id,
+                },
+            )
 
     # --- фоновый дедуп (Фаза 8, Этапы 2–3) ------------------------------------
 

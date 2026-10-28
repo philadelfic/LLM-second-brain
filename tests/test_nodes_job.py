@@ -756,13 +756,13 @@ def test_merge_then_reclass_moves_merged_note(settings: Settings) -> None:
     assert [(job["kind"], job["status"]) for job in _jobs(settings)] == [
         ("reclass", "pending")
     ]
-    assert worker.process_summary_pending() == 1  # суммари объединённой пересчитана
+    assert worker.process_summary_pending() == 1  # суммари части пересчитана
 
     # Задание после сшивания разбирается ДО обхода default (приоритет, FR-3.3):
     # та же заметка — кандидат классификаторного пула, но задание идёт первым.
     worker._classifier = FixedClassifier(Classification("work", 0.9))
     assert worker.process_nodes() == 1
-    row = _row(settings, 1)
+    row = _row(settings, 3)  # F-23: слияние создаёт ЧАСТЬ (id=3) — рекласс её
     assert row["namespace"] == "work"  # узел получен заново
     assert [job["status"] for job in _jobs(settings)] == ["done"]
 
@@ -780,7 +780,7 @@ def test_merge_enqueues_reclass_job_and_wakes_nodes(settings: Settings) -> None:
     assert worker.process_merge_pending() == 1
     jobs = _jobs(settings)
     assert [(job["note_id"], job["kind"], job["status"]) for job in jobs] == [
-        (1, "reclass", "pending")
+        (3, "reclass", "pending")  # F-23: задание на созданную часть, не на раннюю
     ]
     assert worker._nodes_event.is_set()  # событие `nodes` — петля проснётся сразу
 

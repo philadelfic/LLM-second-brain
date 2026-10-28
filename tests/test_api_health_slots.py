@@ -128,3 +128,58 @@ def test_health_no_model_calls(client: TestClient, monkeypatch) -> None:
     assert body["status"] == "ok"
     assert set(body["slots"]) == set(SLOTS)
     assert calls["n"] == 0
+
+
+OPERATIONS = (
+    "summarize",
+    "title",
+    "merge",
+    "split",
+    "classify",
+    "describe",
+    "judge",
+    "structure_judge",
+    "embed",
+)
+
+
+def test_operations_block(client: TestClient) -> None:
+    """/health.operations (LSBN-F-34): модель/провайдер/источник по операции."""
+    body = client.get("/health").json()
+    assert set(body["operations"]) == set(OPERATIONS)
+    for snapshot in body["operations"].values():
+        assert set(snapshot) == {"model", "provider", "source"}
+        assert snapshot["source"] in ("op", "slot", "default")
+        assert snapshot["model"]  # модель есть у каждой операции
+    # Без переопределений summarize/title/merge наследуют слот summary.
+    assert body["operations"]["summarize"]["model"] == "test-summary-model"
+    assert body["operations"]["summarize"]["source"] == "slot"
+    assert body["operations"]["judge"]["model"] == "test-judge-model"
+
+
+def test_operations_block_has_no_addresses(
+    client: TestClient, monkeypatch, tmp_path
+) -> None:
+    """Решение №4 брифа: /health не печатает адреса слотов и ключей —
+    даже при переопределении операции (base_url известен только журналу)."""
+    from app.config import get_settings
+    from app.main import create_app
+
+    monkeypatch.setenv("MERGE_MODEL", "merge-x")
+    monkeypatch.setenv("MERGE_BASE_URL", "http://merge-private:11434")
+    monkeypatch.setenv("MERGE_API_KEY", "sk-merge-test")
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "notes-operations.db"))
+    get_settings.cache_clear()
+    try:
+        with TestClient(create_app()) as fresh:
+            fresh.app.state.services.notes.set_summary_notifier(None)
+            fresh.app.state.services.notes.set_vector_notifier(None)
+            raw = fresh.get("/health").text
+            body = fresh.get("/health").json()
+    finally:
+        get_settings.cache_clear()
+    assert body["operations"]["merge"]["model"] == "merge-x"
+    assert body["operations"]["merge"]["source"] == "op"
+    assert "merge-private" not in raw
+    assert "sk-merge-test" not in raw
+    assert "base_url" not in raw

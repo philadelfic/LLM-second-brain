@@ -33,7 +33,8 @@ def test_summary_returns_meta(monkeypatch) -> None:
     service = make_service(make_settings(monkeypatch))
     result = service.summarize("Заметка о встрече с командой.")
     assert result.text == "Краткое содержание."
-    assert result.meta.operation == "summary"
+    # LSBN-F-34: реестровое имя операции суммаризации — summarize.
+    assert result.meta.operation == "summarize"
     assert result.meta.slot == "summary"
     service.close()
 

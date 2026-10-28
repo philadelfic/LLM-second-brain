@@ -129,7 +129,7 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "JUDGE_TIMEOUT_SEC": ("judge_timeout_sec", 900),
     "JUDGE_CONTEXT_TOKENS": ("judge_context_tokens", 0),  # №49: 0 — неизвестен
     "RRF_K": ("rrf_k", 60),
-    "MAX_NOTE_CHARS": ("max_note_chars", 35000),
+    "MAX_NOTE_CHARS": ("max_note_chars", 1500),  # LSBN-F-22: 35000 → 1500
     "MAX_QUERY_CHARS": ("max_query_chars", 512),
     "COMMENT_MAX_CHARS": ("comment_max_chars", 250),  # no24-01 (3.2.0)
     "PENDING_RETRY_SEC": ("pending_retry_sec", 30),
@@ -216,7 +216,43 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "SLOT_HINT_EVERY_SEC": ("slot_hint_every_sec", 900),
     "SLOT_MAX_ATTEMPTS": ("slot_max_attempts", 8),
     "SLOT_ATTENTION_RESET_ON_START": ("slot_attention_reset_on_start", True),
+    # Релиз 3.4.0, бусты ранжирования LSBN-F-14 (строка дополнена попутно:
+    # поле появилось в Settings в F-14, но в таблицу полноты не попало).
+    "RANKING_BOOSTS_ENABLED": ("ranking_boosts_enabled", True),
+    # Релиз 3.4.0, операции поверх слотов LSBN-F-34: плоские env
+    # `<ОПЕРАЦИЯ>_<ПОЛЕ>` (реестр app/services/operations.py) —
+    # переопределение одного процесса поверх слот-группы; умолчание None =
+    # «не задано» (наследуется слот). MERGE_NUM_PREDICT — историческое поле
+    # (0 = авто), уже было в таблице выше.
 }
+
+for _prefix in (
+    "summarize",
+    "title",
+    "merge",
+    "split",
+    "classify",
+    "describe",
+    "structure_judge",
+    "embed",
+):
+    for _field, _default in (
+        ("MODEL", None),
+        ("PROVIDER", None),
+        ("BASE_URL", None),
+        ("API_KEY", None),
+        ("THINK", None),
+        ("NUM_PREDICT", None),
+        ("TIMEOUT_SEC", None),
+        ("CONTEXT_TOKENS", None),
+        ("MODEL_TYPE", None),
+    ):
+        if f"{_prefix.upper()}_{_field}" in OPTIONAL_ENV:  # merge_num_predict
+            continue
+        OPTIONAL_ENV[f"{_prefix.upper()}_{_field}"] = (
+            f"{_prefix}_{_field.lower()}",
+            _default,
+        )
 
 
 def load_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> Settings:
@@ -243,7 +279,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 162 поля: 6 обязательных + 156 с умолчаниями
+        """В Settings — ровно 233 поля: 6 обязательных + 227 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
@@ -263,7 +299,10 @@ class TestCompleteness:
         и LOGS_*
         + 6 настроек хинта о свежем релизе №45 релиза 3.2.0: UPDATE_*
         + 3 настройки бэкапа №14 релиза 3.2.0: BACKUP_VERIFY_EVERY
-        и BACKUP_SHIP_CMD/BACKUP_SHIP_TIMEOUT_SEC)."""
+        и BACKUP_SHIP_CMD/BACKUP_SHIP_TIMEOUT_SEC
+        + 71 плоское поле операций LSBN-F-34 релиза 3.4.0:
+        SUMMARIZE_/TITLE_/MERGE_/SPLIT_/CLASSIFY_/DESCRIBE_/
+        STRUCTURE_JUDGE_/EMBED_* (MERGE_NUM_PREDICT уже был))."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

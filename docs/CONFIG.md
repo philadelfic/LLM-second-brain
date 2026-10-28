@@ -38,6 +38,54 @@ independently:
 
 `keep_alive` is **not** sent to any provider (see the note below).
 
+## Operations: per-process overrides (v3.4)
+
+Each slot serves several distinct processes. Since v3.4 every process is an
+**operation** with its own flat env override — change the model of one
+process without touching the rest of the slot group:
+
+| Operation | Slot group | Flat env prefix |
+|---|---|---|
+| `summarize` | summary | `SUMMARIZE_*` |
+| `title` (title backfill) | summary | `TITLE_*` |
+| `merge` (dedup merge) | summary | `MERGE_*` |
+| `split` (registered ahead of use) | summary | `SPLIT_*` |
+| `classify` (node grooming) | summary | `CLASSIFY_*` |
+| `describe` (node description) | summary | `DESCRIBE_*` |
+| `judge` (dedup verdict) | judge | `JUDGE_*` (= the slot env) |
+| `structure_judge` (namespace gate) | judge | `STRUCTURE_JUDGE_*` |
+| `embed` (vectorization) | embedding | `EMBED_*` |
+
+Override fields (append to the prefix): `_MODEL`, `_PROVIDER`, `_BASE_URL`,
+`_API_KEY`, `_THINK`, `_NUM_PREDICT`, `_TIMEOUT_SEC`, `_CONTEXT_TOKENS`,
+`_MODEL_TYPE`. Resolution chain per field: **operation env → slot env →
+default**. Unset fields (`None`) inherit the slot, so a partial override
+(e.g. only `MERGE_MODEL`) is the normal case; operations without overrides
+behave exactly as before. `MERGE_NUM_PREDICT` is historical — it already was
+the merge operation's env (0 = auto).
+
+- **Reserve first (F-12):** overrides apply to the primary (generative)
+  path only. When the judge/classifier switch to the decision slot, the
+  `DECISION_*` configuration (with its model) is used as-is.
+- **`/health.operations`** shows `{model, provider, source}` per operation,
+  where `source` is where the model came from (`op` / `slot` / `default`).
+  Base URLs and keys are never exposed there — the address lives in the
+  `slot_call` journal and in the job error event.
+- Changing an operation env (model/think/timeout/budget/context) releases
+  the «requires attention» state on restart, same as slot env changes
+  (config fingerprint); `*_API_KEY` is not part of the fingerprint.
+- A typo in the prefix (e.g. `MERG_MODEL`) is ignored by the parser and
+  produces an `unknown_operation_warning` at startup — the service starts.
+- Example (T-23): give the merge process its own cheap model on another
+  host, leaving summarize/title on the slot default:
+
+  ```yaml
+  MERGE_MODEL: "lfm2.5:latest"
+  MERGE_BASE_URL: "http://192.168.1.47:11434"
+  MERGE_NUM_PREDICT: "16384"
+  MERGE_TIMEOUT_SEC: "600"
+  ```
+
 ## Full variable reference
 
 ### Required
@@ -93,7 +141,18 @@ independently:
 | `JUDGE_THINK` | `false` | thinking judge (ollama only; prod — `true`) |
 | `JUDGE_NUM_PREDICT` | `256` | verdict generation budget (prod — `1024`) |
 | `JUDGE_TIMEOUT_SEC` | `30` | client read timeout (prod — `300`) |
-| `NAMESPACE_JUDGE_THINK` | unset (inherits `JUDGE_THINK`) | structure judge think flag |
+| `NAMESPACE_JUDGE_THINK` | unset (inherits `JUDGE_THINK`) | structure judge think flag (senior to `STRUCTURE_JUDGE_THINK`) |
+
+### Per-operation overrides (v3.4)
+
+Flat `<OPERATION>_<FIELD>` variables (see «Operations: per-process
+overrides» above). All default to unset (= inherit the slot); ranges match
+the slot rules: `_TIMEOUT_SEC` ≥ 1, `_NUM_PREDICT` ≥ 0 (0 = auto),
+`_CONTEXT_TOKENS` ≥ 0 (0 = unknown), `_PROVIDER` ∈ {`ollama`, `openai`},
+`_MODEL_TYPE` ∈ {`reasoning`, `generation`}. Code defaults: `describe`
+budget 512, `think=false` (override with `DESCRIBE_NUM_PREDICT` /
+`DESCRIBE_THINK`); `embed` read timeout 720 s (override with
+`EMBED_TIMEOUT_SEC`).
 
 ### HTTP / MCP / storage
 
