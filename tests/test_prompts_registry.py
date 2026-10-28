@@ -28,6 +28,7 @@ from app.services.prompts import (
     SUMMARY_SYSTEM_PROMPT_V21,
     SUMMARY_SYSTEM_PROMPT_V221,
     PromptRegistry,
+    summary_merge_system_prompt,
 )
 
 # Имена промптов в контракте реестра (10 имён — контракт пула 3).
@@ -398,3 +399,56 @@ class TestSeedAutoMigration:
         registry = PromptRegistry(prompts_dir=tmp_path)
         assert registry.summary_system == custom
         assert _read(tmp_path, "summary_system") == custom
+
+
+# --- число лимита в тексте — из настроек (3.4.1, LSBN-T-26) -----------------
+
+
+class TestSeedValueRewrite:
+    """Сиды merge/split несут мягкий лимит заметки из настроек: смена
+    MAX_NOTE_CHARS переписывает НЕТРОНУТЫЕ сиды (правило 2.2.1 — файл,
+    неизменный с нашего сида, подтягивается к текущему канону), правленые
+    оператором не трогаются. Штамп версии при этом не обязан меняться:
+    триггер — сравнение с текущим встроенным текстом."""
+
+    def test_registry_texts_carry_constructor_limit(self) -> None:
+        """Число в merge/split-промптах — от конструктора, не литерал."""
+        registry = PromptRegistry(max_note_chars=2300)
+        assert "2300" in registry.summary_merge_system
+        assert "2300" in registry.summary_split_system
+        assert "2000" not in registry.summary_merge_system
+        assert registry.summary_merge_system == summary_merge_system_prompt(2300)
+
+    def test_value_change_rewrites_untouched_seed(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """Нетронутый сид (хэш в seed_meta.json совпадает) при смене значения
+        переписывается под новый канон — штамп версии тот же."""
+        PromptRegistry(prompts_dir=tmp_path, max_note_chars=1700)  # seed
+        assert "1700" in _read(tmp_path, "summary_merge_system")
+        # «Рестарт» с другим env — встроенный текст изменился.
+        registry = PromptRegistry(prompts_dir=tmp_path, max_note_chars=2300)
+        assert "2300" in _read(tmp_path, "summary_merge_system")
+        assert "1700" not in _read(tmp_path, "summary_merge_system")
+        assert "2300" in _read(tmp_path, "summary_split_system")
+        assert registry.summary_merge_system == _read(tmp_path, "summary_merge_system")
+        meta = json.loads((tmp_path / "seed_meta.json").read_text(encoding="utf-8"))
+        assert meta["seed_version"] == prompts_mod.SEED_VERSION
+        assert meta["files"]["summary_merge_system"] == PromptRegistry._hash(
+            summary_merge_system_prompt(2300)
+        )
+
+    def test_value_change_keeps_operator_edited_seed(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """Правленый оператором сид (хэш не совпадает с записанным) при смене
+        значения НЕ трогается — FATAL-маркеры судьи остаются честным сигналом."""
+        PromptRegistry(prompts_dir=tmp_path, max_note_chars=1700)  # seed
+        custom = (
+            "Merge into parts of at most 9000 characters. "
+            "DUPLICATE markers: NOT DUPLICATE / DUPLICATE."
+        )
+        (tmp_path / "summary_merge_system.txt").write_text(custom, encoding="utf-8")
+        registry = PromptRegistry(prompts_dir=tmp_path, max_note_chars=2300)
+        assert _read(tmp_path, "summary_merge_system") == custom
+        assert registry.summary_merge_system == custom

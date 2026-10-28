@@ -622,3 +622,57 @@ class TestNodesJobLimits:
         assert custom.job_nodes_interval_sec == 45
         assert custom.job_nodes_batch == 7
         assert custom.job_nodes_classifier_budget == 5
+
+
+# --- 3.4.1 (LSBN-T-26/LSBN-T-27): диапазоны новых/переехавших настроек ------
+
+
+class TestNoteLimitRange:
+    """MAX_NOTE_CHARS валидируется диапазоном 500..20000 (Ruling 28.10.2026):
+    конфиг не должен ломать контракт частей слияния."""
+
+    @pytest.mark.parametrize("bad", ["499", "20001", "0", "-5"])
+    def test_out_of_range_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, bad: str
+    ) -> None:
+        with pytest.raises(ConfigError, match="max_note_chars"):
+            load_env(monkeypatch, MAX_NOTE_CHARS=bad)
+
+    @pytest.mark.parametrize("good", ["500", "1500", "2000", "20000"])
+    def test_bounds_are_valid(
+        self, monkeypatch: pytest.MonkeyPatch, good: str
+    ) -> None:
+        settings = load_env(monkeypatch, MAX_NOTE_CHARS=good)
+        assert settings.max_note_chars == int(good)
+
+
+class TestMigrationSlotBreakerRanges:
+    """Разделитель слота нарезки (LSBN-T-27): партия 1..100, пауза 0..86400."""
+
+    @pytest.mark.parametrize("bad", ["0", "101", "-1", "1000"])
+    def test_migration_batch_out_of_range_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, bad: str
+    ) -> None:
+        with pytest.raises(ConfigError, match="migration_batch"):
+            load_env(monkeypatch, MIGRATION_BATCH=bad)
+
+    @pytest.mark.parametrize("good", ["1", "5", "100"])
+    def test_migration_batch_bounds_are_valid(
+        self, monkeypatch: pytest.MonkeyPatch, good: str
+    ) -> None:
+        settings = load_env(monkeypatch, MIGRATION_BATCH=good)
+        assert settings.migration_batch == int(good)
+
+    @pytest.mark.parametrize("bad", ["-1", "86401"])
+    def test_migration_pause_out_of_range_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch, bad: str
+    ) -> None:
+        with pytest.raises(ConfigError, match="migration_pause_sec"):
+            load_env(monkeypatch, MIGRATION_PAUSE_SEC=bad)
+
+    @pytest.mark.parametrize("good", ["0", "60", "600", "86400"])
+    def test_migration_pause_bounds_are_valid(
+        self, monkeypatch: pytest.MonkeyPatch, good: str
+    ) -> None:
+        settings = load_env(monkeypatch, MIGRATION_PAUSE_SEC=good)
+        assert settings.migration_pause_sec == int(good)

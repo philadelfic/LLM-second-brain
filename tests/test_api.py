@@ -62,8 +62,8 @@ class TestHealth:
             "judge_ok": None,
             "decision_ok": None,
             "notes_count": 0,
-            # LSBN-S-1: мягкий лимит заметки — константа кода, виден оператору.
-            "note_chars_limit": 1500,
+            # LSBN-S-1: мягкий лимит заметки — из настроек (LSBN-T-26).
+            "note_chars_limit": 2000,
             "pending_vector": 0,
             "pending_summary": 0,
             "queues": {
@@ -108,7 +108,8 @@ class TestHealth:
                 "hint_shown_at": None,
             },
             # LSBN-F-22 (M3): база без миграции — блок только с фазой-заглушкой.
-            "migration": {"phase": None},
+            # slot — разделитель слота нарезки (LSBN-T-27): значения из конфига
+            "migration": {"phase": None, "slot": {"batch": 5, "pause_sec": 600}},
         }
 
     def test_contract_fields(self, client: TestClient) -> None:

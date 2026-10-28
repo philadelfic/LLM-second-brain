@@ -37,9 +37,9 @@ def _env(monkeypatch: pytest.MonkeyPatch, limit: int) -> None:
 
 
 def _seed_legacy(settings) -> None:
-    """Прежняя база (CHECK 35000): 1 короткая + 2/3/4 длинные (3 — TTL истёк,
+    """Прежняя база (CHECK 20000): 1 короткая + 2/3/4 длинные (3 — TTL истёк,
     4 — TTL в будущем); после перелива 2/3/4 → 'ожидает'."""
-    init_db(settings, note_chars=35000)
+    init_db(settings, note_chars=20000)
     with session(settings) as conn, transaction(conn):
         conn.execute("INSERT INTO notes(id, text) VALUES (1, 'короткая заметка')")
         conn.execute("INSERT INTO notes(id, text) VALUES (2, ?)", (_LONG,))
@@ -54,7 +54,7 @@ def _seed_legacy(settings) -> None:
 
 
 def _migrate_down(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Полный спуск 35000 → 1500 (storage M1): активная база + 'ожидает'."""
+    """Полный спуск 20000 → 1500 (storage M1): активная база + 'ожидает'."""
     settings = get_settings()
     _seed_legacy(settings)
     _env(monkeypatch, 1500)
@@ -331,7 +331,7 @@ class TestSummarySplit:
     ) -> None:
         """Дозапрос на длинную часть: 2 раунда, второй ответ принимается."""
         settings = _split_settings(monkeypatch)
-        long_part = SOURCE + "x" * 2000  # > 1500
+        long_part = SOURCE + "x" * (settings.max_note_chars + 1)  # > мягкий лимит
         service, recorder = _split_service(
             settings,
             [
@@ -349,7 +349,10 @@ class TestSummarySplit:
         assert recorder.calls == 2
         # Дозапрос в том же контексте: причина «часть длиннее лимита».
         followup = json.loads(recorder.requests[1].read().decode())
-        assert "exceeds the 1500-character" in str(followup["messages"][-1]["content"])
+        assert (
+            f"exceeds the {settings.max_note_chars}-character"
+            in str(followup["messages"][-1]["content"])
+        )
         service.close()
 
     def test_split_incomplete_after_two_rounds(

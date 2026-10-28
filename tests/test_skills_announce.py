@@ -24,7 +24,7 @@ from app.services.terms import TermsService
 from app.services.user_facts import UserFactsService
 from app.storage.db import CREATOR_SKILL_SEED_KEY, init_db, session
 from app.transport.mcp import (
-    SERVER_INSTRUCTIONS,
+    server_instructions,
     InstructionsRefresher,
     _logs_section,
     _note_lifetime_section,
@@ -32,6 +32,12 @@ from app.transport.mcp import (
     build_instructions,
     build_mcp,
 )
+
+
+# 3.4.1 (LSBN-T-26): тексты с числом лимита собираются функциями от
+# настроек — здесь сборка от значений тестового окружения (роль прежних
+# констант; число приходит из Settings, не литерал).
+SERVER_INSTRUCTIONS = server_instructions(get_settings().max_note_chars)
 
 DIM = 64
 

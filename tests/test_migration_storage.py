@@ -46,7 +46,7 @@ def _seed_source(settings) -> None:
     (1,3); предупреждение о заметке 2 и одно не про заметку; в области —
     term с вектором. Свежая база: id 1..3 и chunk id 1 детерминированы.
     """
-    init_db(settings, note_chars=35000)
+    init_db(settings, note_chars=20000)
     with session(settings) as conn, transaction(conn):
         conn.execute(
             "INSERT INTO notes(id, text) VALUES (1, 'привет мир поиск заметка')"
@@ -135,16 +135,16 @@ class TestStartupPlan:
     def test_down_plan_counts_long_notes(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Вниз (35000 → 1500): план down, prev_file = notes.35000.db, pending по длине."""
+        """Вниз (20000 → 1500): план down, prev_file = notes.20000.db, pending по длине."""
         settings = get_settings()
         _seed_source(settings)
         _env(1500, monkeypatch)
         plan = startup_plan(get_settings())
         assert plan["mode"] == "down"
-        assert plan["schema_limit"] == 35000
+        assert plan["schema_limit"] == 20000
         assert plan["target"] == 1500
         assert plan["pending"] == 1
-        assert plan["prev_file"].endswith("notes.35000.db")
+        assert plan["prev_file"].endswith("notes.20000.db")
 
     def test_up_plan_reuses_chain_base(
         self, monkeypatch: pytest.MonkeyPatch
@@ -152,7 +152,7 @@ class TestStartupPlan:
         """Вверх после спуска: источник — база цепочки с CHECK = цели."""
         settings = get_settings()
         _seed_source(settings)
-        prev_file = sibling_db_path(settings.db_path, 35000)
+        prev_file = sibling_db_path(settings.db_path, 20000)
         create_new_base(
             get_settings(),
             source_path=settings.db_path,
@@ -165,10 +165,10 @@ class TestStartupPlan:
             away_file=prev_file,
             incoming_file=sibling_db_path(settings.db_path, 1500),
         )
-        _env(35000, monkeypatch)
+        _env(20000, monkeypatch)
         plan = startup_plan(get_settings())
         assert plan["mode"] == "up_chain"
-        assert plan["source_path"].endswith("notes.35000.db")
+        assert plan["source_path"].endswith("notes.20000.db")
         assert plan["prev_file"].endswith("notes.1500.db")
 
     def test_up_plan_new_base_without_chain(
@@ -177,7 +177,7 @@ class TestStartupPlan:
         """Вверх без родственника в цепочке — новая база, тоже без модели."""
         settings = get_settings()
         init_db(settings, note_chars=1500)
-        _env(35000, monkeypatch)
+        _env(20000, monkeypatch)
         plan = startup_plan(get_settings())
         assert plan["mode"] == "up_new"
         assert plan["schema_limit"] == 1500
@@ -197,7 +197,7 @@ class TestCreateNewBase:
             settings,
             source_path=settings.db_path,
             target=1500,
-            prev_file=sibling_db_path(settings.db_path, 35000),
+            prev_file=sibling_db_path(settings.db_path, 20000),
             reason="тест",
         )
         assert counters == {"old_total": 3, "poured": 2, "pending": 1}
@@ -271,10 +271,10 @@ class TestCreateNewBase:
                     "SELECT value FROM meta WHERE key = 'migration.state'"
                 ).fetchone()[0]
             )
-        assert chain == [{"file": "notes.35000.db", "note_chars": 35000}]
+        assert chain == [{"file": "notes.20000.db", "note_chars": 20000}]
         assert state["phase"] == "pour"
         assert state["target"] == 1500
-        assert state["prev_limit"] == 35000
+        assert state["prev_limit"] == 20000
         assert state["counters"] == counters
 
     def test_restart_before_swap_rebuilds_from_scratch(
@@ -307,10 +307,10 @@ class TestCreateNewBase:
             assert note_versions == {1}
         # Прежняя база цела и переехала под именем своего CHECK.
         old_settings = settings.model_copy(
-            update={"db_path": sibling_db_path(settings.db_path, 35000)}
+            update={"db_path": sibling_db_path(settings.db_path, 20000)}
         )
         with session(old_settings) as conn:
-            assert note_chars_limit(conn) == 35000
+            assert note_chars_limit(conn) == 20000
             assert conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 3
 
     def test_restart_after_swap_is_noop(
@@ -333,7 +333,7 @@ class TestSwap:
     ) -> None:
         """Swap: прежняя база → notes.<L>.db, входящая → db_path, WAL сайдкаров нет."""
         settings = get_settings()
-        init_db(settings, note_chars=35000)
+        init_db(settings, note_chars=20000)
         with session(settings) as conn, transaction(conn):
             conn.execute("INSERT INTO notes(text) VALUES ('старая база')")
         incoming = settings.db_path + ".incoming"
@@ -341,7 +341,7 @@ class TestSwap:
         init_db(new_settings, note_chars=1500)
         with session(new_settings) as conn, transaction(conn):
             conn.execute("INSERT INTO notes(text) VALUES ('новая база')")
-        away_file = sibling_db_path(settings.db_path, 35000)
+        away_file = sibling_db_path(settings.db_path, 20000)
         swap_files = swap
 
         swap_files(settings, away_file=away_file, incoming_file=incoming)
@@ -357,7 +357,7 @@ class TestSwap:
 
 
 def _migrate_down(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Полный спуск 35000 → 1500 (перелив + swap) на тестовой базе."""
+    """Полный спуск 20000 → 1500 (перелив + swap) на тестовой базе."""
     settings = get_settings()
     _seed_source(settings)
     _env(1500, monkeypatch)
@@ -377,12 +377,12 @@ class TestReversePour:
                 "UPDATE notes SET text = 'поправленная заметка' WHERE id = 1"
             )
             conn.execute("INSERT INTO notes(text) VALUES ('написано после миграции')")
-        _env(35000, monkeypatch)
+        _env(20000, monkeypatch)
         plan = startup_plan(get_settings())
         assert plan["mode"] == "up_chain"
         run_startup_migration(get_settings(), plan)
         with session(get_settings()) as conn:
-            assert note_chars_limit(conn) == 35000
+            assert note_chars_limit(conn) == 20000
             rows = {
                 int(r["id"]): str(r["text"])
                 for r in conn.execute("SELECT id, text FROM notes")
@@ -403,7 +403,7 @@ class TestReversePour:
                 ).fetchone()[0]
             )
         assert state["phase"] == "done"
-        assert [entry["note_chars"] for entry in chain] == [35000, 1500]
+        assert [entry["note_chars"] for entry in chain] == [20000, 1500]
         # Повторный старт с тем же env — миграция не нужна.
         assert startup_plan(get_settings())["mode"] == "none"
 
@@ -442,13 +442,13 @@ class TestReversePour:
                 "INSERT INTO notes_vec(note_id, ns, embedding) VALUES (?, 'default', ?)",
                 (part_id, vectors.pack([0.1] * dim)),
             )
-        _env(35000, monkeypatch)
+        _env(20000, monkeypatch)
         plan = startup_plan(get_settings())
         counters = run_startup_migration(get_settings(), plan)
         assert counters["kept_parts"] == 1
         # После swap вернувшаяся база — активная (db_path), sibling gone.
         with session(get_settings()) as conn:
-            assert note_chars_limit(conn) == 35000
+            assert note_chars_limit(conn) == 20000
             assert part_id not in _table_ids(conn, "notes")
             assert part_id not in _table_ids(conn, "notes_chunks", "note_id")
             assert part_id not in _table_ids(
@@ -461,7 +461,7 @@ class TestReversePour:
             }
             assert all(part_id not in pair for pair in pair_links)
         assert not pathlib.Path(
-            sibling_db_path(get_settings().db_path, 35000)
+            sibling_db_path(get_settings().db_path, 20000)
         ).exists()
 
 
@@ -469,12 +469,12 @@ class TestReversePour:
 
 
 class TestLifespanAcceptance:
-    def test_env_1500_over_check_35000_service_boots(
+    def test_env_1500_over_check_20000_service_boots(
         self,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """env=1500 поверх CHECK=35000: сервис поднят, влезающее — в новом файле."""
+        """env=1500 поверх CHECK=20000: сервис поднят, влезающее — в новом файле."""
         settings = get_settings()
         _seed_source(settings)
         _env(1500, monkeypatch)
@@ -494,7 +494,7 @@ class TestLifespanAcceptance:
                 )
             }
             assert status == {2: "ожидает"}
-        assert pathlib.Path(sibling_db_path(settings.db_path, 35000)).is_file()
+        assert pathlib.Path(sibling_db_path(settings.db_path, 20000)).is_file()
         # Первая строка журнала джоб о миграции — с причиной и объёмом.
         events = [
             record for record in caplog.records
@@ -502,7 +502,7 @@ class TestLifespanAcceptance:
         ]
         assert len(events) == 1
         assert events[0].job == "migration"
-        assert events[0].schema_limit == 35000
+        assert events[0].schema_limit == 20000
         assert events[0].target == 1500
         assert events[0].pending == 1
         swapped = [
@@ -511,15 +511,15 @@ class TestLifespanAcceptance:
         ]
         assert len(swapped) == 1
 
-    def test_env_35000_over_check_1500_rollback_without_model(
+    def test_env_20000_over_check_1500_rollback_without_model(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """env=35000 поверх CHECK=1500: обратная миграция 1:1, без модели."""
+        """env=20000 поверх CHECK=1500: обратная миграция 1:1, без модели."""
         _migrate_down(monkeypatch)
-        _env(35000, monkeypatch)
+        _env(20000, monkeypatch)
         with TestClient(create_app()) as client:
             assert client.get("/health").status_code == 200
         with session(get_settings()) as conn:
-            assert note_chars_limit(conn) == 35000
+            assert note_chars_limit(conn) == 20000
             assert conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 3
         assert startup_plan(get_settings())["mode"] == "none"

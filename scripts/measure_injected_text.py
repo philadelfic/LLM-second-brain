@@ -56,7 +56,7 @@ from app.services import build_services  # noqa: E402
 from app.services.injection_budget import ENCODING_NAME, count_tokens  # noqa: E402
 from app.storage.db import init_db  # noqa: E402
 from app.transport.mcp import (  # noqa: E402
-    SERVER_INSTRUCTIONS,
+    server_instructions,
     _NS_RULES,
     _logs_section,
     _namespace_map,
@@ -107,7 +107,7 @@ def _place_a(services: Any, settings: Any) -> dict[str, Any]:
     components: list[tuple[str, str, str]] = [
         (
             "SERVER_INSTRUCTIONS",
-            SERVER_INSTRUCTIONS,
+            server_instructions(settings.max_note_chars),
             "ядро инструкций при подключении (канон §2, бюджет ≤300 ток.)",
         ),
         (

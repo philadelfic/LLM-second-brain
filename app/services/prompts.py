@@ -38,9 +38,8 @@ import json
 import os
 from pathlib import Path
 
-from app.config import ConfigError
+from app.config import MAX_NOTE_CHARS_DEFAULT, ConfigError
 from app.services.decision import DECISION_KINDS, DecisionQuestion
-from app.services.notes import NOTE_TEXT_LIMIT
 
 
 def _build_decision_questions(
@@ -146,41 +145,48 @@ SUMMARY_SYSTEM_PROMPT = (
 # summary.py::MERGE_SYSTEM_PROMPT — слияние дубликатов (системный).
 # Канон LSBN-F-23: слияние отдаёт СПИСОК самодостаточных частей (JSON) —
 # «лучше несколько самодостаточных заметок, чем одна обрезанная». Лимит
-# части — мягкий лимит заметки (NOTE_TEXT_LIMIT, LSBN-S-1); контракт
-# структурированный, чтобы полноту проверял код, а не «на глаз».
-SUMMARY_MERGE_SYSTEM_PROMPT = (
-    "You have two versions of the same note. Merge them into one or several "
-    "SELF-CONTAINED notes (parts): combine all information from both — facts, "
-    "names, numbers, dates, statuses, configs and paths; state each fact once, "
-    "omit repetitions; do not drop anything and do not add anything of your "
-    "own. Every part must be readable on its own, without references to other "
-    "parts. Use ONE part only if the merged text fits the "
-    f"{NOTE_TEXT_LIMIT}-character note limit; otherwise split the content into "
-    "several parts, each within the same limit. Give each part its own `title`: "
-    "a meaningful name of at most 5 words. Write coherently, no headings, "
-    "intros, quotes, or explanations. Respond in the language of the notes. "
-    "Answer with exactly one JSON object, no explanations: "
-    '{"parts": [{"title": "...", "text": "..."}, ...]}'
-)
+# части — мягкий лимит заметки (settings.max_note_chars; 3.4.1 — из
+# конфига, LSBN-T-26); контракт структурированный, чтобы полноту проверял
+# код, а не «на глаз». Число подставляется сборщиком ниже — литерала в
+# каноне нет (одно число — одно место: env MAX_NOTE_CHARS).
+def summary_merge_system_prompt(limit: int) -> str:
+    """Системный промпт слияния; `limit` — мягкий лимит заметки из настроек."""
+    return (
+        "You have two versions of the same note. Merge them into one or several "
+        "SELF-CONTAINED notes (parts): combine all information from both — facts, "
+        "names, numbers, dates, statuses, configs and paths; state each fact once, "
+        "omit repetitions; do not drop anything and do not add anything of your "
+        "own. Every part must be readable on its own, without references to other "
+        "parts. Use ONE part only if the merged text fits the "
+        f"{limit}-character note limit; otherwise split the content into "
+        "several parts, each within the same limit. Give each part its own `title`: "
+        "a meaningful name of at most 5 words. Write coherently, no headings, "
+        "intros, quotes, or explanations. Respond in the language of the notes. "
+        "Answer with exactly one JSON object, no explanations: "
+        '{"parts": [{"title": "...", "text": "..."}, ...]}'
+    )
+
 
 # summary.py::SPLIT_SYSTEM_PROMPT — нарезка длинной заметки (системный).
 # Канон LSBN-F-22 (M2): тот же контракт списка частей, что у слияния, но
 # источник — ОДНА длинная заметка; требование самодостаточности части
 # усилено постановкой (шаг «Нарезка идёт через F-23»): каждая часть несёт
 # СВОИ имена, числа, даты — читается без исходника и остальных частей.
-SUMMARY_SPLIT_SYSTEM_PROMPT = (
-    "You are given ONE long note that exceeds the note limit. Split it into "
-    "one or several SELF-CONTAINED notes (parts): preserve every fact — "
-    "names, numbers, dates, statuses, configs and paths; do not drop "
-    "anything and do not add anything of your own. Every part must be "
-    f"readable on its own, carrying ITS OWN names, numbers and dates — no "
-    "references to the source or to other parts. Parts may be up to "
-    f"{NOTE_TEXT_LIMIT} characters each. Give each part its own `title`: a "
-    "meaningful name of at most 5 words. Write coherently, no headings, "
-    "intros, quotes, or explanations. Respond in the language of the note. "
-    "Answer with exactly one JSON object, no explanations: "
-    '{"parts": [{"title": "...", "text": "..."}, ...]}'
-)
+def summary_split_system_prompt(limit: int) -> str:
+    """Системный промпт нарезки; `limit` — мягкий лимит заметки из настроек."""
+    return (
+        "You are given ONE long note that exceeds the note limit. Split it into "
+        "one or several SELF-CONTAINED notes (parts): preserve every fact — "
+        "names, numbers, dates, statuses, configs and paths; do not drop "
+        "anything and do not add anything of your own. Every part must be "
+        f"readable on its own, carrying ITS OWN names, numbers and dates — no "
+        "references to the source or to other parts. Parts may be up to "
+        f"{limit} characters each. Give each part its own `title`: a "
+        "meaningful name of at most 5 words. Write coherently, no headings, "
+        "intros, quotes, or explanations. Respond in the language of the note. "
+        "Answer with exactly one JSON object, no explanations: "
+        '{"parts": [{"title": "...", "text": "..."}, ...]}'
+    )
 
 # judge.py::JUDGE_SYSTEM_PROMPT — определение одинаковости заметок
 # (ДУБЛЬ/НЕ ДУБЛЬ).
@@ -253,10 +259,13 @@ STRUCTURE_JUDGE_USER_TEMPLATE = (
 )
 
 # Имя → встроенный текст (единый словарь: и свойства реестра, и seed-файлы).
+# Тексты с числом (merge/split) собраны сборщиками от ДЕФОЛТА конфига;
+# PromptRegistry при конструировании пересобирает их от переданного
+# settings.max_note_chars (3.4.1, LSBN-T-26: одно число — одно место).
 BUILTIN_PROMPTS: dict[str, str] = {
     "summary_system": SUMMARY_SYSTEM_PROMPT,
-    "summary_merge_system": SUMMARY_MERGE_SYSTEM_PROMPT,
-    "summary_split_system": SUMMARY_SPLIT_SYSTEM_PROMPT,
+    "summary_merge_system": summary_merge_system_prompt(MAX_NOTE_CHARS_DEFAULT),
+    "summary_split_system": summary_split_system_prompt(MAX_NOTE_CHARS_DEFAULT),
     "judge_system": JUDGE_SYSTEM_PROMPT,
     "merge_user": SUMMARY_MERGE_USER_TEMPLATE,
     "split_user": SUMMARY_SPLIT_USER_TEMPLATE,
@@ -283,7 +292,11 @@ _PROMPT_FILE_SUFFIX = ".txt"
 # legacy seeds (lsbdef-0006). Текущий канон — 3.4.1 (LSBN-F-22 M2: добавлен
 # редактируемый `summary_split_system` — нарезка длинной заметки списком
 # самодостаточных частей; 3.4.0 — слияние списком частей, LSBN-F-23; ранее
-# 3.1.0 — саммари ≤ 150 символов, решение гейта 2026-09-19).
+# 3.1.0 — саммари ≤ 150 символов, решение гейта 2026-09-19). Штамп уже
+# выставлен релизом 3.4.0 и при 3.4.1 не меняется: перезапись нетронутых
+# сидов поднимает сравнение с текущим каноном (_should_migrate) — число
+# лимита в тексте теперь приходит из настроек, и смена MAX_NOTE_CHARS
+# переписывает сид без смены штампа (LSBN-T-26).
 SEED_VERSION = "3.4.1"
 
 # Name of the seed-stamp sidecar file in prompts_dir: version + SHA-256 of
@@ -400,9 +413,17 @@ class PromptRegistry:
         prompts_dir: str | os.PathLike[str] | None = None,
         *,
         decision_max_questions: int = 64,
+        max_note_chars: int = MAX_NOTE_CHARS_DEFAULT,
     ) -> None:
-        # Копия встроенных: файловые переопределения ложатся поверх.
-        self._texts: dict[str, str] = dict(BUILTIN_PROMPTS)
+        # Копия встроенных: файловые переопределения ложатся поверх. Тексты
+        # с мягким лимитом заметки (merge/split) пересобираются от
+        # переданного значения — settings.max_note_chars сборки (3.4.1,
+        # LSBN-T-26: смена env меняет и промпты, и валидацию одним числом).
+        self._texts: dict[str, str] = {
+            **BUILTIN_PROMPTS,
+            "summary_merge_system": summary_merge_system_prompt(max_note_chars),
+            "summary_split_system": summary_split_system_prompt(max_note_chars),
+        }
         # Имена, чей финальный текст пришёл из непустого файла (диагностика
         # источника в ошибках валидации).
         self._file_overrides: set[str] = set()
@@ -599,14 +620,23 @@ class PromptRegistry:
     def _should_migrate(self, name: str, content: str, meta: dict) -> bool:
         """Whether the file needs auto-migration to the current canon.
 
-        True if the file is an untouched legacy seed: either seeded by us and
-        unchanged since (hash matches seed_meta.json) with an outdated stamp
-        version, or byte-identical to a known legacy seed.
+        True if the file is an untouched seed: either seeded by us and
+        unchanged since (hash matches seed_meta.json) while the built-in
+        canon moved on — a bumped stamp version OR the built-in text itself
+        differs (с 3.4.1/LSBN-T-26 число в тексте приходит из настроек:
+        смена MAX_NOTE_CHARS меняет встроенный текст, нетронутый сид
+        переписывается без смены штампа версии) — or byte-identical to a
+        known legacy seed.
         """
         recorded = meta["files"].get(name)
         if recorded is not None and self._hash(content) == recorded:
-            # File unchanged since our seed.
-            return meta.get("seed_version") != SEED_VERSION
+            # File unchanged since our seed → rewrite when the current
+            # canon differs (seed version bumped or the built-in text
+            # moved, e.g. the note limit now comes from the config).
+            return (
+                meta.get("seed_version") != SEED_VERSION
+                or content != self._texts[name]
+            )
         # File not seeded by us (legacy) — checking known legacy seeds.
         return content in LEGACY_SEEDS.get(name, ())
 

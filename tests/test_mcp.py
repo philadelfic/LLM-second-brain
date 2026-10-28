@@ -27,16 +27,26 @@ from mcp.client.streamable_http import (
     streamable_http_client,
 )
 
+from app.config import get_settings
 from app.services.dedup import DEDUP_HINT
 from app.transport.mcp import (
     HINT_INVALID_MODE,
     HINT_INVALID_UPDATED_AFTER,
-    SERVER_INSTRUCTIONS,
+    server_instructions,
     SERVER_NAME,
-    TOOL_DESCRIPTIONS,
+    tool_descriptions,
     TOOL_NAMES,
 )
+
+
 from tests.conftest import TEST_ENV
+
+
+# 3.4.1 (LSBN-T-26): тексты с числом лимита собираются функциями от
+# настроек — здесь сборка от значений тестового окружения (роль прежних
+# констант; число приходит из Settings, не литерал).
+SERVER_INSTRUCTIONS = server_instructions(get_settings().max_note_chars)
+TOOL_DESCRIPTIONS = tool_descriptions(get_settings().max_note_chars)
 
 TOKEN = TEST_ENV["MCP_AUTH_TOKEN"]
 # Порты — уникальные на xdist-воркера (PYTEST_XDIST_WORKER = "gw<N>"; вне xdist
@@ -270,7 +280,8 @@ class TestToolsList:
             tools = {t.name: t for t in (await session.list_tools()).tools}
         save_schema = tools["memory_save"].input_schema
         save_text = save_schema["properties"]["text"]
-        assert save_text["maxLength"] == 1500  # дефолт MAX_NOTE_CHARS (M1)
+        # 3.4.1 (LSBN-T-26): maxLength — из настроек окружения
+        assert save_text["maxLength"] == get_settings().max_note_chars
         assert save_text["default"] == ""  # text необязателен (M2: notes)
         assert save_schema.get("required") is None  # text или notes — любой
         notes = save_schema["properties"]["notes"]["anyOf"][0]
@@ -345,16 +356,17 @@ class TestToolCalls:
     async def test_note_over_soft_limit_soft_fail_with_hint(
         self, server_url: str
     ) -> None:
-        """LSBN-S-1 + M2: заметка длиннее мягкого лимита (1500) отклоняется
+        """LSBN-S-1 + M2: заметка длиннее мягкого лимита (из env) отклоняется
         мягко, с хинтом (лимит + фактическая длина + правило разбиения).
-        Через скалярный `text` путь недостижим (схема несёт maxLength=1500 —
+        Через скалярный `text` путь недостижим (схема несёт maxLength лимита —
         M1), поэтому элемент массива `notes` (элементы без maxLength):
         {stored: false, hint} у ЭТОГО элемента, соседний сохраняется."""
+        limit = get_settings().max_note_chars
         async with connect(server_url) as session:
             call = await session.call_tool(
                 "memory_save",
                 {"notes": [
-                    {"text": "x" * 1501, "title": "Слишком длинная заметка"},
+                    {"text": "x" * (limit + 1), "title": "Слишком длинная заметка"},
                     {"text": "короткая заметка рядом с длинной", "title": "Короткая"},
                 ]},
             )
@@ -362,8 +374,8 @@ class TestToolCalls:
         body = call.structured_content
         assert body["stored_count"] == 1
         assert body["notes"][0]["stored"] is False
-        assert "1500-character note limit" in body["notes"][0]["hint"]
-        assert "1501 characters" in body["notes"][0]["hint"]
+        assert f"{limit}-character note limit" in body["notes"][0]["hint"]
+        assert f"{limit + 1} characters" in body["notes"][0]["hint"]
         assert body["notes"][1]["stored"] is True
 
     @pytest.mark.asyncio
@@ -1658,8 +1670,7 @@ class TestInstructionsBudget:
         русскими: их не трогаем (см. test_map_in_instructions_within_budget).
         """
         from app.transport.mcp import (
-            SERVER_INSTRUCTIONS,
-            TOOL_DESCRIPTIONS,
+            server_instructions,
             _LOGS_SECTION,
             _NS_RULES,
             _NOTE_LIFETIME_SECTION,
@@ -1668,7 +1679,7 @@ class TestInstructionsBudget:
         )
 
         static = (
-            SERVER_INSTRUCTIONS,
+            server_instructions(get_settings().max_note_chars),
             _NS_RULES,
             _LOGS_SECTION,
             _NOTE_LIFETIME_SECTION,

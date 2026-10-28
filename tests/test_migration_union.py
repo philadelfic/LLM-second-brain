@@ -1,7 +1,7 @@
 """LSBN-F-22, M3: union-чтение (search/get/list/dedup), записи в legacy,
 прерывание миграции, сверка счётчиков.
 
-tmp_path (test_env), без сети: спуск 35000→1500 примитивами M1
+tmp_path (test_env), без сети: спуск 20000→1500 примитивами M1
 (run_startup_migration), нарезка — FixedSummarizer (паттерн M2),
 union-контекст — refresh_migration_context (в юнит-тестах lifespan не
 запускается: контекст None = нулевой оверхед, проверяется явно).
@@ -24,7 +24,11 @@ from app.services.migration import (
     migration_health,
     refresh_migration_context,
 )
-from app.services.notes import HINT_SOURCE_SPLIT, NoteService
+from app.services.notes import (
+    HINT_SOURCE_SPLIT,
+    NoteService,
+    NoteValidationError,
+)
 from app.services.search import SearchService
 from app.storage.db import init_db, note_chars_limit, session, transaction
 from app.storage.migration import (
@@ -52,13 +56,13 @@ def _env(monkeypatch: pytest.MonkeyPatch, limit: int) -> None:
 
 
 def _seed_legacy(settings) -> None:
-    """Прежняя база (CHECK 35000): 2 короткие + 3 длинные (50 — TTL истёк).
+    """Прежняя база (CHECK 20000): 2 короткие + 3 длинные (50 — TTL истёк).
 
     id с запасом (10..50): после перелива активная база выдаёт новым
     заметкам max(id)+1 = 31 — вне id исходников; коллизия проверяется
     отдельным тестом явной вставкой id 20 (см. TestAbort).
     """
-    init_db(settings, note_chars=35000)
+    init_db(settings, note_chars=20000)
     with session(settings) as conn, transaction(conn):
         conn.execute(
             "INSERT INTO notes(id, text, title) VALUES "
@@ -109,7 +113,7 @@ def _seed_legacy(settings) -> None:
 
 
 def _migrate_down(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Полный спуск 35000 → 1500 (перелив + swap): активная база + 'ожидает'."""
+    """Полный спуск 20000 → 1500 (перелив + swap): активная база + 'ожидает'."""
     settings = get_settings()
     _seed_legacy(settings)
     _env(monkeypatch, 1500)
@@ -127,7 +131,7 @@ def _service(summarizer: FixedSummarizer | None = None) -> MigrationService:
 
 def _legacy_settings():
     return get_settings().model_copy(
-        update={"db_path": sibling_db_path(get_settings().db_path, 35000)}
+        update={"db_path": sibling_db_path(get_settings().db_path, 20000)}
     )
 
 
@@ -281,22 +285,28 @@ class TestGetListUnion:
 
 
 class TestDedupAndWrites:
-    def test_save_duplicate_found_in_legacy(
+    def test_save_duplicate_of_waiting_source_soft_refused(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Дословный дубль ждущей заметки из прежней базы блокирует запись."""
+        """Повторная запись длинного исходника при спуске — мягкий отказ:
+        валидация АКТИВНОГО лимита (env) идёт до дедупа (LSBN-T-26). Текст
+        'ожидает'-заметки 40 живёт только в legacy и длиннее активного
+        лимита — повторно его записать нельзя; правки идут в прежнюю базу
+        через update (см. test_update_delete_route_to_legacy)."""
         _migrate_down(monkeypatch)
-        monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 40000)
         notes = NoteService(get_settings())
         # Активный путь цел: дубль перелитой заметки находится в активной базе.
         core = notes.save("короткая заметка про ядро хранилища")
         assert core["duplicated"] is True and core["id"] == 10
         refresh_migration_context(get_settings())
-        # Текст 'ожидает'-заметки 40 живёт только в legacy — дубль оттуда
-        # (вставки нет — CHECK активной базы не нарушается).
-        duplicate = notes.save(_LONG_CHART)
-        assert duplicate["duplicated"] is True
-        assert duplicate["id"] == 40
+        with pytest.raises(NoteValidationError):
+            notes.save(_LONG_CHART)
+        # Вставки нет — в активной базе исходника по-прежнему нет.
+        with session(get_settings()) as conn:
+            assert (
+                conn.execute("SELECT COUNT(*) c FROM notes WHERE id = 40").fetchone()["c"]
+                == 0
+            )
 
     def test_update_delete_route_to_legacy(
         self, monkeypatch: pytest.MonkeyPatch
@@ -361,13 +371,13 @@ class TestAbort:
         outcome = abort_migration(get_settings())
         assert outcome["aborted"] is True
         assert outcome["phase"] == "aborted"
-        assert outcome["prev_file"] == "notes.35000.db"
+        assert outcome["prev_file"] == "notes.20000.db"
         assert outcome["counters"]["kept_parts"] == 2  # части 20 не перелиты
 
-        # Сервис на прежней базе (CHECK 35000), union выключен.
+        # Сервис на прежней базе (CHECK 20000), union выключен.
         assert migration_context() is None
         with session(get_settings()) as conn:
-            assert note_chars_limit(conn) == 35000
+            assert note_chars_limit(conn) == 20000
             rows = {
                 int(r["id"]): str(r["text"])
                 for r in conn.execute("SELECT id, text FROM notes")
@@ -388,7 +398,7 @@ class TestAbort:
         ).is_file()
         # Повторный abort — уже прервано.
         assert abort_migration(get_settings())["aborted"] is False
-        # Рестарт с прежним env (1500) поверх CHECK 35000 НЕ мигрирует заново.
+        # Рестарт с прежним env (1500) поверх CHECK 20000 НЕ мигрирует заново.
         plan = startup_plan(get_settings())
         assert plan["mode"] == "none" and plan.get("aborted") is True
 
@@ -406,7 +416,7 @@ class TestAbort:
         assert _service().process_batch(limit=1) == 1  # 20 нарезана, 40/50 ждут
         assert abort_migration(get_settings())["aborted"] is True
         with session(get_settings()) as conn:
-            assert note_chars_limit(conn) == 35000
+            assert note_chars_limit(conn) == 20000
             assert str(
                 conn.execute("SELECT text FROM notes WHERE id = 20").fetchone()[0]
             ) == _LONG_PLAN  # оригинал не затёрт
@@ -556,7 +566,7 @@ class TestIdFloor:
         assert _service().process_batch(limit=1) == 1  # 20 нарезана, 40/50 ждут
         assert abort_migration(get_settings())["aborted"] is True
         with session(get_settings()) as conn:
-            assert note_chars_limit(conn) == 35000
+            assert note_chars_limit(conn) == 20000
             rows = {
                 int(r["id"]): str(r["text"])
                 for r in conn.execute("SELECT id, text FROM notes")

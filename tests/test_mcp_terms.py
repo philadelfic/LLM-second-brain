@@ -33,8 +33,8 @@ from app.services.terms import (
 from app.services.user_facts import UserFactsService
 from app.storage.db import init_db, session
 from app.transport.mcp import (
-    SERVER_INSTRUCTIONS,
-    TOOL_DESCRIPTIONS,
+    server_instructions,
+    tool_descriptions,
     TOOL_NAMES,
     _NS_RULES,
     _logs_section,
@@ -44,7 +44,16 @@ from app.transport.mcp import (
     build_instructions,
     build_mcp,
 )
+
+
 from fakes import HashEmbedder
+
+
+# 3.4.1 (LSBN-T-26): тексты с числом лимита собираются функциями от
+# настроек — здесь сборка от значений тестового окружения (роль прежних
+# констант; число приходит из Settings, не литерал).
+SERVER_INSTRUCTIONS = server_instructions(get_settings().max_note_chars)
+TOOL_DESCRIPTIONS = tool_descriptions(get_settings().max_note_chars)
 
 DIM = 64
 

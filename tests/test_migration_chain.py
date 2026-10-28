@@ -41,8 +41,8 @@ def _env(limit: int, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _seed_source(settings, long_ids: tuple[int, ...] = (2,)) -> None:
-    """База под спуск (CHECK 35000): короткая id=1 + длинные → 'ожидает'."""
-    init_db(settings, note_chars=35000)
+    """База под спуск (CHECK 20000): короткая id=1 + длинные → 'ожидает'."""
+    init_db(settings, note_chars=20000)
     with session(settings) as conn, transaction(conn):
         conn.execute("INSERT INTO notes(id, text) VALUES (1, 'короткая заметка')")
         for old_id in long_ids:
@@ -110,24 +110,24 @@ class TestForwardReverseForward:
         chain описывает обе, часть первого прогона остаётся в цепочной базе."""
         settings = get_settings()
         _seed_source(settings)
-        # forward 35000 → 1500: длинная 2 — 'ожидает', нарезка даёт часть.
+        # forward 20000 → 1500: длинная 2 — 'ожидает', нарезка даёт часть.
         _env(1500, monkeypatch)
         assert _run_plan() == "down"
         part_id = _simulate_split_part("Часть первая", "самодостаточная часть текста")
-        # reverse 1500 → 35000: часть исключается из дельты и остаётся только
+        # reverse 1500 → 20000: часть исключается из дельты и остаётся только
         # в уходящей notes.1500.db (QA D9: «части остаются в уходящей базе»).
-        _env(35000, monkeypatch)
+        _env(20000, monkeypatch)
         assert _run_plan() == "up_chain"
         low_path = sibling_db_path(settings.db_path, 1500)
         assert pathlib.Path(low_path).is_file()
-        # Повторный forward 35000 → 1500 (QA D10): целевое имя notes.1500.db
+        # Повторный forward 20000 → 1500 (QA D10): целевое имя notes.1500.db
         # занято живой базой цепочки — стирать её нельзя.
         _env(1500, monkeypatch)
         assert startup_plan(get_settings())["mode"] == "down"
         assert _run_plan() == "down"
-        # ВСЕ файлы цепочки существуют: notes.35000.db (уходящая) и
+        # ВСЕ файлы цепочки существуют: notes.20000.db (уходящая) и
         # notes.1500.db (цепочная, часть первого прогона) не удалены.
-        assert pathlib.Path(sibling_db_path(settings.db_path, 35000)).is_file()
+        assert pathlib.Path(sibling_db_path(settings.db_path, 20000)).is_file()
         assert pathlib.Path(low_path).is_file()
         assert not pathlib.Path(low_path + ".incoming").exists()  # swap переименовал
         with session(get_settings()) as conn:
@@ -143,7 +143,7 @@ class TestForwardReverseForward:
         chain = json.loads(meta["migration.chain"])
         assert state["phase"] == "pour"
         assert {entry["file"] for entry in chain} == {
-            "notes.35000.db",
+            "notes.20000.db",
             "notes.1500.db",
         }
         assert all(
