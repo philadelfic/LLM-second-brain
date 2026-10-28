@@ -421,7 +421,10 @@ class TestAbort:
         headers = {"Authorization": f"Bearer {test_env['MCP_AUTH_TOKEN']}"}
         with TestClient(create_app()) as client:
             health = client.get("/health").json()
-            assert health["migration"]["phase"] == "pour"
+            # Фаза старта: 'pour' до первой партии джобы, 'split' — как только
+            # она взяла работу (DEF-7a); обе валидны до abort (живой воркер
+            # под TestClient может успеть взять партию).
+            assert health["migration"]["phase"] in ("pour", "split")
             assert health["migration"]["counters"] == {
                 "old_total": 5,
                 "poured": 2,
@@ -449,8 +452,9 @@ class TestHealthCounters:
         _migrate_down(monkeypatch)
         assert _service().process_batch() == 3
         block = migration_health(get_settings())
-        # Фаза остаётся 'pour' до обнуления очереди (джоба ставит done).
-        assert block["phase"] == "pour"
+        # Фаза 'split', пока очередь не обнулена (DEF-7a); done ставит
+        # пустой прогон джобы.
+        assert block["phase"] == "split"
         assert block["counters"] == {
             "old_total": 5,
             "poured": 2,  # заметки 10 и 30 — перелиты 1:1
@@ -484,9 +488,10 @@ class TestHealthCounters:
         assert block["counters"]["split_notes"] == 0
         assert block["counters"]["expired"] == 1
         assert block["invariant_ok"] is True
-        # Джоба не сворачивает миграцию: карантин — ещё работа.
+        # Джоба не сворачивает миграцию: карантин — ещё работа (DEF-7a:
+        # фаза нарезки 'split', done придёт только после обнуления очереди).
         with session(get_settings()) as conn:
-            assert read_state(conn)["phase"] == "pour"
+            assert read_state(conn)["phase"] == "split"
 
 
 # --- резерв диапазона id (design §8.1) -----------------------------------------

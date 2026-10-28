@@ -261,6 +261,9 @@ class MigrationService:
             # карта отката). Идемпотентно: следующий прогон — холостой.
             self._close_if_drained(state)
             return 0
+        # DEF-7a: нарезка началась — фаза видна в state и /health (design §3:
+        # pour — только перелив старта, split — нарезка; done/aborted — M3).
+        self._mark_split_phase(state)
         done = 0
         legacy_settings = self._settings.model_copy(update={"db_path": legacy_path})
         with session(self._settings) as active, session(legacy_settings) as legacy:
@@ -325,6 +328,23 @@ class MigrationService:
             },
         )
 
+    def _mark_split_phase(self, state: dict) -> None:
+        """Старт фазы нарезки: phase pour → split в state (DEF-7a, design §3).
+
+        Пишется один раз — дальнейшие прогоны фазу не переписывают; done
+        (обнуление очереди) и aborted (прерывание, M3) — как было. Сбой
+        записи не ломает партию: фазу поставит следующий прогон (прецедент
+        _close_if_drained).
+        """
+        if str(state.get("phase")) == "split":
+            return
+        try:
+            with session(self._settings) as conn, transaction(conn):
+                set_state_phase(conn, "split")
+        except (sqlite3.Error, StorageError):
+            return
+        refresh_migration_context(self._settings)
+
     def _split_one(
         self,
         active: sqlite3.Connection,
@@ -375,6 +395,9 @@ class MigrationService:
             )
             return "retry-later"
         parts = [(part.title, part.text) for part in result.parts]
+        # Наблюдаемость (DEF-6): slot_call на КАЖДЫЙ вызов нарезки — как у
+        # merge/dedup (worker), дозапрос 2-го раунда виден отдельной строкой.
+        self._log_slot_call(old_id, result)
         outcome = self._notes.save_migration_parts(old_id, namespace, parts)
         self._log(
             "migration: note split into self-contained parts",
@@ -501,6 +524,29 @@ class MigrationService:
                 if value is not None:
                     payload[key] = value
         logger.info(message, extra=payload)
+
+    def _log_slot_call(self, old_id: int, result: MergeResult) -> None:
+        """slot_call на каждый вызов нарезки (DEF-6; прецедент merge — worker).
+
+        Те же поля успешного вызова, что у воркера (`_call_log_fields`):
+        операция/модель/бюджет/длительность — «сколько времени ушло» видно
+        по строке на вызов; без метаданных (тестовый двойник) — молча.
+        Импорт по месту: воркер тяжёлый и тянет полсистемы — миграция не
+        должна импортировать его наверх (прецедент lazy-импортов notes).
+        """
+        from app.services.worker import SLOT_SUMMARY, _call_log_fields
+
+        for meta in result.metas or [result.meta]:
+            if meta is None:
+                continue
+            payload: dict[str, Any] = {
+                "event": "slot_call",
+                "slot": SLOT_SUMMARY,
+                "job": MIGRATION_JOB,
+                "note_id": old_id,
+                **_call_log_fields(meta),
+            }
+            logger.info("slot_call", extra=payload)
 
 
 # --- прерывание (M3, design §4 «Прерывание») ---------------------------------
