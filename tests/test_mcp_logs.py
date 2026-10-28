@@ -29,15 +29,23 @@ from app.services.logs import (
 from app.services.namespaces import NamespaceService
 from app.services.worker import BackgroundWorker
 from app.transport.mcp import (
-    TOOL_DESCRIPTIONS,
+    tool_descriptions,
     TOOL_NAMES,
     _NOTE_LIFETIME_SECTION,
     _namespace_map,
     build_instructions,
     build_mcp,
 )
+
+
 from app.storage.db import init_db
 from fakes import HashEmbedder
+
+
+# 3.4.1 (LSBN-T-26): тексты с числом лимита собираются функциями от
+# настроек — здесь сборка от значений тестового окружения (роль прежних
+# констант; число приходит из Settings, не литерал).
+TOOL_DESCRIPTIONS = tool_descriptions(get_settings().max_note_chars)
 
 DIM = 8
 

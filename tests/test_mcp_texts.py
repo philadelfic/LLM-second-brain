@@ -29,8 +29,8 @@ from app.services.injection_budget import (
 from app.services.namespaces import NamespaceService
 from app.storage.db import init_db
 from app.transport.mcp import (
-    SERVER_INSTRUCTIONS,
-    TOOL_DESCRIPTIONS,
+    server_instructions,
+    tool_descriptions,
     TOOL_NAMES,
     _LOGS_SECTION,
     _NOTE_LIFETIME_SECTION,
@@ -41,6 +41,13 @@ from app.transport.mcp import (
     _SKILLS_ANNOUNCE_RULES,
     _namespace_map,
 )
+
+
+# 3.4.1 (LSBN-T-26): тексты с числом лимита собираются функциями от
+# настроек — здесь сборка от значений тестового окружения (роль прежних
+# констант; число приходит из Settings, не литерал).
+SERVER_INSTRUCTIONS = server_instructions(get_settings().max_note_chars)
+TOOL_DESCRIPTIONS = tool_descriptions(get_settings().max_note_chars)
 
 DIM = 64
 

@@ -28,7 +28,8 @@ NFR-5: тёплый вызов с reasoning — секунды).
 LSBN-F-23): пара дубликатов не выбрасывается, а **сливается** — оба текста
 уходят одним вызовом с merge-промптом, ответ — **список самодостаточных
 частей** (JSON `{"parts": [{"title", "text"}, ...]}`), у каждой части свой
-title (≤5 слов) и текст ≤ NOTE_TEXT_LIMIT (1500, LSBN-S-1). Полнота
+title (≤5 слов) и текст ≤ settings.max_note_chars (3.4.1: мягкий лимит
+заметки живёт в конфиге, LSBN-S-1/LSBN-T-26). Полнота
 (сумма частей покрывает исходники по нормализованному тексту) и лимиты
 проверяются кодом: часть длиннее лимита или неполный ответ — ОДИН дозапрос
 в том же контексте, максимум 2 раунда; не сошлось —
@@ -89,7 +90,6 @@ import httpx
 
 from app.config import TITLE_MAX_WORDS, Settings
 from app.services.llm_client import ChatMeta, ChatResult, LLMClient, LLMError, SlotSpec
-from app.services.notes import NOTE_TEXT_LIMIT
 from app.services.prompts import PromptRegistry
 from app.services.slot_outcome import SlotOutcome, classify_llm_error
 
@@ -111,7 +111,8 @@ MERGE_COVERAGE_MIN = 1.0
 @dataclass(frozen=True)
 class MergePart:
     """Одна самодостаточная часть слияния: свой title (≤5 слов) и текст,
-    укладывающийся в мягкий лимит заметки NOTE_TEXT_LIMIT (LSBN-S-1)."""
+    укладывающийся в мягкий лимит заметки settings.max_note_chars
+    (LSBN-S-1; 3.4.1 — число из конфига)."""
 
     title: str
     text: str
@@ -357,7 +358,12 @@ class SummaryService:
         registry: PromptRegistry | None = None,
     ) -> None:
         self._settings = settings
-        self._prompts = registry if registry is not None else PromptRegistry()
+        # 3.4.1 (LSBN-T-26): число в промптах merge/split — из настроек сборки.
+        self._prompts = (
+            registry
+            if registry is not None
+            else PromptRegistry(max_note_chars=settings.max_note_chars)
+        )
         # Клиенты ПО ОПЕРАЦИЯМ (LSBN-F-34): плоский env SUMMARIZE_/TITLE_/
         # MERGE_/SPLIT_* переопределяет модель/провайдера/адрес/ключ/таймаут/
         # бюджет одного процесса поверх слота summary; без переопределения
@@ -425,12 +431,13 @@ class SummaryService:
         """Слить два текста-дубликата в список самодостаточных частей.
 
         LSBN-F-23: результат — не строка, а СПИСОК частей, у каждой свой
-        title (≤5 слов) и текст ≤ мягкого лимита заметки NOTE_TEXT_LIMIT
-        (1500, LSBN-S-1). Ответ модели — структурированный JSON
+        title (≤5 слов) и текст ≤ мягкого лимита заметки
+        settings.max_note_chars (3.4.1 — из конфига, LSBN-T-26). Ответ
+        модели — структурированный JSON
         ``{"parts": [{"title", "text"}, ...]}`` (канон реестра промптов).
 
         Проверки перед отдачей результата (постановка, пп. 1/4):
-        - каждая часть ≤ NOTE_TEXT_LIMIT;
+        - каждая часть ≤ settings.max_note_chars;
         - полнота: сумма частей покрывает исходники по нормализованному
           тексту (`merge_coverage` ≥ MERGE_COVERAGE_MIN). Молчаливое
           обрезание запрещено.
@@ -485,8 +492,9 @@ class SummaryService:
         в промпт уходят личные заметки, решение О. 15.10.2026).
 
         Проверки перед отдачей результата — как у merge (постановка F-22,
-        фаза 4): каждая часть ≤ NOTE_TEXT_LIMIT; полнота — сумма частей
-        покрывает исходник (`merge_coverage` ≥ MERGE_COVERAGE_MIN, строго).
+        фаза 4): каждая часть ≤ settings.max_note_chars; полнота — сумма
+        частей покрывает исходник (`merge_coverage` ≥ MERGE_COVERAGE_MIN,
+        строго).
         Не сошлось — ОДИН дозапрос в том же контексте; за MERGE_MAX_ROUNDS
         раундов не сошлось — `MergeIncompleteError` (заметка уходит в
         карантин джобой миграции, повтор по back-off). Транзиентные отказы
@@ -550,24 +558,25 @@ class SummaryService:
             result.meta,
         )
 
-    @staticmethod
     def _incomplete_reason(
-        parts: list[MergePart], *sources: str
+        self, parts: list[MergePart], *sources: str
     ) -> str | None:
         """Причина неполного слияния/нарезки или None (постановки F-23/F-22).
 
         «Часть N длиннее лимита» приоритетнее «ответ неполный»: обе идут в
-        ОДИН дозапрос, формулировка — про главную из проблем.
+        ОДИН дозапрос, формулировка — про главную из проблем. Лимит —
+        settings.max_note_chars снимка сборки (3.4.1, LSBN-T-26).
         """
+        limit = self._settings.max_note_chars
         long_parts = [
             number
             for number, part in enumerate(parts, start=1)
-            if len(part.text) > NOTE_TEXT_LIMIT
+            if len(part.text) > limit
         ]
         if long_parts:
             listed = ", ".join(map(str, long_parts))
             return (
-                f"part {listed} exceeds the {NOTE_TEXT_LIMIT}-character note "
+                f"part {listed} exceeds the {limit}-character note "
                 "limit — split it into several self-contained parts"
             )
         coverage = merge_coverage("\n".join(sources), [p.text for p in parts])
@@ -633,7 +642,8 @@ class SummaryService:
         (`SUMMARIZE_/TITLE_/MERGE_NUM_PREDICT`; None — авто-бюджет «сколько
         влезет», №49). think — флаг spec; keep_alive не отправляется
         (решение №6). Content отдаётся как есть: символьные лимиты держат
-        точки сохранения (cap_summary — воркер; NOTE_TEXT_LIMIT — merge).
+        точки сохранения (cap_summary — воркер; лимит частей merge/split —
+        settings.max_note_chars).
         """
         try:
             result = self._llms[operation].chat_result(

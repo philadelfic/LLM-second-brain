@@ -118,8 +118,9 @@ def test_part_validation_and_guards(notes) -> None:
     пустой список частей — отказ; активной ранней нет — merged=False."""
     older_id = notes.save("текст ранней", title="Ранняя")["id"]
     newer_id = notes.save("текст поздней", title="Поздняя")["id"]
-    long_text = "д" * 1501
-    with pytest.raises(NoteValidationError, match="1500"):
+    limit = get_settings().max_note_chars
+    long_text = "д" * (limit + 1)
+    with pytest.raises(NoteValidationError, match=str(limit)):
         notes.merge_into_parts(older_id, newer_id, [("Слитая", long_text)])
     with pytest.raises(TitleValidationError):
         notes.merge_into_parts(older_id, newer_id, [(None, "текст без названия")])

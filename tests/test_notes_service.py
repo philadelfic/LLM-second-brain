@@ -16,7 +16,6 @@ from fakes import HashEmbedder
 from app.config import TITLE_MAX_WORDS, get_settings
 from app.services.namespaces import NamespaceError, NamespaceService
 from app.services.notes import (
-    NOTE_TEXT_LIMIT,
     TITLE_HINT,
     CommentValidationError,
     NoteService,
@@ -109,16 +108,17 @@ class TestSave:
             service.save("")
 
     def test_too_long_text_rejected(self, service: NoteService) -> None:
-        """Мягкий лимит (LSBN-S-1): длиннее NOTE_TEXT_LIMIT — отказ с хинтом,
-        называющим лимит, фактическую длину и правило разбиения."""
+        """Мягкий лимит (LSBN-S-1): длиннее settings.max_note_chars — отказ
+        с хинтом, называющим лимит, фактическую длину и правило разбиения."""
+        limit = get_settings().max_note_chars
         with pytest.raises(NoteValidationError) as exc_info:
-            service.save(long_text(NOTE_TEXT_LIMIT + 1))
+            service.save(long_text(limit + 1))
         hint = str(exc_info.value)
-        assert f"{NOTE_TEXT_LIMIT}-character note limit" in hint
-        assert f"{NOTE_TEXT_LIMIT + 1} characters" in hint
+        assert f"{limit}-character note limit" in hint
+        assert f"{limit + 1} characters" in hint
         assert "self-contained notes" in hint
 
-    @pytest.mark.parametrize("size", [1, NOTE_TEXT_LIMIT])
+    @pytest.mark.parametrize("size", [1, get_settings().max_note_chars])
     def test_boundary_lengths_ok(self, service: NoteService, size: int) -> None:
         assert service.save(long_text(size))["stored"] is True
 
@@ -654,8 +654,7 @@ class TestGetChunk:
         MAX_NOTE_CHARS тоже (M1 сделал 1500 дефолтом настроек и CHECK-лимитом
         новых баз — env поднимаем до init_db фикстуры `service`); границу
         1500/1501 тестируют TestSave и tests/test_note_soft_limit.py."""
-        monkeypatch.setenv("MAX_NOTE_CHARS", "35000")
-        monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)
+        monkeypatch.setenv("MAX_NOTE_CHARS", "20000")
         get_settings.cache_clear()
 
     @staticmethod
@@ -755,8 +754,7 @@ class TestUpdateMetadata:
         боевой MAX_NOTE_CHARS тоже (M1: 1500 — дефолт настроек и CHECK новых
         баз; env поднимаем до init_db фикстуры `service`; границу 1500/1501
         тестируют TestSave и test_note_soft_limit)."""
-        monkeypatch.setenv("MAX_NOTE_CHARS", "35000")
-        monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)
+        monkeypatch.setenv("MAX_NOTE_CHARS", "20000")
         get_settings.cache_clear()
 
     @staticmethod
@@ -1065,8 +1063,7 @@ class TestComment:
         боевой MAX_NOTE_CHARS тоже (M1: 1500 — дефолт настроек и CHECK новых
         баз; env поднимаем до init_db фикстуры `service`; границу 1500/1501
         тестируют TestSave и test_note_soft_limit)."""
-        monkeypatch.setenv("MAX_NOTE_CHARS", "35000")
-        monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)
+        monkeypatch.setenv("MAX_NOTE_CHARS", "20000")
         get_settings.cache_clear()
 
     # Поля, которые правка комментария НЕ трогает (включая служебные).

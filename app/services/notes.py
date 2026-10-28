@@ -109,14 +109,15 @@ TITLE_HINT = "set a title ≤5 words"
 # no24-01 (3.2.0): канонический текст отказа пометки (доменный лимит 250).
 COMMENT_HINT = "comment: up to 250 characters"
 
-# Мягкий лимит текста заметки (LSBN-S-1, решение О. 15.10.2026): целевая
-# длина заметки — 1500 символов; больше — это несколько самодостаточных
-# заметок. Число-дефолт живёт В КОДЕ, не в env (по прецеденту F-13/F-34):
-# это рабочее ограничение валидации сохранения/правки и слияния (merge).
-# Оно СОЗНАТЕЛЬНО строже жёсткого CHECK(length(text) <= MAX_NOTE_CHARS =
-# 35000): env и DDL держат паритет при старте (`_assert_note_chars_limit`),
-# их смена — F-22 (самомиграция), мягкий лимит заметки не трогает.
-NOTE_TEXT_LIMIT = 1500
+# Мягкий лимит текста заметки (LSBN-S-1; 3.4.1, LSBN-T-26): целевая длина
+# заметки — settings.max_note_chars (env MAX_NOTE_CHARS, дефолт 2000);
+# больше — это несколько самодостаточных заметок. Число ЖИВЁТ В КОНФИГЕ
+# (app.config.Settings — единственное место): валидация сохранения/правки,
+# слияние (merge/split), хинты, описания ручек и промпты берут его из
+# настроек при сборке. Оно совпадает с целью схемы: env = живой CHECK
+# активной базы (сверка и самомиграция F-22 держат паритет) — смена лимита
+# это правка override'а и рестарт, базу переносит самомиграция.
+# Литера-константа NOTE_TEXT_LIMIT убрана (3.4.1).
 
 # Канонический текст мягкого отказа «текст длиннее лимита»: называет лимит,
 # фактическую длину и правило разбиения (MCP — fail + hint, REST — 422).
@@ -322,7 +323,9 @@ class NoteService:
             return None  # исходника в прежней базе нет — штатный not-found
         return {
             "settings": legacy_settings,
-            "limit": int(limit) if limit is not None else NOTE_TEXT_LIMIT,
+            "limit": int(limit)
+            if limit is not None
+            else self._settings.max_note_chars,
         }
 
     # --- FR-4 memory_save (ARCH §4.1) --------------------------------------
@@ -921,7 +924,9 @@ class NoteService:
         if text_changed:
             self._validate_text(
                 text,
-                limit=route["limit"] if route is not None else NOTE_TEXT_LIMIT,
+                limit=route["limit"]
+                if route is not None
+                else self._settings.max_note_chars,
             )
         note_title = None if title is None else self._checked_title(title)
         # no24-01 (3.2.0): пометка правится ОТДЕЛЬНЫМ путём (сентинел-семантика
@@ -1619,18 +1624,19 @@ class NoteService:
         """1..limit — мягкий лимит заметки (LSBN-S-1; доменное
         правило REQUIREMENTS FR-4/FR-5).
 
-        Верхняя граница по умолчанию — НЕ settings.max_note_chars (35000):
-        тот держит паритет env ↔ живой CHECK (`_assert_note_chars_limit`) и
-        не меняется. Длиннее лимита — отказ с правилом «разбей на несколько
-        самодостаточных заметок»; жёсткий CHECK на 1500 ставит только
-        самомиграция (F-22). LSBN-F-22 (M3): правка ждущей нарезку заметки
-        идёт в прежнюю базу — её живой CHECK и есть потолок (передаёт
-        `_migration_write_route`). `limit=None` читает константу модуля
-        В МОМЕНТ вызова — monkeypatch лимита тестами (прецедент af42491)
-        продолжает работать (default-параметр связался бы при определении).
+        Верхняя граница по умолчанию — settings.max_note_chars (env
+        MAX_NOTE_CHARS, 3.4.1/LSBN-T-26): то же число, что CHECK новых баз
+        и цель самомиграции, — одно число в одном месте. Длиннее лимита —
+        отказ с правилом «разбей на несколько самодостаточных заметок»;
+        живой CHECK активной базы держит паритет (сверка + самомиграция
+        F-22). LSBN-F-22 (M3): правка ждущей нарезку заметки идёт в прежнюю
+        базу — её живой CHECK и есть потолок (передаёт
+        `_migration_write_route`). `limit=None` читает НАСТРОЙКУ в момент
+        вызова — сервисы, собранные с другим снимком Settings, валидируют
+        по своему значению.
         """
         if limit is None:
-            limit = NOTE_TEXT_LIMIT
+            limit = self._settings.max_note_chars
         if len(text) > limit:
             raise NoteValidationError(
                 HINT_NOTE_TOO_LONG.format(actual=len(text), limit=limit)

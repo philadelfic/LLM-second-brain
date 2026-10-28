@@ -17,9 +17,18 @@ from fakes import HashEmbedder, clear_seeded_skills
 from app.config import get_settings
 from app.services import Services
 from app.services.namespaces import NamespaceService
-from app.services.notes import NOTE_TEXT_LIMIT, NoteService
+from app.services.notes import NoteService
 from app.storage.db import init_db, session
-from app.transport.mcp import SAVE_NOTES_MAX, TOOL_DESCRIPTIONS, build_mcp
+from app.transport.mcp import SAVE_NOTES_MAX, build_mcp, tool_descriptions
+
+
+# 3.4.1 (LSBN-T-26): тексты с числом лимита собираются функциями от
+# настроек — здесь сборка от значений тестового окружения (роль прежних
+# констант; число приходит из Settings, не литерал).
+TOOL_DESCRIPTIONS = tool_descriptions(get_settings().max_note_chars)
+
+# Граница мягкого отказа в batch-save — из настроек окружения (LSBN-T-26).
+LONG_TEXT = "x" * (get_settings().max_note_chars + 1)
 
 DIM = 64
 
@@ -57,7 +66,6 @@ async def _call(mcp, name: str, arguments: dict) -> dict:
     return (await mcp.call_tool(name, arguments)).structured_content
 
 
-LONG_TEXT = "x" * (NOTE_TEXT_LIMIT + 1)
 
 
 class TestSaveArray:
@@ -103,7 +111,7 @@ class TestSaveArray:
         assert body["notes"][0]["stored"] is False
         assert "title" in body["notes"][0]["hint"]
         assert body["notes"][1]["stored"] is False
-        assert str(NOTE_TEXT_LIMIT) in body["notes"][1]["hint"]
+        assert str(get_settings().max_note_chars) in body["notes"][1]["hint"]
         assert body["notes"][2]["stored"] is True
 
     @pytest.mark.asyncio

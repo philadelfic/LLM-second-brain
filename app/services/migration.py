@@ -695,17 +695,24 @@ def migration_health(settings: Settings) -> dict:
     old_total = poured + split_notes + waiting + quarantine + expired
     (расхождение = прежнюю базу правили в обход миграции — удаление
     исходника оператором); после abort'а parts=0 и очередь пуста.
-    Без состояния миграции — {"phase": None}.
+    `slot` — разделитель слота нарезки (3.4.1, LSBN-T-27): партия и пауза
+    из настроек процесса — оператор видит, сколько берётся за прогон и на
+    сколько джоба уходит в паузу. Без состояния миграции — {"phase": None}
+    (slot остаётся: значения — свойства конфигурации, не состояния).
     """
+    slot = {
+        "batch": int(settings.migration_batch),
+        "pause_sec": int(settings.migration_pause_sec),
+    }
     try:
         with session(settings) as conn:
             state = read_state(conn)
             statuses = _status_counts(conn)
             parts = _part_count(conn)
     except (sqlite3.Error, StorageError):
-        return {"phase": None}
+        return {"phase": None, "slot": slot}
     if state is None:
-        return {"phase": None}
+        return {"phase": None, "slot": slot}
     phase = str(state.get("phase"))
     waiting = statuses.get("ожидает", 0)
     split_notes = statuses.get("нарезана", 0)
@@ -729,6 +736,7 @@ def migration_health(settings: Settings) -> dict:
         "phase": phase,
         "target": state.get("target"),
         "reason": state.get("reason"),
+        "slot": slot,
         "counters": {
             "old_total": old_total,
             "poured": poured,
@@ -802,6 +810,15 @@ def build_migration_job(
     самом старте миграции — M1); прогон уходит в `to_thread`. Слот —
     `summary` (нарезка наследует его слот при незаданных SPLIT_*; разрыв
     слота виден в /health и гейтит джобу как у прочих).
+
+    Разделитель слота нарезки (3.4.1, LSBN-T-27):
+    партия — `MIGRATION_BATCH` заметок, после прогона петля спит
+    `MIGRATION_PAUSE_SEC` (pause_after_run), затем берёт следующую —
+    нарезка не монополизирует сервер генерации. Свои числа, НЕ чужие
+    смыслы: `embedding_batch_size` — чанки одного запроса /api/embed
+    векторизации, `pending_retry_sec` — стартовый интервал ретрая
+    до-обработки. Оба значения видны в /health.migration.slot и в
+    стартовом логе (`startup`); крутятся override'ом без релиза.
     """
     if worker._summarizer is None:  # тестовый режим без суммаризатора
         return None
@@ -813,13 +830,17 @@ def build_migration_job(
     )
 
     async def process() -> int:
-        return await asyncio.to_thread(service.process_batch)
+        # Ровно партия разделителя за прогон (LSBN-T-27): не все 'ожидает'
+        # разом — следующий прогон случится после паузы слота.
+        return await asyncio.to_thread(
+            service.process_batch, settings.migration_batch
+        )
 
     return jobs.JobSpec(
         name=MIGRATION_JOB,
         queue=MIGRATION_JOB,
-        interval_sec=settings.pending_retry_sec,
-        batch=settings.embedding_batch_size,
+        interval_sec=settings.migration_pause_sec,
+        batch=settings.migration_batch,
         enabled=True,
         process=process,
         queue_empty=service.queue_empty,
@@ -827,6 +848,7 @@ def build_migration_job(
         idle_hook=None,
         queue_stat=service.queue_stat,
         slot="summary",
+        pause_after_run=True,
     )
 
 
