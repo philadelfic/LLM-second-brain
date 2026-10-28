@@ -418,6 +418,17 @@ def create_new_base(
                 ),
                 "pending": pending,
             }
+            # Резерв диапазона id (design §8.1): max(id) новой базы после
+            # перелива ниже прежнего (длинные хвосты не перелились), и
+            # max+1 может совпасть с old_id ждущего исходника — затенение
+            # в union, потеря заметки при abort. id_floor — нижняя граница
+            # НОВЫХ id (= MAX(id) прежней базы + 1), живёт в state, пока
+            # миграция активна; NoteService._insert не пускает новые id
+            # ниже неё.
+            id_floor = (
+                int(src.execute("SELECT COALESCE(MAX(id), 0) FROM notes").fetchone()[0])
+                + 1
+            )
             _write_state(
                 dst,
                 {
@@ -425,6 +436,7 @@ def create_new_base(
                     "target": target,
                     "prev_file": prev_name,
                     "prev_limit": note_chars_limit(src),
+                    "id_floor": id_floor,
                     "reason": reason,
                     "counters": counters,
                 },

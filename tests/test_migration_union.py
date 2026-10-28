@@ -487,3 +487,76 @@ class TestHealthCounters:
         # Джоба не сворачивает миграцию: карантин — ещё работа.
         with session(get_settings()) as conn:
             assert read_state(conn)["phase"] == "pour"
+
+
+# --- резерв диапазона id (design §8.1) -----------------------------------------
+
+
+class TestIdFloor:
+    def test_floor_in_state_and_new_ids_above_legacy_max(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """id_floor (= MAX(id) прежней базы + 1) живёт в state; новые заметки
+        и части нарезки получают id строго выше прежнего диапазона."""
+        _migrate_down(monkeypatch)
+        with session(get_settings()) as conn:
+            assert read_state(conn)["id_floor"] == 51  # max прежней (50) + 1
+        refresh_migration_context(get_settings())
+        ctx = migration_context()
+        assert ctx is not None and ctx.id_floor == 51
+        notes = NoteService(get_settings())
+        assert int(notes.save("заметка после перелива", title="Дельта")["id"]) > 50
+        with session(get_settings()) as conn:
+            before = {int(r["id"]) for r in conn.execute("SELECT id FROM notes")}
+        assert _service().process_batch() == 3  # 20/40 нарезаны, 50 expired
+        with session(get_settings()) as conn:
+            after = {int(r["id"]) for r in conn.execute("SELECT id FROM notes")}
+        parts = after - before
+        assert len(parts) == 4  # по 2 части FixedSummarizer от 20 и 40
+        assert all(part_id > 50 for part_id in parts)
+
+    def test_union_sees_new_note_and_waiting_source(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Затенения нет: get/search видят и новую заметку, и ждущий исходник."""
+        _migrate_down(monkeypatch)
+        refresh_migration_context(get_settings())
+        notes = NoteService(get_settings())
+        search = SearchService(get_settings())
+        new_id = int(notes.save("резерв диапазона идентификаторов")["id"])
+        found = notes.get([new_id, 20])
+        assert [note["id"] for note in found["notes"]] == [new_id, 20]
+        assert new_id in _note_ids(
+            search.search("резерв диапазона идентификаторов")["results"]
+        )
+        assert 20 in _note_ids(search.search("длинный план")["results"])
+        # Ни один old_id ждущих исходников не затенён.
+        assert legacy_visible_ids(get_settings()) == {20, 40, 50}
+
+    def test_abort_returns_new_notes_and_sources(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Новые заметки добираются до зоны коллизии и выше (без резерва 10-я
+        получила бы id 40 == old_id ждущего исходника и потерялась бы при
+        abort); abort возвращает и их, и исходники целыми."""
+        _migrate_down(monkeypatch)
+        refresh_migration_context(get_settings())
+        notes = NoteService(get_settings())
+        new_ids: list[int] = []
+        for n in range(10):
+            outcome = notes.save(f"дельта при живой миграции номер {n}")
+            assert outcome["stored"] is True
+            new_ids.append(int(outcome["id"]))
+        assert all(note_id > 50 for note_id in new_ids)
+        assert _service().process_batch(limit=1) == 1  # 20 нарезана, 40/50 ждут
+        assert abort_migration(get_settings())["aborted"] is True
+        with session(get_settings()) as conn:
+            assert note_chars_limit(conn) == 35000
+            rows = {
+                int(r["id"]): str(r["text"])
+                for r in conn.execute("SELECT id, text FROM notes")
+            }
+        for n, note_id in enumerate(new_ids):
+            assert rows[note_id] == f"дельта при живой миграции номер {n}"
+        assert rows[20] == _LONG_PLAN
+        assert rows[40] == _LONG_CHART

@@ -526,18 +526,38 @@ class NoteService:
         вызывающим); None — постоянная заметка (без TTL).
         comment (no24-01) — проверен/нормализован вызывающим (_checked_comment);
         None — комментария нет."""
+        from app.services.migration import migration_context
+
+        values = (
+            text,
+            title,
+            comment,
+            author if author else self._settings.author_default,
+            vector_status,
+            namespace,
+            expires_at,
+        )
+        columns = "text, title, comment, author, vector_status, namespace, expires_at"
+        ctx = migration_context()
+        if ctx is None:  # миграции нет — дефолтный rowid (max+1), без оверхеда
+            cursor = conn.execute(
+                f"INSERT INTO notes ({columns}) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                values,
+            )
+            return int(cursor.lastrowid or 0)
+        # Живой контекст миграции (design §8.1): id явно, не ниже id_floor.
+        # Дефолтный max+1 активной базы может совпасть с old_id ждущего
+        # исходника (длинные хвосты не перелились) — затенение в union,
+        # расхождение get/update, потеря заметки при abort.
+        note_id = int(
+            conn.execute(
+                "SELECT MAX(COALESCE(MAX(id), 0) + 1, ?) FROM notes",
+                (ctx.id_floor,),
+            ).fetchone()[0]
+        )
         cursor = conn.execute(
-            "INSERT INTO notes (text, title, comment, author, vector_status, "
-            "namespace, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                text,
-                title,
-                comment,
-                author if author else self._settings.author_default,
-                vector_status,
-                namespace,
-                expires_at,
-            ),
+            f"INSERT INTO notes (id, {columns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (note_id, *values),
         )
         return int(cursor.lastrowid or 0)
 

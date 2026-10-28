@@ -105,6 +105,12 @@ class MigrationContext:
 
     legacy_path: str  # абсолютный путь прежней базы (migration.state.prev_file)
     phase: str  # pour|split — читающие поверхности по ней не различаются
+    # Резерв диапазона id (design §8.1): нижняя граница НОВЫХ id
+    # (= MAX(id) прежней базы + 1, migration.state.id_floor). NoteService._insert
+    # выдаёт новым заметкам/частям id не ниже — без коллизий с old_id
+    # ждущих исходников (затенение в union, потери при abort). 0 — состояние
+    # без ключа (миграция, начатая до появления id_floor): max+1 как раньше.
+    id_floor: int = 0
 
 
 _CONTEXT: MigrationContext | None = None
@@ -145,7 +151,9 @@ def refresh_migration_context(settings: Settings) -> None:
     if not candidate.is_file():
         return
     _CONTEXT = MigrationContext(
-        legacy_path=str(candidate), phase=str(state["phase"])
+        legacy_path=str(candidate),
+        phase=str(state["phase"]),
+        id_floor=int(state.get("id_floor") or 0),
     )
 
 
