@@ -5,6 +5,39 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.0] - 2026-10-28
+
+Release 3.4.0 — "Less information per step and merging without loss": the memory stops paying for its own bookkeeping on every step — searches and listings return headers capped by a character budget, and a note is read point-wise by id. Long notes stop being truncated: merging returns a list of self-contained parts with a strict completeness check, the note limit drops to 1500 characters, and a schema-baked limit can now be changed over a live database by self-migration instead of failing the start.
+
+### Added
+
+* **Character budget and two-level reading (F-13)** — `budget_chars` on `memory_search`, `memory_list`, `memory_get` (100..100000, soft refusal outside the range); defaults are code constants (search 1200 / list 2000 / get 2000). Elements that do not fit degrade to a header with `truncated: true`; the only hint of a successful answer is "read point-wise by id" (up to 8 ids, the rest as "+k"). A single `id` (and chunk mode) still returns the full text.
+* **Environment card in `memory_get` (F-16)** — `map` / `map_level` (`auto`|`1`|`0`) / `map_limit` (1..20, default 8) / `map_offset`: rows `{id, title, namespace, kind}` (direction only for `mention`), budget 1500 characters with degradation, paging with `total`; `batch`+`map` is a soft refusal.
+* **Operations registry (F-34)** — nine operations (summarize, title, merge, split, classify, describe, judge, structure_judge, embed) with flat `<OPERATION>_<FIELD>` overrides and the chain "operation env → slot env → default"; `/health.operations` shows model, provider and source per operation, never addresses or keys.
+* **Note-limit self-migration (F-22)** — a changed `MAX_NOTE_CHARS` over a live database now builds a new base, pours 1:1, splits what does not fit, swaps the file pointer and reads from both bases through the migration (search, get, list, dedup) until done; the chain of bases is kept, the reverse direction pours 1:1 without a model, `POST /migration/abort` stops the migration; reason and progress are visible in `/health` (block `migration`, queue `migration`).
+* **Saving an array of notes (F-23)** — `memory_save(notes=[...])` takes 1..20 objects with per-element validation and answers `{stored_count, notes: [...]}`; `text` became optional.
+* **Ranking boosts (F-14)** — order-only boosts after RRF: title exact 0.25, title prefix 0.15, freshness 0.10 (30-day window), linked 0.05; switch `RANKING_BOOSTS_ENABLED` (default true); `rrf_score` in the answer stays raw RRF.
+
+### Changed
+
+* **Contract change: MCP reads default to headers.** `memory_search` returns `{id, title, namespace, chars, score}`; `memory_list` defaults to `detail="titles"`; batch `memory_get` returns headers without text; full texts are no longer returned in lists (MCP or REST).
+* **Note limit 35000 → 1500 characters** (`NOTE_TEXT_LIMIT`, `MAX_NOTE_CHARS` default and compose): saving or updating a longer text is a soft refusal with a hint to split it into several self-contained notes.
+* **Merging returns self-contained parts** (`{"parts": [{"title", "text"}]}`, each part ≤1500 characters, its own title ≤5 words): completeness is checked strictly (1.0, normalized tokens), one retry in the same context, then the pair is deferred with both notes alive — silent truncation is gone and the truncation marker of merging is removed.
+* **Prompt canon:** `merge_system` now carries the parts contract; a new editable `summary_split_system` splits one long note (`EDITABLE_PROMPTS` 3→4, `SEED_VERSION` 3.4.1).
+* **Prompts and limits:** per-operation output budgets live in the registry (historical `MERGE_NUM_PREDICT` absorbed), `describe` inherits `SUMMARY_NUM_PREDICT`, `judge` has no layer of its own, the decision-slot reserve outranks overrides.
+* Version bumped to 3.4.0 in `app.__version__` and `pyproject.toml`, so `/health.version` matches the release tag.
+
+### Fixed
+
+* **DEF-5** — a repeated forward migration (down → up → down) used to delete the chain base `notes.<limit>.db`, the only live copy of the parts split by the first run; the new base is now poured into `notes.<target>.db.incoming` and the chain base is never removed (event `migration_chain_base_spared`, regression test over the full forward→reverse→forward cycle).
+* **DEF-6 / DEF-7a** — splitting now writes a `slot_call` per model call (a retry is a separate line) and the migration phase is visible as `split` while parts are being produced.
+* **D-8** — a hard delete purges the note's comment rows from `notes_comment_fts` (no more ghosts in comment search); a soft delete keeps them.
+
+### Known price
+
+* Boosts trade MRR for freshness and links on paraphrase queries (0.8223 → 0.7327 on the 53-pair set, recall@5 unchanged): accepted as the stated price, weight tuning is a backlog item.
+* The fixed awareness block grew with the new surfaces (79100 → 84260 tokens at 10 steps) while the per-step payload shrank: shrinking the fixed block is a backlog item.
+
 ## [3.3.1] - 2026-10-17
 
 Release 3.3.1 — "Contour hotfix: history and observability": physically deleted notes no longer leave orphan version history that breaks the next writer of a reused id, and the age of the oldest waiting work stays visible exactly when a slot is down.
