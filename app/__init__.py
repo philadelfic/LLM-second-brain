@@ -4,4 +4,4 @@
 протокол MCP. Слои пакета — по ARCHITECTURE §3: transport / services / storage.
 """
 
-__version__ = "3.3.2"
+__version__ = "3.4.0"
