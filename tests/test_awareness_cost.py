@@ -25,8 +25,11 @@ from scripts.measure_awareness_cost import compute_awareness_cost, totals
 #: старт релиза; фикс 7383T + 527T) → финал 3.4.0 82530T (26.10.2026:
 #: +фикс-блок от схем/инструкций F-13/F-16/F-34, выдача на парных позициях
 #: упала — см. development-docs releases/3.4.0/reports/awareness-after) →
-#: следующий пересмотр не раньше 3.5.0. Допуск +2 % — шумы сериализации.
-GUARD_TOTAL_STEPS_10 = 82530
+#: 26.10 (поздно), кластер 3.4.0 (S-1 описания+note_chars_limit в /health;
+#: M2 notes-параметр, split, очередь migration): 82530→84260 — второй
+#: пересмотр, состав релиза менялся → следующий пересмотр не раньше 3.5.0.
+#: Допуск +2 % — шумы сериализации.
+GUARD_TOTAL_STEPS_10 = 84260
 GUARD_TOLERANCE = 1.02
 
 

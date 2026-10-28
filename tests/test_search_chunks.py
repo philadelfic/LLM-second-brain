@@ -65,6 +65,7 @@ def long_note_with_fact() -> str:
 def _prod_limits(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Боевые MAX_NOTE_CHARS (35000) — многочанковые заметки в тестах."""
     monkeypatch.setenv("MAX_NOTE_CHARS", PROD_MAX_NOTE_CHARS)
+    monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)  # LSBN-S-1
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

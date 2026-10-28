@@ -43,7 +43,9 @@ from fakes import (
 
 from app.config import get_settings
 from app.services.dedup import DeduplicationService
+from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
+from app.services.warnings import WarningsService
 from app.services.worker import BackgroundWorker
 from app.storage.db import init_db, session
 
@@ -180,24 +182,32 @@ def test_merge_updates_earlier_and_soft_deletes_later(dim8, caplog) -> None:
     ]
     assert len(merged_log) == 1
     assert merged_log[0].older_id == 1 and merged_log[0].note_id == 2
+    # F-23 п. 7: журнал несёт раунды, модель, число частей.
+    assert merged_log[0].rounds == 1
+    assert merged_log[0].model == "fake-model"
+    assert merged_log[0].parts == 1
     with session(dim8) as conn:
         rows = conn.execute(
             "SELECT id, text, vector_status, summary_status, deleted_at "
             "FROM notes ORDER BY id"
         ).fetchall()
-    assert rows[0]["text"] == merged_text  # ранний дубликат обновлён
-    assert rows[0]["vector_status"] == "pending"  # ре-векторизация — фон
-    assert rows[0]["summary_status"] == "pending"  # ре-суммаризация — фон
-    assert rows[0]["deleted_at"] is None
-    assert rows[1]["deleted_at"] is not None  # поздняя — soft delete
-    # воркер догоняет обновлённую раннюю, второй пары нет (нет зацикливания)
+    assert len(rows) == 3  # две исходные + часть
+    assert rows[0]["text"] == texts[0]  # исходники не переписываются
+    assert rows[0]["deleted_at"] is not None  # ранняя — в корзине (F-23 п. 5)
+    assert rows[1]["deleted_at"] is not None  # поздняя — тоже
+    part = rows[2]
+    assert part["text"] == merged_text  # текст живёт в части
+    assert part["vector_status"] == "pending"  # векторизация части — фон
+    assert part["summary_status"] == "pending"  # суммаризация части — фон
+    assert part["deleted_at"] is None
+    # воркер догоняет часть, второй пары нет (нет зацикливания)
     assert worker.process_pending() == 1
-    assert worker.process_judge_pending() == 1  # дедуп-работа ранней: кандидатов нет
+    assert worker.process_judge_pending() == 1  # дедуп-работа части: кандидатов нет
     assert worker.process_summary_pending() == 1
     with session(dim8) as conn:
         row = conn.execute(
             "SELECT text, vector_status, summary, summary_status, deleted_at "
-            "FROM notes WHERE id = 1"
+            "FROM notes WHERE id = 3"
         ).fetchone()
     assert row["text"] == merged_text
     assert row["vector_status"] == "ok" and row["summary_status"] == "ok"
@@ -240,9 +250,13 @@ def test_merge_failure_keeps_both_and_retries(dim8, caplog) -> None:
         rows = conn.execute(
             "SELECT id, text, vector_status, deleted_at FROM notes ORDER BY id"
         ).fetchall()
-    assert rows[0]["text"] == summarizer.merge_result  # ранняя слита
-    assert rows[0]["vector_status"] == "pending"  # и в очереди на догонку
-    assert rows[1]["deleted_at"] is not None  # поздняя — в trash
+    assert len(rows) == 3  # две исходные + часть
+    assert rows[0]["text"] == texts[0]  # исходная ранняя не переписывается
+    assert rows[0]["deleted_at"] is not None  # обе исходные — в корзине (F-23)
+    assert rows[1]["deleted_at"] is not None
+    assert rows[2]["text"] == summarizer.merge_result  # текст живёт в части
+    assert rows[2]["vector_status"] == "pending"  # и в очереди на догонку
+    assert rows[2]["deleted_at"] is None
     assert len(summarizer.merge_calls) == 2  # отказ + успешный повтор
 
 
@@ -391,10 +405,13 @@ def test_judge_merges_paraphrase_below_cosine_threshold(dim8, caplog) -> None:
         rows = conn.execute(
             "SELECT id, text, vector_status, deleted_at FROM notes ORDER BY id"
         ).fetchall()
-    assert rows[0]["text"] == "слитый текст"  # ранняя — объединённый текст
-    assert rows[0]["vector_status"] == "pending"  # ре-векторизация — фон
-    assert rows[0]["deleted_at"] is None
-    assert rows[1]["deleted_at"] is not None  # поздняя — soft delete
+    assert len(rows) == 3  # две исходные + часть
+    assert rows[0]["text"] == texts[0]  # исходники не переписываются
+    assert rows[0]["deleted_at"] is not None  # ранняя — в корзине (F-23 п. 5)
+    assert rows[1]["deleted_at"] is not None  # поздняя — тоже
+    assert rows[2]["text"] == "слитый текст"  # текст живёт в части
+    assert rows[2]["vector_status"] == "pending"  # векторизация части — фон
+    assert rows[2]["deleted_at"] is None
 
 
 def test_judge_verdict_keeps_distinct_notes(dim8) -> None:
@@ -472,9 +489,13 @@ def test_judge_failure_keeps_both_and_retries(dim8, caplog) -> None:
         rows = conn.execute(
             "SELECT id, text, vector_status, deleted_at FROM notes ORDER BY id"
         ).fetchall()
-    assert rows[0]["text"] == summarizer.merge_result  # ранняя слита
-    assert rows[0]["vector_status"] == "pending"  # и в очереди на догонку
-    assert rows[1]["deleted_at"] is not None  # поздняя — в trash
+    assert len(rows) == 3  # две исходные + часть
+    assert rows[0]["text"] == texts[0]  # исходная ранняя не переписывается
+    assert rows[0]["deleted_at"] is not None  # обе исходные — в корзине (F-23)
+    assert rows[1]["deleted_at"] is not None
+    assert rows[2]["text"] == summarizer.merge_result  # текст живёт в части
+    assert rows[2]["vector_status"] == "pending"  # и в очереди на догонку
+    assert rows[2]["deleted_at"] is None
     assert len(judge.judge_calls) == 2  # отказ + вердикт на повторе
 
 
@@ -515,9 +536,11 @@ def test_judge_picks_second_candidate_after_first_rejects(dim8) -> None:
             "SELECT id, text, vector_status, deleted_at FROM notes ORDER BY id"
         ).fetchall()
     assert rows[0]["text"] == texts[0] and rows[0]["deleted_at"] is None
-    assert rows[1]["text"] == "слитый текст"  # ранняя (id=2) обновлена
-    assert rows[1]["vector_status"] == "pending"  # ре-векторизация — фон
-    assert rows[2]["deleted_at"] is not None  # свежая (id=3) — trash
+    assert rows[1]["deleted_at"] is not None  # ранняя пары (id=2) — в корзине
+    assert rows[2]["deleted_at"] is not None  # свежая пары (id=3) — тоже
+    assert rows[3]["text"] == "слитый текст"  # текст живёт в части (id=4)
+    assert rows[3]["vector_status"] == "pending"  # векторизация части — фон
+    assert rows[3]["deleted_at"] is None
 
 
 def test_dedup_judge_failed_event_carries_job_judge(dim8, caplog) -> None:
@@ -541,3 +564,52 @@ def test_dedup_judge_failed_event_carries_job_judge(dim8, caplog) -> None:
         if getattr(record, "event", None) == "dedup_judge_failed"
     ]
     assert [record.job for record in events] == ["judge"]
+
+
+def test_merge_incomplete_defers_pair_with_warning(dim8, caplog) -> None:
+    """F-23 п. 6: слияние не набрало полное покрытие за 2 раунда
+    (MergeIncompleteError) — пара ОТКЛАДЫВАЕТСЯ: merge-работа снимается
+    (зацикливания нет), ОБЕ заметки живы, событие dedup_merge_deferred
+    в журнале джоб и открытая запись merge_deferred в warnings."""
+    texts = ["первая отложенная заметка", "вторая отложенная заметка"]
+    notes = NoteService(dim8, FailingEmbedder())
+    notes.save(texts[0])
+    notes.save(texts[1])
+    summarizer = MergeFailingSummarizer(merged="частичный текст без полноты")
+    summarizer.fail = False
+    summarizer.incomplete = True
+    worker = BackgroundWorker(
+        dim8,
+        HashEmbedder(8),
+        summarizer,
+        warnings=WarningsService(
+            dim8, classifier=None, namespaces=NamespaceService(dim8)
+        ),
+    )
+    with caplog.at_level(logging.WARNING, logger="app"):
+        assert worker.process_pending() == 2
+        assert worker.process_judge_pending() == 2  # вердикт → merge-работа
+        assert worker.process_merge_pending() == 1  # отложена и снята
+    assert len(summarizer.merge_calls) == 1  # ровно один заход (2 раунда внутри)
+    deferred = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "dedup_merge_deferred"
+    ]
+    assert len(deferred) == 1 and deferred[0].older_id == 1
+    with session(dim8) as conn:
+        rows = conn.execute(
+            "SELECT id, deleted_at FROM notes ORDER BY id"
+        ).fetchall()
+        warning = conn.execute(
+            "SELECT kind, subject_type, subject_id, status, payload "
+            "FROM warnings WHERE status = 'open'"
+        ).fetchone()
+    assert len(rows) == 2  # частей нет — слияние не записано
+    assert all(row["deleted_at"] is None for row in rows)  # обе живы (п. 6)
+    assert warning is not None
+    assert warning["kind"] == "merge_deferred"
+    assert warning["subject_type"] == "note" and warning["subject_id"] == 1
+    assert '"newer_id": 2' in warning["payload"]
+    # Повторный прогон не находит работы: пара отложена, не зацикливается.
+    assert worker.process_merge_pending() == 0

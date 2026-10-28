@@ -393,14 +393,16 @@ def test_registry_contains_worker_jobs_and_links(settings) -> None:
     """Реестр собирает джобы воркера: имена, очереди, интервалы и формы.
 
     Пять петель воркера + джоба `links` из своего модуля (`links.py`
-    регистрирует себя сама, постановка lsb-0010-03) и джоба `nodes`
-    (lsb-0011-01, обход `default`) — порядок в реестре задаётся импортом
-    (`app.services` → links, затем worker).
+    регистрирует себя сама, постановка lsb-0010-03), джоба `nodes`
+    (lsb-0011-01, обход `default`) и джоба `migration` (M2 3.4.0,
+    `migration.py` регистрирует себя сама) — порядок в реестре задаётся
+    импортом (`app.services` → links, migration, затем worker).
     """
     worker = BackgroundWorker(settings, HashEmbedder(8), FixedSummarizer("С."))
     specs = {spec.name: spec for spec in build_job_specs(worker, settings)}
     assert list(specs) == [
         "links",
+        "migration",
         "embedding",
         "summary",
         "judge",
@@ -423,6 +425,16 @@ def test_registry_contains_worker_jobs_and_links(settings) -> None:
     # Форма «по интервалу + событие `links`» (решение гейта 1c): готовый вектор
     # заметки будит петлю — событие берётся у воркера.
     assert specs["links"].wait_event is not None
+    # Джоба миграции (M2 3.4.0): своя очередь, форма «по интервалу» (без
+    # события: «ожидает» появляются только при самом старте миграции);
+    # слот summary — нарезка наследует его слот при незаданных SPLIT_*.
+    assert specs["migration"].queue == "migration"
+    assert specs["migration"].interval_sec == settings.pending_retry_sec
+    assert specs["migration"].batch == settings.embedding_batch_size
+    assert specs["migration"].wait_event is None
+    assert specs["migration"].queue_empty is not None
+    assert specs["migration"].queue_stat is not None
+    assert specs["migration"].slot == "summary"
     # Джоба обхода default (lsb-0011): своя очередь и расписание из env;
     # форма «по интервалу + событие + перепроверка очереди» — сигнал `nodes`
     # будит петлю сразу после сшивания (lsb-0012), а `queue_empty` закрывает

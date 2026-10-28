@@ -18,7 +18,14 @@ import pytest
 from app.config import get_settings
 from app.services.llm_client import CONNECT_TIMEOUT_SEC_OLLAMA
 from app.services.prompts import PromptRegistry
-from app.services.summary import SummaryError, SummaryService
+from app.services.summary import (
+    MERGE_COVERAGE_MIN,
+    NOTE_TEXT_LIMIT,
+    MergeIncompleteError,
+    SummaryError,
+    SummaryService,
+    merge_coverage,
+)
 
 
 def make_settings(monkeypatch: pytest.MonkeyPatch, **env: str):
@@ -355,31 +362,51 @@ def test_empty_note_text_value_error(monkeypatch) -> None:
             service.summarize(text)
     assert recorder.calls == 0  # в сеть ни разу не пошли
 
-# --- merge: слияние дубликатов (Фаза 8, Этап 2.2) -----------------------------
+# --- merge: слияние дубликатов списком частей (Фаза 8, 2.2; LSBN-F-23) -------
 
 
 TEXT_A = "Купил молоко и хлеб по дороге домой."
 TEXT_B = "По пути домой зашёл в магазин — взял молоко и хлеб."
+# Накрывающий исходники текст (проверка полноты F-23 по значимым токенам).
+MERGED = (
+    "Купил молоко и хлеб по дороге домой; по пути домой зашёл в магазин — "
+    "взял молоко и хлеб."
+)
 
 
-def test_merge_returns_content(monkeypatch) -> None:
-    """Успешное слияние: content ответа возвращается как результат."""
-    settings = make_settings(monkeypatch)
-    service, _ = make_service(
-        settings,
-        [httpx.Response(200, json=ok_body("Молоко и хлеб куплены по дороге домой."))],
+def parts_body(*parts: tuple[str, str]) -> dict:
+    """Штатный JSON-ответ слияния: {"parts": [{"title", "text"}, ...]}."""
+    return ok_body(
+        json.dumps(
+            {"parts": [{"title": t, "text": x} for t, x in parts]},
+            ensure_ascii=False,
+        )
     )
+
+
+COVERING = [("Молоко и хлеб", MERGED)]
+
+
+def test_merge_returns_parts(monkeypatch) -> None:
+    """Успешное слияние (F-23 п. 1): ответ — список частей со своими title."""
+    settings = make_settings(monkeypatch)
+    service, _ = make_service(settings, [httpx.Response(200, json=parts_body(*COVERING))])
     merged = service.merge(TEXT_A, TEXT_B)
-    assert merged.text == "Молоко и хлеб куплены по дороге домой."
+    assert [(p.title, p.text) for p in merged.parts] == COVERING
+    assert merged.rounds == 1  # дозапрос не понадобился
+    assert merged.meta.operation == "merge"
+    assert len(merged.metas) == 1
     assert service.last_attempt_ok is True
     service.close()
 
 
 def test_merge_system_prompt_and_marked_texts(monkeypatch) -> None:
-    """Merge-промпт: объединение с сохранением фактов; оба текста в одном
-    user-сообщении, помечены и в порядке «ранняя → поздняя»."""
+    """Merge-промпт (F-23): контракт списка частей с лимитом; оба текста в
+    одном user-сообщении, помечены и в порядке «ранняя → поздняя»."""
     settings = make_settings(monkeypatch)
-    service, recorder = make_service(settings, [httpx.Response(200, json=ok_body())])
+    service, recorder = make_service(
+        settings, [httpx.Response(200, json=parts_body(*COVERING))]
+    )
     service.merge(TEXT_A, TEXT_B)
     payload = last_payload(recorder)
     messages = payload["messages"]
@@ -387,38 +414,92 @@ def test_merge_system_prompt_and_marked_texts(monkeypatch) -> None:
     assert "two versions of the same note" in messages[0]["content"]
     assert "state each fact once" in messages[0]["content"]
     assert "do not add anything of your own" in messages[0]["content"]
-    # числового лимита в промпте больше нет: потолок держит код, не модель
+    # контракт F-23: список частей, лимит части = мягкий лимит заметки
+    assert '"parts"' in messages[0]["content"]
+    assert "1500-character note limit" in messages[0]["content"]
+    # числового бюджета вывода в промпте нет: потолок держит код, не модель
     assert "35000" not in messages[0]["content"]
     # оба текста в ОДНОМ user-сообщении: ранний — TEXT 1, поздний — TEXT 2
     assert messages[1] == {
         "role": "user",
         "content": "TEXT 1:\n" + TEXT_A + "\n\nTEXT 2:\n" + TEXT_B,
     }
-    # остальное — как у summarize (та же модель и параметры, ARCH §4.7)
-    assert payload["model"] == settings.summary_model
-    assert payload["stream"] is False
-    # остальное — как у summarize, только num_predict свой (MERGE_NUM_PREDICT)
+    # rest — как у summarize (та же модель и параметры, ARCH §4.7)
     assert payload["model"] == settings.summary_model
     assert payload["stream"] is False
     assert settings.merge_num_predict == 0  # №49: дефолт кода — авто
-    # при неизвестном контексте действует legacy-потолок слияния (35000)
-    assert payload["num_predict"] == 35000
+    assert payload["num_predict"] == 35000  # legacy-потолок слияния
     service.close()
 
 
-def test_merge_result_truncated_to_max_note_chars(monkeypatch) -> None:
-    """Страховка длины дедупа: результат — будущий ТЕКСТ заметки, лимит
-    MAX_NOTE_CHARS (не MAX_SUMMARY_CHARS) — не сломает memory_update."""
+def test_merge_long_part_triggers_followup(monkeypatch) -> None:
+    """Часть длиннее лимита (F-23 п. 2): ОДИН дозапрос в том же контексте —
+    исходники → первый ответ → «часть слишком длинная»; максимум 2 раунда."""
     settings = make_settings(monkeypatch)
-    long_content = "ф" * (settings.max_note_chars + 70)
-    service, _ = make_service(settings, [httpx.Response(200, json=ok_body(long_content))])
+    long_text = "ф" * (NOTE_TEXT_LIMIT + 70)
+    service, recorder = make_service(
+        settings,
+        [
+            httpx.Response(200, json=parts_body(("Длинная часть", long_text))),
+            httpx.Response(200, json=parts_body(*COVERING)),
+        ],
+    )
     merged = service.merge(TEXT_A, TEXT_B)
-    assert len(merged.text) == settings.max_note_chars == 35000
+    assert recorder.calls == 2  # раунд 1 + дозапрос, третьего нет
+    assert merged.rounds == 2
+    assert [(p.title, p.text) for p in merged.parts] == COVERING
+    assert len(merged.metas) == 2
+    # дозапрос несёт исходники, первый ответ и причину
+    second = json.loads(recorder.requests[1].read().decode())
+    followup = second["messages"][1]["content"]
+    assert followup.startswith("TEXT 1:\n" + TEXT_A)
+    assert "YOUR ANSWER:" in followup and long_text in followup
+    assert "exceeds the 1500-character note limit" in followup
+    assert service.last_attempt_ok is True
     service.close()
 
 
-def test_merge_failures_raise_summary_error(monkeypatch) -> None:
-    """HTTP-отказ, не-JSON/пустой content — SummaryError; last_attempt_ok — False."""
+def test_merge_incomplete_after_two_rounds_deferred(monkeypatch) -> None:
+    """Полнота (F-23 п. 4): части теряют содержание исходников — дозапрос;
+    два раунда не помогли — MergeIncompleteError (пара откладывается,
+    молчаливое обрезание запрещено)."""
+    settings = make_settings(monkeypatch)
+    lossy = [("Молоко", "Купил молоко.")]  # хлеб/магазин/даты потеряны
+    service, recorder = make_service(
+        settings,
+        [
+            httpx.Response(200, json=parts_body(*lossy)),
+            httpx.Response(200, json=parts_body(*lossy)),
+        ],
+    )
+    with pytest.raises(MergeIncompleteError, match="merge incomplete"):
+        service.merge(TEXT_A, TEXT_B)
+    assert recorder.calls == 2  # ровно два раунда
+    assert service.last_attempt_ok is False
+    service.close()
+
+
+def test_merge_parts_within_limit_passed_through(monkeypatch) -> None:
+    """Части в лимите отдаются как есть, без следов усечения (части
+    накрывают исходники — проверка полноты п. 4 проходит с первого раунда)."""
+    settings = make_settings(monkeypatch)
+    covering = (
+        ("Молоко", "Купил молоко и хлеб по дороге домой."),
+        ("Магазин", "По пути домой зашёл в магазин — взял молоко и хлеб."),
+    )
+    service, _ = make_service(
+        settings,
+        [httpx.Response(200, json=parts_body(*covering))],
+    )
+    merged = service.merge(TEXT_A, TEXT_B)
+    assert [p.text for p in merged.parts] == [c[1] for c in covering]
+    assert all("truncated" not in p.text for p in merged.parts)
+    service.close()
+
+
+def test_merge_off_contract_structure_is_summary_error(monkeypatch) -> None:
+    """HTTP-отказ, пустой content, не-JSON и части без title/текста —
+    SummaryError (OFF_CONTRACT): повтор по back-off, не дозапрос."""
     settings = make_settings(monkeypatch)
     service, recorder = make_service(settings, [httpx.Response(500, text="boom")])
     with pytest.raises(SummaryError, match="HTTP 500"):
@@ -438,13 +519,43 @@ def test_merge_failures_raise_summary_error(monkeypatch) -> None:
     with pytest.raises(SummaryError, match="не-JSON"):
         service.merge(TEXT_A, TEXT_B)
 
+    service, _ = make_service(
+        make_settings(monkeypatch),
+        [httpx.Response(200, json=parts_body(("", "текст без названия")))],
+    )
+    with pytest.raises(SummaryError, match="нет title или текста"):
+        service.merge(TEXT_A, TEXT_B)
+
 
 def test_merge_empty_argument_value_error(monkeypatch) -> None:
     """Пустой текст одной из заметок — ValueError до вызова Ollama."""
     settings = make_settings(monkeypatch)
-    service, recorder = make_service(settings, [httpx.Response(200, json=ok_body())])
+    service, recorder = make_service(
+        settings, [httpx.Response(200, json=parts_body(*COVERING))]
+    )
     for pair in (("", TEXT_B), ("   ", TEXT_B), (TEXT_A, ""), (TEXT_A, "  ")):
         with pytest.raises(ValueError, match="пустая"):
             service.merge(*pair)
     assert recorder.calls == 0  # в сеть ни разу не пошли
     service.close()
+
+
+def test_merge_title_capped_to_five_words(monkeypatch) -> None:
+    """Название части длиннее 5 слов срезается до лимита (прецедент
+    title-догена: обрезка — код, валидация — точка записи)."""
+    settings = make_settings(monkeypatch)
+    service, _ = make_service(
+        settings,
+        [httpx.Response(200, json=parts_body(("одно два три четыре пять шесть", MERGED)))],
+    )
+    merged = service.merge(TEXT_A, TEXT_B)
+    assert merged.parts[0].title == "одно два три четыре пять"
+    service.close()
+
+
+def test_merge_coverage_fraction() -> None:
+    """merge_coverage: нормализованное покрытие исходников частями — 1.0 на
+    копии, ниже MERGE_COVERAGE_MIN на потере содержания."""
+    assert merge_coverage(TEXT_A + "\n" + TEXT_B, [MERGED]) == 1.0
+    assert merge_coverage(TEXT_A + "\n" + TEXT_B, ["Купил молоко."]) < MERGE_COVERAGE_MIN
+    assert merge_coverage("ок да", ["что-то совсем другое"]) == 1.0  # нет значимых токенов

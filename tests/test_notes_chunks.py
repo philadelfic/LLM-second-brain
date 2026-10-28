@@ -74,6 +74,7 @@ class CountingHashEmbedder(HashEmbedder):
 def _prod_note_limit(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """MAX_NOTE_CHARS=35000 (боевой compose): многочанковые заметки влезают."""
     monkeypatch.setenv("MAX_NOTE_CHARS", PROD_MAX_NOTE_CHARS)
+    monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)  # LSBN-S-1
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

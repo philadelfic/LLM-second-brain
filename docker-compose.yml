@@ -139,7 +139,9 @@ services:
       MCP_PATH: "/mcp"
       # --- storage ---
       DB_PATH: "/data/notes.db"
-      MAX_NOTE_CHARS: "35000"                # max note length
+      # LSBN-F-22: 1500 (после S-1); расхождение с живым CHECK запускает
+      # самомиграцию при старте (прямую или обратную — design F-22 §4)
+      MAX_NOTE_CHARS: "1500"                 # max note length
       COMMENT_MAX_CHARS: "250"               # no24-01 (3.2.0): max comment length of a note (a remark, not knowledge)
       PENDING_RETRY_SEC: "30"                # background worker start interval (×2 → 15 min)
       # --- slot breaks (No39, release 3.2.0): pause with a probe + human hint ---

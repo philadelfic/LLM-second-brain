@@ -164,6 +164,13 @@ class DeduplicationService:
         текста (писатели сериализуются busy_timeout, второй видит уже
         вставленную строку — дословный дубль невозможен). Без `conn` — как
         раньше: собственный `session()` (обратная совместимость).
+
+        LSBN-F-22 (M3): во время миграции — вторая попытка по ПРЕЖНЕЙ базе
+        (union, design §4): заметки 'ожидает'/'карантин' существуют только
+        там, и дубль по ним блокирует запись («дублей при save нет» —
+        design §6.4). Гонки нет: прежняя база во время миграции только
+        читается (записи ждущих заметок уходят туда через NoteService, но
+        дословный INSERT новых туда не делает). Контекста нет — пути прежние.
         """
         if namespace:
             ns_clause = " AND namespace = ?"
@@ -174,12 +181,29 @@ class DeduplicationService:
             ns_fts_clause = ""
             ns_params = []
         if conn is not None:
-            return self._literal_duplicate(
+            found = self._literal_duplicate(
                 conn, text, ns_clause, ns_fts_clause, ns_params
             )
-        with session(self._settings) as own_conn:
+        else:
+            with session(self._settings) as own_conn:
+                found = self._literal_duplicate(
+                    own_conn, text, ns_clause, ns_fts_clause, ns_params
+                )
+        if found is not None:
+            return found
+        # Ленивый импорт: services.migration тянет summary → notes (цикл),
+        # прецедент — notes.py ↔ ttl.py.
+        from app.services.migration import migration_context
+
+        context = migration_context()
+        if context is None:
+            return None
+        legacy_settings = self._settings.model_copy(
+            update={"db_path": context.legacy_path}
+        )
+        with session(legacy_settings) as legacy_conn:
             return self._literal_duplicate(
-                own_conn, text, ns_clause, ns_fts_clause, ns_params
+                legacy_conn, text, ns_clause, ns_fts_clause, ns_params
             )
 
     def _literal_duplicate(

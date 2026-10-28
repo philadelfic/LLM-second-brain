@@ -189,14 +189,23 @@ def test_queues_health_empty_queues_are_null(settings) -> None:
     """Пустые очереди: pending 0, возраст старейшего — null.
 
     В объект попадают все наблюдаемые очереди (vector/summary/judge/areas/
-    links/nodes); `expiration` очереди не имеет и не наблюдаема.
+    links/nodes + migration, M2 3.4.0); `expiration` очереди не имеет и не
+    наблюдаема. Снимок миграции — её собственная форма (2 ключа, без
+    waiting/attention): миграции не было, таблицы migration_notes нет.
     """
     queues = make_worker(settings).queues_health()
-    assert set(queues) == {"vector", "summary", "judge", "areas", "links", "nodes"}
-    for stat in queues.values():
-        assert stat == {
-            "pending": 0, "oldest_pending_sec": None, "waiting": 0, "attention": 0
-        }
+    assert set(queues) == {
+        "vector", "summary", "judge", "areas", "links", "nodes", "migration",
+    }
+    for name, stat in queues.items():
+        assert stat == (
+            {"pending": 0, "oldest_pending_sec": None}
+            if name == "migration"
+            else {
+                "pending": 0, "oldest_pending_sec": None,
+                "waiting": 0, "attention": 0,
+            }
+        )
 
 
 def test_queues_health_matches_direct_sql(settings) -> None:
@@ -215,12 +224,17 @@ def test_queues_health_matches_direct_sql(settings) -> None:
 
     queues = worker.queues_health()
 
-    assert set(queues) == {"vector", "summary", "judge", "areas", "links", "nodes"}
+    assert set(queues) == {
+        "vector", "summary", "judge", "areas", "links", "nodes", "migration",
+    }
     _assert_stat(queues["vector"], _sql_note_stat(settings, "vector_status"))
     _assert_stat(queues["summary"], _sql_note_stat(settings, "summary_status"))
     _assert_stat(queues["judge"], _sql_judge_stat(settings))
     _assert_stat(queues["areas"], _sql_areas_stat(settings))
     _assert_stat(queues["links"], _sql_links_stat(settings))
+    # Очередь миграции (M2 3.4.0): в тестовой БД миграции не было — пусто,
+    # возраст null (собственная форма снимка — 2 ключа).
+    assert queues["migration"] == {"pending": 0, "oldest_pending_sec": None}
     # Явные ожидания — снимок считает именно своё состояние.
     assert queues["vector"]["pending"] == 2
     assert queues["summary"]["pending"] == 2

@@ -706,33 +706,61 @@ def _load_vec_extension(conn: sqlite3.Connection) -> None:
 # --- инициализация ------------------------------------------------------
 
 
-def _assert_note_chars_limit(conn: sqlite3.Connection, settings: Settings) -> None:
-    """Сверить MAX_NOTE_CHARS с фактическим CHECK-лимитом живой таблицы.
+def note_chars_limit(conn: sqlite3.Connection) -> int | None:
+    """Лимит живого CHECK(length(text) BETWEEN 1 AND ?) таблицы notes.
 
-    Для свежей таблицы совпадение гарантировано (DDL выше); сверка ловит
-    смену env поверх существующей БД — несовпадение — фатальная ошибка
-    конфигурации: лимит зафиксирован в схеме при первой инициализации.
+    None — таблицы ещё нет (свежая БД) или CHECK нет (рукотворная схема):
+    сверять не с чем. Источник истины — DDL в sqlite_master, а не meta:
+    лимит «запечён» в схему при первом создании.
     """
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'notes'"
     ).fetchone()
     if row is None or row[0] is None:
-        return  # таблица не создана — init_db упал выше по-своему
+        return None  # таблица не создана — init_db упал выше по-своему
     match = _CHECK_LIMIT_RE.search(row[0])
     if match is None:
-        return  # без CHECK (рукотворная схема) — сверки нет, не виноваты
-    stored = int(match.group(1))
-    if stored != settings.max_note_chars:
-        raise StorageError(
-            f"MAX_NOTE_CHARS разошёлся с БД: таблица создана с лимитом "
-            f"{stored}, окружение задаёт {settings.max_note_chars}. "
-            f"CHECK не меняется на лету: верни MAX_NOTE_CHARS={stored} "
-            f"или пересоздай БД (сохрани заметки: sqlite3 {settings.db_path} .dump)."
+        return None  # без CHECK (рукотворная схема) — сверки нет
+    return int(match.group(1))
+
+
+def _assert_note_chars_limit(conn: sqlite3.Connection, expected: int) -> int | None:
+    """Сверить ожидаемый лимит с живым CHECK таблицы notes — БЕЗ фатала.
+
+    История: до LSBN-F-22 несовпадение env с живым CHECK валило старт
+    (лимит зафиксирован в схеме, CHECK не меняется на лету). Самомиграция
+    (LSBN-F-22, решение О. 15.10.2026) заменяет фатал: функция возвращает
+    лимит живого CHECK (None — сверять не с чем), а решение о переливе
+    принимает `app.storage.migration` рядом с `init_db` в lifespan. Здесь
+    только наблюдаемость: расхождение — warning в журнале старта.
+
+    Returns:
+        Лимит живого CHECK или None (таблицы/CHECK нет).
+    """
+    stored = note_chars_limit(conn)
+    if stored is not None and stored != expected:
+        logging.getLogger("app").warning(
+            "MAX_NOTE_CHARS разошёлся с живым CHECK; старт продолжается, "
+            "решение о самомиграции — при старте сервиса (LSBN-F-22)",
+            extra={
+                "event": "note_chars_mismatch",
+                "schema_limit": stored,
+                "env_limit": expected,
+            },
         )
+    return stored
 
 
-def init_db(settings: Settings) -> None:
+def init_db(settings: Settings, *, note_chars: int | None = None) -> None:
     """Создать схему при старте (критерий приёмки Фазы 2); идемпотентно.
+
+    `note_chars` — лимит CHECK(length(text)) ДЛЯ НОВОЙ базы (LSBN-F-22,
+    M1): None — из env (`settings.max_note_chars`), как раньше. Самомиграция
+    создаёт базу под целевой лимит этим параметром (копия Settings с другим
+    db_path не нужна для лимита). Поверх существующей БД параметр роли не
+    играет (IF NOT EXISTS), а расхождение env с живым CHECK больше не фатал:
+    `_assert_note_chars_limit` возвращает живой лимит, решение о переливе —
+    в `app.storage.migration` (lifespan).
 
     При смене EMBEDDING_MODEL или EMBEDDING_DIM поверх существующей БД
     автоматически перестраиваются ОБА векторных индекса (полный текст и
@@ -748,20 +776,19 @@ def init_db(settings: Settings) -> None:
     (notes_chunks_vec) остаются валидными — они построены по текстам чанков.
 
     Raises:
-        StorageError: БД недоступна, нет FTS5/vec0, схема повреждена,
-        env разошёлся с зафиксированной схемой (CHECK-лимит MAX_NOTE_CHARS).
+        StorageError: БД недоступна, нет FTS5/vec0, схема повреждена.
     """
+    limit = settings.max_note_chars if note_chars is None else note_chars
     path = Path(settings.db_path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with session(settings) as conn:
-            conn.execute(_NOTES_DDL.format(max_note_chars=settings.max_note_chars))
+            conn.execute(_NOTES_DDL.format(max_note_chars=limit))
             # Лимит CHECK «запечён» в DDL при первом создании (ARCH §3.3:
-            # «лимиты подставляются из env»); смена MAX_NOTE_CHARS поверх
-            # готовой БД — разрыв конфигурации: CHECK не меняется на лету,
-            # крупные заметки стали бы падать в рантайме с невнятным
-            # IntegrityError (сообщение CHECK-а ничего не говорит об env).
-            _assert_note_chars_limit(conn, settings)
+            # «лимиты подставляются из env»). До LSBN-F-22 расхождение с env
+            # валило старт; теперь возвращается живой лимит (наблюдаемость —
+            # warning), решение о переливе — app.storage.migration.
+            _assert_note_chars_limit(conn, limit)
             conn.execute(_FTS_DDL)
             for trigger in _TRIGGERS:
                 conn.execute(trigger)

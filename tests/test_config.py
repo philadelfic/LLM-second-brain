@@ -129,7 +129,7 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "JUDGE_TIMEOUT_SEC": ("judge_timeout_sec", 900),
     "JUDGE_CONTEXT_TOKENS": ("judge_context_tokens", 0),  # №49: 0 — неизвестен
     "RRF_K": ("rrf_k", 60),
-    "MAX_NOTE_CHARS": ("max_note_chars", 35000),
+    "MAX_NOTE_CHARS": ("max_note_chars", 1500),  # LSBN-F-22: 35000 → 1500
     "MAX_QUERY_CHARS": ("max_query_chars", 512),
     "COMMENT_MAX_CHARS": ("comment_max_chars", 250),  # no24-01 (3.2.0)
     "PENDING_RETRY_SEC": ("pending_retry_sec", 30),

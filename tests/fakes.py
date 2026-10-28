@@ -27,6 +27,8 @@ FailingSummarizer — всегда отказ (деградация: back-off, p
 Фаза 8, Этап 2.2: у суммаризаторов есть и `merge` (слияние дублей);
 MergeFailingSummarizer — суммаризация работает, слияние отказывает
 (флаг fail переключается тестом — повтор слияния по back-off).
+LSBN-F-22 M2: у них же есть и `split` (нарезка миграции) — части/режим
+отказа настраиваются `split_parts`/`split_mode`.
 
 Оба ведут `last_attempt_ok` — как настоящий SummaryService: e2e-тесты
 с DI-сборкой проверяют и `/health.summarizer_ok` (NFR-4).
@@ -54,7 +56,13 @@ from app.services.promotion import (
     StructureJudgeError,
     Verdict,
 )
-from app.services.summary import SummaryError, SummaryResult
+from app.services.summary import (
+    MergeIncompleteError,
+    MergePart,
+    MergeResult,
+    SummaryError,
+    SummaryResult,
+)
 from app.services.worker import BackgroundWorker
 from app.storage.db import CREATOR_SKILL_NAME, session, transaction
 
@@ -178,7 +186,16 @@ class FixedSummarizer:
         self.merge_result = merged
         self.calls: list[str] = []
         self.merge_calls: list[tuple[str, str]] = []
+        self.merge_rounds: int = 1  # раунды слияния в MergeResult (F-23 п. 7)
         self.last_attempt_ok: bool | None = None  # для /health.summarizer_ok
+        # LSBN-F-22 M2: части нарезки и режим отказа джобы migration
+        # ("ok" | "transient" | "incomplete" — см. split).
+        self.split_parts: list[MergePart] = [
+            MergePart(title="Первая часть", text="Первая самодостаточная часть."),
+            MergePart(title="Вторая часть", text="Вторая самодостаточная часть."),
+        ]
+        self.split_mode: str = "ok"
+        self.split_calls: list[str] = []
 
     def summarize(self, text: str) -> SummaryResult:
         self.calls.append(text)
@@ -192,11 +209,36 @@ class FixedSummarizer:
         self.last_attempt_ok = True
         return SummaryResult(text=self.summary, meta=fake_meta("summary", "title"))
 
-    def merge(self, text_a: str, text_b: str) -> SummaryResult:
-        """Слияние дубликатов (Этап 2.2): фиксированный ответ, журнал пар."""
+    def merge(self, text_a: str, text_b: str) -> MergeResult:
+        """Слияние дубликатов (Этап 2.2; контракт F-23): фиксированный ответ —
+        одна самодостаточная часть, журнал пар."""
         self.merge_calls.append((text_a, text_b))
         self.last_attempt_ok = True
-        return SummaryResult(text=self.merge_result, meta=fake_meta("summary", "merge"))
+        meta = fake_meta("summary", "merge")
+        return MergeResult(
+            parts=[MergePart(title="Объединённая заметка", text=self.merge_result)],
+            meta=meta,
+            metas=[meta],
+            rounds=self.merge_rounds,
+        )
+
+    def split(self, text: str) -> MergeResult:
+        """Нарезка длинной заметки (LSBN-F-22 M2): фиксированные части,
+        журнал исходников. `split_parts`/`split_mode` настраивает тест."""
+        self.split_calls.append(text)
+        self.last_attempt_ok = True
+        meta = fake_meta("summary", "split")
+        if self.split_mode == "transient":
+            raise SummaryError("нарезка недоступна")
+        if self.split_mode == "incomplete":
+            raise MergeIncompleteError(
+                "split incomplete after 2 rounds: coverage 0.40",
+                metas=[meta],
+                rounds=2,
+            )
+        return MergeResult(
+            parts=list(self.split_parts), meta=meta, metas=[meta], rounds=1
+        )
 
     def close(self) -> None:  # интерфейс-совместимость с SummaryService
         return None
@@ -228,6 +270,12 @@ class FailingSummarizer:
     def merge(self, text_a: str, text_b: str) -> str:
         """Слияние дубликатов всегда отказывает (как summarize)."""
         self.merge_calls.append((text_a, text_b))
+        self.last_attempt_ok = False
+        raise SummaryError(self.message)
+
+    def split(self, text: str) -> str:
+        """Нарезка миграции всегда отказывает (как summarize)."""
+        self.split_calls.append(text)
         self.last_attempt_ok = False
         raise SummaryError(self.message)
 
@@ -281,14 +329,29 @@ class MergeFailingSummarizer(FixedSummarizer):
         self.merge_result = merged
         self.merge_calls: list[tuple[str, str]] = []
         self.fail: bool = True  # False — слияние восстановилось
+        # F-23 п. 6: True — восстановившееся слияние не добирает полноту
+        # (MergeIncompleteError, пара откладывается), а не SummaryError.
+        self.incomplete: bool = False
 
-    def merge(self, text_a: str, text_b: str) -> SummaryResult:
+    def merge(self, text_a: str, text_b: str) -> MergeResult:
         self.merge_calls.append((text_a, text_b))
         if self.fail:
             self.last_attempt_ok = False
             raise SummaryError("слияние недоступно")
         self.last_attempt_ok = True
-        return SummaryResult(text=self.merge_result, meta=fake_meta("summary", "merge"))
+        if self.incomplete:
+            raise MergeIncompleteError(
+                "merge incomplete after 2 rounds: coverage 0.42",
+                metas=[fake_meta("summary", "merge")],
+                rounds=2,
+            )
+        meta = fake_meta("summary", "merge")
+        return MergeResult(
+            parts=[MergePart(title="Объединённая заметка", text=self.merge_result)],
+            meta=meta,
+            metas=[meta],
+            rounds=1,
+        )
 
 
 class FixedClassifier:

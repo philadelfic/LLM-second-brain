@@ -16,6 +16,7 @@ from fakes import HashEmbedder
 from app.config import TITLE_MAX_WORDS, get_settings
 from app.services.namespaces import NamespaceError, NamespaceService
 from app.services.notes import (
+    NOTE_TEXT_LIMIT,
     TITLE_HINT,
     CommentValidationError,
     NoteService,
@@ -108,10 +109,16 @@ class TestSave:
             service.save("")
 
     def test_too_long_text_rejected(self, service: NoteService) -> None:
-        with pytest.raises(NoteValidationError):
-            service.save(long_text(35001))
+        """Мягкий лимит (LSBN-S-1): длиннее NOTE_TEXT_LIMIT — отказ с хинтом,
+        называющим лимит, фактическую длину и правило разбиения."""
+        with pytest.raises(NoteValidationError) as exc_info:
+            service.save(long_text(NOTE_TEXT_LIMIT + 1))
+        hint = str(exc_info.value)
+        assert f"{NOTE_TEXT_LIMIT}-character note limit" in hint
+        assert f"{NOTE_TEXT_LIMIT + 1} characters" in hint
+        assert "self-contained notes" in hint
 
-    @pytest.mark.parametrize("size", [1, 35000])
+    @pytest.mark.parametrize("size", [1, NOTE_TEXT_LIMIT])
     def test_boundary_lengths_ok(self, service: NoteService, size: int) -> None:
         assert service.save(long_text(size))["stored"] is True
 
@@ -640,6 +647,17 @@ class TestListIndexes:
 class TestGetChunk:
     """lsb-0003, №16: чтение заметки чанком (memory_get с query/chunk/limit)."""
 
+    @pytest.fixture(autouse=True)
+    def _long_notes_allowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Многочанковые тексты (9000 симв.) — механика чанков, не лимита:
+        мягкий лимит заметки (LSBN-S-1) поднят до прежнего потолка, боевой
+        MAX_NOTE_CHARS тоже (M1 сделал 1500 дефолтом настроек и CHECK-лимитом
+        новых баз — env поднимаем до init_db фикстуры `service`); границу
+        1500/1501 тестируют TestSave и tests/test_note_soft_limit.py."""
+        monkeypatch.setenv("MAX_NOTE_CHARS", "35000")
+        monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)
+        get_settings.cache_clear()
+
     @staticmethod
     def _vectorize(note_id: int) -> None:
         """Довекторизовать чанки заметки детерминированным HashEmbedder."""
@@ -730,6 +748,16 @@ class TestUpdateMetadata:
     запрошенные поля. Если text передан — полный штатный набор сбросов
     (vector_status='pending', замена чанков, дроп вектора, сброс причёски).
     """
+
+    @pytest.fixture(autouse=True)
+    def _long_notes_allowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Многочанковые тексты — механика чанков: мягкий лимит поднят,
+        боевой MAX_NOTE_CHARS тоже (M1: 1500 — дефолт настроек и CHECK новых
+        баз; env поднимаем до init_db фикстуры `service`; границу 1500/1501
+        тестируют TestSave и test_note_soft_limit)."""
+        monkeypatch.setenv("MAX_NOTE_CHARS", "35000")
+        monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)
+        get_settings.cache_clear()
 
     @staticmethod
     def _processed_note(service: NoteService, text: str, title: str) -> int:
@@ -1030,6 +1058,16 @@ class TestComment:
     суммаризацию, дедуп, векторизацию и связи пометка не входит. Версии
     истории — tests/test_notes_history.py.
     """
+
+    @pytest.fixture(autouse=True)
+    def _long_notes_allowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Многочанковые тексты — механика чанков: мягкий лимит поднят,
+        боевой MAX_NOTE_CHARS тоже (M1: 1500 — дефолт настроек и CHECK новых
+        баз; env поднимаем до init_db фикстуры `service`; границу 1500/1501
+        тестируют TestSave и test_note_soft_limit)."""
+        monkeypatch.setenv("MAX_NOTE_CHARS", "35000")
+        monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)
+        get_settings.cache_clear()
 
     # Поля, которые правка комментария НЕ трогает (включая служебные).
     _UNTOUCHED = (

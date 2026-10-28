@@ -62,11 +62,14 @@ class TestHealth:
             "judge_ok": None,
             "decision_ok": None,
             "notes_count": 0,
+            # LSBN-S-1: мягкий лимит заметки — константа кода, виден оператору.
+            "note_chars_limit": 1500,
             "pending_vector": 0,
             "pending_summary": 0,
             "queues": {
                 queue: {"pending": 0, "oldest_pending_sec": None, "waiting": 0, "attention": 0}
-                for queue in ("vector", "summary", "judge", "areas", "links", "nodes", "warnings", "terms-normalize")
+                # migration — очередь нарезки (LSBN-F-22 M2).
+                for queue in ("vector", "summary", "judge", "areas", "links", "nodes", "warnings", "terms-normalize", "migration")
             },
             "slots": {
                 slot: {
@@ -104,6 +107,8 @@ class TestHealth:
                 "checked_at": None,
                 "hint_shown_at": None,
             },
+            # LSBN-F-22 (M3): база без миграции — блок только с фазой-заглушкой.
+            "migration": {"phase": None},
         }
 
     def test_contract_fields(self, client: TestClient) -> None:
@@ -117,6 +122,7 @@ class TestHealth:
             "judge_ok",
             "decision_ok",
             "notes_count",
+            "note_chars_limit",
             "pending_vector",
             "pending_summary",
             "queues",
@@ -127,6 +133,7 @@ class TestHealth:
             "decision",
             "update",
             "backups",
+            "migration",  # LSBN-F-22 M3: фаза/причина/прогресс самомиграции
         }
         assert body["status"] == "ok"
         # techdebt-0036 (FR-4.2): версия — из приложения, не из окружения.
@@ -143,6 +150,7 @@ class TestHealth:
             "nodes",
             "warnings",
             "terms-normalize",
+            "migration",  # LSBN-F-22 M2: очередь нарезки
         }
         for stat in body["queues"].values():
             assert set(stat) == {"pending", "oldest_pending_sec", "waiting", "attention"}

@@ -50,6 +50,7 @@ PORT_STRIDE = 4
 SERVER_PORT = 18765 + PORT_STRIDE * _WORKER_INDEX
 CUSTOM_PORT = 18766 + PORT_STRIDE * _WORKER_INDEX
 NS_PORT = 18767 + PORT_STRIDE * _WORKER_INDEX
+CHUNK_PORT = 18768 + PORT_STRIDE * _WORKER_INDEX
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -108,6 +109,23 @@ def custom_path_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
 def ns_db(tmp_path_factory: pytest.TempPathFactory) -> str:
     """Отдельная БД для namespace-тестов (изоляция от общей памяти)."""
     return str(tmp_path_factory.mktemp("mcp-ns") / "notes.db")
+
+
+@pytest.fixture(scope="session")
+def chunk_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+    """Сервер с мелким окном чанка: многочанковая заметка умещается в мягкий
+    лимит NOTE_TEXT_LIMIT (LSBN-S-1) — дефолтные 1024 токена требуют текст
+    заметно длиннее 1500 символов, что мягкий лимит больше не разрешает."""
+    db = tmp_path_factory.mktemp("mcp-chunk") / "notes.db"
+    yield from _start_server(
+        CHUNK_PORT,
+        {
+            "DB_PATH": str(db),
+            "CHUNK_SIZE": "64",
+            "CHUNK_OVERLAP": "16",
+            "CHUNK_MIN_TARGET": "8",
+        },
+    )
 
 
 @pytest.fixture(scope="session")
@@ -240,19 +258,27 @@ class TestToolsList:
 
     @pytest.mark.asyncio
     async def test_save_update_schema(self, server_url: str) -> None:
-        """Контракты FR-4/FR-5: text 1..MAX_NOTE_CHARS (35000), id обязателен;
-        title (Фаза 11, решение №9) — опционален в схеме: отказ за сервисом
+        """Контракты FR-4/FR-5 + M1/M2 (3.4.0): maxLength текста — дефолт
+        MAX_NOTE_CHARS (1500); text в save стал опционален (default "") ради
+        массива `notes` (F-23, п. 3) — 1..SAVE_NOTES_MAX (20) самодостаточных
+        заметок одним вызовом, обязательных аргументов в save нет; title
+        (Фаза 11, решение №9) — опционален в схеме: отказ за сервисом
         (fail+hint «set a title ≤5 words»), не схемой. lsb-0004-01: text в
-        memory_update стал опционален (можно править title/summary/namespace
-        без перезаписи текста) — обязателен только id.
+        memory_update опционален — обязателен только id.
         """
         async with connect(server_url) as session:
             tools = {t.name: t for t in (await session.list_tools()).tools}
-        save_text = tools["memory_save"].input_schema["properties"]["text"]
-        assert save_text["maxLength"] == 35000
-        assert tools["memory_save"].input_schema["required"] == ["text"]
+        save_schema = tools["memory_save"].input_schema
+        save_text = save_schema["properties"]["text"]
+        assert save_text["maxLength"] == 1500  # дефолт MAX_NOTE_CHARS (M1)
+        assert save_text["default"] == ""  # text необязателен (M2: notes)
+        assert save_schema.get("required") is None  # text или notes — любой
+        notes = save_schema["properties"]["notes"]["anyOf"][0]
+        assert notes["type"] == "array"
+        assert notes["minItems"] == 1
+        assert notes["maxItems"] == 20  # SAVE_NOTES_MAX
         assert tools["memory_update"].input_schema["required"] == ["id"]
-        assert tools["memory_save"].input_schema["properties"]["title"]["default"] is None
+        assert save_schema["properties"]["title"]["default"] is None
         assert tools["memory_update"].input_schema["properties"]["title"]["default"] is None
 
     @pytest.mark.asyncio
@@ -314,6 +340,31 @@ class TestToolCalls:
             call = await session.call_tool("memory_save", {"text": "x" * 36000})
         assert call.is_error is True
         assert "string_too_long" in call.content[0].text
+
+    @pytest.mark.asyncio
+    async def test_note_over_soft_limit_soft_fail_with_hint(
+        self, server_url: str
+    ) -> None:
+        """LSBN-S-1 + M2: заметка длиннее мягкого лимита (1500) отклоняется
+        мягко, с хинтом (лимит + фактическая длина + правило разбиения).
+        Через скалярный `text` путь недостижим (схема несёт maxLength=1500 —
+        M1), поэтому элемент массива `notes` (элементы без maxLength):
+        {stored: false, hint} у ЭТОГО элемента, соседний сохраняется."""
+        async with connect(server_url) as session:
+            call = await session.call_tool(
+                "memory_save",
+                {"notes": [
+                    {"text": "x" * 1501, "title": "Слишком длинная заметка"},
+                    {"text": "короткая заметка рядом с длинной", "title": "Короткая"},
+                ]},
+            )
+        assert call.is_error is False
+        body = call.structured_content
+        assert body["stored_count"] == 1
+        assert body["notes"][0]["stored"] is False
+        assert "1500-character note limit" in body["notes"][0]["hint"]
+        assert "1501 characters" in body["notes"][0]["hint"]
+        assert body["notes"][1]["stored"] is True
 
     @pytest.mark.asyncio
     async def test_schema_rejects_too_many_ids(self, server_url: str) -> None:
@@ -435,10 +486,10 @@ class TestMemoryFlow:
         assert got["notes"][0]["id"] == note_id
 
     @pytest.mark.asyncio
-    async def test_chunk_read_by_index(self, server_url: str) -> None:
+    async def test_chunk_read_by_index(self, chunk_url: str) -> None:
         """lsb-0003: memory_get с chunk=N возвращает чанки заметки (списком)."""
-        text = f"{self.marker}: " + ("длинный текст заметки для нескольких чанков " * 60)
-        async with connect(server_url) as session:
+        text = f"{self.marker}: " + ("длинный текст заметки для нескольких чанков " * 25)
+        async with connect(chunk_url) as session:
             note_id = await _saved_id(session, text, title="Чанк чтение")
             got = (
                 await session.call_tool("memory_get", {"id": note_id, "chunk": 0})
@@ -962,10 +1013,10 @@ class TestCommentMCP:
         assert got["notes"][0]["comment"] is None  # заметка не тронута
 
     @pytest.mark.asyncio
-    async def test_memory_get_has_no_comment_in_chunk_mode(self, server_url: str) -> None:
+    async def test_memory_get_has_no_comment_in_chunk_mode(self, chunk_url: str) -> None:
         """Chunk-режим memory_get комментарий не отдаёт (там чанки)."""
-        text = f"{self.marker}: " + ("длинный текст для чанков " * 60)
-        async with connect(server_url) as session:
+        text = f"{self.marker}: " + ("длинный текст для чанков " * 30)
+        async with connect(chunk_url) as session:
             note_id = await _saved_id(session, text, title="Чанк и комментарий")
             await session.call_tool(
                 "memory_update", {"id": note_id, "comment": "не в чанках"}
