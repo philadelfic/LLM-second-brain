@@ -20,7 +20,6 @@ from app.services.llm_client import CONNECT_TIMEOUT_SEC_OLLAMA
 from app.services.prompts import PromptRegistry
 from app.services.summary import (
     MERGE_COVERAGE_MIN,
-    NOTE_TEXT_LIMIT,
     MergeIncompleteError,
     SummaryError,
     SummaryService,
@@ -415,8 +414,9 @@ def test_merge_system_prompt_and_marked_texts(monkeypatch) -> None:
     assert "state each fact once" in messages[0]["content"]
     assert "do not add anything of your own" in messages[0]["content"]
     # контракт F-23: список частей, лимит части = мягкий лимит заметки
+    # (из настроек сборки — LSBN-T-26)
     assert '"parts"' in messages[0]["content"]
-    assert "1500-character note limit" in messages[0]["content"]
+    assert f"{get_settings().max_note_chars}-character note limit" in messages[0]["content"]
     # числового бюджета вывода в промпте нет: потолок держит код, не модель
     assert "35000" not in messages[0]["content"]
     # оба текста в ОДНОМ user-сообщении: ранний — TEXT 1, поздний — TEXT 2
@@ -436,7 +436,7 @@ def test_merge_long_part_triggers_followup(monkeypatch) -> None:
     """Часть длиннее лимита (F-23 п. 2): ОДИН дозапрос в том же контексте —
     исходники → первый ответ → «часть слишком длинная»; максимум 2 раунда."""
     settings = make_settings(monkeypatch)
-    long_text = "ф" * (NOTE_TEXT_LIMIT + 70)
+    long_text = "ф" * (get_settings().max_note_chars + 70)
     service, recorder = make_service(
         settings,
         [
@@ -454,7 +454,10 @@ def test_merge_long_part_triggers_followup(monkeypatch) -> None:
     followup = second["messages"][1]["content"]
     assert followup.startswith("TEXT 1:\n" + TEXT_A)
     assert "YOUR ANSWER:" in followup and long_text in followup
-    assert "exceeds the 1500-character note limit" in followup
+    assert (
+        f"exceeds the {get_settings().max_note_chars}-character note limit"
+        in followup
+    )
     assert service.last_attempt_ok is True
     service.close()
 

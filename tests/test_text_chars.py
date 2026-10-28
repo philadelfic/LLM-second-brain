@@ -71,8 +71,7 @@ def _long_notes_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
     боевой MAX_NOTE_CHARS (CHECK у новой БД берётся из настроек при init_db)
     и мягкий NOTE_TEXT_LIMIT подняты до прежнего потолка; границу 1500/1501
     тестируют TestSave и tests/test_note_soft_limit.py (LSBN-S-1 + M1)."""
-    monkeypatch.setenv("MAX_NOTE_CHARS", "35000")
-    monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)
+    monkeypatch.setenv("MAX_NOTE_CHARS", "20000")
     get_settings.cache_clear()
 
 

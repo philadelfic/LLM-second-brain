@@ -429,8 +429,10 @@ def test_registry_contains_worker_jobs_and_links(settings) -> None:
     # события: «ожидает» появляются только при самом старте миграции);
     # слот summary — нарезка наследует его слот при незаданных SPLIT_*.
     assert specs["migration"].queue == "migration"
-    assert specs["migration"].interval_sec == settings.pending_retry_sec
-    assert specs["migration"].batch == settings.embedding_batch_size
+    # 3.4.1 (LSBN-T-27): разделитель слота — свои настройки, не чужие смыслы
+    assert specs["migration"].interval_sec == settings.migration_pause_sec
+    assert specs["migration"].batch == settings.migration_batch
+    assert specs["migration"].pause_after_run is True
     assert specs["migration"].wait_event is None
     assert specs["migration"].queue_empty is not None
     assert specs["migration"].queue_stat is not None

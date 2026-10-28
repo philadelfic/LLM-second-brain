@@ -167,6 +167,9 @@ def build_services(
     registry = PromptRegistry(
         settings.prompts_dir,
         decision_max_questions=settings.decision_max_questions,
+        # 3.4.1 (LSBN-T-26): число в промптах merge/split — то же, что
+        # валидация записи и цель миграции (одно число — одно место).
+        max_note_chars=settings.max_note_chars,
     )
     # Клиенты слотов — по одному на слот (решение №1); их делят сервисы
     # слота, и по ним же идёт стартовая проверка (решение №5).

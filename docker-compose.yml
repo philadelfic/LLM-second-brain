@@ -139,11 +139,20 @@ services:
       MCP_PATH: "/mcp"
       # --- storage ---
       DB_PATH: "/data/notes.db"
-      # LSBN-F-22: 1500 (после S-1); расхождение с живым CHECK запускает
-      # самомиграцию при старте (прямую или обратную — design F-22 §4)
-      MAX_NOTE_CHARS: "1500"                 # max note length
+      # 3.4.1: 2000 — одно число на всё: мягкий лимит
+      # записи/правки, части merge/split, промпты и цель схемы; расхождение
+      # с живым CHECK запускает самомиграцию при старте (вверх — перелив 1:1,
+      # вниз — нарезка; design F-22 §4)
+      MAX_NOTE_CHARS: "2000"                 # max note length (soft limit = schema target)
       COMMENT_MAX_CHARS: "250"               # no24-01 (3.2.0): max comment length of a note (a remark, not knowledge)
       PENDING_RETRY_SEC: "30"                # background worker start interval (×2 → 15 min)
+      # --- slot breaker of the split (3.4.1): во время
+      # раскатки нарезка берёт партию заметок, отрабатывает и уступает слот
+      # генерации на паузу, затем берёт следующую; очередь однопоточная.
+      # Свои числа (НЕ embedding_batch_size/pending_retry_sec — у тех свои
+      # смыслы); крутятся override'ом без релиза.
+      MIGRATION_BATCH: "5"                   # notes per migration split run (1..100)
+      MIGRATION_PAUSE_SEC: "600"             # pause AFTER a run before the next one, sec (0..86400)
       # --- slot breaks (No39, release 3.2.0): pause with a probe + human hint ---
       SLOT_PAUSE_SEC: "900"          # pause of a broken slot = back-off ceiling (≥30); one probe per pause
       SLOT_PAUSE_AFTER: "3"          # consecutive non-transient failures opening the break (≥1; auth opens at once)

@@ -523,7 +523,7 @@ def live_chunks(tmp_path_factory) -> SimpleNamespace:
     контрольного факта. Ollama недоступна — SKIP (skip расставит fixture).
 
     Прогрев обязателен: 8B-модель на CPU 113 грузится минуты; с
-    read-таймаутом 720 с (решение О. 2026-08-30) дефолты §8 (32×3)
+    read-таймаутом 720 с (решение 2026-08-30) дефолты §8 (32×3)
     влезают, подъёмки идут по канону как в проде.
     """
     url = os.environ.get("LIVE_EMBEDDING_URL", LIVE_URL_DEFAULT)

@@ -49,13 +49,22 @@ from app.services.skills import HINT_SKILLS_BODY
 from app.services.update_check import UPDATE_HINT_TEMPLATE, UpdateChecker
 from app.storage.db import init_db
 from app.transport.mcp import (
-    SERVER_INSTRUCTIONS,
-    TOOL_DESCRIPTIONS,
+    server_instructions,
+    tool_descriptions,
     TOOL_NAMES,
     build_instructions,
     build_mcp,
 )
+
+
 from scripts.measure_injected_text import default_samples
+
+
+# 3.4.1 (LSBN-T-26): тексты с числом лимита собираются функциями от
+# настроек — здесь сборка от значений тестового окружения (роль прежних
+# констант; число приходит из Settings, не литерал).
+SERVER_INSTRUCTIONS = server_instructions(get_settings().max_note_chars)
+TOOL_DESCRIPTIONS = tool_descriptions(get_settings().max_note_chars)
 
 EXPECTED_TOOL_COUNT = 31
 

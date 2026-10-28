@@ -182,14 +182,20 @@ class TestSchemaCreated:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Лимит CHECK берётся из env при первой инициализации (ARCH §3.3)."""
-        monkeypatch.setenv("MAX_NOTE_CHARS", "10")
+        monkeypatch.setenv("MAX_NOTE_CHARS", "600")
         get_settings.cache_clear()
         settings = get_settings()
         init_db(settings)
         with session(settings) as conn:
-            conn.execute("INSERT INTO notes(text) VALUES (?)", ("x" * 10,))
+            conn.execute(
+                "INSERT INTO notes(text) VALUES (?)",
+                ("x" * settings.max_note_chars,),
+            )
             with pytest.raises(sqlite3.IntegrityError):
-                conn.execute("INSERT INTO notes(text) VALUES (?)", ("x" * 11,))
+                conn.execute(
+                    "INSERT INTO notes(text) VALUES (?)",
+                    ("x" * (settings.max_note_chars + 1),),
+                )
 
     def test_start_survives_max_note_chars_diverged(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -201,15 +207,15 @@ class TestSchemaCreated:
         CHECK-лимит (решение о переливе — `app.storage.migration` в lifespan),
         расхождение — warning `note_chars_mismatch` в журнале старта.
         """
-        monkeypatch.setenv("MAX_NOTE_CHARS", "10")
+        monkeypatch.setenv("MAX_NOTE_CHARS", "600")
         get_settings.cache_clear()
-        init_db(get_settings())  # БД создана с лимитом 10
+        init_db(get_settings())  # БД создана с лимитом 600
         monkeypatch.setenv("MAX_NOTE_CHARS", "500")
         get_settings.cache_clear()
         init_db(get_settings())  # прежнее поведение — StorageError; теперь нет
         settings = get_settings()
         with session(settings) as conn:
-            assert note_chars_limit(conn) == 10
+            assert note_chars_limit(conn) == 600
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="app"):
             init_db(get_settings())  # ещё один прогон — warning воспроизводим
@@ -219,7 +225,7 @@ class TestSchemaCreated:
             if getattr(record, "event", None) == "note_chars_mismatch"
         ]
         assert len(mismatches) == 1
-        assert mismatches[0].schema_limit == 10
+        assert mismatches[0].schema_limit == 600
         assert mismatches[0].env_limit == 500
 
     def test_note_chars_limit_fresh_and_checkless(

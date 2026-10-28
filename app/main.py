@@ -518,6 +518,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "port": settings.port,
                 "mcp_path": settings.mcp_path,
                 "db_path": settings.db_path,
+                # Разделитель слота нарезки (3.4.1, LSBN-T-27): по проде
+                # видно, сколько заметок берётся за прогон и на сколько
+                # джоба миграции уходит в паузу.
+                "migration_batch": settings.migration_batch,
+                "migration_pause_sec": settings.migration_pause_sec,
             },
         )
         # №40 (FR-4.3): состав включённых областей — из журнала старта видно,

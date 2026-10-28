@@ -29,7 +29,13 @@ from app.services.skills import SkillsService
 from app.services.terms import TermsService
 from app.services.user_facts import UserFactsService
 from app.storage.db import init_db, session
-from app.transport.mcp import TOOL_DESCRIPTIONS, TOOL_NAMES, build_mcp
+from app.transport.mcp import TOOL_NAMES, build_mcp, tool_descriptions
+
+
+# 3.4.1 (LSBN-T-26): тексты с числом лимита собираются функциями от
+# настроек — здесь сборка от значений тестового окружения (роль прежних
+# констант; число приходит из Settings, не литерал).
+TOOL_DESCRIPTIONS = tool_descriptions(get_settings().max_note_chars)
 
 DIM = 64
 

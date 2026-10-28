@@ -50,8 +50,7 @@ def make_notes(settings, embedder: HashEmbedder = HashEmbedder(8)) -> NoteServic
 def set_env(monkeypatch: pytest.MonkeyPatch, tmp_path, **overrides: str) -> None:
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     monkeypatch.setenv("EMBEDDING_DIM", "8")
-    monkeypatch.setenv("MAX_NOTE_CHARS", "35000")
-    monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)  # LSBN-S-1
+    monkeypatch.setenv("MAX_NOTE_CHARS", "20000")
     for key, value in overrides.items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
@@ -214,8 +213,7 @@ def test_legacy_note_gets_chunks_on_chunk_param_change(
     (вектора чанков — pending воркеру)."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     monkeypatch.setenv("EMBEDDING_DIM", "8")
-    monkeypatch.setenv("MAX_NOTE_CHARS", "35000")
-    monkeypatch.setattr("app.services.notes.NOTE_TEXT_LIMIT", 35000)  # LSBN-S-1
+    monkeypatch.setenv("MAX_NOTE_CHARS", "20000")
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
