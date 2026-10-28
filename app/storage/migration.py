@@ -334,6 +334,35 @@ def _prune_chain(chain: list[dict], file_name: str) -> list[dict]:
     return [entry for entry in chain if entry.get("file") != file_name]
 
 
+#: Суффикс файла-приёмника, когда целевое имя занято живой базой цепочки
+#: (DEF-5): notes.<target>.db.incoming — swap ставит его на db_path, а база
+#: цепочки остаётся нетронутой (design: «базы не удаляются»).
+INCOMING_SUFFIX = ".incoming"
+
+
+def _pour_target(settings: Settings, conn: sqlite3.Connection, target: int) -> str:
+    """Файл-приёмник новой базы: notes.<target>.db либо …db.incoming (DEF-5).
+
+    Существующий notes.<target>.db, описанный в chain АКТИВНОЙ базы, — живая
+    база цепочки (единственная копия частей прошлого прогона): новая база
+    льётся рядом под именем …db.incoming. Файла в chain нет — это недолитый
+    остаток прерванной попытки (рестарт до swap, design §6): имя свободно
+    для пересоздания. Вызывается и в `create_new_base`, и в
+    `run_startup_migration` — swap обязан получить тот же файл, в который
+    шёл перелив; решение детерминировано состоянием диска и meta активной
+    базы, между двумя вызовами chain активной не меняется.
+    """
+    path = sibling_db_path(settings.db_path, target)
+    if not Path(path).is_file():
+        return path
+    chain_files = {
+        Path(str(entry.get("file", ""))).name for entry in read_chain(conn)
+    }
+    if Path(path).name in chain_files:
+        return path + INCOMING_SUFFIX
+    return path
+
+
 def create_new_base(
     settings: Settings,
     *,
@@ -345,16 +374,31 @@ def create_new_base(
     """Фазы 2–3: новая база notes.<target><suffix>, перелив 1:1, состояние.
 
     Идемпотентно по отношению к обрыву (design §6): недолитый файл прошлой
-    попытки стирается — рестарт до swap переливает заново, прежняя база
-    не тронута. Одна транзакция на весь перелив + состояние (design §4,
-    фаза 3). Направление «вверх» без базы-родственника идёт тем же путём:
-    фильтр length(text) <= target вбирает всё, migration_notes остаётся
-    пустой (обратный перелив без частей — тоже без модели).
+    попытки (его нет в chain активной базы) стирается — рестарт до swap
+    переливает заново, прежняя база не тронута. Живая база цепочки под
+    целевым именем (DEF-5: повторный forward после reverse) НЕ стирается —
+    перелив идёт в notes.<target>.db.incoming, swap ставит её на db_path.
+    Одна транзакция на весь перелив + состояние (design §4, фаза 3).
+    Направление «вверх» без базы-родственника идёт тем же путём: фильтр
+    length(text) <= target вбирает всё, migration_notes остаётся пустой
+    (обратный перелив без частей — тоже без модели).
 
     Returns:
         Счётчики {old_total, poured, pending} — для журнала и /health (M3).
     """
-    temp_path = sibling_db_path(settings.db_path, target)
+    canonical = sibling_db_path(settings.db_path, target)
+    with session(settings) as conn:
+        temp_path = _pour_target(settings, conn, target)
+    if temp_path != canonical:
+        logger.warning(
+            "файл цели занят базой цепочки — новая база льётся под временным "
+            "именем (базы не удаляются)",
+            extra={
+                "event": "migration_chain_base_spared",
+                "file": Path(canonical).name,
+                "incoming": Path(temp_path).name,
+            },
+        )
     for suffix in ("", "-wal", "-shm"):  # сайдкары не должны пережить пересоздание
         Path(temp_path + suffix).unlink(missing_ok=True)
     new_settings = settings.model_copy(
@@ -770,6 +814,11 @@ def run_startup_migration(settings: Settings, plan: dict) -> dict:
     """
     mode = plan["mode"]
     if mode in ("down", "up_new"):
+        # Приёмник перелива — до create_new_base (DEF-5): база цепочки под
+        # целевым именем не стирается, новая база льётся в …db.incoming;
+        # swap ставит на db_path именно её.
+        with session(settings) as conn:
+            incoming = _pour_target(settings, conn, plan["target"])
         counters = create_new_base(
             settings,
             source_path=settings.db_path,
@@ -780,7 +829,7 @@ def run_startup_migration(settings: Settings, plan: dict) -> dict:
         swap(
             settings,
             away_file=plan["prev_file"],
-            incoming_file=sibling_db_path(settings.db_path, plan["target"]),
+            incoming_file=incoming,
         )
         return counters
     if mode == "up_chain":
