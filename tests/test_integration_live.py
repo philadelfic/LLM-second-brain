@@ -1,10 +1,12 @@
 """Интеграционные тесты Фаз 3–8 — живые Ollama (@pytest.mark.integration).
 
 Маркер `integration` (pyproject). Сервер векторизации берётся из env
-`LIVE_EMBEDDING_URL` (дефолт — рабочий адрес REQUIREMENTS §4,
-qwen3-embedding:8b, dim 4096); суммаризатор — из `LIVE_SUMMARY_URL`
-(дефолт localhost, lfm2.5:latest). При недоступности — SKIP, а не
-падение (ARCH §7). Проверяется: форматы живых векторов, качество на русских
+`LIVE_EMBEDDING_URL` (дефолт — рабочий адрес REQUIREMENTS §4); модель и
+размерность эмбеддера — `EMBEDDING_MODEL`/`EMBEDDING_DIM` (Settings),
+размерность проверок — `LIVE_EMBEDDING_DIM`; суммаризатор — из
+`LIVE_SUMMARY_URL`/`LIVE_SUMMARY_MODEL` (дефолт localhost, lfm2.5:latest).
+Запускать удобнее раннером `scripts/run_live_tests.sh` — он выставляет env
+под модели контура. При недоступности — SKIP, а не падение (ARCH §7). Проверяется: форматы живых векторов, качество на русских
 перефразах, дедуп-порог, догон pending фоновым воркером; суммаризация:
 реальная длина summary, язык, латентность, timeout, погонка фонового воркера
 (режим «Б»). Фаза 8: save мгновенный — вектора/дедуп догоняет фоновый
@@ -43,8 +45,10 @@ from app.storage import chunks, vectors
 from app.storage.db import init_db, session, transaction
 
 # Дефолт из REQUIREMENTS §4 (операторский адрес); перебить env при другом.
+# Раннер живого яруса (scripts/run_live_tests.sh) выставляет env под модели
+# контура: qwen3-embedding:4b на .109 → dim 2560 (LIVE_EMBEDDING_DIM).
 LIVE_URL_DEFAULT = "http://localhost:11434"
-DIM = 4096  # qwen3-embedding:8b — REQUIREMENTS §8
+DIM = int(os.environ.get("LIVE_EMBEDDING_DIM", "4096"))  # 8b: 4096, 4b: 2560
 
 # Живой суммаризатор — Фаза 4 (REQUIREMENTS §4/§5.5).
 LIVE_SUMMARY_URL_DEFAULT = "http://localhost:11434"
@@ -90,7 +94,7 @@ def live(tmp_path_factory) -> SimpleNamespace:
 
 
 def test_embedding_shape_and_determinism(live) -> None:
-    """/api/embed живой: размерность 4096; один текст — тот же вектор."""
+    """/api/embed живой: вектор размерности LIVE_EMBEDDING_DIM; один текст — тот же вектор."""
     text = "интеграционная проверка формата живых векторов"
     vector = live.embedding.embed(text)
     assert len(vector) == DIM
@@ -511,20 +515,22 @@ def _chunks_note_text() -> str:
     )
     half = para * 30
     text = half + CHUNKS_FACT + half
-    assert 14000 <= len(text) <= 35000
+    # Потолок контракта LSBN-T-26 (3.4.1): диапазон max_note_chars 500..20000;
+    # ~15k влезает, заметка по-прежнему многочанковая (chunk_size 1024).
+    assert 14000 <= len(text) <= 20000
     return text
 
 
 @pytest.fixture(scope="session")
 def live_chunks(tmp_path_factory) -> SimpleNamespace:
-    """Живой векторизатор + дефолты §8, MAX_NOTE_CHARS=35000.
+    """Живой векторизатор + дефолты §8, MAX_NOTE_CHARS=20000 (потолок T-26).
 
     Отдельная БД (tmp) — живые заметки фаз 3–4 не мешают ранжированию
     контрольного факта. Ollama недоступна — SKIP (skip расставит fixture).
 
-    Прогрев обязателен: 8B-модель на CPU 113 грузится минуты; с
-    read-таймаутом 720 с (решение 2026-08-30) дефолты §8 (32×3)
-    влезают, подъёмки идут по канону как в проде.
+    Прогрев обязателен: эмбеддер на CPU грузится минуты; с read-таймаутом
+    720 с (решение 2026-08-30) дефолты §8 (32×3) влезают, подъёмки идут
+    по канону как в проде.
     """
     url = os.environ.get("LIVE_EMBEDDING_URL", LIVE_URL_DEFAULT)
     if not _reachable(url):
@@ -536,7 +542,13 @@ def live_chunks(tmp_path_factory) -> SimpleNamespace:
         mcp_auth_token="live-chunk-token",
         db_path=str(tmp_path_factory.mktemp("live-chunks") / "notes.db"),
         embedding_dim=DIM,
-        max_note_chars=35000,
+        max_note_chars=20000,
+        # Тест проверяет механику «лучшего чанка» (cosine/snippet из него),
+        # а не порог векторного попадания: порог 0.62 откалиброван под 8b,
+        # у 4b (замер 29.10.2026) косинусы перефраза ниже (замер
+        # 29.10.2026: 0.44 на контрольном факте) — занижаем в изолированной
+        # БД, чтобы векторное плечо было принято и хит шёл от чанка.
+        score_threshold=0.3,
     )
     init_db(settings)
     embedding = EmbeddingService(settings)
@@ -670,7 +682,12 @@ def test_long_note_chunk_relevance(live_chunks) -> None:
         for chunk_id, _idx, chunk_text, _tokens in chunk_rows
         if chunk_id == best_chunk_id
     )
-    assert "наряду 84031" in best_chunk_text  # факт целиком в лучшем чанке
+    # Лучший чанк — чанк факта. Дословную фразу не проверяем: tiktoken-сплиттер
+    # (TEXT_SPLITTER по канону §8) режет по токенам, граница чанка может пройти
+    # посреди слова («наряду» → «яду…») — проверяем инвариантные части факта,
+    # которые граница токенов не разрезает на разные чанки (короткие токены
+    # рядом; найдено живым прогоном 29.10.2026, релиз 3.4.1).
+    assert "84031" in best_chunk_text and "Хомяков" in best_chunk_text
     assert hit["cosine"] == pytest.approx(best_cosine, abs=1e-3)
     assert hit["snippet"] == best_chunk_text[: settings.snippet_chars]
     assert hit["snippet"] != text[: settings.snippet_chars]
