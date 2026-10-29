@@ -543,6 +543,12 @@ def live_chunks(tmp_path_factory) -> SimpleNamespace:
         db_path=str(tmp_path_factory.mktemp("live-chunks") / "notes.db"),
         embedding_dim=DIM,
         max_note_chars=20000,
+        # Тест проверяет механику «лучшего чанка» (cosine/snippet из него),
+        # а не порог векторного попадания: порог 0.62 откалиброван под 8b,
+        # у 4b (замер 29.10.2026) косинусы перефраза ниже (замер
+        # 29.10.2026: 0.44 на контрольном факте) — занижаем в изолированной
+        # БД, чтобы векторное плечо было принято и хит шёл от чанка.
+        score_threshold=0.3,
     )
     init_db(settings)
     embedding = EmbeddingService(settings)
@@ -676,7 +682,12 @@ def test_long_note_chunk_relevance(live_chunks) -> None:
         for chunk_id, _idx, chunk_text, _tokens in chunk_rows
         if chunk_id == best_chunk_id
     )
-    assert "наряду 84031" in best_chunk_text  # факт целиком в лучшем чанке
+    # Лучший чанк — чанк факта. Дословную фразу не проверяем: tiktoken-сплиттер
+    # (TEXT_SPLITTER по канону §8) режет по токенам, граница чанка может пройти
+    # посреди слова («наряду» → «яду…») — проверяем инвариантные части факта,
+    # которые граница токенов не разрезает на разные чанки (короткие токены
+    # рядом; найдено живым прогоном 29.10.2026, релиз 3.4.1).
+    assert "84031" in best_chunk_text and "Хомяков" in best_chunk_text
     assert hit["cosine"] == pytest.approx(best_cosine, abs=1e-3)
     assert hit["snippet"] == best_chunk_text[: settings.snippet_chars]
     assert hit["snippet"] != text[: settings.snippet_chars]
