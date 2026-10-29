@@ -34,10 +34,17 @@
 отказ судьи снимает партию на первой же паре (`judge_calls == 1`). Сети нет:
 судья — тестовый двойник с отказами `JudgeError` нужного исхода, векторизация —
 `HashEmbedder`.
+
+LSBN-T-30 (3.4.1) добавляет сюда embedding-джобу — та же тема «недоступные
+модели + непустая очередь»: после введения перепроверки очереди
+(`_embedding_queue_empty`) петля даёт на интервал ровно ДВА прогона (обычный
+и один немедленный lost-wakeup, пул 6) и дальше спит с выросшим back-off —
+холостого шторма нет (arch §3.2: отказ — не прогресс, no39-05).
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -45,10 +52,11 @@ from fakes import FailingEmbedder, FixedSummarizer, HashEmbedder, RecordingDedup
 
 from app.config import get_settings
 from app.services import jobs
+from app.services.embedding import EmbeddingError
 from app.services.judge import JudgeError, JudgeResult
 from app.services.notes import NoteService
 from app.services.slot_outcome import SlotOutcome
-from app.services.worker import BackgroundWorker, build_judge_job
+from app.services.worker import BackgroundWorker, build_embedding_job, build_judge_job
 from app.storage.db import init_db, session, transaction
 
 
@@ -282,3 +290,84 @@ async def test_auth_outage_breaker_waits_then_probe_drains(
     assert stat["pending"] == 0
     assert stat["waiting"] == 0
     assert stat["oldest_pending_sec"] is None
+
+
+class UnavailableEmbedder:
+    """Кодировщик-фейк: `EmbeddingError` с транзиентным исходом UNAVAILABLE.
+
+    Транзиентный отказ разрыв слота embedding НЕ открывает
+    (`SlotBreaker._TRANSIENT_OUTCOMES`) — ворота партию берут, модель честно
+    вызывается, а ждать недоступность — работа back-off петли (arch §13.2).
+    `calls` — размеры запрошенных батчей: тест считает вызовы модели и
+    проверяет, что их не больше двух на интервал (LSBN-T-30).
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    def embed(self, text: str) -> list[float]:
+        return self.embed_texts([text])[0]
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        self.calls.append(len(texts))
+        raise EmbeddingError(
+            "embedding slot unavailable", outcome=SlotOutcome.UNAVAILABLE
+        )
+
+    def close(self) -> None:  # интерфейс-совместимость с EmbeddingService
+        return None
+
+
+@pytest.mark.asyncio
+async def test_embedding_outage_no_idle_storm(settings, monkeypatch) -> None:
+    """LSBN-T-30, embedding: недоступные модели + непустая очередь — шторма нет.
+
+    Перепроверка очереди (`_embedding_queue_empty`) закрывает lost wakeup,
+    но не превращает недоступность в холостой шторм: на интервал — ровно два
+    прогона (обычный + один немедленный lost-wakeup), затем петля спит
+    с выросшим back-off и модель не трогает до истечения интервала (arch
+    §3.2: работа, которую петля взять не может, — не прогресс, no39-05).
+    Заметки сеются прямым SQL (прецедент `_seed_pending`) без чанков —
+    один прогон ровно один вызов модели, арифметика вызовов прозрачна.
+    """
+    with session(settings) as conn, transaction(conn):
+        for index in range(1, 4):
+            conn.execute(
+                "INSERT INTO notes (id, title, text, namespace, vector_status) "
+                "VALUES (?, ?, ?, 'default', 'pending')",
+                (index, f"Заметка №{index}", f"текст заметки вектора №{index}"),
+            )
+    embedder = UnavailableEmbedder()
+    worker = BackgroundWorker(settings, embedder)
+    spec = build_embedding_job(worker, settings)
+
+    # --- фаза «недоступны»: транзиентный отказ, разрыв не открывается -------
+    assert await jobs._gated_process(spec) == 0  # один прогон вернул 0
+    assert embedder.calls == [2]  # модель позвана один раз (батч 2 из 3)
+    assert worker._breakers["embedding"].is_paused() is False  # разрыва нет
+    assert worker._embedding_queue_empty() is False  # берущаяся работа есть
+    # Очередь честна: ни одна заметка не потеряна и не «обработана».
+    stat = worker.queues_health()["vector"]
+    assert stat["pending"] == 3
+    assert stat["waiting"] == 0
+
+    # --- петля: два прогона на интервал, дальше сон с выросшим back-off -----
+    # Реальный back-off тест не ждёт: `asyncio.sleep` — мгновенный шпион
+    # с записью запрошенных пауз (паттерн `patch_sleep` из test_jobs).
+    real_sleep = asyncio.sleep
+    delays: list[float] = []
+
+    async def spy_sleep(delay: float, *args: object, **kwargs: object) -> None:
+        delays.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", spy_sleep)
+    await jobs.run_loop(
+        spec, lambda: len(delays) >= 2, jobs.BackoffState(spec.interval_sec)
+    )
+    # Две итерации по два прогона, по одному вызову embed_texts на прогон,
+    # плюс прогон фазы «недоступны» выше: вызовов модели ровно 5, а не
+    # десятки — повторных вызовов до истечения интервала нет.
+    assert embedder.calls == [2, 2, 2, 2, 2]
+    assert delays == [30.0, 60.0]  # интервал вырос: петля спит, а не крутится
+    assert worker._embedding_event.is_set() is False  # отказ сигнала не ставит

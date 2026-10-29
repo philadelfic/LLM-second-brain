@@ -1280,6 +1280,71 @@ async def test_judge_loop_rechecks_queue_before_sleep(slow) -> None:
         asyncio.wait_for = orig_wait_for
 
 
+@pytest.mark.asyncio
+async def test_embedding_loop_rechecks_queue_before_sleep(slow) -> None:
+    """Пул 6 (lost wakeup) для embedding-петли (LSBN-T-30): notify, пришедший
+    МЕЖДУ пустым прогоном и `clear()` события, не теряется — перед
+    `clear()+wait` петля перепроверяет очередь (`_embedding_queue_empty`) и
+    даёт берущейся работе ОДИН немедленный прогон БЕЗ ожидания таймаута
+    (интервал петли — PENDING_RETRY_SEC, на простаивающей системе back-off
+    дорастает до 15 мин: свежая заметка ждала бы вектор столько же)."""
+    worker = make_worker(slow, FailingEmbedder())
+    calls: list[float] = []  # моменты прогонов process_pending (monotonic)
+
+    def racy_batch(limit=None):
+        calls.append(time.monotonic())
+        if len(calls) == 1:
+            # notify пришёл, пока петля выгребала (прогон вернул 0): заметка
+            # закоммичена и сигнал поставлен — но следующий `clear()` его
+            # сотрёт; единственный шанс не потерять будильник — перепроверка
+            # очереди (LSBN-T-30).
+            NoteService(slow, FailingEmbedder()).save(
+                "заметка, добавленная прямо во время прогона векторизации",
+                title="Заметка во время прогона",
+            )
+            worker.notify_embedding_pending()
+        return 0
+
+    worker.process_pending = racy_batch
+    orig_wait_for = asyncio.wait_for
+    # Нарушения сна фиксируем списком (AssertionError внутри петли заглотил бы
+    # супервизор итерации — пул 4), а проверяем явным assert ниже.
+    slept_with_work: list[float] = []
+
+    def spy_wait_for(coro, timeout=None, *args, **kwargs):
+        # Петля не должна засыпать в ожидании события, пока в очереди есть
+        # берущаяся работа (стёртый `clear()` сигнал — не повод для сна).
+        with session(slow) as conn:
+            pending = conn.execute(
+                "SELECT 1 FROM notes WHERE deleted_at IS NULL "
+                "AND vector_status = 'pending'"
+            ).fetchone()
+        if pending:
+            slept_with_work.append(time.monotonic())
+        return orig_wait_for(coro, timeout, *args, **kwargs)
+
+    asyncio.wait_for = spy_wait_for
+    try:
+        task = asyncio.create_task(worker._run_embedding_single())
+        # петля продолжила БЕЗ сна: немедленный lost-wakeup прогон наступает
+        # сразу (не по истечении интервала PENDING_RETRY_SEC).
+        deadline = time.monotonic() + 2.0
+        while len(calls) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        worker.stop()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    finally:
+        asyncio.wait_for = orig_wait_for
+    assert len(calls) >= 2
+    # Второй прогон — немедленный lost-wakeup, много быстрее интервала (1 с):
+    # без перепроверки сигнал стирался бы `clear()` и петля ждала бы интервал.
+    assert calls[1] - calls[0] < 0.5
+    # И в ожидание события с непустой очередью петля не уходила вовсе.
+    assert slept_with_work == []
+
+
 # --- каркас джоб (lsb-0014-02): поле job в событиях петель --------------------
 
 

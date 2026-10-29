@@ -497,12 +497,15 @@ def test_registry_contains_worker_jobs_and_links(settings) -> None:
     for name in ("embedding", "summary", "judge", "areas"):
         assert specs[name].interval_sec == retry  # как было (FR-1.5)
     assert specs["expiration"].interval_sec == EXPIRATION_CLEANUP_INTERVAL_SEC
-    # Форма «по интервалу + событие `embedding`» (gate 2026-09-19): свежая
+    # Форма «по интервалу + событие `embedding` + перепроверка очереди»
+    # (gate 2026-09-19; перепроверка lost wakeup — LSBN-T-30): свежая
     # pending-заметка будит петлю сразу — событие берётся у воркера (владельца
-    # очереди векторизации). Перепроверки очереди нет: очередь векторизации и
-    # есть ожидание модели — с ней петля крутилась бы вхолостую (busy-loop).
+    # очереди векторизации), а перепроверка (`_embedding_queue_empty`)
+    # страхует сигнал, стёртый `clear()` (пул 6); шторма при недоступных
+    # моделях нет — отказ не прогресс (no39-05), один немедленный прогон —
+    # и сон по back-off.
     assert specs["embedding"].wait_event is worker._embedding_event
-    assert specs["embedding"].queue_empty is None
+    assert specs["embedding"].queue_empty is not None
     assert specs["expiration"].wait_event is None
     assert specs["summary"].wait_event is not None
     assert specs["judge"].wait_event is not None
