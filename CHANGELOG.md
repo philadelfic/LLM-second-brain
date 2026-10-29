@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.1] - 2026-10-29
+
+Release 3.4.1 — "One number for the note limit, a background that degrades politely": the note limit leaves the code for a single configuration value, the migration job gets its own slicing cadence, and the background job framework stops grinding through broken providers — a failing slot now pauses whole batches instead of timing out item by item, a broken slot gates every job that shares it (including external ones), and a freshly saved note can no longer miss its vectorization wake-up.
+
+### Added
+
+* **Note limit in configuration (one number, one place)** — `MAX_NOTE_CHARS` (env, default **2000**, validated 500..20000) feeds the save/update validation, merge and split part limits, hints, tool descriptions, server instructions and `/health.note_chars_limit`. The `CHECK` of new databases and the self-migration target follow the same value: raising the limit pours 1:1 without a model, lowering it splits. The `NOTE_TEXT_LIMIT` code constant is removed.
+* **Migration slicing cadence** — `MIGRATION_BATCH` (default 5) and `MIGRATION_PAUSE_SEC` (default 600 s) are the migration job's own numbers: it takes a batch of notes, yields the generation slot for the pause, and repeats; an emptied queue skips the pause. Both values are visible in `/health.migration.slot` and the startup log; the old shared knobs (`EMBEDDING_BATCH_SIZE`, `PENDING_RETRY_SEC`) no longer affect the migration.
+* **Framework-level slot gate** — the circuit-breaker check moved into the job framework (`JobSpec.gate`/`is_gated`, applied by the shared loop to both pass invocations); manual per-job checks are gone. External jobs (`migration`, `warnings`) are now gated by their declared `summary` slot — previously they kept calling a broken slot — and `areas` declares its embedding slot. Queue snapshots move `pending` to `waiting` uniformly for every job of a broken slot; `/health.queues` still never calls models.
+* **Live integration tier runner** — `scripts/run_live_tests.sh` runs the 13 integration tests against real model hosts taken from the environment (or a gitignored local env file); host addresses never enter the repository. The tier's dimension is env-configurable (`LIVE_EMBEDDING_DIM`).
+
+### Changed
+
+* **Batches stop on wait-class slot failures** — `summary`, `title` and `judge` batches abort after the first `unavailable`/`timeout`/`auth` outcome instead of grinding through up to 32 positions (a hanging provider could previously hold a loop for hours of 900-second timeouts, invisibly). Processed positions count, the tail stays pending, and the queue is drained by back-off, the slot probe or the save notifier — no work is lost.
+* **Note limit default 1500 → 2000** — one step that keeps 176 active prod notes (average 1735 chars) whole instead of splitting them; the "one note = one cluster of facts" band is preserved.
+
+### Fixed
+
+* **Lost wake-up for fresh notes** — the embedding job now rechecks its queue after clearing its wake-up event: a save landing between an empty pass and the event clear no longer waits the grown back-off (up to 15 minutes on an idle system) for vectorization while models are healthy. With models down the recheck costs one refused pass — a failed attempt is not progress, so no busy loop returns.
+
 ## [3.4.0] - 2026-10-28
 
 Release 3.4.0 — "Less information per step and merging without loss": the memory stops paying for its own bookkeeping on every step — searches and listings return headers capped by a character budget, and a note is read point-wise by id. Long notes stop being truncated: merging returns a list of self-contained parts with a strict completeness check, the note limit drops to 1500 characters, and a schema-baked limit can now be changed over a live database by self-migration instead of failing the start.
