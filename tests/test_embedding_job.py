@@ -16,10 +16,13 @@ embedding-петлю сигналом `notify_embedding_pending`. Это зак�
 
 Контракт надёжности сохранён: задание живёт в самой заметке
 (`vector_status='pending'`), событие только ускоряет; при недоступных моделях
-(`EmbeddingError`) сигнала нет и петля честно ждёт по back-off. Перепроверки
-очереди (`queue_empty`) у джобы нет намеренно: очередь векторизации — это и
-есть ожидание модели, поэтому с ней петля крутилась бы вхолостую (busy-loop) —
-это тоже проверяется здесь.
+(`EmbeddingError`) сигнала нет и петля честно ждёт по back-off — перепроверка
+очереди (`queue_empty` → `_embedding_queue_empty`, LSBN-T-30) этого не ломает:
+отказ — не прогресс петли (arch §3.2, no39-05), на интервал ровно два прогона
+(обычный + немедленный lost-wakeup, пул 6), дальше сон. Перепроверка страхует
+сигнал, стёртый `clear()` (lost wakeup), и здесь же проверяются её драйверы:
+разрыв embedding-слота делает очередь пустой для петли, pending-чанк —
+берущейся работой.
 
 Юниты на хосте: HashEmbedder/фейки, сеть не нужна.
 """
@@ -36,10 +39,12 @@ from fakes import FailingEmbedder, HashEmbedder
 
 from app.config import Settings, get_settings
 from app.main import create_app
+from app.services.embedding import EmbeddingError
 from app.services.jobs import BackoffState, build_job_specs, run_loop
 from app.services.notes import NoteService
+from app.services.slot_outcome import SlotOutcome
 from app.services.worker import EMBEDDING_JOB, BackgroundWorker
-from app.storage.db import init_db, session
+from app.storage.db import init_db, session, transaction
 
 DIM = 8
 
@@ -85,21 +90,36 @@ def _vector_pending(settings: Settings) -> int:
     return int(row["pending"])
 
 
-def patch_wait_event_timeout(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    """Мгновенный таймаут ожидания события с записью запрошенных пауз.
+class TransientFailEmbedder(FailingEmbedder):
+    """FailingEmbedder с транзиентным исходом UNAVAILABLE (arch §13.2).
 
-    Форма «по интервалу + событие» ждёт `wait_for(event.wait(), timeout)`:
-    реальный таймаут (30 с) тест не переживёт — ожидание подменяется мгновенным
-    `TimeoutError`, пауза записана, петля растит back-off (как в test_links_job).
+    Транзиентный отказ разрыв слота embedding НЕ открывает
+    (`SlotBreaker._TRANSIENT_OUTCOMES`) — ворота партию берут, и картина
+    итерации петли чистая: два прогона, потом сон по back-off (сценарий
+    разрыва слота — в test_worker_queue_unavailable_models.py).
     """
+
+    def embed(self, text: str) -> list[float]:
+        self.calls.append(text)
+        raise EmbeddingError(self.message, outcome=SlotOutcome.UNAVAILABLE)
+
+
+def patch_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Мгновенный `asyncio.sleep` с записью запрошенных пауз.
+
+    С перепроверкой очереди (LSBN-T-30) итерация с непустой очередью до
+    `wait_for` не доходит — петля спит `asyncio.sleep(back-off)`: реальную
+    паузу (30 с) тест не переживёт — сон подменяется мгновенным yield'ом,
+    запрошенная пауза записана (как `patch_sleep` в test_jobs).
+    """
+    real_sleep = asyncio.sleep
     delays: list[float] = []
 
-    async def spy(awaitable, timeout=None, *args: object, **kwargs: object):
-        awaitable.close()  # корутину event.wait() не ждём — как при таймауте
-        delays.append(float(timeout))
-        raise asyncio.TimeoutError
+    async def spy(delay: float, *args: object, **kwargs: object) -> None:
+        delays.append(delay)
+        await real_sleep(0)
 
-    monkeypatch.setattr(asyncio, "wait_for", spy)
+    monkeypatch.setattr(asyncio, "sleep", spy)
     return delays
 
 
@@ -125,18 +145,20 @@ def _queue_waiting_records(caplog) -> list:
 # --- регистрация: форма «по интервалу + событие» ------------------------------
 
 
-def test_embedding_job_has_event_and_no_queue_recheck(settings: Settings) -> None:
-    """Регистрация: интервал с back-off + событие `embedding`, без `queue_empty`."""
+def test_embedding_job_has_event_and_queue_recheck(settings: Settings) -> None:
+    """Регистрация: интервал с back-off + событие `embedding` + `queue_empty`."""
     worker = make_worker(settings)
     spec = embedding_spec(worker, settings)
     assert spec.queue == "vector"
     assert spec.interval_sec == settings.pending_retry_sec
-    # Форма «по интервалу + событие»: событие берётся у воркера (владелец
-    # очереди векторизации), save/update ставят его через NoteService.
+    # Событие берётся у воркера (владелец очереди векторизации), save/update
+    # ставят его через NoteService.
     assert spec.wait_event is worker._embedding_event
-    # Перепроверки очереди нет: очередь векторизации — это и есть ожидание
-    # модели; `queue_empty` дал бы busy-loop при недоступном кодировщике.
-    assert spec.queue_empty is None
+    # Перепроверка очереди (LSBN-T-30) страхует сигнал, стёртый `clear()`
+    # (пул 6, lost wakeup); холостого шторма при недоступном кодировщике она
+    # не даёт — отказ не считается прогрессом (no39-05), после одного
+    # немедленного прогона петля уходит в сон по back-off.
+    assert spec.queue_empty == worker._embedding_queue_empty
     # Гигиена worker_jobs осталась в idle-ветке.
     assert spec.idle_hook == worker._purge_done_jobs
     assert spec.queue_stat is not None
@@ -244,21 +266,72 @@ async def test_embedding_error_sends_no_signal_and_grows_backoff(
 ) -> None:
     """Отказ кодирования: сигнала нет, петля ждёт по back-off (не busy-loop).
 
-    Заметка pending (модели недоступны) — событие не выставляется, а каждая
-    пустая итерация растит интервал ожидания: 30 → 60 → 120 с.
+    Заметка pending (модели недоступны) — событие не выставляется; итерация —
+    ровно ДВА прогона (обычный + немедленный lost-wakeup перепроверки,
+    LSBN-T-30), дальше пауза с ростом интервала: 30 → 60 с. Холостого шторма
+    нет: отказ — не прогресс петли (arch §3.2, no39-05).
     """
     _seed_pending(settings)
-    worker = make_worker(settings, FailingEmbedder())
+    worker = make_worker(settings, TransientFailEmbedder())
     spec = embedding_spec(worker, settings)
     real_wait_for = asyncio.wait_for
-    waits = patch_wait_event_timeout(monkeypatch)
+    sleeps = patch_sleep(monkeypatch)
+    runs: list[int] = []
+
+    def counting(self, limit=None) -> int:
+        runs.append(1)
+        return 0  # модель недоступна — статусы не тронуты
+
+    monkeypatch.setattr(BackgroundWorker, "process_pending", counting)
     with caplog.at_level(logging.INFO, logger="app"):
         await real_wait_for(
-            run_loop(spec, lambda: len(waits) >= 2, BackoffState(spec.interval_sec)),
+            run_loop(spec, lambda: len(sleeps) >= 2, BackoffState(spec.interval_sec)),
             timeout=2.0,
         )
-    assert waits == [30.0, 60.0]  # back-off растёт: петля спит, а не крутится
+    assert runs == [1, 1, 1, 1]  # два прогона на итерацию, не десятки (нет шторма)
+    assert sleeps == [30.0, 60.0]  # back-off растёт: петля спит, а не крутится
     assert worker._embedding_event.is_set() is False  # EmbeddingError — сигнала нет
     assert spec.queue_stat()["pending"] == _vector_pending(settings) == 1
     # «Работа есть, но она не выполняется» (FR-2.3) — видно в журнале.
     assert _queue_waiting_records(caplog)
+
+
+# --- драйвер петли `_embedding_queue_empty` (LSBN-T-30) -----------------------
+
+
+def test_slot_breaker_makes_queue_empty(settings: Settings) -> None:
+    """Разрыв embedding-слота — очередь для петли пуста даже с pending-работой.
+
+    Петля спит по back-off и модель не зовёт (no39-05): ворота партию не
+    берут, считать непустую очередь работой — значило бы крутить busy-loop.
+    """
+    _seed_pending(settings)
+    worker = make_worker(settings, HashEmbedder(DIM))
+    assert worker._embedding_queue_empty() is False  # работа берущаяся
+    # AUTH-отказ открывает разрыв сразу (SlotBreaker, FR-4.3).
+    worker._breakers["embedding"].note_failure(SlotOutcome.AUTH)
+    assert worker._breakers["embedding"].is_paused() is True
+    assert worker._embedding_queue_empty() is True
+
+
+def test_pending_chunk_counts_as_work(settings: Settings) -> None:
+    """Pending-чанк без pending-заметок — берущаяся работа (queue_empty False).
+
+    Чанковая очередь — та же embedding-джоба (решение №10), предикат pending —
+    тот же, что у вычитки `_read_chunk_batch`: чанк без строки в
+    `notes_chunks_vec` (анти-джойн). Без чанка и без pending-заметок очередь
+    пуста.
+    """
+    worker = make_worker(settings, HashEmbedder(DIM))
+    assert worker._embedding_queue_empty() is True  # пусто: нет ни заметок, ни чанков
+    with session(settings) as conn, transaction(conn):
+        # Заметка с готовым вектором (не работа), но чанк без вектора — работа.
+        conn.execute(
+            "INSERT INTO notes (id, title, text, namespace, vector_status) "
+            "VALUES (1, 'Заметка', 'текст про встречу', 'default', 'ok')"
+        )
+        conn.execute(
+            "INSERT INTO notes_chunks (note_id, idx, text, tokens) "
+            "VALUES (1, 0, 'текст про встречу', 3)"
+        )
+    assert worker._embedding_queue_empty() is False
