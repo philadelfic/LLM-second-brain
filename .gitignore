@@ -1,0 +1,8 @@
+# Local developer files — never published (no personal/infra info in the repo).
+*.local
+scripts/run_live_tests.env
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.egg-info/
