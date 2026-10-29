@@ -221,6 +221,27 @@ _NON_TRANSIENT_OUTCOMES = frozenset(
     {SlotOutcome.EMPTY, SlotOutcome.TRUNCATED, SlotOutcome.OFF_CONTRACT}
 )
 
+# Wait-класс исходов, при котором продолжать партию бессмысленно (LSBN-T-28):
+# `unavailable`/`timeout` — провайдер лежит или висит; каждая следующая позиция
+# партии — ещё один потенциальный read-таймаут (900 с: config.py
+# `summary_timeout_sec`/`judge_timeout_sec`), поэтому партия до
+# `embedding_batch_size` позиций могла держать петлю и поток до 8 часов,
+# не будучи в back-off и не пиша `queue_waiting` — деградация невидима в
+# журнале. `auth` — ждать бессмысленно в принципе: разрыв слота открывается
+# сразу (`slot_breaker.note_failure`), и до его снятия гейт каркаса (LSBN-T-29)
+# партию не пустит. EMPTY/TRUNCATED/OFF_CONTRACT остаются per-item (`continue`):
+# они не означают «провайдер лежит» (зовутся быстро), а их покрытие — разрыв
+# слота после трёх отказов одного исхода (`slot_breaker.py`). Прецедент
+# снятия партии — джоба миграции (`if outcome == "retry-later": break`).
+# Требование «работа не теряется»: снятие партии ему не
+# противоречит — отказавшая позиция остаётся pending (как и хвост партии),
+# её добирают back-off петли, пробный стук разрыва после паузы и будка
+# нотификатором при новом сохранении; возврат — число обработанных ДО отказа
+# (сделанное засчитывается, как у миграции).
+_BATCH_ABORT_OUTCOMES = frozenset(
+    {SlotOutcome.UNAVAILABLE, SlotOutcome.TIMEOUT, SlotOutcome.AUTH}
+)
+
 # Слот → имя джобы-владельца очереди (для событий внимания и /jobs/attention).
 _SLOT_JOB_NAMES = {
     SLOT_EMBEDDING: EMBEDDING_JOB,
@@ -898,7 +919,11 @@ class BackgroundWorker:
         состоялся (отказ после ответа — `meta` у ошибки), событие дополняется
         полями вызова (§7.2) — второй записи нет. Отказ фиксируется и у
         разрыва слота: открылся — пишется `slot_paused`. Вызывающий сохраняет
-        прежнее поведение (работа остаётся pending, `continue`).
+        прежнее поведение для исходов per-item (работа остаётся pending,
+        `continue`); исход wait-класса (unavailable/timeout/auth,
+        `_BATCH_ABORT_OUTCOMES` — LSBN-T-28, партии summary/title/judge)
+        вызывающий снимает партию (`break`, прецедент migration retry-later):
+        работа остаётся pending — её добирает back-off после возврата слота.
         """
         fields: dict[str, object] = {
             "event": event,
@@ -2130,7 +2155,12 @@ class BackgroundWorker:
         Признанный дубль → merge-работа в очередь слота summary (решение
         №10: merge ходит в summary-слот). Отказ судьи (JudgeError) — работа
         остаётся pending, повтор по back-off judge-петли (NFR-3: обе заметки
-        целы). Протухшая заметка (удалена/вектор не готов) — работа снимается.
+        целы); исход wait-класса (unavailable/timeout/auth,
+        `_BATCH_ABORT_OUTCOMES`, LSBN-T-28) вдобавок снимает партию — остальные
+        позиции остаются pending и добираются по back-off после возврата
+        слота (прецедент migration retry-later), иначе «висящий» провайдер
+        жёг бы до 32 × 900 с на партию. Протухшая заметка (удалена/вектор не
+        готов) — работа снимается.
         Заметка с таймером (TTL, no46-03) — тоже снимается, но ДО судьи и без
         вызова моделей (событие `dedup_skipped`, reason="note has a lifetime").
         """
@@ -2257,6 +2287,10 @@ class BackgroundWorker:
                         outcome_of(exc),
                         detail=str(exc),
                     )
+                    if outcome_of(exc) in _BATCH_ABORT_OUTCOMES:
+                        # транзиент/auth: партию снимаем, остальное — повтор по
+                        # back-off (прецедент migration retry-later).
+                        break
                     continue  # работа остаётся pending — повтор по back-off
                 if best is not None:
                     older_id, cosine_value = best
@@ -2625,7 +2659,11 @@ class BackgroundWorker:
         TITLE_PROMPT, Фаза 11), результат обрезается до TITLE_MAX_WORDS слов
         механикой, запись title. Отказ генерации
         (SummaryError) — заметка остаётся без названия, повтор по back-off
-        (NFR-3). Возвращает число записанных названий.
+        (NFR-3); исход wait-класса (unavailable/timeout/auth,
+        `_BATCH_ABORT_OUTCOMES`, LSBN-T-28) вдобавок снимает партию — остальные
+        позиции остаются без названия и добираются по back-off после возврата
+        слота (прецедент migration retry-later). Возвращает число записанных
+        названий (до отказа, если партия снята).
 
         Запись названия инвалидирует полный вектор (lsb-0001 FR-1.1: title
         участвует в кодировании) — в той же транзакции векторизация
@@ -2660,6 +2698,10 @@ class BackgroundWorker:
                     detail=str(exc),
                     meta=getattr(exc, "meta", None),
                 )
+                if outcome_of(exc) in _BATCH_ABORT_OUTCOMES:
+                    # транзиент/auth: партию снимаем, остальное — повтор по
+                    # back-off (прецедент migration retry-later).
+                    break
                 continue  # отказ: title остаётся NULL, повтор по back-off
             self._log_slot_call(
                 SUMMARY_JOB, SLOT_SUMMARY, generated.meta, note_id=row["id"]
@@ -2718,7 +2760,12 @@ class BackgroundWorker:
 
         Режим «Б» (§5.5): генерация — только здесь, по заметкам из очереди.
         Отказ генерации одной заметки не отменяет остальных (NFR-3): статус
-        остаётся pending, заметка догонится следующей партией. Trash
+        остаётся pending, заметка догонится следующей партией. Исключение —
+        wait-класс исходов (unavailable/timeout/auth, `_BATCH_ABORT_OUTCOMES`,
+        LSBN-T-28): провайдер лежит или висит (read-таймаут до 900 с на
+        позицию) — партия снимается (прецедент migration retry-later),
+        обработанные до отказа позиции засчитаны, хвост остаётся pending и
+        добирается по back-off после возврата слота. Trash
         (deleted_at IS NOT NULL) не обслуживается — как и в векторизации.
 
         Гонка с memory_update (ARCH §4.5): суммари пишется только если текст
@@ -2735,9 +2782,10 @@ class BackgroundWorker:
         если хоть одна заметка батча реально доведена до `summary_status='ok'`,
         будится петля `nodes` (`notify_nodes_pending`) — её задание `reclass`
         после сшивания дубликатов могло ждать именно этой выжимки и «спать» по
-        back-off (в приёмочном контуре до 15 мин). Отказ генерации (`continue`
-        выше — статус остаётся pending) и пустой прогон сигнала не дают: «модели
-        недоступны → задание ждёт» сохраняется.
+        back-off (в приёмочном контуре до 15 мин). Отказ генерации per-item
+        (`continue` выше — статус остаётся pending), позиция, снявшая партию
+        (wait-класс, `break` — её статус тоже остаётся pending), и пустой
+        прогон сигнала не дают: «модели недоступны → задание ждёт» сохраняется.
         """
         if self._summarizer is None:
             return 0
@@ -2766,6 +2814,10 @@ class BackgroundWorker:
                     detail=str(exc),
                     meta=getattr(exc, "meta", None),
                 )
+                if outcome_of(exc) in _BATCH_ABORT_OUTCOMES:
+                    # транзиент/auth: партию снимаем, остальное — повтор по
+                    # back-off (прецедент migration retry-later).
+                    break
                 continue  # отказ: status pending остаётся, повтор по back-off
             self._log_slot_call(
                 SUMMARY_JOB, SLOT_SUMMARY, summary_result.meta, note_id=row["id"]
@@ -2807,8 +2859,10 @@ class BackgroundWorker:
         if done:
             # Хоть одна заметка партии реально получила готовую суммари — будим
             # петлю `nodes` (lsb-0012, по образцу `notify_links_pending`).
-            # Одно событие на батч достаточно; отказ генерации сюда не доходит
-            # (выше `continue` — статус остаётся pending).
+            # Одно событие на батч достаточно; отказавшая позиция сюда с
+            # готовой суммари не доходит (per-item `continue` или `break` при
+            # wait-классе — статус остаётся pending), но досчитанные до отказа
+            # позиции партию сняли честно — сигнал по ним оправдан.
             self.notify_nodes_pending()
         return done
 
