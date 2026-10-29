@@ -1,10 +1,12 @@
 """Интеграционные тесты Фаз 3–8 — живые Ollama (@pytest.mark.integration).
 
 Маркер `integration` (pyproject). Сервер векторизации берётся из env
-`LIVE_EMBEDDING_URL` (дефолт — рабочий адрес REQUIREMENTS §4,
-qwen3-embedding:8b, dim 4096); суммаризатор — из `LIVE_SUMMARY_URL`
-(дефолт localhost, lfm2.5:latest). При недоступности — SKIP, а не
-падение (ARCH §7). Проверяется: форматы живых векторов, качество на русских
+`LIVE_EMBEDDING_URL` (дефолт — рабочий адрес REQUIREMENTS §4); модель и
+размерность эмбеддера — `EMBEDDING_MODEL`/`EMBEDDING_DIM` (Settings),
+размерность проверок — `LIVE_EMBEDDING_DIM`; суммаризатор — из
+`LIVE_SUMMARY_URL`/`LIVE_SUMMARY_MODEL` (дефолт localhost, lfm2.5:latest).
+Запускать удобнее раннером `scripts/run_live_tests.sh` — он выставляет env
+под модели контура. При недоступности — SKIP, а не падение (ARCH §7). Проверяется: форматы живых векторов, качество на русских
 перефразах, дедуп-порог, догон pending фоновым воркером; суммаризация:
 реальная длина summary, язык, латентность, timeout, погонка фонового воркера
 (режим «Б»). Фаза 8: save мгновенный — вектора/дедуп догоняет фоновый
@@ -43,8 +45,10 @@ from app.storage import chunks, vectors
 from app.storage.db import init_db, session, transaction
 
 # Дефолт из REQUIREMENTS §4 (операторский адрес); перебить env при другом.
+# Раннер живого яруса (scripts/run_live_tests.sh) выставляет env под модели
+# контура: qwen3-embedding:4b на .109 → dim 2560 (LIVE_EMBEDDING_DIM).
 LIVE_URL_DEFAULT = "http://localhost:11434"
-DIM = 4096  # qwen3-embedding:8b — REQUIREMENTS §8
+DIM = int(os.environ.get("LIVE_EMBEDDING_DIM", "4096"))  # 8b: 4096, 4b: 2560
 
 # Живой суммаризатор — Фаза 4 (REQUIREMENTS §4/§5.5).
 LIVE_SUMMARY_URL_DEFAULT = "http://localhost:11434"
@@ -90,7 +94,7 @@ def live(tmp_path_factory) -> SimpleNamespace:
 
 
 def test_embedding_shape_and_determinism(live) -> None:
-    """/api/embed живой: размерность 4096; один текст — тот же вектор."""
+    """/api/embed живой: вектор размерности LIVE_EMBEDDING_DIM; один текст — тот же вектор."""
     text = "интеграционная проверка формата живых векторов"
     vector = live.embedding.embed(text)
     assert len(vector) == DIM
