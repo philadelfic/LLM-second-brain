@@ -515,20 +515,22 @@ def _chunks_note_text() -> str:
     )
     half = para * 30
     text = half + CHUNKS_FACT + half
-    assert 14000 <= len(text) <= 35000
+    # Потолок контракта LSBN-T-26 (3.4.1): диапазон max_note_chars 500..20000;
+    # ~15k влезает, заметка по-прежнему многочанковая (chunk_size 1024).
+    assert 14000 <= len(text) <= 20000
     return text
 
 
 @pytest.fixture(scope="session")
 def live_chunks(tmp_path_factory) -> SimpleNamespace:
-    """Живой векторизатор + дефолты §8, MAX_NOTE_CHARS=35000.
+    """Живой векторизатор + дефолты §8, MAX_NOTE_CHARS=20000 (потолок T-26).
 
     Отдельная БД (tmp) — живые заметки фаз 3–4 не мешают ранжированию
     контрольного факта. Ollama недоступна — SKIP (skip расставит fixture).
 
-    Прогрев обязателен: 8B-модель на CPU 113 грузится минуты; с
-    read-таймаутом 720 с (решение 2026-08-30) дефолты §8 (32×3)
-    влезают, подъёмки идут по канону как в проде.
+    Прогрев обязателен: эмбеддер на CPU грузится минуты; с read-таймаутом
+    720 с (решение 2026-08-30) дефолты §8 (32×3) влезают, подъёмки идут
+    по канону как в проде.
     """
     url = os.environ.get("LIVE_EMBEDDING_URL", LIVE_URL_DEFAULT)
     if not _reachable(url):
@@ -540,7 +542,7 @@ def live_chunks(tmp_path_factory) -> SimpleNamespace:
         mcp_auth_token="live-chunk-token",
         db_path=str(tmp_path_factory.mktemp("live-chunks") / "notes.db"),
         embedding_dim=DIM,
-        max_note_chars=35000,
+        max_note_chars=20000,
     )
     init_db(settings)
     embedding = EmbeddingService(settings)
