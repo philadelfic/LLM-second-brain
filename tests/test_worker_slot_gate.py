@@ -1,9 +1,13 @@
-"""Ворота слота в воркере (№39, релиз 3.2.0; arch §6.2, §6.7).
+"""Ворота слота в каркасе джоб (№39, релиз 3.2.0; LSBN-T-29; arch §6.2, §6.7).
 
 Юнит без сети: при открытом разрыве партия не берётся (вызовы модели не
-жгутся); при наступившем пробном стуке один `probe()` снимает разрыв
-(`ok`) или переставляет паузу (`auth_failed`); отказ слота попадает в
-журнал событием с типом исхода, а работа остаётся pending.
+жгутся) — с 3.4.1 проверку делает КАРКАС (`JobSpec.gate` в `run_loop`),
+а не ручной `if` в теле джобы; при наступившем пробном стуке один
+`probe()` снимает разрыв (`ok`) или переставляет паузу (`auth_failed`);
+отказ слота попадает в журнал событием с типом исхода, а работа остаётся
+pending. Сквозной прогон петли с закрытыми воротами (0 — не прогресс,
+no39-05) — в tests/test_jobs.py, ворота внешних джоб — в
+tests/test_jobs_slot_gate.py.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ from app.config import get_settings
 from app.services.judge import JudgeResult
 from app.services.notes import NoteService
 from app.services.slot_outcome import SlotOutcome
-from app.services.worker import BackgroundWorker
+from app.services.worker import BackgroundWorker, build_judge_job
 from app.storage.db import init_db
 
 
@@ -88,13 +92,18 @@ def _worker_with_dedup_jobs(settings, judge) -> BackgroundWorker:
 
 @pytest.mark.asyncio
 async def test_gate_skips_batch_when_paused(settings, monkeypatch) -> None:
-    """Разрыв открыт, стук не наступил → process_* = 0 и вызовов модели нет."""
+    """Разрыв открыт, стук не наступил → ворота закрыты, вызовов модели нет.
+
+    Гейт теперь у каркаса (`JobSpec.gate`, LSBN-T-29): закрытые ворота дают 0
+    ДО `process()` — тело джобы партию не берёт, судья не зовётся.
+    """
     _freeze(monkeypatch)
     judge = ProbeJudge(result="ok")
     worker = _worker_with_dedup_jobs(settings, judge)
     worker._breakers["judge"].note_failure(SlotOutcome.AUTH)
     assert worker._breakers["judge"].is_paused() is True
-    assert await worker._process_judge() == 0
+    spec = build_judge_job(worker, settings)
+    assert spec.gate is not None and spec.gate() is False
     assert judge.judge_calls == []  # партия не бралась
     assert judge.probe_calls == 0  # стук ещё не наступил
     assert worker._pending_jobs("judge", "dedup", 10)  # работа осталась pending
@@ -107,10 +116,12 @@ async def test_gate_probes_then_runs(settings, monkeypatch) -> None:
     judge = ProbeJudge(result="ok", verdicts=[False])
     worker = _worker_with_dedup_jobs(settings, judge)
     worker._breakers["judge"].note_failure(SlotOutcome.AUTH)
-    clock["t"] += 901  # пауза истекла — пора стучать
-    # заметка без ранних кандидатов снимается сразу, вторая — по вердикту судьи
-    assert await worker._process_judge() == 2
+    clock["t"] += settings.slot_pause_sec + 1  # пауза истекла — пора стучать
+    spec = build_judge_job(worker, settings)
+    assert spec.gate() is True  # один стук снял разрыв — партия пойдёт сейчас
     assert judge.probe_calls == 1
+    # заметка без ранних кандидатов снимается сразу, вторая — по вердикту судьи
+    assert await spec.process() == 2
     assert len(judge.judge_calls) == 1
     assert worker._breakers["judge"].is_paused() is False
 
@@ -122,8 +133,9 @@ async def test_probe_auth_rearms_pause(settings, monkeypatch) -> None:
     judge = ProbeJudge(result="auth_failed")
     worker = _worker_with_dedup_jobs(settings, judge)
     worker._breakers["judge"].note_failure(SlotOutcome.AUTH)
-    clock["t"] += 901
-    assert await worker._process_judge() == 0
+    clock["t"] += settings.slot_pause_sec + 1
+    spec = build_judge_job(worker, settings)
+    assert spec.gate() is False
     assert judge.probe_calls == 1
     assert judge.judge_calls == []
     assert worker._breakers["judge"].is_paused() is True

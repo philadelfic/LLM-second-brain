@@ -9,6 +9,12 @@
 3.3.1 (LSBN-S-3): `oldest_pending_sec` — возраст старейшей работы, ждущей
 исполнения (pending ИЛИ waiting): при разрыве слота возраст ожидания виден,
 null — только когда обе категории пусты.
+
+3.4.1 (LSBN-T-29): снимки двусоставные — `queue_stat` джобы отдаёт СЫРОЙ
+снимок (свои вычисления waiting/attention не тронуты), а перенос
+pending → waiting при заблокированном слоте делает каркас: `is_gated` →
+`gated_queue_stat` в `queues_health` (и в событии `queue_waiting`). Поэтому
+гейт-состояния проверяются здесь через `worker.queues_health()`.
 """
 
 from __future__ import annotations
@@ -84,7 +90,7 @@ def test_judge_waiting_and_attention(settings) -> None:
             (_ts(0), attention_id),
         )
 
-    stat = worker._judge_queue_stat()
+    stat = worker.queues_health()["judge"]
     assert stat["pending"] == 1          # берётся только работа без внимания
     assert stat["attention"] == 1        # замороженная ждёт человека
     assert stat["waiting"] == 1          # у судьи отложено именно замороженное
@@ -108,15 +114,16 @@ def test_queue_empty_ignores_attention(settings) -> None:
 
 
 def test_paused_slot_moves_pending_to_waiting(settings, monkeypatch) -> None:
-    """Разрыв открыт: pending слота уходит в waiting, петля очередь считает пустой."""
+    """Разрыв открыт: сырой снимок как есть, каркас едет pending → waiting."""
     _freeze(monkeypatch)
     worker = make_worker(settings)
     worker._create_job("judge", "dedup", 1)
     worker._create_job("judge", "dedup", 2)
-    assert worker._judge_queue_stat()["pending"] == 2
+    assert worker._judge_queue_stat()["pending"] == 2  # сырое — джоба не гейтит
 
     worker._breakers["judge"].note_failure(SlotOutcome.AUTH)  # разрыв открыт
-    stat = worker._judge_queue_stat()
+    assert worker._judge_queue_stat()["pending"] == 2  # сырое не менялось
+    stat = worker.queues_health()["judge"]  # каркас применяет gated_queue_stat
     assert stat["pending"] == 0
     assert stat["waiting"] == 2  # вся текущая работа — в ожидании слота
     assert worker._judge_queue_empty() is True  # петля не крутится вхолостую
@@ -128,9 +135,9 @@ def test_vector_queue_waits_on_embedding_break(settings, monkeypatch) -> None:
     NoteService(settings, FailingEmbedder()).save("заметка ждёт кодировщик")
     worker = make_worker(settings, FailingEmbedder())
 
-    assert worker._vector_queue_stat()["pending"] == 1
+    assert worker.queues_health()["vector"]["pending"] == 1
     worker._breakers["embedding"].note_failure(SlotOutcome.AUTH)
-    stat = worker._vector_queue_stat()
+    stat = worker.queues_health()["vector"]
     assert stat["pending"] == 0
     assert stat["waiting"] == 1
 
@@ -153,14 +160,14 @@ def test_vector_age_survives_embedding_break(settings, monkeypatch) -> None:
     worker = make_worker(settings, FailingEmbedder())
 
     worker._breakers["embedding"].note_failure(SlotOutcome.AUTH)  # разрыв открыт
-    stat = worker._vector_queue_stat()
+    stat = worker.queues_health()["vector"]
     assert stat["pending"] == 0
     assert stat["waiting"] == 2
     assert isinstance(stat["oldest_pending_sec"], int)
     assert stat["oldest_pending_sec"] >= 119
 
     worker._breakers["embedding"].note_success()  # разрыв закрыт
-    stat = worker._vector_queue_stat()
+    stat = worker.queues_health()["vector"]
     assert stat["pending"] == 2
     assert stat["waiting"] == 0
     assert isinstance(stat["oldest_pending_sec"], int)
@@ -211,7 +218,7 @@ def test_judge_attention_only_age_visible(settings, monkeypatch) -> None:
             (_ts(0), job_id),
         )
 
-    stat = worker._judge_queue_stat()
+    stat = worker.queues_health()["judge"]
     assert stat["pending"] == 0
     assert stat["waiting"] == 1
     assert stat["attention"] == 1
@@ -219,7 +226,7 @@ def test_judge_attention_only_age_visible(settings, monkeypatch) -> None:
     assert stat["oldest_pending_sec"] >= 89
 
     worker._breakers["judge"].note_failure(SlotOutcome.AUTH)  # разрыв judge
-    stat = worker._judge_queue_stat()
+    stat = worker.queues_health()["judge"]
     assert stat["pending"] == 0
     assert stat["waiting"] == 1
     assert stat["attention"] == 1
