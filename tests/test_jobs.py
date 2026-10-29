@@ -55,6 +55,8 @@ def make_spec(
     wait_event: asyncio.Event | None = None,
     idle_hook=None,
     queue_stat=None,
+    gate=None,
+    is_gated=None,
 ) -> JobSpec:
     """Синтетическая джоба: прогон задаёт тест, остальное — по умолчанию."""
     return JobSpec(
@@ -68,6 +70,8 @@ def make_spec(
         wait_event=wait_event,
         idle_hook=idle_hook,
         queue_stat=queue_stat,
+        gate=gate,
+        is_gated=is_gated,
     )
 
 
@@ -216,6 +220,49 @@ async def test_zero_progress_does_not_spin_on_nonempty_queue(monkeypatch, caplog
 
 
 # --- контракт надёжности ------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gate_blocks_process_and_zero_is_not_progress(
+    monkeypatch, caplog
+) -> None:
+    """Ворота слота в каркасе (3.4.1, LSBN-T-29; arch §6.2/§6.7).
+
+    `JobSpec.gate` — единая точка проверки разрыва слота: закрытые ворота —
+    `process()` не зовётся вовсе (модель не жгётся). Гейт-0 — «отказ джобы не
+    считается прогрессом» (no39-05): `queue_waiting` — снимок через
+    `is_gated` → `gated_queue_stat`, работа видна как waiting — и сон по
+    back-off, никакого busy-loop.
+    """
+    delays = patch_sleep(monkeypatch)
+    calls = 0
+
+    async def process() -> int:
+        nonlocal calls
+        calls += 1
+        return 1  # если тело зовётся при закрытых воротах — тест это увидит
+
+    spec = make_spec(
+        process,
+        interval_sec=30,
+        queue="gated",
+        queue_stat=lambda: {"pending": 2, "oldest_pending_sec": 4},
+        gate=lambda: False,
+        is_gated=lambda: True,
+    )
+    state = BackoffState(30)
+    with caplog.at_level(logging.INFO, logger="app"):
+        await asyncio.wait_for(
+            run_loop(spec, lambda: len(delays) >= 1, state), timeout=1.0
+        )
+    assert calls == 0        # ворота закрыты — тело прогона не выполнялось
+    assert delays == [30.0]  # 0 — не прогресс: сон по back-off
+    assert state.interval == 60.0
+    waited = _queue_waiting_records(caplog)
+    assert len(waited) == 1
+    assert waited[0].pending == 0
+    assert waited[0].waiting == 2  # работа ждёт слот (pending → waiting)
+
 
 @pytest.mark.asyncio
 async def test_iteration_failure_does_not_kill_loop(caplog) -> None:

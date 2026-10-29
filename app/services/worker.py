@@ -147,6 +147,7 @@ from app.services.jobs import (
     BackoffState,
     JobSpec,
     build_job_specs,
+    gated_queue_stat,
     next_interval,
     queue_snapshot,
     run_loop,
@@ -478,8 +479,10 @@ class BackgroundWorker:
         # Разрывы слотов (№39, arch §6.2): состояние СЛОТА, а не джобы —
         # слот делят разные петли (summary: суммаризация/слияние/
         # классификация/описания и обход `nodes`; judge: dedup и структура),
-        # поэтому разрыв живёт в одной точке на слот. `_slot_gate` проверяет
-        # разрыв в начале прогона, `_log_slot_failure` фиксирует исход отказа.
+        # поэтому разрыв живёт в одной точке на слот. Разрыв перед прогоном
+        # проверяют ворота каркаса (`JobSpec.gate` → `_slot_gate`, 3.4.1,
+        # LSBN-T-29: единая точка, без ручных `if` в телах джоб),
+        # `_log_slot_failure` фиксирует исход отказа.
         # Пауза — SLOT_PAUSE_SEC (потолок back-off), порог открытия —
         # SLOT_PAUSE_AFTER (auth открывает сразу). Состояние — в памяти
         # процесса: переживания рестарта не требует (конфигурация слота
@@ -1376,10 +1379,10 @@ class BackgroundWorker:
         (`process_pending` — синхронный SQL/HTTP, уходит в `to_thread`) и
         чанковая очередь (`process_pending_chunks` — своя async-обработка с
         Semaphore внутри). Возвращает число фактически обработанных заданий:
-        0 уводит каркасную петлю в ожидание с back-off (arch §3.2).
+        0 уводит каркасную петлю в ожидание с back-off (arch §3.2). Разрыв
+        слота до тела прогона не доходит: ворота — в каркасе (`JobSpec.gate`,
+        3.4.1, LSBN-T-29) — ручной `if` убран, проверка одна на все джобы.
         """
-        if not self._slot_gate(SLOT_EMBEDDING, EMBEDDING_JOB):
-            return 0  # разрыв слота: партия не берётся (№39, arch §6.2)
         with history.bind_origin(f"job:{EMBEDDING_JOB}"):
             processed = await asyncio.to_thread(self.process_pending)
             processed += await self.process_pending_chunks()
@@ -1392,9 +1395,9 @@ class BackgroundWorker:
         сохранён (как в исходной петле). Возвращает число обработанных
         заданий: 0 уводит каркасную петлю к ожиданию сигнала
         `notify_summary_pending` (форма «по требованию», пул 6) или таймаута.
+        Разрыв слота summary проверяют ворота каркаса (`JobSpec.gate`,
+        3.4.1, LSBN-T-29) — ручной `if` убран.
         """
-        if not self._slot_gate(SLOT_SUMMARY, SUMMARY_JOB):
-            return 0  # разрыв слота summary: партия не берётся (№39, §6.2)
         with history.bind_origin(f"job:{SUMMARY_JOB}"):
             processed = await asyncio.to_thread(self.process_title_pending)
             processed += await asyncio.to_thread(self.process_summary_pending)
@@ -1417,10 +1420,10 @@ class BackgroundWorker:
         """Прогон judge-джобы: партия judge-работ (дедуп) в `to_thread`.
 
         0 уводит каркасную петлю к ожиданию сигнала `notify_judge_pending`
-        (форма «по требованию», пул 6) или таймаута интервала.
+        (форма «по требованию», пул 6) или таймаута интервала. Разрыв слота
+        judge проверяют ворота каркаса (`JobSpec.gate`, 3.4.1, LSBN-T-29) —
+        ручной `if` убран.
         """
-        if not self._slot_gate(SLOT_JUDGE, JUDGE_JOB):
-            return 0  # разрыв слота judge: партия не берётся (№39, §6.2)
         with history.bind_origin(f"job:{JUDGE_JOB}"):
             return await asyncio.to_thread(self.process_judge_pending)
 
@@ -1753,79 +1756,71 @@ class BackgroundWorker:
 
     # --- наблюдаемость очередей (lsb-0014-03, FR-2.2) -------------------------
 
+    def _slot_blocked(self, slot: str) -> bool:
+        """Слот заблокирован прямо сейчас? (№39, arch §6.9; LSBN-T-29).
+
+        Единая точка условия гейта для СНИМКОВ очередей (раньше жила в
+        `_gated_queue_stat`): разрыв слота открыт (`SlotBreaker.is_paused`)
+        ИЛИ работа слота не может быть взята (decision недоступен,
+        `DECISION_FALLBACK=false` — слоты `summary`/`judge`, no39-05).
+        БЕЗ побочных эффектов — только память, никогда не зовёт модели и не
+        переставляет паузу: `is_gated` джоб читают её из `/health.queues` и
+        события `queue_waiting` (наблюдаемость не жжёт вызовы, контракт
+        `/health.queues`; пробный стук по истечении паузы — забота `gate`,
+        то есть `worker._slot_gate`, в каркасном `run_loop`).
+        """
+        breaker = self._breakers.get(slot)
+        return (
+            breaker is not None and breaker.is_paused()
+        ) or (
+            slot in (SLOT_SUMMARY, SLOT_JUDGE) and self._decision_blocks_work()
+        )
+
     def queues_health(self) -> dict[str, dict]:
         """Собрать `/health.queues` по реестру джоб (FR-2.2): только SQL.
 
         У каждой зарегистрированной джобы с очередью берётся её собственный
         снимок (`JobSpec.queue_stat`) — `/health` не правится при добавлении
-        джобы. Джоба без очереди (`expiration`) в объект не попадает;
-        обращений к моделям нет (только чтение pending-состояния).
+        джобы. Джоба без очереди (`expiration`) в объект не попадает.
+        Слоты единообразно (3.4.1, LSBN-T-29): при заблокированном слоте
+        (`spec.is_gated` → `_slot_blocked`) сырой снимок прогоняется через
+        каркасный `gated_queue_stat` — работа едет из `pending` в `waiting`
+        у ВСЕХ джоб (прежде внешние migration/warnings и areas этому не
+        подчинялись). Обращений к моделям нет (только чтение
+        pending-состояния; `is_gated` — память/SQL, см. `_slot_blocked`).
         """
         queues: dict[str, dict] = {}
         for spec in build_job_specs(self, self._settings):
             if spec.queue is None or spec.queue_stat is None:
                 continue
-            queues[spec.queue] = spec.queue_stat()
+            stat = spec.queue_stat()
+            if spec.is_gated is not None and spec.is_gated():
+                stat = gated_queue_stat(stat)
+            queues[spec.queue] = stat
         return queues
 
-    def _gated_queue_stat(self, slot: str, stat: dict) -> dict:
-        """Снимок очереди с учётом разрыва слота (№39, arch §6.9).
-
-        Разрыв слота открыт (`SlotBreaker.is_paused`) или работа слота не
-        может быть взята (decision недоступен, `DECISION_FALLBACK=false` —
-        слоты `summary`/`judge` и классификатор `nodes`, no39-05) — петля
-        партию не берёт, поэтому вся текущая работа из `pending` уезжает в
-        `waiting` (`pending=0`), а `oldest_pending_sec`/`attention` сохраняются
-        (3.3.1: `queue_snapshot` гасит возраст только при пустых
-        pending+waiting — сохранение теперь фактическое, включая разрыв слота):
-        ожидание видно в `/health.queues`, но петля не крутится вхолостую.
-        Иначе — снимок нормализуется как есть (возраст и внимание не
-        пересчитываются).
-        """
-        pending = int(stat.get("pending", 0) or 0)
-        waiting = int(stat.get("waiting", 0) or 0)
-        attention = int(stat.get("attention", 0) or 0)
-        breaker = self._breakers.get(slot)
-        gated = (
-            breaker is not None and breaker.is_paused()
-        ) or (
-            slot in (SLOT_SUMMARY, SLOT_JUDGE) and self._decision_blocks_work()
-        )
-        if gated:
-            return queue_snapshot(
-                0,
-                stat.get("oldest_pending_sec"),
-                waiting=waiting + pending,
-                attention=attention,
-            )
-        return queue_snapshot(
-            pending,
-            stat.get("oldest_pending_sec"),
-            waiting=waiting,
-            attention=attention,
-        )
-
     def _vector_queue_stat(self) -> dict:
-        """Снимок очереди векторизации заметок: pending и возраст старейшего.
+        """Сырой снимок очереди векторизации заметок: pending и возраст.
 
         Источник — `notes.vector_status='pending'` (тот же предикат, что у
         легаси-счётчика `pending_vector`); SQL живёт рядом с `health_counts`
-        в NoteService. №39 (arch §6.9): при открытом разрыве embedding очередь
-        ждёт слот — `_gated_queue_stat` (работа едет в `waiting`).
+        в NoteService. Перенос pending → waiting при разрыве embedding делает
+        каркас (`queues_health`/`queue_waiting` через `is_gated`,
+        3.4.1, LSBN-T-29) — метод отдаёт снимок как есть.
         """
-        return self._gated_queue_stat(
-            SLOT_EMBEDDING, self._notes.vector_queue_stat()
-        )
+        return self._notes.vector_queue_stat()
 
     def _summary_queue_stat(self) -> dict:
-        """Снимок очереди суммаризации (№39, arch §6.9).
+        """Сырой снимок очереди суммаризации (№39, arch §6.9).
 
         `pending` — работа, которую петля может взять СЕЙЧАС: заметки
         (title-доген + pending суммаризации) плюс pending merge-работы слота
         summary БЕЗ внимания. `attention` — pending merge-работы с вниманием
         (no39-02, ждут человека), `waiting = attention`: у слота summary
         отложено именно замороженное. `oldest_pending_sec` — максимум возраста
-        по обоим источникам; при открытом разрыве слота — `_gated_queue_stat`.
+        по обоим источникам. Перенос pending → waiting при разрыве слота
+        делает каркас (`is_gated` → `gated_queue_stat`, 3.4.1, LSBN-T-29) —
+        собственные вычисления waiting/attention не тронуты.
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
@@ -1849,25 +1844,25 @@ class BackgroundWorker:
                 ") AS oldest_pending_sec"
             ).fetchone()
         attention = int(row["attention"])
-        stat = queue_snapshot(
+        return queue_snapshot(
             row["pending"],
             row["oldest_pending_sec"],
             waiting=attention,
             attention=attention,
         )
-        return self._gated_queue_stat(SLOT_SUMMARY, stat)
 
     def _judge_queue_stat(self) -> dict:
-        """Снимок очереди judge (№39, arch §6.9).
+        """Сырой снимок очереди judge (№39, arch §6.9).
 
         `pending` — dedup-работы слота judge БЕЗ внимания (берущееся сейчас,
         драйвер `_judge_queue_empty`); `attention` — с вниманием (no39-02),
         `waiting = attention`: у судьи отложено именно замороженное. Возраст
         (3.3.1, LSBN-S-3) — `now - MIN(created_at)` по ВСЕМ pending джобы
         (attention-работа тоже ждёт исполнения; иначе attention-only состояние
-        `pending=0, waiting>0` давало бы `null` вопреки определению). При
-        открытом разрыве judge — `_gated_queue_stat`. Таблица создаётся лениво
-        (`_ensure_job_table`), моделей не зовём.
+        `pending=0, waiting>0` давало бы `null` вопреки определению).
+        Перенос pending → waiting при разрыве judge делает каркас
+        (`is_gated` → `gated_queue_stat`, 3.4.1, LSBN-T-29). Таблица
+        создаётся лениво (`_ensure_job_table`), моделей не зовём.
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
@@ -1884,23 +1879,25 @@ class BackgroundWorker:
                 "FROM worker_jobs WHERE slot = 'judge'"
             ).fetchone()
         attention = int(row["attention"])
-        stat = queue_snapshot(
+        return queue_snapshot(
             row["pending"],
             row["oldest_pending_sec"],
             waiting=attention,
             attention=attention,
         )
-        return self._gated_queue_stat(SLOT_JUDGE, stat)
 
     def _areas_queue_stat(self) -> dict:
-        """Снимок очереди областей: сумма pending по ВКЛЮЧЁННЫМ областям (FR-2.5).
+        """Сырой снимок очереди областей: сумма pending по ВКЛЮЧЁННЫМ (FR-2.5).
 
         Источник pending — тот же, что у `_areas_queue_empty`: pending-записи
         активных строк включённых областей (`enabled_areas`, №40) — выключенная
         область фоном не забирается и в общий счётчик не входит. Суммы
         складываются, возраст старейшего — максимум `now - updated_at` по
         областям; пусто — `null`. Накопление выключенной области видно
-        отдельно в `/health.areas` (`areas_health`).
+        отдельно в `/health.areas` (`areas_health`). Перенос pending →
+        waiting при разрыве embedding (области кодируют тем же слотом, №39,
+        arch §6.9) делает каркас (`is_gated` → `gated_queue_stat`,
+        3.4.1, LSBN-T-29).
         """
         pending = 0
         oldest: int | None = None
@@ -1918,10 +1915,7 @@ class BackgroundWorker:
                 value = row["oldest_pending_sec"]
                 if value is not None:
                     oldest = int(value) if oldest is None else max(oldest, int(value))
-        stat = queue_snapshot(pending, oldest)
-        # №39 (arch §6.9): петля `areas` кодирует тем же слотом embedding —
-        # разрыв слота означает, что очередь ждёт его.
-        return self._gated_queue_stat(SLOT_EMBEDDING, stat)
+        return queue_snapshot(pending, oldest)
 
     def areas_health(self) -> dict[str, dict]:
         """`/health.areas` (FR-4.3, №40): по ВСЕМ областям `{enabled, pending}`.
@@ -3084,13 +3078,12 @@ class BackgroundWorker:
         `source='sweep'`/`'after_merge'`, `outcome`, `reason`, `target`,
         `note_id`). Возврат — число разобранных заметок (0 уводит каркасную
         петлю к ожиданию интервала или сигнала `notify_nodes_pending`).
+        Разрыв слота summary (классификатор ходит в него, №39, §6.2)
+        проверяют ворота каркаса (`JobSpec.gate`, 3.4.1, LSBN-T-29) —
+        ручной `if` убран: при разрыве партия не берётся вовсе, петля уходит
+        в back-off; задание и очередь не теряются (разбудит сигнал/таймаут).
         """
         limit = self._settings.job_nodes_batch if budget is None else budget
-        # Ворота слота summary (№39, §6.2): при разрыве классификатор не
-        # зовём — прогон возвращает 0, петля уходит в back-off; задание и
-        # очередь не теряются (разбудит сигнал/таймаут после снятия разрыва).
-        if not self._slot_gate(SLOT_SUMMARY, NODES_JOB):
-            return 0
         # (1) Промоция первой: заметка не «переезжает» в узел, который
         # появится в этом же прогоне (FR-3.1). Отказ не роняет джобу (FR-3.2).
         self._run_promotion(NODES_JOB)
@@ -3308,6 +3301,9 @@ class BackgroundWorker:
         (задания — `created_at`, кандидаты — `updated_at`), `null` — очередь
         пуста. Только SQL, без обращений к моделям; снимок работает и у
         выключенной джобы (`SQL` собирается в `_nodes_queue_stat_sql`).
+        Перенос pending → waiting при разрыве слота summary (классификатор
+        ходит в него, №39, arch §6.9) делает каркас (`is_gated` →
+        `gated_queue_stat`, 3.4.1, LSBN-T-29).
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
@@ -3318,10 +3314,7 @@ class BackgroundWorker:
                         self._settings.namespace_auto_move_min_confidence
                 },
             ).fetchone()
-        stat = queue_snapshot(row["pending"], row["oldest_pending_sec"])
-        # №39 (arch §6.9): классификатор обхода `nodes` ходит в слот summary —
-        # при его разрыве очередь ждёт слот (работа едет в `waiting`).
-        return self._gated_queue_stat(SLOT_SUMMARY, stat)
+        return queue_snapshot(row["pending"], row["oldest_pending_sec"])
 
     def _nodes_queue_empty(self) -> bool:
         """Пуста ли очередь `nodes` (дешёвая перепроверка, пул 6, lost wakeup).
@@ -3334,10 +3327,15 @@ class BackgroundWorker:
         `reclass` + кандидаты обоих пулов обхода `default`. Заметка/задание,
         ждущее суммари, очередь непустой НЕ делает: джоба его не возьмёт, а
         сама заметка видна в очереди `summary` — иначе петля крутилась бы
-        вхолостую (busy-loop) вместо back-off. Только SQL, без обращений к
-        моделям (FR-2.2).
+        вхолостую (busy-loop) вместо back-off. Слот — через единую точку
+        условия гейта (`_slot_blocked`, 3.4.1, LSBN-T-29; прежде гейт был
+        размазан по снимку): заблокированный слот для петли — пустая очередь
+        (no39-05). Только SQL, без обращений к моделям (FR-2.2).
         """
-        return int(self._nodes_queue_stat()["pending"] or 0) == 0
+        return (
+            self._slot_blocked(SLOT_SUMMARY)
+            or int(self._nodes_queue_stat()["pending"] or 0) == 0
+        )
 
     # --- чанковая очередь (Фаза 7) ---------------------------------------------
 
@@ -3479,6 +3477,10 @@ class BackgroundWorker:
 # PENDING_RETRY_SEC у очередей и фиксированные 300 с у зачистки (новых env эта
 # постановка не заводит). `queue_stat` — снимок своей очереди для
 # `/health.queues` (lsb-0014-03, FR-2.2): у `expiration` очереди нет (`None`).
+# Ворота слота (3.4.1, LSBN-T-29): `gate` (для `run_loop`, с пробным стуком)
+# и `is_gated` (для снимков, без моделей) передают `worker._slot_gate`/
+# `worker._slot_blocked` — проверка разрыва живёт в каркасе, ручных `if` в
+# телах джоб больше нет.
 
 
 def build_embedding_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
@@ -3492,6 +3494,8 @@ def build_embedding_job(worker: BackgroundWorker, settings: Settings) -> JobSpec
     гигиена `worker_jobs` (`idle_hook`, пул 5) и пауза PENDING_RETRY_SEC с
     back-off.
 
+    Ворота слота (3.4.1, LSBN-T-29): `gate` — `_slot_gate` (с пробным стуком
+    по истечении паузы), `is_gated` — `_slot_blocked` (снимки без моделей).
     Перепроверку очереди (`queue_empty`) НЕ задаём намеренно: очередь
     векторизации — это и есть ожидание модели (`vector_status='pending'`),
     поэтому непустая очередь означает «отложенное задание», а не прогресс
@@ -3512,6 +3516,8 @@ def build_embedding_job(worker: BackgroundWorker, settings: Settings) -> JobSpec
         idle_hook=worker._purge_done_jobs,
         queue_stat=worker._vector_queue_stat,
         slot=SLOT_EMBEDDING,
+        gate=lambda: worker._slot_gate(SLOT_EMBEDDING, EMBEDDING_JOB),
+        is_gated=lambda: worker._slot_blocked(SLOT_EMBEDDING),
     )
 
 
@@ -3520,6 +3526,8 @@ def build_summary_job(
 ) -> JobSpec | None:
     """Джоба `summary`: title-доген → summarize → merge, сигнал `summary`.
 
+    Ворота слота (3.4.1, LSBN-T-29): `gate` — `_slot_gate` (с пробным
+    стуком), `is_gated` — `_slot_blocked` (снимки без моделей).
     Без суммаризатора (тестовый режим Фазы 3) джоба неприменима — сборщик
     возвращает None, в реестр она не попадает (петли не было и раньше).
     """
@@ -3537,11 +3545,17 @@ def build_summary_job(
         idle_hook=None,
         queue_stat=worker._summary_queue_stat,
         slot=SLOT_SUMMARY,
+        gate=lambda: worker._slot_gate(SLOT_SUMMARY, SUMMARY_JOB),
+        is_gated=lambda: worker._slot_blocked(SLOT_SUMMARY),
     )
 
 
 def build_judge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
-    """Джоба `judge`: партия judge-работ (дедуп), сигнал `judge`."""
+    """Джоба `judge`: партия judge-работ (дедуп), сигнал `judge`.
+
+    Ворота слота (3.4.1, LSBN-T-29): `gate` — `_slot_gate` (с пробным
+    стуком), `is_gated` — `_slot_blocked` (снимки без моделей).
+    """
     return JobSpec(
         name=JUDGE_JOB,
         queue="judge",
@@ -3554,11 +3568,21 @@ def build_judge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         idle_hook=None,
         queue_stat=worker._judge_queue_stat,
         slot=SLOT_JUDGE,
+        gate=lambda: worker._slot_gate(SLOT_JUDGE, JUDGE_JOB),
+        is_gated=lambda: worker._slot_blocked(SLOT_JUDGE),
     )
 
 
 def build_areas_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
-    """Джоба `areas`: вектора записей областей (субстрат 3.0.0), сигнал `areas`."""
+    """Джоба `areas`: вектора записей областей (субстрат 3.0.0), сигнал `areas`.
+
+    Слот — `embedding` (№39, arch §6.9; LSBN-T-29): области кодируются тем же
+    слотом, что заметки (прецедент `_areas_queue_empty`), — теперь это
+    объявлено и в `JobSpec.slot`, и в воротах: `gate` — `_slot_gate`
+    embedding-слота (с пробным стуком), `is_gated` — `_slot_blocked`
+    (снимки без моделей). Прежде слот не заявлялся (None) — джоба при разрыве
+    продолжала дёргать мёртвый слот.
+    """
     return JobSpec(
         name=AREAS_JOB,
         queue="areas",
@@ -3570,7 +3594,9 @@ def build_areas_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         wait_event=worker._areas_event,
         idle_hook=None,
         queue_stat=worker._areas_queue_stat,
-        slot=None,
+        slot=SLOT_EMBEDDING,
+        gate=lambda: worker._slot_gate(SLOT_EMBEDDING, AREAS_JOB),
+        is_gated=lambda: worker._slot_blocked(SLOT_EMBEDDING),
     )
 
 
@@ -3615,7 +3641,11 @@ def build_nodes_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
     сейчас (берущееся задание `reclass` либо кандидат пула) и заставляет петлю
     продолжить прогон без сна; заметка/задание, ждущее модель или суммари, — не
     работа, и петля уходит в сон по back-off (busy-loop'а нет, arch §3.2,
-    «отложенное задание — не прогресс»).
+    «отложенное задание — не прогресс»); заблокированный слот summary
+    (`_slot_blocked`) тоже делает очередь пустой для петли (no39-05).
+
+    Ворота слота (3.4.1, LSBN-T-29): `gate` — `_slot_gate` summary-слота
+    (с пробным стуком), `is_gated` — `_slot_blocked` (снимки без моделей).
     """
     batch = settings.job_nodes_batch
 
@@ -3637,6 +3667,8 @@ def build_nodes_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         idle_hook=None,
         queue_stat=worker._nodes_queue_stat,
         slot=SLOT_SUMMARY,
+        gate=lambda: worker._slot_gate(SLOT_SUMMARY, NODES_JOB),
+        is_gated=lambda: worker._slot_blocked(SLOT_SUMMARY),
     )
 
 

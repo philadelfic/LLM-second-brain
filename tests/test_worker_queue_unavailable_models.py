@@ -21,9 +21,10 @@
 Числа наблюдаемости (`queues_health`/`queue_stat`) сверяются с фактом по
 строкам `worker_jobs` — «числа совпадают с фактом» из приёмки брифа 3.3.0.
 
-Прогон — прямыми вызовами `_process_judge` (тело петли каркаса), без снов:
-асинхронное ожидание `run_loop` (back-off, `queue_waiting`) покрыто
-соседними тестами (`test_jobs.py`, `test_worker_queue_waiting_event.py`),
+Прогон — обёрткой каркаса `jobs._gated_process(spec)` (та же, что в обоих
+вызовах `run_loop`; с 3.4.1, LSBN-T-29, ворота слота — в каркасе, не в теле
+джобы), без снов: асинхронное ожидание `run_loop` (back-off, `queue_waiting`)
+покрыто соседними тестами (`test_jobs.py`, `test_worker_queue_waiting_event.py`),
 здесь важен контракт очереди, а не форма расписания; драйвер петли
 `_judge_queue_empty` проверяется напрямую. Фаза «недоступны» транзиентного
 сценария опрашивает всю очередь одним прогоном `process_judge_pending(5)` —
@@ -42,10 +43,11 @@ import pytest
 from fakes import FailingEmbedder, FixedSummarizer, HashEmbedder, RecordingDedup, fake_meta
 
 from app.config import get_settings
+from app.services import jobs
 from app.services.judge import JudgeError, JudgeResult
 from app.services.notes import NoteService
 from app.services.slot_outcome import SlotOutcome
-from app.services.worker import BackgroundWorker
+from app.services.worker import BackgroundWorker, build_judge_job
 from app.storage.db import init_db, session, transaction
 
 
@@ -159,6 +161,7 @@ async def test_transient_outage_waits_then_drains(settings, monkeypatch) -> None
     _freeze(monkeypatch)
     judge = FlakyJudge(fail_outcome=SlotOutcome.UNAVAILABLE)
     worker = _worker_with_five_judge_jobs(settings, judge)
+    spec = build_judge_job(worker, settings)
 
     # --- фаза «недоступны»: транзиентный отказ, разрыв не открывается -------
     # Вся очередь (5 пар) — одним прогоном с явным лимитом (см. докстринг
@@ -186,21 +189,21 @@ async def test_transient_outage_waits_then_drains(settings, monkeypatch) -> None
     # --- фаза «доступны»: слот отвечает — дренаж партиями по батчу 2 --------
     judge.fail_outcome = None
     # Итерация 1: первые 2 работы (заметки 2–3).
-    assert await worker._process_judge() == 2
+    assert await jobs._gated_process(spec) == 2
     rows = _job_rows(settings)
     assert sum(row["status"] == "done" for row in rows) == 2
     assert sum(row["status"] == "pending" for row in rows) == 3
     # Итерация 2: следующие 2 (заметки 4–5).
-    assert await worker._process_judge() == 2
+    assert await jobs._gated_process(spec) == 2
     rows = _job_rows(settings)
     assert sum(row["status"] == "done" for row in rows) == 4
     assert sum(row["status"] == "pending" for row in rows) == 1
     # Итерация 3: хвост (заметка 6) — дренаж занял ТРИ прогона петли (2+2+1).
-    assert await worker._process_judge() == 1
+    assert await jobs._gated_process(spec) == 1
     rows = _job_rows(settings)
     assert all(row["status"] == "done" for row in rows)  # ни одно не потеряно
     # Контрольный прогон: очередь пуста — busy-loop-остатка нет.
-    assert await worker._process_judge() == 0
+    assert await jobs._gated_process(spec) == 0
     assert not worker._pending_jobs("judge", "dedup", 10)
     stat = worker.queues_health()["judge"]
     assert stat["pending"] == 0
@@ -217,10 +220,13 @@ async def test_auth_outage_breaker_waits_then_probe_drains(
     clock = _freeze(monkeypatch)
     judge = FlakyJudge(fail_outcome=SlotOutcome.AUTH)
     worker = _worker_with_five_judge_jobs(settings, judge)
+    spec = build_judge_job(worker, settings)
     _backdate_judge_jobs(settings, 120)  # старейшая работа — 120 с (детерминизм возраста)
 
-    # --- отказ доступа: разрыв открывается сразу, партия не берётся ---------
-    assert await worker._process_judge() == 0
+    # --- отказ доступа: разрыв открывается сразу, работа не двигается -------
+    # Первый прогон ещё при живых воротах (разрыв откроют ИСХОДЫ отказов
+    # внутри прогона) — партия обработанных не даёт, работы остаются pending.
+    assert await jobs._gated_process(spec) == 0
     assert worker._breakers["judge"].is_paused() is True
     rows = _job_rows(settings)
     assert len(rows) == 5
@@ -230,7 +236,7 @@ async def test_auth_outage_breaker_waits_then_probe_drains(
 
     # --- закрытый гейт: партия не берётся, вызовы модели не жгутся ----------
     calls_before = judge.judge_calls
-    assert await worker._process_judge() == 0
+    assert await jobs._gated_process(spec) == 0
     assert judge.judge_calls == calls_before  # модель не вызывалась
     assert judge.probe_calls == 0  # стук ещё не наступил
     # Очередь для петли «пуста» (иначе back-off-петля крутилась бы вхолостую).
@@ -251,24 +257,24 @@ async def test_auth_outage_breaker_waits_then_probe_drains(
     # --- пауза истекла: стук снимает разрыв — дренаж партиями по батчу 2 ----
     clock["t"] += settings.slot_pause_sec + 1
     judge.fail_outcome = None
-    # Итерация 1: один дешёвый стук перед партией, затем первые 2 работы.
-    assert await worker._process_judge() == 2
+    # Итерация 1: один дешёвый стук в воротах, затем первые 2 работы.
+    assert await jobs._gated_process(spec) == 2
     assert judge.probe_calls == 1  # стук — один, перед первой партией
     assert worker._breakers["judge"].is_paused() is False
     rows = _job_rows(settings)
     assert sum(row["status"] == "done" for row in rows) == 2
     assert sum(row["status"] == "pending" for row in rows) == 3
     # Итерация 2: следующие 2 (заметки 4–5).
-    assert await worker._process_judge() == 2
+    assert await jobs._gated_process(spec) == 2
     rows = _job_rows(settings)
     assert sum(row["status"] == "done" for row in rows) == 4
     assert sum(row["status"] == "pending" for row in rows) == 1
     # Итерация 3: хвост (заметка 6) — дренаж занял ТРИ прогона петли (2+2+1).
-    assert await worker._process_judge() == 1
+    assert await jobs._gated_process(spec) == 1
     assert worker.slots_health()["judge"]["state"] == "closed"
     assert all(row["status"] == "done" for row in _job_rows(settings))
     # Контрольный прогон: очередь пуста — busy-loop-остатка нет.
-    assert await worker._process_judge() == 0
+    assert await jobs._gated_process(spec) == 0
     assert judge.probe_calls == 1  # повторных стуков дренаж не требует
     stat = worker.queues_health()["judge"]
     assert stat["pending"] == 0
