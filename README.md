@@ -109,6 +109,19 @@ first-run walkthrough (compose, token, Open WebUI, `/health`).
   and the `OLLAMA_KEEP_ALIVE` note.
 - [Changelog](CHANGELOG.md) — release history (Keep a Changelog).
 
+## Contributing
+
+- **Commits and code comments are in English** (a standing rule since
+  2026-10-29). Commit messages follow Conventional Commits
+  (`Feat(...)`/`Fix(...)`/`Chore(...)`).
+- **Comments only when they earn their place**: a constraint or a reason the
+  code itself does not show. No restatements of the code, no dates or
+  decision initials.
+- Documentation (`documents/`, `development-docs/`, release folders) stays in
+  Russian and is maintained in Russian — the rule covers git commits and
+  code comments/docstrings only.
+- Do not rewrite published git history.
+
 ## Operational notes
 
 - **`keep_alive` is not sent by the client** (since v2.1). Model residency is
