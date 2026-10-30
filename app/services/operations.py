@@ -34,6 +34,8 @@ from typing import TYPE_CHECKING
 
 from pydantic_core import PydanticUndefined
 
+from app.services.slot_budget import resolve_budgets
+
 if TYPE_CHECKING:  # только для аннотаций — модуль остаётся чистым
     from app.config import Settings
 
@@ -53,6 +55,9 @@ OPERATIONS: dict[str, str] = {
 
 # Поля переопределения (решение №1 брифа): плоский env `<ОПЕРАЦИЯ>_<ПОЛЕ>`.
 # Порядок — часть контракта (источники в /health и тестах перечисляют так).
+# LSBN-T-33: `reasoning_num_predict` — бюджет РАССУЖДЕНИЯ операции (отдельно от
+# бюджета ответа `num_predict`); слот-слой у него один на все слоты — глобальный
+# `slot_reasoning_num_predict` (см. resolve_operation).
 OPERATION_FIELDS: tuple[str, ...] = (
     "model",
     "provider",
@@ -60,6 +65,7 @@ OPERATION_FIELDS: tuple[str, ...] = (
     "api_key",
     "think",
     "num_predict",
+    "reasoning_num_predict",
     "timeout_sec",
     "context_tokens",
     "model_type",
@@ -74,6 +80,7 @@ SPEC_FIELDS: dict[str, str] = {
     "api_key": "api_key",
     "think": "think",
     "num_predict": "num_predict",
+    "reasoning_num_predict": "reasoning_num_predict",
     "timeout_sec": "read_timeout",
     "context_tokens": "context_tokens",
     "model_type": "model_type",
@@ -148,6 +155,10 @@ def resolve_operation(
     `merge_num_predict` (историческое поле, config.py) — уже операционный
     env: значение 0 («авто») считается ЗАДАННЫМ операцией — поведение
     прежнее (наследование слота для merge не включается).
+    Исключение — `reasoning_num_predict` (LSBN-T-33): у него нет слот-групповых
+    полей, поэтому операционный слой читается и для `judge`
+    (`JUDGE_REASONING_NUM_PREDICT`), а слот-слой — глобальный
+    `slot_reasoning_num_predict`.
     """
     slot = OPERATIONS.get(operation)
     if slot is None:
@@ -155,13 +166,17 @@ def resolve_operation(
     sources: dict[str, str] = {}
     values: dict[str, object] = {}
     for field in OPERATION_FIELDS:
-        if operation != slot:
+        if operation != slot or field == "reasoning_num_predict":
             value = getattr(settings, _settings_field(operation, field), None)
             if value is not None:
                 values[field] = value
                 sources[field] = "op"
                 continue
-        slot_field = _slot_settings_field(slot, field)
+        slot_field = (
+            "slot_reasoning_num_predict"
+            if field == "reasoning_num_predict"
+            else _slot_settings_field(slot, field)
+        )
         if type(settings).model_fields.get(slot_field) is not None:
             sources[field] = _source_of(settings, slot_field)
         else:
@@ -174,18 +189,66 @@ def operation_overrides_active(settings: "Settings") -> bool:
     return any(resolve_operation(operation, settings)[1].get("op") for operation in OPERATIONS)  # noqa: E501
 
 
-def operations_health(settings: "Settings") -> dict[str, dict[str, str]]:
-    """Снимок для /health.operations: {операция: {model, provider, source}}.
+def _operation_budgets(operation: str, settings: "Settings") -> dict[str, object]:
+    """Бюджеты операции для /health.operations (LSBN-T-33, ТкР 3.7).
 
-    `source` — источник МОДЕЛИ операции (`op` | `slot` | `default`). Адресов
+    Эффективные значения полей собираются той же цепочкой, что в `for_operation`
+    (env операции → слот-слой → дефолт), после чего считается раздельный бюджет
+    (`slot_budget.resolve_budgets`, чистая функция — цикла импорта нет).
+    `prompt_tokens=0` — это КОНФИГУРАЦИОННЫЙ потолок операции (максимум), а не
+    бюджет конкретного вызова: фактические бюджеты живёт в `ChatMeta` и журнале
+    (`slot_call`). `think=None`/True — размышление разрешено (резерв считается);
+    False — нет (sent = ответ). Эффективный think НЕ заданной операции — флаг
+    слот-группы.
+    """
+    slot = OPERATIONS[operation]
+    values, _sources = resolve_operation(operation, settings)
+
+    def effective(field: str, fallback: object) -> object:
+        if field in values:
+            return values[field]
+        slot_field = (
+            "slot_reasoning_num_predict"
+            if field == "reasoning_num_predict"
+            else _slot_settings_field(slot, field)
+        )
+        if type(settings).model_fields.get(slot_field) is not None:
+            return getattr(settings, slot_field)
+        return fallback
+
+    budgets = resolve_budgets(
+        operation=operation,
+        prompt_tokens=0,
+        explicit_answer=int(effective("num_predict", 0) or 0),  # type: ignore[arg-type]
+        explicit_reasoning=effective("reasoning_num_predict", None),  # type: ignore[arg-type]
+        context_tokens=int(effective("context_tokens", 0) or 0),  # type: ignore[arg-type]
+        reserve_tokens=settings.slot_prompt_reserve_tokens,
+        defensive_cap=settings.slot_max_output_tokens,
+        think_enabled=effective("think", None) is not False,
+    )
+    return {
+        "answer_budget": budgets.answer_budget,
+        "reasoning_budget": budgets.reasoning_budget,
+        "sent_budget": budgets.sent_budget,
+        "answer_source": budgets.answer_source,
+        "reasoning_source": budgets.reasoning_source,
+    }
+
+
+def operations_health(settings: "Settings") -> dict[str, dict[str, object]]:
+    """Снимок для /health.operations: {операция: {model, provider, source, бюджеты}}.
+
+    `source` — источник МОДЕЛИ операции (`op` | `slot` | `default`); с LSBN-T-33
+    рядом бюджеты (`answer_budget`/`reasoning_budget`/`sent_budget` + их
+    источники) — конфигурационный потолок операции при пустом промпте. Адресов
     и ключей здесь нет сознательно (решение №4 брифа): /health открыт наружу
     без Bearer, адрес живёт в журнале (`slot_call`) и в событии джобы при
     ошибке.
     """
-    block: dict[str, dict[str, str]] = {}
+    block: dict[str, dict[str, object]] = {}
     for operation in OPERATIONS:
         _values, sources = resolve_operation(operation, settings)
-        block[operation] = {
+        entry: dict[str, object] = {
             "model": str(
                 getattr(settings, _settings_field(operation, "model"), None)
                 or getattr(settings, _slot_settings_field(OPERATIONS[operation], "model"))
@@ -198,6 +261,8 @@ def operations_health(settings: "Settings") -> dict[str, dict[str, str]]:
             ),
             "source": sources["model"],
         }
+        entry.update(_operation_budgets(operation, settings))
+        block[operation] = entry
     return block
 
 

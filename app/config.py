@@ -125,6 +125,12 @@ class Settings(BaseSettings):
     summary_context_tokens: int = 0
     slot_prompt_reserve_tokens: int = 512
     slot_max_output_tokens: int = 32768
+    # LSBN-T-33: слот-уровень бюджета РАССУЖДЕНИЯ (0 — не задан: «сколько
+    # влезет» в пределах контекста, но не за счёт ответа). Транспорт ограничивает
+    # сумму thinking+content, поэтому разделение обеспечивает сторона LSB:
+    # в вызов уходит num_predict = бюджет_ответа + бюджет_рассуждения (с потолком
+    # контекста). Уровень операций — `<ОПЕРАЦИЯ>_REASONING_NUM_PREDICT` (блок ниже).
+    slot_reasoning_num_predict: int = 0
     # №49 (arch §8): порог WARN «бюджет не оставляет места размышлению» и
     # порог WARN «таймаут мал для "думать долго"».
     slot_reasoning_min_output_tokens: int = 4096
@@ -148,6 +154,7 @@ class Settings(BaseSettings):
     summarize_api_key: str | None = None
     summarize_think: bool | None = None
     summarize_num_predict: int | None = None
+    summarize_reasoning_num_predict: int | None = None
     summarize_timeout_sec: int | None = None
     summarize_context_tokens: int | None = None
     summarize_model_type: str | None = None
@@ -158,6 +165,7 @@ class Settings(BaseSettings):
     title_api_key: str | None = None
     title_think: bool | None = None
     title_num_predict: int | None = None
+    title_reasoning_num_predict: int | None = None
     title_timeout_sec: int | None = None
     title_context_tokens: int | None = None
     title_model_type: str | None = None
@@ -167,6 +175,7 @@ class Settings(BaseSettings):
     merge_base_url: str | None = None
     merge_api_key: str | None = None
     merge_think: bool | None = None
+    merge_reasoning_num_predict: int | None = None
     merge_timeout_sec: int | None = None
     merge_context_tokens: int | None = None
     merge_model_type: str | None = None
@@ -177,6 +186,7 @@ class Settings(BaseSettings):
     split_api_key: str | None = None
     split_think: bool | None = None
     split_num_predict: int | None = None
+    split_reasoning_num_predict: int | None = None
     split_timeout_sec: int | None = None
     split_context_tokens: int | None = None
     split_model_type: str | None = None
@@ -187,6 +197,7 @@ class Settings(BaseSettings):
     classify_api_key: str | None = None
     classify_think: bool | None = None
     classify_num_predict: int | None = None
+    classify_reasoning_num_predict: int | None = None
     classify_timeout_sec: int | None = None
     classify_context_tokens: int | None = None
     classify_model_type: str | None = None
@@ -197,6 +208,7 @@ class Settings(BaseSettings):
     describe_api_key: str | None = None
     describe_think: bool | None = None
     describe_num_predict: int | None = None
+    describe_reasoning_num_predict: int | None = None
     describe_timeout_sec: int | None = None
     describe_context_tokens: int | None = None
     describe_model_type: str | None = None
@@ -207,6 +219,7 @@ class Settings(BaseSettings):
     structure_judge_api_key: str | None = None
     structure_judge_think: bool | None = None
     structure_judge_num_predict: int | None = None
+    structure_judge_reasoning_num_predict: int | None = None
     structure_judge_timeout_sec: int | None = None
     structure_judge_context_tokens: int | None = None
     structure_judge_model_type: str | None = None
@@ -217,6 +230,7 @@ class Settings(BaseSettings):
     embed_api_key: str | None = None
     embed_think: bool | None = None
     embed_num_predict: int | None = None
+    embed_reasoning_num_predict: int | None = None
     embed_timeout_sec: int | None = None
     embed_context_tokens: int | None = None
     embed_model_type: str | None = None
@@ -255,6 +269,10 @@ class Settings(BaseSettings):
     judge_think: bool = False  # при false в вызов идёт "think": false
     # №49: 0 = авто-бюджет; 256 — прежний потолок (legacy при неизвестном контексте).
     judge_num_predict: int = 0
+    # LSBN-T-33: бюджет рассуждения операции judge (None — не задан: глобальный
+    # SLOT_REASONING_NUM_PREDICT). У операции judge имя совпадает со слот-группой,
+    # поэтому операционное поле здесь — единственный уровень поверх глобального.
+    judge_reasoning_num_predict: int | None = None
     # №49 (arch §13.1): тип модели слота judge (reasoning | generation).
     judge_model_type: str = "generation"
     # №49 (arch §13.4): 900 = потолок back-off/паузы слота; было 30.
@@ -823,6 +841,12 @@ class Settings(BaseSettings):
         need_low("slot_prompt_reserve_tokens", self.slot_prompt_reserve_tokens, 1)
         need_low("slot_max_output_tokens", self.slot_max_output_tokens, 1)
         need_low("judge_timeout_sec", self.judge_timeout_sec, 1)
+        # LSBN-T-33: бюджет рассуждения 0 — «сколько влезет» (авто), поэтому
+        # минимум 0; операционные None = «не задано» — проверяются ниже.
+        need_low("slot_reasoning_num_predict", self.slot_reasoning_num_predict, 0)
+        judge_reasoning = self.judge_reasoning_num_predict
+        if judge_reasoning is not None:
+            need_low("judge_reasoning_num_predict", judge_reasoning, 0)
         # №49 (arch §8): пороги типа модели — минимум 1, реляционно порог
         # размышления не может быть выше защитного потолка авто-бюджета.
         need_low(
@@ -866,6 +890,10 @@ class Settings(BaseSettings):
             num_predict = getattr(self, f"{prefix}_num_predict")
             if num_predict is not None:
                 need_low(f"{prefix}_num_predict", num_predict, 0)
+            # LSBN-T-33: бюджет рассуждения операции — ≥ 0 (None = не задано).
+            reasoning_num_predict = getattr(self, f"{prefix}_reasoning_num_predict", None)
+            if reasoning_num_predict is not None:
+                need_low(f"{prefix}_reasoning_num_predict", reasoning_num_predict, 0)
             timeout_sec = getattr(self, f"{prefix}_timeout_sec")
             if timeout_sec is not None:
                 need_low(f"{prefix}_timeout_sec", timeout_sec, 1)

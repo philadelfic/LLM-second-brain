@@ -228,6 +228,11 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     # переопределение одного процесса поверх слот-группы; умолчание None =
     # «не задано» (наследуется слот). MERGE_NUM_PREDICT — историческое поле
     # (0 = авто), уже было в таблице выше.
+    # Релиз 3.5.0, раздельный бюджет рассуждения LSBN-T-33: слот-уровень и
+    # операция judge (её имя совпадает со слот-группой, поэтому отдельное
+    # поле; остальные операции генерирует цикл ниже).
+    "SLOT_REASONING_NUM_PREDICT": ("slot_reasoning_num_predict", 0),
+    "JUDGE_REASONING_NUM_PREDICT": ("judge_reasoning_num_predict", None),
 }
 
 for _prefix in (
@@ -247,6 +252,7 @@ for _prefix in (
         ("API_KEY", None),
         ("THINK", None),
         ("NUM_PREDICT", None),
+        ("REASONING_NUM_PREDICT", None),
         ("TIMEOUT_SEC", None),
         ("CONTEXT_TOKENS", None),
         ("MODEL_TYPE", None),

@@ -52,5 +52,9 @@ def test_number_predict_zero_means_auto(monkeypatch) -> None:
     )
     result = explicit.summarize("Заметка.")
     assert result.meta.budget_source == "explicit"
-    assert result.meta.budget == 1234
+    # LSBN-T-33: budget — суммарный sent (ответ + резерв рассуждения),
+    # заявка на ответ — answer_budget.
+    assert result.meta.answer_budget == 1234
+    assert result.meta.budget == result.meta.sent_budget
+    assert result.meta.budget > 1234
     explicit.close()

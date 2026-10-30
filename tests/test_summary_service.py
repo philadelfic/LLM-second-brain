@@ -310,16 +310,40 @@ def test_missing_message_raises(monkeypatch) -> None:
         service.summarize(NOTE)
 
 
+def _empty_body(content: str) -> dict:
+    """Ответ без поля thinking: честный «пустой ответ» (LSBN-T-33 —
+    пустой content при НЕПУСТОМ thinking классифицируется иначе)."""
+    body = ok_body(content)
+    body["message"] = {"role": "assistant", "content": content}
+    return body
+
+
 def test_empty_content_is_treated_as_failure(monkeypatch) -> None:
     """Страховка §5.5: пустой content = отказ, не суммари."""
     for content in ("", "   \n\t"):
         settings = make_settings(monkeypatch)
         service, _ = make_service(
-            settings, [httpx.Response(200, json=ok_body(content))]
+            settings, [httpx.Response(200, json=_empty_body(content))]
         )
         with pytest.raises(SummaryError, match="пустой content"):
             service.summarize(NOTE)
         assert service.last_attempt_ok is False
+
+
+def test_empty_content_with_thinking_is_truncated(monkeypatch) -> None:
+    """LSBN-T-33: content пуст, а thinking был — «бюджет съеден рассуждением»:
+    исход TRUNCATED (внимание человеку), не EMPTY; клиент уже сделал свой
+    авто-ретрай (здесь контекст неизвестен — ретрая нет)."""
+    from app.services.slot_outcome import SlotOutcome
+
+    settings = make_settings(monkeypatch)
+    service, _ = make_service(
+        settings, [httpx.Response(200, json=ok_body(""))]
+    )
+    with pytest.raises(SummaryError, match="съеден рассуждением") as exc_info:
+        service.summarize(NOTE)
+    assert exc_info.value.outcome is SlotOutcome.TRUNCATED
+    assert service.last_attempt_ok is False
 
 
 def test_non_string_content_raises(monkeypatch) -> None:
@@ -511,7 +535,7 @@ def test_merge_off_contract_structure_is_summary_error(monkeypatch) -> None:
     assert service.last_attempt_ok is False
 
     service, _ = make_service(
-        make_settings(monkeypatch), [httpx.Response(200, json=ok_body(""))]
+        make_settings(monkeypatch), [httpx.Response(200, json=_empty_body(""))]
     )
     with pytest.raises(SummaryError, match="пустой content"):
         service.merge(TEXT_A, TEXT_B)

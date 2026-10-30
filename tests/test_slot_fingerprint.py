@@ -38,6 +38,8 @@ EXPECTED_FINGERPRINT_FIELDS: tuple[str, ...] = (
     "summary_timeout_sec",
     "slot_max_output_tokens",
     "slot_prompt_reserve_tokens",
+    # LSBN-T-33: бюджет рассуждения (глобальный слот-уровень).
+    "slot_reasoning_num_predict",
     "judge_model",
     "judge_provider",
     "judge_model_type",
@@ -45,6 +47,7 @@ EXPECTED_FINGERPRINT_FIELDS: tuple[str, ...] = (
     "judge_num_predict",
     "judge_context_tokens",
     "judge_timeout_sec",
+    "judge_reasoning_num_predict",
     # LSBN-F-34: плоские поля операций (7 на генеративную операцию,
     # 3 у embed) — правка env операции тоже «причина ушла».
     "summarize_model",
@@ -54,6 +57,7 @@ EXPECTED_FINGERPRINT_FIELDS: tuple[str, ...] = (
     "summarize_num_predict",
     "summarize_context_tokens",
     "summarize_timeout_sec",
+    "summarize_reasoning_num_predict",
     "title_model",
     "title_provider",
     "title_model_type",
@@ -61,6 +65,7 @@ EXPECTED_FINGERPRINT_FIELDS: tuple[str, ...] = (
     "title_num_predict",
     "title_context_tokens",
     "title_timeout_sec",
+    "title_reasoning_num_predict",
     "merge_model",
     "merge_provider",
     "merge_model_type",
@@ -68,6 +73,7 @@ EXPECTED_FINGERPRINT_FIELDS: tuple[str, ...] = (
     "merge_num_predict",
     "merge_context_tokens",
     "merge_timeout_sec",
+    "merge_reasoning_num_predict",
     "split_model",
     "split_provider",
     "split_model_type",
@@ -75,6 +81,7 @@ EXPECTED_FINGERPRINT_FIELDS: tuple[str, ...] = (
     "split_num_predict",
     "split_context_tokens",
     "split_timeout_sec",
+    "split_reasoning_num_predict",
     "classify_model",
     "classify_provider",
     "classify_model_type",
@@ -82,6 +89,7 @@ EXPECTED_FINGERPRINT_FIELDS: tuple[str, ...] = (
     "classify_num_predict",
     "classify_context_tokens",
     "classify_timeout_sec",
+    "classify_reasoning_num_predict",
     "describe_model",
     "describe_provider",
     "describe_model_type",
@@ -89,6 +97,7 @@ EXPECTED_FINGERPRINT_FIELDS: tuple[str, ...] = (
     "describe_num_predict",
     "describe_context_tokens",
     "describe_timeout_sec",
+    "describe_reasoning_num_predict",
     "structure_judge_model",
     "structure_judge_provider",
     "structure_judge_model_type",
@@ -96,6 +105,7 @@ EXPECTED_FINGERPRINT_FIELDS: tuple[str, ...] = (
     "structure_judge_num_predict",
     "structure_judge_context_tokens",
     "structure_judge_timeout_sec",
+    "structure_judge_reasoning_num_predict",
     "embed_model",
     "embed_provider",
     "embed_timeout_sec",
@@ -167,7 +177,17 @@ def test_fingerprint_changes_with_budget_and_context(tmp_path, monkeypatch) -> N
     reserve = slot_config_fingerprint(
         _settings(tmp_path, monkeypatch, SLOT_PROMPT_RESERVE_TOKENS="1024")
     )
-    assert len({base, budget, context, cap, reserve}) == 5
+    # LSBN-T-33: бюджет рассуждения (глобальный и операционный) — тоже слагаемое:
+    # правка не снимала бы «требует вмешательства» у заданий.
+    reasoning = slot_config_fingerprint(
+        _settings(tmp_path, monkeypatch, SLOT_REASONING_NUM_PREDICT="4096")
+    )
+    op_reasoning = slot_config_fingerprint(
+        _settings(tmp_path, monkeypatch, MERGE_REASONING_NUM_PREDICT="4096")
+    )
+    assert len({base, budget, context, cap, reserve, reasoning, op_reasoning}) == 7
+    assert _parts(reasoning)["slot_reasoning_num_predict"] == "4096"
+    assert _parts(op_reasoning)["merge_reasoning_num_predict"] == "4096"
 
 
 def test_fingerprint_changes_with_model_type(tmp_path, monkeypatch) -> None:

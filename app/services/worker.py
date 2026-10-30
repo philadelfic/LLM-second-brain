@@ -267,6 +267,13 @@ def _call_meta_fields(meta: ChatMeta) -> dict[str, object]:
         "model_type": meta.model_type,
         "budget": meta.budget,
         "budget_source": meta.budget_source,
+        # LSBN-T-33: раздельные бюджеты вызова — в журнале видно, сколько
+        # заявлено под ответ и сколько под рассуждение (и был ли авто-ретрай).
+        "answer_budget": meta.answer_budget,
+        "reasoning_budget": meta.reasoning_budget,
+        "sent_budget": meta.sent_budget,
+        "reasoning_source": meta.reasoning_source,
+        "escalated_from": meta.escalated_from,
         "base_url": meta.base_url,
         "config_source": meta.config_source,
         "prompt_tokens": meta.prompt_tokens,
@@ -778,6 +785,12 @@ class BackgroundWorker:
             snapshot["last_budget"] = meta.budget if meta else None
             snapshot["last_budget_source"] = meta.budget_source if meta else None
             snapshot["last_had_thinking"] = meta.had_thinking if meta else None
+            # LSBN-T-33: раздельные бюджеты последнего вызова — «съедено
+            # рассуждением» видно парой `last_outcome=truncated` +
+            # `last_had_thinking=true` + расщепление бюджетов.
+            snapshot["last_answer_budget"] = meta.answer_budget if meta else None
+            snapshot["last_reasoning_budget"] = meta.reasoning_budget if meta else None
+            snapshot["last_sent_budget"] = meta.sent_budget if meta else None
             health[name] = snapshot
         health[SLOT_DECISION] = self._decision_slot_health(attention)
         return health

@@ -272,11 +272,21 @@ def test_missing_message_raises(monkeypatch) -> None:
         service.judge(TEXT_NEW, TEXT_CANDIDATE)
 
 
+def _empty_body(content: str) -> dict:
+    """Ответ без поля thinking: честный «пустой ответ» (LSBN-T-33 —
+    пустой content при НЕПУСТОМ thinking классифицируется иначе)."""
+    body = ok_body(content)
+    body["message"] = {"role": "assistant", "content": content}
+    return body
+
+
 def test_empty_content_is_treated_as_failure(monkeypatch) -> None:
     """Пустой content — отказ (по образцу суммаризатора, §5.5)."""
     for content in ("", "   \n\t"):
         settings = make_settings(monkeypatch)
-        service, _ = make_service(settings, [httpx.Response(200, json=ok_body(content))])
+        service, _ = make_service(
+            settings, [httpx.Response(200, json=_empty_body(content))]
+        )
         with pytest.raises(JudgeError, match="пустой content"):
             service.judge(TEXT_NEW, TEXT_CANDIDATE)
         assert service.last_attempt_ok is False

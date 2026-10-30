@@ -53,6 +53,10 @@ def test_slots_block(client: TestClient) -> None:
             "last_budget",
             "last_budget_source",
             "last_had_thinking",
+            # LSBN-T-33: раздельные бюджеты последнего вызова.
+            "last_answer_budget",
+            "last_reasoning_budget",
+            "last_sent_budget",
         }
         assert stat["paused_until"] is None  # разрыва нет
         assert stat["attention"] == 0
@@ -148,7 +152,17 @@ def test_operations_block(client: TestClient) -> None:
     body = client.get("/health").json()
     assert set(body["operations"]) == set(OPERATIONS)
     for snapshot in body["operations"].values():
-        assert set(snapshot) == {"model", "provider", "source"}
+        assert set(snapshot) == {
+            "model",
+            "provider",
+            "source",
+            # LSBN-T-33: раздельные бюджеты операции.
+            "answer_budget",
+            "reasoning_budget",
+            "sent_budget",
+            "answer_source",
+            "reasoning_source",
+        }
         assert snapshot["source"] in ("op", "slot", "default")
         assert snapshot["model"]  # модель есть у каждой операции
     # Без переопределений summarize/title/merge наследуют слот summary.

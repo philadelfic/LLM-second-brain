@@ -86,6 +86,11 @@ def fake_meta(slot: str = "summary", operation: str | None = None) -> ChatMeta:
         finish_reason="stop",
         truncated=False,
         duration_ms=1,
+        answer_budget=1000,
+        reasoning_budget=0,
+        sent_budget=1000,
+        answer_source="legacy",
+        reasoning_source="legacy",
     )
 
 

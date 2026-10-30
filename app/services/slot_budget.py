@@ -18,7 +18,7 @@ lsbdef0008-02, arch §5/§13.8): состав конфигурации, смен
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:  # только для аннотации — модуль остаётся чистым (без домена)
     from app.config import Settings
@@ -73,6 +73,84 @@ def resolve_output_budget(
     return LEGACY_OUTPUT_BUDGET.get(operation, LEGACY_DEFAULT_OUTPUT_BUDGET), SOURCE_LEGACY
 
 
+class Budgets(NamedTuple):
+    """Раздельные бюджеты одного вызова (LSBN-T-33, arch §6.1).
+
+    `answer_budget` — гарантированная заявка на полезный ответ; `reasoning_budget`
+    — потолок рассуждения (0 — не резервируется); `sent_budget` — что реально
+    уходит в `num_predict`/`max_tokens` (у транспорта лимит СУММАРНЫЙ:
+    thinking + content, поэтому разделение обеспечивает сторона LSB, а не провод).
+    Транспорт ограничивает сумму, поэтому «ответ не меньше `answer_budget`»
+    на стороне запроса не гарантируется — это заявка; фактическая проверка —
+    по ответу (пустой content при непустом рассуждении — бюджет съеден).
+    """
+
+    answer_budget: int
+    reasoning_budget: int
+    sent_budget: int
+    answer_source: str
+    reasoning_source: str
+
+
+def resolve_budgets(
+    *,
+    operation: str,
+    prompt_tokens: int,
+    explicit_answer: int | None,
+    explicit_reasoning: int | None,
+    context_tokens: int,
+    reserve_tokens: int,
+    defensive_cap: int,
+    think_enabled: bool,
+) -> Budgets:
+    """Раздельные бюджеты ответа и рассуждения (LSBN-T-33, arch §6.1).
+
+    Порядок решений обязателен, деградация при неизвестном контексте — как в
+    `resolve_output_budget`:
+    - `answer_budget` — политика ответа прежняя (`resolve_output_budget`):
+      явный бюджет → «сколько влезет» из контекста → прежний потолок;
+    - `reasoning_budget` — явный операторский (`explicit_reasoning > 0`); иначе
+      при известном контексте — остаток окна после ответа (зажат защитным
+      потолком, не ниже 0); иначе 0 (деградация: рассуждение не резервируется,
+      поведение 3.4.1);
+    - `sent_budget` — при выключенном размышлении (`think_enabled=False`) ровно
+      ответ; иначе сумма ответ+рассуждение, зажатая окном контекста и защитным
+      потолком; при неизвестном контексте — только ответ (деградация).
+
+    Важно: рассуждение не уменьшает заявку на ответ — `answer_budget` входит в
+    `sent_budget` первым слагаемым, а рассуждение занимает остаток окна.
+    """
+    answer_budget, answer_source = resolve_output_budget(
+        operation=operation,
+        prompt_tokens=prompt_tokens,
+        explicit=explicit_answer,
+        context_tokens=context_tokens,
+        reserve_tokens=reserve_tokens,
+        defensive_cap=defensive_cap,
+    )
+    window = context_tokens - prompt_tokens - reserve_tokens
+    if explicit_reasoning is not None and explicit_reasoning > 0:
+        reasoning_budget, reasoning_source = explicit_reasoning, SOURCE_EXPLICIT
+    elif context_tokens > 0:
+        reasoning_budget = max(0, min(window - answer_budget, defensive_cap))
+        reasoning_source = SOURCE_CONTEXT
+    else:
+        reasoning_budget, reasoning_source = 0, SOURCE_LEGACY
+    if not think_enabled or context_tokens <= 0:
+        sent_budget = answer_budget
+    else:
+        sent_budget = max(
+            1, min(answer_budget + reasoning_budget, window, defensive_cap)
+        )
+    return Budgets(
+        answer_budget=answer_budget,
+        reasoning_budget=reasoning_budget,
+        sent_budget=sent_budget,
+        answer_source=answer_source,
+        reasoning_source=reasoning_source,
+    )
+
+
 # Состав отпечатка конфигурации слота (lsbdef0008-02/-03, arch §5/§8/§13.8):
 # порядок слагаемых — часть контракта, значения приводятся к строкам. Провайдер,
 # модель, тип модели, «думать / не думать» (`*_THINK`), бюджет вывода, заявленный
@@ -94,6 +172,9 @@ FINGERPRINT_FIELDS: tuple[str, ...] = (
     "summary_timeout_sec",
     "slot_max_output_tokens",
     "slot_prompt_reserve_tokens",
+    # LSBN-T-33: бюджет рассуждения (глобальный слот-уровень) — правка
+    # меняет исход вызова (sent_budget) так же, как `*_num_predict`.
+    "slot_reasoning_num_predict",
     "judge_model",
     "judge_provider",
     "judge_model_type",
@@ -101,6 +182,7 @@ FINGERPRINT_FIELDS: tuple[str, ...] = (
     "judge_num_predict",
     "judge_context_tokens",
     "judge_timeout_sec",
+    "judge_reasoning_num_predict",
     # LSBN-F-34: плоские поля операций (цепочка env операции → слота →
     # дефолт) — правка MERGE_MODEL/TITLE_TIMEOUT_SEC и т.п. тоже «причина
     # ушла»: без них правка конфигурации операции не снимала бы «требует
@@ -113,6 +195,7 @@ FINGERPRINT_FIELDS: tuple[str, ...] = (
     "summarize_num_predict",
     "summarize_context_tokens",
     "summarize_timeout_sec",
+    "summarize_reasoning_num_predict",
     "title_model",
     "title_provider",
     "title_model_type",
@@ -120,6 +203,7 @@ FINGERPRINT_FIELDS: tuple[str, ...] = (
     "title_num_predict",
     "title_context_tokens",
     "title_timeout_sec",
+    "title_reasoning_num_predict",
     "merge_model",
     "merge_provider",
     "merge_model_type",
@@ -127,6 +211,7 @@ FINGERPRINT_FIELDS: tuple[str, ...] = (
     "merge_num_predict",
     "merge_context_tokens",
     "merge_timeout_sec",
+    "merge_reasoning_num_predict",
     "split_model",
     "split_provider",
     "split_model_type",
@@ -134,6 +219,7 @@ FINGERPRINT_FIELDS: tuple[str, ...] = (
     "split_num_predict",
     "split_context_tokens",
     "split_timeout_sec",
+    "split_reasoning_num_predict",
     "classify_model",
     "classify_provider",
     "classify_model_type",
@@ -141,6 +227,7 @@ FINGERPRINT_FIELDS: tuple[str, ...] = (
     "classify_num_predict",
     "classify_context_tokens",
     "classify_timeout_sec",
+    "classify_reasoning_num_predict",
     "describe_model",
     "describe_provider",
     "describe_model_type",
@@ -148,6 +235,7 @@ FINGERPRINT_FIELDS: tuple[str, ...] = (
     "describe_num_predict",
     "describe_context_tokens",
     "describe_timeout_sec",
+    "describe_reasoning_num_predict",
     "structure_judge_model",
     "structure_judge_provider",
     "structure_judge_model_type",
@@ -155,6 +243,7 @@ FINGERPRINT_FIELDS: tuple[str, ...] = (
     "structure_judge_num_predict",
     "structure_judge_context_tokens",
     "structure_judge_timeout_sec",
+    "structure_judge_reasoning_num_predict",
     "embed_model",
     "embed_provider",
     "embed_timeout_sec",

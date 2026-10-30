@@ -365,7 +365,10 @@ class SlotStat(BaseModel):
     `last_finish_reason`/`last_budget`/`last_budget_source`/`last_had_thinking`
     — диагностика последнего вызова (None — вызова не было) — оператор видит
     причину (обрезано по бюджету / размышление съело вывод) без журнала.
-    Собирается воркером, только SQL/память — моделей не зовём.
+    LSBN-T-33: `last_answer_budget`/`last_reasoning_budget`/`last_sent_budget`
+    — раздельные бюджеты последнего вызова; «съедено рассуждением» видно
+    парой `last_outcome=truncated` + `last_had_thinking=true` и расщеплением
+    бюджетов. Собирается воркером, только SQL/память — моделей не зовём.
     """
 
     ok: bool | None
@@ -376,6 +379,9 @@ class SlotStat(BaseModel):
     last_budget: int | None = None
     last_budget_source: str | None = None
     last_had_thinking: bool | None = None
+    last_answer_budget: int | None = None
+    last_reasoning_budget: int | None = None
+    last_sent_budget: int | None = None
 
 
 class BackupStat(BaseModel):
@@ -433,9 +439,11 @@ class HealthResponse(BaseModel):
     slots: dict[str, SlotStat]
     # LSBN-F-34 (решение №4 брифа): по операции {model, provider, source} —
     # эффективная модель/провайдер и источник конфигурации (op|slot|default).
-    # БЕЗ адресов и ключей: /health открыт наружу (NFR-2); адрес живёт только
+    # LSBN-T-33: рядом раздельные бюджеты операции (answer/reasoning/sent +
+    # их источники) — конфигурационный потолок при пустом промпте. БЕЗ адресов
+    # и ключей: /health открыт наружу (NFR-2); адрес живёт только
     # в журнале (`slot_call`) и в событии джобы при ошибке.
-    operations: dict[str, dict[str, str]]
+    operations: dict[str, dict[str, Any]]
     # №40 (FR-4.3): по каждой области {enabled, pending} — по ВСЕМ областям,
     # включая выключенные (их накопление видно). Собирает воркер, только SQL.
     areas: dict[str, dict]

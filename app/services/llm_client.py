@@ -77,7 +77,7 @@ from app.services.operations import (
     resolve_operation,
 )
 from app.services.ollama_gate import ollama_slot
-from app.services.slot_budget import resolve_output_budget
+from app.services.slot_budget import Budgets, resolve_budgets, resolve_output_budget
 from app.services.splitter import count_tokens
 
 # Провайдеры LLM-слотов (Фаза 11, решение №1).
@@ -244,6 +244,10 @@ class SlotSpec:
     # "думать долго"» — из Settings (для чистоты `slot_config_warnings`).
     reasoning_min_output_tokens: int = 4096
     num_predict: int = 0
+    # LSBN-T-33: операторский бюджет РАССУЖДЕНИЯ (0 — не задан: «сколько
+    # влезет» в пределах контекста). Заполняется фабриками из глобального
+    # SLOT_REASONING_NUM_PREDICT и переопределяется плоским env операции.
+    reasoning_num_predict: int = 0
     min_timeout_sec: int = 300
     # LSBN-F-34: источник МОДЕЛИ этого spec (`op` | `slot` | `default`) —
     # плоское env операции, env слота или дефолт. Заполняет for_operation;
@@ -280,6 +284,7 @@ class SlotSpec:
             prompt_reserve_tokens=settings.slot_prompt_reserve_tokens,
             reasoning_min_output_tokens=settings.slot_reasoning_min_output_tokens,
             num_predict=settings.summary_num_predict,
+            reasoning_num_predict=settings.slot_reasoning_num_predict,
             min_timeout_sec=settings.slot_min_timeout_sec,
         )
 
@@ -300,6 +305,7 @@ class SlotSpec:
             prompt_reserve_tokens=settings.slot_prompt_reserve_tokens,
             reasoning_min_output_tokens=settings.slot_reasoning_min_output_tokens,
             num_predict=settings.judge_num_predict,
+            reasoning_num_predict=settings.slot_reasoning_num_predict,
             min_timeout_sec=settings.slot_min_timeout_sec,
         )
 
@@ -401,6 +407,16 @@ class ChatMeta:
     # секрет (в отличие от ключа, который сюда не попадает никогда).
     base_url: str = ""
     config_source: str = "slot"
+    # LSBN-T-33: раздельные бюджеты вызова. `budget` выше — суммарный
+    # (legacy-совместимость), равен `sent_budget`; `budget_source` равен
+    # `answer_source`. `escalated_from` — sent_budget первой попытки, когда
+    # вызов повторён после «бюджет съеден рассуждением» (None — без ретрая).
+    answer_budget: int = 0
+    reasoning_budget: int = 0
+    sent_budget: int = 0
+    answer_source: str = ""
+    reasoning_source: str = ""
+    escalated_from: int | None = None
 
 
 @dataclass(frozen=True)
@@ -409,6 +425,23 @@ class ChatResult:
 
     content: str
     meta: ChatMeta
+
+
+class LLMReasoningBudgetError(LLMError):
+    """Бюджет ответа съеден рассуждением (LSBN-T-33; класс lsbdef-0008).
+
+    Content пуст, а рассуждение было (ollama — непустой `message.thinking`,
+    openai — `reasoning_tokens > 0` или непустой `reasoning_content`).
+    Это НЕ общий «пустой ответ» и не «отказ слота»: отдельный тип даёт
+    вызывающему опознать исход и повторить вызов с увеличенным бюджетом
+    (в клиенте — один авто-ретрай до окна контекста; дальше — наверх).
+    Признаки: `truncated=True` (бюджет исчерпан), `empty=False`,
+    `transient=False` — исход вызова TRUNCATED (задание ждёт внимания),
+    но причина в тексте ошибки своя, читаемая в журнале.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, truncated=True)
 
 
 class LLMClient:
@@ -455,14 +488,22 @@ class LLMClient:
     ) -> ChatResult:
         """Одна генерация: system+user, non-stream; возвращает content + метаданные.
 
-        num_predict — явный бюджет оператора (None — политика «сколько влезет»:
-        из заявленного контекста слота минус промпт и запас, зажатая защитным
-        потолком; при неизвестном контексте — прежний потолок операции).
+        num_predict — явный бюджет ОТВЕТА оператора (None — политика «сколько
+        влезет»: из заявленного контекста слота минус промпт и запас, зажатая
+        защитным потолком; при неизвестном контексте — прежний потолок
+        операции). Бюджеты раздельные (LSBN-T-33): в вызов уходит
+        `sent_budget = бюджет_ответа + бюджет_рассуждения` (с потолком окна
+        контекста), потому что транспорт ограничивает СУММУ thinking+content.
         `operation` — имя операции для деградации (`summary`/`title`/`merge`/
         `judge`/`classify`). think=None — флаг из spec (слота); bool —
         переопределение (судья структуры: NAMESPACE_JUDGE_THINK).
         Пустой content — отказ (§5.5); reasoning-поля идут только в метаданные.
-        Любой отказ — LLMError/LLMAuthError.
+        Исключение — «бюджет съеден рассуждением» (`LLMReasoningBudgetError`):
+        content пуст, а рассуждение было — ОДИН авто-ретрай с удвоенным
+        бюджетом до окна контекста (не слот-ретрай: back-off и счётчики
+        отказов его не касаются); если ретрай невозможен (окно исчерпано,
+        контекст неизвестен) — отказ уходит наверх. Любой отказ —
+        LLMError/LLMAuthError.
         """
         think_flag = self.spec.think if think is None else think
         # Операция по умолчанию — имя слота: клиент вызывается и без явной
@@ -473,14 +514,80 @@ class LLMClient:
         # потолок spec (LSBN-F-34: плоский env операции → env слота → 0/авто).
         if num_predict is None:
             num_predict = self.spec.num_predict or None
-        budget, budget_source = resolve_output_budget(
+        budgets = resolve_budgets(
             operation=operation,
             prompt_tokens=prompt_tokens,
-            explicit=num_predict,
+            explicit_answer=num_predict,
+            explicit_reasoning=self.spec.reasoning_num_predict or None,
             context_tokens=self.spec.context_tokens,
             reserve_tokens=self.spec.prompt_reserve_tokens,
             defensive_cap=self.spec.max_output_tokens,
+            think_enabled=think_flag is not False,
         )
+        try:
+            return self._chat_once(
+                system_prompt,
+                user_text,
+                operation=operation,
+                budgets=budgets,
+                sent_budget=budgets.sent_budget,
+                think_flag=think_flag,
+                prompt_tokens=prompt_tokens,
+                escalated_from=None,
+            )
+        except LLMReasoningBudgetError:
+            escalation = self._escalation_budget(budgets, prompt_tokens)
+            if escalation is None:
+                raise
+            # Один авто-ретрай с увеличенным sent_budget: это починка формы
+            # запроса, а не повтор слот-отказа — back-off и разрыв слота
+            # не открываются, счётчики отказов не растут.
+            return self._chat_once(
+                system_prompt,
+                user_text,
+                operation=operation,
+                budgets=budgets,
+                sent_budget=escalation,
+                think_flag=think_flag,
+                prompt_tokens=prompt_tokens,
+                escalated_from=budgets.sent_budget,
+            )
+
+    def _escalation_budget(self, budgets: Budgets, prompt_tokens: int) -> int | None:
+        """Увеличенный sent_budget для ретрая после «съеден рассуждением».
+
+        ×2 от отправленного, с потолком окна контекста
+        (`context − prompt − reserve`); ретрая нет (None), если контекст
+        неизвестен, рассуждение не резервировалось (think=false/деградация)
+        или окно уже исчерпано первым вызовом — дальше решает оператор
+        (поднять бюджет/контекст или сменить модель).
+        """
+        if budgets.reasoning_budget <= 0:
+            return None  # деградация (контекст неизвестен) или think=false
+        window = self.spec.context_tokens - prompt_tokens - self.spec.prompt_reserve_tokens
+        escalated = min(budgets.sent_budget * 2, window)
+        return escalated if escalated > budgets.sent_budget else None
+
+    def _chat_once(
+        self,
+        system_prompt: str,
+        user_text: str,
+        *,
+        operation: str,
+        budgets: Budgets,
+        sent_budget: int,
+        think_flag: bool | None,
+        prompt_tokens: int,
+        escalated_from: int | None,
+    ) -> ChatResult:
+        """Один HTTP-вызов с заданным sent_budget + разбор ответа.
+
+        Выделен из `chat_result` (LSBN-T-33): первый вызов идёт с
+        `budgets.sent_budget`, авто-ретрай после «бюджет съеден рассуждением» —
+        с увеличенным. Метаданные всегда описывают ФАКТИЧЕСКИЙ вызов
+        (`sent_budget`, при ретрае — `escalated_from`).
+        """
+        budget = sent_budget
         if self.spec.provider == PROVIDER_OPENAI:
             path = "/v1/chat/completions"
             payload = {
@@ -518,7 +625,7 @@ class LLMClient:
             operation=operation,
             model_type=self.spec.model_type,
             budget=budget,
-            budget_source=budget_source,
+            budget_source=budgets.answer_source,
             prompt_tokens=prompt_count,
             completion_tokens=completion_count,
             reasoning_tokens=reasoning_count,
@@ -529,9 +636,17 @@ class LLMClient:
             duration_ms=duration_ms,
             base_url=self.spec.base_url,
             config_source=self.spec.model_source,
+            answer_budget=budgets.answer_budget,
+            reasoning_budget=budgets.reasoning_budget,
+            sent_budget=sent_budget,
+            answer_source=budgets.answer_source,
+            reasoning_source=budgets.reasoning_source,
+            escalated_from=escalated_from,
         )
         try:
-            content = self._parse_chat_content(data, path, truncated=truncated)
+            content = self._parse_chat_content(
+                data, path, truncated=truncated, had_thinking=had_thinking
+            )
         except LLMError as exc:
             exc.meta = meta  # отказ после ответа модели — метаданные вызова
             raise
@@ -1081,7 +1196,9 @@ class LLMClient:
         had_thinking = bool(thinking)
         return prompt, completion, reasoning, had_thinking, len(thinking or "")
 
-    def _parse_chat_content(self, data: Any, path: str, *, truncated: bool) -> str:
+    def _parse_chat_content(
+        self, data: Any, path: str, *, truncated: bool, had_thinking: bool = False
+    ) -> str:
         """Извлечь content ответа чата; малформация/пустота — отказ (§5.5).
 
         ollama — `message.content` (поле `thinking` отбрасывается в
@@ -1091,6 +1208,9 @@ class LLMClient:
         Правило первенства (№50 §13.8): если `truncated` (причина завершения
         `length`), пустой content — это ОБРЕЗКА бюджета, признак `truncated`
         (признак `empty` не ставится); иначе — прежний `empty`.
+        LSBN-T-33: пустой content при НЕПУСТОМ рассуждении — отдельный исход
+        «бюджет съеден рассуждением» (`LLMReasoningBudgetError`), опознаваемый
+        типом, а не разбором текста ошибки.
         """
         content = None
         if isinstance(data, dict):
@@ -1108,6 +1228,20 @@ class LLMClient:
                 message = data.get("message")
                 content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str) or not content.strip():
+            if had_thinking:
+                # Ответа нет, а рассуждение было: reasoning съел бюджет вывода
+                # (lsbdef-0008 в явной форме). Отдельный тип — вызывающий
+                # отличает «съедено рассуждением» от «слот отказал».
+                detail = (
+                    "done_reason='length' — обрезано по суммарному лимиту вывода"
+                    if truncated
+                    else "модель завершилась без content"
+                )
+                raise LLMReasoningBudgetError(
+                    f"бюджет ответа съеден рассуждением: content пуст, "
+                    f"thinking был ({detail}; провайдер {self.spec.provider}, "
+                    f"слот {self.spec.name}, {path})"
+                )
             if truncated:
                 # reasoning-модель могла съесть бюджет вывода целиком —
                 # вызов обрезан, а не «пуст» (№50 §13.8, дефект lsbdef-0008).
