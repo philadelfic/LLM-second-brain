@@ -686,7 +686,7 @@ def _migration_note_ids(settings: Settings) -> set[int]:
 
 
 def migration_health(settings: Settings) -> dict:
-    """Блок `migration` для /health: фаза, причина, прогресс, инвариант.
+    """Блок `migration` для /health: фаза, направление, причина, инвариант.
 
     Счётчики — ЗАМЕТКИ (решение пилота): old_total — заметки прежней базы
     (живой COUNT — сверковая база), poured — перелитые 1:1 при старте
@@ -700,6 +700,15 @@ def migration_health(settings: Settings) -> dict:
     из настроек процесса — оператор видит, сколько берётся за прогон и на
     сколько джоба уходит в паузу. Без состояния миграции — {"phase": None}
     (slot остаётся: значения — свойства конфигурации, не состояния).
+
+    Направление (DEF-7b, LSBN-D-11): `direction: forward|reverse`. Состояние
+    reverse-pour (возврат вверх — phase=done, прерывание — aborted) пишется
+    `reverse_pour` с подписью `kept_parts` в counters; в этом режиме счётчик
+    `poured` прямого перелива не существует — показываются `poured_rows`
+    (строки ВСЕХ таблиц дельты) и `kept_parts` (неперелитые части остались
+    в уходящей базе), а forward-инвариант не считается (`invariant_ok=None`):
+    числа строк и заметок несравнимы, прежний вывод читался как ошибка
+    миграции. Для abort'а сохранён прежний вид («всё вернулось целым»).
     """
     slot = {
         "batch": int(settings.migration_batch),
@@ -715,11 +724,15 @@ def migration_health(settings: Settings) -> dict:
     if state is None:
         return {"phase": None, "slot": slot}
     phase = str(state.get("phase"))
+    counters = state.get("counters", {})
     waiting = statuses.get("ожидает", 0)
     split_notes = statuses.get("нарезана", 0)
     quarantine = statuses.get("карантин", 0)
     expired = statuses.get("expired", 0)
     old_total = _legacy_total(settings, state, phase)
+    # reverse-pour — единственный писец `kept_parts`; прямому переливу это
+    # поле не принадлежит (pour/split/done вниз — old_total/pending).
+    direction = "reverse" if "kept_parts" in counters else "forward"
     if old_total is None:
         poured = None
         invariant_ok = None
@@ -728,12 +741,17 @@ def migration_health(settings: Settings) -> dict:
         # state.counters от reverse_pour (строки перелива) — не про заметки.
         poured = old_total
         invariant_ok = old_total == poured + split_notes + waiting + quarantine + expired
+    elif direction == "reverse":
+        # Возврат вверх (phase=done): poured прямого перелива не писался,
+        # инвариант прямого хода к этим числам неприменим (DEF-7b).
+        poured = None
+        invariant_ok = None
     else:
-        poured = int(state.get("counters", {}).get("poured", 0))
+        poured = int(counters.get("poured", 0))
         invariant_ok = (
             old_total == poured + split_notes + waiting + quarantine + expired
         )
-    return {
+    block: dict = {
         "phase": phase,
         "target": state.get("target"),
         "reason": state.get("reason"),
@@ -749,6 +767,15 @@ def migration_health(settings: Settings) -> dict:
         },
         "invariant_ok": invariant_ok,
     }
+    if direction == "reverse":
+        # Поля reverse-режима: строки дельты (все таблицы) и неперелитые
+        # части; poured прямого хода в этом состоянии не существует.
+        block["direction"] = "reverse"
+        block["counters"]["poured_rows"] = counters.get("poured")
+        block["counters"]["kept_parts"] = counters.get("kept_parts")
+    else:
+        block["direction"] = "forward"
+    return block
 
 
 def _status_counts(conn: sqlite3.Connection) -> dict[str, int]:

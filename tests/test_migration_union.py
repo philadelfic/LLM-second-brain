@@ -485,6 +485,37 @@ class TestHealthCounters:
             + c["expired"]
         )
 
+    def test_reverse_health_block_is_interpretable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """DEF-7b (LSBN-D-11): после возврата вверх блок честно помечен
+        reverse — poured прямого хода отсутствует, строки дельты и неперелитые
+        части названы своими именами, forward-инвариант не считается."""
+        _migrate_down(monkeypatch)
+        _env(monkeypatch, 20000)  # поднять цель обратно — возврат по цепочке
+        plan = startup_plan(get_settings())
+        assert plan["mode"] == "up_chain"
+        run_startup_migration(get_settings(), plan)
+        block = migration_health(get_settings())
+        assert block["direction"] == "reverse"
+        assert block["phase"] == "done"
+        c = block["counters"]
+        assert c["poured"] is None  # счётчик прямого перелива не существует
+        assert c["poured_rows"] > 0  # строки ВСЕХ таблиц дельты
+        assert c["kept_parts"] == 0  # спуск без нарезки — частей нет
+        assert block["invariant_ok"] is None
+
+    def test_forward_health_block_is_marked_forward(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Прямой ход: direction=forward, поля reverse-режима не появляются."""
+        _migrate_down(monkeypatch)
+        block = migration_health(get_settings())
+        assert block["direction"] == "forward"
+        assert "poured_rows" not in block["counters"]
+        assert "kept_parts" not in block["counters"]
+        assert block["invariant_ok"] is True
+
     def test_quarantine_counts_and_keeps_phase(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
