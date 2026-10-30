@@ -33,6 +33,7 @@ from app.services.search import SearchService
 from app.storage.db import init_db, note_chars_limit, session, transaction
 from app.storage.migration import (
     MIGRATION_NOTES_TABLE,
+    read_chain,
     read_state,
     run_startup_migration,
     set_state_phase,
@@ -606,3 +607,76 @@ class TestIdFloor:
             assert rows[note_id] == f"дельта при живой миграции номер {n}"
         assert rows[20] == _LONG_PLAN
         assert rows[40] == _LONG_CHART
+
+
+class TestAwayNameCollision:
+    """Коллизия имён при swap (LSBN-D-12, находка приёмки 3.4.1).
+
+    Цикл «вниз-вверх» оставляет базу-родственника с тем же CHECK, что у
+    активной; раньше второй возврат упирался в «имя прежней базы занято
+    посторонним файлом» (fail-closed). Теперь имя уходящей базы решается ДО
+    перелива: занятое имя получает суффикс `.away`, базы не удаляются,
+    цепочка документирует фактическое имя.
+    """
+
+    @staticmethod
+    def _cycle_base(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Засеять базу и пройти спуск-подъём-спуск (коллизия готова)."""
+        settings = get_settings()
+        init_db(settings, note_chars=20000)
+        with session(settings) as conn, transaction(conn):
+            for i in range(3):
+                conn.execute(
+                    "INSERT INTO notes(text, title) VALUES (?, ?)",
+                    ("длинный текст миграции туда и обратно " * 120, f"n{i}"),
+                )
+            conn.execute(
+                "INSERT INTO notes(text, title) VALUES ('короткий', 'k')"
+            )
+        _env(monkeypatch, 1500)
+        run_startup_migration(get_settings(), startup_plan(get_settings()))
+        _env(monkeypatch, 20000)
+        run_startup_migration(get_settings(), startup_plan(get_settings()))
+        _env(monkeypatch, 1500)
+        run_startup_migration(get_settings(), startup_plan(get_settings()))
+
+    def test_second_up_survives_same_check_orphan(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Второй подъём при занятом имени уходящей базы: суффикс .away."""
+        self._cycle_base(monkeypatch)
+        settings = get_settings()
+        occupied = sibling_db_path(settings.db_path, 1500)
+        assert pathlib.Path(occupied).is_file()  # база-родственник с тем же CHECK
+        _env(monkeypatch, 20000)
+        plan = startup_plan(get_settings())
+        assert plan["mode"] == "up_chain"
+        run_startup_migration(get_settings(), plan)  # раньше — MigrationError
+        with session(get_settings()) as conn:
+            assert note_chars_limit(conn) == 20000
+        # Посторонний файл не тронут; уходящая база — под свободным именем.
+        assert pathlib.Path(occupied).is_file()
+        assert pathlib.Path(occupied + ".away").is_file()
+        with session(get_settings()) as conn:
+            chain_files = [entry["file"] for entry in read_chain(conn)]
+        assert "notes.1500.db.away" in chain_files
+
+    def test_abort_survives_same_check_orphan(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Прерывание при занятом имени уходящей базы — не падает (D-12):
+        уходящая база уходит под .away, сервис остаётся на прежней."""
+        self._cycle_base(monkeypatch)
+        settings = get_settings()
+        occupied = sibling_db_path(settings.db_path, 1500)
+        outcome = abort_migration(get_settings())
+        assert outcome["aborted"] is True
+        # Активная база — прежняя (CHECK 20000); посторонний файл цел,
+        # уходящая база нарезки — под свободным именем.
+        with session(get_settings()) as conn:
+            assert note_chars_limit(conn) == 20000
+        assert pathlib.Path(occupied).is_file()
+        assert pathlib.Path(occupied + ".away").is_file()
+        # Рестарт с прежним env: миграция не возобновляется (aborted).
+        _env(monkeypatch, 1500)
+        assert startup_plan(get_settings()).get("aborted") is True

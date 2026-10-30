@@ -58,6 +58,7 @@ from app.storage.migration import (
     MIGRATION_NOTES_TABLE,
     SOURCE_MIGRATION_SPLIT,
     MigrationError,
+    free_away_name,
     read_state,
     reverse_pour,
     set_state_phase,
@@ -627,9 +628,13 @@ def abort_migration(settings: Settings) -> dict:
     )
     # 3) Swap назад: новая база уходит под имя своего CHECK (не удаляется),
     # прежняя возвращается на db_path — следующие session() открывают её.
+    # Имя решается ДО reverse_pour (LSBN-D-12): оно расходится в state и
+    # цепочку приёмника; занятое посторонним файлом — суффикс .away.
     swap(
         settings,
-        away_file=sibling_db_path(settings.db_path, int(live or 0)),
+        away_file=free_away_name(
+            settings, sibling_db_path(settings.db_path, int(live or 0))
+        ),
         incoming_file=legacy_path,
     )
     # 4) Состояние восстановленной базы — phase=aborted (reverse_pour);

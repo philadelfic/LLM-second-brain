@@ -493,6 +493,38 @@ def _live_limit_or(conn: sqlite3.Connection, fallback: int) -> int:
     return limit if limit is not None else fallback
 
 
+def free_away_name(settings: Settings, away_file: str) -> str:
+    """Имя уходящей базы, не занятое посторонним файлом (LSBN-D-12, DEF-5b).
+
+    Имя свободно или это сама активная база (swap переименует её же) — берём
+    как есть. Занято посторонним файлом (например, остаток прошлых циклов
+    «вниз-вверх» с тем же CHECK — базы не удаляются по design) — подбираем
+    суффикс: `…away`, `…away2`, … Имя обязано решиться ДО перелива: оно
+    расходится в state.prev_file и в цепочку приёмника, а swap обязан
+    получить ровно тот же файл. Событие `migration_away_name_rebased` —
+    оператор видит, под каким именем ушла база.
+    """
+    active = Path(settings.db_path)
+    candidate = Path(away_file)
+    if not candidate.exists() or _same_file(candidate, active):
+        return away_file
+    for number in range(2, 1000):
+        suffix = ".away" if number == 2 else f".away{number}"
+        alternate = candidate.with_name(candidate.name + suffix)
+        if not alternate.exists() or _same_file(alternate, active):
+            logger.warning(
+                "имя уходящей базы занято посторонним файлом — база уходит "
+                "под свободным именем (базы не удаляются)",
+                extra={
+                    "event": "migration_away_name_rebased",
+                    "requested": candidate.name,
+                    "file": alternate.name,
+                },
+            )
+            return str(alternate)
+    raise MigrationError(f"нет свободного имени для уходящей базы: {away_file}")
+
+
 def swap(settings: Settings, *, away_file: str, incoming_file: str) -> None:
     """Файловый swap указателя активной базы (design §2, фаза 3).
 
@@ -500,6 +532,9 @@ def swap(settings: Settings, *, away_file: str, incoming_file: str) -> None:
     пережить rename), затем rename: активная → away_file, входящая →
     db_path. Следующие session() открывают уже новую базу; открытых
     соединений нет — swap идёт в паузе старта до первого запроса.
+    Отказ «имя занято посторонним файлом» остаётся fail-closed страховкой
+    (LSBN-D-12): нормальные потоки подбирают имя через `free_away_name`
+    ДО перелива, сюда постороннее имя больше не доходит.
     """
     active = Path(settings.db_path)
     away = Path(away_file)
@@ -813,6 +848,9 @@ def run_startup_migration(settings: Settings, plan: dict) -> dict:
     работу на прежней базе; сбой swap восстанавливает указатель (`swap`).
     """
     mode = plan["mode"]
+    # Имя уходящей базы решается ДО перелива (LSBN-D-12): оно расходится в
+    # state.prev_file и в цепочку приёмника, swap получает то же имя.
+    away = free_away_name(settings, plan["prev_file"])
     if mode in ("down", "up_new"):
         # Приёмник перелива — до create_new_base (DEF-5): база цепочки под
         # целевым именем не стирается, новая база льётся в …db.incoming;
@@ -823,12 +861,12 @@ def run_startup_migration(settings: Settings, plan: dict) -> dict:
             settings,
             source_path=settings.db_path,
             target=plan["target"],
-            prev_file=plan["prev_file"],
+            prev_file=away,
             reason=plan["reason"],
         )
         swap(
             settings,
-            away_file=plan["prev_file"],
+            away_file=away,
             incoming_file=incoming,
         )
         return counters
@@ -836,13 +874,13 @@ def run_startup_migration(settings: Settings, plan: dict) -> dict:
         counters = reverse_pour(
             settings,
             source_path=plan["source_path"],
-            away_file=plan["prev_file"],
+            away_file=away,
             target=plan["target"],
             reason=plan["reason"],
         )
         swap(
             settings,
-            away_file=plan["prev_file"],
+            away_file=away,
             incoming_file=plan["source_path"],
         )
         return counters
