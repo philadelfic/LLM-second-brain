@@ -127,6 +127,7 @@ class TestHistoryTools:
             "logs_delete",
             "logs_search",
             "logs_list",
+            "logs_export",
         } == names
         assert len(names) == 25
         assert TOOL_DESCRIPTIONS["history_list"]

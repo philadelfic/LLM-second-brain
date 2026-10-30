@@ -175,6 +175,6 @@ async def test_surface_grew_by_exactly_one(mcp_server) -> None:
     """Регресс поверхности: словарь TOOL_NAMES целиком (№12 + пометки + 6 ручек
     логов LSBN-F-10: 4 в f10-02, ещё 2 в f10-03)."""
     names = {tool.name for tool in await mcp_server.list_tools()}
-    assert len(names) == 31
+    assert len(names) == 32
     assert names == TOOL_NAMES
     assert "warnings_list" in names

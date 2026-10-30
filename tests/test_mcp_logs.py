@@ -57,6 +57,7 @@ LOGS_TOOL_NAMES = frozenset(
         "logs_delete",
         "logs_search",
         "logs_list",
+        "logs_export",
     }
 )
 
@@ -119,7 +120,7 @@ async def _save(mcp, **extra) -> dict:
 
 class TestToolRegistry:
     def test_logs_tools_registered(self, settings: Settings, mcp_logs) -> None:
-        """При включённом флаге в реестре ровно шесть ручек области §7.1."""
+        """При включённом флаге в реестре ручки области §7.1 (семь с LSBN-F-26)."""
         names = _tool_names(mcp_logs)
         assert LOGS_TOOL_NAMES <= names
         assert set(TOOL_NAMES) == names

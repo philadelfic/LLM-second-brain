@@ -878,6 +878,15 @@ def tool_descriptions(note_limit: int) -> dict[str, str]:
             "entity_version). Returns {items, total, has_more, next_offset, hint?}; "
             "the body is cut to an excerpt — the full text via `logs_get`."
         ),
+        # LSBN-F-26 (релиз 3.5.0): выгрузка журнала за период файлом.
+        "logs_export": (
+            "Export the assistant-logs area for a period as a digest FILE "
+            "(`logs-<from>_<to>.md` next to the database, visible on the host "
+            "volume) plus a short summary. Slices as in `logs_search`; at least "
+            "one of date_from/date_to (YYYY-MM-DD, UTC) is required. Entries run "
+            "oldest first, grouped by day, with FULL field text — built for "
+            "release gates. Read-only."
+        ),
     }
 
 
@@ -3816,5 +3825,97 @@ def build_mcp(
                 "logs_list", started, results=len(result["items"])
             )
             return _compact_log_list(result, _logs_excerpt)
+
+        # f26-01 (LSBN-F-26, релиз 3.5.0): выгрузка журнала за период файлом.
+        # Границы периода проверяет СЕРВИС (мягкий отказ hint'ом): хотя бы
+        # одна из date_from/date_to обязательна — без периода случайный вызов
+        # рожал бы файл со всей историей. Остальные срезы — те же, что у
+        # `logs_search`/`logs_list`. Read-only: файл + короткая сводка.
+        @mcp.tool(name="logs_export", description=descriptions["logs_export"])
+        async def logs_export(
+            entity: Annotated[
+                str | None,
+                Field(
+                    description="Slice by object of the change (see logs_search)",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            entity_id: Annotated[
+                int | None,
+                Field(
+                    description="Slice by id of the changed object",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            entity_version: Annotated[
+                int | None,
+                Field(
+                    description="Slice by version of the changed object "
+                    "(requires entity_id)",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            session: Annotated[
+                str | None,
+                Field(
+                    description="Slice by call/agent identifier",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            source: Annotated[
+                str | None,
+                Field(
+                    description="Slice by call channel: mcp | rest | merge "
+                    "| migration | job:<name>",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            date_from: Annotated[
+                str | None,
+                Field(
+                    description="Period start (YYYY-MM-DD, UTC, inclusive); "
+                    "at least one of date_from/date_to is required",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            date_to: Annotated[
+                str | None,
+                Field(
+                    description="Period end (YYYY-MM-DD, UTC, inclusive); "
+                    "at least one of date_from/date_to is required",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+        ) -> dict[str, Any]:
+            started = time.perf_counter()
+            try:
+                result = await asyncio.to_thread(
+                    services.logs.export,
+                    entity=entity,
+                    entity_id=entity_id,
+                    entity_version=entity_version,
+                    session=session,
+                    source=source,
+                    date_from=date_from,
+                    date_to=date_to,
+                )
+            except LogValidationError as exc:
+                log_tool_call("logs_export", started, failed=True, reason=str(exc))
+                return {"hint": str(exc)}
+            log_tool_call(
+                "logs_export", started, results=result["records"]
+            )
+            return {
+                "file": result["file"],
+                "path": result["path"],
+                "records": result["records"],
+                "date_from": result["date_from"],
+                "date_to": result["date_to"],
+                "entity": result["entity"],
+                "entity_id": result["entity_id"],
+                "entity_version": result["entity_version"],
+                "session": result["session"],
+                "source": result["source"],
+            }
 
     return mcp

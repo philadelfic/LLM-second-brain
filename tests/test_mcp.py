@@ -200,7 +200,7 @@ class TestToolsList:
         навыков + 5 user + 3 terms + 2 общих ручки чтения истории + 6 логов."""
         async with connect(server_url) as session:
             tools = await session.list_tools()
-        assert len(tools.tools) == 31
+        assert len(tools.tools) == 32
         assert {tool.name for tool in tools.tools} == TOOL_NAMES
 
     @pytest.mark.asyncio

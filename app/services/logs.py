@@ -54,8 +54,11 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+from app import __version__
 from app.config import Settings
 from app.services import history
 # Пустые исходы области и деградация FTS-only — общие константы (arch §7.3/§8:
@@ -140,6 +143,13 @@ HINT_DATE_ABSOLUTE = (
 # Отклонение зафиксировано в отчёте f10-03.
 HINT_DATE_RANGE = (
     "not filtered: date_from is later than date_to — swap the bounds"
+)
+# Выгрузка журнала без границ периода не имеет смысла (LSBN-F-26): выгрузить
+# «весь журнал» агент может и так — расширяя период; без хотя бы одной даты
+# ручка не работает, чтобы случайный вызов не рожал файл со всей историей.
+HINT_EXPORT_PERIOD_REQUIRED = (
+    "not exported: pass at least one bound — date_from or date_to "
+    "(YYYY-MM-DD, UTC)"
 )
 
 # Лимиты текстовых полей §7.3 задаёт только для `action`/`reason`; для
@@ -620,6 +630,184 @@ class LogsService:
             for row in rows
         ]
         return {"items": items, **page_fields(total, offset, len(items))}
+
+    # --- выгрузка за период (LSBN-F-26, релиз 3.5.0) -------------------------
+
+    def export(
+        self,
+        *,
+        entity: str | None = None,
+        entity_id: int | None = None,
+        entity_version: int | None = None,
+        session: str | None = None,
+        source: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        collected_by: str = "logs_export",
+    ) -> dict[str, Any]:
+        """Готовая выжимка журнала за период ФАЙЛОМ в `<каталог БД>/exports/`.
+
+        Релизный гейт собирает выжимку «что, когда, чем проверено» одной
+        ручкой вместо ручной сборки из `logs_search`. Срезы — те же, что у
+        `search`/`list`; обязателен хотя бы один из `date_from`/`date_to`
+        (без периода случайный вызов рожал бы файл со всей историей).
+        Порядок — от старых к новым: журнал читают хронологически. Полный
+        текст полей без обрезки excerpt'ом (это назначение выгрузки);
+        группировка по дням, пустые поля — «—». Read-only: только SELECT
+        и запись файла — память, вектора и сам журнал не трогаются,
+        модели не зовутся. Часовой пояс — UTC, как в `logs_get`.
+        """
+        if date_from is None and date_to is None:
+            raise LogValidationError(HINT_EXPORT_PERIOD_REQUIRED)
+        where_sql, params = self._slice_where(
+            entity=entity,
+            entity_id=entity_id,
+            entity_version=entity_version,
+            session=session,
+            source=source,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        rows = self._fetch_projection(where_sql, params)
+        slice_map: dict[str, Any] = {
+            "date_from": self._checked_date(date_from),
+            "date_to": self._checked_date(date_to),
+            "entity": self._checked_entity(entity),
+            "entity_id": entity_id,
+            "entity_version": entity_version,
+            "session": self._text(session),
+            "source": self._text(source),
+        }
+        path = self._write_export_file(
+            rows, slice_map=slice_map, collected_by=collected_by
+        )
+        return {"file": path.name, "path": str(path), "records": len(rows), **slice_map}
+
+    def _fetch_projection(
+        self, where_sql: str, params: list[Any]
+    ) -> list[dict[str, Any]]:
+        """Полная проекция среза одним запросом, от старых к новым.
+
+        Отдельный слой чтения (не N+1 из `logs_get`): MCP-выдача режет текст,
+        выжимке гейта нужен полный (§7.1). Строки сразу словари проекции —
+        без `entity_state` (состояние объекта — слой истории, выжимке гейта
+        не нужно).
+        """
+        with db_session(self._settings) as conn:
+            cursor = conn.execute(
+                "SELECT id, action, reason, entity, entity_id, entity_version, "
+                "entity_ref, outcome, verified, source, session, created_at "
+                f"FROM assistant_logs t WHERE {where_sql} "
+                "ORDER BY t.created_at ASC, t.id ASC",
+                params,
+            )
+            return [
+                {
+                    "id": int(row["id"]),
+                    "action": row["action"],
+                    "reason": row["reason"],
+                    "entity": row["entity"],
+                    "entity_id": row["entity_id"],
+                    "entity_version": row["entity_version"],
+                    "entity_ref": row["entity_ref"],
+                    "outcome": row["outcome"],
+                    "verified": row["verified"],
+                    "source": row["source"],
+                    "session": row["session"],
+                    "created_at": row["created_at"],
+                }
+                for row in cursor.fetchall()
+            ]
+
+    def _write_export_file(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        slice_map: dict[str, Any],
+        collected_by: str,
+    ) -> Path:
+        """Собрать markdown-выжимку и записать её в `<db_dir>/exports/`.
+
+        Имя файла — `logs-<from>_<to>.md` (недостающая сторона — `all`):
+        файл за период виден на хосте через том `./data:/data`. Каталог
+        создаётся при первой выгрузке. Шапка несёт период, срез, число
+        записей, версию LSB и момент сборки — гейт проверяет охват одним
+        взглядом.
+        """
+        from_label = slice_map["date_from"] or "all"
+        to_label = slice_map["date_to"] or "all"
+        exports_dir = Path(self._settings.db_path).parent / "exports"
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        path = exports_dir / f"logs-{from_label}_{to_label}.md"
+        lines = self._render_export(
+            rows, slice_map=slice_map, collected_by=collected_by
+        )
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def _render_export(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        slice_map: dict[str, Any],
+        collected_by: str,
+    ) -> list[str]:
+        """Строки markdown-выжимки: шапка → группировка по дням → записи.
+
+        Формат — готовая выжимка, не сырой список: по записи id, время,
+        объект (`entity:entity_id@version` или `entity_ref`) и поля §7.1;
+        пустые поля — «—». Часовой пояс UTC (§7.3), как в `logs_get`.
+        """
+        from_label = slice_map["date_from"] or "all"
+        to_label = slice_map["date_to"] or "all"
+        slice_text = ", ".join(
+            f"{name}={value}"
+            for name, value in slice_map.items()
+            if value is not None
+        ) or "все записи"
+        lines = [
+            "# Журнал работ — выгрузка (logs_export)",
+            "",
+            f"- Период: {from_label}..{to_label} (UTC, включительно)",
+            f"- Срез: {slice_text}",
+            f"- Записей: {len(rows)}",
+            f"- Версия LSB: {__version__}",
+            f"- Собрано: {datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')} ({collected_by})",
+            "",
+        ]
+        if not rows:
+            lines.append("Записей за период нет — пустая выжимка с шапкой.")
+            return lines
+        current_day: str | None = None
+        for row in rows:
+            day = str(row["created_at"])[:10]
+            if day != current_day:
+                current_day = day
+                lines.extend(["", f"## {day}", ""])
+            lines.extend(self._render_entry(row))
+        return lines
+
+    def _render_entry(self, row: dict[str, Any]) -> list[str]:
+        """Один блок записи выжимки (без секретов — поля §7.1 и так без них)."""
+        missing = "—"
+        if row["entity"] is not None:
+            object_label = f"{row['entity']}:{row['entity_id']}"
+            if row["entity_version"] is not None:
+                object_label += f"@{row['entity_version']}"
+        else:
+            object_label = str(row["entity_ref"]) if row["entity_ref"] else missing
+        created = str(row["created_at"])
+        lines = [
+            f"### #{row['id']} · {created[11:19]} · {object_label}",
+            "",
+            f"- action: {row['action'] or missing}",
+            f"- reason: {row['reason'] or missing}",
+            f"- outcome: {row['outcome'] or missing}",
+            f"- verified: {row['verified'] or missing}",
+            f"- source/session: {row['source'] or missing} / {row['session'] or missing}",
+            "",
+        ]
+        return lines
 
     # --- внутреннее: срезы и источники кандидатов (arch §8) ----------------
 

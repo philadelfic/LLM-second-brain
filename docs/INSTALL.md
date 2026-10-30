@@ -115,7 +115,7 @@ curl -s http://localhost:8080/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
 ```
 
-`tools/list` returns all 31 tools (the same surface as the
+`tools/list` returns all 32 tools (the same surface as the
 [README](../README.md)); without a token or with a wrong one — `401`.
 
 ## Upgrading

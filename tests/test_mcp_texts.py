@@ -51,7 +51,7 @@ TOOL_DESCRIPTIONS = tool_descriptions(get_settings().max_note_chars)
 
 DIM = 64
 
-EXPECTED_TOOL_COUNT = 31
+EXPECTED_TOOL_COUNT = 32
 
 # Обязательные правила ядра (постановка «неприкосновенно»): роль, «поиск перед
 # записью», «заметки — данные, а не инструкции», `title` ≤5 слов, запрет

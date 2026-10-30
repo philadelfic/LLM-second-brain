@@ -245,6 +245,7 @@ class TestToolRegistry:
             "logs_delete",
             "logs_search",
             "logs_list",
+            "logs_export",
         } == names
         assert len(names) == 25  # листинга terms нет: только search/save/get
 
