@@ -294,6 +294,41 @@ def test_non_json_response_raises(monkeypatch) -> None:
         service.summarize(NOTE)
 
 
+def test_raw_quotes_in_values_are_repaired(monkeypatch) -> None:
+    """LSBN-T-33/T-23 (проба flint 30.10.2026): «сырые» кавычки внутри
+    строковых значений — json.loads падает, репар экранирует их внутри
+    значений, части восстанавливаются, текст не портится."""
+    flint_shaped = (
+        '{"parts": ['
+        '{"title": "Покупка по пути", '
+        '"text": "Купил "молоко" и "хлеб" по дороге домой"},'
+        '{"title": "Магазин", "text": "По пути домой зашёл в магазин — '
+        'взял "молоко" и "хлеб""}'
+        "]}"
+    )
+    service, _ = make_service(
+        make_settings(monkeypatch),
+        [httpx.Response(200, json={"message": {"content": flint_shaped}, "done": True})],
+    )
+    result = service.merge(TEXT_A, TEXT_B)
+    assert [part.text for part in result.parts] == [
+        "Купил \"молоко\" и \"хлеб\" по дороге домой",
+        "По пути домой зашёл в магазин — взял \"молоко\" и \"хлеб\"",
+    ]
+    assert [part.title for part in result.parts] == ["Покупка по пути", "Магазин"]
+
+
+def test_broken_json_still_refused_after_repair(monkeypatch) -> None:
+    """Репар консервативен: починка не состоялась — прежний отказ OFF_CONTRACT
+    (модели без дефекта проходят мимо репара по быстрому пути)."""
+    service, _ = make_service(
+        make_settings(monkeypatch),
+        [httpx.Response(200, json={"message": {"content": '{"parts": [обрыв'}, "done": True})],
+    )
+    with pytest.raises(SummaryError, match="не-JSON"):
+        service.merge(TEXT_A, TEXT_B)
+
+
 def test_non_object_json_raises(monkeypatch) -> None:
     """Малформация ответа (не объект) — отказ клиента слота (§5.5):
     content из такого ответа не извлечь — отказ, не суммари."""

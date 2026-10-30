@@ -221,6 +221,51 @@ def _significant_normalized(text: str) -> set[str]:
     }
 
 
+def _escape_raw_quotes(text: str) -> str:
+    """Экранировать «сырые» кавычки внутри строковых значений JSON (T-33/T-23).
+
+    Проба flint 30.10.2026 (пара 354+413): reasoning-модель пишет значение
+    ``"text": "слот на .113 "основной" и .109"`` — кавычки внутри значения не
+    экранированы, ``json.loads`` падает, ответ целиком уходит в OFF_CONTRACT
+    (973 отказа lsbdef-0008 — соседний класс). Проход по тексту различает
+    кавычки СТРУКТУРНЫЕ (открыть/закрыть значение) и СЫРЫЕ (внутри значения):
+    структурная кавычка стоит перед структурным знаком (`:`, `,`, `}`, `]`,
+    конец строки-значения), сырая — экранируется. Консервативно: если починка
+    не приводит к валидному JSON, вызывающий отдаёт прежний отказ — модель
+    без этого дефекта проходит мимо репара (первый loads успешен).
+    """
+    fixed: list[str] = []
+    in_string = False
+    escaped = False
+    length = len(text)
+    for index, char in enumerate(text):
+        if char != '"' or not (in_string and not escaped):
+            # Вне значения любая кавычка структурная (открывает значение);
+            # внутри значения экранированная (\") — содержимое.
+            if char == '"' and not in_string:
+                in_string = True
+                escaped = False
+            elif in_string and escaped:
+                escaped = False
+            elif in_string and char == "\\":
+                escaped = True
+            elif in_string:
+                escaped = False
+            fixed.append(char)
+            continue
+        # Мы внутри значения, кавычка не экранирована: структурная, если это
+        # конец значения — за ней (после пробелов) идут `:`, `,`, `}` или `]`.
+        rest = text[index + 1 :].lstrip()
+        if rest[:1] in (":", ",", "}", "]"):
+            in_string = False
+            escaped = False
+            fixed.append(char)
+            continue
+        # Сырая кавычка внутри значения — экранируем.
+        fixed.append('\\"')
+    return "".join(fixed)
+
+
 def _parse_merge_parts(content: str, label: str = "merge") -> list[MergePart]:
     """Разобрать JSON-ответ (слияние/нарезка) в список частей (F-23, п. 1).
 
@@ -595,7 +640,14 @@ class SummaryService:
 
         Тот же приём, что у классификатора (`ClassifierService._extract_json`):
         срез обвязки thinking/response до json.loads — модель может завернуть
-        JSON в рассуждения, где есть фигурные скобки.
+        JSON в рассуждения, где есть фигурные скобки. Починка «сырых кавычек»
+        (LSBN-T-33/T-23, проба flint 30.10.2026): reasoning-модели отдают
+        валидный по смыслу объект, где внутри строковых значений не
+        экранированы кавычки — json.loads падает, части терялись целиком
+        (OFF_CONTRACT → back-off). Репар pass экранирует кавычки ВНУТРИ
+        значений и повторяет разбор; не помогло — прежний отказ (ответ вне
+        контракта целиком, повтор решает back-off, поведение других моделей
+        не меняется).
         """
         text = content.strip()
         if text.startswith("```"):
@@ -611,6 +663,10 @@ class SummaryService:
             text = text[start : end + 1]
         try:
             return json.loads(text)
+        except ValueError:
+            pass
+        try:
+            return json.loads(_escape_raw_quotes(text))
         except ValueError as exc:
             raise SummaryError("merge: не-JSON объект в ответе модели") from exc
 
