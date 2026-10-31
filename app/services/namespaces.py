@@ -1,29 +1,30 @@
-"""NamespaceService — реестр иерархических неймспейсов (Фаза 10, REQUIREMENTS §5.7).
+"""NamespaceService - the hierarchical namespace registry (Phase 10, REQUIREMENTS §5.7).
 
-Слой доменных правил над таблицей `namespaces` (схема — `app.storage.db`).
-Контракт описаний (решение О. 2026-09-03): у каждого узла `description` —
-обязательное, ≤2 кратких предложений; валидация — здесь, единая точка для
-операторских ручек (REST) и LLM-генерации описаний (причёска, Шаг 5).
+    The domain-rule layer over the `namespaces` table (the schema - app.storage.db).
+    The description contract (the owner's decision): every node's `description` is
+    required, at most 2 short sentences; the validation lives here - the single
+    point for both the operator handles (REST) and the LLM description generation
+    (grooming, Step 5).
 
-Правила пути:
-- слэш-путь, максимум **3 уровня** (`domain`, `domain/subdomain`,
-  `domain/subdomain/section`) — глубже свалка (§5.7);
-- каждый сегмент — слаг: латиница/цифры/дефис, дефисы не ведут/не кончают
-  сегмент; нормализация — нижний регистр, прочие символы → дефис (модель
-  классификатора обязана слать латиницу — «СУБО 2020» без транслита
-  не слаг, а `subo-2020` — слаг);
-- `default` — системный узел (создаётся в init_db), существует всегда;
-  его можно править описанием, но нельзя удалять/переименовывать
-  (REST-ручки — Шаг 6).
+    The path rules:
+    - a slash path, at most 3 levels (`domain`, `domain/subdomain`,
+      `domain/subdomain/section`) - deeper is a dump (§5.7);
+    - each segment is a slug: latin/digits/dash, no leading/trailing dashes in a
+      segment; normalization - lowercase, other characters -> dash (the classifier
+      model MUST send latin - "SUBO 2020" without transliteration is not a slug,
+      `subo-2020` is);
+    - `default` - the system node (created in init_db), always exists; its
+      description may be edited but it cannot be deleted or renamed (the REST
+      handles - Step 6).
 
-Домен оправдан массой на одну тему + изоляцией (§5.7 «Дисциплина»); решение
-о создании авто-узлов принимает судья структуры (Шаг 5), оператор — редактор
-карты. Этот сервис — механика реестра, без триггеров.
+    The domain is justified by mass per topic + isolation (§5.7 "Discipline"); the
+    structure judge decides on auto-node creation (Step 5), the operator edits the
+    map. This service is the registry mechanics, without triggers.
 
-Счётчики (метрики О., 2026-09-03): `notes_count` — заметки в самом узле,
-`subtree_count` — всё поддерево; оба по активным (deleted_at IS NULL).
-Выдача `list_all` — полный контракт сервис-слоя (REST отдаёт как есть;
-MCP-слой отдаёт компактную проекцию — Шаг 3).
+    The counters (the owner's metrics): `notes_count` - the notes in the node
+    itself; `subtree_count` - the whole subtree; both over the active records
+    (deleted_at IS NULL). The `list_all` output - the full service-layer contract
+    (REST serves it as is; the MCP layer serves a compact projection - Step 3).
 """
 
 from __future__ import annotations
@@ -37,17 +38,17 @@ from app.config import Settings
 from app.storage.db import DEFAULT_NAMESPACE, session, transaction
 
 MAX_DEPTH = 3
-MAX_PATH_LEN = 200  # защита от абсурдно длинных путей (3 сегмента × слаг ≤64 + 2 слеша)
-MAX_DESCRIPTION_CHARS = 500  # грубая защита от простыней; контракт — ≤2 предложений
+MAX_PATH_LEN = 200  # a guard against absurdly long paths (3 segments x slug <=64 + 2 slashes)
+MAX_DESCRIPTION_CHARS = 500  # a rough guard against walls of text; the contract - <= 2 sentences
 
 _SEGMENT_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SENTENCE_SPLIT_RE = re.compile(r"[.!?]+(?:\s|$)")
 
-# Подсказка узла при save без namespace (№28, релиз 3.2.0; arch §13.1):
-# значимое слово — ≥ _NODE_HINT_MIN_TOKEN символов; совпадение — равенство
-# либо общий префикс ≥ _STEM_MIN символов (дешёвая основа русской морфологии:
-# «сервер»/«сервера»). Вес сегмента пути выше веса слова описания: пути —
-# латинские слаги, основной сигнал идёт из русских описаний.
+# The node hint on save without a namespace (No28, 3.2.0; arch §13.1):
+# a significant word - >= _NODE_HINT_MIN_TOKEN chars; a match - equality
+# or a shared prefix >= _STEM_MIN chars (a cheap basis of Russian morphology:
+#"server"/"servers"). A path segment's weight outranks a description word's:
+# the paths are latin slugs; the main signal comes from the Russian descriptions.
 _NODE_HINT_MIN_TOKEN = 4
 _STEM_MIN = 4
 _NODE_HINT_PATH_WEIGHT = 3.0
@@ -56,29 +57,30 @@ _WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+")
 
 
 def _node_hint_words(text: str) -> set[str]:
-    """Слова текста (нижний регистр), длиной ≥ _STEM_MIN — база сравнения."""
+    """The text's words (lowercase) of length >= _STEM_MIN - the comparison base."""
     return {word.lower() for word in _WORD_RE.findall(text) if len(word) >= _STEM_MIN}
 
 
 def _node_hint_match(token: str, words: set[str]) -> bool:
-    """Слово совпало: равенство либо общий префикс ≥ _STEM_MIN символов."""
+    """A word matches: equality or a shared prefix >= _STEM_MIN characters."""
     head = token[:_STEM_MIN]
     return any(token == word or head == word[:_STEM_MIN] for word in words)
 
 
 class NamespaceError(RuntimeError):
-    """Операционная ошибка реестра: узел уже существует / не найден / конфликт."""
+    """A registry operational error: the node exists / not found / a conflict."""
 
 
 class NamespaceValidationError(ValueError):
-    """Нарушение доменных ограничений: путь/описание вне контракта §5.7."""
+    """A domain-contract violation: the path/description outside §5.7."""
 
 
 def normalize_slug(value: str) -> str | None:
-    """Строка → слаг-сегмент или None (нечего нормализовать).
+    """A string -> a slug segment, or None (nothing to normalize).
 
-    Нижний регистр; прочие символы → дефис; повторные/крайние дефисы срезаются.
-    Кириллица не транслитерируется — классификатор обязан слать латиницу.
+            Lowercase; other characters -> dash; repeated/edge dashes are trimmed.
+            Cyrillic is not transliterated - the classifier must send latin.
+
     """
     cleaned = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
     if not cleaned or len(cleaned) > 64:
@@ -87,24 +89,25 @@ def normalize_slug(value: str) -> str | None:
 
 
 def count_sentences(text: str) -> int:
-    """Число предложений текста (границы [.!?] + конец строки)."""
+    """The sentence count of a text (the [.!?] borders + the end of the line)."""
     return len([part for part in _SENTENCE_SPLIT_RE.split(text) if part.strip()])
 
 
 class NamespaceService:
-    """Реестр иерархических неймспейсов: CRUD узлов, счётчики, поддеревья."""
+    """The hierarchical namespace registry: node CRUD, counters, subtrees."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    # --- валидация контракта описаний (§5.7) --------------------------------
+    #--- the description contract validation (§5.7) --------------------------------
 
     def validate_path(self, path: str) -> str:
-        """Строка → нормализованный путь узла; нарушение — NamespaceValidationError.
+        """A string -> a normalized node path; a violation - NamespaceValidationError.
 
-        «СУБО 2020» → '2020' (кириллица не слаг); 'Work/SBOS 2020' →
-        'work/sbos-2020'; глубина > 3, пустые сегменты, длина,
-        вложенность под default — ошибки.
+                    "SUBO 2020" -> '2020' (Cyrillic is not a slug); 'Work/SBOS 2020' ->
+                    'work/sbos-2020'; a depth > 3, empty segments, the length, nesting
+                    under default - errors.
+
         """
         if not path or not path.strip():
             raise NamespaceValidationError("path: path cannot be empty")
@@ -133,15 +136,18 @@ class NamespaceService:
         return "/".join(segments)
 
     def validate_description(self, description: str) -> str:
-        """Описание узла: непустое, ≥1 осмысленного предложения, ≤2 предложений
-        (контракт О. 2026-09-03 + аудит lsb-0005-08).
+        """A node description: non-empty, >= 1 meaningful sentence, <= 2 sentences
+                    (the owner's contract + the lsb-0005-08 audit).
 
-        Единая точка валидации контракта описаний: через неё проходят ОБА
-        пути создания авто-узлов — модель (memory_namespace_create → create
-        confirmed) и судья (авто-промоушн → create provisional). Содержательная
-        проверка «не мусор»: есть хотя бы одна буква/цифра — чистая пунктуация
-        («...», «!?!») не проходит; смысловая осмысленность — гейт судьи
-        (авто-путь) / оператор (операторские ручки), не механика реестра.
+                    The single validation point of the description contract: BOTH auto-node
+                    creation paths go through it - the model (memory_namespace_create ->
+                    create confirmed) and the judge (auto-promotion -> create
+                    provisional). The content check "not garbage": at least one
+                    letter/digit must be present - pure punctuation ("...", "!?!") does
+                    not pass; the semantic meaningfulness is the judge's gate (the auto
+                    path) / the operator's (the operator handles), not the registry
+                    mechanics.
+
         """
         if not description or not description.strip():
             raise NamespaceValidationError("description: cannot be empty")
@@ -157,10 +163,10 @@ class NamespaceService:
             )
         return text
 
-    # --- чтение ---------------------------------------------------------------
+    #--- reads ---------------------------------------------------------------
 
     def exists(self, path: str) -> bool:
-        """Зарегистрирован ли узел (валидация save/search — Шаг 3)."""
+        """Whether the node is registered (the save/search validation - Step 3)."""
         normalized = self.validate_path(path)
         with session(self._settings) as conn:
             return (
@@ -171,10 +177,11 @@ class NamespaceService:
             )
 
     def validate_placement(self, namespace: str) -> str:
-        """Целевой узел записи (save/update): нормализованный путь
-        зарегистрированного узла; незарегистрированный — NamespaceError
-        (транспорт Шага 3 обернёт в fail + hint). «default» существует
-        всегда, поэтому укладка без указания узла всегда проходит."""
+        """The write's target node (save/update): the normalized path of a registered
+                    node; unregistered - NamespaceError (the Step 3 transport wraps it
+                    into fail + hint). "default" always exists, so a save without a node
+                    always passes.
+        """
         normalized = self.validate_path(namespace)
         if not self.exists(normalized):
             raise NamespaceError(
@@ -185,7 +192,7 @@ class NamespaceService:
         return normalized
 
     def get(self, path: str) -> dict[str, Any] | None:
-        """Узел реестра со счётчиками или None (нет узла)."""
+        """A registry node with counters, or None (no node)."""
         normalized = self.validate_path(path)
         with session(self._settings) as conn:
             row = conn.execute(
@@ -194,21 +201,25 @@ class NamespaceService:
         return self._node_dict(row) if row is not None else None
 
     def list_all(self) -> dict[str, Any]:
-        """Полный реестр: узлы + счётчики (контракт memory_namespaces, Шаг 3).
+        """The full registry: nodes + counters (the memory_namespaces contract, Step 3).
 
-        notes_count — заметки в самом узле; subtree_count — всё поддерево;
-        оба по активным заметкам. Сортировка по path — детерминированная карта.
+                    notes_count - the notes in the node itself; subtree_count - the whole
+                    subtree; both over the active notes. The path sort - a deterministic
+                    map.
+
         """
         with session(self._settings) as conn:
             rows = conn.execute(self._select_node() + " ORDER BY np.path").fetchall()
         return {"namespaces": [self._node_dict(row) for row in rows]}
 
     def subtree_nodes(self, path: str) -> list[str]:
-        """Узлы поддерева: сам узел + листья под ним (для KNN-фильтра партиций).
+        """A subtree's nodes: the node itself + the leaves under it (for the KNN partition filter).
 
-        «domain» → ['domain', 'domain/a', 'domain/b']; лист → ['domain/leaf'].
-        Известны только ЗАРЕГИСТРИРОВАННЫЕ узлы: заметки в путях вне реестра
-        (не бывает при штатной записи) глобальному поиску не принадлежат.
+                    "domain" -> ['domain', 'domain/a', 'domain/b']; a leaf ->
+                    ['domain/leaf']. Only REGISTERED nodes are known: notes in paths
+                    outside the registry (impossible in a routine save) belong to no
+                    global search.
+
         """
         normalized = self.validate_path(path)
         with session(self._settings) as conn:
@@ -222,10 +233,12 @@ class NamespaceService:
             ]
 
     def filter_nodes(self, namespace: str | None, exact: bool) -> list[str] | None:
-        """Узлы-партиции для фильтра выдачи (§5.7): None — глобально;
-        точный узел (`exact`) — только он; иначе — поддерево (узел + листья).
-        Незарегистрированный узел — NamespaceError (транспорт Шага 3 обернёт
-        в fail + hint). Общая точка для search и list."""
+        """The partition nodes for the output filter (§5.7): None - global;
+                    an exact node (`exact`) - only it; otherwise - the subtree (the node +
+                    the leaves). An unregistered node - NamespaceError (the Step 3
+                    transport wraps it into fail + hint). The shared point of search and
+                    list.
+        """
         if namespace is None:
             return None
         normalized = self.validate_path(namespace)
@@ -242,16 +255,18 @@ class NamespaceService:
     def suggest(
         self, terms: str, *, limit: int = 2, min_score: float = 2.0
     ) -> list[dict[str, Any]]:
-        """Кандидаты-узлы карты под слова заметки (подсказка №28, arch §13.1).
+        """The map's candidate nodes for a note's words (the No28 hint, arch §13.1).
 
-        Сравниваем значимые слова `terms` (≥ _NODE_HINT_MIN_TOKEN) с сегментами
-        путей (вес 3.0) и словами описаний (вес 2.0); совпадение — равенство
-        либо общий префикс ≥ _STEM_MIN («сервер»/«сервера»). Скор узла — сумма
-        по совпавшим словам (слово учитывается один раз, максимум веса);
-        возврат — топ по score вниз (тай-брейк — path), не больше `limit`,
-        только score ≥ min_score. Это ЧТЕНИЕ карты (один SELECT без
-        счётчиков): без модели, эмбеддера и записи; сбой чтения — пустой
-        список, а не исключение (подсказка не имеет права ронять save).
+                    The significant words of `terms` (>= _NODE_HINT_MIN_TOKEN) are compared
+                    with the path segments (weight 3.0) and the description words (weight
+                    2.0); a match - equality or a shared prefix >= _STEM_MIN
+                    ("server"/"servers"). A node's score - the sum over the matched words
+                    (a word counts once, at most its weight); the return - the top by
+                    score descending (the tie-break - path), at most `limit`, only
+                    score >= min_score. This is a MAP READ (one SELECT without counters):
+                    no model, no embedder, no writes; a read failure - an empty list, not
+                    an exception (the hint has no right to fail a save).
+
         """
         tokens = list(dict.fromkeys(_node_hint_words(terms)))
         if not tokens:
@@ -261,7 +276,7 @@ class NamespaceService:
                 rows = conn.execute(
                     "SELECT path, description FROM namespaces"
                 ).fetchall()
-        except Exception:  # noqa: BLE001 — подсказка не роняет запись
+        except Exception:  # noqa: BLE001 - the hint never fails a save
             logging.getLogger("app").warning(
                 "node hint map unavailable",
                 extra={"event": "node_hint_unavailable"},
@@ -288,7 +303,7 @@ class NamespaceService:
         candidates.sort(key=lambda node: (-node["score"], node["path"]))
         return candidates[:limit]
 
-    # --- запись ---------------------------------------------------------------
+    #--- writes ---------------------------------------------------------------
 
     def create(
         self,
@@ -296,11 +311,13 @@ class NamespaceService:
         description: str,
         status: str = "confirmed",
     ) -> dict[str, Any]:
-        """Зарегистрировать узел; узел уже есть — NamespaceError.
+        """Register a node; the node already exists - NamespaceError.
 
-        Вызывается: операторские REST-ручки (Шаг 6, confirmed) и авто-создание
-        судьи структуры (Шаг 5, provisional). Родитель (`domain`) обязан
-        существовать — иерархия не создаёт корни сама (§5.7).
+                    Called by: the operator REST handles (Step 6, confirmed) and the
+                    structure judge's auto-creation (Step 5, provisional). The parent
+                    (`domain`) must exist - the hierarchy does not create roots by itself
+                    (§5.7).
+
         """
         normalized = self.validate_path(path)
         text = self.validate_description(description)
@@ -334,7 +351,7 @@ class NamespaceService:
         return self.get(normalized)  # type: ignore[return-value]
 
     def update_description(self, path: str, description: str) -> dict[str, Any] | None:
-        """Отредактировать описание узла (оператор/подтверждение); None — нет узла."""
+        """Edit a node's description (the operator/confirmation); None - no node."""
         normalized = self.validate_path(path)
         text = self.validate_description(description)
         with session(self._settings) as conn, transaction(conn):
@@ -349,7 +366,7 @@ class NamespaceService:
         return self.get(normalized)  # type: ignore[return-value]
 
     def set_status(self, path: str, status: str) -> dict[str, Any] | None:
-        """Сменить статус узла (confirm provisional-аудитом оператора)."""
+        """Change the node's status (confirm a provisional by the operator's audit)."""
         if status not in ("confirmed", "provisional"):
             raise NamespaceValidationError(
                 f"status: expected confirmed|provisional, got {status}"
@@ -366,19 +383,21 @@ class NamespaceService:
             return None
         return self.get(normalized)  # type: ignore[return-value]
 
-    # --- операторские перекладки (Фаза 10, Шаг 6; §5.7 «структурные ручки») ---
+    #--- the operator moves (Phase 10, Step 6; §5.7 "structural handles") ---
 
     def groom(self) -> dict[str, Any]:
-        """Груминг реестра после перекладок (§5.7): пустое чистится, мелкое — сигнал.
+        """The registry grooming after the moves (§5.7): the empty is cleaned, the small is signaled.
 
-        Автоматом удаляются только ПУСТЫЕ provisional-листы (система их и
-        создала — системой и чистится; confirmed-узлы оператора автоматом
-        не сносятся — оператор мог создать узел под будущий контент).
-        Лист с < NAMESPACE_GROOM_MIN_NOTES заметками — кандидат на слияние:
-        не трогаем, сигнал в логах и в отчёте (merge-ручка оператора).
-        default и корни автоматом не трогаются; пустые confirmed-узлы —
-        сигнал empty_confirmed (логи). Возврат — отчёт:
-        {deleted, merge_candidates, empty_confirmed}.
+                    Only EMPTY provisional leaves are deleted automatically (the system
+                    created them - the system cleans them; the operator's confirmed nodes
+                    are never removed automatically - the operator may have created a node
+                    for future content). A leaf with < NAMESPACE_GROOM_MIN_NOTES notes - a
+                    merge candidate: untouched, a signal in the logs and the report (the
+                    operator's merge handle). default and the roots are never touched
+                    automatically; empty confirmed nodes - the empty_confirmed signal (the
+                    logs). The return - the report:
+                    {deleted, merge_candidates, empty_confirmed}.
+
         """
         logger = logging.getLogger("app")
         nodes = self.list_all()["namespaces"]
@@ -391,7 +410,7 @@ class NamespaceService:
         for node in nodes:
             path = node["path"]
             if path == DEFAULT_NAMESPACE:
-                continue  # системный своп живёт всегда
+                continue  # the system swap lives forever
             is_leaf = "/" in path
             if (
                 is_leaf
@@ -434,14 +453,16 @@ class NamespaceService:
         return report
 
     def rename(self, old: str, new: str) -> dict[str, Any]:
-        """Переименовать узел (лист или корень с детьми) с перекладкой (§5.7).
+        """Rename a node (a leaf or a root with children) with the moves (§5.7).
 
-        Переезжают: пути реестра (узел + дети), namespace заметок поддерева
-        (vector_status='pending' — пере-кодировка в новую партицию), разметка
-        default-заметок (hint_path — полный путь разметки, префиксная замена
-        как для promotions: корень — все потомки, лист — глубина 2/3) и
-        вердикты promotions (hint_path и canonical_path). Ничего не теряется.
-        default не переименовывается; новый путь обязан быть свободным.
+                    What moves: the registry paths (the node + the children), the notes'
+                    namespace in the subtree (vector_status='pending' - re-encoding into
+                    the new partition), the default notes' placement (hint_path - the full
+                    placement path, a prefix replacement as for promotions: a root - all
+                    descendants, a leaf - depth 2/3) and the promotions verdicts (hint_path
+                    and canonical_path). Nothing is lost. default is never renamed; the
+                    new path must be free.
+
         """
         old_path = self.validate_path(old)
         new_path = self.validate_path(new)
@@ -457,33 +478,33 @@ class NamespaceService:
         with session(self._settings) as conn:
             try:
                 with transaction(conn):
-                    # Реестр: путь узла и всех его детей (узлов мало — по одному).
+                    # The registry: a node's and all its children's paths (few nodes - one query each).
                     for node_path in old_nodes:
                         conn.execute(
                             "UPDATE namespaces SET path = ?, "
                             "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE path = ?",
                             (new_path + node_path[len(old_path):], node_path),
                         )
-                    # Заметки поддерева: namespace + пере-кодировка в новую партицию.
+                    # The subtree's notes: the namespace + re-encoding into the new partition.
                     for node_path in old_nodes:
                         conn.execute(
                             "UPDATE notes SET namespace = ?, vector_status = 'pending' "
                             "WHERE namespace = ? AND deleted_at IS NULL",
                             (new_path + node_path[len(old_path):], node_path),
                         )
-                    # Разметка default-заметок: hint_path (полный путь разметки,
-                    # lsb-0005-02) — префиксная замена старого пути на новый,
-                    # как у promotions: корень — все потомки, лист — глубины 2/3
-                    # (причёска ссылается на путь узла).
+                    # The default notes' placement: hint_path (the full placement path,
+                    # lsb-0005-02) - a prefix replacement of the old path with the new one,
+                    # as for promotions: a root - all descendants, a leaf - depth 2/3
+                    # (grooming references the node's path).
                     conn.execute(
                         "UPDATE notes SET hint_path = ? || substr(hint_path, ?) "
                         "WHERE namespace = 'default' "
                         "AND (hint_path = ? OR hint_path LIKE ? || '/%')",
                         (new_path, len(old_path) + 1, old_path, old_path),
                     )
-                    # Вердикты триггера: единый hint_path (lsb-0005-03) —
-                    # префиксная замена как у canonical_path (корень или лист
-                    # с детьми — у всех подпутей меняется только префикс).
+                    # The trigger verdicts: the single hint_path (lsb-0005-03) -
+                    # a prefix replacement as for canonical_path (a root or a leaf
+                    # with children - only the prefix changes in every subpath).
                     conn.execute(
                         "UPDATE promotions SET hint_path = ? || substr(hint_path, ?) "
                         "WHERE hint_path = ? OR hint_path LIKE ? || '/%'",
@@ -514,15 +535,17 @@ class NamespaceService:
         return self.get(new_path)  # type: ignore[return-value]
 
     def merge_node(self, path: str, into: str) -> dict[str, Any]:
-        """Слить ЛИСТ с существующим узлом: заметки переехали, узел исчез (§5.7).
+        """Merge a LEAF into an existing node: the notes moved, the node is gone (§5.7).
 
-        Канонизация hint_path: в лист → полный путь цели; в корень или
-        default → NULL («общая»). Ничего не теряется: заметки перекладываются
-        целиком (vector_status='pending' — пере-кодировка в новую партицию).
-        Вердикты promotions следуют за перекладкой (canonical_path и ключ
-        hint_path источника → цель). Слияние корня не поддерживается (дети
-        остались бы без родителя — оператор разбирает поддерево по листьям);
-        default не сливается. Возврат — {path, into, moved}.
+                    The hint_path canonicalization: into a leaf - the full target path;
+                    into a root or default - NULL ("general"). Nothing is lost: the notes
+                    move whole (vector_status='pending' - re-encoding into the new
+                    partition). The promotions verdicts follow the move (the source's
+                    canonical_path and hint_path key -> the target). A root merge is not
+                    supported (the children would be left without a parent - the operator
+                    sorts the subtree out leaf by leaf); default never merges. The return
+                    - {path, into, moved}.
+
         """
         source = self.validate_path(path)
         target = self.validate_path(into)
@@ -538,7 +561,7 @@ class NamespaceService:
             raise NamespaceError(f"node «{source}» is not registered")
         if not self.exists(target):
             raise NamespaceError(f"node «{target}» is not registered")
-        target_hint = target if "/" in target else None  # лист → путь цели; корень/default → NULL
+        target_hint = target if "/" in target else None  # a leaf -> the target's path; a root/default -> NULL
         with session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
                 "UPDATE notes SET namespace = ?, hint_path = ?, "
@@ -548,10 +571,10 @@ class NamespaceService:
             )
             moved = cursor.rowcount
             conn.execute("DELETE FROM namespaces WHERE path = ?", (source,))
-            # Вердикты триггера: источник слит, его контент ушёл в target —
-            # canonical_path и сам ключ hint_path следуют за перекладкой
-            # (если у цели уже есть свой вердикт — он главенствует, INSERT
-            # OR IGNORE сохраняет его; ключ источника сносится).
+            # The trigger verdicts: the source was merged, its content went to the target -
+            # canonical_path and the hint_path key itself follow the move
+            # (if the target already has its own verdict - it dominates; the INSERT
+            # OR IGNORE keeps it; the source's key is dropped).
             conn.execute(
                 "UPDATE promotions SET canonical_path = ? WHERE canonical_path = ?",
                 (target, source),
@@ -577,14 +600,15 @@ class NamespaceService:
         return {"path": source, "into": target, "moved": moved}
 
     def delete_node(self, path: str) -> dict[str, Any]:
-        """Удалить узел с перекладкой заметок (§5.7, ничего не теряется).
+        """Delete a node with the note moves (§5.7, nothing is lost).
 
-        Лист: заметки → родительский корень (hint_path=NULL — общая для
-        домена), vector_status='pending'; вердикты promotions следуют за
-        перекладкой (canonical_path и ключ hint_path листа → родитель).
-        Пустой корень удаляется; корень с детьми — NamespaceError (сначала
-        разбери поддерево по листьям). default не удаляется. Возврат —
-        {path, moved}.
+                    A leaf: the notes -> the parent root (hint_path=NULL - the domain's
+                    general), vector_status='pending'; the promotions verdicts follow the
+                    move (the leaf's canonical_path and hint_path key -> the parent). An
+                    empty root is deleted; a root with children - NamespaceError (sort the
+                    subtree out leaf by leaf first). default is never deleted. The return
+                    - {path, moved}.
+
         """
         normalized = self.validate_path(path)
         if normalized == DEFAULT_NAMESPACE:
@@ -611,9 +635,9 @@ class NamespaceService:
                     (domain, normalized),
                 )
                 moved = cursor.rowcount
-                # Вердикты триггера: лист удалён, контент ушёл в родительский
-                # корень — canonical_path и ключ hint_path следуют за перекладкой
-                # (если у родителя уже есть вердикт — он главенствует).
+                # The trigger verdicts: the leaf is deleted, its content went to the parent
+                # root - canonical_path and the hint_path key follow the move
+                # (if the parent already has a verdict - it dominates).
                 conn.execute(
                     "UPDATE promotions SET canonical_path = ? WHERE canonical_path = ?",
                     (domain, normalized),
@@ -640,11 +664,11 @@ class NamespaceService:
         )
         return {"path": normalized, "moved": moved}
 
-    # --- внутренне ------------------------------------------------------------
+    #--- internal ------------------------------------------------------------
 
     @staticmethod
     def _select_node() -> str:
-        """Узел реестра + счётчики (активные заметки), одним запросом."""
+        """A registry node + the counters (active notes), in one query."""
         return (
             "SELECT np.path, np.description, np.status, np.created_at, np.updated_at, "
             "(SELECT COUNT(*) FROM notes n "
