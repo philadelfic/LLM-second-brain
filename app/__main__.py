@@ -1,7 +1,7 @@
-"""Точка входа: `python -m app`.
+"""The entry point: `python -m app`.
 
-Поднимает uvicorn на 0.0.0.0:PORT с уровнем логов LOG_LEVEL.
-Некорректное окружение — фатально (код выхода 2).
+Brings up uvicorn on 0.0.0.0:PORT with the LOG_LEVEL log level.
+An invalid environment is fatal (exit code 2).
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ def main() -> None:
         print(f"FATAL: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
-    # NFR-4: весь stdout процесса — JSON (app-логи + uvicorn access/error).
+    # NFR-4: the whole process stdout is JSON (app logs + uvicorn access/error).
     setup_logging(settings.log_level)
     uvicorn.run(
         "app.main:app",

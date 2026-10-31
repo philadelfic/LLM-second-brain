@@ -1,19 +1,20 @@
-"""FastAPI-приложение LLM Second Brain.
+"""The FastAPI application of LLM Second Brain.
 
-Каркас Фазы 1: REST, MCP-сервер (`/mcp`, 6 инструментов `memory_*`),
-Bearer-миддлварь на всё, кроме `/health` (NFR-2). Фаза 2: при старте
-инициализируется хранилище (SQLite, ARCH §3.3); MCP и REST работают
-над общим service-слоем (ARCH §1) через `app.state.services`.
-Фаза 3–4: в lifespan поднимается фоновый воркер (ARCH §3.4) — две
-независимые очереди pending_vector (до-векторизация) и pending_summary
-(до-суммаризация, режим «Б» — единственный путь генерации summary);
-очереди живут в БД и переживают рестарт; при останове — graceful отмена.
-Фаза 11: перед стартом воркера — стартовая проверка трёх LLM-слотов
-(решение №5): лёгкий GET без генерации, параллельно; отказ авторизации
-(401/403) фатален (SystemExit 2 + hint про {SLOT}_API_KEY), недоступность
-— WARN и штатный старт (NFR-3).
+Phase 1 framework: REST, the MCP server (`/mcp`, 6 `memory_*` tools), a
+Bearer middleware over everything except `/health` (NFR-2). Phase 2: the
+storage is initialized at startup (SQLite, ARCH §3.3); MCP and REST work
+over the shared service layer (ARCH §1) via `app.state.services`.
+Phases 3–4: the lifespan brings up the background worker (ARCH §3.4) — two
+independent queues, pending_vector (re-vectorization) and pending_summary
+(re-summarization, mode "B" — the only path that generates a summary);
+the queues live in the DB and survive restarts; shutdown cancels them
+gracefully. Phase 11: before the worker starts, the three LLM slots get a
+startup check: a light GET without generation, in parallel; an auth
+failure (401/403) is fatal (SystemExit 2 + the {SLOT}_API_KEY hint),
+unreachability — WARN and a normal start (NFR-3).
 
-Запуск: `python -m app` (uvicorn) — порт и уровень логов из окружения.
+Run: `python -m app` (uvicorn) — the port and the log level come from the
+environment.
 """
 
 from __future__ import annotations
@@ -51,23 +52,23 @@ from app.storage.migration import (
     run_startup_migration,
     startup_plan,
 )
-# LSBN-F-22 (M3): union-контекст чтения (holder — services.migration).
+# LSBN-F-22 (M3): the union read context (the holder lives in services.migration).
 from app.services.migration import refresh_migration_context
 from app.transport.auth import BearerAuthMiddleware
 from app.transport.mcp import build_mcp
 from app.transport.rest import build_rest_router
 
-# Пути, доступные без Bearer-токена (NFR-2: только /health).
+# Paths reachable without a Bearer token (NFR-2: /health only).
 OPEN_PATHS = frozenset({"/health"})
 
 
 def _startup_slots(services: Services) -> list[tuple[str, LLMClient, object]]:
-    """Три LLM-слота стартовой проверки (решение №5): (имя, клиент, сервис).
+    """The three LLM slots of the startup check: (name, client, service).
 
-    Сервис — носитель `last_attempt_ok` (/health): результат проверки
-    инициализирует его до первого реального вызова. DI-сборки тестов без
-    клиентов слотов (llm_* = None, сервисы подменены фейками) пропускаются:
-    у фейков стартовая проверка — заглушка ok (бриф §3).
+    The service carries `last_attempt_ok` (/health): the check result
+    initializes it before the first real call. Test DI builds without slot
+    clients (llm_* = None, services replaced by fakes) are skipped: for fakes
+    the startup check is a stubbed ok (brief §3).
     """
     return [
         (slot, client, service)
@@ -81,10 +82,10 @@ def _startup_slots(services: Services) -> list[tuple[str, LLMClient, object]]:
 
 
 def _decision_slot(services: Services) -> list[tuple[str, LLMClient, DecisionService]]:
-    """Пара decision-слота стартовой проверки — только когда она собрана.
+    """The decision-slot pair of the startup check — only when it is built.
 
-    LSBN-F-12: при выключенном слоте пары нет (Services.decision is None) —
-    стартовая проверка его не видит вообще.
+    LSBN-F-12: with the slot off there is no pair (Services.decision is None) —
+    the startup check does not see it at all.
     """
     if services.llm_decision is not None and services.decision is not None:
         return [("decision", services.llm_decision, services.decision)]
@@ -97,14 +98,14 @@ def _handle_decision_check(
     outcome: str,
     logger: logging.Logger,
 ) -> None:
-    """Исход проверки decision-слота (LSBN-F-12): WARN + гашение, старт жив.
+    """The decision-slot check outcome (LSBN-F-12): WARN + shutoff, the start lives.
 
-    Осознанное отступление от фатальности auth генеративных слотов: у decision
-    есть штатный генеративный путь, и ронять обязательный слот из-за
-    необязательного нельзя (§13.6). Событие — `decision_check` (slot/model/result);
-    `ok` слот не трогает, иной исход — `disable(outcome)`: `unsupported` даёт
-    причину переключения «модель не умеет», `unreachable`/`auth_failed` —
-    «слота сейчас нет» (§13.6, f12-04).
+    A deliberate deviation from the auth fatality of generative slots: decision
+    has its own generative fallback, and an optional slot must not kill the
+    mandatory ones (§13.6). The event is `decision_check` (slot/model/result);
+    `ok` leaves the slot alone, any other outcome — `disable(outcome)`:
+    `unsupported` gives the "model cannot" fallback reason,
+    `unreachable`/`auth_failed` — "no slot right now" (§13.6, f12-04).
     """
     extra = {
         "event": "decision_check",
@@ -132,12 +133,12 @@ def _log_operation_config_warning(
     text: str,
     spec: SlotSpec,
 ) -> None:
-    """Одно предупреждение конфигурации ОПЕРАЦИИ (LSBN-F-34, arch §13.5).
+    """One configuration warning of an OPERATION (LSBN-F-34, arch §13.5).
 
-    Тот же контракт события `slot_config_warning`, что у слотов (main.py
-    пишет, сервис стартует): `slot` — слот-группа операции, `operation` —
-    имя операции из реестра. Эффективный бюджет — тем же
-    `resolve_output_budget`, что и в вызове.
+    The same `slot_config_warning` event contract as the slots have (main.py
+    writes, the service still starts): `slot` — the operation's slot group,
+    `operation` — the registry name of the operation. The effective budget is
+    resolved by the same `resolve_output_budget` as in a call.
     """
     budget, _source = resolve_output_budget(
         operation=spec.name,
@@ -164,14 +165,14 @@ def _log_operation_config_warning(
 
 
 def _operations_config_warnings(logger: logging.Logger, settings: Settings) -> None:
-    """Предупреждения конфигурации операций (LSBN-F-34; решение №4 брифа).
+    """Operation configuration warnings (LSBN-F-34; brief decision No4).
 
-    Те же правила `slot_config_warnings` (таймаут/бюджет/контекст), что у
-    слотов, но по эффективному spec ПЕРЕОПРЕДЕЛЁННОЙ операции — операция без
-    плоского env уже покрыта предупреждениями своего слота, дублей не
-    создаём. Плюс WARN об env с неизвестным именем операции (опечатка вида
-    `MERG_MODEL`) — не фатально, сервис стартует. Вызывается при старте
-    (lifespan), после проверки слотов.
+    The same `slot_config_warnings` rules (timeout/budget/context) as the
+    slots, but over the effective spec of an OVERRIDDEN operation — an
+    operation without flat env is already covered by its slot's warnings, no
+    duplicates. Plus the WARN about env with an unknown operation name (a typo
+    like `MERG_MODEL`) — not fatal, the service starts. Called at startup
+    (lifespan), after the slot checks.
     """
     for operation in OPERATIONS:
         spec, sources = SlotSpec.for_operation(operation, settings)
@@ -186,8 +187,8 @@ def _operations_config_warnings(logger: logging.Logger, settings: Settings) -> N
                 text=text,
                 spec=spec,
             )
-    # Неизвестное имя операции — отдельное событие БЕЗ слота: контракт
-    # `slot_config_warning` (всегда со слотом) не ломается (см.
+    # An unknown operation name — a separate event WITHOUT a slot: the
+    # `slot_config_warning` contract (always with a slot) stays intact (see
     # test_main_startup_warnings).
     for _code, text in unknown_operation_warnings():
         logger.warning(
@@ -203,16 +204,17 @@ def _operations_config_warnings(logger: logging.Logger, settings: Settings) -> N
 def _run_startup_migration(
     settings: Settings, plan: dict, backup: BackupService
 ) -> None:
-    """LSBN-F-22 (M1), фазы 1–3: журнал → снапшот → перелив и swap.
+    """LSBN-F-22 (M1), phases 1–3: journal → snapshot → pour and swap.
 
-    Вызывается из lifespan, когда `startup_plan` увидел расхождение env с
-    живым CHECK (фаза 0). Порядок фазы 1 (постановка: «старт, видимость,
-    снапшот»): ПЕРВАЯ строка журнала джоб с причиной и объёмом, затем
-    снапшот прежней базы — без него перелив не начинается (решение M1:
-    отказ снапшота — WARN, сервис остаётся на прежней базе и переживёт
-    рестарт с тем же расхождением). Сбой перелива/swap тоже не роняет
-    старт: активная база цела (`run_startup_migration` гарантирует
-    восстановление указателя), расхождение остаётся видимым в журнале.
+    Called from the lifespan when `startup_plan` sees the env diverge from the
+    live CHECK (phase 0). Phase 1 order (the design: "start, visibility,
+    snapshot"): the FIRST job-journal line with the reason and the volume,
+    then the snapshot of the previous base — without it the pour never starts
+    (M1: a snapshot failure is a WARN, the service stays on the previous base
+    and survives a restart with the same divergence). A pour/swap failure does
+    not kill the start either: the active base is intact
+    (`run_startup_migration` guarantees the pointer is restored) and the
+    divergence stays visible in the journal.
     """
     logger = logging.getLogger("app")
     logger.info(
@@ -268,30 +270,31 @@ def _run_startup_migration(
 async def _provider_startup_check(
     services: Services, settings: Settings | None = None
 ) -> None:
-    """Стартовая проверка трёх LLM-слотов (решение №5) — в lifespan.
+    """The startup check of the three LLM slots — inside the lifespan.
 
-    После init_db, ДО старта воркера: лёгкий GET к каждому слоту (без
-    генерации — не грузит модели в память, не тратит токены), три слота
-    параллельно, по 1 попытке (~5 с на слот). Исходы:
-    - ok → INFO + `last_attempt_ok=True` — /health честен ещё до первого
-      реального вызова (без ложного None);
-    - auth_failed (401/403) → фатальный отказ старта: SystemExit(2) с
-      hint про {SLOT}_API_KEY — нерабочая конфигурация не должна
-      подниматься и молча копить pending;
-    - unreachable/model_missing (сеть/таймаут/5xx/404/модель не в списке)
-      → WARN, старт продолжается (NFR-3: транзиентная недоступность не
-      роняет рестарты — ребут хоста, Ollama ещё поднимается; воркер
-      догонит по pending-очередям).
-    Лог-события: provider_check_started / provider_check_result
-    (слот, провайдер, исход — аудит в стиле Фазы 10).
+    After init_db, BEFORE the worker starts: a light GET per slot (no
+    generation — models stay out of memory, no tokens spent), three slots in
+    parallel, one attempt each (~5 s per slot). Outcomes:
+    - ok → INFO + `last_attempt_ok=True` — /health is honest before the first
+      real call (no misleading None);
+    - auth_failed (401/403) → a fatal start refusal: SystemExit(2) with the
+      {SLOT}_API_KEY hint — a broken configuration must not come up and
+      silently accumulate pending;
+    - unreachable/model_missing (network/timeout/5xx/404/model not listed)
+      → WARN, the start continues (NFR-3: a transient outage must not kill
+      restarts — a host reboot with Ollama still coming up; the worker
+      catches up over the pending queues).
+    Log events: provider_check_started / provider_check_result
+    (slot, provider, outcome — Phase-10-style audit).
     """
     logger = logging.getLogger("app")
     if settings is None:
         settings = get_settings()
     slots = _startup_slots(services)
     if not slots:
-        # DI-сборка без клиентов слотов (фейки вместо сервисов): проверка —
-        # заглушка ok (бриф §3), сервис стартует без сетевых обращений.
+        # A DI build without slot clients (fakes instead of services): the
+        # check is a stubbed ok (brief §3), the service starts with no network
+        # calls.
         return
     for slot, client, _service in slots:
         logger.info(
@@ -338,22 +341,22 @@ async def _provider_startup_check(
             print(f"FATAL: {message}", file=sys.stderr)
             raise SystemExit(2)
         else:
-            # unreachable/model_missing → WARN + деградация (NFR-3). Приёмка
-            # пула 4 (решение координатора, уточнение брифа §1.5):
-            # last_attempt_ok остаётся None — семантика NFR-4 «исход последней
-            # РЕАЛЬНОЙ попытки»: стартовая проверка — GET живости, не векторизация
-            # (тесты Фазы 8: save не кодирует синхронно → None). Деградация
-            # видна в WARN-логах старта; False поставит первый реальный отказ.
+            # unreachable/model_missing → WARN + degradation (NFR-3). The pool-4
+            # acceptance (brief §1.5): last_attempt_ok stays None — the NFR-4
+            # semantics "the outcome of the last REAL attempt": the startup
+            # check is a liveness GET, not vectorization (Phase 8 tests: save
+            # does not encode synchronously → None). The degradation is visible
+            # in the startup WARN logs; the first real failure sets False.
             logger.warning(
                 "стартовая проверка LLM-слота не пройдена — старт продолжается "
                 "(деградация, воркер догонит по pending-очередям)",
                 extra=extra,
             )
-        # №49 (arch §13.5): предупреждения конфигурации слота — WARN и старт
-        # продолжается (фатален только auth_failed, см. выше); пишутся и при
-        # unreachable/model_missing — они про конфигурацию, не про сеть. У
-        # слота векторизации нет бюджета вывода и *_CONTEXT_TOKENS, а у
-        # decision нет ни бюджета, ни *_CONTEXT_TOKENS (LSBN-F-12).
+        # No49 (arch §13.5): slot configuration warnings — WARN and the start
+        # continues (only auth_failed is fatal, see above); they are written
+        # for unreachable/model_missing too — they are about configuration, not
+        # the network. The embedding slot has no output budget and no
+        # *_CONTEXT_TOKENS; decision has neither (LSBN-F-12).
         if slot == "embedding":
             continue
         warnings = LLMClient.slot_config_warnings(client.spec)
@@ -380,41 +383,41 @@ async def _provider_startup_check(
                         "text": text,
                     },
                 )
-    # LSBN-F-34 (решение №4 брифа): предупреждения конфигурации операций —
-    # переопределённые плоским env (те же правила, что у слотов) + WARN о
-    # неизвестном имени операции. Сервис стартует (не фатально).
+    # LSBN-F-34 (brief decision No4): operation configuration warnings —
+    # operations overridden by flat env (the same rules as slots) + the WARN
+    # about an unknown operation name. The service starts (not fatal).
     _operations_config_warnings(logger, settings)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    """Собрать приложение; настройки — из окружения, если не переданы явно."""
+    """Build the application; settings come from the environment unless passed."""
     if settings is None:
         try:
             settings = get_settings()
         except ConfigError as exc:
-            # Фатальная ошибка конфигурации: понятное сообщение вместо traceback.
+            # Fatal configuration error: a readable message instead of a traceback.
             print(f"FATAL: {exc}", file=sys.stderr)
             raise SystemExit(2) from exc
 
     try:
-        services = build_services(settings)  # один Settings-снимок на процесс
+        services = build_services(settings)  # one Settings snapshot per process
     except ConfigError as exc:
-        # Фатальная конфигурация (например, judge_system из файла без
-        # маркеров «ДУБЛЬ»/«НЕ ДУБЛЬ» — решение №7): понятное сообщение
-        # вместо traceback, старт прерывается.
+        # A fatal configuration (for example, a judge_system file without the
+        # "DUPLICATE"/"NOT DUPLICATE" markers): a readable message instead of a
+        # traceback, the start aborts.
         print(f"FATAL: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
-    # JSON-логи stdout (NFR-4): включаются при сборке приложения (импорт
-    # app.main / тесты / uvicorn — один и тот же идемпотентный setup).
+    # JSON logs to stdout (NFR-4): enabled at application build (importing
+    # app.main / tests / uvicorn — the same idempotent setup).
     setup_logging(settings.log_level)
-    # §3.4: две очереди — векторы (Фаза 3) и summary (Фаза 4, режим «Б»);
-    # суммаризатор из DI — тот же экземпляр, что в /health.summarizer_ok.
-    # Судья дедупа (Фаза 8, Этап 3.1) — тоже DI из services, один экземпляр
-    # на процесс (вердикты по кандидатам — Задача 3.2).
-    # №12 (3.2.0): один сервис предупреждений на процесс — им воркер пишет
-    # «слияние отложено» (F-23 п. 6), а NoteService инвалидирует
-    # предупреждения при правке (ниже). Снятию классификатор не нужен
-    # (только SQL) — узкая инъекция без циклических импортов.
+    # §3.4: two queues — vectors (Phase 3) and summary (Phase 4, mode "B");
+    # the DI summarizer is the same instance /health.summarizer_ok reports.
+    # The dedup judge (Phase 8, step 3.1) is DI from services too, one
+    # instance per process (candidate verdicts — Task 3.2).
+    # No12 (3.2.0): one warnings service per process — the worker writes
+    # "merge deferred" with it (F-23 p. 6), and NoteService invalidates
+    # warnings on edit (below). The removal needs no classifier (SQL only) —
+    # a narrow injection without circular imports.
     warnings_service = WarningsService(
         settings, classifier=None, namespaces=services.namespaces
     )
@@ -429,48 +432,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         decision=services.decision,
         warnings=warnings_service,
     )
-    # Суммаризация стартует сразу при save/update: NoteService сигналит
-    # воркеру, тот немедленно догоняет pending_summary (не ждёт back-off).
+    # Summarization starts immediately on save/update: NoteService signals
+    # the worker, which catches up pending_summary right away (no back-off
+    # wait).
     services.notes.set_summary_notifier(worker.notify_summary_pending)
-    # Векторизация стартует сразу при save/update: та же запись заметки
-    # (vector_status='pending') сигналит embedding-петле — свежая заметка
-    # кодируется немедленно, а не после выросшего back-off (до 15 мин).
-    # Событие только ускоряет — задание живёт в статусе заметки (gate
-    # 2026-09-19, прецедент summary-нотификатора).
+    # Vectorization also starts immediately on save/update: the same note
+    # write (vector_status='pending') signals the embedding loop — a fresh note
+    # is encoded right away, not after the grown back-off (up to 15 min).
+    # The event only accelerates — the work lives in the note status (the
+    # 2026-09-19 gate, the summary-notifier precedent).
     services.notes.set_vector_notifier(worker.notify_embedding_pending)
-    # №12 (FR-4.4): правка заметки инвалидирует её предупреждение — в той же
-    # транзакции.
+    # No12 (FR-4.4): editing a note invalidates its warning — in the same
+    # transaction.
     services.notes.set_warnings_resolver(warnings_service.resolve_for_subject)
-    # Область навыков (3.0.0): save/правка сигналит петле areas — вектора
-    # записи догоняются сразу, а не по выросшему back-off (прецедент
-    # summary-нотификатора). None — DI-сборка тестов без области навыков.
+    # The skills area (3.0.0): save/edit signals the areas loop — the record's
+    # vectors are caught up immediately, not after the grown back-off (the
+    # summary-notifier precedent). None — a test DI build without the skills
+    # area.
     if services.skills is not None:
         services.skills.set_areas_notifier(worker.notify_areas_pending)
-    # Область «user» (3.0.0, lsb-0009): запись/правка/удаление факта будит
-    # петлю areas тем же сигналом — вектора записи догоняются сразу, а не по
-    # выросшему back-off (прецедент области навыков). Проверка на None — как
-    # у области навыков: поле может быть пустым в DI-сборках тестов (№40).
+    # The "user" area (3.0.0, lsb-0009): fact save/edit/delete wakes the areas
+    # loop with the same signal — the record's vectors are caught up
+    # immediately, not after the grown back-off (the skills-area precedent).
+    # The None check mirrors the skills area: the field may be empty in test
+    # DI builds (No40).
     if services.user_facts is not None:
         services.user_facts.set_areas_notifier(worker.notify_areas_pending)
-    # Область terms (3.0.0, lsb-0008): запись/правка/удаление термина будит
-    # петлю areas тем же сигналом — вектора записи догоняются сразу, а не по
-    # выросшему back-off (прецедент областей навыков и «user»). Проверка на
-    # None — симметрично прочим областям (№40).
+    # The terms area (3.0.0, lsb-0008): term save/edit/delete wakes the areas
+    # loop with the same signal — the record's vectors are caught up
+    # immediately, not after the grown back-off (the skills and "user" area
+    # precedents). The None check mirrors the other areas (No40).
     if services.terms is not None:
         services.terms.set_areas_notifier(worker.notify_areas_pending)
-    # Область логов (3.2.0, LSBN-F-10, f10-02): запись/правка/удаление лога будит ту
-    # же петлю areas — вектор записи (непустые action + reason + outcome, §5.3)
-    # догоняется сразу, а не по выросшему back-off. Проверка на None — как у
-    # прочих областей (№40).
+    # The logs area (3.2.0, LSBN-F-10, f10-02): log save/edit/delete wakes the
+    # same areas loop — the record vector (non-empty action + reason + outcome,
+    # §5.3) is caught up immediately, not after the grown back-off. The None
+    # check mirrors the other areas (No40).
     if services.logs is not None:
         services.logs.set_areas_notifier(worker.notify_areas_pending)
-    # Внутренний маршрут MCP-сервера — ровно MCP_PATH. host="0.0.0.0" — не
-    # localhost, поэтому SDK не включает DNS-rebinding protection (сервис
-    # живёт в LAN за Bearer-токеном; Open WebUI ходит с не-localhost Host).
-    # MCP собирается после воркера (№39, FR-4.4): миддлварь хинта о сломанном
-    # слоте берёт снимок разрывов из воркера (`slot_states`). №45 (FR-45.8):
-    # чекер версии создаётся здесь и передаётся в MCP — миддлварь `update_hint`
-    # читает только его кеш; фоновая петля стартует в lifespan (если включено).
+    # The internal MCP route is exactly MCP_PATH. host="0.0.0.0" — not
+    # localhost, so the SDK does not enable DNS-rebinding protection (the
+    # service lives in a LAN behind a Bearer token; Open WebUI sends a
+    # non-localhost Host). MCP is built after the worker (No39, FR-4.4): the
+    # broken-slot hint middleware takes the break snapshot from the worker
+    # (`slot_states`). No45 (FR-45.8): the version checker is created here and
+    # handed to MCP — the `update_hint` middleware reads only its cache; the
+    # background loop starts in the lifespan (when enabled).
     update_checker = UpdateChecker(settings)
     mcp = build_mcp(settings, services, worker=worker, update_checker=update_checker)
     mcp_app = mcp.streamable_http_app(
@@ -480,35 +487,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        # Инициализация хранилища при старте (критерий приёмки Фазы 2):
-        # схема создаётся/сверяется до первого запроса; ошибка — фатальна.
+        # Storage initialization at startup (the Phase 2 acceptance test):
+        # the schema is created/verified before the first request; an error is
+        # fatal.
         try:
             init_db(settings)
-            # LSBN-F-22: таблица migration_notes + штамп schema.note_chars
-            # на каждой старте (идемпотентно; наблюдаемость — design §3).
+            # LSBN-F-22: the migration_notes table + the schema.note_chars
+            # stamp on every start (idempotent; observability — design §3).
             ensure_startup_schema(settings)
         except StorageError as exc:
             print(f"FATAL: {exc}", file=sys.stderr)
             raise SystemExit(2) from exc
-        # LSBN-F-22 (M1), фазы 0–3: env разошёлся с живым CHECK — сервис сам
-        # строит новую базу, переливает влезающее 1:1 и переключается файловым
-        # swap (автостарт без предохранителя — вариант C постановки; без
-        # простоя: старт продолжается на уже новой базе). Сбой не роняет старт:
-        # активная база цела, причина — в журнале джоб (первая строка миграции).
+        # LSBN-F-22 (M1), phases 0–3: the env diverged from the live CHECK —
+        # the service builds a new base itself, pours what fits 1:1 and
+        # switches by a file swap (an automatic start without a safety catch —
+        # variant C of the design; zero downtime: the start continues on the
+        # already-new base). A failure does not kill the start: the active base
+        # is intact, the reason is in the job journal (the first migration
+        # line).
         plan = startup_plan(settings)
         if plan["mode"] != "none":
             _run_startup_migration(settings, plan, services.backup)
-        # LSBN-F-22 (M3): union-контекст чтения (search/notes/dedup) — по
-        # состоянию миграции активной базы: phase pour/split и живой
-        # prev_file → вторая сессия по прежней базе (в т.ч. возобновление —
-        # рестарт середины миграции); done/aborted/нет — None (нулевой
-        # оверхед, пути прежние).
+        # LSBN-F-22 (M3): the union read context (search/notes/dedup) — by the
+        # active base migration state: phase pour/split with a live prev_file →
+        # a second session over the previous base (including a resume — a
+        # restart in the middle of a migration); done/aborted/none — None (zero
+        # overhead, the old paths).
         refresh_migration_context(settings)
-        # Стартовая проверка трёх LLM-слотов (решение №5): после init_db,
-        # ДО старта воркера — лёгкий GET без генерации, параллельно;
-        # отказ авторизации фатален, недоступность — WARN + деградация.
-        # LSBN-F-34: settings переданы явно — предупреждения операций считаются
-        # по тому же снимку настроек, что собрал процесс.
+        # The startup check of the three LLM slots: after init_db, BEFORE the
+        # worker starts — a light GET without generation, in parallel; an auth
+        # failure is fatal, unreachability — WARN + degradation.
+        # LSBN-F-34: settings are passed explicitly — operation warnings are
+        # computed over the same settings snapshot the process was built with.
         await _provider_startup_check(services, settings)
         logging.getLogger("app").info(
             "service started",
@@ -518,16 +528,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "port": settings.port,
                 "mcp_path": settings.mcp_path,
                 "db_path": settings.db_path,
-                # Разделитель слота нарезки (3.4.1, LSBN-T-27): по проде
-                # видно, сколько заметок берётся за прогон и на сколько
-                # джоба миграции уходит в паузу.
+                # The migration slot cadence (3.4.1, LSBN-T-27): the startup
+                # record shows how many notes a run takes and how long the
+                # migration job pauses.
                 "migration_batch": settings.migration_batch,
                 "migration_pause_sec": settings.migration_pause_sec,
             },
         )
-        # №40 (FR-4.3): состав включённых областей — из журнала старта видно,
-        # какие области активны (диагностика не гадает). Флаг гейтит только
-        # поверхность/фон; данные и REST остаются доступны и у выключенной.
+        # No40 (FR-4.3): the set of enabled areas in the startup log —
+        # diagnostics does not guess. The flag gates only the surface/loop;
+        # data and REST stay reachable for a disabled area too.
         logging.getLogger("app").info(
             "areas enabled",
             extra={
@@ -536,26 +546,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "skills": settings.area_skills_enabled,
                     "terms": settings.area_terms_enabled,
                     "user_facts": settings.area_user_facts_enabled,
-                    # LSBN-F-10 (f10-02): область логов активна тем же реестром;
-                    # ключ добавлен минимально, реестровый рефакторинг события —
-                    # отдельная позиция (f10-04).
+                    # LSBN-F-10 (f10-02): the logs area is live in the same
+                    # registry; the key was added minimally, the event's registry
+                    # refactor is a separate item (f10-04).
                     "logs": settings.area_logs_enabled,
                 },
             },
         )
-        # Жизненный цикл MCP-сессий Streamable HTTP = жизни процесса.
+        # The MCP Streamable HTTP session lifecycle = the process lifetime.
         async with mcp.session_manager.run():
-            # Фоновый воркер: очереди pending живут в БД — после рестарта
-            # дорезюмируются/довекторизуются сами (ARCH §3.4); при останове —
-            # отмена таски.
+            # Background worker: the pending queues live in the DB — after a
+            # restart they resume/re-encode on their own (ARCH §3.4); on
+            # shutdown the task is cancelled.
             worker_task = asyncio.create_task(worker.run(), name="pending-backlog")
-            # BackupService (Фаза 5, NFR-3): снапшот сразу после старта,
-            # далее — раз в BACKUP_INTERVAL_SEC; отказы — в лог, петля живёт.
+            # BackupService (Phase 5, NFR-3): a snapshot right after the start,
+            # then once per BACKUP_INTERVAL_SEC; failures go to the log, the
+            # loop keeps living.
             backup_task = asyncio.create_task(
                 services.backup.run(), name="backup-snapshots"
             )
-            # №45 (FR-45.3): фоновая проверка версии — только когда включена;
-            # первый опрос сразу после старта, далее по интервалу.
+            # No45 (FR-45.3): the background version check — only when enabled;
+            # the first poll right after the start, then by the interval.
             update_task: asyncio.Task[None] | None = None
             if settings.update_check_enabled:
                 update_task = asyncio.create_task(
@@ -564,8 +575,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             try:
                 yield
             finally:
-                worker.stop()  # мягкий флаг: не начинать новую партию
-                worker_task.cancel()  # и прервать ожидание, если спит
+                worker.stop()  # soft flag: do not start a new batch
+                worker_task.cancel()  # and interrupt the wait if sleeping
                 with suppress(asyncio.CancelledError):
                     await worker_task
                 services.backup.stop()
@@ -581,22 +592,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="LLM Second Brain",
         version=__version__,
-        # REST — внутренняя поверхность (REQUIREMENTS §3): OpenAPI-документацию
-        # не публикуем, меньше лишних ручек за миддлварью.
+        # REST is an internal surface (REQUIREMENTS §3): no OpenAPI docs —
+        # fewer extra handles behind the middleware.
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
         lifespan=lifespan,
     )
     app.include_router(build_rest_router(settings))
-    app.state.services = services  # REST-ручки достают сервисы отсюда
-    # Воркер нужен REST-ручке /health: снимки очередей (queues, FR-2.2)
-    # собираются по реестру джоб — только SQL, без обращений к моделям.
+    app.state.services = services  # REST handles fetch the services here
+    # The worker is needed by the /health REST handle: queue snapshots
+    # (queues, FR-2.2) are built over the job registry — SQL only, no model
+    # calls.
     app.state.worker = worker
-    # №45 (FR-4.4): снимок версии для /health.update — из памяти чекера.
+    # No45 (FR-4.4): the version snapshot for /health.update — from the
+    # checker's memory.
     app.state.update_checker = update_checker
-    # Монтирование в корень: MCP_PATH задаёт точный путь MCP-эндпоинта;
-    # маршруты FastAPI (/health и будущие REST) матчатся раньше mount.
+    # Mounted at the root: MCP_PATH pins the exact MCP endpoint path;
+    # FastAPI routes (/health and future REST) match before the mount.
     app.mount("/", mcp_app)
     app.add_middleware(
         BearerAuthMiddleware,
