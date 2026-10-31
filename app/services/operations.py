@@ -1,29 +1,29 @@
-"""Реестр операций LLM (LSBN-F-34, релиз 3.4.0): модель под каждый процесс.
+"""The LLM operations registry (LSBN-F-34, 3.4.0): a model per process.
 
-Исторически модель выбиралась слотом-группой (канон 4.2.8): слот `summary`
-обслуживал `summarize`, `title` и `merge`, слот `judge` — вердикт дедупа и
-судью структуры. Поменять модель только для одного процесса (например,
-только для сшивания дублей — живой пример T-23) было нельзя. Реестр режет
-слоты-группы на **операции**: плоское env-переопределение `<ОПЕРАЦИЯ>_<ПОЛЕ>`
-(без префикса `OP_`, решение О. 21.10.2026) действует поверх env слота.
+    Historically the model was chosen by the slot group (canon 4.2.8): the
+    `summary` slot served `summarize`, `title` and `merge`; the `judge` slot - the
+    dedup verdict and the structure judge. Changing the model for one process
+    only (for example, only for merging duplicates - the live T-23 case) was
+    impossible. The registry cuts slot groups into OPERATIONS: a flat env
+    override `<OP>_<FIELD>` (no `OP_` prefix) acts over the slot env.
 
-Цепочка разрешения по каждому полю: **env операции → env слота → дефолт**
-(существующие поля Settings). `None` у поля операции = «не задано» —
-наследуется слот, поэтому частичное переопределение (только `MERGE_MODEL`)
-— норма. Операции без переопределения ведут себя ровно как раньше.
+    The resolution chain per field: operation env -> slot env -> default (the
+    existing Settings fields). `None` at an operation field = "not set" - the slot
+    is inherited, so a partial override (only `MERGE_MODEL`) is the norm.
+    Operations without overrides behave exactly as before.
 
-Границы (решения брифа 21.10.2026):
-- слот `SPLIT_*` как отдельная слот-группа отменён — реестр не восстанавливает
-  его; `split` остаётся ОПЕРАЦИЕЙ слота summary (зарегистрирована впрок, как
-  и `describe` — сегодня не вызывается);
-- переопределение операции действует только на основном (генеративном) пути;
-  резервный слот (decision, механика F-12) главнее: при переключении на резерв
-  берутся настройки `DECISION_*` вместе с его моделью;
-- секреты (`*_API_KEY`) переопределяются env операции, но в отпечаток
-  конфигурации и наружные поверхности (/health) не попадают.
+    The boundaries (the brief decisions):
+    - the `SPLIT_*` slot as a separate slot group stays retired - the registry
+      does not restore it; `split` remains an OPERATION of the summary slot
+      (registered ahead of use, like `describe` - not called today);
+    - an operation override acts on the primary (generative) path only; the
+      reserve slot (decision, the F-12 mechanics) is senior: switching to the
+      reserve takes the `DECISION_*` settings with its model;
+    - secrets (`*_API_KEY`) are overridden by the operation env but never reach
+      the config fingerprint or the outer surfaces (/health).
 
-Модуль чистый: знает только `app.config.Settings`, без клиентов, БД и сети —
-разрешение конфигурации тестируется без поднятия приложения.
+    The module is pure: it knows only `app.config.Settings`, no clients, DB or
+    network - the configuration resolution is testable without booting the app.
 """
 
 from __future__ import annotations
@@ -36,11 +36,11 @@ from pydantic_core import PydanticUndefined
 
 from app.services.slot_budget import resolve_budgets
 
-if TYPE_CHECKING:  # только для аннотаций — модуль остаётся чистым
+if TYPE_CHECKING:  # annotations only - the module stays pure
     from app.config import Settings
 
-# Реестр «имя операции → слот-группа» (LSBN-F-34, решение №1 брифа). Порядок
-# — часть контракта (/health.operations перечисляет операции в этом порядке).
+# The "operation name -> slot group" registry (LSBN-F-34, brief decision No1). The order
+# is part of the contract (/health.operations lists operations in this order).
 OPERATIONS: dict[str, str] = {
     "summarize": "summary",
     "title": "summary",
@@ -53,11 +53,11 @@ OPERATIONS: dict[str, str] = {
     "embed": "embedding",
 }
 
-# Поля переопределения (решение №1 брифа): плоский env `<ОПЕРАЦИЯ>_<ПОЛЕ>`.
-# Порядок — часть контракта (источники в /health и тестах перечисляют так).
-# LSBN-T-33: `reasoning_num_predict` — бюджет РАССУЖДЕНИЯ операции (отдельно от
-# бюджета ответа `num_predict`); слот-слой у него один на все слоты — глобальный
-# `slot_reasoning_num_predict` (см. resolve_operation).
+# The override fields (the brief's decision No1): the flat env `<OP>_<FIELD>`.
+# The order is part of the contract (/health and the tests list the sources this way).
+# LSBN-T-33: `reasoning_num_predict` - the operation's REASONING budget (apart from
+# the answer budget `num_predict`); its slot layer is one for all slots - the global
+# `slot_reasoning_num_predict` (see resolve_operation).
 OPERATION_FIELDS: tuple[str, ...] = (
     "model",
     "provider",
@@ -71,8 +71,8 @@ OPERATION_FIELDS: tuple[str, ...] = (
     "model_type",
 )
 
-# Поле операции → атрибут SlotSpec (llm_client.SlotSpec): таймаут операции
-# ложится в клиентский read-таймаут, остальные — одноимённо.
+# An operation field -> a SlotSpec attribute (llm_client.SlotSpec): the operation timeout
+# lands in the client read timeout; the rest map by name.
 SPEC_FIELDS: dict[str, str] = {
     "model": "model",
     "provider": "provider",
@@ -86,18 +86,18 @@ SPEC_FIELDS: dict[str, str] = {
     "model_type": "model_type",
 }
 
-# Кодовые дефолты полей операций (низший слой цепочки — ДО дефолта SlotSpec):
-# описание узла исторически шло с явным бюджетом 128 и без рассуждений
-# (promotion.py, DESCRIBE_NUM_PREDICT + think=False) — дефолты переезжают
-# сюда, чтобы DESCRIBE_NUM_PREDICT/DESCRIBE_THINK и наследование слота
-# работали по общей цепочке.
+# The code defaults of the operation fields (the lowest chain layer - BEFORE the SlotSpec default):
+# the node description historically ran with an explicit budget of 128 and no
+# reasoning (promotion.py, DESCRIBE_NUM_PREDICT + think=False) - the defaults
+# move here so DESCRIBE_NUM_PREDICT/DESCRIBE_THINK and slot inheritance
+# work through the shared chain.
 OPERATION_FIELD_DEFAULTS: dict[tuple[str, str], object] = {
     ("describe", "num_predict"): 512,
     ("describe", "think"): False,
 }
 
-# Известные env-префиксы верхнего уровня (для WARN о неизвестном имени
-# операции): операции реестра + слот-группы + общие слот-параметры.
+# The known top-level env prefixes (for the WARN about an unknown operation
+# name): the registry operations + the slot groups + the shared slot parameters.
 KNOWN_ENV_PREFIXES: frozenset[str] = frozenset(OPERATIONS) | {
     "embedding",
     "summary",
@@ -105,34 +105,35 @@ KNOWN_ENV_PREFIXES: frozenset[str] = frozenset(OPERATIONS) | {
     "decision",
 }
 
-# Маска «плоского операционного» env: `<ПРЕФИКС>_<ПОЛЕ>` по полям реестра.
+# The "flat operator" env mask: `<PREFIX>_<FIELD>` over the registry fields.
 _OPERATION_ENV_RE = re.compile(
     r"^([A-Z][A-Z0-9_]*)_(" + "|".join(field.upper() for field in OPERATION_FIELDS) + r")$"
 )
 
 
 def env_name(operation: str, field: str) -> str:
-    """Плоское имя env операции: `<ОПЕРАЦИЯ>_<ПОЛЕ>` (решение №1 брифа)."""
+    """The operation's flat env name: `<OP>_<FIELD>` (the brief's decision No1)."""
     return f"{operation.upper()}_{field.upper()}"
 
 
 def _settings_field(operation: str, field: str) -> str:
-    """Имя Settings-поля плоского env операции (pydantic читает env сам)."""
+    """The Settings field name of the operation's flat env (pydantic reads env itself)."""
     return f"{operation}_{field}"
 
 
 def _slot_settings_field(slot: str, field: str) -> str:
-    """Имя Settings-поля слот-группы (provider/model/... per-slot канона 4.2.8)."""
+    """The Settings field name of a slot group (provider/model/... per the 4.2.8 canon)."""
     return f"{slot}_{field}"
 
 
 def _source_of(settings: "Settings", settings_field: str) -> str:
-    """Источник значения слот-слоя: `slot` (задано оператором) | `default`.
+    """The value source of the slot layer: `slot` (set by the operator) | `default`.
 
-    Обязательные поля (`SUMMARY_MODEL` и т.п., без умолчания) — всегда
-    `slot`; опциональные сравниваются с объявленным дефолтом Settings:
-    значение равно дефолту → `default`, отличается → `slot`. Поля, которых
-    у слота нет (например, `embedding_think`), — `default`.
+            Required fields (`SUMMARY_MODEL` etc., no default) are always `slot`;
+            optional ones compare against the declared Settings default: equal to the
+            default -> `default`, different -> `slot`. Fields a slot does not have
+            (for example, `embedding_think`) - `default`.
+
     """
     field_info = type(settings).model_fields.get(settings_field)
     if field_info is None:
@@ -146,19 +147,21 @@ def _source_of(settings: "Settings", settings_field: str) -> str:
 def resolve_operation(
     operation: str, settings: "Settings"
 ) -> tuple[dict[str, object], dict[str, str]]:
-    """Эффективные значения полей операции и источник каждого: (values, sources).
+    """The operation fields' effective values and each one's source: (values, sources).
 
-    values — ТОЛЬКО поля, заданные плоским env операции (слой `op`); sources —
-    полное покрытие OPERATION_FIELDS: `op` | `slot` | `default`. Операция,
-    чьё имя совпадает со слот-группой (`judge`), отдельного слоя не имеет —
-    её env и есть env слота (`JUDGE_*`), источники честно слот-слоя.
-    `merge_num_predict` (историческое поле, config.py) — уже операционный
-    env: значение 0 («авто») считается ЗАДАННЫМ операцией — поведение
-    прежнее (наследование слота для merge не включается).
-    Исключение — `reasoning_num_predict` (LSBN-T-33): у него нет слот-групповых
-    полей, поэтому операционный слой читается и для `judge`
-    (`JUDGE_REASONING_NUM_PREDICT`), а слот-слой — глобальный
-    `slot_reasoning_num_predict`.
+            values - ONLY the fields set by the flat operation env (the `op` layer);
+            sources - the full coverage of OPERATION_FIELDS: `op` | `slot` |
+            `default`. An operation whose name equals the slot group (`judge`) has no
+            separate layer - its env IS the slot env (`JUDGE_*`), the sources are
+            honestly the slot layer's. `merge_num_predict` (a historical field,
+            config.py) is already an operation env: a value of 0 ("auto") counts as
+            SET by the operation - the behavior unchanged (slot inheritance for merge
+            stays off).
+            The exception - `reasoning_num_predict` (LSBN-T-33): it has no slot-group
+            fields, so the operation layer is read for `judge` too
+            (`JUDGE_REASONING_NUM_PREDICT`), and the slot layer is the global
+            `slot_reasoning_num_predict`.
+
     """
     slot = OPERATIONS.get(operation)
     if slot is None:
@@ -185,21 +188,22 @@ def resolve_operation(
 
 
 def operation_overrides_active(settings: "Settings") -> bool:
-    """Хотя бы одна операция переопределена плоским env (слой `op`)."""
+    """At least one operation is overridden by flat env (the `op` layer)."""
     return any(resolve_operation(operation, settings)[1].get("op") for operation in OPERATIONS)  # noqa: E501
 
 
 def _operation_budgets(operation: str, settings: "Settings") -> dict[str, object]:
-    """Бюджеты операции для /health.operations (LSBN-T-33, ТкР 3.7).
+    """The operation budgets for /health.operations (LSBN-T-33, the brief 3.7).
 
-    Эффективные значения полей собираются той же цепочкой, что в `for_operation`
-    (env операции → слот-слой → дефолт), после чего считается раздельный бюджет
-    (`slot_budget.resolve_budgets`, чистая функция — цикла импорта нет).
-    `prompt_tokens=0` — это КОНФИГУРАЦИОННЫЙ потолок операции (максимум), а не
-    бюджет конкретного вызова: фактические бюджеты живёт в `ChatMeta` и журнале
-    (`slot_call`). `think=None`/True — размышление разрешено (резерв считается);
-    False — нет (sent = ответ). Эффективный think НЕ заданной операции — флаг
-    слот-группы.
+            The effective field values are assembled by the same chain as
+            `for_operation` (operation env -> slot layer -> default), then the split
+            budget is computed (`slot_budget.resolve_budgets`, a pure function - no
+            import cycle). `prompt_tokens=0` - this is the operation's CONFIGURED
+            ceiling (the maximum), not a specific call's budget: the actual budgets
+            live in `ChatMeta` and the journal (`slot_call`). `think=None`/True -
+            thinking allowed (the reserve counts); False - not (sent = the answer).
+            An unset operation's effective think - the slot group's flag.
+
     """
     slot = OPERATIONS[operation]
     values, _sources = resolve_operation(operation, settings)
@@ -236,14 +240,16 @@ def _operation_budgets(operation: str, settings: "Settings") -> dict[str, object
 
 
 def operations_health(settings: "Settings") -> dict[str, dict[str, object]]:
-    """Снимок для /health.operations: {операция: {model, provider, source, бюджеты}}.
+    """The /health.operations snapshot: {operation: {model, provider, source, budgets}}.
 
-    `source` — источник МОДЕЛИ операции (`op` | `slot` | `default`); с LSBN-T-33
-    рядом бюджеты (`answer_budget`/`reasoning_budget`/`sent_budget` + их
-    источники) — конфигурационный потолок операции при пустом промпте. Адресов
-    и ключей здесь нет сознательно (решение №4 брифа): /health открыт наружу
-    без Bearer, адрес живёт в журнале (`slot_call`) и в событии джобы при
-    ошибке.
+            `source` - the source of the operation's MODEL (`op` | `slot` |
+            `default`); with LSBN-T-33 the budgets sit next to it
+            (`answer_budget`/`reasoning_budget`/`sent_budget` + their sources) - the
+            operation's configured ceiling with an empty prompt. Addresses and keys
+            are deliberately absent (the brief's decision No4): /health is open
+            without Bearer; the address lives in the journal (`slot_call`) and the job
+            error event.
+
     """
     block: dict[str, dict[str, object]] = {}
     for operation in OPERATIONS:
@@ -267,13 +273,14 @@ def operations_health(settings: "Settings") -> dict[str, dict[str, object]]:
 
 
 def unknown_operation_warnings() -> list[tuple[str, str]]:
-    """WARN об env с неизвестным именем операции (решение №4 брифа).
+    """The WARN about env with an unknown operation name (the brief's decision No4).
 
-    Сканирует окружение по маске `<ПРЕФИКС>_<ПОЛЕ>` (поля — реестра);
-    префикс вне известных операций/слот-групп — кандидат на опечатку
-    (`MERG_MODEL` вместо `MERGE_MODEL`). Возвращает `(code, EN-текст)` —
-    как `LLMClient.slot_config_warnings`, логирует вызывающий (main.py);
-    сервис стартует, предупреждение не фатально.
+            Scans the environment against the `<PREFIX>_<FIELD>` mask (the registry's
+            fields); a prefix outside the known operations/slot groups is a typo
+            candidate (`MERG_MODEL` instead of `MERGE_MODEL`). Returns
+            `(code, EN text)` - like `LLMClient.slot_config_warnings`; the caller
+            (main.py) logs; the service starts, the warning is not fatal.
+
     """
     warnings: list[tuple[str, str]] = []
     for name in sorted(os.environ):
