@@ -1,15 +1,14 @@
-"""Env-парсер — все переменные окружения из REQUIREMENTS §8.
+"""Env parser — every environment variable of REQUIREMENTS §8.
 
-Обязательные переменные (`EMBEDDING_BASE_URL`, `SUMMARY_BASE_URL`,
-`SUMMARY_MODEL`, `JUDGE_BASE_URL`, `JUDGE_MODEL`,
-`MCP_AUTH_TOKEN`) умолчаний не имеют: отсутствие или пустое
-значение — фатальная ошибка старта (NFR-2). Остальные имеют значения по
-умолчанию из таблицы REQUIREMENTS §8.
+Required variables (`EMBEDDING_BASE_URL`, `SUMMARY_BASE_URL`, `SUMMARY_MODEL`,
+`JUDGE_BASE_URL`, `JUDGE_MODEL`, `MCP_AUTH_TOKEN`) carry no defaults: a
+missing or empty value is a fatal startup error (NFR-2). Everything else
+defaults to the REQUIREMENTS §8 table.
 
-Фаза 5 (NFR-6): все ограничения валидируются при старте — кривое значение
-(вне диапазона, сепараторы, мусор) роняет сервис с понятным сообщением, а не
-создаёт сюрпризов в рантайме: некорректный лимит — это конфигурационная
-ошибка, а не ошибка какого-то отдельного вызова.
+Phase 5 (NFR-6): every constraint is validated at startup — a bad value
+(out of range, wrong separators, garbage) kills the service with a readable
+message instead of springing runtime surprises: a wrong limit is a
+configuration error, not a per-call failure.
 """
 
 from __future__ import annotations
@@ -20,134 +19,135 @@ from functools import lru_cache
 from pydantic import Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Допустимые уровни логирования (NFR-4: LOG_LEVEL); имя плывёт в std logging.
+# Allowed log levels (NFR-4: LOG_LEVEL); the name flows into std logging.
 LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
-# Допустимые провайдеры LLM-слотов (Фаза 11, решение №1): ollama — нативный
-# API, openai — OpenAI-совместимый (Bearer).
+# Allowed LLM slot providers (Phase 11): ollama — the native API, openai —
+# the OpenAI-compatible surface (Bearer).
 LLM_PROVIDERS = frozenset({"ollama", "openai"})
 
-# №49 (3.2.0, arch §13.1): тип модели генеративного слота — параметр
-# конфигурации. `reasoning` включает защиты бюджета и размышления;
-# `decision` — свойство отдельного decision-слота (свой конфиг DECISION_*),
-# у summary/judge он запрещён с подсказкой.
+# No49 (3.2.0, arch §13.1): the model type of a generative slot is a
+# configuration parameter. `reasoning` enables the budget/thinking guards;
+# `decision` belongs to the separate decision slot (its own DECISION_* config)
+# and is rejected with a hint on summary/judge.
 LLM_MODEL_TYPES = frozenset({"reasoning", "generation"})
 
-# Максимум слов в названии заметки (решение №9 брифа Фазы 11): зашитая
-# константа, НЕ env. Слова = len(title.split()).
+# Maximum words in a note title (Phase 11 brief): a code constant, NOT an
+# env. Words = len(title.split()).
 TITLE_MAX_WORDS = 5
 
-# Мягкий лимит текста заметки — дефолт (3.4.1:
-# 1500 → 2000 — 176 активных заметок прода в полосе 1500–2000 больше не
-# режутся нарезкой; полоса «одна заметка = один кластер фактов» держится).
-# ЕДИНСТВЕННОЕ место этого числа: Settings.max_note_chars (env
-# MAX_NOTE_CHARS). Константа кода NOTE_TEXT_LIMIT убрана (LSBN-T-26):
-# валидация записи, части merge/split, хинты, описания ручек, инструкции
-# и промпты берут значение из настроек при сборке. Диапазон 500..20000
-# держит контракт частей слияния («часть читаема сама по себе») — конфиг
-# не должен его ломать (Ruling 28.10.2026).
+# Soft note-text limit — the default (3.4.1: 1500 → 2000 so the 176 active
+# prod notes in the 1500–2000 band stop being split; the "one note = one
+# cluster of facts" band holds). The SINGLE home of this number:
+# Settings.max_note_chars (env MAX_NOTE_CHARS). The NOTE_TEXT_LIMIT code
+# constant is gone (LSBN-T-26): save validation, merge/split part limits,
+# hints, tool descriptions, instructions and prompts take the value from
+# settings at build time. The 500..20000 range protects the merge-part
+# contract ("a part is readable on its own") — the config must not break it.
 MAX_NOTE_CHARS_DEFAULT = 2000
 
 
 class ConfigError(RuntimeError):
-    """Фатальная ошибка конфигурации: сервис обязан отказаться стартовать."""
+    """Fatal configuration error: the service must refuse to start."""
 
 
 class Settings(BaseSettings):
-    """Настройки сервиса; источник — только переменные окружения.
+    """Service settings; the source is environment variables only.
 
-    Имена полей соответствуют env-переменным REQUIREMENTS §8
-    (pydantic-settings сопоставляет без учёта регистра).
+    Field names match the REQUIREMENTS §8 env variables (pydantic-settings
+    matches case-insensitively).
     """
 
     model_config = SettingsConfigDict(
-        env_file=None,  # только окружение; .env — зона деплоя (docker compose)
-        extra="ignore",  # посторонние переменные не ломают парсинг
-        frozen=True,  # настройки неизменяемы после старта
+        env_file=None,  # environment only; .env belongs to deployment (docker compose)
+        extra="ignore",  # foreign variables do not break parsing
+        frozen=True,  # settings are immutable after startup
     )
 
-    # --- обязательные (REQUIREMENTS §8: «обязательна», без умолчания) ---
-    embedding_base_url: str = Field(...)  # адрес API слота embedding (Фаза 11)
-    summary_base_url: str = Field(...)  # адрес API слота summary (Фаза 11)
-    summary_model: str = Field(...)  # генеративная модель суммаризации
-    judge_base_url: str = Field(...)  # адрес API слота judge (Фаза 11)
-    judge_model: str = Field(...)  # модель-судья дедупа (Фаза 11)
-    mcp_auth_token: str = Field(...)  # Bearer-токен (NFR-2)
+    # --- required (REQUIREMENTS §8: "required", no defaults) ---
+    embedding_base_url: str = Field(...)  # embedding slot API address (Phase 11)
+    summary_base_url: str = Field(...)  # summary slot API address (Phase 11)
+    summary_model: str = Field(...)  # generative summarization model
+    judge_base_url: str = Field(...)  # judge slot API address (Phase 11)
+    judge_model: str = Field(...)  # dedup judge model (Phase 11)
+    mcp_auth_token: str = Field(...)  # Bearer token (NFR-2)
 
-    # --- провайдеры per-slot (Фаза 11, решение №1): ollama — дефолт | openai ---
+    # --- per-slot providers (Phase 11): ollama is the default | openai ---
     embedding_provider: str = "ollama"
     summary_provider: str = "ollama"
     judge_provider: str = "ollama"
 
-    # --- API-ключи per-slot (Фаза 11, решение №3): опциональны, default "" ---
+    # --- per-slot API keys (Phase 11): optional, default "" ---
     embedding_api_key: str = ""
     summary_api_key: str = ""
     judge_api_key: str = ""
 
-    # --- каталог редактируемых промптов (Фаза 11, решение №7): не задан —
-    # файловая механика не активна, используются встроенные константы ---
+    # --- editable prompts directory (Phase 11): unset — the file mechanics
+    # are inactive, the built-in constants are used ---
     prompts_dir: str | None = None
 
-    # --- векторизация ---
+    # --- vectorization ---
     embedding_model: str = "qwen3-embedding:8b"
-    embedding_dim: int = 4096  # фиксируется при создании БД (vec0-таблица)
+    embedding_dim: int = 4096  # fixed at database creation (vec0 table)
 
-    # --- чанковая индексация (Фаза 7): вектора — по чанкам заметки ---
-    text_splitter: str = "tiktoken"  # токен-сплиттер; encoding фикс: cl100k_base
-    chunk_size: int = 1024  # окно чанка, токенов
-    chunk_overlap: int = 180  # перекрытие соседних окон, токенов
-    chunk_min_target: int = 200  # хвостовой чанк короче — слить с предыдущим
-    embedding_batch_size: int = 32  # чанков в одном /api/embed запросе воркера
-    embedding_concurrent_requests: int = 3  # параллельных embed-запросов воркера
+    # --- chunked indexing (Phase 7): vectors per note chunk ---
+    text_splitter: str = "tiktoken"  # token splitter; encoding pinned: cl100k_base
+    chunk_size: int = 1024  # chunk window, tokens
+    chunk_overlap: int = 180  # overlap of neighboring windows, tokens
+    chunk_min_target: int = 200  # a shorter tail chunk merges into the previous one
+    embedding_batch_size: int = 32  # chunks per worker /api/embed request
+    embedding_concurrent_requests: int = 3  # parallel worker embed requests
 
-    # --- суммаризация ---
-    # Лимит длины саммари в символах (решение гейта 3.1.0, 2026-09-19: 150).
-    # Держит обе стороны одной константой: жёсткую страховку МОДЕЛЬНОГО
-    # саммари при сохранении (worker.py, cap_summary — усечение по границе
-    # слова) и fallback-усечение текста заметки в выдачах (emit.py, пока
-    # summary_status != 'ok'). Прежние 200 были только fallback-лимитом.
+    # --- summarization ---
+    # The summary length limit in characters (the 3.1.0 gate decision: 150).
+    # Keeps both sides on one constant: the hard guard of the MODEL summary at
+    # save time (worker.py, cap_summary — word-boundary truncation) and the
+    # fallback truncation of the note text in outputs (emit.py, while
+    # summary_status != 'ok'). The earlier 200 was a fallback-only limit.
     max_summary_chars: int = 150
-    summary_think: bool = True  # при false в вызов идёт "think": false
-    # №49 (arch §13.1): reasoning | generation — влияет на бюджет, трактовку
-    # флага размышления и стартовые предупреждения (не на тело запроса).
+    summary_think: bool = True  # when false the call carries "think": false
+    # No49 (arch §13.1): reasoning | generation — affects the budget, the
+    # thinking-flag treatment and startup warnings (not the request body).
     summary_model_type: str = "generation"
-    # №49 (3.2.0): 0 = «сколько влезет» (авто-бюджет из заявленного контекста
-    # модели минус промпт и запас, зажат защитным потолком); прежние 35000 —
-    # явный потолок оператора и деградация при неизвестном контексте.
+    # No49 (3.2.0): 0 = "as much as fits" (the auto budget from the declared
+    # model context minus the prompt and the reserve, clamped by the defensive
+    # cap); the earlier 35000 — the explicit operator cap and the degradation
+    # when the context is unknown.
     summary_num_predict: int = 0
-    merge_num_predict: int = 0  # отдельный потолок слияния дублей (решение О. 2026-08-30)
-    # №49 (arch §13.4): 900 = потолок back-off/паузы слота («думать долго» —
-    # не ошибка); было 60.
-    summary_timeout_sec: int = 900  # клиентский таймаут вызова
-    # Заявленный контекст модели слота summary (0 — неизвестен → прежние
-    # потолки без падения); запас на chat-template/служебные поля и защитный
-    # потолок авто-бюджета — общие для генеративных слотов.
+    merge_num_predict: int = 0  # the separate dedup-merge cap
+    # No49 (arch §13.4): 900 = the back-off/slot pause ceiling ("thinking
+    # long" is not an error); was 60.
+    summary_timeout_sec: int = 900  # the client read timeout of a call
+    # The declared context of the summary slot model (0 — unknown → the
+    # previous caps without failing); the chat-template/service-fields reserve
+    # and the auto-budget defensive cap are shared across generative slots.
     summary_context_tokens: int = 0
     slot_prompt_reserve_tokens: int = 512
     slot_max_output_tokens: int = 32768
-    # LSBN-T-33: слот-уровень бюджета РАССУЖДЕНИЯ (0 — не задан: «сколько
-    # влезет» в пределах контекста, но не за счёт ответа). Транспорт ограничивает
-    # сумму thinking+content, поэтому разделение обеспечивает сторона LSB:
-    # в вызов уходит num_predict = бюджет_ответа + бюджет_рассуждения (с потолком
-    # контекста). Уровень операций — `<ОПЕРАЦИЯ>_REASONING_NUM_PREDICT` (блок ниже).
+    # LSBN-T-33: the slot-level REASONING budget (0 — unset: "as much as fits"
+    # within the context, never at the answer's expense). The transport caps
+    # the thinking+content SUM, so LSB enforces the split itself: the call
+    # carries num_predict = answer_budget + reasoning_budget (clamped by the
+    # context). The per-operation level is `<OP>_REASONING_NUM_PREDICT` (block
+    # below).
     slot_reasoning_num_predict: int = 0
-    # №49 (arch §8): порог WARN «бюджет не оставляет места размышлению» и
-    # порог WARN «таймаут мал для "думать долго"».
+    # No49 (arch §8): the WARN threshold "the budget leaves no room for
+    # thinking" and the WARN threshold "the timeout is small for long thinking".
     slot_reasoning_min_output_tokens: int = 4096
     slot_min_timeout_sec: int = 300
 
-    # --- операции поверх слотов (LSBN-F-34, релиз 3.4.0; канон 4.2.8) --------
-    # Плоские env `<ОПЕРАЦИЯ>_<ПОЛЕ>` (без префикса OP_, решение О. 21.10.2026)
-    # переопределяют конфигурацию ОДНОГО процесса поверх слот-группы: цепочка
-    # разрешения по каждому полю — env операции → env слота → дефолт. None =
-    # «не задано» — наследуется слот, частичное переопределение (только
-    # MERGE_MODEL) — норма; операции без переопределения ведут себя как
-    # раньше. Реестр операций — app/services/operations.py; поля: MODEL,
-    # PROVIDER, BASE_URL, API_KEY, THINK, NUM_PREDICT, TIMEOUT_SEC,
-    # CONTEXT_TOKENS, MODEL_TYPE. Секреты (API_KEY) в /health и отпечаток
-    # конфигурации не попадают. Исторический `merge_num_predict` — уже
-    # операционный env: поглощён механизмом, поведение прежнее (0 = авто,
-    # наследование слота для merge не включается).
+    # --- operations over slots (LSBN-F-34, 3.4.0; canon 4.2.8) --------
+    # Flat `<OPERATION>_<FIELD>` env (no OP_ prefix) overrides the
+    # configuration of ONE process over the slot group: the resolution chain
+    # per field is operation env → slot env → default. None = "not set" —
+    # the slot is inherited, a partial override (only MERGE_MODEL) is the norm;
+    # operations without overrides behave exactly as before. The operations
+    # registry — app/services/operations.py; fields: MODEL, PROVIDER, BASE_URL,
+    # API_KEY, THINK, NUM_PREDICT, REASONING_NUM_PREDICT, TIMEOUT_SEC,
+    # CONTEXT_TOKENS, MODEL_TYPE. Secrets (API_KEY) never reach /health or the
+    # config fingerprint. The historical `merge_num_predict` is already an
+    # operation env: absorbed by the mechanism, behavior unchanged (0 = auto,
+    # slot inheritance for merge stays off).
     summarize_model: str | None = None
     summarize_provider: str | None = None
     summarize_base_url: str | None = None
@@ -235,7 +235,7 @@ class Settings(BaseSettings):
     embed_context_tokens: int | None = None
     embed_model_type: str | None = None
 
-    # --- выдача ---
+    # --- output ---
     snippet_chars: int = 120
     max_get_batch: int = 20
 
@@ -243,10 +243,10 @@ class Settings(BaseSettings):
     port: int = 8080
     mcp_path: str = "/mcp"
 
-    # --- хранилище ---
+    # --- storage ---
     db_path: str = "/data/notes.db"
 
-    # --- поиск ---
+    # --- search ---
     default_top_k: int = 5
     default_list_limit: int = 20
     # Listing ceilings per surface (lsb-0013, release 3.1.0): the MCP surface
@@ -255,82 +255,85 @@ class Settings(BaseSettings):
     # startup (see _validate_ranges).
     list_max_limit_mcp: int = 20
     list_max_limit_rest: int = 50
-    # №12 (no12-02, 3.2.0): потолки страницы предупреждений по поверхностям
-    # (§7.1): агентский MCP — 20, операторский REST — 50.
+    # No12 (no12-02, 3.2.0): warnings page ceilings per surface (§7.1):
+    # the agent MCP surface — 20, the operator REST — 50.
     warnings_max_limit_mcp: int = 20
     warnings_max_limit_rest: int = 50
-    score_threshold: float = 0.50  # калибровка 2026-09-02: 0.35→0.50 (эксперимент на 82 реальных запросах, решение О.)
+    # Calibrated on 82 real queries: 0.35 → 0.50.
+    score_threshold: float = 0.50
     dedup_similarity: float = 0.92
-    # --- фоновый дедуп (Фаза 8, Этап 2.1): кандидат-предфильтр до сводки ---
-    dedup_candidate_top_n: int = 3  # топ-N кандидатов (проверит судья, Этап 3)
-    dedup_candidate_similarity: float = 0.80  # нижний порог кандидата-перефраза
-    # --- LLM-судья дедупа (Фаза 8, Этап 3.1; Фаза 11 — блок переименован в judge_*):
+    # --- background dedup (Phase 8, step 2.1): candidate pre-filter before the summary ---
+    dedup_candidate_top_n: int = 3  # top-N candidates (the judge verifies, step 3)
+    dedup_candidate_similarity: float = 0.80  # paraphrase-candidate lower threshold
+    # --- LLM dedup judge (Phase 8, step 3.1; Phase 11 renamed the block to judge_*):
     # ornith-1.5:35b, think:false ---
-    judge_think: bool = False  # при false в вызов идёт "think": false
-    # №49: 0 = авто-бюджет; 256 — прежний потолок (legacy при неизвестном контексте).
+    judge_think: bool = False  # when false the call carries "think": false
+    # No49: 0 = auto budget; 256 — the previous cap (legacy when the context is unknown).
     judge_num_predict: int = 0
-    # LSBN-T-33: бюджет рассуждения операции judge (None — не задан: глобальный
-    # SLOT_REASONING_NUM_PREDICT). У операции judge имя совпадает со слот-группой,
-    # поэтому операционное поле здесь — единственный уровень поверх глобального.
+    # LSBN-T-33: the judge operation reasoning budget (None — unset: the global
+    # SLOT_REASONING_NUM_PREDICT). The judge operation name equals its slot
+    # group, so this operation field is the only layer above the global one.
     judge_reasoning_num_predict: int | None = None
-    # №49 (arch §13.1): тип модели слота judge (reasoning | generation).
+    # No49 (arch §13.1): the judge slot model type (reasoning | generation).
     judge_model_type: str = "generation"
-    # №49 (arch §13.4): 900 = потолок back-off/паузы слота; было 30.
-    judge_timeout_sec: int = 900  # клиентский таймаут вызова судьи
-    judge_context_tokens: int = 0  # заявленный контекст модели judge (0 — неизвестен)
+    # No49 (arch §13.4): 900 = the back-off/slot pause ceiling; was 30.
+    judge_timeout_sec: int = 900  # client read timeout of the judge call
+    judge_context_tokens: int = 0  # declared judge model context (0 — unknown)
     rrf_k: int = 60
-    # Бусты ранжирования после RRF (LSBN-F-14, релиз 3.4.0): операторский
-    # выключатель (false — порядок выдачи ровно как до бустов; доп. SQL по
-    # links не выполняется). Веса бустов — константы кода
-    # app/services/ranking.py, НЕ env (фиксация в каноне через changes.md).
+    # Ranking boosts after RRF (LSBN-F-14, 3.4.0): the operator switch
+    # (false — the output order is exactly pre-boost; the extra links SQL does
+    # not run). Boost weights are code constants in app/services/ranking.py,
+    # NOT env (pinned in the canon via changes.md).
     ranking_boosts_enabled: bool = True
 
-    # --- связи заметок, уровень 0 (lsb-0010, релиз 3.1.0) ---
-    # LINK_TOP — потолок связей на заметку (FR-1.1); LINK_LAZY_THRESHOLD —
-    # порог косинуса «ленивого графа» (дефолт равен SCORE_THRESHOLD);
-    # LINK_POOL — окно KNN-кандидатов связей (arch §3.1).
+    # --- note links, level 0 (lsb-0010, 3.1.0) ---
+    # LINK_TOP — the per-note link ceiling (FR-1.1); LINK_LAZY_THRESHOLD —
+    # the "lazy graph" cosine threshold (the default equals SCORE_THRESHOLD);
+    # LINK_POOL — the KNN candidate window for links (arch §3.1).
     link_top: int = 3
     link_lazy_threshold: float = 0.50
     link_pool: int = 20
 
-    # --- связи заметок, уровень 1: таблица links, расчёт без LLM (lsb-0010-02) ---
-    # LINK_COSINE_THRESHOLD — порог вида `cosine` (выше поискового: связь
-    # должна быть сильнее «просто похоже», FR-2.3); LINK_ENTITIES_MIN_COMMON —
-    # сколько общих значимых слов делают пару связью; LINK_ENTITIES_MIN_WORD_CHARS
-    # — минимальная длина значимого слова (arch §3.3).
+    # --- note links, level 1: the links table, computed without an LLM (lsb-0010-02) ---
+    # LINK_COSINE_THRESHOLD — the `cosine` kind threshold (above search: a link
+    # must be stronger than "just similar", FR-2.3); LINK_ENTITIES_MIN_COMMON —
+    # how many shared significant words make a pair a link;
+    # LINK_ENTITIES_MIN_WORD_CHARS — the minimum significant-word length
+    # (arch §3.3).
     link_cosine_threshold: float = 0.70
     link_entities_min_common: int = 2
     link_entities_min_word_chars: int = 5
 
-    # --- фоновые джобы каркаса (lsb-0014, релиз 3.1.0): расписание из env ---
-    # Джоба расчёта связей `links` (lsb-0010-03, FR-2.2): очередь — служебный
-    # маркер notes.links_at; JOB_LINKS_INTERVAL_SEC — стартовая пауза ожидания
-    # (≥ 30 с), JOB_LINKS_BATCH — сколько заметок разбирается за прогон (≥ 1),
-    # JOB_LINKS_ENABLED — операторский выключатель (false — джоба не стартует,
-    # но её очередь остаётся видна в /health).
+    # --- framework background jobs (lsb-0014, 3.1.0): env-scheduled ---
+    # The `links` job (lsb-0010-03, FR-2.2): the queue is the service marker
+    # notes.links_at; JOB_LINKS_INTERVAL_SEC — the starting wait pause (>= 30 s),
+    # JOB_LINKS_BATCH — notes processed per run (>= 1), JOB_LINKS_ENABLED —
+    # the operator switch (false — the job does not start, its queue stays
+    # visible in /health).
     job_links_enabled: bool = True
     job_links_interval_sec: int = 300
     job_links_batch: int = 100
 
-    # Джоба «порядок в узлах» `nodes` (lsb-0011-01, FR-1.1/FR-1.2): обход
-    # накопленного `default` — интервал ≥ 30 с (дефолт 1 час), батч ≥ 1
-    # (общий бюджет обработок за прогон, дефолт 20), выключатель (false —
-    # джоба не стартует, но её очередь остаётся видна в /health).
+    # The `nodes` "order in nodes" job (lsb-0011-01, FR-1.1/FR-1.2): sweeps
+    # the accumulated `default` — interval >= 30 s (default 1 hour), batch >= 1
+    # (the shared per-run processing budget, default 20), a switch (false —
+    # the job does not start, its queue stays visible in /health).
     job_nodes_enabled: bool = True
     job_nodes_interval_sec: int = 3600
     job_nodes_batch: int = 20
-    # Бюджет вызовов классификатора за прогон (lsb-0011-02, FR-2.3): ≥ 1 и не
-    # выше общего батча — экономия вызовов моделей (arch §3.2/§3.4, дефолт 10).
+    # The classifier-call budget per run (lsb-0011-02, FR-2.3): >= 1 and not
+    # above the shared batch — model calls are economized (arch §3.2/§3.4,
+    # default 10).
     job_nodes_classifier_budget: int = 10
 
-    # Джоба «предупреждения» `warnings` (№12, релиз 3.2.0; arch §6.5/§8):
-    # обход РАЗМЕЩЁННЫХ заметок (не `default` либо уже разобранных `nodes`) и
-    # подсветка расхождения с разметкой классификатора — БЕЗ автоматического
-    # переноса (§13.5). Интервал ≥ 30 с (дефолт 1 час), батч ≥ 1 (дефолт 20),
-    # бюджет вызовов классификатора за прогон ≥ 1 и ≤ батча (дефолт 10),
-    # порог уверенности 0..1 (дефолт 0.80), строгий уровень «родитель/ребёнок»
-    # (дефолт false — мелкий шум не подсвечиваем); выключатель (false — джоба
-    # не стартует, но её очередь остаётся видна в /health).
+    # The `warnings` job (No12, 3.2.0; arch §6.5/§8): sweeps PLACED notes
+    # (not `default`, or already groomed by `nodes`) and highlights divergence
+    # from the classifier placement — WITHOUT auto-moving (§13.5). Interval
+    # >= 30 s (default 1 hour), batch >= 1 (default 20), classifier-call budget
+    # per run >= 1 and <= batch (default 10), confidence threshold 0..1
+    # (default 0.80), strict parent/child level (default false — small noise is
+    # not highlighted); a switch (false — the job does not start, its queue
+    # stays visible in /health).
     job_warnings_enabled: bool = True
     job_warnings_interval_sec: int = 3600
     job_warnings_batch: int = 20
@@ -338,77 +341,79 @@ class Settings(BaseSettings):
     warnings_min_confidence: float = 0.80
     warnings_level_strict: bool = False
 
-    # Джоба `terms-normalize` (№32, релиз 3.2.0; arch §6.6/§8): кластеры
-    # контекстов термина + каноничное написание, без LLM. Интервал ≥ 30 с
-    # (дефолт 1800), батч (терминов за прогон) ≥ 1 (дефолт 50), порог
-    # кластеризации single-linkage 0..1 (дефолт 0.75, отдельно от
-    # `term_context_similarity`, чтобы тюнинг фона не ослаблял мягкий отказ на
-    # записи), порог переизбытка контекстов ≥ 2 (дефолт 5). Выключатель; джоба
-    # подчиняется ещё и `AREA_TERMS_ENABLED` (№40).
+    # The `terms-normalize` job (No32, 3.2.0; arch §6.6/§8): term-context
+    # clusters + canonical spelling, no LLM. Interval >= 30 s (default 1800),
+    # batch (terms per run) >= 1 (default 50), single-linkage clustering
+    # threshold 0..1 (default 0.75, separate from `term_context_similarity` so
+    # background tuning does not weaken the soft refusal on save), the
+    # contexts-excess threshold >= 2 (default 5). A switch; the job also obeys
+    # `AREA_TERMS_ENABLED` (No40).
     job_terms_enabled: bool = True
     job_terms_interval_sec: int = 1800
     job_terms_batch: int = 50
     job_terms_cluster_similarity: float = 0.75
     job_terms_contexts_excess: int = 5
 
-    # --- лимиты (NFR-6: env-переопределяемы, валидируются; см. _validate_ranges) ---
-    # 3.4.1 (LSBN-T-26): мягкий лимит заметки переехал
-    # из константы кода (NOTE_TEXT_LIMIT, 24 вхождения в 6 модулях) сюда —
-    # одно число кормит и CHECK новых баз + цель самомиграции (F-22), и
-    # валидацию записи/правки, части merge/split, хинты, описания ручек,
-    # инструкции и промпты. Меняется override'ом и рестартом; базу переносит
-    # самомиграция (вверх — перелив 1:1 без модели, вниз — нарезка).
-    max_note_chars: int = MAX_NOTE_CHARS_DEFAULT  # 2000→20000 (Фаза 7) → 35000 (2026-08-30) → 1500 (F-22) → 2000 (3.4.1)
+    # --- limits (NFR-6: env-overridable, validated; see _validate_ranges) ---
+    # 3.4.1 (LSBN-T-26): the soft note limit moved from a code constant
+    # (NOTE_TEXT_LIMIT, 24 occurrences in 6 modules) into settings — one number
+    # feeds the CHECK of new databases + the self-migration target (F-22), the
+    # save/update validation, merge/split part limits, hints, tool descriptions,
+    # instructions and prompts. Changed via an override + restart; the base is
+    # carried by self-migration (up — a 1:1 pour without a model, down —
+    # splitting).
+    max_note_chars: int = MAX_NOTE_CHARS_DEFAULT  # 2000 → 20000 (Phase 7) → 35000 → 1500 (F-22) → 2000 (3.4.1)
     max_query_chars: int = 512
-    # no24-01 (3.2.0): лимит пометки заметки `comment` (доменная валидация,
-    # не CHECK схемы; мягкий отказ CommentValidationError).
+    # no24-01 (3.2.0): the note `comment` limit (domain validation, not a
+    # schema CHECK; soft refusal CommentValidationError).
     comment_max_chars: int = 250
 
-    # --- фоновые операции ---
-    pending_retry_sec: int = 30  # стартовый интервал до-векторизации/досуммаризации
+    # --- background operations ---
+    pending_retry_sec: int = 30  # starting re-vectorization/re-summarization interval
 
-    # --- разделитель слота нарезки (3.4.1, LSBN-T-27) --
-    # Во время раскатки нарезка не должна монополизировать сервер генерации:
-    # джоба миграции берёт партию MIGRATION_BATCH заметок, отрабатывает и
-    # уступает слот на MIGRATION_PAUSE_SEC секунд, затем берёт следующую
-    # партию. Свои числа ВМЕСТО чужих смыслов: embedding_batch_size — чанки
-    # одного запроса /api/embed векторизации, pending_retry_sec — стартовый
-    # интервал ретрая до-обработки; крутить их под миграцию нельзя. Окно
-    # раскатки зависит от машины и модели, поэтому оба числа — конфиг
-    # (правка override + рестарт, без релиза). Параллельных воркеров нет:
-    # очередь нарезки однопоточная.
-    migration_batch: int = 5  # заметок за прогон джобы миграции
-    migration_pause_sec: int = 600  # пауза ПОСЛЕ прогона перед следующим (10 мин)
+    # --- migration slot cadence (3.4.1, LSBN-T-27) --
+    # During a rollout, splitting must not monopolize the generation server:
+    # the migration job takes a MIGRATION_BATCH batch of notes, processes it,
+    # yields the slot for MIGRATION_PAUSE_SEC seconds, then takes the next
+    # batch. Its own numbers INSTEAD of borrowed meanings: embedding_batch_size
+    # is chunks of one vectorization /api/embed request, pending_retry_sec is
+    # the starting retry interval of catch-up processing — they must not be
+    # tuned for migration. The rollout window depends on the machine and model,
+    # so both numbers are configuration (an override edit + restart, no
+    # release). No parallel workers: the splitting queue is single-threaded.
+    migration_batch: int = 5  # notes per migration job run
+    migration_pause_sec: int = 600  # the pause AFTER a run, before the next (10 min)
 
-    # --- разрывы слотов (№39, релиз 3.2.0) ----------------------------------
-    # SLOT_PAUSE_SEC — пауза слота при разрыве (= потолок back-off), пробный
-    # стук раз в паузу; SLOT_PAUSE_AFTER — сколько подряд нетранзиентных
-    # отказов ОДНОГО исхода открывают разрыв (для `auth` — сразу, порог не
-    # применяется); SLOT_HINT_EVERY_SEC — троттлинг хинта «предупреди своего
-    # человека» на слот (0 — каждый вызов, не рекомендуется). Валидируются
-    # при старте (см. _validate_ranges).
+    # --- slot breaks (No39, 3.2.0) ----------------------------------
+    # SLOT_PAUSE_SEC — the slot pause during a break (= the back-off ceiling),
+    # one probe knock per pause; SLOT_PAUSE_AFTER — how many consecutive
+    # non-transient failures of ONE outcome open a break (for `auth` —
+    # immediately, the threshold does not apply); SLOT_HINT_EVERY_SEC — the
+    # "warn your human" hint throttling per slot (0 — every call, not
+    # recommended). Validated at startup (see _validate_ranges).
     slot_pause_sec: int = 900
     slot_pause_after: int = 3
     slot_hint_every_sec: int = 900
-    # SLOT_MAX_ATTEMPTS — предел попыток ПАРЫ до состояния «требует
-    # вмешательства»: при исчерпании задание замирает, оставаясь `pending`
-    # (вызовы модели не жгутся), и возвращается в работу при уходе причины
-    # (№39 §6.8, no39-02). SLOT_ATTENTION_RESET_ON_START — выполнять ли
-    # стартовую сверку отпечатка конфигурации слотов: true — отпечаток
-    # (`slot_config_fingerprint`, lsbdef0008-02) сравнивается с записанным в
-    # `meta` и внимание снимается при его отсутствии/отличии; false — шаг
-    # отключён целиком (воля оператора, отпечаток не читается и не пишется).
+    # SLOT_MAX_ATTEMPTS — the attempt limit of a PAIR before "requires
+    # attention": exhausted, the job freezes while staying `pending` (model
+    # calls are not burned) and resumes when the cause goes away
+    # (No39 §6.8, no39-02). SLOT_ATTENTION_RESET_ON_START — whether to run the
+    # startup slot-config fingerprint check: true — the fingerprint
+    # (`slot_config_fingerprint`, lsbdef0008-02) is compared with the one
+    # stored in `meta` and attention clears when it is absent or different;
+    # false — the step is disabled entirely (the operator's will; the
+    # fingerprint is neither read nor written).
     slot_max_attempts: int = 8
     slot_attention_reset_on_start: bool = True
 
-    # --- decision-слот (LSBN-F-12, релиз 3.2.0; arch §6.4/§8/§13.6) ----------
-    # Третий тип слота: клиентская ветка POST /v1/systemone (state + вопросы →
-    # вероятности). Выключен по умолчанию — решения идут генеративно, как
-    # сегодня (нулевой риск регресса); включается и настраивается из
-    # docker-compose. Провайдер — нативный ollama ≥ 0.35.1 (маршрут НЕ
-    # OpenAI-совместимый); ключ уходит Bearer-ом только при заданном значении.
-    # THRESHOLD/UNCERTAINTY_ZONE — механизм переключения (числа выверяются на
-    # тестировании); MAX_QUESTIONS/MAX_LABELS — потолки запроса.
+    # --- decision slot (LSBN-F-12, 3.2.0; arch §6.4/§8/§13.6) ----------
+    # The third slot kind: the client branch POST /v1/systemone (state +
+    # questions → probabilities). Off by default — decisions run generatively
+    # as today (zero regression risk); enabled and configured from
+    # docker-compose. Provider — native ollama >= 0.35.1 (the route is NOT
+    # OpenAI-compatible); the key goes as Bearer only when set.
+    # THRESHOLD/UNCERTAINTY_ZONE — the switch mechanics (numbers are tuned in
+    # testing); MAX_QUESTIONS/MAX_LABELS — request ceilings.
     decision_enabled: bool = False
     decision_base_url: str = ""
     decision_model: str = ""
@@ -420,140 +425,147 @@ class Settings(BaseSettings):
     decision_max_questions: int = 64
     decision_max_labels: int = 40
 
-    # --- история версий (№41, релиз 3.2.0) ---
-    # HISTORY_ENABLED — выключатель слоя истории (kill switch): false —
-    # версии не пишутся, чтение отдаёт пусто. HISTORY_MAX_VERSIONS — потолок
-    # версий на запись (0 — хранить всё, дефолт FR-10.1); HISTORY_RETENTION_DAYS
-    # — срок хранения версий в сутках (0 — без ограничения). При >0 prune
-    # вычищает старейшие версии и перебазирует самую раннюю сохраняемую в
-    # полный snapshot (§13.8). HISTORY_DELTA_INLINE_MAX — порог «поле целиком ↔
-    # построчная дельта» в символах (§5.2).
+    # --- version history (No41, 3.2.0) ---
+    # HISTORY_ENABLED — the history layer kill switch: false — versions are
+    # not written, reads return empty. HISTORY_MAX_VERSIONS — the per-record
+    # version ceiling (0 — keep everything, the FR-10.1 default);
+    # HISTORY_RETENTION_DAYS — the version retention in days (0 — unlimited).
+    # Above 0, prune removes the oldest versions and re-bases the earliest
+    # kept one into a full snapshot (§13.8). HISTORY_DELTA_INLINE_MAX — the
+    # "whole field ↔ line delta" threshold in characters (§5.2).
     history_enabled: bool = True
     history_max_versions: int = 0
     history_retention_days: int = 0
     history_delta_inline_max: int = 2048
 
-    # --- флаги областей (№40, релиз 3.2.0) ----------------------------------
-    # AREA_*_ENABLED — операторский выключатель области (дефолт «включено»,
-    # FR-1.1/FR-1.2): выключенная область не отдаёт MCP-ручки, её раздел и
-    # анонс не вшиваются в инструкцию, петля `areas` её не обрабатывает; при
-    # этом сервис области собирается всегда и операторский REST остаётся
-    # полным (решение владельца 2026-10-08: данные выключенной области
-    # доступны REST и слою истории). Невалидное значение — pydantic
-    # ValidationError → ConfigError → фатальный старт со перечислением ВСЕХ
-    # нарушений (FR-1.3, NFR-6), а не молчаливое выключение.
+    # --- area flags (No40, 3.2.0) ----------------------------------
+    # AREA_*_ENABLED — the operator switch of an area (default "on",
+    # FR-1.1/FR-1.2): a disabled area serves no MCP handles, its section and
+    # announcement are not baked into the instructions, the `areas` loop skips
+    # it; the area service is still built and the operator REST stays complete
+    # (owner decision 2026-10-08: disabled-area data remains reachable via
+    # REST and the history layer). An invalid value — pydantic
+    # ValidationError → ConfigError → a fatal start listing ALL violations
+    # (FR-1.3, NFR-6), not a silent shutdown.
     area_skills_enabled: bool = True
     area_terms_enabled: bool = True
     area_user_facts_enabled: bool = True
-    # Область «Логи ассистента» (LSBN-F-10, arch §9): гейтит MCP-ручки, раздел
-    # инструкции и фон; данные/REST/история остаются доступны (№40, §13.11).
+    # The "Assistant logs" area (LSBN-F-10, arch §9): gates the MCP handles,
+    # the instructions section and the background loop; data/REST/history stay
+    # reachable (No40, §13.11).
     area_logs_enabled: bool = True
 
-    # --- прочее ---
+    # --- misc ---
     log_level: str = "INFO"
     author_default: str = "unknown"
 
     # --- backup (NFR-3) ---
     backup_dir: str = "/data/backups"
-    backup_interval_sec: int = 86400  # сутки
+    backup_interval_sec: int = 86400  # a day
     backup_keep: int = 7
-    # №14 (3.2.0, arch §8): проверять восстановление каждого N-го снапшота;
-    # 0 — авто-проверка выключена (только ручная POST /backups/verify).
+    # No14 (3.2.0, arch §8): background-verify every Nth snapshot;
+    # 0 — automatic verification is off (manual POST /backups/verify only).
     backup_verify_every: int = 1
-    # №14 (3.2.0, arch §8/§13.4): вынос проверенной копии за пределы сервера.
-    # Хранится ТОЛЬКО команда: назначение и учётки живут ВНЕ репозитория и
-    # образа (host env/bind-mount), сервис передаёт команде лишь путь к файлу.
-    # Пусто (дефолт) — вынос выключен, тихий no-op без событий.
+    # No14 (3.2.0, arch §8/§13.4): ship a verified copy off the server.
+    # ONLY the command is stored: destinations and credentials live OUTSIDE
+    # the repository and the image (host env/bind-mount); the service passes
+    # the command nothing but the file path. Empty (default) — shipping is
+    # off, a silent no-op without events.
     backup_ship_cmd: str = ""
     backup_ship_timeout_sec: int = 300
 
-    # --- хинт о свежем релизе (№45, релиз 3.2.0; arch §6.2/§8/§13.8-13.13) ----
-    # Фоновая проверка версии: источник — локальный JSON-файл (работает без
-    # интернета) приоритетно, HTTP — осознанная опция оператора. Дефолт
-    # выключен: наличие выхода в интернет у контейнера не проверено, поэтому
-    # «сеть из рантайма» дефолтом быть не может (arch §13.8). Кеш и отметка
-    # «хинт показан» — в памяти процесса (без БД). Интервал опроса ≥ 60 с,
-    # период хинта ≥ 0 (0 — один на процесс), лимит текста 1..400.
+    # --- new-release hint (No45, 3.2.0; arch §6.2/§8/§13.8-13.13) ----
+    # Background version check: the source is a local JSON file (works without
+    # the internet) preferentially; HTTP is a deliberate operator option. Off
+    # by default: the container's internet access has never been probed, so
+    # "network from runtime" cannot be the default (arch §13.8). The cache and
+    # the "hint shown" mark live in process memory (no DB). Poll interval
+    # >= 60 s, hint period >= 0 (0 — one per process), text limit 1..400.
     update_check_enabled: bool = False
-    update_source_file: str = ""  # локальный JSON-источник (приоритетно)
-    update_check_url: str = ""  # HTTP-источник (опционально)
-    update_check_interval_sec: int = 21600  # период фонового опроса (6 ч)
-    update_hint_every_sec: int = 86400  # не чаще одного хинта за период
-    update_hint_max_chars: int = 240  # лимит текста подсказки
+    update_source_file: str = ""  # local JSON source (preferential)
+    update_check_url: str = ""  # HTTP source (optional)
+    update_check_interval_sec: int = 21600  # background poll period (6 h)
+    update_hint_every_sec: int = 86400  # at most one hint per period
+    update_hint_max_chars: int = 240  # hint text limit
 
-    # --- неймспейсы (Фаза 10, REQUIREMENTS §5.7/§8) ---
-    namespace_auto_move_min_confidence: float = 0.80  # авто-переезд default-заметки в существующий домен
-    namespace_promotion_threshold: int = 15  # счётчик default-заметок с одним hint → авто-создание листа
-    namespace_promotion_min_confidence: float = 0.60  # минимальный confidence разметки, учитываемый триггером
-    namespace_synonym_similarity: float = 0.85  # антисинонимия: косинус описаний — слияние вместо создания
-    namespace_auto_max_per_day: int = 3  # лимит авто-созданных узлов в сутки (защита от шторма)
-    namespace_max_leaves_per_domain: int = 12  # потолок листов в корне
-    namespace_groom_min_notes: int = 2  # груминг: узел с меньшим числом заметок — кандидат на слияние
-    # Подсказка узла при save без `namespace` (№28, релиз 3.2.0; arch §6.2/§8):
-    # сравнение слов заголовка и первых `MEMORY_NODE_HINT_TEXT_CHARS` символов
-    # текста с сегментами путей (вес 3.0) и словами описаний (вес 2.0) — БЕЗ
-    # вызова модели; подсказка только ориентирует: заметку не двигает и запись
-    # не блокирует (§13.2). `MIN_SCORE` 2.0 = «≥1 совпавшее значимое слово»;
-    # `MAX_NODES` 1..2 (FR-1.1); выключатель гасит поле целиком.
+    # --- namespaces (Phase 10, REQUIREMENTS §5.7/§8) ---
+    namespace_auto_move_min_confidence: float = 0.80  # auto-moving a default note into an existing domain
+    namespace_promotion_threshold: int = 15  # counter of one-hint default notes → auto-creating a leaf
+    namespace_promotion_min_confidence: float = 0.60  # minimum placement confidence counted by the trigger
+    namespace_synonym_similarity: float = 0.85  # anti-synonymy: description cosine — merge instead of create
+    namespace_auto_max_per_day: int = 3  # auto-created nodes per day (storm guard)
+    namespace_max_leaves_per_domain: int = 12  # leaf ceiling in a root
+    namespace_groom_min_notes: int = 2  # grooming: a node with fewer notes is a merge candidate
+    # The node hint on save without `namespace` (No28, 3.2.0; arch §6.2/§8):
+    # the title words and the first `MEMORY_NODE_HINT_TEXT_CHARS` characters
+    # of the text are compared with path segments (weight 3.0) and description
+    # words (weight 2.0) — WITHOUT a model call; the hint only orients: it
+    # never moves the note and never blocks the save (§13.2). `MIN_SCORE` 2.0
+    # = ">= 1 matched significant word"; `MAX_NODES` 1..2 (FR-1.1); the switch
+    # kills the whole field.
     memory_node_hint_enabled: bool = True
     memory_node_hint_min_score: float = 2.0
     memory_node_hint_max_nodes: int = 2
     memory_node_hint_text_chars: int = 200
-    # Подсказка «похожее» при save (№30, релиз 3.2.0; arch §6.4/§8/§13.4):
-    # кандидаты из FTS-индекса `notes_fts` + Dice по значимым словам заголовка
-    # и первых `MEMORY_SIMILAR_TEXT_CHARS` символов текста — БЕЗ вызова модели
-    # (вектор свежей заметки ещё не построен). Подсказка не блокирует запись
-    # и не роняет её при сбое поиска; `LIMIT` 1..3; `POOL` ≥ `LIMIT`.
+    # The "similar" hint on save (No30, 3.2.0; arch §6.4/§8/§13.4):
+    # candidates from the `notes_fts` FTS index + Dice over the significant
+    # words of the title and the first `MEMORY_SIMILAR_TEXT_CHARS` characters
+    # of the text — WITHOUT a model call (a fresh note has no vector yet).
+    # The hint never blocks a save and never fails it on a search error;
+    # `LIMIT` 1..3; `POOL` >= `LIMIT`.
     memory_similar_enabled: bool = True
     memory_similar_limit: int = 2
     memory_similar_pool: int = 5
-    # №30: подсказка «похожее» при записи считается БЕЗ модели и эмбеддинга —
-    # это Dice по множествам значимых слов заголовка и первых `text_chars`
-    # символов текста (arch §6.4). Прежние 0.30 требовали совпадения лишь
-    # ~шестой части словаря (на коротких текстах — почти всегда), поэтому
-    # подсказка шумела; 0.74 — «делит примерно три четверти значимых слов»:
-    # это переписанная та же мысль (решение О. 12.10.2026). Решение О. 12.10.2026.
+    # No30: the save-time "similar" hint runs WITHOUT a model and embedding —
+    # Dice over the significant-word sets of the title and the first
+    # `text_chars` characters of the text (arch §6.4). The earlier 0.30
+    # required matching only ~a sixth of the vocabulary (on short texts —
+    # almost always), so the hint was noisy; 0.74 means "sharing about three
+    # quarters of the significant words" — the same thought, rewritten.
     memory_similar_threshold: float = 0.74
     memory_similar_text_chars: int = 500
-    # Судья структуры (Фаза 10): отдельный флаг think — дедуп-судья остаётся
-    # думающим (решение Фазы 8), судья структуры бездумный (E2E Шага 7:
-    # думающий «залипал» на парах-близнецах, голодая суммаризацию; вердикт
-    # — 10–50 токенов, рассуждения не нужны). None — наследует JUDGE_THINK.
+    # The structure judge (Phase 10): its own think flag — the dedup judge
+    # stays thinking (the Phase 8 decision), the structure judge thoughtless
+    # (Phase 7 E2E: a thinking judge "stuck" on twin pairs, starving
+    # summarization; the verdict is 10–50 tokens, no reasoning needed).
+    # None — inherits JUDGE_THINK.
     namespace_judge_think: bool | None = None
 
-    # --- области 3.0.0 (субстрат: skills / terms / user) ---------------------
-    # Лимиты формы и пороги сходства — из контрактов фич lsb-0007/0008/0009;
-    # env-настраиваемые, валидируются при старте (см. _validate_ranges): лимиты
-    # применяет сервис области (CHECK-констрейнты, как у заметок, не используем).
-    # Лимиты формы навыка подняты решением О. 12.10.2026 (канон §6): description
-    # 250→400, steps 500→1000, text 4000→7500, example 1000→2000, поле extra
-    # 500→1000 (сумма 2000→4000), instruction_template 1000→2000. Причина —
-    # реальные процедуры не влезали в прежние потолки, модель дробила навык.
-    # `name` (65 симв., ≤5 слов) не тронут: это рекомендация по имени, а не
-    # потолок содержания; бюджет анонса (2000) тоже не тронут — он про контекст.
+    # --- 3.0.0 areas (substrate: skills / terms / user) ---------------------
+    # Form limits and similarity thresholds come from the lsb-0007/0008/0009
+    # feature contracts; env-tunable, validated at startup (see
+    # _validate_ranges): the limits are applied by the area service (schema
+    # CHECK constraints, unlike notes, are not used). The skill form limits
+    # were raised (canon §6): description 250→400, steps 500→1000, text
+    # 4000→7500, example 1000→2000, an extra field 500→1000 (total 2000→4000),
+    # instruction_template 1000→2000. Reason: real procedures did not fit the
+    # earlier ceilings and the model fragmented a skill. `name` (65 chars,
+    # <= 5 words) untouched: it is a naming recommendation, not a content
+    # ceiling; the announce budget (2000) untouched too — it is about context.
     skill_name_max_chars: int = 65
     skill_description_max_chars: int = 400
     skill_steps_max_chars: int = 1000
     skill_text_max_chars: int = 7500
     skill_example_max_chars: int = 2000
-    skill_extra_field_max_chars: int = 1000  # одно поле класса навыка (JSON extra)
-    skill_extra_total_max_chars: int = 4000  # сумма всех полей extra
-    instruction_template_max_chars: int = 2000  # глобальный шаблон (skills_meta)
-    skill_announce_max_chars: int = 2000  # бюджет блока анонса скиллов
-    skill_announce_description_chars: int = 120  # обрезка description в анонсе
-    skill_synonym_similarity: float = 0.90  # антисинонимия создания навыка
+    skill_extra_field_max_chars: int = 1000  # one skill-class field (JSON extra)
+    skill_extra_total_max_chars: int = 4000  # the total of all extra fields
+    instruction_template_max_chars: int = 2000  # the global template (skills_meta)
+    skill_announce_max_chars: int = 2000  # the skill announce block budget
+    skill_announce_description_chars: int = 120  # the description excerpt in the announce
+    skill_synonym_similarity: float = 0.90  # anti-synonymy at skill creation
     term_max_chars: int = 100
     term_context_max_chars: int = 40
     term_definition_max_chars: int = 350
-    term_context_similarity: float = 0.75  # триграммная близость контекста
-    term_contexts_hint_limit: int = 30  # топ использованных контекстов в hint'е
-    user_name_max_words: int = 5  # контракт title заметок (TITLE_MAX_WORDS)
+    term_context_similarity: float = 0.75  # trigram closeness of contexts
+    term_contexts_hint_limit: int = 30  # top used contexts in the hint
+    user_name_max_words: int = 5  # the note title contract (TITLE_MAX_WORDS)
     user_body_max_chars: int = 1200
-    user_similar_strong: float = 0.85  # мягкий отказ «почти тот же факт»
-    user_similar_weak: float = 0.55  # средняя зона: запись + список похожих
-    user_search_excerpt_chars: int = 300  # обрезка body в выдаче поиска
-    # Область «Логи ассистента» (LSBN-F-10, arch §9): лимиты формы записи
-    # (валидация сервиса, CHECK-констрейнтов нет) и обрезка action в выдаче.
+    user_similar_strong: float = 0.85  # soft refusal "almost the same fact"
+    user_similar_weak: float = 0.55  # the middle band: saved + a similar list
+    user_search_excerpt_chars: int = 300  # body truncation in search output
+    # The "Assistant logs" area (LSBN-F-10, arch §9): record form limits
+    # (service validation, no CHECK constraints) and the action excerpt in
+    # outputs.
     logs_action_max_chars: int = 500
     logs_reason_max_chars: int = 500
     logs_entity_ref_max_chars: int = 200
@@ -571,7 +583,7 @@ class Settings(BaseSettings):
     )
     @classmethod
     def _required_not_empty(cls, value: str) -> str:
-        """Обязательные переменные: пустая/пробельная строка = отсутствие."""
+        """Required variables: an empty/whitespace string counts as absent."""
         if not value or not value.strip():
             raise ValueError("обязательная переменная пуста — задай значение")
         return value
@@ -579,7 +591,7 @@ class Settings(BaseSettings):
     @field_validator("embedding_provider", "summary_provider", "judge_provider")
     @classmethod
     def _validate_provider(cls, value: str) -> str:
-        """Провайдер слота — один из {ollama, openai} (Фаза 11, решение №1)."""
+        """The slot provider is one of {ollama, openai} (Phase 11)."""
         provider = value.strip().lower()
         if provider not in LLM_PROVIDERS:
             raise ValueError(
@@ -590,10 +602,10 @@ class Settings(BaseSettings):
     @field_validator("summary_model_type", "judge_model_type")
     @classmethod
     def _validate_model_type(cls, value: str) -> str:
-        """Тип модели слота — один из {reasoning, generation} (arch §13.1).
+        """The slot model type is one of {reasoning, generation} (arch §13.1).
 
-        `decision` — самостоятельный слот со своим конфигом: попытка объявить
-        его у генеративного слота отправляет оператора к `DECISION_ENABLED`.
+        `decision` is a standalone slot with its own config: declaring it on a
+        generative slot points the operator to `DECISION_ENABLED`.
         """
         model_type = value.strip().lower()
         if model_type == "decision":
@@ -610,17 +622,17 @@ class Settings(BaseSettings):
     @field_validator("log_level")
     @classmethod
     def _validate_log_level(cls, value: str) -> str:
-        """LOG_LEVEL — имя уровня std logging (NFR-4), регистр не учитываем."""
+        """LOG_LEVEL — a std logging level name (NFR-4), case-insensitive."""
         level = value.strip().upper()
         if level not in LOG_LEVELS:
             raise ValueError("LOG_LEVEL — один из " + ", ".join(sorted(LOG_LEVELS)))
         return level
 
-    # --- операции поверх слотов (LSBN-F-34): валидация при задании -----------
-    # Опциональные поля операций (None = «не задано» — наследуется слот)
-    # валидируются теми же правилами, что и слот-поля: провайдер ∈ {ollama,
-    # openai}, тип модели ∈ {reasoning, generation} (decision — отдельный
-    # слот, у операций запрещён).
+    # --- operations over slots (LSBN-F-34): validation when set -----------
+    # Optional operation fields (None = "not set" — the slot is inherited) are
+    # validated by the same rules as slot fields: provider ∈ {ollama, openai},
+    # model type ∈ {reasoning, generation} (decision is a standalone slot and
+    # is forbidden on operations).
     @field_validator(
         "summarize_provider",
         "title_provider",
@@ -633,7 +645,7 @@ class Settings(BaseSettings):
     )
     @classmethod
     def _validate_operation_provider(cls, value: str | None) -> str | None:
-        """Провайдер операции — ollama|openai, когда задан (None — слот)."""
+        """The operation provider is ollama|openai when set (None — the slot)."""
         if value is None:
             return None
         provider = value.strip().lower()
@@ -655,7 +667,7 @@ class Settings(BaseSettings):
     )
     @classmethod
     def _validate_operation_model_type(cls, value: str | None) -> str | None:
-        """Тип модели операции — reasoning|generation, когда задан."""
+        """The operation model type is reasoning|generation when set."""
         if value is None:
             return None
         model_type = value.strip().lower()
@@ -673,12 +685,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_ranges(self) -> Settings:
-        """Диапазоны всех лимитов и полей, влияющих на поведение (NFR-6).
+        """Ranges of every limit and behavior-affecting field (NFR-6).
 
-        Собираем ВСЕ нарушения сразу — оператор правит окружение за один
-        перезапуск, а не по ошибке на рестарт. The hard contract ceiling stays
-        with top_k ≤ 20; listing ceilings (lsb-0013) are env parameters of the
-        surfaces (MCP ≤ REST) — their order and the default are validated.
+        ALL violations are collected at once — the operator fixes the
+        environment in one restart, not one error per restart. The hard
+        contract ceiling stays with top_k ≤ 20; listing ceilings (lsb-0013)
+        are env parameters of the surfaces (MCP ≤ REST) — their order and the
+        default are validated.
         """
         errors: list[str] = []
 
@@ -698,17 +711,16 @@ class Settings(BaseSettings):
         if not self.mcp_path.startswith("/"):
             errors.append("  - mcp_path: путь должен начинаться с «/»")
 
-        # --- внешние API-слоты: только http(s) ---
+        # --- external API slots: http(s) only ---
         for field in ("embedding_base_url", "summary_base_url", "judge_base_url"):
             url = getattr(self, field)
             if not url.strip().startswith(("http://", "https://")):
                 errors.append(f"  - {field}: ожидается URL с http:// или https://")
 
-        # --- лимиты выдачи/ввода (NFR-6) ---
-        # 3.4.1 (LSBN-T-26): 500..20000 — контракт частей слияния («каждая
-        # часть читаема сама по себе») держится с обеих сторон: ниже 500
-        # заметка перестаёт быть самодостаточной, выше 20000 части слияния
-        # становятся нечитаемыми (Ruling 28.10.2026).
+        # --- output/input limits (NFR-6) ---
+        # 3.4.1 (LSBN-T-26): 500..20000 — the merge-part contract ("each part
+        # is readable on its own") holds on both sides: below 500 a note stops
+        # being self-sufficient, above 20000 merge parts become unreadable.
         need_range("max_note_chars", self.max_note_chars, 500, 20000)
         need_low("max_query_chars", self.max_query_chars, 1)
         need_low("max_summary_chars", self.max_summary_chars, 1)
@@ -722,7 +734,7 @@ class Settings(BaseSettings):
         need_low("default_list_limit", self.default_list_limit, 1)
         need_low("list_max_limit_mcp", self.list_max_limit_mcp, 1)
         need_low("list_max_limit_rest", self.list_max_limit_rest, 1)
-        # Джоба `warnings` (№12, 3.2.0): потолки страницы предупреждений (§7.1).
+        # The `warnings` job (No12, 3.2.0): warnings page ceilings (§7.1).
         need_low("warnings_max_limit_mcp", self.warnings_max_limit_mcp, 1)
         need_low("warnings_max_limit_rest", self.warnings_max_limit_rest, 1)
         if self.default_list_limit > self.list_max_limit_mcp:
@@ -737,15 +749,16 @@ class Settings(BaseSettings):
                 "list_max_limit_rest — MCP cannot be looser than REST"
             )
 
-        # --- пороги и слияние ---
+        # --- thresholds and dedup ---
         need_range("score_threshold", self.score_threshold, 0.0, 1.0)
         need_range("dedup_similarity", self.dedup_similarity, 0.0, 1.0)
-        # Фоновый дедуп (Фаза 8, Этап 2.1): кандидат-порог обязан быть не выше
-        # дубль-порога — иначе кандидаты находятся, а дублем не признаются.
+        # Background dedup (Phase 8, step 2.1): the candidate threshold must
+        # not exceed the duplicate threshold — otherwise candidates are found
+        # but never recognized as duplicates.
         need_range(
             "dedup_candidate_similarity", self.dedup_candidate_similarity, 0.0, 1.0
         )
-        # Потолок 50 — защита brute-force KNN от безумного окна (NFR-5).
+        # The 50 cap protects brute-force KNN from a crazy window (NFR-5).
         need_range("dedup_candidate_top_n", self.dedup_candidate_top_n, 1, 50)
         if self.dedup_candidate_similarity > self.dedup_similarity:
             errors.append(
@@ -755,12 +768,13 @@ class Settings(BaseSettings):
             )
         need_low("rrf_k", self.rrf_k, 1)
 
-        # --- связи заметок (lsb-0010): потолок и пул ≥ 1, порог 0..1 ---
+        # --- note links (lsb-0010): ceiling and pool >= 1, threshold 0..1 ---
         need_low("link_top", self.link_top, 1)
         need_low("link_pool", self.link_pool, 1)
         need_range("link_lazy_threshold", self.link_lazy_threshold, 0.0, 1.0)
-        # Уровень 1 (lsb-0010-02): порог связи выше порога «ленивого графа»
-        # (FR-2.3, arch §3.1), иначе связь уровня 1 слабее своего фолбэка.
+        # Level 1 (lsb-0010-02): the link threshold is above the "lazy graph"
+        # one (FR-2.3, arch §3.1) — otherwise a level-1 link is weaker than
+        # its own fallback.
         need_range("link_cosine_threshold", self.link_cosine_threshold, 0.0, 1.0)
         need_low("link_entities_min_common", self.link_entities_min_common, 1)
         need_low(
@@ -773,17 +787,17 @@ class Settings(BaseSettings):
                 "строже фолбэка уровня 0"
             )
 
-        # --- фоновые джобы каркаса (lsb-0014): расписание из окружения ---
-        # Джоба `links` (lsb-0010-03): интервал ≥ 30 (дёшево, но не в цикле),
-        # батч ≥ 1 (нулевой батч не разобрал бы backfill никогда).
+        # --- framework background jobs (lsb-0014): env-scheduled ---
+        # The `links` job (lsb-0010-03): interval >= 30 (cheap, but not a busy
+        # loop), batch >= 1 (a zero batch would never drain the backfill).
         need_low("job_links_interval_sec", self.job_links_interval_sec, 30)
         need_low("job_links_batch", self.job_links_batch, 1)
-        # Джоба `nodes` (lsb-0011-01): обход default — интервал ≥ 30,
-        # батч ≥ 1 (общий бюджет обработок за прогон).
+        # The `nodes` job (lsb-0011-01): the default sweep — interval >= 30,
+        # batch >= 1 (the shared per-run processing budget).
         need_low("job_nodes_interval_sec", self.job_nodes_interval_sec, 30)
         need_low("job_nodes_batch", self.job_nodes_batch, 1)
-        # Бюджет классификатора (lsb-0011-02): ≥ 1 и не выше общего батча —
-        # иначе вызовов модели за прогон больше, чем обработок.
+        # The classifier budget (lsb-0011-02): >= 1 and not above the shared
+        # batch — otherwise a run makes more model calls than processings.
         need_low(
             "job_nodes_classifier_budget", self.job_nodes_classifier_budget, 1
         )
@@ -794,8 +808,8 @@ class Settings(BaseSettings):
                 "не разберётся"
             )
 
-        # Джоба `warnings` (№12, 3.2.0): интервал ≥ 30, батч ≥ 1, бюджет
-        # классификатора ≥ 1 и не выше батча, порог уверенности 0..1.
+        # The `warnings` job (No12, 3.2.0): interval >= 30, batch >= 1, the
+        # classifier budget >= 1 and not above the batch, confidence 0..1.
         need_low("job_warnings_interval_sec", self.job_warnings_interval_sec, 30)
         need_low("job_warnings_batch", self.job_warnings_batch, 1)
         need_low(
@@ -811,8 +825,8 @@ class Settings(BaseSettings):
             "warnings_min_confidence", self.warnings_min_confidence, 0.0, 1.0
         )
 
-        # Джоба `terms-normalize` (№32, 3.2.0): интервал ≥ 30, батч ≥ 1, порог
-        # кластеризации 0..1, порог переизбытка контекстов ≥ 2.
+        # The `terms-normalize` job (No32, 3.2.0): interval >= 30, batch >= 1,
+        # clustering threshold 0..1, contexts-excess threshold >= 2.
         need_low("job_terms_interval_sec", self.job_terms_interval_sec, 30)
         need_low("job_terms_batch", self.job_terms_batch, 1)
         need_low(
@@ -825,30 +839,31 @@ class Settings(BaseSettings):
             1.0,
         )
 
-        # --- векторизация / суммаризация ---
+        # --- vectorization / summarization ---
         need_low("embedding_dim", self.embedding_dim, 1)
-        # №49: бюджет 0 — «сколько влезет» (авто), поэтому минимум 0; контексты
-        # 0 — неизвестен (деградация); запас/потолок ≥ 1; запас обязан быть
-        # меньше заявленного контекста (иначе он съедает весь контекст).
+        # No49: a budget of 0 = "as much as fits" (auto), hence the minimum 0;
+        # a context of 0 = unknown (degradation); reserve/cap >= 1; the reserve
+        # must be smaller than the declared context (otherwise it eats the
+        # whole context).
         need_low("summary_num_predict", self.summary_num_predict, 0)
         need_low("merge_num_predict", self.merge_num_predict, 0)
         need_low("summary_context_tokens", self.summary_context_tokens, 0)
         need_low("summary_timeout_sec", self.summary_timeout_sec, 1)
-        # LLM-судья дедупа (Фаза 8, Этап 3.1; Фаза 11 — judge_*): бюджет 0 =
-        # авто, контекст 0 — неизвестен, таймаут ≥ 1 (NFR-6).
+        # The LLM dedup judge (Phase 8, step 3.1; Phase 11 — judge_*): a budget
+        # of 0 = auto, a context of 0 = unknown, timeout >= 1 (NFR-6).
         need_low("judge_num_predict", self.judge_num_predict, 0)
         need_low("judge_context_tokens", self.judge_context_tokens, 0)
         need_low("slot_prompt_reserve_tokens", self.slot_prompt_reserve_tokens, 1)
         need_low("slot_max_output_tokens", self.slot_max_output_tokens, 1)
         need_low("judge_timeout_sec", self.judge_timeout_sec, 1)
-        # LSBN-T-33: бюджет рассуждения 0 — «сколько влезет» (авто), поэтому
-        # минимум 0; операционные None = «не задано» — проверяются ниже.
+        # LSBN-T-33: a reasoning budget of 0 = "as much as fits" (auto), hence
+        # the minimum 0; operation-level None = "not set" — checked below.
         need_low("slot_reasoning_num_predict", self.slot_reasoning_num_predict, 0)
         judge_reasoning = self.judge_reasoning_num_predict
         if judge_reasoning is not None:
             need_low("judge_reasoning_num_predict", judge_reasoning, 0)
-        # №49 (arch §8): пороги типа модели — минимум 1, реляционно порог
-        # размышления не может быть выше защитного потолка авто-бюджета.
+        # No49 (arch §8): model-type thresholds — minimum 1; relationally, the
+        # thinking threshold cannot exceed the auto-budget defensive cap.
         need_low(
             "slot_reasoning_min_output_tokens",
             self.slot_reasoning_min_output_tokens,
@@ -873,10 +888,10 @@ class Settings(BaseSettings):
                     f"{context_field} ({context}) — авто-бюджет всегда упирался бы в минимум"
                 )
 
-        # --- операции поверх слотов (LSBN-F-34): правила слотов, поля опций ---
-        # Заданные плоские env операций валидируются как слот-поля: бюджет ≥ 0
-        # (0 = авто), таймаут ≥ 1, контекст ≥ 0 и запас не съедает контекст.
-        # None = «не задано» — проверять нечего (наследуется слот).
+        # --- operations over slots (LSBN-F-34): slot rules, option fields ---
+        # Set flat operation envs are validated like slot fields: budget >= 0
+        # (0 = auto), timeout >= 1, context >= 0, and the reserve must not eat
+        # the context. None = "not set" — nothing to check (the slot inherits).
         for prefix in (
             "summarize",
             "title",
@@ -890,7 +905,7 @@ class Settings(BaseSettings):
             num_predict = getattr(self, f"{prefix}_num_predict")
             if num_predict is not None:
                 need_low(f"{prefix}_num_predict", num_predict, 0)
-            # LSBN-T-33: бюджет рассуждения операции — ≥ 0 (None = не задано).
+            # LSBN-T-33: the operation reasoning budget — >= 0 (None = not set).
             reasoning_num_predict = getattr(self, f"{prefix}_reasoning_num_predict", None)
             if reasoning_num_predict is not None:
                 need_low(f"{prefix}_reasoning_num_predict", reasoning_num_predict, 0)
@@ -908,40 +923,40 @@ class Settings(BaseSettings):
                         "авто-бюджет всегда упирался бы в минимум"
                     )
 
-        # --- чанковая индексация (Фаза 7) ---
+        # --- chunked indexing (Phase 7) ---
         if self.text_splitter.strip().lower() != "tiktoken":
-            errors.append("  - text_splitter: поддерживается только «tiktoken»")
+            errors.append("  - text_splitter: only 'tiktoken' is supported")
         need_range("chunk_size", self.chunk_size, 64, 16384)
-        # перекрытие < окна (иначе окна не сдвигаются / нет прогресса);
-        # верхняя граница вычисляется от chunk_size — реляционные проверки.
+        # overlap < window (otherwise the windows never shift / no progress);
+        # the upper bound is computed from chunk_size — relational checks.
         need_range("chunk_overlap", self.chunk_overlap, 0, self.chunk_size - 1)
         need_range("chunk_min_target", self.chunk_min_target, 1, self.chunk_size)
         need_low("embedding_batch_size", self.embedding_batch_size, 1)
         need_low("embedding_concurrent_requests", self.embedding_concurrent_requests, 1)
 
-        # --- фоновые операции (0 допускается: у юнит-тестов — режим без пауз) ---
+        # --- background operations (0 is allowed: unit tests use a pause-free mode) ---
         need_low("pending_retry_sec", self.pending_retry_sec, 0)
 
-        # --- разделитель слота нарезки (3.4.1, LSBN-T-27): партия 1..100
-        # заметок (больше — джоба монополизирует слот на минуты), пауза
-        # 0..86400 с (0 — выгребать без уступания слота, сутки — потолок
-        # вменяемого окна раскатки).
+        # --- migration slot cadence (3.4.1, LSBN-T-27): a batch of 1..100
+        # notes (more — the job monopolizes the slot for minutes), a pause of
+        # 0..86400 s (0 — drain without yielding the slot; a day is the sane
+        # rollout-window ceiling).
         need_range("migration_batch", self.migration_batch, 1, 100)
         need_range("migration_pause_sec", self.migration_pause_sec, 0, 86400)
 
-        # --- разрывы слотов (№39): пауза ≥ 30 (дёшево, но не в цикле),
-        # порог открытия ≥ 1, троттлинг хинта ≥ 0 (0 — каждый вызов).
+        # --- slot breaks (No39): pause >= 30 (cheap, but not a busy loop),
+        # open threshold >= 1, hint throttling >= 0 (0 — every call).
         need_low("slot_pause_sec", self.slot_pause_sec, 30)
         need_low("slot_pause_after", self.slot_pause_after, 1)
         need_low("slot_hint_every_sec", self.slot_hint_every_sec, 0)
-        # --- счётчик попыток пары (№39 §6.8, no39-02): предел ≥ 1 ---
+        # --- pair attempt counter (No39 §6.8, no39-02): limit >= 1 ---
         need_low("slot_max_attempts", self.slot_max_attempts, 1)
-        # no39-04 (решение О. 2026-10-12): софт-проверка достижимости порога
-        # внимания. Если порог внимания НЕ выше порога паузы
-        # (`slot_max_attempts <= slot_pause_after`), пара будет казаться
-        # безнадёжной только после нескольких циклов «пауза → стук → отказ», и
-        # состояние «требует вмешательства» придёт позже, чем ждёт оператор.
-        # Фатальным не делаем: оба значения — воля оператора, старт не падает.
+        # no39-04: a soft reachability check of the attention threshold. If the
+        # attention threshold is NOT above the pause threshold
+        # (`slot_max_attempts <= slot_pause_after`), a pair looks hopeless only
+        # after several "pause → knock → refuse" cycles, and the "requires
+        # attention" state arrives later than the operator expects. Not fatal:
+        # both values are the operator's will, the start does not fail.
         if self.slot_max_attempts <= self.slot_pause_after:
             logging.getLogger("app").warning(
                 "порог внимания не выше порога паузы: пара будет казаться "
@@ -950,10 +965,11 @@ class Settings(BaseSettings):
                 extra={"event": "slot_attempts_below_pause"},
             )
 
-        # --- decision-слот (LSBN-F-12, arch §8): таймаут ≥ 1, потолок вопросов
-        # в 1..64 (лимит модели), потолок меток ≥ 2, порог и зона в 0..1. При
-        # включённом слоте обязательны непустые адрес (http(s)) и модель, а
-        # порог ± зона обязаны лежать внутри 0..1 (иначе зона уходит за границы).
+        # --- decision slot (LSBN-F-12, arch §8): timeout >= 1, the question
+        # ceiling within 1..64 (the model limit), the label ceiling >= 2, the
+        # threshold and the zone within 0..1. With the slot enabled, a non-empty
+        # http(s) address and a model are required, and threshold ± zone must
+        # stay inside 0..1 (otherwise the zone leaves the bounds).
         need_low("decision_timeout_sec", self.decision_timeout_sec, 1)
         need_range("decision_max_questions", self.decision_max_questions, 1, 64)
         need_low("decision_max_labels", self.decision_max_labels, 2)
@@ -984,9 +1000,10 @@ class Settings(BaseSettings):
                     "уходит выше 1 — зона неопределённости вне 0..1"
                 )
 
-        # --- история версий (№41): 0 — «без ограничения» для потолка версий и
-        # срока хранения (дефолт — хранить всё); порог дельты ≥ 1 (иначе
-        # построчное кодирование длинных полей не включилось бы никогда).
+        # --- version history (No41): 0 = "unlimited" for the version ceiling
+        # and retention (the default is keep everything); the delta threshold
+        # >= 1 (otherwise line-delta encoding of long fields would never turn
+        # on).
         need_low("history_max_versions", self.history_max_versions, 0)
         need_low("history_retention_days", self.history_retention_days, 0)
         need_low("history_delta_inline_max", self.history_delta_inline_max, 1)
@@ -994,36 +1011,37 @@ class Settings(BaseSettings):
         # --- backup (NFR-3) ---
         need_low("backup_interval_sec", self.backup_interval_sec, 1)
         need_low("backup_keep", self.backup_keep, 1)
-        # №14 (arch §8): 0 — авто-проверка выключена (только вручную).
+        # No14 (arch §8): 0 — automatic verification is off (manual only).
         need_low("backup_verify_every", self.backup_verify_every, 0)
-        # №14 (arch §8): таймаут команды выноса ≥ 1 (при пустой команде не важен).
+        # No14 (arch §8): the ship-command timeout >= 1 (irrelevant when empty).
         need_low("backup_ship_timeout_sec", self.backup_ship_timeout_sec, 1)
         if not self.backup_dir.strip():
-            errors.append("  - backup_dir: путь не может быть пустым")
+            errors.append("  - backup_dir: the path cannot be empty")
         if not self.db_path.strip():
-            errors.append("  - db_path: путь не может быть пустым")
+            errors.append("  - db_path: the path cannot be empty")
 
-        # --- хинт о свежем релизе (№45, arch §8): интервал ≥ 60, период хинта
-        # ≥ 0 (0 — один на процесс), лимит текста 1..400; при включённой
-        # проверке обязателен хотя бы один источник (иначе — фатальный старт, NFR-6).
+        # --- new-release hint (No45, arch §8): interval >= 60, hint period
+        # >= 0 (0 — one per process), text limit 1..400; with the check enabled
+        # at least one source is required (otherwise a fatal start, NFR-6).
         need_low("update_check_interval_sec", self.update_check_interval_sec, 60)
         need_low("update_hint_every_sec", self.update_hint_every_sec, 0)
         need_low("update_hint_max_chars", self.update_hint_max_chars, 1)
         if self.update_hint_max_chars > 400:
             errors.append(
-                "  - update_hint_max_chars: больше 400 — текст подсказки "
-                "раздувает ответ (arch §8), получено "
+                "  - update_hint_max_chars: above 400 — the hint text bloats "
+                "the response (arch §8), got "
                 f"{self.update_hint_max_chars}"
             )
         if self.update_check_enabled and not (
             self.update_source_file.strip() or self.update_check_url.strip()
         ):
             errors.append(
-                "  - update_check_enabled: проверка включена без источника — "
-                "задай UPDATE_SOURCE_FILE (локальный JSON) или UPDATE_CHECK_URL"
+                "  - update_check_enabled: the check is enabled without a "
+                "source — set UPDATE_SOURCE_FILE (a local JSON) or "
+                "UPDATE_CHECK_URL"
             )
 
-        # --- неймспейсы (Фаза 10) ---
+        # --- namespaces (Phase 10) ---
         need_range(
             "namespace_auto_move_min_confidence",
             self.namespace_auto_move_min_confidence,
@@ -1045,8 +1063,8 @@ class Settings(BaseSettings):
             "namespace_max_leaves_per_domain", self.namespace_max_leaves_per_domain, 1
         )
         need_low("namespace_groom_min_notes", self.namespace_groom_min_notes, 0)
-        # №28: порог отбора ≥ 0 (2.0 — дефолт), потолок узлов 1..2 (FR-1.1),
-        # текст для сравнения — хотя бы один символ.
+        # No28: the match threshold >= 0 (2.0 — the default), the node ceiling
+        # 1..2 (FR-1.1), the comparison text — at least one character.
         need_range(
             "memory_node_hint_min_score", self.memory_node_hint_min_score, 0.0, 1e6
         )
@@ -1058,8 +1076,9 @@ class Settings(BaseSettings):
                 f"{self.memory_node_hint_max_nodes}"
             )
         need_low("memory_node_hint_text_chars", self.memory_node_hint_text_chars, 1)
-        # №30: лимит/пул/текст ≥ 1, порог 0..1; потолок подсказок 1..3 (arch
-        # §6.4 — ответ ≤2, допускаем 3 с запасом) и пул не меньше лимита.
+        # No30: limit/pool/text >= 1, threshold 0..1; the hint ceiling 1..3
+        # (arch §6.4 — the answer is <= 2, 3 is allowed with margin) and the
+        # pool is not smaller than the limit.
         need_low("memory_similar_limit", self.memory_similar_limit, 1)
         need_low("memory_similar_pool", self.memory_similar_pool, 1)
         need_low("memory_similar_text_chars", self.memory_similar_text_chars, 1)
@@ -1075,7 +1094,7 @@ class Settings(BaseSettings):
                 f"кандидатов меньше, чем подсказок, получено {self.memory_similar_pool}"
             )
 
-        # --- области 3.0.0 (субстрат: skills / terms / user) ---
+        # --- 3.0.0 areas (substrate: skills / terms / user) ---
         for field in (
             "skill_name_max_chars",
             "skill_description_max_chars",
@@ -1102,16 +1121,16 @@ class Settings(BaseSettings):
             "logs_search_excerpt_chars",
         ):
             need_low(field, getattr(self, field), 1)
-        # Пороги сходства — косинус/триграммы: шкала 0..1 (как у дедупа).
+        # Similarity thresholds — cosine/trigrams: the 0..1 scale (like dedup).
         need_range("skill_synonym_similarity", self.skill_synonym_similarity, 0.0, 1.0)
         need_range("term_context_similarity", self.term_context_similarity, 0.0, 1.0)
         need_range("user_similar_strong", self.user_similar_strong, 0.0, 1.0)
         need_range("user_similar_weak", self.user_similar_weak, 0.0, 1.0)
-        # Реляционные проверки (по образцу dedup_candidate_similarity):
-        # сумма бюджета extra обязана вмещать хотя бы одно поле класса;
-        # обрезка description в анонсе — в пределах бюджета блока;
-        # слабый порог «похоже» не выше сильного «тот же факт» — иначе
-        # средняя зона пуста и подсказка не приходит никогда.
+        # Relational checks (modeled after dedup_candidate_similarity):
+        # the extra budget total must fit at least one class field;
+        # the announce description excerpt stays within the block budget;
+        # the weak "similar" threshold is not above the strong "same fact" —
+        # otherwise the middle band is empty and the hint never arrives.
         if self.skill_extra_field_max_chars > self.skill_extra_total_max_chars:
             errors.append(
                 "  - skill_extra_field_max_chars: лимит одного поля extra выше "
@@ -1128,7 +1147,7 @@ class Settings(BaseSettings):
                 "user_similar_strong — средняя зона окажется пустой"
             )
 
-        # --- прочее ---
+        # --- misc ---
         if not self.author_default.strip():
             errors.append("  - author_default: не может быть пустым")
 
@@ -1140,11 +1159,11 @@ class Settings(BaseSettings):
 
 
 def load_settings() -> Settings:
-    """Прочитать и провалидировать настройки из окружения.
+    """Load and validate the settings from the environment.
 
     Raises:
-        ConfigError: окружение неполно или невалидно (например, пустой
-            MCP_AUTH_TOKEN) — вызывающий код обязан завершить процесс.
+        ConfigError: the environment is incomplete or invalid (for example, an
+            empty MCP_AUTH_TOKEN) — the calling code must terminate the process.
     """
     try:
         return Settings()
@@ -1164,5 +1183,5 @@ def load_settings() -> Settings:
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Синглтон настроек на время жизни процесса."""
+    """The settings singleton for the process lifetime."""
     return load_settings()
