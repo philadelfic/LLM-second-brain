@@ -1,19 +1,21 @@
-"""Единый исход вызова слота (№39, релиз 3.2.0; arch §6.1, §13.1).
+"""The single outcome of a slot call (No39, 3.2.0; arch SS6.1, SS13.1).
 
-Отказ внешнего слота перестаёт быть безликим: у вызова появляется тип исхода
-`SlotOutcome` — им пользуется и блок слотов №49 / lsbdef-0008 / LSBN-F-12
-(общий словарь). Модуль ничего не логирует и не пишет в БД — только чистое
-отображение «ошибка клиента → исход»; журналит вызывающий (воркер), что даёт
-один формат события на все слоты.
+    A slot failure stops being anonymous: a call now has an outcome type
+    `SlotOutcome` - shared by the slot block No49 / lsbdef-0008 / LSBN-F-12 (a
+    common dictionary). The module neither logs nor writes to the DB - a pure
+    "client error -> outcome" mapping; the caller (the worker) journals, giving
+    one event format across all slots.
 
-`classify_llm_error` — ЕДИНСТВЕННАЯ точка сопоставления ошибки клиента с
-исходом; порядок проверок обязателен (`LLMAuthError`/`exc.auth` →
-`exc.timeout` → `exc.empty` → `exc.truncated` → `exc.transient` →
-`OFF_CONTRACT`), иначе `transient=True` у таймаута съел бы `TIMEOUT`. Исход НЕ выводится из текста
-сообщения — клиент ставит явные признаки (`app/services/llm_client.py`).
+    `classify_llm_error` is the ONLY place mapping a client error to an outcome;
+    the check order is mandatory (`LLMAuthError`/`exc.auth` -> `exc.timeout` ->
+    `exc.empty` -> `exc.truncated` -> `exc.transient` -> `OFF_CONTRACT`) - the
+    `transient=True` of a timeout would otherwise eat `TIMEOUT`. The outcome is
+    NEVER derived from the message text - the client sets explicit flags
+    (`app/services/llm_client.py`).
 
-Модуль не импортирует домен и транспорт: `LLMError`/`LLMAuthError` — граница
-клиента слотов, выше исхода никто не видит (`SlotCallError` — внутренний тип).
+    The module imports neither the domain nor the transport: `LLMError`/
+    `LLMAuthError` is the slot-client boundary; nobody above sees the outcome
+    beforehand (`SlotCallError` is an internal type).
 """
 
 from __future__ import annotations
@@ -24,14 +26,15 @@ from app.services.llm_client import LLMAuthError, LLMError
 
 
 class SlotOutcome(str, Enum):
-    """Словарь исхода вызова слота: ровно шесть значений (arch §6.1).
+    """The slot call outcome dictionary: exactly six values (arch SS6.1).
 
-    * `UNAVAILABLE` — сеть/5xx/429: слот не отвечает (ждать, back-off);
-    * `AUTH` — 401/403: ждать бессмысленно (пауза + пробный стук);
-    * `EMPTY` — ответ есть, но контент пуст (НЕ недоступность);
-    * `TRUNCATED` — обрезано по лимиту вывода (finish_reason=length, блок №49);
-    * `TIMEOUT` — не ответил вовремя (не «пусто», не «недоступен»);
-    * `OFF_CONTRACT` — ответ есть, но маркер/структура не найдены.
+            * `UNAVAILABLE` - network/5xx/429: the slot does not answer (wait, back-off);
+            * `AUTH` - 401/403: waiting is pointless (a pause + a probe knock);
+            * `EMPTY` - there is a response but the content is empty (NOT unavailability);
+            * `TRUNCATED` - cut by the output limit (finish_reason=length, block No49);
+            * `TIMEOUT` - did not answer in time (not "empty", not "unavailable");
+            * `OFF_CONTRACT` - there is a response but the marker/structure is missing.
+
     """
 
     UNAVAILABLE = "unavailable"
@@ -43,19 +46,21 @@ class SlotOutcome(str, Enum):
 
 
 def classify_llm_error(exc: LLMError) -> SlotOutcome:
-    """Отобразить ошибку LLM-клиента в исход вызова слота (arch §6.1, §13.1).
+    """Map an LLM client error to a slot call outcome (arch SS6.1, SS13.1).
 
-    Порядок проверок строго фиксирован: AUTH → TIMEOUT → EMPTY → TRUNCATED →
-    UNAVAILABLE → OFF_CONTRACT. Признаки `timeout`/`empty`/`truncated`/`auth`
-    заполняет сам клиент (`LLMError`); `truncated` до постановки блока №49
-    недостижим, но классификатор его уже читает через `getattr`.
+            The check order is strictly fixed: AUTH -> TIMEOUT -> EMPTY -> TRUNCATED
+            -> UNAVAILABLE -> OFF_CONTRACT. The `timeout`/`empty`/`truncated`/`auth`
+            flags are set by the client itself (`LLMError`); `truncated` was
+            unreachable before block No49, but the classifier already reads it via
+            `getattr`.
 
-    `auth` (arch §6.1: AUTH = «401/403 — ждать бессмысленно») приходит
-    ДВУМЯ путями: `LLMAuthError` — 401/403 у openai-слота (ключ не задан или
-    отклонён), признак `auth` — 401/403 у ollama-слота, где Bearer не ходит
-    (приёмка 3.2.0, живой прогон 13.10.2026: 401 от провайдера слота
-    summary классифицировался как `off_contract`, разрыв открывался после
-    трёх отказов и с чужой причиной).
+            `auth` (arch SS6.1: AUTH = "401/403 - waiting is pointless") arrives by
+            TWO paths: `LLMAuthError` - 401/403 at an openai slot (the key unset or
+            rejected); the `auth` flag - 401/403 at an ollama slot where Bearer never
+            goes (the 3.2.0 acceptance, the live run: a summary-provider 401 used to
+            classify as `off_contract`, the break opened after three failures with a
+            foreign cause).
+
     """
     if isinstance(exc, LLMAuthError) or getattr(exc, "auth", False):
         return SlotOutcome.AUTH
@@ -71,11 +76,13 @@ def classify_llm_error(exc: LLMError) -> SlotOutcome:
 
 
 def outcome_of(exc: BaseException) -> SlotOutcome:
-    """Прочитать исход у доменной ошибки (`exc.outcome`), иначе OFF_CONTRACT.
+    """Read the outcome from a domain error (`exc.outcome`), else OFF_CONTRACT.
 
-    Доменные ошибки слотов (`SummaryError`/`JudgeError`/`ClassificationError`/
-    `EmbeddingError`) несут поле `outcome`; чужое исключение без него —
-    безопасный `OFF_CONTRACT` (неизвестную причину не выдаём за известную).
+            The slot domain errors (`SummaryError`/`JudgeError`/`ClassificationError`/
+            `EmbeddingError`) carry the `outcome` field; a foreign exception without
+            it - a safe `OFF_CONTRACT` (an unknown cause is never presented as a known
+            one).
+
     """
     outcome = getattr(exc, "outcome", None)
     if isinstance(outcome, SlotOutcome):
@@ -87,10 +94,12 @@ def outcome_of(exc: BaseException) -> SlotOutcome:
 
 
 class SlotCallError(RuntimeError):
-    """Отказ слота с исходом (внутренний; домены и транспорт его не видят).
+    """A slot failure with an outcome (internal; the domains and transport never see it).
 
-    `slot` — имя слота (`embedding`/`summary`/`judge`), `outcome` — тип
-    исхода, `detail` — фрагмент причины без секретов (для журнала).
+            `slot` - the slot name (`embedding`/`summary`/`judge`), `outcome` - the
+            outcome kind, `detail` - a cause fragment without secrets (for the
+            journal).
+
     """
 
     def __init__(

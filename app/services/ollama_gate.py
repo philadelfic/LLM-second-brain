@@ -1,32 +1,33 @@
-"""Очередь запросов к Ollama — один запрос к серверу в момент времени.
+"""The Ollama request queue - one request to the server at a time.
 
-Решение Олега (2026-08-30, после сквозного тестирования Фазы 8, находка F1):
-сервер обрабатывает **одну генерацию за раз**, параллелизма нет. Параллельные
-HTTP-запросы не ускоряют систему, а портят её: Ollama сам выстраивает их в
-очередь, но клиентский read-таймаут (httpx) тикает с момента отправки —
-запрос, отстоявший чужую генерацию, умирает по таймауту ещё до начала своей
-работы. Так в E2E судья (таймаут 30 с) таймаутился, стоя за merge
-(240 с), а «недостаточность» таймаутов оказалась очередью на сервере.
+    The owner's decision (after Phase 8 end-to-end testing, the F1 finding): the
+    server processes ONE generation at a time, there is no parallelism. Parallel
+    HTTP requests do not speed the system up - they break it: Ollama queues them
+    itself, but the client read timeout (httpx) ticks from the moment of sending,
+    so a request that waited out someone else's generation dies by timeout before
+    its own work starts. That is how, in the E2E, the judge (a 30 s timeout)
+    timed out standing behind a merge (240 s), and the "insufficiency" of the
+    timeouts turned out to be the server-side queue.
 
-Очередь живёт в приложении: `ollama_slot(base_url)` — лок по адресу сервера.
-Все вызовы к одному base_url выстраиваются, read-таймаут тикает только с
-момента реальной отправки запроса (ожидание в очереди не расходует бюджет).
-Серверы независимы: векторизация (.113) и суммаризация/судья (.112) не
-сериализуются между собой — очередь на каждый base_url своя.
+    The queue lives in the application: `ollama_slot(base_url)` - a lock per
+    server address. Every call to one base_url lines up, and the read timeout
+    ticks only from the actual send (waiting in the queue spends nothing). The
+    servers are independent: vectorization and summary/judge do not serialize
+    against each other - one queue per base_url.
 
-Гарантии и ограничения:
-- Покрыты **все** HTTP-вызовы наружу: `EmbeddingService.embed_texts` (единая
-  точка кодирований — notes-очередь, чанковая очередь, поиск), `SummaryService`
-  (summarize + merge) и `JudgeService` (вердикт дедупа).
-- Вложенных захватов одного слота нет (воркер: embed → отпустить → judge →
-  отпустить → merge), дедлок невозможен; один вызов = один захват.
-- Lock не даёт FIFO (порядок пробуждения недетерминирован) — для
-  однопользовательского персонального сценария порядок некритичен;
-  справедливость очереди не обещаем.
-- Очередь межпроцессная не нужна: один воркер на процесс (ARCH §3.4).
+    Guarantees and limits:
+    - ALL outbound HTTP calls are covered: `EmbeddingService.embed_texts` (the
+      single encoding point - the notes queue, the chunk queue, search),
+      `SummaryService` (summarize + merge) and `JudgeService` (the dedup verdict).
+    - No nested takes of one slot (the worker: embed -> release -> judge ->
+      release -> merge); a deadlock is impossible; one call = one take.
+    - The Lock gives no FIFO (the wake order is nondeterministic) - for a
+      single-user personal scenario the order is not critical; queue fairness is
+      not promised.
+    - No cross-process queue is needed: one worker per process (ARCH SS3.4).
 
-Юнит-тесты: `tests/test_ollama_gate.py` — сериализация по одному base_url
-и параллельность разных.
+    Unit tests: `tests/test_ollama_gate.py` - serialization over one base_url and
+    parallelism across different ones.
 """
 
 from __future__ import annotations
@@ -35,14 +36,14 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-# Реестр слотов: base_url → Lock. Растёт с числом разных адресов (в проде
-# 2–3); локи не хранят состояния между захватами.
+# The slot registry: base_url -> Lock. Grows with the number of distinct addresses (2-3 in
+# production); the locks keep no state between takes.
 _registry_lock = threading.Lock()
 _slots: dict[str, threading.Lock] = {}
 
 
 def _slot_for(base_url: str) -> threading.Lock:
-    """Слот сервера (создаётся при первом обращении; dict под GIL + лок)."""
+    """The server's slot (created on first use; a dict under the GIL + a lock)."""
     with _registry_lock:
         lock = _slots.get(base_url)
         if lock is None:
@@ -53,11 +54,13 @@ def _slot_for(base_url: str) -> threading.Lock:
 
 @contextmanager
 def ollama_slot(base_url: str) -> Iterator[None]:
-    """Занять слот сервера: один запрос к base_url в момент времени.
+    """Take the server's slot: one request per base_url at a time.
 
-    Вызывающий держит слот ровно на время HTTP-вызова (включая ретраи
-    эмбеддера — это одна задача); ожидание в очереди не тратит клиентские
-    read-таймауты: они тикают только после реальной отправки запроса.
+            The caller holds the slot exactly for the duration of the HTTP call
+            (including the embedder's retries - that is one task); waiting in the
+            queue spends no client read timeouts: they tick only after the request is
+            actually sent.
+
     """
     slot = _slot_for(base_url)
     slot.acquire()

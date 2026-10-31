@@ -1,22 +1,25 @@
-"""Разрыв слота — пауза с пробным стуком (№39, релиз 3.2.0; arch §6.2, §13.2).
+"""The slot break - a pause with a probe knock (No39, 3.2.0; arch SS6.2, SS13.2).
 
-`SlotBreaker` — состояние одного СЛОТА (не джобы): слот `summary` делят
-суммаризация, слияние, классификация, описания и обход `nodes`; слот `judge`
-— dedup-судья и судья структуры. Разрыв живёт в одной точке на слот, иначе
-«судья структуры не знает, что dedup-судья уже упал по auth». Состояние — в
-памяти процесса (переживания рестарта не требует: на старте конфигурация
-слота переоценивается стартовой проверкой).
+    `SlotBreaker` is the state of one SLOT (not a job): the `summary` slot is
+    shared by summarization, merging, classification, descriptions and the `nodes`
+    sweep; the `judge` slot - by the dedup judge and the structure judge. The
+    break lives in one place per slot - otherwise "the structure judge does not
+    know the dedup judge already died by auth". The state is in process memory (no
+    restart persistence needed: at startup the slot configuration is re-evaluated
+    by the startup check).
 
-Правила (arch §6.2, §13.2): отказ доступа (`AUTH`) открывает разрыв сразу;
-иной нетранзиентный исход (`EMPTY`/`TRUNCATED`/`OFF_CONTRACT`) — после
-`open_after` отказов ОДНОГО исхода; `UNAVAILABLE`/`TIMEOUT` разрыв не открывают
-(ждать — нормальное состояние, им занимается back-off петли). Пауза —
-`pause_sec` вперёд от отказа; после её истечения слот делает ОДИН дешёвый
-пробный вызов (`probe()`, без генерации): успех снимает разрыв
-(`note_success`), отказ переставляет паузу (`note_failure`).
+    The rules (arch SS6.2, SS13.2): an access failure (`AUTH`) opens the break
+    immediately; another non-transient outcome (`EMPTY`/`TRUNCATED`/
+    `OFF_CONTRACT`) - after `open_after` failures of ONE outcome;
+    `UNAVAILABLE`/`TIMEOUT` never open a break (waiting is a normal state, handled
+    by the loop's back-off). The pause is `pause_sec` ahead of the failure; when
+    it expires the slot makes ONE cheap probe call (`probe()`, no generation):
+    success clears the break (`note_success`), a failure re-arms the pause
+    (`note_failure`).
 
-Модуль ничего не логирует и не пишет в БД: журналит вызывающий (воркер) —
-один формат события на все слоты (`slot_paused`/`slot_resumed`/`slot_probe`).
+    The module neither logs nor writes to the DB: the caller (the worker)
+    journals - one event format across all slots
+    (`slot_paused`/`slot_resumed`/`slot_probe`).
 """
 
 from __future__ import annotations
@@ -26,16 +29,18 @@ from datetime import datetime, timezone
 
 from app.services.slot_outcome import SlotOutcome
 
-# Исходы, которые НЕ открывают разрыв: ждать их — нормальное состояние,
-# которым занимается back-off петли (arch §13.2).
+# The outcomes that do NOT open a break: waiting for them is a normal state,
+# handled by the loop's back-off (arch §13.2).
 _TRANSIENT_OUTCOMES = frozenset({SlotOutcome.UNAVAILABLE, SlotOutcome.TIMEOUT})
 
 
 class SlotBreaker:
-    """Разрыв одного слота: пауза до потолка back-off + пробный стук.
+    """One slot's break: a pause up to the back-off ceiling + a probe knock.
 
-    `open_after` — сколько отказов ОДНОГО нетранзиентного исхода открывают
-    разрыв (`SLOT_PAUSE_AFTER`); для `AUTH` не применяется — разрыв сразу.
+            `open_after` - how many failures of ONE non-transient outcome open the
+            break (`SLOT_PAUSE_AFTER`); not applied to `AUTH` - the break opens
+            immediately.
+
     """
 
     def __init__(self, slot: str, pause_sec: int, *, open_after: int = 3) -> None:
@@ -43,18 +48,19 @@ class SlotBreaker:
         self._pause_sec = int(pause_sec)
         self._open_after = max(int(open_after), 1)
         self._last_outcome: SlotOutcome | None = None
-        # Серия отказов по КАЖДОМУ нетранзиентному исходу (arch §6.2/§13.2:
-        # «после open_after отказов одного исхода»). Чередование разных исходов
-        # серию не сбрасывает, поэтому ни один исход не копит чужую серию.
+        # A failure series per EACH non-transient outcome (arch §6.2/§13.2:
+        #"after open_after failures of one outcome"). Alternating different outcomes
+        #does not reset the series, so no outcome accumulates a foreign one.
         self._failures: dict[SlotOutcome, int] = {}
         self._paused_until: float | None = None
 
     def note_failure(self, outcome: SlotOutcome) -> bool:
-        """Зафиксировать отказ; True — разрыв открылся ЭТИМ вызовом.
+        """Record a failure; True - THIS call opened the break.
 
-        Если разрыв уже открыт (пробный стук отказал) — пауза переставляется
-        на `pause_sec`, но новым открытием это не считается (False): событие
-        `slot_paused` пишется только на первом открытии.
+                    When the break is already open (a probe knock failed) - the pause is
+                    re-armed by `pause_sec`, but it does not count as a new opening
+                    (False): the `slot_paused` event is written on the first opening only.
+
         """
         now = time.time()
         self._last_outcome = outcome
@@ -62,12 +68,12 @@ class SlotBreaker:
             self._paused_until = now + self._pause_sec
             return False
         if outcome is SlotOutcome.AUTH:
-            # Отказ доступа: ждать бессмысленно — разрыв сразу (FR-4.3).
+            # An access failure: waiting is pointless - the break opens immediately (FR-4.3).
             self._failures[outcome] = self._failures.get(outcome, 0) + 1
             self._paused_until = now + self._pause_sec
             return True
         if outcome in _TRANSIENT_OUTCOMES:
-            # Недоступность/таймаут: разрыв не открывают, серии сбрасывают.
+            # Unavailability/timeout: they never open a break and reset the series.
             self._failures.clear()
             return False
         count = self._failures.get(outcome, 0) + 1
@@ -78,28 +84,29 @@ class SlotBreaker:
         return False
 
     def note_success(self) -> None:
-        """Снять разрыв (успешный пробный стук); `last_outcome` сохраняется."""
+        """Clear the break (a successful probe knock); `last_outcome` is kept."""
         self._paused_until = None
         self._failures.clear()
 
     def is_paused(self, now: float | None = None) -> bool:
-        """Открыт ли разрыв прямо сейчас (пауза ещё не истекла)."""
+        """Whether the break is open right now (the pause has not expired)."""
         if self._paused_until is None:
             return False
         return (time.time() if now is None else now) < self._paused_until
 
     def probe_due(self, now: float | None = None) -> bool:
-        """Наступил ли пробный стук (пауза истекла, разрыв ещё не снят)."""
+        """Whether the probe knock is due (the pause expired, the break is still on)."""
         if self._paused_until is None:
             return False
         return (time.time() if now is None else now) >= self._paused_until
 
     def snapshot(self) -> dict:
-        """Снимок состояния словарём — для наблюдаемости и журнала (arch §6.2).
+        """The state snapshot as a dict - for observability and the journal (arch SS6.2).
 
-        `state` — `paused` (пауза активна) или `closed`; `paused_until` —
-        ISO-8601 UTC или None (закрыто/истекло); `failures` — счётчик серии
-        последнего исхода.
+                    `state` - `paused` (the pause is active) or `closed`; `paused_until` -
+                    ISO-8601 UTC or None (closed/expired); `failures` - the counter of the
+                    last outcome's series.
+
         """
         paused = self.is_paused()
         return {
@@ -118,7 +125,7 @@ class SlotBreaker:
 
     @staticmethod
     def _iso_utc(timestamp: float | None) -> str | None:
-        """Unix-время → ISO-8601 UTC с суффиксом Z (формат остальных меток)."""
+        """Unix time -> ISO-8601 UTC with a Z suffix (the format of the other stamps)."""
         if timestamp is None:
             return None
         return datetime.fromtimestamp(timestamp, timezone.utc).strftime(
