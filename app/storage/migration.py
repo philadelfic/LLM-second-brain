@@ -1,34 +1,35 @@
-"""Самомиграция схемы: перелив БД под новый лимит заметки (LSBN-F-22, M1).
+"""Self-migration of the schema: pouring the DB under a new note limit (LSBN-F-22, M1).
 
-Слой без доменных правил: состояние миграции (meta + `migration_notes`),
-создание новой базы, перелив 1:1, файловый swap и обратный перелив. Решение
-о запуске (фазы 0–1) — в `app.services.migration` (lifespan); нарезка
-невлезающих — джоба M2; union-чтение и прерывание — M3.
+    A layer without domain rules: the migration state (meta + `migration_notes`),
+    new-base creation, the 1:1 pour, the file swap and the reverse pour. The
+    launch decision (phases 0-1) lives in `app.services.migration` (lifespan);
+    splitting the non-fitting - the M2 job; union reads and the abort - M3.
 
-Ключевые решения (design §2–§4, решения О. не пересматриваются):
-- Указатель активной БД — файловый swap при старте: `session()` открывает БД
-  по пути на каждую операцию, rename переключает весь трафик, ноль правок в
-  точках записи. Прежняя база → notes.<старый-лимит>.db (имя = её CHECK —
-  цепочка сама себя документирует).
-- Цепочка баз в `meta` активной базы: `migration.chain` = JSON
-  [{file, note_chars}] прежних баз (старые впереди, активная не входит).
-  Обратное направление (env вверх) разрешается по ней: источник — база chain,
-  чей CHECK равен целевому числу; возврат к лимиту из цепочки всегда
-  переиспользует ту базу (дельта активной переливается в неё), новая база
-  создаётся только для лимита, которого в цепочке не было.
-- Перелив 1:1, одна транзакция: справочники → notes (id сохранён, оба FTS
-  строятся триггерами при INSERT — rebuild не нужен) → links/expirations/
-  chunks/record_versions → вектора ПОСТРОЧНО (vec0 при INSERT…SELECT не
-  проверен — design §7) → области. Невлезающие → `migration_notes` 'ожидает'
-  (текст остаётся в прежней базе).
-- Обратный перелив (откат): дельта активной базы апсертится В прежнюю
-  (UPDATE-else-INSERT — REPLACE ломает FTS внешнего контента); части
-  (record_versions source='migration_split') из дельты исключаются —
-  длинные заметки возвращаются целыми. Swap возвращает прежний файл на
-  db_path; базы не удаляются.
-- Swap под открытым соединением (design §7 риск 5): сессии пократковременны,
-  swap идёт в паузе старта; перед rename — WAL-checkpoint(TRUNCATE) обеих
-  баз и снос пустых -wal/-shm, чтобы сайдкары не пережили rename.
+    Key decisions (design SS2-SS4; the owner's rulings are not revisited):
+    - The active-DB pointer - a file swap at startup: `session()` opens the DB by
+      path on every operation, a rename switches the whole traffic, zero edits at
+      the write sites. The previous base -> notes.<old-limit>.db (the name = its
+      CHECK - the chain documents itself).
+    - The chain of bases in the active base's `meta`: `migration.chain` = JSON
+      [{file, note_chars}] of previous bases (oldest first, the active one not
+      included). The reverse direction (env up) resolves over it: the source is
+      the chain base whose CHECK equals the target number; a return to a limit
+      from the chain always reuses that base (the active delta pours into it); a
+      new base is created only for a limit the chain never had.
+    - The 1:1 pour, one transaction: registries -> notes (the id is preserved, both
+      FTS indexes are built by the INSERT triggers - no rebuild needed) ->
+      links/expirations/chunks/record_versions -> vectors ROW BY ROW (vec0 under
+      INSERT...SELECT is unverified - design SS7) -> areas. Non-fitting ->
+      `migration_notes` 'ozhidaet' (the text stays in the previous base).
+    - The reverse pour (the rollback): the active base's delta is upserted INTO
+      the previous base (UPDATE-else-INSERT - REPLACE breaks external-content
+      FTS); the parts (record_versions source='migration_split') are excluded
+      from the delta - long notes come back whole. The swap returns the previous
+      file to db_path; bases are never deleted.
+    - A swap under an open connection (design SS7 risk 5): sessions are
+      short-lived, the swap runs in the startup pause; before the rename - a
+      WAL-checkpoint(TRUNCATE) of both bases and removing empty -wal/-shm so the
+      sidecars do not survive the rename.
 """
 
 from __future__ import annotations
@@ -48,25 +49,25 @@ from app.storage.db import (
     transaction,
 )
 
-# --- состояние миграции в meta (design §3) --------------------------------
+# --- migration state in meta (design §3) --------------------------------
 
-# Лимит активной схемы: дублирует живой CHECK читаемым для человека ключом.
+# The active schema limit: mirrors the live CHECK under a human-readable key.
 META_SCHEMA_NOTE_CHARS = "schema.note_chars"
-# Текущее состояние: JSON {phase: pour|split|done|aborted, target, prev_file,
-# prev_limit, reason, counters} (split:{provider,model} — фаза 4, M2).
+# The current state: JSON {phase: pour|split|done|aborted, target, prev_file,
+# prev_limit, reason, counters} (split:{provider,model} — phase 4, M2).
 META_MIGRATION_STATE = "migration.state"
-# Цепочка прежних баз: JSON [{file, note_chars}], старые впереди; активная
-# база в список не входит. Имена файлов — относительно каталога db_path.
+# The chain of previous bases: JSON [{file, note_chars}], oldest first; the
+# active base is not in the list. File names — relative to the db_path dir.
 META_MIGRATION_CHAIN = "migration.chain"
 
-# Происхождение частей нарезки (фаза 4, M2): по этому source в record_versions
-# обратный перелив узнаёт части и исключает их из дельты (design §3).
+# The split-parts origin (phase 4, M2): by this record_versions source the
+# reverse pour recognizes the parts and excludes them from the delta (design §3).
 SOURCE_MIGRATION_SPLIT = "migration_split"
 
 MIGRATION_NOTES_TABLE = "migration_notes"
 
-# Статусы заметки в миграции (design §3): 'ожидает' — ждёт нарезки (текст в
-# прежней базе); 'нарезана'/'карантин'/'expired' — ставит джоба M2.
+# Note statuses in a migration (design §3): 'ожидает' — waiting to be split
+# (the text stays in the previous base); 'нарезана'/'карантин'/'expired' — the M2 job.
 _MIGRATION_NOTES_DDL = f"""
 CREATE TABLE IF NOT EXISTS {MIGRATION_NOTES_TABLE} (
   old_id     INTEGER PRIMARY KEY,
@@ -82,7 +83,7 @@ logger = logging.getLogger("app")
 
 
 class MigrationError(RuntimeError):
-    """Ошибка самомиграции: перелив/swap не состоялись; активная база цела."""
+    """Self-migration failed: the pour/swap did not happen; the active base is intact."""
 
 
 # --- meta/chain/state -------------------------------------------------------
@@ -102,7 +103,7 @@ def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def read_chain(conn: sqlite3.Connection) -> list[dict]:
-    """Цепочка прежних баз [{file, note_chars}] из meta; битый JSON — пусто."""
+    """The chain of previous bases [{file, note_chars}] from meta; broken JSON - empty."""
     raw = _get_meta(conn, META_MIGRATION_CHAIN)
     if not raw:
         return []
@@ -122,7 +123,7 @@ def write_chain(conn: sqlite3.Connection, chain: list[dict]) -> None:
 
 
 def read_state(conn: sqlite3.Connection) -> dict | None:
-    """Состояние миграции из meta; None — базы миграция не касалась."""
+    """The migration state from meta; None - the migration never touched the base."""
     raw = _get_meta(conn, META_MIGRATION_STATE)
     if not raw:
         return None
@@ -140,12 +141,13 @@ def _write_state(conn: sqlite3.Connection, state: dict) -> None:
 
 
 def set_state_phase(conn: sqlite3.Connection, phase: str) -> dict | None:
-    """Сменить фазу состояния миграции (остальные поля не тронуты).
+    """Change the migration state's phase (the other fields untouched).
 
-    Публичная точка для сервиса (M3): «стоп джобы» прерывания пишет
-    phase=aborted ДО reverse-pour (следующая партия нарезки видит её и
-    берёт ноль заметок), фаза 7 ставит done. None — состояния нет
-    (база миграцию не касалась), писать нечего.
+            The public entry point for the service (M3): the abort's "stop the jobs"
+            writes phase=aborted BEFORE the reverse-pour (the next splitting batch
+            sees it and takes zero notes), phase 7 sets done. None - there is no
+            state (the base was never migrated), nothing to write.
+
     """
     state = read_state(conn)
     if state is None:
@@ -156,10 +158,11 @@ def set_state_phase(conn: sqlite3.Connection, phase: str) -> dict | None:
 
 
 def ensure_migration_schema(conn: sqlite3.Connection) -> None:
-    """Таблица migration_notes + штамп schema.note_chars (идемпотентно).
+    """The migration_notes table + the schema.note_chars stamp (idempotent).
 
-    Вызывается для новой базы после init_db и для возвращаемой при откате
-    (та создана до LSBN-F-22 — таблицы/штампа в ней может не быть).
+            Called for a new base after init_db and for the one returned by a rollback
+            (it was created before LSBN-F-22 - the table/stamp may be missing).
+
     """
     conn.execute(_MIGRATION_NOTES_DDL)
     limit = note_chars_limit(conn)
@@ -167,16 +170,16 @@ def ensure_migration_schema(conn: sqlite3.Connection) -> None:
         _set_meta(conn, META_SCHEMA_NOTE_CHARS, str(limit))
 
 
-# --- базовые примитивы перелива ---------------------------------------------
+# --- basic pour primitives ---------------------------------------------
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
-    """Колонки таблицы в порядке DDL (PRAGMA table_info)."""
+    """The table's columns in DDL order (PRAGMA table_info)."""
     return [str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")]
 
 
 def _table_pk(conn: sqlite3.Connection, table: str) -> list[str]:
-    """Колонки PRIMARY KEY в порядке объявления (для ON CONFLICT)."""
+    """The PRIMARY KEY columns in declaration order (for ON CONFLICT)."""
     rows = [row for row in conn.execute(f"PRAGMA table_info({table})") if row["pk"]]
     return [str(row["name"]) for row in sorted(rows, key=lambda r: r["pk"])]
 
@@ -188,14 +191,16 @@ def _copy_rows(
     where: str = "1=1",
     params: tuple = (),
 ) -> int:
-    """Скопировать строки таблицы источник→приёмник с сохранением id.
+    """Copy a table's rows source -> receiver preserving ids.
 
-    Апсерт по PRIMARY KEY (UPDATE-else-INSERT), не REPLACE: REPLACE удаляет
-    строку и вставляет заново, а у таблиц с FTS внешнего контента DELETE без
-    'delete'-команды оставляет в индексе призрак (design §4: «REPLACE ломает
-    FTS»). UPDATE-ветка апсерта триггеры UPDATE OF … честно срабатывают.
-    Колонки — пересечение схем в порядке источника (схемы строит один
-    init_db, расхождение — признак рукотворной правки).
+            An upsert over the PRIMARY KEY (UPDATE-else-INSERT), not REPLACE: REPLACE
+            deletes the row and inserts it again, and for external-content FTS tables
+            a DELETE without the 'delete' command leaves a ghost in the index
+            (design SS4: "REPLACE breaks FTS"). The UPDATE branch of the upsert lets
+            the UPDATE OF ... triggers fire honestly. The columns - the intersection
+            of the schemas in source order (one init_db builds both schemas; a
+            divergence signals a hand-made edit).
+
     """
     src_cols = _table_columns(src, table)
     dst_cols = set(_table_columns(dst, table))
@@ -223,7 +228,7 @@ def _copy_rows(
 
 
 def _vec_columns(conn: sqlite3.Connection, table: str) -> list[str]:
-    """Колонки vec0-таблицы (виртуальная таблица: PRAGMA table_info врёт)."""
+    """The columns of a vec0 table (a virtual table: PRAGMA table_info lies)."""
     cursor = conn.execute(f"SELECT * FROM {table} LIMIT 0")
     return [description[0] for description in cursor.description]
 
@@ -236,13 +241,13 @@ def _copy_vec_rows(
     where: str = "1=1",
     params: tuple = (),
 ) -> int:
-    """Перелить вектора ПОСТРОЧНО (vec0 при INSERT…SELECT не проверен).
+    """Pour the vectors ROW BY ROW (vec0 under INSERT...SELECT is unverified).
 
-    Каждая строка: DELETE+INSERT по ключевой колонке (прецедент
-    vectors.upsert — публичный протокол xUpdate, устойчив к версии
-    расширения). embedding переносится как есть (BLOB float32): перелив
-    идёт в пределах одной модели/размерности (смена эмбеддера — вне
-    скоупа F-22, design §7).
+            Each row: DELETE+INSERT over the key column (the vectors.upsert precedent
+            - the public xUpdate protocol, robust to extension version changes). The
+            embedding is carried as is (a float32 BLOB): the pour runs within one
+            model/dimension (an embedding change is out of F-22's scope, design SS7).
+
     """
     columns = [c for c in _vec_columns(src, table) if c != "rowid"]
     rows = src.execute(
@@ -260,11 +265,11 @@ def _copy_vec_rows(
     return len(rows)
 
 
-# Реестр перелива «вниз» (фаза 3, design §4). Порядок обязателен:
-# справочники → notes (FTS строят триггеры INSERT) → зависимости заметок
-# (FK notes_chunks REFERENCES notes) → области (skills перед skill_versions).
-# Фильтры — по ИСТОЧНИКУ: влезающее = length(text) ≤ цели; зависимости
-# невлезающих заметок остаются в прежней базе вместе с текстом.
+# The "down" pour registry (phase 3, design §4). The order is mandatory:
+# registries → notes (the INSERT triggers build FTS) → note dependencies
+# (the notes_chunks REFERENCES notes FK) → areas (skills before skill_versions).
+# Filters — by the SOURCE: what fits = length(text) <= the target; the
+# dependencies of non-fitting notes stay in the previous base with the text.
 _FITTING = "length(text) <= ?"
 _POUR_SPECS: tuple[tuple[str, str], ...] = (
     ("namespaces", "1=1"),
@@ -301,9 +306,9 @@ _POUR_SPECS: tuple[tuple[str, str], ...] = (
     ("meta", "1=1"),  # мета эмбеддинга/чанков; migration.* переставляются ниже
 )
 
-# vec-таблицы: (таблица, ключевая колонка, фильтр строк). Area-vec переливаются
-# целиком (содержимое областей переливается 1:1), вектора заметок/чанков —
-# только влезающих.
+# vec tables: (table, key column, row filter). Area vecs are poured whole
+# (area content pours 1:1); note/chunk vectors — only the fitting ones,
+# the fitting ones.
 _VEC_POUR_SPECS: tuple[tuple[str, str, str | None], ...] = (
     (vectors.VEC_TABLE, "note_id", f"note_id IN (SELECT id FROM notes WHERE {_FITTING})"),
     (
@@ -316,41 +321,44 @@ _VEC_POUR_SPECS: tuple[tuple[str, str, str | None], ...] = (
 )
 
 
-# --- фаза 2–3: новая база, перелив, swap ------------------------------------
+# --- phases 2–3: the new base, the pour, the swap ------------------------------------
 
 
 def sibling_db_path(db_path: str, limit: int) -> str:
-    """Имя базы-родственника рядом: notes.db → notes.<limit>.db.
+    """The name of a sibling base next to this one: notes.db -> notes.<limit>.db.
 
-    Имя = лимит CHECK той базы (design §2: «цепочка сама себя
-    документирует»).
+            The name = that base's CHECK limit (design SS2: "the chain documents
+            itself").
+
     """
     path = Path(db_path)
     return str(path.with_name(f"{path.stem}.{limit}{path.suffix}"))
 
 
 def _prune_chain(chain: list[dict], file_name: str) -> list[dict]:
-    """Цепочка без записей об указанном файле (цикл вниз-вверх не плодит дублей)."""
+    """The chain without records of the given file (a down-up cycle spawns no duplicates)."""
     return [entry for entry in chain if entry.get("file") != file_name]
 
 
-#: Суффикс файла-приёмника, когда целевое имя занято живой базой цепочки
-#: (DEF-5): notes.<target>.db.incoming — swap ставит его на db_path, а база
-#: цепочки остаётся нетронутой (design: «базы не удаляются»).
+#: The receiver-file suffix for when the target name is taken by a live chain
+#: base (DEF-5): notes.<target>.db.incoming — swap places it on db_path, and
+#: the chain base stays untouched (design: "bases are never deleted").
 INCOMING_SUFFIX = ".incoming"
 
 
 def _pour_target(settings: Settings, conn: sqlite3.Connection, target: int) -> str:
-    """Файл-приёмник новой базы: notes.<target>.db либо …db.incoming (DEF-5).
+    """The new base's receiver file: notes.<target>.db or ...db.incoming (DEF-5).
 
-    Существующий notes.<target>.db, описанный в chain АКТИВНОЙ базы, — живая
-    база цепочки (единственная копия частей прошлого прогона): новая база
-    льётся рядом под именем …db.incoming. Файла в chain нет — это недолитый
-    остаток прерванной попытки (рестарт до swap, design §6): имя свободно
-    для пересоздания. Вызывается и в `create_new_base`, и в
-    `run_startup_migration` — swap обязан получить тот же файл, в который
-    шёл перелив; решение детерминировано состоянием диска и meta активной
-    базы, между двумя вызовами chain активной не меняется.
+            An existing notes.<target>.db described in the ACTIVE base's chain is a
+            live chain base (the only copy of the previous run's parts): the new base
+            pours next to it under the ...db.incoming name. Not in the chain - an
+            unfinished remainder of an interrupted attempt (a restart before the swap,
+            design SS6): the name is free for recreation. Called both in
+            `create_new_base` and in `run_startup_migration` - swap must receive the
+            exact file the pour went into; the decision is deterministic over the disk
+            state and the active base's meta, and the active chain does not change
+            between the two calls.
+
     """
     path = sibling_db_path(settings.db_path, target)
     if not Path(path).is_file():
@@ -371,20 +379,22 @@ def create_new_base(
     prev_file: str,
     reason: str,
 ) -> dict:
-    """Фазы 2–3: новая база notes.<target><suffix>, перелив 1:1, состояние.
+    """Phases 2-3: the new base notes.<target><suffix>, the 1:1 pour, the state.
 
-    Идемпотентно по отношению к обрыву (design §6): недолитый файл прошлой
-    попытки (его нет в chain активной базы) стирается — рестарт до swap
-    переливает заново, прежняя база не тронута. Живая база цепочки под
-    целевым именем (DEF-5: повторный forward после reverse) НЕ стирается —
-    перелив идёт в notes.<target>.db.incoming, swap ставит её на db_path.
-    Одна транзакция на весь перелив + состояние (design §4, фаза 3).
-    Направление «вверх» без базы-родственника идёт тем же путём: фильтр
-    length(text) <= target вбирает всё, migration_notes остаётся пустой
-    (обратный перелив без частей — тоже без модели).
+            Idempotent against a break (design SS6): the unfinished file of a previous
+            attempt (absent from the active base's chain) is wiped - a restart before
+            the swap pours again, the previous base untouched. A live chain base under
+            the target name (DEF-5: a repeated forward after a reverse) is NEVER wiped
+            - the pour goes into notes.<target>.db.incoming and swap places it on
+            db_path. One transaction for the whole pour + the state (design SS4,
+            phase 3). The "up" direction without a sibling base takes the same path:
+            the length(text) <= target filter takes everything, migration_notes stays
+            empty (a reverse pour without parts - also model-free).
 
-    Returns:
-        Счётчики {old_total, poured, pending} — для журнала и /health (M3).
+            Returns:
+                The counters {old_total, poured, pending} - for the journal and
+                /health (M3).
+
     """
     canonical = sibling_db_path(settings.db_path, target)
     with session(settings) as conn:
@@ -411,17 +421,17 @@ def create_new_base(
             src.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
         )
         with transaction(dst):
-            # Таблица migration_notes + штамп CHECK: init_db о миграции не
-            # знает (схема релиза), а 'ожидает' пишутся ниже в эту же
-            # транзакцию. Идемпотентно.
+            # The migration_notes table + the CHECK stamp: init_db knows nothing about
+            # the migration (the release schema), and the waiting rows are written below
+            # into the same transaction. Idempotent.
             ensure_migration_schema(dst)
-            # Строки: справочники → notes (FTS строят триггеры) → зависимости
-            # → реестры; мета переливается как есть, миграционные ключи
-            # переставляются ниже явно.
+            # Rows: registries → notes (the triggers build FTS) → dependencies
+            # → registries; the meta pours as is, the migration keys are
+            # re-set below explicitly.
             for table, where in _POUR_SPECS:
                 _copy_rows(src, dst, table, where, (target,) * where.count("?"))
-            # Вектора и области — ПОСТРОЧНО (vec0 при INSERT…SELECT не
-            # проверен, design §7); области — без фильтра, целиком.
+            # Vectors and areas — ROW BY ROW (vec0 under INSERT…SELECT is
+            # unverified, design §7); the areas — unfiltered, whole.
             for table, key_column, where in _VEC_POUR_SPECS:
                 if where is None:
                     _copy_vec_rows(src, dst, table, key_column)
@@ -429,8 +439,8 @@ def create_new_base(
                     _copy_vec_rows(
                         src, dst, table, key_column, where, (target,) * where.count("?")
                     )
-            # Мета миграции поверх перелитой: ключи миграции прежней базы
-            # (после прошлой миграции) не должны течь в новую как есть.
+            # The migration meta over the poured one: the previous base's migration keys
+            # (left by an earlier migration) must not flow into the new base as is.
             prev_name = Path(prev_file).name
             _set_meta(dst, META_SCHEMA_NOTE_CHARS, str(target))
             write_chain(
@@ -440,9 +450,9 @@ def create_new_base(
                     {"file": prev_name, "note_chars": _live_limit_or(src, target)},
                 ],
             )
-            # Невлезающие → 'ожидает' (текст остаётся в прежней базе): id
-            # берутся из ИСТОЧНИКА — в новой базе их уже нет, длинные не
-            # перелились. Кросс-коннект в одном INSERT невозможен — перенос.
+            # Non-fitting → 'ожидает' (the text stays in the previous base): the ids are
+            # taken from the SOURCE — the new base does not have them, the long ones did
+            # not pour. A cross-connection in one INSERT is impossible — a transfer.
             long_ids = [
                 int(row[0])
                 for row in src.execute(
@@ -462,13 +472,13 @@ def create_new_base(
                 ),
                 "pending": pending,
             }
-            # Резерв диапазона id (design §8.1): max(id) новой базы после
-            # перелива ниже прежнего (длинные хвосты не перелились), и
-            # max+1 может совпасть с old_id ждущего исходника — затенение
-            # в union, потеря заметки при abort. id_floor — нижняя граница
-            # НОВЫХ id (= MAX(id) прежней базы + 1), живёт в state, пока
-            # миграция активна; NoteService._insert не пускает новые id
-            # ниже неё.
+            # The id range reserve (design §8.1): the new base's max(id) after the pour
+            # is below the previous one (the long tails did not pour), and max+1 may
+            # collide with the old_id of a waiting source — shadowing in the union, a
+            # lost note on abort. id_floor is the lower bound of NEW ids
+            # (= MAX(id) of the previous base + 1); it lives in state while the migration
+            # is active; NoteService._insert refuses new ids below it.
+            # it.
             id_floor = (
                 int(src.execute("SELECT COALESCE(MAX(id), 0) FROM notes").fetchone()[0])
                 + 1
@@ -494,15 +504,16 @@ def _live_limit_or(conn: sqlite3.Connection, fallback: int) -> int:
 
 
 def free_away_name(settings: Settings, away_file: str) -> str:
-    """Имя уходящей базы, не занятое посторонним файлом (LSBN-D-12, DEF-5b).
+    """An away-base name not taken by a foreign file (LSBN-D-12, DEF-5b).
 
-    Имя свободно или это сама активная база (swap переименует её же) — берём
-    как есть. Занято посторонним файлом (например, остаток прошлых циклов
-    «вниз-вверх» с тем же CHECK — базы не удаляются по design) — подбираем
-    суффикс: `…away`, `…away2`, … Имя обязано решиться ДО перелива: оно
-    расходится в state.prev_file и в цепочку приёмника, а swap обязан
-    получить ровно тот же файл. Событие `migration_away_name_rebased` —
-    оператор видит, под каким именем ушла база.
+            The name is free or it IS the active base (swap will rename that very one)
+            - take it as is. Taken by a foreign file (for example, a remainder of past
+            down-up cycles with the same CHECK - bases are never deleted by design) -
+            pick a suffix: `...away`, `...away2`, ... The name must be resolved BEFORE
+            the pour: it fans out into state.prev_file and the receiver chain, and
+            swap must receive exactly that file. The `migration_away_name_rebased`
+            event - the operator sees the name the base left under.
+
     """
     active = Path(settings.db_path)
     candidate = Path(away_file)
@@ -526,15 +537,16 @@ def free_away_name(settings: Settings, away_file: str) -> str:
 
 
 def swap(settings: Settings, *, away_file: str, incoming_file: str) -> None:
-    """Файловый swap указателя активной базы (design §2, фаза 3).
+    """The file swap of the active-base pointer (design SS2, phase 3).
 
-    WAL-checkpoint обеих баз, снос пустых -wal/-shm (сайдкары не должны
-    пережить rename), затем rename: активная → away_file, входящая →
-    db_path. Следующие session() открывают уже новую базу; открытых
-    соединений нет — swap идёт в паузе старта до первого запроса.
-    Отказ «имя занято посторонним файлом» остаётся fail-closed страховкой
-    (LSBN-D-12): нормальные потоки подбирают имя через `free_away_name`
-    ДО перелива, сюда постороннее имя больше не доходит.
+            A WAL-checkpoint of both bases, removing empty -wal/-shm (sidecars must
+            not survive the rename), then the rename: active -> away_file, incoming ->
+            db_path. The next session() calls open the new base already; no open
+            connections - the swap runs in the startup pause before the first request.
+            The "the name is taken by a foreign file" refusal stays as the fail-closed
+            guard (LSBN-D-12): normal flows pick the name via `free_away_name` BEFORE
+            the pour, a foreign name never reaches here anymore.
+
     """
     active = Path(settings.db_path)
     away = Path(away_file)
@@ -551,8 +563,8 @@ def swap(settings: Settings, *, away_file: str, incoming_file: str) -> None:
     try:
         incoming.replace(active)
     except OSError:
-        # Второй rename не прошёл: вернуть указатель — активная база цела
-        # (контракт MigrationError), CrashConsistency прежнего файла не тронут.
+        # The second rename failed: restore the pointer — the active base is intact
+        # (the MigrationError contract), the old file's crash consistency untouched.
         with suppress(OSError):
             away.replace(active)
         raise
@@ -563,7 +575,7 @@ def _same_file(a: Path, b: Path) -> bool:
 
 
 def _checkpoint(db_path: str) -> None:
-    """WAL-checkpoint(TRUNCATE) на отдельном соединении + снос сайдкаров."""
+    """A WAL-checkpoint(TRUNCATE) on a separate connection + sidecar removal."""
     conn = sqlite3.connect(db_path, timeout=5.0)
     try:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -573,14 +585,15 @@ def _checkpoint(db_path: str) -> None:
         Path(db_path + suffix).unlink(missing_ok=True)
 
 
-# --- обратное направление (env вверх / откат) -------------------------------
+# --- the reverse direction (env up / the rollback) -------------------------------
 
 
 def _migration_part_ids(conn: sqlite3.Connection) -> set[int]:
-    """Id частей нарезки в активной базе (record_versions source).
+    """The ids of split parts in the active base (record_versions source).
 
-    Базы до появления record_versions (гипотетический откат очень старой
-    схемы) частей не имеют — таблицы нет, множество пусто.
+            Databases predating record_versions (a hypothetical rollback of a very old
+            schema) have no parts - no table, an empty set.
+
     """
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='record_versions'"
@@ -607,32 +620,34 @@ def reverse_pour(
     phase: str = "done",
     exclude_note_ids: set[int] | None = None,
 ) -> dict:
-    """Обратный перелив: дельта активной базы → прежняя (с CHECK = цели).
+    """The reverse pour: the active base's delta -> the previous one (CHECK = the target).
 
-    Перелив идёт 1:1 без модели (design §4): части (record_versions
-    source='migration_split') и все их зависимости из дельты исключаются —
-    в прежней базе длинные заметки возвращаются целыми, частей там нет и
-    быть не должно. Апсерт по PK (REPLACE ломает FTS), вектора — построчно.
-    Одна транзакция на приёмнике: строки + вектора + мета (цепочка получает
-    уходящую базу, state → phase=`phase`: done при возврате вверх — нарезка
-    не нужна, всё вернулось целым; aborted при прерывании миграции вниз,
-    M3 — части возвращаются в исходники, сервис остаётся на прежней базе).
-    Swap — отдельным вызовом.
+            The pour is 1:1 without a model (design SS4): the parts
+            (record_versions source='migration_split') and all their dependencies are
+            excluded from the delta - in the previous base the long notes come back
+            whole, and there are no parts there and must not be. An upsert over the PK
+            (REPLACE breaks FTS), the vectors row by row. One transaction on the
+            receiver: rows + vectors + meta (the chain gets the away base, state ->
+            phase=`phase`: done on a return up - no splitting needed, everything came
+            back whole; aborted on an interruption of a downward migration, M3 - the
+            parts return into the sources, the service stays on the previous base).
+            The swap is a separate call.
 
-    `exclude_note_ids` (M3, abort): id, чьи строки приёмника НЕЛЬЗЯ
-    трогать дельтой. Прерывание передаёт все old_id из migration_notes:
-    активная база выдаёт новым заметкам max(id)+1, что может совпасть
-    с id исходника — апсерт по такому id ЗАТИРАЛ бы оригинал прежней базы
-    посторонней заметкой (потеря исходника). Затенённые заметки остаются
-    только в уходящей базе (файл не удаляется). Зависимости (связи, чанки,
-    TTL, история, вектора) исключаются тем же множеством.
+            `exclude_note_ids` (M3, abort): ids whose receiver rows must NOT be
+            touched by the delta. The abort passes every old_id from migration_notes:
+            the active base hands new notes max(id)+1, which may collide with a
+            source's id - an upsert over such an id would OVERWRITE the previous
+            base's original with a stranger note (a lost source). Shadowed notes stay
+            only in the away base (the file is not deleted). The dependencies (links,
+            chunks, TTLs, history, vectors) are excluded by the same set.
+
     """
     with session(settings) as active, session(
         settings.model_copy(update={"db_path": source_path})
     ) as src:
         part_notes = _migration_part_ids(active)
-        # kept_parts — семантика частей (нарезка), exclude в неё не мешается:
-        # счётчик прерывания/отката показывает именно неперелитые части.
+        # kept_parts — the parts semantics (splitting), exclude does not pollute it:
+        # the abort/rollback counter shows exactly the unpoured parts.
         kept_parts = len(part_notes)
         if exclude_note_ids:
             part_notes = part_notes | set(exclude_note_ids)
@@ -651,7 +666,7 @@ def reverse_pour(
         live = note_chars_limit(active)
 
         def _where_not_in(*columns: str, ids: set[int]) -> tuple[str, tuple]:
-            """`col NOT IN (…)` по каждому столбцу; пустое множество — без фильтра."""
+            """`col NOT IN (...)` per column; an empty set - no filter."""
             if not ids:
                 return "1=1", ()
             ordered = tuple(sorted(ids))
@@ -660,8 +675,8 @@ def reverse_pour(
             return where, ordered * len(columns)
 
         notes_where, notes_params = _where_not_in("id", ids=part_notes)
-        # Зависимости частей (связи-наследования F-23, чанки, TTL, история,
-        # предупреждения о частях) остаются в уходящей базе вместе с ними.
+        # The parts' dependencies (the F-23 inheritance links, chunks, TTLs, history,
+        # the part warnings) stay in the away base together with them.
         warnings_where, warnings_params = _where_not_in("subject_id", ids=part_notes)
         if part_notes:
             warnings_where = f"subject_type != 'note' OR {warnings_where}"
@@ -686,7 +701,7 @@ def reverse_pour(
             ("meta", "1=1", ()),  # миграционные ключи переставляются ниже
         )
         vec_specs: tuple[tuple[str, str, str, tuple], ...] = (
-            # Ключ vec-таблицы — note_id (не notes.id!), фильтр свой.
+            # The vec table's key is note_id (not notes.id!), its own filter.
             (vectors.VEC_TABLE, "note_id", *_where_not_in("note_id", ids=part_notes)),
             (
                 chunks.CHUNKS_VEC_TABLE,
@@ -698,8 +713,8 @@ def reverse_pour(
 
         counters = {"poured": 0, "kept_parts": kept_parts}
         with transaction(src):
-            # Приёмник мог быть создан до LSBN-F-22: таблицы migration_notes
-            # и штампа в нём может не быть (идемпотентно).
+            # The receiver may have been created before LSBN-F-22: it may lack the
+            # migration_notes table and the stamp (idempotent).
             ensure_migration_schema(src)
             for table, where, params in specs:
                 counters["poured"] += _copy_rows(active, src, table, where, params)
@@ -707,10 +722,10 @@ def reverse_pour(
                 counters["poured"] += _copy_vec_rows(
                     active, src, table, key_column, where, params
                 )
-            # Уходящая база встаёт в конец цепочки; state → phase (done при
-            # возврате вверх, aborted при прерывании — M3): migration_notes
-            # приёмника не тронуты (после прямого перелива 'ожидает' писались
-            # в уходящую базу, не в приёмник).
+            # The away base joins the end of the chain; state → phase (done on a return
+            # up, aborted on an interruption — M3): the receiver's migration_notes are
+            # untouched (after a forward pour the 'ожидает' rows were written to the away
+            # base, not the receiver).
             away_name = Path(away_file).name
             _set_meta(src, META_SCHEMA_NOTE_CHARS, str(target))
             write_chain(
@@ -734,19 +749,21 @@ def reverse_pour(
         return counters
 
 
-# --- фаза 0: план старта (решение о миграции принимает lifespan) ------------
+# --- phase 0: the startup plan (the lifespan makes the migration decision) ------------
 
 
 def startup_plan(settings: Settings) -> dict:
-    """Фаза 0: сверка env с живым CHECK → план старта (design §4).
+    """Phase 0: compare the env with the live CHECK -> the startup plan (design SS4).
 
-    Режимы: `none` — миграция не нужна (файла нет — его только что создал
-    init_db, CHECK нет, env совпал, либо миграция была прервана оператором —
-    phase=aborted, автостарт не возобновляется); `down` — цель меньше живого
-    CHECK, новая база и перелив влезающего; `up_chain` — цель больше, в
-    цепочке есть база с таким CHECK — дельта возвращается в неё (откат 1:1,
-    части исключаются); `up_new` — цель больше, родственной базы нет — новая
-    база вбирает всё (тоже без модели).
+            Modes: `none` - no migration is needed (no file - init_db just created it,
+            no CHECK, the env matches, or the migration was aborted by the operator -
+            phase=aborted, the autostart does not resume); `down` - the target is
+            below the live CHECK, a new base and a pour of what fits; `up_chain` - the
+            target is above and the chain has a base with that CHECK - the delta
+            returns into it (a 1:1 rollback, the parts excluded); `up_new` - the
+            target is above, no sibling base - a new base takes everything (also
+            model-free).
+
     """
     path = Path(settings.db_path)
     target = settings.max_note_chars
@@ -754,10 +771,10 @@ def startup_plan(settings: Settings) -> dict:
         return {"mode": "none", "target": target, "schema_limit": None, "pending": 0}
     with session(settings) as conn:
         live = note_chars_limit(conn)
-        # Прерывание (M3, design §4): оператор остановил миграцию — автостарт
-        # НЕ возобновляется при рестарте с тем же env («сервис остаётся на
-        # прежней базе»); повторный запуск — сознательное действие (вопрос
-        # «дожать миграцию» открыт, design §6).
+        # An interruption (M3, design §4): the operator stopped the migration — the
+        # autostart does NOT resume on a restart with the same env ("the service
+        # stays on the previous base"); a repeated run is a deliberate action (the
+        # "finish the migration" question is open, design §6).
         state = read_state(conn)
         if state is not None and str(state.get("phase")) == "aborted":
             return {
@@ -818,7 +835,7 @@ def startup_plan(settings: Settings) -> dict:
 
 
 def _chain_source(settings: Settings, conn: sqlite3.Connection, target: int) -> str | None:
-    """Путь базы цепочки с CHECK = target (новейшая годная впереди)."""
+    """The path of the chain base with CHECK = target (newest fitting first)."""
     directory = Path(settings.db_path).parent
     for entry in reversed(read_chain(conn)):  # новые впереди
         file_name = str(entry.get("file", ""))
@@ -842,19 +859,21 @@ def _chain_source(settings: Settings, conn: sqlite3.Connection, target: int) -> 
 
 
 def run_startup_migration(settings: Settings, plan: dict) -> dict:
-    """Фазы 2–3 по плану `startup_plan`: перелив + swap; счётчики — назад.
+    """Phases 2-3 over the `startup_plan`: the pour + the swap; the counters - back.
 
-    При ошибке перелива (до swap) активная база цела — вызывающий продолжает
-    работу на прежней базе; сбой swap восстанавливает указатель (`swap`).
+            On a pour error (before the swap) the active base is intact - the caller
+            keeps working on the previous base; a swap failure restores the pointer
+            (`swap`).
+
     """
     mode = plan["mode"]
-    # Имя уходящей базы решается ДО перелива (LSBN-D-12): оно расходится в
-    # state.prev_file и в цепочку приёмника, swap получает то же имя.
+    # The away-base name is resolved BEFORE the pour (LSBN-D-12): it fans out
+    # into state.prev_file and the receiver chain, and swap gets the same name.
     away = free_away_name(settings, plan["prev_file"])
     if mode in ("down", "up_new"):
-        # Приёмник перелива — до create_new_base (DEF-5): база цепочки под
-        # целевым именем не стирается, новая база льётся в …db.incoming;
-        # swap ставит на db_path именно её.
+        # The pour receiver — before create_new_base (DEF-5): the chain base under
+        # the target name is never wiped, the new base pours into …db.incoming;
+        # swap places exactly that one on db_path.
         with session(settings) as conn:
             incoming = _pour_target(settings, conn, plan["target"])
         counters = create_new_base(
@@ -888,10 +907,12 @@ def run_startup_migration(settings: Settings, plan: dict) -> dict:
 
 
 def ensure_startup_schema(settings: Settings) -> None:
-    """Таблица migration_notes + штамп schema.note_chars на каждом старте.
+    """The migration_notes table + the schema.note_chars stamp on every start.
 
-    Идемпотентно: база без миграции получает пустую таблицу и читаемый
-    штамп живого CHECK (observability — design §3); миграционная — свою.
+            Idempotent: a non-migration database gets an empty table and a readable
+            stamp of the live CHECK (observability - design SS3); a migration one - its
+            own.
+
     """
     with session(settings) as conn, transaction(conn):
         ensure_migration_schema(conn)
