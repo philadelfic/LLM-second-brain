@@ -1,30 +1,31 @@
-"""Очередь удаления просроченных заметок — note_expirations (lsb-0004-02).
+"""The expired-note deletion queue — note_expirations (lsb-0004-02).
 
-Слой без доменных правил (как `app.storage.chunks`/`app.storage.vectors`):
-только строки таблицы `note_expirations(note_id PK, expires_at)`. Доменная
-семантика (когда вставлять/обновлять/удалять, парсинг TTL) — в сервисном
-слое `app.services.notes`.
+A layer without domain rules (like `app.storage.chunks`/`app.storage.vectors`):
+only rows of the `note_expirations(note_id PK, expires_at)` table. The domain
+semantics (when to insert/update/delete, TTL parsing) live in the service
+layer `app.services.notes`.
 
-Синхронизация с `notes.expires_at` — на уровне сервиса (постановка lsb-0004-02,
-этап 3): вставка при создании заметки с TTL, upsert при смене TTL, удаление
-при снятии TTL (clear) или удалении заметки. `note_id` — PK: одна запись на
-заметку, поэтому «обновление» — это upsert (INSERT ... ON CONFLICT DO UPDATE).
+Synchronization with `notes.expires_at` is at the service level (the
+lsb-0004-02 design, step 3): insert when a note with a TTL is created, upsert
+when the TTL changes, delete when the TTL is cleared or the note is deleted.
+`note_id` is the PK: one row per note, so an "update" is an upsert
+(INSERT ... ON CONFLICT DO UPDATE).
 """
 
 from __future__ import annotations
 
 import sqlite3
 
-# Таблица создаётся идемпотентно в init_db (app/storage/db.py, _NOTE_EXPIRATIONS_DDL).
+# The table is created idempotently in init_db (app/storage/db.py, _NOTE_EXPIRATIONS_DDL).
 _EXPIRATIONS_TABLE = "note_expirations"
 
 
 def upsert(conn: sqlite3.Connection, note_id: int, expires_at: str) -> None:
-    """Вставить/обновить срок жизни заметки в очереди удаления.
+    """Insert/update the note lifetime in the deletion queue.
 
-    `note_id` — PK, поэтому одна запись на заметку: INSERT ... ON CONFLICT
-    DO UPDATE перезаписывает expires_at при смене TTL (set в memory_update).
-    Вызывается внутри открытой транзакции сервиса.
+    `note_id` is the PK, so one row per note: INSERT ... ON CONFLICT DO UPDATE
+    overwrites expires_at when the TTL changes (set in memory_update). Called
+    inside an open service transaction.
     """
     conn.execute(
         f"INSERT INTO {_EXPIRATIONS_TABLE} (note_id, expires_at) VALUES (?, ?) "
@@ -34,10 +35,10 @@ def upsert(conn: sqlite3.Connection, note_id: int, expires_at: str) -> None:
 
 
 def delete(conn: sqlite3.Connection, note_id: int) -> None:
-    """Удалить строку из очереди удаления (снятие TTL / clear / удаление заметки).
+    """Remove a row from the deletion queue (TTL cleared / clear / note deleted).
 
-    Идемпотентно: отсутствующей строки нет — DELETE просто не матчит ничего.
-    Вызывается внутри открытой транзакции сервиса.
+    Idempotent: a missing row matches nothing — the DELETE simply no-ops.
+    Called inside an open service transaction.
     """
     conn.execute(
         f"DELETE FROM {_EXPIRATIONS_TABLE} WHERE note_id = ?",
