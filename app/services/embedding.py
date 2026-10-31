@@ -1,45 +1,43 @@
-"""EmbeddingService — векторизация через LLM-слот embedding (ARCH §3.2, §5.3).
+"""EmbeddingService - vectorization through the embedding LLM slot (ARCH §3.2, §5.3).
 
-Единственный вызов наружу: embed слота embedding — `POST /api/embed` у
-ollama-провайдера, `POST /v1/embeddings` у openai (Фаза 11, решение №1).
-Кодируются **полные тексты** (заметок и поисковых запросов), не summary
-(REQUIREMENTS §5.3).
+    The single outbound call: the embedding slot's embed - `POST /api/embed` at an
+    ollama provider, `POST /v1/embeddings` at openai (Phase 11). FULL TEXTS are
+    encoded (notes and search queries), not summaries (REQUIREMENTS §5.3).
 
-Фаза 11: HTTP-транспорт вынесен в `LLMClient` (app/services/llm_client.py):
-один клиент на слот embedding — провайдер `ollama` | `openai`, per-slot
-адрес/модель/ключ из Settings (SlotSpec.for_embedding). Сервис больше не
-держит httpx и не собирает пейлоады сам: очередь F1 (ollama_slot — только
-ollama-провайдер), Bearer при заданном ключе, таймауты (connect 2 с LAN /
-10 с облако, read 720 с) и разбор ответа — внутри клиента.
+    Phase 11: the HTTP transport moved into `LLMClient` (app/services/llm_client.py):
+    one client per embedding slot - the provider `ollama` | `openai`, the per-slot
+    address/model/key from Settings (SlotSpec.for_embedding). The service no
+    longer keeps httpx nor assembles payloads itself: the F1 queue (ollama_slot -
+    the ollama provider only), Bearer with a key set, the timeouts (connect 2 s
+    LAN / 10 s cloud, read 720 s) and the response parse live inside the client.
 
-Ключевые решения:
-- Синхронный путь: сервисы вызываются из `asyncio.to_thread` (event loop
-  не занимаем); `LLMClient` держит keep-alive пул httpx — без TCP-handshake
-  на каждый запрос.
-- Таймаут read — фиксированные 720 с (§8 таймаут эмбеддинга не задаёт;
-  решение О. 2026-08-30: qwen3-embedding:8b на CPU-хосте кодирует ~3.7k
-  токенов за ~2 мин — длинные тексты должны дорабатываться, а не рваться;
-  вернёт раньше — раньше получим ответ. Короткие тексты остаются в диапазоне
-  миллисекунд, REQUIREMENTS §5.1).
-- Один ретрай в синхронном пути (ARCH §3.2): только транзиентные сбои —
-  сигнал `LLMError.transient` (429/5xx/транспорт/таймаут, решение №4).
-  401/403 (`LLMAuthError`) и прочие 4xx не повторяются; текст ошибки
-  клиента (включая hint про {SLOT}_API_KEY у auth-отказа) сохраняется.
-- Ответ проверяется жёстко: длина списка векторов равна числу входов,
-  размерность каждого вектора равна EMBEDDING_DIM. Мусор от прокси или
-  чужой модели не проходит дальше как «валидные вектора» (vec0-таблица
-  фиксирует размерность — несоответствие иначе рвало бы перезапуск).
-- Любой отказ — `EmbeddingError`, и только она: вызывающий код сам решает
-  деградацию (save → vector_status=pending, search → FTS-only; шаги
-  3.3–3.4). Ни один отказ не ломает пользовательскую операцию (NFR-3).
-- `last_attempt_ok` (NFR-4) — источник `/health.embedding_ok`: None —
-  попыток ещё не было, True/False — исход последней попытки. Стартовая
-  проверка слота (main.py, решение №5) инициализирует его до первого
-  реального вызова.
-- Юнит-тестам — транспорт без сети: `transport` в конструкторе принимает
-  httpx.MockTransport или handler (пробрасывается в LLMClient); для тестов
-  сервисов есть детерминированный HashEmbedder (tests/fakes.py, ARCH §7:
-  hash→вектор).
+    Key decisions:
+    - The synchronous path: the services are called from `asyncio.to_thread` (the
+      event loop is not occupied); `LLMClient` keeps an httpx keep-alive pool -
+      no TCP handshake per request.
+    - The read timeout is a fixed 720 s (SS8 sets no embedding timeout; sized for
+      CPU inference: qwen3-embedding:8b on a CPU host encodes ~3.7k tokens in
+      ~2 min - long texts must finish, not tear; an earlier finish returns
+      earlier. Short texts stay in the milliseconds range, REQUIREMENTS §5.1).
+    - One retry in the synchronous path (ARCH §3.2): transient failures only -
+      the `LLMError.transient` signal (429/5xx/transport/timeout). 401/403
+      (`LLMAuthError`) and other 4xx never retry; the client error text
+      (including the {SLOT}_API_KEY hint on an auth refusal) is preserved.
+    - The response is checked hard: the vector list length equals the input
+      count, and every vector's dimension equals EMBEDDING_DIM. Garbage from a
+      proxy or someone else's model does not pass further as "valid vectors"
+      (the vec0 table pins the dimension - a mismatch would otherwise break the
+      restart).
+    - Any failure - `EmbeddingError`, and only it: the calling code decides the
+      degradation itself (save -> vector_status=pending, search -> FTS-only;
+      steps 3.3-3.4). No failure ever breaks a user operation (NFR-3).
+    - `last_attempt_ok` (NFR-4) - the source of `/health.embedding_ok`: None -
+      no attempts yet; True/False - the last attempt's outcome. The startup slot
+      check (main.py) initializes it before the first real call.
+    - For unit tests - a transport without the network: the constructor's
+      `transport` takes an httpx.MockTransport or a handler (passed into
+      LLMClient); for the service tests there is the deterministic HashEmbedder
+      (tests/fakes.py, ARCH §7: hash -> vector).
 """
 
 from __future__ import annotations
@@ -53,18 +51,20 @@ from app.config import Settings
 from app.services.llm_client import LLMClient, LLMError, SlotSpec
 from app.services.slot_outcome import SlotOutcome, classify_llm_error
 
-# Одна повторная попытка в синхронном пути (ARCH §3.2): только транзиентные
-# сбои — сигнал `LLMError.transient` (429/5xx/транспорт/таймаут); 401/403
-# (LLMAuthError) и прочие 4xx не повторяются.
+# One retry in the synchronous path (ARCH §3.2): transient failures only -
+# the `LLMError.transient` signal (429/5xx/transport/timeout); 401/403
+# (LLMAuthError) and other 4xx never retry.
 MAX_ATTEMPTS = 2
 
 
 class EmbeddingError(RuntimeError):
-    """Векторизация не выполнена: сервер недоступен или ответ некорректен.
+    """The vectorization failed: the server is unavailable or the response is malformed.
 
-    `outcome` — единый тип исхода вызова слота (№39, arch §6.4): отказ
-    клиента — `classify_llm_error`, нарушение контракта ответа (число/
-    размерность векторов) — явно `OFF_CONTRACT` (дефолт). Воркер пишет исход.
+            `outcome` - the single slot-call outcome type (No39, arch §6.4): a client
+            failure - `classify_llm_error`; a response-contract violation (the count/
+            dimension of the vectors) - explicitly `OFF_CONTRACT` (the default). The
+            worker journals the outcome.
+
     """
 
     def __init__(
@@ -78,35 +78,38 @@ class EmbeddingError(RuntimeError):
 
 
 class Embedder(Protocol):
-    """Контракт кодировщика текста: природы реализации он не знает.
+    """The text encoder contract: it knows nothing of the implementation.
 
-    Реализации: EmbeddingService (живой слот embedding) и тестовый
-    HashEmbedder (tests/fakes.py) — потребители (SearchService,
-    DeduplicationService, воркер) зависят от протокола, а не от класса
-    клиента.
+            The implementations: EmbeddingService (the live embedding slot) and the
+            test HashEmbedder (tests/fakes.py) - the consumers (SearchService,
+            DeduplicationService, the worker) depend on the protocol, not the client
+            class.
+
     """
 
     def embed(self, text: str) -> list[float]:
-        """Закодировать один текст."""
+        """Encode one text (the synchronous save/update/query path)."""
         ...
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        """Закодировать batch текстов; порядок результата = порядку входа."""
+        """Encode a batch of texts; the result order = the input order."""
         ...
 
     def probe(self) -> str:
-        """Дешёвый пробный стук слота (№39, arch §6.4): `check()` без генерации;
-        исход — CheckResult из llm_client."""
+        """A cheap probe knock of the embedding slot (No39, arch §6.4): `check()`
+                    without generation. The outcome is served as is (CheckResult).
+        """
         ...
 
 
 class EmbeddingService:
-    """Кодирование текстов через embed слота embedding (batch).
+    """Encode texts through the embedding slot's embed (batch).
 
-    Попутно ведёт `last_attempt_ok` (NFR-4) — источник `/health.embedding_ok`:
-    None — попыток ещё не было, True/False — исход последней попытки. Статус
-    обновляется в `embed_texts`, то есть единой точке всех кодирований
-    (save/update/query/фоновый воркер).
+            It also maintains `last_attempt_ok` (NFR-4) - the source of
+            `/health.embedding_ok`: None - no attempts yet; True/False - the last
+            attempt's outcome. The status updates in `embed_texts` - the single point
+            of all encodings (save/update/query/the background worker).
+
     """
 
     def __init__(
@@ -119,11 +122,11 @@ class EmbeddingService:
         llm: LLMClient | None = None,
     ) -> None:
         self._settings = settings
-        # DI сборки (build_services передаёт общий клиент слота) или свой
-        # клиент с transport-инъекцией для юнит-тестов (MockTransport).
-        # Операция `embed` (LSBN-F-34): плоский env EMBED_* переопределяет
-        # модель/провайдера/адрес/ключ/таймаут кодирования поверх слота
-        # embedding (у которого своего таймаута нет — дефолт 720 с).
+        # A DI build (build_services passes the slot's shared client) or an own
+        # client with a transport injection for unit tests (MockTransport).
+        # The `embed` operation (LSBN-F-34): the flat EMBED_* env overrides the
+        # encoding model/provider/address/key/timeout over the embedding slot
+        # (which has no timeout of its own - the 720 s default).
         self._llm = (
             llm
             if llm is not None
@@ -131,31 +134,33 @@ class EmbeddingService:
                 SlotSpec.for_operation("embed", settings)[0], transport=transport
             )
         )
-        # None — попыток не было (health не врёт до первых данных).
+        # None - no attempts yet (health does not lie before the first data).
         self.last_attempt_ok: bool | None = None
 
     def embed(self, text: str) -> list[float]:
-        """Кодировать один текст (синхронный путь save/update/запрос)."""
+        """Encode one text (the synchronous save/update/query path)."""
         return self.embed_texts([text])[0]
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        """Кодировать batch текстов; порядок результата = порядку входа."""
+        """Encode a batch of texts; the result order = the input order."""
         if not texts:
             raise ValueError("embed_texts: пустой список текстов")
         try:
             embeddings = self._request_and_parse(list(texts))
         except EmbeddingError:
-            self.last_attempt_ok = False  # деградация станет видна в /health
+            self.last_attempt_ok = False  # the degradation will show in /health
             raise
         self.last_attempt_ok = True
         return embeddings
 
     def _request_and_parse(self, texts: list[str]) -> list[list[float]]:
-        """Цикл с единственным ретраем + проверки контракта ответа.
+        """The loop with the single retry + the response contract checks.
 
-        Ретрай — по сигналу `LLMError.transient` клиента (429/5xx/транспорт/
-        таймаут, решение №4); 401/403 и прочие 4xx не повторяются. Сам
-        клиент не ретраит никогда — решение о повторе принимает вызывающий.
+                    The retry - by the client's `LLMError.transient` signal
+                    (429/5xx/transport/timeout); 401/403 and other 4xx never retry. The
+                    client itself never retries - the repeat decision belongs to the
+                    caller.
+
         """
         expected = len(texts)
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -164,33 +169,35 @@ class EmbeddingService:
                 vectors = self._llm.embed(texts)
             except LLMError as exc:
                 if final or not exc.transient:
-                    # Исход вызова (№39, arch §6.4): единый тип на границе сервиса.
+                    # The call outcome (No39, arch §6.4): one type at the service boundary.
                     raise EmbeddingError(
                         str(exc), outcome=classify_llm_error(exc)
                     ) from exc
-                continue  # единственный ретрай (ARCH §3.2)
+                continue  # the single retry (ARCH §3.2)
             return self._check_contract(vectors, expected)
         raise EmbeddingError("неожиданный выход из цикла попыток")  # unreachable
 
     def close(self) -> None:
-        """Закрыть HTTP-пул (чистое завершение процесса)."""
+        """Close the HTTP pool (a clean process shutdown)."""
         self._llm.close()
 
     def probe(self) -> str:
-        """Дешёвый пробный стук слота embedding (№39, arch §6.4): `check()`
-        без генерации. Исход отдаётся как есть (CheckResult)."""
+        """A cheap probe knock of the embedding slot (No39, arch §6.4): `check()`
+                    without generation. The outcome is served as is (CheckResult).
+        """
         return self._llm.check()
 
-    # --- внутреннее ---------------------------------------------------------
+    #--- internal ---------------------------------------------------------
 
     def _check_contract(
         self, embeddings: object, expected: int
     ) -> list[list[float]]:
-        """Проверить контракт embed-ответа; любые нарушения — EmbeddingError.
+        """Check the embed response contract; any violation - EmbeddingError.
 
-        Число векторов обязано равняться числу входов, размерность каждого —
-        EMBEDDING_DIM (vec0-таблица фиксирует размерность — несоответствие
-        иначе рвало бы перезапуск).
+                    The vector count must equal the input count and every vector's
+                    dimension - EMBEDDING_DIM (the vec0 table pins the dimension - a
+                    mismatch would otherwise break the restart).
+
         """
         if not isinstance(embeddings, list) or len(embeddings) != expected:
             raise EmbeddingError(
