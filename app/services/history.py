@@ -1,24 +1,27 @@
-"""Слой истории версий (№41, релиз 3.2.0): общая таблица `record_versions`.
+"""The version history layer (No41, 3.2.0): the shared `record_versions` table.
 
-Актуальная запись живёт в прежних таблицах и читается как раньше; рядом
-хранится история: `version=1` — baseline (содержимое целиком), дальше —
-цепочка дельт (FR-1.1/FR-2.1/FR-2.2). Лист над хранилищем: доменные сервисы
-не импортирует, `Settings` берёт из `app.config`, соединение — у вызывающего.
+    The live record lives in the previous tables and is read as before; the
+    history is stored alongside: `version=1` is the baseline (the content whole),
+    then a chain of deltas (FR-1.1/FR-2.1/FR-2.2). A layer over the storage: it
+    imports no domain services, takes `Settings` from `app.config`; the connection
+    belongs to the caller.
 
-Ключевые решения (ARCH substrate-versioning §5, §6.1, §13):
-- Формат дельты — пофайловый JSON-объект «поле → новое значение»; длинное
-  текстовое поле (≥ `HISTORY_DELTA_INLINE_MAX`) кодируется построчной заменой
-  (`{"__lines__": [[i, j, [строки]], …]}`) — история растёт по числу правок,
-  а не по объёму записи (§5.2, §13.1).
-- Запись — ТОЛЬКО на открытом соединении вызывающего, внутри его
-  `transaction()`: нет состояния «правка прошла, истории нет» (FR-2.4, §13.5).
-  Модуль на пути записи не открывает ни соединений, ни транзакций.
-- Источник и сессия версии (`source`/`session`) приходят из contextvar
-  (`bind_origin`/`current_origin`): сигнатуры сервисов не меняются (§13.4).
-- История никогда не переписывается: откат — новая версия (§13.6); политика
-  хранения (`HISTORY_MAX_VERSIONS`/`HISTORY_RETENTION_DAYS`) вычищает
-  старейшие версии и ПЕРЕБАЗИРУЕТ самую раннюю сохраняемую в полный snapshot,
-  номера не переиспользуются (§13.8).
+    Key decisions (ARCH substrate-versioning §5, §6.1, §13):
+    - The delta format - a per-field JSON object "field -> new value"; a long text
+      field (>= `HISTORY_DELTA_INLINE_MAX`) is encoded as a line replacement
+      (`{"__lines__": [[i, j, [lines]], ...]}`) - the history grows by the number
+      of edits, not by the record's volume (§5.2, §13.1).
+    - A write - ONLY on the caller's open connection, inside its `transaction()`:
+      there is no "the edit went through, the history did not" state
+      (FR-2.4, §13.5). The module opens neither connections nor transactions on
+      the write path.
+    - A version's source and session (`source`/`session`) come from a contextvar
+      (`bind_origin`/`current_origin`): the service signatures do not change
+      (§13.4).
+    - The history is never rewritten: a rollback is a new version (§13.6); the
+      retention policy (`HISTORY_MAX_VERSIONS`/`HISTORY_RETENTION_DAYS`) prunes
+      the oldest versions and RE-BASES the earliest kept one into a full snapshot;
+      the numbers are never reused (§13.8).
 """
 
 from __future__ import annotations
@@ -35,31 +38,31 @@ from app.config import Settings, get_settings
 from app.services.listing import page_fields
 from app.storage.db import INSTRUCTION_TEMPLATE_KEY, session
 
-# --- сущности и версионируемая проекция (§5.3) -----------------------------
+#--- the entities and the versioned projection (§5.3) -----------------------------
 
 ENTITY_NOTE = "note"
 ENTITY_SKILL = "skill"
 ENTITY_SKILL_TEMPLATE = "skill_template"
 ENTITY_TERM = "term"
 ENTITY_USER_FACT = "user_fact"
-# Область «Логи ассистента» (LSBN-F-10, arch §5.4): версионируемая сущность
-# области логов; служебные поля (`vector_status`, времена) версий не создают.
+# The "Assistant logs" area (LSBN-F-10, arch §5.4): the logs area's
+# versioned entity; the service fields (`vector_status`, times) create no versions.
 ENTITY_ASSISTANT_LOG = "assistant_log"
 
-# Реестр проекции §5.3: какие поля сущности создают версию. Служебные
+# The §5.3 projection registry: which entity fields create a version. The service
 # (`vector_status`, `summary_status`, `links_at`, `node_order_at`,
-# `classified_at`, `hint_path`, `confidence`) в проекцию не входят и версий
-# не создают (FR-4.2). Производная (авто) `summary` заметки тоже вне проекции:
-# в версию попадает только явно переданная выжимка (§13.3).
+# `classified_at`, `hint_path`, `confidence`) are not in the projection and
+# create no versions (FR-4.2). A note's derived (auto) `summary` is outside the
+# projection too: only an explicitly passed summary enters a version (§13.3).
 CONTENT_FIELDS: dict[str, tuple[str, ...]] = {
     ENTITY_NOTE: ("text", "title", "namespace", "expires_at", "comment"),
     ENTITY_SKILL: ("name", "description", "example", "steps", "text", "extra"),
     ENTITY_SKILL_TEMPLATE: ("instruction_template",),
     ENTITY_TERM: ("term", "context", "definition"),
     ENTITY_USER_FACT: ("name", "body"),
-    # Контент лога (arch §5.4): `source`/`session` — часть контента («что за
-    # действие и какой канал/сессия его породили»), отдельно от
-    # `record_versions.source/session` (происхождение самой версии, §13.3).
+    # A log's content (arch §5.4): `source`/`session` are part of the content ("what
+    # action and which channel/session produced it"), apart from
+    # `record_versions.source/session` (the version's own origin, §13.3).
     ENTITY_ASSISTANT_LOG: (
         "action",
         "reason",
@@ -78,14 +81,15 @@ CONTENT_FIELDS: dict[str, tuple[str, ...]] = {
 def note_projection(
     row: sqlite3.Row | Mapping[str, Any], *, explicit_summary: bool = False
 ) -> dict[str, Any]:
-    """Проекция заметки по §5.3 — одна точка правды для save/update/merge.
+    """The note projection per §5.3 - the single truth for save/update/merge.
 
-    Контент: `text`/`title`/`namespace`/`expires_at`/`comment` (пометка —
-    контентное поле версионирования №24, FR-5.6). `summary` входит только
-    при ЯВНОЙ передаче (`explicit_summary=True`) — авто-перегенерация воркером
-    версий не создаёт (§13.3). Служебные поля (`vector_status`,
-    `summary_status`, `links_at`, `node_order_at`, `classified_at`) в проекцию
-    не входят и версий не создают (FR-4.2).
+            The content: `text`/`title`/`namespace`/`expires_at`/`comment` (the comment
+            is the versioning content field No24, FR-5.6). `summary` enters only on an
+            EXPLICIT pass (`explicit_summary=True`) - the worker's auto-regeneration
+            creates no versions (§13.3). The service fields (`vector_status`,
+            `summary_status`, `links_at`, `node_order_at`, `classified_at`) are not in
+            the projection and create no versions (FR-4.2).
+
     """
     fields: dict[str, Any] = {
         "text": row["text"],
@@ -100,11 +104,13 @@ def note_projection(
 
 
 def _parsed_extra(raw: Any) -> dict[str, Any] | None:
-    """`extra` навыка из живой строки → объект полей класса; NULL/битый → `None`.
+    """A skill's `extra` from the live row -> the class-fields object; NULL/broken -> `None`.
 
-    В живой таблице `extra` — JSON-текст, в версии он живёт распарсенным
-    объектом (одна форма у baseline и дельт, §13.3): так `null` в дельте честно
-    означает «поле снято». Пусто/повреждённый JSON (ручная правка БД) — `None`.
+            In the live table `extra` is a JSON text; in a version it lives as the
+            parsed object (one shape for the baseline and the deltas, §13.3): so a
+            `null` in a delta honestly means "the field was removed". Empty/damaged
+            JSON (a manual DB edit) - `None`.
+
     """
     if not raw:
         return None
@@ -116,11 +122,13 @@ def _parsed_extra(raw: Any) -> dict[str, Any] | None:
 
 
 def skill_projection(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
-    """Проекция навыка по §5.3 — одна точка правды для create/update/delete.
+    """The skill projection per §5.3 - the single truth for create/update/delete.
 
-    Контент: `name`/`description`/`example`/`steps`/`text`/`extra` (поля класса
-    — распарсенным объектом, §13.3). Служебное (`vector_status`; `version` —
-    зеркало головной версии) в проекцию не входит и версий не создаёт (FR-4.2).
+            The content: `name`/`description`/`example`/`steps`/`text`/`extra` (the
+            class fields - as the parsed object, §13.3). The service fields
+            (`vector_status`; `version` - the head-version mirror) are not in the
+            projection and create no versions (FR-4.2).
+
     """
     return {
         "name": row["name"],
@@ -133,10 +141,12 @@ def skill_projection(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
 
 
 def term_projection(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
-    """Проекция термина по §5.3 — одна точка правды для save/update/delete.
+    """The term projection per §5.3 - the single truth for save/update/delete.
 
-    Контент: `term`/`context`/`definition`. Нормализованные ключи (`term_norm`,
-    `context_norm`) и `vector_status` — служебные, версий не создают (FR-4.2).
+            The content: `term`/`context`/`definition`. The normalized keys
+            (`term_norm`, `context_norm`) and `vector_status` are service fields and
+            create no versions (FR-4.2).
+
     """
     return {
         "term": row["term"],
@@ -146,21 +156,23 @@ def term_projection(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
 
 
 def user_fact_projection(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
-    """Проекция факта о пользователе по §5.3 — одна точка правды для CRUD.
+    """The user-fact projection per §5.3 - the single truth for CRUD.
 
-    Контент: `name`/`body`; `vector_status` — служебное, версий не создаёт
-    (FR-4.2).
+            The content: `name`/`body`; `vector_status` is a service field and creates
+            no versions (FR-4.2).
+
     """
     return {"name": row["name"], "body": row["body"]}
 
 
 def assistant_log_projection(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
-    """Проекция лога ассистента по §5.4 — одна точка правды для CRUD области.
+    """The assistant-log projection per §5.4 - the single truth of the area's CRUD.
 
-    Контент: `action`/`reason`/`entity`/`entity_id`/`entity_version`/`entity_ref`/
-    `outcome`/`verified`/`source`/`session`. Служебные поля (`vector_status`,
-    `created_at`/`updated_at`/`deleted_at`) в проекцию не входят и версий не
-    создают (FR-4.2).
+            The content: `action`/`reason`/`entity`/`entity_id`/`entity_version`/
+            `entity_ref`/`outcome`/`verified`/`source`/`session`. The service fields
+            (`vector_status`, `created_at`/`updated_at`/`deleted_at`) are not in the
+            projection and create no versions (FR-4.2).
+
     """
     return {
         "action": row["action"],
@@ -176,27 +188,27 @@ def assistant_log_projection(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, 
     }
 
 
-# Мягкий ответ чтения, когда версии/записи нет: транспорт превращает его в
-# 404 (никакого исключения — «версии нет» валидный исход).
+# The soft read answer when a version/record is absent: the transport turns it
+# into a 404 (no exception - "no version" is a valid outcome).
 HINT_VERSION_NOT_FOUND = (
     "version not found for this record — history_list shows the available versions"
 )
 
-# Мягкий ответ чтения при выключенном слое истории (`HISTORY_ENABLED=false`, §8):
-# версии не пишутся и не читаются — пусто + эта подсказка (EN), не исключение.
+# The soft read answer with the history layer off (`HISTORY_ENABLED=false`, §8):
+# no versions are written or read - empty + this hint (EN), not an exception.
 HINT_HISTORY_OFF = "history is off"
 
-# Источник версии, если запись вызвана вне `bind_origin` (прямой вызов слоя
-# из тестов/утилит): настоящий источник неизвестен.
+# The version's source when the write happened outside `bind_origin` (a direct
+# layer call from tests/utilities): the true source is unknown.
 DEFAULT_SOURCE = "unknown"
 
 
 class HistoryValidationError(ValueError):
-    """Ошибка слоя истории: неизвестная сущность или версия вне диапазона."""
+    """A history-layer error: an unknown entity or a version out of range."""
 
 
 def _check_entity(entity: str) -> None:
-    """Сущность обязана быть в реестре проекции (§5.3)."""
+    """The entity must be in the projection registry (§5.3)."""
     if entity not in CONTENT_FIELDS:
         raise HistoryValidationError(
             "unknown entity: " + entity + " (known: " + ", ".join(CONTENT_FIELDS) + ")"
@@ -204,28 +216,31 @@ def _check_entity(entity: str) -> None:
 
 
 def _history_enabled() -> bool:
-    """Гейт слоя истории (§8, `HISTORY_ENABLED`): `false` — версии не пишутся.
+    """The history layer gate (§8, `HISTORY_ENABLED`): `false` - no versions written.
 
-    Выключатель читается из текущих настроек на КАЖДОМ пути записи: правка
-    сущности при выключенном слое проходит как раньше, а строк в
-    `record_versions` не появляется. Тот же гейт в чтении отдаёт пусто с
-    `HINT_HISTORY_OFF`.
+            The switch is read from the current settings on EVERY write path: an edit
+            with the layer off passes as before and no rows appear in
+            `record_versions`. The same gate in reads serves empty with
+            `HINT_HISTORY_OFF`.
+
     """
     return bool(get_settings().history_enabled)
 
 
-# --- кодирование и применение дельты (§5.2) --------------------------------
+#--- the delta encoding and application (§5.2) --------------------------------
 
 def encode_delta(
     previous: Mapping[str, Any], current: Mapping[str, Any], *, inline_max: int
 ) -> tuple[dict[str, Any], list[str]]:
-    """Дельта «поле → представление нового значения» + список изменившихся полей.
+    """The delta "field -> the new value's representation" + the changed-field list.
 
-    Поле кодируется построчно, если и прежнее, и новое значения — строки и
-    новое длиннее/равно `inline_max`; иначе — значением целиком (короткие поля,
-    объекты, `null` при снятии). Представление выбирается по каждому полю
-    в каждой версии (§5.2). Порядок полей в результате стабилен: сначала поля
-    прежнего значения, затем новые (появление поля — в конец).
+            A field is encoded line-by-line when both the old and the new values are
+            strings and the new one is >= `inline_max`; otherwise - the whole value
+            (short fields, objects, `null` on removal). The representation is chosen
+            per field in every version (§5.2). The field order in the result is
+            stable: the old value's fields first, then the new ones (a field's
+            appearance goes to the end).
+
     """
     delta: dict[str, Any] = {}
     changed: list[str] = []
@@ -242,24 +257,25 @@ def encode_delta(
 def _ordered_fields(
     previous: Mapping[str, Any], current: Mapping[str, Any]
 ) -> list[str]:
-    """Поля обоих значений без повторов: порядок прежнего, затем новые."""
+    """The fields of both values without repeats: the old order first, then the new."""
     fields = list(previous)
     fields.extend(field for field in current if field not in previous)
     return fields
 
 
 def _encode_value(old: Any, new: Any, *, inline_max: int) -> Any:
-    """Представление значения поля: построчная замена или значение целиком."""
+    """A field value's representation: the line replacement or the whole value."""
     if isinstance(old, str) and isinstance(new, str) and len(new) >= inline_max:
         return _encode_lines(old, new)
     return new
 
 
 def _encode_lines(previous: str, current: str) -> dict[str, list[list[Any]]]:
-    """Построчная замена: только не-`equal` опкоды SequenceMatcher (§5.2).
+    """The line replacement: only the non-`equal` opcodes of SequenceMatcher (§5.2).
 
-    `[i, j, [строки]]` — в прежнем значении позиции `[i, j)` заменяются на
-    перечисленные строки (insert — `i == j`, delete — пустой список).
+            `[i, j, [lines]]` - in the old value the positions `[i, j)` are replaced
+            with the listed lines (insert - `i == j`, delete - an empty list).
+
     """
     previous_lines = previous.split("\n")
     current_lines = current.split("\n")
@@ -273,11 +289,12 @@ def _encode_lines(previous: str, current: str) -> dict[str, list[list[Any]]]:
 
 
 def apply_delta(fields: dict[str, Any], delta: Mapping[str, Any]) -> dict[str, Any]:
-    """Применить дельту к словарю полей (тот же объект; §5.2).
+    """Apply a delta to a field dict (the same object; §5.2).
 
-    Один алгоритм на все представления: `{"__lines__": …}` — построчная замена
-    в текущем значении поля (не строки → пустая строка), любое другое значение
-    (в том числе `null`) — присваивание целиком.
+            One algorithm for all representations: `{"__lines__": ...}` - the line
+            replacement in the field's current value (not a string -> an empty
+            string); any other value (including `null`) - the whole assignment.
+
     """
     for field, value in delta.items():
         if isinstance(value, dict) and "__lines__" in value:
@@ -290,11 +307,11 @@ def apply_delta(fields: dict[str, Any], delta: Mapping[str, Any]) -> dict[str, A
     return fields
 
 
-# --- происхождение версии (contextvar, §13.4) ------------------------------
+#--- the version origin (a contextvar, §13.4) ------------------------------
 
-# Источник и сессия вызова живут в contextvar: сигнатуры сервисов не меняются,
-# `asyncio.to_thread` контекст пробрасывает; jobs и миграция передают источник
-# явно (без bind_origin).
+# The call's source and session live in a contextvar: the service signatures
+# do not change, `asyncio.to_thread` propagates the context; jobs and the
+# migration pass the source explicitly (no bind_origin).
 _ORIGIN: ContextVar[tuple[str, str | None]] = ContextVar(
     "history_origin", default=(DEFAULT_SOURCE, None)
 )
@@ -305,11 +322,13 @@ _ROLLBACK_TO: ContextVar[int | None] = ContextVar("history_rollback_to", default
 def bind_origin(
     source: str, session: str | None = None, *, rollback_to: int | None = None
 ) -> Iterator[None]:
-    """Обвязать участок работы источником версий: `source` + `session`.
+    """Wrap a work segment with the version origin: `source` + `session`.
 
-    `rollback_to` отмечает участок как откат: версии получают
-    `event='rollback'` и `restore_from` (FR-5.4). Вложенный `bind_origin`
-    перекрывает внешний, выход возвращает прежнее значение (contextvar).
+            `rollback_to` marks the segment as a rollback: the versions get
+            `event='rollback'` and `restore_from` (FR-5.4). A nested `bind_origin`
+            overrides the outer one; leaving restores the previous value (the
+            contextvar).
+
     """
     origin_token = _ORIGIN.set((source, session))
     rollback_token = _ROLLBACK_TO.set(rollback_to)
@@ -321,24 +340,24 @@ def bind_origin(
 
 
 def current_origin() -> tuple[str, str | None]:
-    """Текущий источник версии (`source`, `session`) участка работы."""
+    """The current version origin (`source`, `session`) of the work segment."""
     return _ORIGIN.get()
 
 
 def current_rollback_to() -> int | None:
-    """Номер версии-цели, если участок работы — откат (иначе `None`)."""
+    """The target version number when the segment is a rollback (else `None`)."""
     return _ROLLBACK_TO.get()
 
 
-# --- запись: только на соединении вызывающего (§13.5) ----------------------
+#--- writes: only on the caller's connection (§13.5) ----------------------
 
 def _dump(value: Any) -> str:
-    """JSON-строка записи (кириллица — как есть: читаемость для оператора)."""
+    """The record's JSON string (Cyrillic as is: the operator's readability)."""
     return json.dumps(value, ensure_ascii=False)
 
 
 def _origin(source: str | None, session_id: str | None) -> tuple[str, str | None]:
-    """Источник/сессия версии: явные аргументы сильнее текущего contextvar."""
+    """The version's source/session: explicit arguments beat the current contextvar."""
     current_source, current_session = current_origin()
     resolved_source = current_source if source is None else source
     resolved_session = current_session if session_id is None else session_id
@@ -346,7 +365,7 @@ def _origin(source: str | None, session_id: str | None) -> tuple[str, str | None
 
 
 def _head(conn: sqlite3.Connection, entity: str, entity_id: int) -> int:
-    """Головная версия записи (`0` — истории ещё нет)."""
+    """A record's head version (`0` - no history yet)."""
     row = conn.execute(
         "SELECT MAX(version) FROM record_versions WHERE entity = ? AND entity_id = ?",
         (entity, entity_id),
@@ -363,12 +382,14 @@ def record_initial(
     source: str | None = None,
     session: str | None = None,
 ) -> int:
-    """Первая версия записи: `version=1, event='baseline'`, содержимое целиком.
+    """A record's first version: `version=1, event='baseline'`, the content whole.
 
-    Baseline — единственная версия со `snapshot`; все дальнейшие — дельты
-    (FR-2.1/FR-2.2). Писать baseline для записи, у которой он уже есть, —
-    ошибка вызывающей стороны (история не переписывается).
-    При `HISTORY_ENABLED=false` версия не пишется — возврат `0` (§8).
+            The baseline is the only version with a `snapshot`; everything further is
+            deltas (FR-2.1/FR-2.2). Writing a baseline for a record that already has
+            one is the caller's error (the history is never rewritten).
+            With `HISTORY_ENABLED=false` no version is written - the return is `0`
+            (§8).
+
     """
     _check_entity(entity)
     if not _history_enabled():
@@ -392,13 +413,15 @@ def record_change(
     session: str | None = None,
     event: str = "content",
 ) -> int | None:
-    """Версия-правка: дельта от головной версии, `None` — если не изменилось.
+    """An edit version: a delta from the head version; `None` - nothing changed.
 
-    Пустая дельта версии не создаёт (не плодит шум). Под `current_rollback_to()`
-    версия помечается `event='rollback'` с `restore_from` (FR-5.4). Для навыка
-    `skills.version` поднимается до головной версии — в ТОЙ ЖЕ транзакции
-    (§13.7). После записи применяется политика хранения (`_prune`).
-    При `HISTORY_ENABLED=false` версия не пишется (§8).
+            An empty delta creates no version (no noise). Under
+            `current_rollback_to()` the version is marked `event='rollback'` with
+            `restore_from` (FR-5.4). For a skill, `skills.version` is raised to the
+            head version in the SAME transaction (§13.7). After the write the
+            retention policy applies (`_prune`). With `HISTORY_ENABLED=false` no
+            version is written (§8).
+
     """
     _check_entity(entity)
     if not _history_enabled():
@@ -408,8 +431,8 @@ def record_change(
     entity_id = int(entity_id)
     head = _head(conn, entity, entity_id)
     if head == 0:
-        # Запись появилась после baseline-миграции и истории ещё не имеет:
-        # пишем baseline (иначе дельта не от чего отсчитывать).
+        # The record appeared after the baseline migration and has no history yet:
+        # write a baseline (otherwise a delta has nothing to count from).
         return record_initial(
             conn, entity, entity_id, fields, source=source, session=session
         )
@@ -454,11 +477,13 @@ def record_event(
     source: str | None = None,
     session: str | None = None,
 ) -> int:
-    """Версия-событие без контента (`changed='[]'`, дельта NULL): FR-4.3/FR-6.
+    """An event version without content (`changed='[]'`, a NULL delta): FR-4.3/FR-6.
 
-    Мягкое удаление/восстановление — факт в истории, а не правка полей; для
-    навыка зеркало `skills.version` поднимается так же, как у правки.
-    При `HISTORY_ENABLED=false` версия не пишется — возврат `0` (§8).
+            A soft delete/restore is a history fact, not a field edit; for a skill the
+            `skills.version` mirror rises the same way as on an edit.
+            With `HISTORY_ENABLED=false` no version is written - the return is `0`
+            (§8).
+
     """
     _check_entity(entity)
     if not _history_enabled():
@@ -480,7 +505,7 @@ def record_event(
     return version
 
 
-# --- чтение и восстановление (FR-5.1/FR-5.2) --------------------------------
+#--- reads and restoration (FR-5.1/FR-5.2) --------------------------------
 
 def reconstruct(
     conn: sqlite3.Connection,
@@ -490,10 +515,11 @@ def reconstruct(
     *,
     inline_max: int,
 ) -> dict[str, Any] | None:
-    """Содержимое версии: от baseline применять дельты до `version` включительно.
+    """A version's content: apply the deltas from the baseline up to `version` inclusive.
 
-    `snapshot` в любой версии перекрывает накопленное состояние — это якорь
-    re-base после prune (§13.8). `None` — записи/версии нет.
+            A `snapshot` in any version overrides the accumulated state - that is the
+            re-base anchor after prune (§13.8). `None` - no record/version.
+
     """
     _check_entity(entity)
     entity_id = int(entity_id)
@@ -522,18 +548,19 @@ def read_versions(
     limit: int | None = None,
     offset: int = 0,
 ) -> dict[str, Any]:
-    """Список версий записи без тел: метаданные + «что изменилось» (FR-5.1).
+    """A record's version list without bodies: the metadata + "what changed" (FR-5.1).
 
-    Порядок — от новых к старым (как у операторского архива навыков);
-    страница — по контракту lsb-0013 (`total`/`has_more`/`next_offset`).
+            The order - newest first (like the operator's skill archive); the page -
+            per the lsb-0013 contract (`total`/`has_more`/`next_offset`).
+
     """
     _check_entity(entity)
     entity_id = int(entity_id)
     page_size = settings.default_list_limit if limit is None else int(limit)
     offset = int(offset)
     if not settings.history_enabled:
-        # §8: выключатель слоя истории — версий нет; чтение отдаёт пусто с
-        # подсказкой (EN), а не ошибку.
+        # §8: the history layer switch - no versions; a read serves empty with
+        # a hint (EN), not an error.
         return {
             "entity": entity,
             "id": entity_id,
@@ -577,15 +604,16 @@ def read_versions(
 def read_version(
     entity: str, entity_id: int, version: int, settings: Settings
 ) -> dict[str, Any]:
-    """Содержимое конкретной версии: метаданные + реконструированные поля.
+    """A specific version's content: the metadata + the reconstructed fields.
 
-    Нет такой версии/записи — мягкий ответ с `hint` (транспорт превращает его
-    в 404); исключения не бросаем: «версии нет» — валидный исход (§6.1).
+            No such version/record - a soft answer with a `hint` (the transport turns
+            it into a 404); no exceptions: "no version" is a valid outcome (§6.1).
+
     """
     _check_entity(entity)
     entity_id = int(entity_id)
     if not settings.history_enabled:
-        # §8: выключатель слоя истории — версии не читаются (пусто + hint).
+        # §8: the history layer switch - versions are not read (empty + a hint).
         return {
             "entity": entity,
             "id": entity_id,
@@ -626,11 +654,12 @@ def read_version(
 
 
 def history_stats(settings: Settings) -> dict[str, Any]:
-    """Размер истории: счётчики версий по сущностям + общий (FR-10.3).
+    """The history size: the per-entity version counters + the total (FR-10.3).
 
-    Форма стабильна: все известные сущности присутствуют, даже с нулём
-    (оператору видно, какая область истории ещё пуста). При
-    `HISTORY_ENABLED=false` счётчики нулевые + `HINT_HISTORY_OFF` (§8).
+            The shape is stable: every known entity is present, even with a zero (the
+            operator sees which history area is still empty). With
+            `HISTORY_ENABLED=false` the counters are zero + `HINT_HISTORY_OFF` (§8).
+
     """
     if not settings.history_enabled:
         return {
@@ -653,14 +682,16 @@ def history_stats(settings: Settings) -> dict[str, Any]:
 def entity_fields(
     entity: str, entity_id: int, settings: Settings
 ) -> tuple[dict[str, Any], str] | None:
-    """Проекция АКТУАЛЬНОЙ строки сущности + её состояние — точка отката (§7.3).
+    """The projection of a LIVE entity row + its state - the rollback point (§7.3).
 
-    Возврат `(fields, state)`: `fields` — проекция живой строки по §5.3 (та же,
-    что легла бы в версию), `state` — `"active"` или `"deleted"` (строка
-    мягко удалена); `None` — строки нет. Читает живые строки всех версионных
-    сущностей — сырой SQL по чужим таблицам наружу не отдаётся (так же читает
-    состояние f10-04). Глобальный шаблон навыков — ключ `skills_meta`
-    (`skill_template`, id 0): он «есть», пока в таблице есть ключ.
+            Returns `(fields, state)`: `fields` - the live row's §5.3 projection (the
+            same one that would go into a version); `state` - `"active"` or
+            `"deleted"` (the row is soft-deleted); `None` - no row. It reads the live
+            rows of all versioned entities - the raw SQL over foreign tables is never
+            exposed (f10-04 reads the state the same way). The skills global template -
+            the `skills_meta` key (`skill_template`, id 0): it "exists" while the key
+            is in the table.
+
     """
     _check_entity(entity)
     entity_id = int(entity_id)
@@ -709,7 +740,7 @@ def entity_fields(
             if row is None:
                 return None
             fields = assistant_log_projection(row)
-        else:  # ENTITY_SKILL_TEMPLATE — глобальный шаблон (id 0)
+        else:  # ENTITY_SKILL_TEMPLATE - the global template (id 0)
             row = conn.execute(
                 "SELECT value FROM skills_meta WHERE key = ?",
                 (INSTRUCTION_TEMPLATE_KEY,),
@@ -721,9 +752,9 @@ def entity_fields(
     return fields, state
 
 
-# Флаги областей версионных сущностей (№40, no40-02): сущность выключенной
-# области неотличима от несуществующей. `note` и глобальный шаблон навыков
-# (`skill_template`) — ядро, флага не имеют; `assistant_log` — область логов.
+# The area flags of the versioned entities (No40, no40-02): an entity of a
+# disabled area is indistinguishable from a nonexistent one. `note` and the
+# skills global template (`skill_template`) are core and have no flag; `assistant_log` - the logs area.
 _ENTITY_AREA_FLAGS: dict[str, str] = {
     ENTITY_SKILL: "area_skills_enabled",
     ENTITY_TERM: "area_terms_enabled",
@@ -735,21 +766,22 @@ _ENTITY_AREA_FLAGS: dict[str, str] = {
 def resolve_entity(
     entity: str, entity_id: int, settings: Settings
 ) -> dict[str, Any] | None:
-    """Состояние объекта ссылки лога и его головная версия (arch §11, §13.4).
+    """A log reference object's state and its head version (arch §11, §13.4).
 
-    Возврат `{"state": str, "current_version": int | None} | None`:
-    * `"active"` — живая строка есть, `deleted_at IS NULL`, область включена;
-    * `"deleted"` — строка есть, но мягко удалена (запись лога жива, FR-4.3);
-    * `"unavailable"` — строки нет **либо** область сущности выключена флагом
-      (что область существует, не раскрываем);
-    * `None` — неверсионная (`file`/`commit`/`tracker_task`/`config`/`contour`)
-      или неизвестная сущность (вызывающий ставит `"external"`), а также при
-      `HISTORY_ENABLED=false`: истории нет — состояние не достраивается.
+            Returns `{"state": str, "current_version": int | None} | None`:
+            * `"active"` - a live row exists, `deleted_at IS NULL`, the area is on;
+            * `"deleted"` - the row exists but is soft-deleted (the log record lives, FR-4.3);
+            * `"unavailable"` - no row OR the entity's area is switched off by the flag
+              (whether the area exists is not revealed);
+            * `None` - a non-versioned (`file`/`commit`/`tracker_task`/`config`/
+              `contour`) or unknown entity (the caller sets `"external"`), and also at
+              `HISTORY_ENABLED=false`: no history - the state is not built.
 
-    `current_version` — головная версия из `record_versions` (MAX(version))
-    для активной/удалённой строки, иначе `None`. Живые строки версионных
-    сущностей читает тот же субстрат, что `entity_fields`; сырой SQL по чужим
-    таблицам наружу не отдаётся (изоляция области логов, §4/§13.4).
+            `current_version` - the head version from `record_versions` (MAX(version))
+            for an active/deleted row, else `None`. The live rows of the versioned
+            entities are read by the same substrate as `entity_fields`; the raw SQL
+            over foreign tables is never exposed (the logs-area isolation, §4/§13.4).
+
     """
     if not settings.history_enabled:
         return None
@@ -767,18 +799,20 @@ def resolve_entity(
     return {"state": state, "current_version": current}
 
 
-# --- политика хранения: prune с re-base (§13.8) -----------------------------
+#--- the retention policy: prune with a re-base (§13.8) -----------------------------
 
 def _prune(
     conn: sqlite3.Connection, entity: str, entity_id: int, settings: Settings
 ) -> None:
-    """Почистить старейшие версии записи и перебазировать самую раннюю.
+    """Prune a record's oldest versions and re-base the earliest kept one.
 
-    Потолок `HISTORY_MAX_VERSIONS` и срок `HISTORY_RETENTION_DAYS` (0 — без
-    ограничения) сохраняют `version=1` (якорь цепочки) и новейшие версии.
-    После удаления самая ранняя сохраняемая версия переписывается в полный
-    `snapshot` (`delta=NULL`): без этого её дельта ссылалась бы на удалённую
-    версию и цепочка не восстановилась бы. Номера не переиспользуются.
+            The `HISTORY_MAX_VERSIONS` ceiling and the `HISTORY_RETENTION_DAYS` term
+            (0 - unlimited) keep `version=1` (the chain anchor) and the newest
+            versions. After the removal the earliest kept version is rewritten into a
+            full `snapshot` (`delta=NULL`): otherwise its delta would reference a
+            deleted version and the chain would not reconstruct. The numbers are
+            never reused.
+
     """
     max_versions = settings.history_max_versions
     retention_days = settings.history_retention_days
@@ -795,7 +829,7 @@ def _prune(
     base = versions[0]
     doomed: set[int] = set()
     if max_versions > 0 and len(versions) > max_versions:
-        keep_count = max_versions - 1  # version=1 остаётся всегда
+        keep_count = max_versions - 1  # version=1 always stays
         newest = versions[-keep_count:] if keep_count > 0 else []
         keep = {base, *newest}
         doomed |= {version for version in versions if version not in keep}
@@ -812,8 +846,8 @@ def _prune(
     if not doomed:
         return
     survivors = [version for version in versions if version not in doomed]
-    # Перебазируем самую раннюю сохраняемую версию, только если под ней версии
-    # удаляются (иначе её дельта ссылается на удалённую и цепочка рвётся).
+    # Re-base the earliest kept version only when versions below it are removed
+    # (otherwise its delta would reference a removed one and the chain breaks).
     anchor = survivors[0] if survivors[0] != base else next(iter(survivors[1:]), None)
     snapshot = None
     if anchor is not None and any(version < anchor for version in doomed):
