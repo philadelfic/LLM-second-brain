@@ -1,45 +1,49 @@
-"""LinksService — связи заметок (lsb-0010, релиз 3.1.0).
+"""LinksService - the note links (lsb-0010, 3.1.0).
 
-Уровень 0 — «ленивый граф»: кандидаты — KNN по вектору самой заметки
-(`SearchService.similar_notes`, глобально, без фильтра неймспейса), новых
-таблиц нет (FR-1, arch §3.1).
+    Level 0 - the "lazy graph": the candidates are the KNN over the note's own
+    vector (`SearchService.similar_notes`, global, no namespace filter); no new
+    tables (FR-1, arch §3.1).
 
-Уровень 1 — таблица `links`: хранимые связи трёх видов (`mention` >
-`entities` > `cosine`), рассчитанные механически и идемпотентно, без вызовов
-моделей (FR-2, arch §3.2–3.4): косинус — KNN по готовому вектору, значимые
-слова и упоминания по названию — FTS-пул + точная проверка правил в коде.
-Вид пары детерминирован и НЕ равен «последнему пересчёту» (решение гейта 2A):
-на пару — одна строка с высшим приоритетом вида, кандидат заметки объединяется
-с хранимым видом (понижения нет), а пару, которую сама заметка больше не
-находит, подтверждает вторая сторона своими правилами — иначе она остаётся,
-пока сосед ждёт пересчёта (`links_at IS NULL`). Поэтому состав пар и их вид не
-зависят от порядка обхода очереди.
-Маркер `notes.links_at` — очередь расчёта (backfill и инкремент одним
-правилом выборки в джобе `links`, постановка 8): `recompute_batch` разбирает
-партию очереди, `queue_stat` описывает её для `/health`, `purge_orphans` —
-гигиена idle-ветки. Джоба регистрируется в реестре каркаса (`build_links_job`);
-форма — «по интервалу + событие `links`» (решение гейта 1c): интервал
-`JOB_LINKS_INTERVAL_SEC` остаётся страховкой/backfill'ом, а заметка, получившая
-готовый вектор, будит петлю событием `worker._links_event` (notify_links_pending)
-— уровень 1 появляется сразу, не дожидаясь интервала. Перед ожиданием петля
-перепроверяет очередь после `clear()` (`queue_empty`, та же выборка, что
-`recompute_batch`): сигнал, пришедший в окне до `clear()`, работу не теряет, а
-заметка, ждущая вектор (`vector_status='pending'`), в выборку не входит — петля
-спит по back-off, без busy-loop (пул 6, lost wakeup).
+    Level 1 - the `links` table: stored links of three kinds
+    (`mention` > `entities` > `cosine`), computed mechanically and idempotently,
+    with no model calls (FR-2, arch §3.2-3.4): the cosine - KNN over the ready
+    vector; the significant words and the title mentions - an FTS pool + exact
+    rule checks in code. A pair's kind is deterministic and NOT "the last
+    recomputation" (the gate 2A decision): a pair carries one row with the highest
+    kind priority; a note's candidate merges with the stored kind (no
+    downgrades), and a pair the note itself no longer finds is confirmed by the
+    other side with its own rules - otherwise it stays while the neighbor awaits
+    its recomputation (`links_at IS NULL`). So the pair set and their kinds do not
+    depend on the queue walk order.
+    The `notes.links_at` marker - the computation queue (backfill and increment
+    under one selection rule in the `links` job, design 8): `recompute_batch`
+    drains a queue batch, `queue_stat` describes it for `/health`, and
+    `purge_orphans` is the idle-branch hygiene. The job registers in the framework
+    registry (`build_links_job`); the shape is "by interval + the `links` event"
+    (the gate 1c decision): the `JOB_LINKS_INTERVAL_SEC` interval stays the
+    safety net/backfill, and a note that got a ready vector wakes the loop with
+    the `worker._links_event` (notify_links_pending) - level 1 appears
+    immediately, not at the next interval. Before waiting, the loop rechecks the
+    queue after `clear()` (`queue_empty` - the same selection as
+    `recompute_batch`): a signal arriving in the window before `clear()` is not
+    lost, and a note awaiting its vector (`vector_status='pending'`) is not in the
+    selection - the loop sleeps by back-off, with no busy loop (pool 6, the lost
+    wakeup).
 
-Выдача связей (постановка 10, arch §3.5): `related` отдаёт уровень 1
-(таблица `links`) с приоритетом вида и фолбэком на уровень 0, только если после
-отсечений уровня 1 не осталось ни одной связи. Уровень 1 отдаётся лишь заметке
-с проставленным маркером: `links_at IS NULL` — связи ещё не рассчитаны (или
-сброшены правкой `text`/`title`), значит хранимые строки устарели — сразу
-фолбэк на уровень 0 (решение гейта 4A). Форму компактной выдачи для модели
-собирает транспорт (`mcp.py`), полный контракт — `rest.py`.
+    The link output (design 10, arch §3.5): `related` serves level 1 (the `links`
+    table) with the kind priority and falls back to level 0 only when the level-1
+    cutoffs left no links at all. Level 1 is served only for a note with the
+    marker set: `links_at IS NULL` - the links are not computed yet (or were
+    reset by a `text`/`title` edit), so the stored rows are stale - an immediate
+    level-0 fallback (the gate 4A decision). The transport (`mcp.py`) shapes the
+    compact model-facing output; the full contract is `rest.py`.
 
-Карта окружения (LSBN-F-16, релиз 3.4.0) — компрессор того же графа:
-`neighborhood` отдаёт по строке на соседа (`{id, title, namespace, kind}` +
-`direction` у вида `mention`), с уровнем-источником (`auto`/`1`/`0`),
-страницей (`limit`/`offset`) и `total` того же фильтра; источник отдаётся
-как `level_used`, уровень 0 достраивается `"kind": "cosine"`.
+    The environment map (LSBN-F-16, 3.4.0) - a compressor of the same graph:
+    `neighborhood` serves one row per neighbor (`{id, title, namespace, kind}` +
+    `direction` for the `mention` kind), with the source level
+    (`auto`/`1`/`0`), a page (`limit`/`offset`) and the `total` of the same
+    filter; the source is reported as `level_used`, and level 0 is completed with
+    `"kind": "cosine"`.
 """
 
 from __future__ import annotations
@@ -56,39 +60,39 @@ from app.services.search import SearchService
 from app.storage import vectors
 from app.storage.db import session, transaction
 
-if TYPE_CHECKING:  # только аннотации: рантайм-зависимости на воркер нет
+if TYPE_CHECKING:  # annotations only: no runtime dependency on the worker
     from app.services.worker import BackgroundWorker
 
-# Приоритет видов связи: на пару заметок хранится ОДНА строка — побеждает
-# вид с высшим приоритетом (arch §3.2: mention > entities > cosine).
+# The link-kind priority: a note pair stores ONE row - the kind with the
+# highest priority wins (arch §3.2: mention > entities > cosine).
 _KIND_PRIORITY = {"mention": 3, "entities": 2, "cosine": 1}
 
-# Значимые слова (arch §3.3): нижний регистр, токены [a-zа-яё0-9-]; в FTS-
-# запрос уходят до _FTS_MAX_WORDS самых длинных слов — ограничение стоимости
-# запроса (константа кода, не env).
+# Significant words (arch §3.3): lowercase, the tokens [a-zа-яё0-9-]; the FTS
+# query takes up to the _FTS_MAX_WORDS longest words - a query cost cap
+# (a code constant, not env).
 _TOKEN_RE = re.compile(r"[a-zа-яё0-9-]+")
 _FTS_MAX_WORDS = 8
 
-# Предел триграммы: FTS5/trigram не ищет строки короче 3 символов — название
-# короче не становится кандидатом вида `mention` (arch §3.3).
+# The trigram limit: FTS5/trigram does not search strings under 3 characters -
+# a shorter title never becomes an `mention` candidate (arch §3.3).
 _TRIGRAM_MIN_CHARS = 3
 
-# Имя джобы расчёта связей в журнале и реестре каркаса (FR-1.1); очередь для
-# `/health.queues` — то же имя.
+# The link computation job's name in the journal and the framework registry
+# `/health.queues` - the same name.
 LINKS_JOB = "links"
 
-# Единое правило выборки очереди расчёта связей (arch §3.4): backfill и
-# инкремент разбираются одной выборкой — активные заметки с готовым вектором и
-# пустым маркером `links_at`, свежие первыми. Заметки с `vector_status='pending'`
-# в выборку не попадают (ждут вектора в очереди `vector`), маркер не теряется.
+# The single selection rule of the link computation queue (arch §3.4): backfill
+# and increment drain one selection - active notes with a ready vector and
+# an empty `links_at` marker, freshest first. Notes with
+# `vector_status='pending'` are not selected (they wait in the `vector` queue); the marker is not lost.
 _PENDING_SELECT = (
     "SELECT id FROM notes "
     "WHERE deleted_at IS NULL AND vector_status = 'ok' AND links_at IS NULL "
     "ORDER BY updated_at DESC, id DESC LIMIT ?"
 )
 
-# Снимок очереди для `/health.queues` (FR-2.2): тот же предикат, что у выборки;
-# возраст старейшего — `now - MIN(updated_at)` (через MAX разниц — иначе).
+# The queue snapshot for `/health.queues` (FR-2.2): the same predicate as the selection;
+# the oldest's age - `now - MIN(updated_at)` (via MAX of the differences - otherwise).
 _QUEUE_STAT_SQL = (
     "SELECT COUNT(*) AS pending, "
     "MAX(CAST(strftime('%s','now') AS INTEGER) - "
@@ -97,15 +101,15 @@ _QUEUE_STAT_SQL = (
     "WHERE deleted_at IS NULL AND vector_status = 'ok' AND links_at IS NULL"
 )
 
-# Выдача связей уровня 1 (arch §3.5): связь читается в обе стороны (`note_a`
-# ИЛИ `note_b`), join к `notes`; отсечения — свой неймспейс (связи — признак
-# «между разделами»), soft-deleted и заметки удалённых (неизвестных) узлов.
-# Порядок: приоритет вида (mention → entities → cosine; на пару хранится одна
-# строка с высшим приоритетом) → `score` DESC → свежесть → id DESC; потолок —
-# параметр LIMIT. Запрос зовётся только когда у заметки проставлен маркер
-# `links_at` (решение гейта 4A): без маркера хранимые строки устарели.
-# LSBN-F-16: `l.kind AS kind` — тип связи в строке карты окружения (перечень
-# `related` поле игнорирует), OFFSET — страница карты (`map_offset`).
+# The level-1 link output (arch §3.5): a link is read both ways (`note_a`
+# OR `note_b`) with a join to `notes`; the cutoffs - the own namespace (links
+# mean "between sections"), soft-deleted, and notes of deleted (unknown) nodes.
+# The order: the kind priority (mention -> entities -> cosine; a pair stores one
+# row with the highest priority) -> `score` DESC -> freshness -> id DESC; the
+# ceiling - the LIMIT parameter. The query runs only when the note has the
+# `links_at` marker set (the gate 4A decision): without it the stored rows are stale.
+# LSBN-F-16: `l.kind AS kind` - the link kind in an environment-map row (the
+# `related` list ignores the field); OFFSET - the map page (`map_offset`).
 _RELATED_SQL = (
     "SELECT n.id AS id, n.title AS title, n.namespace AS namespace, "
     "l.kind AS kind, n.text AS text FROM links l JOIN notes n ON n.id = "
@@ -118,9 +122,9 @@ _RELATED_SQL = (
     "LIMIT ? OFFSET ?"
 )
 
-# Тот же фильтр, что у `_RELATED_SQL`, без порядка и страницы — `total`
-# карты окружения (LSBN-F-16): пагинация `map_limit`/`map_offset` считает
-# «сколько всего», а не только размер отданной страницы.
+# The same filter as `_RELATED_SQL`, without the order and the page - the
+# environment map's `total` (LSBN-F-16): the `map_limit`/`map_offset`
+# pagination counts "how many in total", not just the served page size.
 _RELATED_COUNT_SQL = (
     "SELECT COUNT(*) AS total FROM links l JOIN notes n ON n.id = "
     "CASE WHEN l.note_a = ? THEN l.note_b ELSE l.note_a END "
@@ -129,7 +133,7 @@ _RELATED_COUNT_SQL = (
     "AND n.namespace IN (SELECT path FROM namespaces)"
 )
 
-# Стоп-слова значимых слов (ru+en) — константа кода, не env (arch §3.3).
+# The significant words' stop-word list (ru+en) - a code constant, not env (arch §3.3).
 _STOP_WORDS = frozenset(
     {
         # ru
@@ -178,7 +182,7 @@ def _prefer(
     kind: str,
     score: float | None,
 ) -> None:
-    """Записать вид связи, если он приоритетнее найденного (одна строка на пару)."""
+    """Store the link kind if it outranks the found one (one row per pair)."""
     current = found.get(other_id)
     if current is None or _KIND_PRIORITY[kind] > _KIND_PRIORITY[current[0]]:
         found[other_id] = (kind, score)
@@ -188,13 +192,14 @@ def _merge_kind(
     stored: tuple[str, float | None] | None,
     candidate: tuple[str, float | None],
 ) -> tuple[str, float | None]:
-    """Вид пары по приоритету (arch §3.2, решение гейта 2A).
+    """A pair's kind by priority (arch §3.2, the gate 2A decision).
 
-    На пару — одна строка, и её вид НЕ понижается пересчётом: объединение
-    существующей и найденной связи — максимум по приоритету
-    (`mention` > `entities` > `cosine`). `score` берётся у победившего вида
-    (у `mention` — NULL); при равном приоритете (вид один и тот же) побеждает
-    свежий кандидат.
+            A pair carries one row, and its kind is NEVER downgraded by a
+            recomputation: the union of the existing and the found link is the maximum
+            by priority (`mention` > `entities` > `cosine`). The `score` comes from
+            the winning kind (NULL for `mention`); at equal priority (the same kind)
+            the fresh candidate wins.
+
     """
     if stored is None or _KIND_PRIORITY[candidate[0]] >= _KIND_PRIORITY[stored[0]]:
         return candidate
@@ -202,7 +207,7 @@ def _merge_kind(
 
 
 def _cosine(first: list[float], second: list[float]) -> float:
-    """Косинус двух векторов (0.0 — нулевая норма; нормы не предполагаются)."""
+    """The cosine of two vectors (0.0 - a zero norm; no normalization assumed)."""
     dot = sum(a * b for a, b in zip(first, second))
     norm_first = sum(a * a for a in first) ** 0.5
     norm_second = sum(b * b for b in second) ** 0.5
@@ -214,10 +219,12 @@ def _cosine(first: list[float], second: list[float]) -> float:
 def _pair_cosine(
     conn: sqlite3.Connection, note_a: int, note_b: int
 ) -> float | None:
-    """Косинус пары по готовым векторам (`app.storage.vectors`); None — вектора нет.
+    """A pair's cosine over the ready vectors (`app.storage.vectors`); None - no vector.
 
-    Слой `vectors` — единственный источник косинуса в проекте (та же метрика,
-    что у KNN); сам домен порогов живёт в конфиге (`LINK_COSINE_THRESHOLD`).
+            The `vectors` layer is the project's only cosine source (the same metric as
+            KNN); the thresholds themselves live in the config
+            (`LINK_COSINE_THRESHOLD`).
+
     """
     first = vectors.get_vector(conn, note_a)
     second = vectors.get_vector(conn, note_b)
@@ -227,34 +234,36 @@ def _pair_cosine(
 
 
 class LinksService:
-    """Связи заметок: уровень 0 («ленивый граф») и уровень 1 (таблица `links`)."""
+    """The note links: level 0 (the "lazy graph") and level 1 (the `links` table)."""
 
     def __init__(
         self, settings: Settings, search: SearchService | None = None
     ) -> None:
         self._settings = settings
-        # DI для тестов и общий экземпляр из build_services; иначе — свой.
+        # DI for tests and the shared instance from build_services; otherwise - its own.
         self._search = search if search is not None else SearchService(settings)
 
-    # --- выдача связей: уровень 1 с фолбэком на уровень 0 (arch §3.5) -------
+    #--- the link output: level 1 with a level-0 fallback (arch §3.5) -------
 
     def related(self, note_id: int, limit: int | None = None) -> list[dict[str, Any]]:
-        """Связанные заметки из ДРУГИХ неймспейсов; `[]` — нормальный ответ.
+        """Related notes from OTHER namespaces; `[]` is a normal answer.
 
-        Приоритет — уровень 1 (arch §3.5): хранимые связи `links` читаются в обе
-        стороны, отсечения при выдаче (свой неймспейс, soft-deleted, заметки
-        удалённых узлов), порядок «приоритет вида → `score` DESC → свежесть →
-        id DESC». Уровень 1 отдаётся лишь заметке с проставленным маркером
-        `links_at`: без маркера связи ещё не рассчитаны (или сброшены правкой
-        `text`/`title`, вектор pending) — хранимые строки устарели, поэтому
-        уровень 1 не отдаётся вовсе (решение гейта 4A). Фолбэк на уровень 0
-        (KNN по вектору заметки, §3.1) — когда после отсечений уровня 1 не
-        осталось ни одной связи или маркера нет. Потолок обеих веток —
-        `LINK_TOP`; `limit` может лишь понизить его (FR-1.1).
+                    The priority - level 1 (arch §3.5): the stored `links` rows are read
+                    both ways, with the output cutoffs (own namespace, soft-deleted, notes
+                    of deleted nodes) and the order "kind priority -> `score` DESC ->
+                    freshness -> id DESC". Level 1 is served only for a note with the
+                    `links_at` marker set: without the marker the links are not computed
+                    yet (or were reset by a `text`/`title` edit, the vector pending) - the
+                    stored rows are stale, so level 1 is not served at all (the gate 4A
+                    decision). The level-0 fallback (the note's vector KNN, §3.1) applies
+                    when the level-1 cutoffs left no links or the marker is absent. The
+                    ceiling of both branches - `LINK_TOP`; `limit` may only lower it
+                    (FR-1.1).
 
-        Нет активной заметки с таким id, пустая таблица связей или заметка без
-        готового вектора — пустой список без ошибки: отсутствие связей — не
-        ошибка и не повод для `hint` (FR-3.3).
+                    No active note with such an id, an empty links table, or a note without
+                    a ready vector - an empty list without an error: the absence of links
+                    is neither an error nor a reason for a `hint` (FR-3.3).
+
         """
         top = (
             self._settings.link_top
@@ -265,7 +274,7 @@ class LinksService:
             return []
         own = self._note_state(note_id)
         if own is None:
-            return []  # нет активной заметки (trash / неизвестный id)
+            return []  # no active note (trash / an unknown id)
         own_namespace, links_at = own
         if links_at is not None:
             stored = self._related_level1(note_id, own_namespace, top)
@@ -274,12 +283,13 @@ class LinksService:
         return self._related_level0(note_id, own_namespace, top)
 
     def _note_state(self, note_id: int) -> tuple[str, str | None] | None:
-        """Состояние активной заметки для выдачи: `(namespace, links_at)`.
+        """The active note's state for the output: `(namespace, links_at)`.
 
-        `None` — активной заметки нет (trash/неизвестный id). Маркер `links_at`
-        читается тем же запросом, что и неймспейс (лишнего чтения на выдачу
-        нет): `None` — связи заметки ещё не рассчитаны — уровень 1 не отдаётся
-        (решение гейта 4A, arch §3.4).
+                    `None` - no active note (trash/unknown id). The `links_at` marker is
+                    read by the same query as the namespace (no extra read per output):
+                    `None` - the note's links are not computed yet - level 1 is not served
+                    (the gate 4A decision, arch §3.4).
+
         """
         with session(self._settings) as conn:
             row = conn.execute(
@@ -294,16 +304,18 @@ class LinksService:
     def _related_level1(
         self, note_id: int, own_namespace: str, top: int
     ) -> list[dict[str, Any]]:
-        """Связи уровня 1 (таблица `links`, arch §3.5) — отсечения и порядок в SQL.
+        """The level-1 links (the `links` table, arch §3.5) - the cutoffs and the order in SQL.
 
-        Чтение в обе стороны (`note_a`/`note_b`) с join к `notes`; отсечения при
-        выдаче: свой неймспейс (связи — признак «между разделами»), soft-deleted,
-        заметки удалённых узлов. Порядок и потолок задаёт `_RELATED_SQL` (LIMIT):
-        на пару хранится одна строка с высшим приоритетом вида, поэтому `mention`
-        выше `entities`, а `entities` выше `cosine`. Зовётся только для заметки
-        с проставленным маркером `links_at` (см. `_note_state`): без него
-        хранимые строки устарели. Пусто — нормальный ответ (таблица пуста или всё
-        отсечено): решает вызывающий (фолбэк уровня 0).
+                    Reading both ways (`note_a`/`note_b`) with a join to `notes`; the
+                    output cutoffs: the own namespace (links mean "between sections"),
+                    soft-deleted, notes of deleted nodes. The order and the ceiling are
+                    `_RELATED_SQL` (LIMIT): a pair stores one row with the highest kind
+                    priority, so `mention` outranks `entities` and `entities` outranks
+                    `cosine`. Called only for a note with the `links_at` marker set (see
+                    `_note_state`): without it the stored rows are stale. Empty - a normal
+                    answer (the table is empty or everything was cut): the caller decides
+                    (the level-0 fallback).
+
         """
         with session(self._settings) as conn:
             rows = conn.execute(
@@ -323,8 +335,9 @@ class LinksService:
     def _related_level0(
         self, note_id: int, own_namespace: str, top: int
     ) -> list[dict[str, Any]]:
-        """Уровень 0 (arch §3.1): полный пул после отсечений, срезанный до
-        `top` (потолок `LINK_TOP`). Порядок — по убыванию близости."""
+        """Level 0 (arch §3.1): the full pool after the cutoffs, cut to `top`
+                    (the `LINK_TOP` ceiling). The order - by descending closeness.
+        """
         if top < 1:
             return []
         return self._related_level0_pool(note_id, own_namespace)[:top]
@@ -332,13 +345,14 @@ class LinksService:
     def _related_level0_pool(
         self, note_id: int, own_namespace: str
     ) -> list[dict[str, Any]]:
-        """Полный отсечённый пул уровня 0 (arch §3.1) — база `related` (режется
-        `LINK_TOP`) и карты окружения (режется страницей `map_offset`, F-16).
+        """The full cutoff level-0 pool (arch §3.1) - the base of `related` (cut to
+                    `LINK_TOP`) and of the environment map (cut by the `map_offset` page, F-16).
 
-        Пул `LINK_POOL` из KNN по полному вектору заметки (без фильтра
-        неймспейса) → отсечения (свой неймспейс, soft-deleted, заметки
-        удалённых узлов). Сортировка — по убыванию близости (порядок
-        `similar_notes`)."""
+                    The `LINK_POOL` pool from the KNN over the note's full vector (no
+                    namespace filter) -> the cutoffs (the own namespace, soft-deleted,
+                    notes of deleted nodes). The order - by descending closeness (the
+                    `similar_notes` order).
+        """
         candidates = self._search.similar_notes(
             note_id,
             self._settings.link_pool,
@@ -356,17 +370,17 @@ class LinksService:
                     [hit_id for hit_id, _ in candidates],
                 )
             }
-            # Узлы реестра: заметка удалённого (неизвестного) узла в связи не идёт.
+            # The registry nodes: a note of a deleted (unknown) node never enters a link.
             known = {row[0] for row in conn.execute("SELECT path FROM namespaces")}
         result: list[dict[str, Any]] = []
         for hit_id, _cosine in candidates:
             row = rows.get(hit_id)
             if row is None:
-                continue  # мягкое чтение: trash исчезает
+                continue  # a soft read: trash vanishes
             if row["namespace"] == own_namespace:
-                continue  # связи — признак «между разделами» (FR-1.4б)
+                continue  # links mean "between sections" (FR-1.4b)
             if row["namespace"] not in known:
-                continue  # заметка удалённого узла
+                continue  # a note of a deleted node
             result.append(
                 {
                     "id": row["id"],
@@ -377,32 +391,34 @@ class LinksService:
             )
         return result
 
-    # --- карта окружения заметки (LSBN-F-16, релиз 3.4.0) --------------------
+    #--- the note environment map (LSBN-F-16, 3.4.0) --------------------
 
     def neighborhood(
         self, note_id: int, level: str, limit: int, offset: int
     ) -> dict[str, Any]:
-        """Карта окружения заметки: по строке на соседа, с типом связи.
+        """The note's environment map: one row per neighbor, with the link kind.
 
-        Компрессор чтения (LSBN-F-16): вместо перечня `related` (объём каждой
-        заметки, «открой и посмотри») — построчная карта `{id, title,
-        namespace, kind}`, по которой агент раскрывает 1–2 заметки точечным
-        чтением. Источник задаёт `level`: `"auto"` — как `related` (уровень 1
-        при проставленном маркере `links_at`, иначе и фолбэком — уровень 0),
-        `"1"` — только хранимые связи (без фолбэка; тоже лишь при маркере —
-        решение гейта 4A: без него строки устарели), `"0"` — только KNN-пул.
-        Отданный источник виден в `level_used` (0|1); у уровня 0 вида у соседа
-        нет — достраивается `"kind": "cosine"` (это и есть способ уровня 0).
-        Для `"1"` источник — всегда 1: и когда связей нет, и когда маркер
-        `links_at` сброшен (устаревшие строки не отдаются, фолбэка нет).
-        У вида `mention` строка получает `direction` (`_mention_directions`):
-        «out» — название соседа в text этой заметки, «in» — наоборот;
-        симметричным видам (`entities`/`cosine`) направления нет. Страница —
-        `limit`/`offset`, `total` — размер ТОГО же фильтра без страницы
-        (пагинация карты). Диапазоны `limit`/`offset` и значение `level`
-        проверяет транспорт (мягкие отказы ручки). Отсутствие связей —
-        нормальный ответ: `neighbors: []` без ошибки. Нет активной заметки с
-        таким id — пустая карта, `level_used: 0`.
+                    The read compressor (LSBN-F-16): instead of the `related` list (each
+                    item's volume, "open and look") - a row map `{id, title, namespace,
+                    kind}` over which the agent expands 1-2 notes by point reads. `level`
+                    sets the source: `"auto"` - like `related` (level 1 with the
+                    `links_at` marker set, otherwise with the fallback - level 0); `"1"` -
+                    the stored links only (no fallback; also only with the marker - the
+                    gate 4A decision: without it the rows are stale); `"0"` - the KNN pool
+                    only. The served source is visible in `level_used` (0|1); at level 0 a
+                    neighbor has no kind - completed with `"kind": "cosine"` (that is
+                    level 0's very method). For `"1"` the source is always 1: both when
+                    there are no links and when the `links_at` marker is reset (stale rows
+                    are not served, no fallback). The `mention` kind rows get `direction`
+                    (`_mention_directions`): "out" - the neighbor's title occurs in this
+                    note's text, "in" - the reverse; the symmetric kinds
+                    (`entities`/`cosine`) have no direction. The page - `limit`/`offset`;
+                    `total` - the size of the SAME filter without the page (the map's
+                    pagination). The `limit`/`offset` ranges and the `level` value are
+                    checked by the transport (the handle's soft refusals). No links - a
+                    normal answer: `neighbors: []` without an error. No active note with
+                    such an id - an empty map, `level_used: 0`.
+
         """
         if level not in ("auto", "1", "0"):
             raise ValueError(f"unknown neighborhood level: {level!r}")
@@ -416,7 +432,7 @@ class LinksService:
         total = 0
         level_used = 0
         if level == "1":
-            level_used = 1  # источник — хранимые связи, даже если отдали пусто
+            level_used = 1  # the source - the stored links, even when they served empty
         if level in ("1", "auto") and links_at is not None:
             rows, total = self._neighborhood_level1(
                 note_id, own_namespace, limit, offset
@@ -443,13 +459,14 @@ class LinksService:
     def _neighborhood_level1(
         self, note_id: int, own_namespace: str, limit: int, offset: int
     ) -> tuple[list[dict[str, Any]], int]:
-        """Страница связей уровня 1 + `total` того же фильтра (LSBN-F-16).
+        """A level-1 links page + the `total` of the same filter (LSBN-F-16).
 
-        Тот же запрос, что у `_related_level1` (`_RELATED_SQL`: отсечения при
-        выдаче, порядок «приоритет вида → score → свежесть → id»), со страницей
-        LIMIT/OFFSET; отдельный `COUNT(*)` того же фильтра без страницы даёт
-        `total` для пагинации карты. Зовётся только для заметки с маркером
-        `links_at` (решение гейта 4A, см. `neighborhood`).
+                    The same query as `_related_level1` (`_RELATED_SQL`: the output
+                    cutoffs, the order "kind priority -> score -> freshness -> id"), with
+                    a LIMIT/OFFSET page; a separate `COUNT(*)` of the same filter without
+                    the page gives the map's `total`. Called only for a note with the
+                    `links_at` marker (the gate 4A decision, see `neighborhood`).
+
         """
         with session(self._settings) as conn:
             rows = conn.execute(
@@ -478,14 +495,16 @@ class LinksService:
     def _mention_directions(
         self, note_id: int, neighbors: list[dict[str, Any]]
     ) -> None:
-        """Достроить `direction` строкам вида `mention` (LSBN-F-16, на месте).
+        """Complete the `direction` of the `mention`-kind rows (LSBN-F-16, in place).
 
-        «out» — название соседа встречается в text этой заметки (эта заметка
-        упоминает соседа), «in» — наоборот (связь помнит другая сторона: её
-        пересчёт нашёл название этой заметки в text соседа). Дёшево: одна
-        выборка text заметки на вызов, дальше casefold-подстроки по названиям;
-        симметричным видам (`entities`/`cosine`) направления не достраивается —
-        сущность выдумывать нечестно (решение по вопросу №3).
+                    "out" - the neighbor's title occurs in this note's text (this note
+                    mentions the neighbor); "in" - the reverse (the other side remembers
+                    the link: its recomputation found this note's title in the neighbor's
+                    text). Cheap: one note-text select per call, then casefold substrings
+                    over the titles; the symmetric kinds (`entities`/`cosine`) get no
+                    direction - inventing an entity would be dishonest (the question-3
+                    decision).
+
         """
         mention = [row for row in neighbors if row["kind"] == "mention"]
         if not mention:
@@ -502,40 +521,44 @@ class LinksService:
                 "out" if title and title.casefold() in haystack else "in"
             )
 
-    # --- уровень 1: расчёт и гигиена ---------------------------------------
+    #--- level 1: the computation and hygiene ---------------------------------------
 
     def compute_for_note(self, note_id: int) -> int:
-        """Пересчитать связи уровня 1 одной заметки; вернуть число строк.
+        """Recompute one note's level-1 links; return the row count.
 
-        Одна транзакция (arch §3.3, идемпотентно): собрать кандидатов заметки →
-        свести их с УЖЕ хранимыми парами (вид по приоритету, потеря связи
-        недопустима, решение гейта 2A) → записать в каноническом порядке
-        `note_a < note_b` → отметить `notes.links_at`. Повторный расчёт не
-        плодит строк: пара — первичный ключ, запись полная (не доливка).
+                    One transaction (arch §3.3, idempotent): collect the note's candidates
+                    -> merge them with the ALREADY stored pairs (the kind by priority; a
+                    lost link is unacceptable - the gate 2A decision) -> write in the
+                    canonical order `note_a < note_b` -> stamp `notes.links_at`. A repeated
+                    computation spawns no rows: a pair is the primary key and the write is
+                    complete (not an increment).
 
-        Виды связи (`kind`, на пару — высший приоритет mention > entities >
-        cosine): `cosine` — KNN-пул выше `LINK_COSINE_THRESHOLD`, `score` —
-        косинус; `entities` — общие значимые слова `title`+`summary` (≥
-        `LINK_ENTITIES_MIN_COMMON`), `score` — доля общих слов; `mention` —
-        название другой заметки (≥ 3 символов) встречается в её `title`/`text`,
-        `score` — NULL. Ни одного вызова модели.
+                    The link kinds (`kind`; a pair carries the highest priority of
+                    mention > entities > cosine): `cosine` - the KNN pool above
+                    `LINK_COSINE_THRESHOLD`, `score` - the cosine; `entities` - the shared
+                    significant words of `title`+`summary` (>=
+                    `LINK_ENTITIES_MIN_COMMON`), `score` - the shared-word share;
+                    `mention` - another note's title (>= 3 characters) occurs in this
+                    note's `title`/`text`, `score` - NULL. Not a single model call.
 
-        Вид пары НЕ определяется «последним пересчётом» (решение гейта 2A):
-        кандидат заметки объединяется с хранимым видом по приоритету (понижения
-        нет), а пару, которую сама заметка больше не находит, подтверждает
-        вторая сторона своими правилами (`_neighbour_kind`); если сосед ещё ждёт
-        пересчёта (`links_at IS NULL`) или лежит в корзине — строка не теряется.
-        Пару, которую не подтверждает ни одна сторона и косинус которой можно
-        проверить, удаляем. Так состав пар и их вид не зависят от порядка
-        обхода очереди.
+                    A pair's kind is NOT "the last recomputation" (the gate 2A decision):
+                    the note's candidate merges with the stored kind by priority (no
+                    downgrades), and a pair the note itself no longer finds is confirmed by
+                    the other side with its own rules (`_neighbour_kind`); while the
+                    neighbor awaits its recomputation (`links_at IS NULL`) or lies in
+                    trash - the row is not lost. A pair confirmed by nobody whose cosine
+                    can be checked is deleted. This way the pair set and their kinds do
+                    not depend on the queue walk order.
 
-        Отсечения при расчёте: сама заметка и soft-deleted (arch §3.3);
-        отсечение «своего неймспейса» здесь НЕ делается — оно при выдаче
-        (arch §3.5), переезд заметки между узлами пересчёта не требует.
+                    The computation cutoffs: the note itself and the soft-deleted
+                    (arch §3.3); the "own namespace" cutoff is NOT done here - it belongs
+                    to the output (arch §3.5); moving a note between nodes needs no
+                    recomputation.
 
-        Нет активной заметки с таким id (в том числе trash) — 0 без изменений:
-        строки связей trash-заметки не трогаются (trash остаётся восстановимым,
-        arch §3.2). Возврат — число записанных строк связей.
+                    No active note with such an id (trash included) - 0 without changes:
+                    a trash note's link rows are untouched (trash stays restorable,
+                    arch §3.2). The return - the number of written link rows.
+
         """
         cosine_pool = self._search.similar_notes(
             note_id,
@@ -574,7 +597,7 @@ class LinksService:
     def _existing_pairs(
         self, conn: sqlite3.Connection, note_id: int
     ) -> dict[int, tuple[str, float | None]]:
-        """Хранимые пары заметки: `{сосед: (kind, score)}` (чтение в обе стороны)."""
+        """A note's stored pairs: `{neighbor: (kind, score)}` (read both ways)."""
         rows = conn.execute(
             "SELECT note_a, note_b, kind, score FROM links "
             "WHERE note_a = ? OR note_b = ?",
@@ -595,43 +618,46 @@ class LinksService:
         found: dict[int, tuple[str, float | None]],
         existing: dict[int, tuple[str, float | None]],
     ) -> dict[int, tuple[str, float | None]]:
-        """Итоговый состав пар заметки: вид по приоритету, потеря недопустима.
+        """The final pair set of a note: the kind by priority; a loss is unacceptable.
 
-        Вид пары — объединение по приоритету (arch §3.2, решение гейта 2A), а не
-        «последний пересчёт»: кандидат заметки сливается с хранимым видом
-        (`_merge_kind`), понижения нет. Пару, которую сама заметка больше не
-        находит, подтверждает вторая сторона своими правилами (`_neighbour_kind`);
-        если сосед ещё ждёт пересчёта (`links_at IS NULL`) или лежит в корзине —
-        строку не теряем (решит его пересчёт, arch §3.2/§3.4). Не подтверждённую
-        никем пару удаляем, но только если косинус пары вообще проверяем: без
-        готового вектора связь не теряется, а ждёт вектора (arch §3.3).
+                    A pair's kind is the union by priority (arch §3.2, the gate 2A
+                    decision), not "the last recomputation": the note's candidate merges
+                    with the stored kind (`_merge_kind`), no downgrades. A pair the note
+                    itself no longer finds is confirmed by the other side with its own
+                    rules (`_neighbour_kind`); while the neighbor awaits its recomputation
+                    (`links_at IS NULL`) or lies in trash - the row is kept (its own
+                    recomputation will decide, arch §3.2/§3.4). A pair confirmed by nobody
+                    is deleted, but only when the pair's cosine is checkable at all:
+                    without a ready vector the link is not lost - it waits for the vector
+                    (arch §3.3).
+
         """
         kept: dict[int, tuple[str, float | None]] = {}
-        # (а) пары, которые заметка находит сама — слияние с хранимым видом.
+        # (a) the pairs the note finds itself - merged with the stored kind.
         for other_id, candidate in found.items():
             kept[other_id] = _merge_kind(existing.get(other_id), candidate)
-        # (б) пары, которых сама больше не находит — голос второй стороны.
+        # (b) the pairs it no longer finds itself - the other side's vote.
         for other_id, stored in existing.items():
             if other_id in kept:
                 continue
             neighbour = self._neighbour_state(conn, other_id)
             if neighbour is None:
-                continue  # сосед физически удалён: осиротевшую строку снесёт гигиена
+                continue  # the neighbor is physically deleted: the hygiene will remove the orphaned row
             if neighbour["links_at"] is None or neighbour["deleted_at"] is not None:
-                kept[other_id] = stored  # сосед ждёт пересчёта / в корзине — не теряем
+                kept[other_id] = stored  # the neighbor awaits recomputation / is in trash - we keep it
                 continue
             voice = self._neighbour_kind(conn, source, neighbour)
             if voice is not None:
                 kept[other_id] = _merge_kind(stored, voice)
             elif _pair_cosine(conn, source["id"], other_id) is None:
-                kept[other_id] = stored  # вектор не готов — косинус не проверить
-            # иначе: ни одна сторона не подтверждает — пара удаляется
+                kept[other_id] = stored  # the vector is not ready - the cosine cannot be checked
+            # otherwise: neither side confirms - the pair is deleted
         return kept
 
     def _neighbour_state(
         self, conn: sqlite3.Connection, other_id: int
     ) -> sqlite3.Row | None:
-        """Состояние соседа для проверки его правил; None — физически удалён."""
+        """The neighbor's state for checking its rules; None - physically deleted."""
         return conn.execute(
             "SELECT id, title, text, summary, vector_status, links_at, deleted_at "
             "FROM notes WHERE id = ?",
@@ -644,13 +670,15 @@ class LinksService:
         source: sqlite3.Row,
         neighbour: sqlite3.Row,
     ) -> tuple[str, float | None] | None:
-        """Вид, которым сосед подтверждает пару с заметкой (те же три правила).
+        """The kind by which the neighbor confirms a pair with the note (the same three rules).
 
-        Проверяем правила соседа (решение гейта 2A): `mention` — название ЭТОЙ
-        заметки (≥ 3 символов) встречается в `title`/`text` соседа; `entities` —
-        ≥ `LINK_ENTITIES_MIN_COMMON` общих значимых слов `title`+`summary`
-        (правило симметрично); `cosine` — оба вектора готовы и косинус не ниже
-        `LINK_COSINE_THRESHOLD`. None — сосед пару не подтверждает.
+                    The neighbor's rules are checked (the gate 2A decision): `mention` -
+                    THIS note's title (>= 3 characters) occurs in the neighbor's
+                    `title`/`text`; `entities` - >= `LINK_ENTITIES_MIN_COMMON` shared
+                    significant words of `title`+`summary` (the rule is symmetric);
+                    `cosine` - both vectors are ready and the cosine is not below
+                    `LINK_COSINE_THRESHOLD`. None - the neighbor does not confirm the pair.
+
         """
         source_title = (source["title"] or "").strip()
         if len(source_title) >= _TRIGRAM_MIN_CHARS:
@@ -673,11 +701,13 @@ class LinksService:
         return None
 
     def purge_orphans(self) -> int:
-        """Снести строки связей физически удалённых заметок; вернуть число строк.
+        """Tear down the link rows of physically deleted notes; return the row count.
 
-        Гигиена (arch §3.4) — по образцу существующих чисток (`worker_jobs`):
-        дёшево и редко, в idle-ветке джобы `links` (постановка 8). Soft delete
-        заметку не убирает: строка живёт, пока заметка восстанавливаема (§3.2).
+                    Hygiene (arch §3.4) - modeled after the existing cleanups
+                    (`worker_jobs`): cheap and rare, in the idle branch of the `links` job
+                    (design 8). A soft delete does not remove a note: the row lives while
+                    the note is restorable (§3.2).
+
         """
         with session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
@@ -686,22 +716,25 @@ class LinksService:
             )
             return cursor.rowcount
 
-    # --- очередь расчёта: батч и снимок (lsb-0010-03, FR-2.2) ---------------
+    #--- the computation queue: the batch and the snapshot (lsb-0010-03, FR-2.2) ---------------
 
     def recompute_batch(self, limit: int) -> int:
-        """Разобрать партию заметок из очереди расчёта; вернуть число обработанных.
+        """Drain a batch of notes from the computation queue; return the processed count.
 
-        Единое правило выборки для backfill и инкремента (arch §3.4): активные
-        заметки с готовым вектором (`vector_status='ok'`) и пустым маркером
-        `links_at IS NULL`, свежие первыми (`updated_at DESC, id DESC`), не
-        больше `limit` за прогон. Каждая выбранная заметка пересчитывается
-        `compute_for_note` — маркер `links_at` проставляется в той же транзакции,
-        поэтому следующая выборка её уже не вернёт. Первый прогон естественно
-        разбирает накопленную базу батчами, дальше выборка пуста — джоба спит.
+                    The single selection rule for backfill and increment (arch §3.4):
+                    active notes with a ready vector (`vector_status='ok'`) and an empty
+                    marker `links_at IS NULL`, freshest first
+                    (`updated_at DESC, id DESC`), at most `limit` per run. Each selected
+                    note is recomputed by `compute_for_note` - the `links_at` marker is
+                    set in the same transaction, so the next selection will not return it.
+                    The first run naturally drains the accumulated base in batches; then
+                    the selection is empty - the job sleeps.
 
-        Заметки с `vector_status='pending'` в выборку не попадают: их видно в
-        очереди `vector`, задание не теряется — маркер ждёт готового вектора.
-        Моделей расчёт не зовёт (FR-2.2). Возврат — размер разобранного батча.
+                    Notes with `vector_status='pending'` are not in the selection: they
+                    are visible in the `vector` queue, no work is lost - the marker waits
+                    for a ready vector. The computation calls no models (FR-2.2). The
+                    return - the drained batch size.
+
         """
         with session(self._settings) as conn:
             rows = conn.execute(_PENDING_SELECT, (limit,)).fetchall()
@@ -710,32 +743,35 @@ class LinksService:
         return len(rows)
 
     def queue_empty(self) -> bool:
-        """Пуста ли очередь расчёта связей (дешёвая проверка, пул 6, lost wakeup).
+        """Whether the link computation queue is empty (a cheap check; pool 6, the lost wakeup).
 
-        Петля перед `clear()+wait` перепроверяет саму очередь, а не только
-        событие: notify мог прийти между пустым прогоном и `clear()` — без этой
-        проверки сигнал стирался бы и заметка ждала интервал/back-off (до 15 мин).
-        Выборка — ровно та, что выгребает `recompute_batch`: берётся у
-        `queue_stat` (та же `_QUEUE_STAT_SQL`, предикат не дублируется). Заметка,
-        ждущая вектор, очередь непустой не делает — петля уходит в сон, а не
-        крутится вхолостую. Только SQL, без моделей (FR-2.2).
+                    Before `clear()+wait` the loop rechecks the queue itself, not only the
+                    event: a notify could arrive between an empty run and `clear()` -
+                    without this check the signal would be erased and the note would wait
+                    for the interval/back-off (up to 15 min). The selection is exactly the
+                    one `recompute_batch` drains: it comes from `queue_stat` (the same
+                    `_QUEUE_STAT_SQL`; the predicate is not duplicated). A note awaiting
+                    its vector does not make the queue non-empty - the loop goes to sleep
+                    instead of spinning. SQL only, no models (FR-2.2).
+
         """
         return int(self.queue_stat()["pending"] or 0) == 0
 
     def queue_stat(self) -> dict[str, int | None]:
-        """Снимок очереди расчёта связей для `/health.queues` (FR-2.2).
+        """The link computation queue snapshot for `/health.queues` (FR-2.2).
 
-        `pending` — активные заметки с готовым вектором и пустым маркером
-        (`vector_status='ok' AND links_at IS NULL`) — ровно та выборка, что
-        выгребает `recompute_batch`; `oldest_pending_sec` — возраст старейшей
-        заметки (`now - MIN(updated_at)`), `null` — очередь пуста. Только SQL,
-        без обращений к моделям (общая форма — `jobs.queue_snapshot`).
+                    `pending` - active notes with a ready vector and an empty marker
+                    (`vector_status='ok' AND links_at IS NULL`) - exactly the selection
+                    `recompute_batch` drains; `oldest_pending_sec` - the oldest note's age
+                    (`now - MIN(updated_at)`), `null` - the queue is empty. SQL only, no
+                    model calls (the shared shape - `jobs.queue_snapshot`).
+
         """
         with session(self._settings) as conn:
             row = conn.execute(_QUEUE_STAT_SQL).fetchone()
         return queue_snapshot(row["pending"], row["oldest_pending_sec"])
 
-    # --- уровень 1: кандидаты и правила ------------------------------------
+    #--- level 1: the candidates and the rules ------------------------------------
 
     def _candidate_kinds(
         self,
@@ -743,14 +779,16 @@ class LinksService:
         source: sqlite3.Row,
         cosine_pool: list[tuple[int, float]],
     ) -> dict[int, tuple[str, float | None]]:
-        """Виды связи кандидатов заметки: `{id: (kind, score)}`.
+        """The link kinds of the note's candidates: `{id: (kind, score)}`.
 
-        Пул кандидатов — объединение пулов трёх правил (arch §3.3), база
-        целиком не перебирается: KNN-пул (`cosine`, он же пул `entities`) ∪
-        FTS по значимым словам `title`+`summary` (`entities`) ∪ FTS по словам
-        `title`+`text` (`mention`). В пуле — только активные заметки, кроме
-        самой; правила ниже проверяются точно, поэтому лишний кандидат пула
-        связью не становится.
+                    The candidate pool - the union of the three rules' pools
+                    (arch §3.3); the base is not enumerated whole: the KNN pool
+                    (`cosine`, also the `entities` pool) UNION the FTS over the
+                    significant words of `title`+`summary` (`entities`) UNION the FTS over
+                    the words of `title`+`text` (`mention`). Only active notes except the
+                    note itself enter the pool; the rules below are checked exactly, so an
+                    extra pool candidate never becomes a link.
+
         """
         source_words = self._significant_words(source["title"], source["summary"])
         candidate_ids = {other_id for other_id, _ in cosine_pool}
@@ -766,11 +804,11 @@ class LinksService:
         candidate_ids.update(self._mention_ids(conn, source))
         rows = self._candidate_rows(conn, candidate_ids)
         found: dict[int, tuple[str, float | None]] = {}
-        # cosine — косинус KNN-пула выше порога (сам порог — в similar_notes).
+        # cosine - the KNN pool's cosine above the threshold (the threshold itself - in similar_notes).
         for other_id, cosine in cosine_pool:
             if other_id in rows:
                 found[other_id] = ("cosine", cosine)
-        # entities — точное пересечение множеств значимых слов.
+        # entities - an exact intersection of the significant-word sets.
         for other_id, row in rows.items():
             words = self._significant_words(row["title"], row["summary"])
             common = source_words & words
@@ -778,8 +816,8 @@ class LinksService:
                 continue
             score = len(common) / max(len(source_words), len(words))
             _prefer(found, other_id, "entities", score)
-        # mention — название другой заметки встречается в title/text этой.
-        # Упоминания по `id` правилом не ловятся: совпадение id — не название.
+        # mention - another note's title occurs in this note's title/text.
+        # Mentions by `id` are not caught by the rule: an id match is not a title.
         haystack = f"{source['title'] or ''}\n{source['text']}".casefold()
         for other_id, row in rows.items():
             title = (row["title"] or "").strip()
@@ -792,14 +830,15 @@ class LinksService:
     def _mention_ids(
         self, conn: sqlite3.Connection, source: sqlite3.Row
     ) -> list[int]:
-        """Пул кандидатов вида `mention`: FTS по словам `title`+`text` (arch §3.3).
+        """The `mention` candidate pool: FTS over the words of `title`+`text` (arch §3.3).
 
-        Триграмма ищет подстроки от 3 символов, поэтому в запрос уходят только
-        такие слова (до `_FTS_MAX_WORDS` самых длинных) — это лишь пул; точную
-        проверку «название другой заметки встречается в title/text этой» делает
-        `_candidate_kinds`. Упоминания по `id` в тексте правилом не ловятся:
-        совпадение id — не название, а цифры короче 3 символов и вовсе вне
-        триграммы.
+                    The trigram searches substrings of 3+ characters, so only such words
+                    go into the query (up to the `_FTS_MAX_WORDS` longest) - this is only
+                    the pool; the exact check "another note's title occurs in this note's
+                    title/text" belongs to `_candidate_kinds`. Mentions by `id` in the text
+                    are not caught by the rule: an id match is not a title, and digits
+                    under 3 characters are outside the trigram anyway.
+
         """
         words = self._longest(
             _TOKEN_RE.findall(f"{source['title'] or ''} {source['text']}".lower()),
@@ -810,11 +849,13 @@ class LinksService:
     def _fts_ids(
         self, conn: sqlite3.Connection, note_id: int, expression: str | None
     ) -> list[int]:
-        """Пул заметок по FTS-выражению: `LINK_POOL`, без самой заметки и trash.
+        """The note pool by an FTS expression: `LINK_POOL`, without the note itself and trash.
 
-        `CROSS JOIN` (как в дедупе) форсирует FTS внешним циклом — планировщик
-        иначе сканирует `notes` и дёргает MATCH на каждую строку. Порядок —
-        BM25, tie-break по id: пул детерминирован при переполнении `LINK_POOL`.
+                    `CROSS JOIN` (as in dedup) forces FTS into an outer loop - otherwise
+                    the planner scans `notes` and runs MATCH on every row. The order -
+                    BM25 with an id tie-break: the pool is deterministic when `LINK_POOL`
+                    overflows.
+
         """
         if expression is None:
             return []
@@ -829,7 +870,7 @@ class LinksService:
     def _candidate_rows(
         self, conn: sqlite3.Connection, ids: set[int]
     ) -> dict[int, sqlite3.Row]:
-        """Метаданные кандидатов (мягкое чтение: trash и удалённые исчезают)."""
+        """The candidates' metadata (a soft read: trash and the deleted vanish)."""
         if not ids:
             return {}
         placeholders = ",".join("?" * len(ids))
@@ -841,8 +882,9 @@ class LinksService:
         return {row["id"]: row for row in rows}
 
     def _significant_words(self, title: str | None, summary: str | None) -> set[str]:
-        """Значимые слова `title`+`summary` (arch §3.3): нижний регистр, токены
-        ≥ `LINK_ENTITIES_MIN_WORD_CHARS`, без стоп-слов ru+en."""
+        """The significant words of `title`+`summary` (arch §3.3): lowercase, tokens
+                    >= `LINK_ENTITIES_MIN_WORD_CHARS`, without the ru+en stop words.
+        """
         tokens = _TOKEN_RE.findall(f"{title or ''} {summary or ''}".lower())
         return {
             token
@@ -853,20 +895,23 @@ class LinksService:
 
     @staticmethod
     def _longest(tokens: list[str], min_chars: int) -> list[str]:
-        """До `_FTS_MAX_WORDS` самых длинных уникальных токенов (длина ≥ min_chars).
+        """Up to the `_FTS_MAX_WORDS` longest unique tokens (length >= min_chars).
 
-        Ограничение стоимости FTS-запроса: в выражение уходит только вершина
-        по длине — детерминированно (`-len`, затем сам токен).
+                    The FTS query cost cap: only the length top enters the expression -
+                    deterministic (`-len`, then the token itself).
+
         """
         unique = {token for token in tokens if len(token) >= min_chars}
         return sorted(unique, key=lambda token: (-len(token), token))[:_FTS_MAX_WORDS]
 
     @staticmethod
     def _fts_expression(words: list[str]) -> str | None:
-        """FTS5-выражение: цитированные подстроки через OR (контракт trigram).
+        """An FTS5 expression: quoted substrings joined by OR (the trigram contract).
 
-        None — пустой список слов: trigram искать нечего. Кавычки заменяются
-        удвоенными (внутри фразы FTS5 это экранирование), как в поиске.
+                    None - an empty word list: the trigram has nothing to search. Quotes
+                    are replaced with doubles (inside an FTS5 phrase that is the escape),
+                    as in search.
+
         """
         unique = list(dict.fromkeys(words))
         if not unique:
@@ -876,43 +921,46 @@ class LinksService:
         )
 
 
-# --- сборщик джобы расчёта связей (каркас lsb-0014) --------------------------
+#--- the link computation job builder (the lsb-0014 framework) --------------------------
 
 
 def build_links_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
-    """Джоба `links`: фоновый расчёт связей уровня 1, очередь — маркер `links_at`.
+    """The `links` job: the background level-1 computation; the queue - the `links_at` marker.
 
-    Форма «по интервалу + событие `links`» (решение гейта 1c): прогон разбирает
-    партию `JOB_LINKS_BATCH` из очереди (свежие первыми), прогресс сбрасывает
-    back-off, пустая выборка — гигиена `purge_orphans` (idle_hook) и ожидание
-    (`JOB_LINKS_INTERVAL_SEC` с back-off), но сигнал `notify_links_pending`
-    (заметка получила готовый вектор — `process_pending`) будит петлю сразу.
-    Очередь при этом — состояние заметки (`links_at IS NULL`), поэтому событие
-    только ускоряет: задание не теряется. `JOB_LINKS_ENABLED=false` джобу не
-    запускает, но очередь остаётся видна в `/health` (реестр её сохраняет).
-    Расчёт связей моделей не зовёт (FR-2.2): косинус — готовый вектор,
-    entities/mention — FTS.
+            The shape "by interval + the `links` event" (the gate 1c decision): a run
+            drains a `JOB_LINKS_BATCH` batch from the queue (freshest first), progress
+            resets the back-off, an empty selection - the `purge_orphans` hygiene
+            (idle_hook) and the wait (`JOB_LINKS_INTERVAL_SEC` with back-off), but the
+            `notify_links_pending` signal (a note got its ready vector -
+            process_pending) wakes the loop immediately. The queue is the note's state
+            (`links_at IS NULL`), so the event only accelerates: no work is lost.
+            `JOB_LINKS_ENABLED=false` does not start the job, but the queue stays
+            visible in `/health` (the registry keeps it). The link computation calls
+            no models (FR-2.2): the cosine - a ready vector; entities/mention - FTS.
 
-    Перепроверка очереди (`queue_empty`) задана — форма закрывает узкую гонку
-    lost wakeup (пул 6): пустой прогон → `idle_hook` → `clear()` события, и
-    сигнал о свежем векторе, пришедший в этом окне, иначе был бы стёрт (`clear()`
-    его не помнит). `queue_empty` смотрит ровно выборку `recompute_batch`
-    (`vector_status='ok' AND links_at IS NULL`): непустая очередь — петля сразу
-    продолжает прогон (без сна), пустая — спит до события/таймаута. Заметка,
-    ждущая вектор (`vector_status='pending'`), в выборку не входит — очередь
-    пуста и петля уходит в сон по back-off: busy-loop'а нет, задание придёт
-    событием от векторизации (`notify_links_pending`).
+            The queue recheck (`queue_empty`) is set - the shape closes the narrow
+            lost-wakeup race (pool 6): an empty run -> `idle_hook` -> the event's
+            `clear()`, and a signal about a fresh vector arriving in that window would
+            otherwise be erased (`clear()` does not remember it). `queue_empty` looks
+            at exactly the `recompute_batch` selection
+            (`vector_status='ok' AND links_at IS NULL`): a non-empty queue - the loop
+            continues the run immediately (no sleep); an empty one - it sleeps until
+            an event/timeout. A note awaiting its vector
+            (`vector_status='pending'`) is not in the selection - the queue is empty
+            and the loop goes to sleep by back-off: no busy loop; the work arrives
+            with the vectorization event (`notify_links_pending`).
 
-    Сервис собирается над общим эмбеддером воркера (отдельный клиент не
-    заводим): расчёт связей кодирование не зовёт, но `LinksService` требует
-    `SearchService` для KNN-пула `cosine`.
+            The service is built over the worker's shared embedder (no separate
+            client): the link computation calls no encoding, but `LinksService`
+            requires `SearchService` for the `cosine` KNN pool.
+
     """
     links = LinksService(settings, search=SearchService(settings, worker._embedding))
     batch = settings.job_links_batch
 
     async def process() -> int:
-        # Синхронный SQL/расчёт уводим в поток — event loop не занимаем
-        # (как петли воркера: process_* синхронные).
+        # The synchronous SQL/computation goes to a thread - the event loop is not
+        # occupied (like the worker loops: process_* are synchronous).
         return await asyncio.to_thread(links.recompute_batch, batch)
 
     return JobSpec(
@@ -929,6 +977,6 @@ def build_links_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
     )
 
 
-# Регистрация джобы в реестре каркаса (FR-1.1): своя джоба — в своём модуле
-# (одна строка в `JOB_BUILDERS`); импорт односторонний — links → jobs, круга нет.
+# The job registration in the framework registry (FR-1.1): a job lives in its
+# own module (one line in `JOB_BUILDERS`); the import is one-way - links -> jobs, no cycle.
 jobs.JOB_BUILDERS += (build_links_job,)
