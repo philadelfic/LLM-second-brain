@@ -1,43 +1,45 @@
-"""SearchService — гибридный поиск (Фаза 3, ARCHITECTURE §4.2; Фаза 7 — вектора
-строятся по чанкам).
+"""SearchService — hybrid search (Phase 3, ARCHITECTURE §4.2; Phase 7 — vectors
+    are built per chunk).
 
-Два источника кандидатов, слияние Reciprocal Rank Fusion, единый top_k:
-- вектор (Фаза 7): KNN по чанкам (топ-50) → агрегация до заметок: лучший чанк
-  заметки задаёт близость (cosine = лучшего чанка, сравним с SCORE_THRESHOLD);
-  заметки без ГОТОВЫХ чанков (унаследованные до Фазы 7 и pending у воркера) —
-  fallback на вектор полного текста (notes_vec) как в Фазе 3. Полный текст и
-  summary на качество поиска не влияли раньше — не влияют и сейчас: векторам
-  всё равно, а summary только в выдаче;
-- полнотекст: FTS5/BM25 топ-50 (trigram: русские словоформы, точные токены) —
-  ловит идентификаторы/даты; порогу не подлежит (REQUIREMENTS FR-1). Слова
-  запроса — OR подстрок (BUG-001: AND терял заметку без одного из слов).
-- RRF устойчив к несопоставимым шкалам (косинус vs BM25): score(d) =
-  Σ_sources 1/(RRF_K + rank_source), rank с 1. Векторная сторона после
-  агрегации — один список, ранжирование как в Фазе 3.
+    Two candidate sources, a Reciprocal Rank Fusion merge, one top_k:
+    - vector (Phase 7): KNN over chunks (top-50) → aggregation to notes: a note's
+      best chunk sets the closeness (cosine = the best chunk's, comparable with
+      SCORE_THRESHOLD); notes without READY chunks (inherited before Phase 7 and
+      pending at the worker) — a fallback to the full-text vector (notes_vec) as in
+      Phase 3. The full text and summary never affected search quality before —
+      they do not now: vectors do not care, and summary is output-only;
+    - full text: FTS5/BM25 top-50 (trigram: Russian word forms, exact tokens) —
+      catches identifiers/dates; not subject to the threshold (REQUIREMENTS FR-1).
+      Query words — OR of substrings (BUG-001: AND lost a note missing one word).
+    - RRF is robust to incomparable scales (cosine vs BM25): score(d) =
+      Σ_sources 1/(RRF_K + rank_source), rank from 1. The vector side after
+      aggregation is one list, ranked as in Phase 3.
 
-Деградация (NFR-3): отказ кодирования запроса → поиск FTS-only + `warning`
-(обучающий текст §5.3); НЕ жёсткая ошибка — поиск не ломается от внешней
-зависимости. Кандидаты с лучшим векторным hit ниже порога вылетают до слияния.
+    Degradation (NFR-3): a query-encoding failure → FTS-only search + `warning`
+    (the §5.3 teaching text); NOT a hard error — search does not break on an
+    external dependency. Candidates whose best vector hit is below the threshold
+    fly out before the merge.
 
-Выдача FR-1: summary/snippet, без полного текста (memory_get адресно).
-Фаза 11 (решение №9): +title — реальное значение notes.title (None остаётся
-только у миграционных заметок без названия).
-lsb-0010-04 (FR-4.1/FR-4.2): +chars — объём ПОЛНОГО текста заметки в
-символах (не snippet/summary); значение для одной заметки совпадает с
-memory_list/memory_get без чанков.
-Snippet — из ЛУЧШЕГО чанка (первые SNIPPET_CHARS символов чанка): модель видит
-релевантный фрагмент длинной заметки, а не её начало; у fallback-кандидатов —
-из полного текста, как в Фазе 3. Ties (равный rrf_score) — по updated_at DESC,
-id DESC: свежее полезнее (в духе FR-2), детерминированно без случайности.
-Выдача — полный контракт сервис-слоя (REST отдаёт как есть);
-MCP-слой срезает служебные поля — см. Фаза 9.
+    The FR-1 output: summary/snippet, without the full text (memory_get addresses
+    it). Phase 11 (decision #9): +title — the real notes.title value (None remains
+    only for titleless migration notes).
+    lsb-0010-04 (FR-4.1/FR-4.2): +chars — the note's FULL text volume in characters
+    (not snippet/summary); the value for one note matches memory_list/memory_get
+    without chunks.
+    The snippet — from the BEST chunk (the chunk's first SNIPPET_CHARS characters):
+    the model sees a relevant fragment of a long note, not its beginning; for
+    fallback candidates — from the full text, as in Phase 3. Ties (an equal
+    rrf_score) — by updated_at DESC, id DESC: fresher is more useful (in the spirit
+    of FR-2), deterministic without randomness.
+    The output is the full service-layer contract (REST returns it as is);
+    the MCP layer trims service fields — see Phase 9.
 
-lsb-0001-01 (Шаг 3): FTS-сторона гибрида — с весами bm25: совпадение
-подстроки в title ранжируется выше той же подстроки в text (FR-1.2;
-вес TITLE_FTS_WEIGHT — решение гейта R3). Плюс отдельный title-режим
-SearchService.search_title: строгий поиск по названиям (решение D3 —
-вхождение в text не матчится), компактная выдача и ступеньки score
-(решение D2 — FR-2.1/FR-2.2).
+    lsb-0001-01 (Step 3): the hybrid's FTS side — with bm25 weights: a substring
+    match in the title ranks above the same match in the text (FR-1.2;
+    the TITLE_FTS_WEIGHT weight — the R3 gate decision). Plus the separate
+    title mode SearchService.search_title: a strict search over titles
+    (the D3 decision — an occurrence in the text does not match), a compact output
+    and score steps (the D2 decision — FR-2.1/FR-2.2).
 """
 
 from __future__ import annotations
@@ -61,19 +63,19 @@ from app.services.ranking import (
 from app.storage import chunks, vectors
 from app.storage.db import session
 
-# Верхняя граница контракта (REQUIREMENTS FR-1: top_k 1..20); env задаёт
-# только умолчание — DEFAULT_TOP_K, поэтому MAX_TOP_K не настраивается.
+# The contract's upper bound (REQUIREMENTS FR-1: top_k 1..20); env sets
+# only the default — DEFAULT_TOP_K, so MAX_TOP_K is not configurable.
 MAX_TOP_K = 20
 
-# Кандидатов из каждого источника до слияния (ARCH §4.2, REQUIREMENTS §5.4).
+# Candidates from each source before the merge (ARCH §4.2, REQUIREMENTS §5.4).
 CANDIDATE_LIMIT = 50
 
-# Разбивка составных токенов запроса (BUG-001): «open-webui» → «open» +
-# «webui» — FTS ловит тексты, где написание отличается («Open WebUI»).
-# FTS-выражение запроса — общий примитив app.services.ranking.match_expression
-# (с релиза 3.0.0 его же использует поиск внутри области).
+# Splitting the query's compound tokens (BUG-001): "open-webui" → "open" +
+# "webui" — FTS catches texts where the spelling differs ("Open WebUI").
+# The query's FTS expression — the shared app.services.ranking.match_expression
+# primitive (since release 3.0.0 the in-area search uses it too).
 
-# Отказ кодирования запроса: поиск деградирует к FTS-only + warning (§5.3).
+# A query-encoding failure: the search degrades to FTS-only + a warning (§5.3).
 WARNING_FTS_ONLY = (
     "search without semantics: query encoding failed (vectorization "
     "unavailable), output is full-text only — paraphrases may be missed"
@@ -89,21 +91,21 @@ HINT_SHORT_QUERY = (
     "add meaningful words"
 )
 
-# Вес bm25 title-колонки notes_fts (lsb-0001-01, FR-1.2): совпадение
-# подстроки в названии даёт более НИЗКУЮ badness → выше в ORDER BY badness,
-# чем то же совпадение в тексте (колонки notes_fts: title, text; вес text —
-# 1.0). Значение подбирается тестами (решение гейта R3); env-переменной нет.
+# The bm25 weight of the notes_fts title column (lsb-0001-01, FR-1.2): a match
+# of a substring in the title yields a LOWER badness → higher in ORDER BY badness,
+# than the same match in the text (the notes_fts columns: title, text; the text weight —
+# 1.0). The value is tuned by tests (the R3 gate decision); there is no env variable.
 TITLE_FTS_WEIGHT = 2.0
 
-# Пустой title-режим (FR-2.2): компактная выдача, обычный semantic-поиск
-# ищет шире — hint обучает модель выбрать нужный инструмент.
+# An empty title mode (FR-2.2): a compact output; the regular semantic search
+# searches wider — the hint teaches the model to pick the right tool.
 HINT_NO_RESULTS_TITLE = (
     "nothing found by title; check the title substring or browse "
     "via memory_list; regular semantic search also searches by text"
 )
 
-# Пустой отдельный поиск ПОМЕТОК (no24-02, arch §13.6): пометки ищутся только
-# здесь — смысловой search их не видит; hint обучает модель различать ручки.
+# An empty separate COMMENT search (no24-02, arch §13.6): comments are searched only
+# here — the semantic search does not see them; the hint teaches the model to tell the handles apart.
 HINT_NO_COMMENTS = (
     "no notes with such a comment; comments are searched separately — "
     "regular search looks at note text only"
@@ -111,19 +113,19 @@ HINT_NO_COMMENTS = (
 
 
 class SearchValidationError(ValueError):
-    """Нарушение доменных ограничений запроса (длина, top_k)."""
+    """A violation of the query's domain constraints (length, top_k)."""
 
 
 class SearchService:
-    """Гибрид vec0+chunk-vec0 (агрегация) + FTS5 → RRF; эмбеддер — DI."""
+    """The hybrid of vec0 + chunk-vec0 (aggregation) + FTS5 → RRF; the embedder is DI."""
 
     def __init__(
         self, settings: Settings, embedding: Embedder | None = None
     ) -> None:
         self._settings = settings
-        # DI для тестов: детерминированный HashEmbedder вместо сети.
+        # DI for tests: a deterministic HashEmbedder instead of the network.
         self._embedding: Embedder = embedding if embedding is not None else EmbeddingService(settings)
-        # Фаза 10: реестр неймспейсов (валидация узла, поддеревья).
+        # Phase 10: the namespace registry (node validation, subtrees).
         self._namespaces = NamespaceService(settings)
 
     def search(
@@ -134,18 +136,18 @@ class SearchService:
         namespace_exact: bool = False,
         updated_after: str | None = None,
     ) -> dict[str, Any]:
-        """Гибридный поиск (ARCH §4.2 + Фаза 7); выдача FR-1 без полного текста.
+        """Hybrid search (ARCH §4.2 + Phase 7); the FR-1 output without the full text.
 
-        Фаза 10: `namespace` — узел иерархии; фильтр по его поддереву
-        (узел + зарегистрированные листья; `namespace_exact` — только сам
-        узел). None — глобальный поиск (RRF как раньше). Незарегистрированный
-        узел — NamespaceError (транспорт Шага 3 обернёт в fail + hint).
-        Каждый результат несёт свой `namespace` — модель видит, где нашлось
-        (слой ориентирования № 3).
-        no29-01: `updated_after` — фильтр свежести (ISO-8601 UTC, граница
-        включающая): в выдачу входят только заметки с `updated_at >= значения`;
-        применяется к обеим сторонам гибрида, сортировка не меняется.
-        Невалидное значение — FreshnessValidationError (мягкий отказ транспорта).
+                    Phase 10: `namespace` — a hierarchy node; a filter over its subtree
+                    (the node + registered leaves; `namespace_exact` — the node itself
+                    only). None — a global search (RRF as before). An unregistered node —
+                    NamespaceError (the Step-3 transport wraps it into fail + hint).
+                    Every result carries its `namespace` — the model sees where it was
+                    found (orientation layer #3).
+                    no29-01: `updated_after` — a freshness filter (ISO-8601 UTC, an
+                    inclusive bound): only notes with `updated_at >= value` enter the
+                    output; it applies to both hybrid sides, the sort does not change.
+                    An invalid value — FreshnessValidationError (a soft transport failure).
         """
         query = self._validate_query(query)
         top_k = self._default_top_k() if top_k is None else top_k
@@ -161,12 +163,12 @@ class SearchService:
             if updated_after is not None
             else None
         )
-        # LSBN-F-22 (M3): union-чтение — во время миграции кандидаты берутся
-        # и из ПРЕЖНЕЙ базы ('ожидает'/'карантин': их единственная копия там;
-        # 'нарезана'/'expired' — исключены, исходник заменён частями).
-        # Ленивый импорт: services.migration тянет summary → notes (цикл),
-        # прецедент — notes.py ↔ ttl.py. Контекст None — путей прежних,
-        # нулевой оверхед: ни второго соединения, ни лишнего SQL.
+        # LSBN-F-22 (M3): the union read — during a migration candidates are taken
+        # from the PREVIOUS database too ('waiting'/'quarantine': their only copy lives there;
+        # 'split'/'expired' — excluded, the source was replaced by parts).
+        # A lazy import: services.migration pulls summary → notes (a cycle),
+        # the precedent — notes.py ↔ ttl.py. A None context — the old paths,
+        # zero overhead: no second connection, no extra SQL.
         from app.services.migration import legacy_visible_ids, migration_context
 
         context = migration_context()
@@ -210,12 +212,12 @@ class SearchService:
                             if row["id"] in visible
                         ]
 
-            # --- слияние RRF: score(d) = Σ 1/(RRF_K + rank) -----------------
-            # Векторный источник — уже агрегированный список заметок
-            # (лучший чанк задал cosine и snippet), Фаза 3 — полный вектор.
-            # Слияние — общий примитив app.services.ranking.fuse_rrf (тот же
-            # счёт у поиска внутри области, субстрат 3.0.0); во время
-            # миграции ранжированные списки обеих баз сливаются им же.
+            # --- the RRF merge: score(d) = Σ 1/(RRF_K + rank) ----------------
+            # The vector source — an already-aggregated list of notes
+            # (the best chunk set the cosine and the snippet); Phase 3 — the full vector.
+            # The merge — the shared app.services.ranking.fuse_rrf primitive (the same
+            # math as the in-area search, substrate 3.0.0); during a
+            # migration the ranked lists of both databases are merged by it too.
             cosine_by_id: dict[int, float] = {}
             snippet_source: dict[int, str | None] = {}
             for note_id, cosine, chunk_text in vector_hits:
@@ -231,23 +233,23 @@ class SearchService:
 
             rows = self._fetch_rows(conn, list(scores))
             if legacy_conn is not None:
-                # Заметки 'ожидает' есть только в прежней базе: метаданные
-                # добираются из неё (активная копия для общих id — выше).
+                # 'Waiting' notes exist only in the previous database: the metadata
+                # are fetched from it (the active copy for shared ids — above).
                 missing = [note_id for note_id in scores if note_id not in rows]
                 if missing:
                     rows.update(self._fetch_rows(legacy_conn, missing))
-            # --- бусты ранжирования (релиз 3.4.0, LSBN-F-14) -----------------
-            # Только ПОРЯДОК выдачи: ключ сортировки в _merge — бустовый
-            # score, поле rrf_score элемента остаётся сырым RRF (контракт
-            # §4.2.6 / шапки F-13 не меняются). Выключатель —
-            # RANKING_BOOSTS_ENABLED; при false доп. SQL по links не ходит.
-            # LINKED_BOOST — один заход по списку кандидатов ДО сортировки
-            # и топ-реза. Title-режим и comment_search бустов не касаются.
+            # --- ranking boosts (release 3.4.0, LSBN-F-14) -------------------
+            # Only the OUTPUT ORDER: the sort key in _merge is the boosted
+            # score; the item's rrf_score field stays the raw RRF (the contract
+            # §4.2.6 / the F-13 headers do not change). The switch —
+            # RANKING_BOOSTS_ENABLED; when false, no extra SQL over links runs.
+            # LINKED_BOOST — one pass over the candidate list BEFORE the sort
+            # and the top cut. The title mode and comment_search are not touched by boosts.
             order: dict[int, float] = scores
             if scores and self._settings.ranking_boosts_enabled:
                 linked_ids = self._linked_ids(conn, list(rows))
                 if legacy_conn is not None:
-                    # Связи 'ожидает'-заметок остались в прежней базе.
+                    # The 'waiting' notes' links stayed in the previous database.
                     linked_ids |= self._linked_ids(legacy_conn, list(rows))
                 order = apply_boosts(
                     scores,
@@ -284,37 +286,39 @@ class SearchService:
         namespace_exact: bool = False,
         updated_after: str | None = None,
     ) -> dict[str, Any]:
-        """Title-поиск memory_search (lsb-0001-01): FR-2.1/FR-2.2 + решения
-        D2/D3 владельца.
+        """Title search of memory_search (lsb-0001-01): FR-2.1/FR-2.2 + the owner's
+                    D2/D3 decisions.
 
-        D3 — строго по названиям: подстрока совпадает ТОЛЬКО с title;
-        вхождение в текст здесь не матчится (такой текст находит обычный
-        гибридный search). Сопоставление — на стороне Python
-        (`needle in title.lower()`), а не LIKE/FTS: lower() в SQLite
-        регистронезависим только для ASCII, кириллица не покрывается (и
-        trigram-FTS её не ищет). Масштаб — тот же аргумент, что у
-        brute-force vec0 (NFR-5): до 50 000 заметок — одна вычитка и
-        линейный скан только заголовков.
+                    D3 — strictly over titles: a substring matches ONLY the title;
+                    an occurrence in the text does not match here (the regular hybrid
+                    search finds such text). The matching — on the Python side
+                    (`needle in title.lower()`), not LIKE/FTS: SQLite's lower() is
+                    case-insensitive only for ASCII, Cyrillic is not covered (and
+                    trigram FTS does not search it). The scale — the same argument as for
+                    brute-force vec0 (NFR-5): up to 50,000 notes — one scan and a linear
+                    pass over the titles only.
 
-        Ранжирование (D2, ступеньки): 1.0 — запрос совпал с названием
-        ЦЕЛИКОМ (регистронезависимо), 0.5 — подстрока. Порядок: точные
-        выше; среди частичных — вхождение ближе к началу названия выше;
-        tie — updated_at DESC, затем id DESC (в духе _merge). Выдача
-        компактная (FR-2.2): id, title, namespace, summary, score — без
-        snippet/rrf_score/полного текста (summary — через summary_of:
-        pending → fallback-усечение §5.5, готовое — как есть).
+                    Ranking (D2, steps): 1.0 — the query matched the title WHOLLY
+                    (case-insensitively), 0.5 — a substring. Order: exact ones higher;
+                    among partial ones — an occurrence closer to the title's start is
+                    higher; a tie — updated_at DESC, then id DESC (in the spirit of
+                    _merge). The output is compact (FR-2.2): id, title, namespace,
+                    summary, score — without snippet/rrf_score/the full text (the summary —
+                    via summary_of: pending → the §5.5 fallback truncation, ready — as
+                    is).
 
-        Валидации как у semantic: длина запроса 1..max_query_chars, top_k
-        1..MAX_TOP_K (умолчание — default_top_k). Trigram-правило «слова
-        ≥3 симв.» здесь НЕ применяется — это не FTS. `namespace` — узел
-        иерархии: поддерево (`namespace_exact` — только сам узел), как в
-        search(); незарегистрированный узел — NamespaceError, пробрасывается
-        как есть (MCP-транспорт подключит на шаге 03 релиза 2.2 и обернёт
-        в fail + hint, как у search). warning в этом режиме не бывает —
-        эмбеддинг не используется. no29-01: `updated_after` — фильтр свежести
-        (та же включающая граница, что в search); ранжирование и выдача не
-        меняются. LSBN-F-22 (M3): во время миграции заголовки ждущих нарезку
-        заметок ищутся и в прежней базе (union, design §4).
+                    Validations like semantic: the query length 1..max_query_chars, top_k
+                    1..MAX_TOP_K (the default — default_top_k). The trigram rule "words
+                    ≥3 chars" does NOT apply here — this is not FTS. `namespace` — a
+                    hierarchy node: the subtree (`namespace_exact` — the node itself
+                    only), as in search(); an unregistered node — NamespaceError,
+                    propagated as is (the MCP transport will hook in at step 03 of release
+                    2.2 and wrap it into fail + hint, like search). A warning never happens
+                    in this mode — no embedding is used. no29-01: `updated_after` — a
+                    freshness filter (the same inclusive bound as in search); ranking and
+                    output do not change. LSBN-F-22 (M3): during a migration the titles of
+                    notes waiting for splitting are searched in the previous database too
+                    (union, design §4).
         """
         query = self._validate_query(query)
         top_k = self._default_top_k() if top_k is None else top_k
@@ -331,12 +335,12 @@ class SearchService:
         fresh_clause = ""
         fresh_params: list[object] = []
         if updated_after is not None:
-            # no29-01: та же включающая граница свежести, что в search().
+            # no29-01: the same inclusive freshness bound as in search().
             fresh_clause = " AND updated_at >= ?"
             fresh_params = [parse_updated_after(updated_after)]
         with session(self._settings) as conn:
-            # text — только вход summary_of (pending-fallback §5.5); в выдачу
-            # полный текст не идёт (компактный контракт FR-2.2).
+            # text — the summary_of input only (the §5.5 pending fallback); the full text
+            # does not go into the output (the compact FR-2.2 contract).
             rows = conn.execute(
                 "SELECT id, title, namespace, text, summary, summary_status, "
                 "       created_at, updated_at "
@@ -344,9 +348,9 @@ class SearchService:
                 f"{ns_clause}{fresh_clause}",
                 [*ns_params, *fresh_params],
             ).fetchall()
-        # LSBN-F-22 (M3): union — заголовки ждущих нарезку заметок живут в
-        # прежней базе ('нарезана'/'expired' не показываются — исходник
-        # заменён частями). Ленивый импорт — цикл (см. search()).
+        # LSBN-F-22 (M3): union — the titles of notes waiting for splitting live in the
+        # previous database ('split'/'expired' are not shown — the source
+        # was replaced by parts). A lazy import — a cycle (see search()).
         from app.services.migration import legacy_visible_ids, migration_context
 
         context = migration_context()
@@ -376,9 +380,9 @@ class SearchService:
             ranked.append(
                 (1.0 if lowered == needle else 0.5, lowered.find(needle), row)
             )
-        # Порядок (решение D2): score DESC → позиция вхождения ASC →
-        # updated_at DESC → id DESC. Стабильные проходы: последний ключ —
-        # главный; updated_at/id не отрицаются — DESC проходом reverse=True.
+        # The order (decision D2): score DESC → the occurrence position ASC →
+        # updated_at DESC → id DESC. Stable passes: the last key is the
+        # main one; updated_at/id are not negated — DESC via a reverse=True pass.
         ranked.sort(key=lambda hit: hit[2]["id"], reverse=True)
         ranked.sort(key=lambda hit: hit[2]["updated_at"], reverse=True)
         ranked.sort(key=lambda hit: hit[1])
@@ -405,17 +409,18 @@ class SearchService:
         namespace_exact: bool = False,
         updated_after: str | None = None,
     ) -> dict[str, Any]:
-        """Отдельный поиск ПОМЕТОК (no24-02, arch §13.6): только по comment.
+        """A separate COMMENT search (no24-02, arch §13.6): over comment only.
 
-        Ищет по ОТДЕЛЬНОЙ FTS-таблице `notes_comment_fts` (trigram/BM25) —
-        результаты НЕ смешиваются со смысловым `search` (тот смотрит только
-        title/text). Валидация как у `search`: `query` 1..max_query_chars,
-        `top_k` 1..MAX_TOP_K (дефолт default_top_k). `namespace` — узел
-        иерархии (поддерево; `namespace_exact` — только сам узел);
-        незарегистрированный узел — NamespaceError (транспорт даёт hint).
-        no29-01: `updated_after` — включающая граница свежести (n.updated_at).
-        Эмбеддинг не используется — `warning` не бывает (FTS/BM25). Выдача —
-        {id, title, namespace, comment, updated_at} (≤ top_k); пусто → hint.
+                    It searches a SEPARATE FTS table `notes_comment_fts` (trigram/BM25) —
+                    the results are NOT mixed with the semantic `search` (that one looks
+                    only at title/text). Validation like `search`: `query`
+                    1..max_query_chars, `top_k` 1..MAX_TOP_K (the default default_top_k).
+                    `namespace` — a hierarchy node (the subtree; `namespace_exact` — the
+                    node itself only); an unregistered node — NamespaceError (the transport
+                    gives a hint). no29-01: `updated_after` — an inclusive freshness bound
+                    (n.updated_at). No embedding is used — no `warning` (FTS/BM25). The
+                    output — {id, title, namespace, comment, updated_at} (≤ top_k);
+                    empty → a hint.
         """
         query = self._validate_query(query)
         top_k = self._default_top_k() if top_k is None else top_k
@@ -430,7 +435,7 @@ class SearchService:
             if updated_after is not None
             else None
         )
-        if expression is None:  # все слова короче 3 символов — trigram слеп
+        if expression is None:  # all words shorter than 3 characters — trigram is blind
             return {"results": [], "hint": HINT_NO_COMMENTS}
         params: list[object] = [expression]
         ns_clause = ""
@@ -471,17 +476,19 @@ class SearchService:
     def similar_notes(
         self, note_id: int, pool: int, threshold: float
     ) -> list[tuple[int, float]]:
-        """KNN по ПОЛНОМУ вектору заметки (notes_vec) — кандидаты связей §3.1.
+        """KNN over the note's FULL vector (notes_vec) — the §3.1 link candidates.
 
-        Отличие от `search`: вход — не текст запроса, а вектор самой заметки;
-        фильтра неймспейса НЕТ (`ns_filter=None`) — связи ищутся по всей базе,
-        а отсечение «своего раздела» делает выдача (LinksService, arch §3.5).
-        Отсечения здесь: сама заметка, soft-deleted, `cosine < threshold`
-        (порог включительный: кандидат ровно на пороге остаётся).
+                    The difference from `search`: the input is not a query text but the
+                    note's own vector; there is NO namespace filter (`ns_filter=None`) —
+                    links are searched over the whole database, and the "own section"
+                    cutoff is done by the output (LinksService, arch §3.5).
+                    The cutoffs here: the note itself, soft-deleted, `cosine < threshold`
+                    (an inclusive threshold: a candidate exactly at the threshold stays).
 
-        Заметка без готового вектора (`vector_status != 'ok'` или нет строки
-        notes_vec) даёт пустой список, без ошибки (FR-1.5): связей просто нет.
-        Возврат — [(note_id, cosine)] по убыванию близости, не больше `pool`.
+                    A note without a ready vector (`vector_status != 'ok'` or no notes_vec
+                    row) yields an empty list, without an error (FR-1.5): there are simply
+                    no links. Returns [(note_id, cosine)] by closeness descending, at most
+                    `pool`.
         """
         with session(self._settings) as conn:
             row = conn.execute(
@@ -497,9 +504,9 @@ class SearchService:
             vector = vectors.get_vector(conn, note_id)
             if vector is None:
                 return []
-            # Окно KNN расширяем на trash-векторы (vec0 их не знает — то же
-            # пост-отсечение, что в search) и на саму заметку: после фильтра
-            # вернём до `pool` активных кандидатов.
+            # We widen the KNN window by trash vectors (vec0 does not know them — the same
+            # post-cutoff as in search) and by the note itself: after the filter
+            # we return up to `pool` active candidates.
             trash = conn.execute(
                 "SELECT COUNT(*) FROM notes_vec WHERE note_id IN "
                 "(SELECT id FROM notes WHERE deleted_at IS NOT NULL)"
@@ -534,23 +541,24 @@ class SearchService:
         threshold: float,
         text_chars: int,
     ) -> list[dict[str, Any]]:
-        """Подсказка «похожее» при записи (№30, arch §6.4/§8/§13.4).
+        """The "similar" hint at write time (#30, arch §6.4/§8/§13.4).
 
-        БЕЗ эмбеддинга и вызовов моделей: вектор свежей заметки ещё не
-        построен (вектор на пути записи запрещён). Кандидаты — из уже
-        существующего FTS-индекса `notes_fts` (как в `DedupService`,
-        `CROSS JOIN` форсит внешний цикл по FTS), близость — **Dice** по
-        множествам значимых слов (`ranking.significant_tokens`) заголовка и
-        первых `text_chars` символов текста; остаются `score >= threshold`
-        (порог включительный), порядок — score DESC, тай-брейк id DESC, не
-        больше `limit`. Возврат — `[{"id", "title", "namespace"}]` (пустой
-        список — нормальный ответ: похожих нет). `exclude_ids` отсекает саму
-        свежую заметку и id чужих дословных дублей; сбой поиска — на совести
-        вызывающего (save оборачивает в try/except), здесь ошибки не глушатся.
+                    WITHOUT embedding or model calls: the fresh note's vector is not built
+                    yet (a vector on the write path is forbidden). Candidates — from the
+                    already-existing FTS index `notes_fts` (as in `DedupService`,
+                    the `CROSS JOIN` forces the outer loop over FTS); closeness — **Dice**
+                    over the sets of significant words (`ranking.significant_tokens`) of
+                    the title and the first `text_chars` characters of the text; those with
+                    `score >= threshold` stay (an inclusive threshold), the order —
+                    score DESC, the tie-break id DESC, at most `limit`. Returns
+                    `[{"id", "title", "namespace"}]` (an empty list — a normal answer: no
+                    similar ones). `exclude_ids` cuts off the fresh note itself and the ids
+                    of foreign verbatim duplicates; a search failure is the caller's
+                    concern (save wraps it in try/except); errors are not silenced here.
         """
         head = " ".join(filter(None, [title, text[:text_chars]]))
         expression = match_expression(head)
-        if expression is None:  # все слова короче 3 символов — trigram слеп
+        if expression is None:  # all words shorter than 3 characters — trigram is blind
             return []
         with session(self._settings) as conn:
             rows = conn.execute(
@@ -584,7 +592,7 @@ class SearchService:
             for _, note_id, cand_title, namespace in scored[:limit]
         ]
 
-    # --- источники кандидатов ------------------------------------------------
+    # --- candidate sources ----------------------------------------------------
 
     def _vector_candidates(
         self,
@@ -593,18 +601,18 @@ class SearchService:
         ns_nodes: list[str] | None,
         updated_after: str | None = None,
     ) -> list[tuple[int, float, str | None]]:
-        """Векторные кандидаты: чанки → агрегация до заметок + fallback.
+        """Vector candidates: chunks → aggregation to notes + a fallback.
 
-        Каждая заметка входит в источник ОДИН раз: близость задаёт её лучший
-        чанк; заметки без готовых чанков (нет строк notes_chunks вообще или
-        векторов у чанков) получают cosine полного вектора (notes_vec).
-        Фаза 10: поиск в партициях узлов поддерева (ns_nodes) — или глобально.
-        Возврат уже отсортирован по cosine (для ранга в RRF) и отфильтрован
-        по активности и порогу.
+                    Every note enters the source ONCE: its best chunk sets the closeness;
+                    notes without ready chunks (no notes_chunks rows at all, or no chunk
+                    vectors) get the full vector's cosine (notes_vec).
+                    Phase 10: the search over the subtree nodes' partitions (ns_nodes) — or
+                    globally. The result is already sorted by cosine (for the RRF rank) and
+                    filtered by activity and threshold.
         """
         by_chunk_source = self._chunk_candidates(conn, query_vector, ns_nodes, updated_after)
-        # Fallback Фазы 7: заметки, у которых нет готовых чанк-векторов
-        # (legacy/пending), ищутся по полному тексту, как в Фазе 3.
+        # The Phase-7 fallback: notes without ready chunk vectors
+        # (legacy/pending) are searched by the full text, as in Phase 3.
         for note_id, cosine in self._full_text_candidates(
             conn, query_vector, ns_nodes, updated_after
         ):
@@ -625,15 +633,16 @@ class SearchService:
         ns_nodes: list[str] | None,
         updated_after: str | None = None,
     ) -> dict[int, tuple[float, str]]:
-        """KNN по notes_chunks_vec (топ-50) → одна запись на заметку.
+        """KNN over notes_chunks_vec (top-50) → one record per note.
 
-        Первый чанк заметки в отсортированной по близости выдаче KNN — её
-        лучший чанк: он задаёт cosine и текст для snippet. Порог сравнивается
-        с cosine лучшего чанка (brief §6). Чанки trash-заметок отбрасываются
-        пост-фильтром (vec0 не знает о notes). Фаза 10: KNN сканирует партиции
-        узлов поддерева (ns_nodes) — или глобально; trash-окно считается
-        в тех же партициях. no29-01: `updated_after` — включающая граница
-        свежести в наборе активных кандидатов (`active`-запрос).
+                    The note's first chunk in the closeness-sorted KNN output is its best
+                    chunk: it sets the cosine and the snippet text. The threshold is
+                    compared with the best chunk's cosine (brief §6). Chunks of trash notes
+                    are dropped post-filter (vec0 knows nothing of notes). Phase 10: KNN
+                    scans the subtree nodes' partitions (ns_nodes) — or globally; the
+                    trash window is counted in the same partitions. no29-01:
+                    `updated_after` — an inclusive freshness bound in the active candidate
+                    set (the `active` query).
         """
         if ns_nodes:
             ns_ph = ",".join("?" * len(ns_nodes))
@@ -658,7 +667,7 @@ class SearchService:
         if not hits:
             return {}
         placeholders = ",".join("?" * len(hits))
-        # один заход: note_id и text чанка + активность заметки (в узлах)
+        # one pass: the chunk's note_id and text + the note's activity (in nodes)
         chunk_meta = {
             row["id"]: (row["note_id"], row["text"])
             for row in conn.execute(
@@ -671,15 +680,15 @@ class SearchService:
         }
         by_note: dict[int, tuple[float, str]] = {}
         threshold = self._settings.score_threshold
-        for chunk_id, cosine_value in hits:  # порядок KNN: лучший чанк — первым
+        for chunk_id, cosine_value in hits:  # the KNN order: the best chunk first
             meta = chunk_meta.get(chunk_id)
             if meta is None:
-                continue  # чанк trash-заметки
+                continue  # a chunk of a trash note
             note_id, text = meta
             if note_id in by_note:
-                continue  # лучший чанк заметки уже учтён
+                continue  # the note's best chunk is already counted
             if cosine_value < threshold:
-                continue  # лучший чанк ниже порога — остальные тем более
+                continue  # the best chunk is below the threshold — the rest the more so
             by_note[note_id] = (cosine_value, text)
         return by_note
 
@@ -690,13 +699,13 @@ class SearchService:
         ns_nodes: list[str] | None,
         updated_after: str | None = None,
     ) -> list[tuple[int, float]]:
-        """Топ-50 активных по косинусу полного текста + гейт порога (FR-1).
+        """Top-50 active by the full text's cosine + the threshold gate (FR-1).
 
-        Окно KNN расширяется на число trash-векторов, пост-фильтр оставляет
-        только активные. Заметки, уже попавшие в чанк-агрегацию, здесь
-        отфильтруются наверху (они не fallback). Фаза 10: KNN — в партициях
-        узлов поддерева, активные — только из тех же узлов. no29-01:
-        `updated_after` — включающая граница свежести в `active`-запросе.
+                    The KNN window is widened by the trash-vector count; the post-filter
+                    keeps only active ones. Notes already in the chunk aggregation are
+                    filtered out here (they are not fallback). Phase 10: KNN — in the
+                    subtree nodes' partitions, active — only from the same nodes. no29-01:
+                    `updated_after` — an inclusive freshness bound in the `active` query.
         """
         if ns_nodes:
             ns_ph = ",".join("?" * len(ns_nodes))
@@ -742,17 +751,17 @@ class SearchService:
         ns_nodes: list[str] | None,
         updated_after: str | None = None,
     ) -> list[sqlite3.Row]:
-        """Топ-50 FTS5/BM25 по активным заметкам в узлах поддерева; rank с 1 —
-        для RRF. Фаза 10: фильтр namespace — JOIN'ом на notes (FTS-индекс
-        не пересоздаётся, бриф Шаг 1). lsb-0001-01 (FR-1.2): веса bm25
-        (TITLE_FTS_WEIGHT, 1.0) — совпадение в title выше совпадения в text.
-        no29-01: `updated_after` — включающая граница свежести (`n.updated_at`).
+        """Top-50 FTS5/BM25 over active notes in the subtree nodes; rank from 1 —
+                    for RRF. Phase 10: the namespace filter — by a JOIN on notes (the FTS
+                    index is not rebuilt, the Step-1 brief). lsb-0001-01 (FR-1.2): the bm25
+                    weights (TITLE_FTS_WEIGHT, 1.0) — a title match above a text match.
+                    no29-01: `updated_after` — an inclusive freshness bound (`n.updated_at`).
         """
         if ns_nodes:
             ns_ph = ",".join("?" * len(ns_nodes))
             ns_clause = f" AND n.namespace IN ({ns_ph})"
-            # Весовые параметры bm25 идут ПЕРЕД остальными: порядок вызова
-            # аргументов — как в SQL (SELECT bm25(..., ?, ?) раньше WHERE ?).
+            # The bm25 weight parameters go BEFORE the others: the argument
+            # call order — as in SQL (SELECT bm25(..., ?, ?) earlier than WHERE ?).
             params: list[object] = [TITLE_FTS_WEIGHT, 1.0, expression, *ns_nodes]
         else:
             ns_clause = ""
@@ -772,15 +781,16 @@ class SearchService:
             (*params, CANDIDATE_LIMIT),
         ).fetchall()
 
-    # --- слияние и выдача ------------------------------------------------------
+    # --- merge and output -------------------------------------------------------
 
     @staticmethod
     def _linked_ids(conn: sqlite3.Connection, ids: list[int]) -> set[int]:
-        """id кандидатов, у которых есть строка в links (любая сторона).
+        """Ids of candidates that have a row in links (either side).
 
-        LSBN-F-14: один SELECT на вызов поиска, по списку id кандидатов
-        (до сортировки и топ-реза). Возврат может содержать id вне `ids`
-        (партнёр пары) — не страшно: буст ищется только для кандидатов.
+                    LSBN-F-14: one SELECT per search call, over the candidate id list
+                    (before the sort and the top cut). The result may contain ids outside
+                    `ids` (a pair's partner) — harmless: the boost is looked up only for
+                    candidates.
         """
         if not ids:
             return set()
@@ -795,7 +805,7 @@ class SearchService:
     def _fetch_rows(
         self, conn: sqlite3.Connection, ids: list[int]
     ) -> dict[int, sqlite3.Row]:
-        """Метаданные кандидатов (мягкое чтение: удалённые исчезают)."""
+        """Candidates' metadata (a soft read: deleted ones vanish)."""
         if not ids:
             return {}
         placeholders = ",".join("?" * len(ids))
@@ -815,13 +825,13 @@ class SearchService:
         rows: dict[int, sqlite3.Row],
         order: dict[int, float] | None = None,
     ) -> list[dict[str, Any]]:
-        """Сортировка: score DESC → updated_at DESC → id DESC; сборка FR-1.
+        """Sort: score DESC → updated_at DESC → id DESC; the FR-1 assembly.
 
-        LSBN-F-14: `order` — бустовые score (apply_boosts) задают ТОЛЬКО
-        порядок; прежние tie-break'и (updated_at DESC, id DESC) сохранены.
-        Поле rrf_score элемента — сырой RRF из `scores`, контракт выдачи
-        (§4.2.6, шапки F-13) не меняется. `order is None` — сортировка по
-        `scores` (поведение до бустов).
+                    LSBN-F-14: `order` — the boosted scores (apply_boosts) set ONLY the
+                    order; the old tie-breaks (updated_at DESC, id DESC) are preserved.
+                    The item's rrf_score field — the raw RRF from `scores`; the output
+                    contract (§4.2.6, the F-13 headers) does not change. `order is None` —
+                    a sort by `scores` (the pre-boost behavior).
         """
         keys = scores if order is None else order
         candidates = [
@@ -837,9 +847,9 @@ class SearchService:
             ),
             reverse=True,
         )
-        # Совместимость: rrf_score по итоговому слиянию; cosine — только у
-        # кандидатов с валидным векторным hit (≥ SCORE_THRESHOLD); snippet —
-        # из лучшего чанка, если он есть, иначе из полного текста (fallback).
+        # Compatibility: rrf_score by the final merge; cosine — only for
+        # candidates with a valid vector hit (≥ SCORE_THRESHOLD); the snippet —
+        # from the best chunk when it exists, else from the full text (fallback).
         return [
             self._result(
                 row,
@@ -857,19 +867,20 @@ class SearchService:
         cosine: float | None,
         snippet_source: str | None,
     ) -> dict[str, Any]:
-        """Формат элемента FR-1: без текста заметки (memory_get адресно).
+        """The FR-1 item format: without the note's text (memory_get addresses it).
 
-        Фаза 11 (решение №9, follow-up 5b): +title — реальное значение
-        notes.title (None только у миграционных заметок без названия);
-        REST /search отдаёт выдачу как есть, MCP-слой берёт то же поле.
-        lsb-0010-04 (FR-4.2): +chars — объём ПОЛНОГО текста заметки в
-        символах (не snippet/summary); текст уже в выборке (snippet-fallback)
-        — новых чтений нет. То же значение, что в memory_list/memory_get.
+                    Phase 11 (decision #9, follow-up 5b): +title — the real notes.title
+                    value (None only for titleless migration notes);
+                    REST /search returns the output as is, the MCP layer takes the same
+                    field. lsb-0010-04 (FR-4.2): +chars — the note's FULL text volume in
+                    characters (not snippet/summary); the text is already in the sample
+                    (the snippet fallback) — no new reads. The same value as in
+                    memory_list/memory_get.
         """
         return {
             "id": row["id"],
             "title": row["title"],
-            "chars": len(row["text"]),  # lsb-0010-04: объём полного текста
+            "chars": len(row["text"]),  # lsb-0010-04: the full text's volume
             "summary": summary_of(row, self._settings),
             "snippet": snippet(snippet_source or row["text"], self._settings),
             "summary_status": row["summary_status"],
@@ -881,17 +892,17 @@ class SearchService:
             "namespace": row["namespace"],
         }
 
-    # --- внутреннее ---------------------------------------------------------
+    # --- internal -------------------------------------------------------------
 
     def _query_vector(self, query: str) -> list[float] | None:
-        """Кодирование запроса; отказ — деградация к FTS, не исключение."""
+        """Encode the query; failure — degrade to FTS, not an exception."""
         try:
             return self._embedding.embed(query)
         except EmbeddingError:
             return None
 
     def _validate_query(self, query: str) -> str:
-        """1..MAX_QUERY_CHARS — доменное правило FR-1 (бекстоп схемы)."""
+        """1..MAX_QUERY_CHARS — the FR-1 domain rule (a schema backstop)."""
         if not 1 <= len(query) <= self._settings.max_query_chars:
             raise SearchValidationError(
                 f"query: length must be 1..{self._settings.max_query_chars} "
@@ -904,9 +915,9 @@ class SearchService:
 
     @staticmethod
     def _match_expression(query: str) -> str | None:
-        """FTS-выражение запроса (общий примитив app.services.ranking).
+        """The query's FTS expression (the shared app.services.ranking primitive).
 
-        Слова ≥3 символов как цитированные подстроки через OR (trigram);
-        None — нет ни одного слова, по которому trigram может искать.
+                    Words ≥3 characters as quoted substrings joined by OR (trigram);
+                    None — not a single word for trigram to search by.
         """
         return match_expression(query)
