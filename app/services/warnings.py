@@ -1,30 +1,33 @@
-"""Джоба `warnings` и её состояние (№12, релиз 3.2.0; arch §5.1/§6.5/§13.5).
+"""The `warnings` job and its state (#12, release 3.2.0; arch §5.1/§6.5/§13.5).
 
-Фоновая джоба `warnings` проходит по **размещённым** заметкам (название +
-готовая выжимка + структура), сверяет фактический `namespace` с разметкой
-классификатора и **подсвечивает** расхождение — БЕЗ автоматического переноса
-(решение О. 2026-10-08, FR-2.2/§13.5). Результат — строка общей поверхности
-`warnings` (`app/storage/db.py`), читаемая без вызовов модели (surface — no12-02).
+    The background `warnings` job walks over **placed** notes (a title + a ready
+    summary + structure), compares the actual `namespace` with the classifier's
+    markup and **highlights** the divergence — WITHOUT an automatic move
+    (the 2026-10-08 decision, FR-2.2/§13.5). The result is a row of the shared
+    `warnings` surface (`app/storage/db.py`), readable without model calls (the
+    surface — no12-02).
 
-Состояние (таблица `warnings`) обслуживает `WarningsService`:
+    The state (the `warnings` table) is served by `WarningsService`:
 
-* `open` — upsert по открытому ключу `(subject_type, subject_id, kind)`: не
-  более одного ОТКРЫТОГО предупреждения (partial unique index, §5.1),
-  повторный прогон двигает `message`/`payload`/`updated_at`, а не плодит строки
-  (идемпотентность, №12 FR-4.4/§13.7);
-* `resolve` — причина ушла (авто): `resolved_at=now`, `status='open'` остаётся;
-* `resolve_for_subject` — снятие всех предупреждений субъекта при правке
-  заметки (№12 FR-4.4); вызывается в ТОЙ ЖЕ транзакции через узкую инъекцию
-  `NoteService.set_warnings_resolver`;
-* `dismiss` — снятие человеком (`status='dismissed'`, REST — no12-02);
-* `list`/`counts` — чтение только SQL, без моделей (FR-3.2, §13.4);
-* `check_note`/`run` — прогон джобы с бюджетом вызовов классификатора.
+    * `open` — an upsert by the open key `(subject_type, subject_id, kind)`: no
+      more than one OPEN warning (a partial unique index, §5.1);
+      a repeated run moves `message`/`payload`/`updated_at` instead of multiplying
+      rows (idempotency, #12 FR-4.4/§13.7);
+    * `resolve` — the reason is gone (auto): `resolved_at=now`, `status='open'`
+      stays;
+    * `resolve_for_subject` — clearing all of a subject's warnings on a note edit
+      (#12 FR-4.4); called in THE SAME transaction through the narrow injection
+      `NoteService.set_warnings_resolver`;
+    * `dismiss` — cleared by a human (`status='dismissed'`, REST — no12-02);
+    * `list`/`counts` — SQL-only reads, no models (FR-3.2, §13.4);
+    * `check_note`/`run` — the job's run with a classifier call budget.
 
-Джоба регистрируется на каркасе lsb-0014 (сборщик + строка в `JOB_BUILDERS`,
-импорт односторонний — warnings → jobs, круга нет) и объявляет слот `summary`
-(та же модель, что у джобы `nodes`); разрыв слота гейтит её воротами каркаса
-(3.4.1, LSBN-T-29). Свежий `default` оставлен джобе `nodes`
-(§13.5): две джобы не спорят за один узел.
+    The job registers on the lsb-0014 framework (a builder + a line in
+    `JOB_BUILDERS`; the import is one-way — warnings → jobs, no cycle) and
+    declares the `summary` slot (the same model as the `nodes` job); the slot
+    breaker gates it with the framework's gate (3.4.1, LSBN-T-29). A fresh
+    `default` is left to the `nodes` job (§13.5): two jobs do not argue over one
+    node.
 """
 
 from __future__ import annotations
@@ -45,22 +48,22 @@ from app.services.listing import page_fields
 from app.services.slot_outcome import outcome_of
 from app.storage.db import session, transaction
 
-if TYPE_CHECKING:  # рантайм-зависимостей у сервиса нет (DI)
+if TYPE_CHECKING:  # the service has no runtime dependencies (DI)
     from app.services.namespaces import NamespaceService
     from app.services.worker import BackgroundWorker
 
-# Имя джобы в журнале и очередь для `/health.queues`.
+# The job's name in the journal and the queue for `/health.queues`.
 WARNINGS_JOB = "warnings"
 
-# Словарь видов предупреждений — единый для всех поверхностей (№12 + №32).
-# Две последние заводит №32, но значения фиксируются здесь.
+# The warning kinds dictionary — one for all surfaces (#12 + #32).
+# The last two are introduced by #32, but the values are fixed here.
 KIND_NOTE_MISPLACED = "note_misplaced"
 KIND_NOTE_NO_NODE = "note_no_node"
 KIND_TERM_CONTEXTS_EXCESS = "term_contexts_excess"
 KIND_TERM_CONTEXT_CLUSTER = "term_context_cluster"
 
-# Тексты сообщений — обезличенные, английские (без имён людей и слова
-# «оператор»): собираются при открытии, читаются без join'а к текстам.
+# The message texts are impersonal, English (no people's names and no word
+# "operator"): assembled at open time, read without a join to the texts.
 MESSAGE_MISPLACED = (
     "note {id} is in '{namespace}' but the classifier places it in "
     "'{hint_path}' (confidence {confidence})"
@@ -70,9 +73,9 @@ MESSAGE_NO_NODE = (
     "exist yet"
 )
 
-# Отбор кандидатов (SQL, без модели, arch §6.5): активные заметки с готовой
-# непустой выжимкой, РАЗМЕЩЁННЫЕ (`namespace != 'default'` ИЛИ уже разобранные
-# `nodes`), ещё не проверенные после последней правки, свежие первыми.
+# The candidate selection (SQL, no model, arch §6.5): active notes with a ready
+# non-empty summary, PLACED (`namespace != 'default'` OR already parsed by
+# `nodes`), not yet checked after the last edit, newest first.
 _CANDIDATE_WHERE = (
     "deleted_at IS NULL "
     "AND summary_status = 'ok' AND summary IS NOT NULL AND summary != '' "
@@ -89,7 +92,7 @@ _CANDIDATE_STAT_SELECT = (
     "AS oldest_pending_sec FROM notes WHERE " + _CANDIDATE_WHERE
 )
 
-# Столбцы листинга (`GET /warnings`, §7.1) — форма ответа и пагинация в no12-02.
+# The listing columns (`GET /warnings`, §7.1) — the answer shape and pagination in no12-02.
 _LIST_COLUMNS = (
     "id, kind, subject_type, subject_id, message, payload, status, "
     "created_at, updated_at, resolved_at"
@@ -97,21 +100,21 @@ _LIST_COLUMNS = (
 
 
 class WarningsValidationError(ValueError):
-    """Форма листинга предупреждений нарушена (`limit`/`offset`).
+    """The warnings listing shape violated (`limit`/`offset`).
 
-    Мягкий отказ: транспорт отвечает `hint` (MCP) либо 422 с текстом (REST),
-    прецедент lsb-0013 — общий с листингами памяти.
+            A soft failure: the transport answers with a `hint` (MCP) or 422 with the
+            text (REST); the precedent — lsb-0013, shared with the memory listings.
     """
 
 
 class WarningsService:
-    """Состояние предупреждений и прогон джобы `warnings` (arch §6.5).
+    """The warnings state and the `warnings` job's run (arch §6.5).
 
-    Зависимости — узкая инъекция (`classifier`/`namespaces`): в юнит-тестах
-    классификатор — фейк, в прогоне — та же модель слота `summary`, что у
-    джобы `nodes`. `conn_factory` — точка сборки соединений (по умолчанию
-    `session`); при передаче готового `conn` сервис работает в чужой
-    транзакции (правка заметки, arch §6.5).
+            The dependencies are a narrow injection (`classifier`/`namespaces`): in
+            unit tests the classifier is a fake; in a run — the same model of the
+            `summary` slot as the `nodes` job's. `conn_factory` — the connection
+            assembly point (`session` by default); with a ready `conn` passed the
+            service works in a foreign transaction (a note edit, arch §6.5).
     """
 
     def __init__(
@@ -126,18 +129,18 @@ class WarningsService:
         self._classifier = classifier
         self._namespaces = namespaces
         self._conn = conn_factory
-        # Итог последнего `check_note`: none | opened | updated | resolved |
-        # failed. Нужен прогону, чтобы посчитать `warnings_run`, не меняя
-        # контракт возврата `check_note` (str | None).
+        # The last `check_note`'s outcome: none | opened | updated | resolved |
+        # failed. The run needs it to count `warnings_run` without changing
+        # the `check_note` return contract (str | None).
         self._last_check = "none"
-        # Была ли последняя `open` вставкой (а не обновлением) — счётчик.
+        # Whether the last `open` was an insert (not an update) — the counter.
         self._last_open_created = False
 
-    # --- состояние предупреждений -----------------------------------------
+    # --- the warnings state ----------------------------------------------------
 
     @contextmanager
     def _connection(self, conn: sqlite3.Connection | None) -> Iterator[Any]:
-        """Своё соединение с транзакцией или уже открытое (чужая транзакция)."""
+        """One's own connection with a transaction, or an already-open one (a foreign transaction)."""
         if conn is not None:
             yield conn
             return
@@ -154,10 +157,11 @@ class WarningsService:
         *,
         conn: sqlite3.Connection | None = None,
     ) -> int:
-        """Открыть/обновить предупреждение (upsert по открытому ключу).
+        """Open/update a warning (an upsert by the open key).
 
-        Событие `warning_opened` пишется ТОЛЬКО при вставке: повторный прогон
-        обновляет строку и журнал не дублирует (идемпотентность, §13.7).
+                    The `warning_opened` event is written ONLY on insert: a repeated run
+                    updates the row and does not duplicate the journal (idempotency,
+                    §13.7).
         """
         payload_json = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
         with self._connection(conn) as active:
@@ -196,10 +200,11 @@ class WarningsService:
         return warning_id
 
     def resolve(self, kind: str, subject_type: str, subject_id: int) -> int:
-        """Снять предупреждение — причина ушла (авто); число снятых строк.
+        """Clear a warning — the reason is gone (auto); the number of cleared rows.
 
-        `status='open'` остаётся, `resolved_at=now`: снятое не возвращается в
-        открытую выборку и не удаляется (аудит, прецедент `promotions`).
+                    `status='open'` stays, `resolved_at=now`: a cleared one does not return
+                    to the open sample and is not deleted (an audit, the `promotions`
+                    precedent).
         """
         with self._connection(None) as conn:
             count = self._resolve_in(conn, subject_type, subject_id, kind=kind)
@@ -221,9 +226,9 @@ class WarningsService:
         *,
         conn: sqlite3.Connection | None = None,
     ) -> int:
-        """Снять ВСЕ открытые предупреждения субъекта (правка заметки, FR-4.4).
+        """Clear ALL of a subject's open warnings (a note edit, FR-4.4).
 
-        Вызывается в ТОЙ ЖЕ транзакции, что и правка (готовый `conn`).
+                    Called in THE SAME transaction as the edit (a ready `conn`).
         """
         with self._connection(conn) as active:
             count = self._resolve_in(active, subject_type, subject_id)
@@ -258,7 +263,7 @@ class WarningsService:
         return int(conn.execute(sql, params).rowcount)
 
     def dismiss(self, warning_id: int) -> dict:
-        """Снять предупреждение человеком; нет/уже снято — мягкий ответ."""
+        """Clear a warning by a human; none/already cleared — a soft answer."""
         with self._connection(None) as conn:
             cursor = conn.execute(
                 "UPDATE warnings SET status = 'dismissed', resolved_at = "
@@ -299,12 +304,13 @@ class WarningsService:
         offset: int = 0,
         max_limit: int = 50,
     ) -> dict:
-        """Листинг предупреждений — только SQL, без моделей (FR-3.2, §13.4).
+        """The warnings listing — SQL only, no models (FR-3.2, §13.4).
 
-        Форма общая с листингами памяти: поля страницы считает общий хелпер
-        `page_fields` (прецедент `NoteService.list`). `limit` вне
-        1..`max_limit` (и отрицательный `offset`) — `WarningsValidationError`:
-        транспорт отвечает мягко (прецедент lsb-0013), а не молча режет.
+                    The shape is shared with the memory listings: the page fields are
+                    computed by the shared `page_fields` helper (the `NoteService.list`
+                    precedent). A `limit` outside 1..`max_limit` (and a negative `offset`)
+                    — `WarningsValidationError`: the transport answers softly (the
+                    lsb-0013 precedent) instead of silently trimming.
         """
         limit = int(limit)
         offset = int(offset)
@@ -341,7 +347,7 @@ class WarningsService:
         return {"warnings": warnings, **page_fields(total, offset, len(warnings))}
 
     def counts(self) -> dict:
-        """Агрегаты для `/health.warnings`: открытые по видам + total (§7.1)."""
+        """The aggregates for `/health.warnings`: open per kind + total (§7.1)."""
         with self._connection(None) as conn:
             rows = conn.execute(
                 "SELECT kind, COUNT(*) AS n FROM warnings WHERE status = 'open' "
@@ -352,7 +358,7 @@ class WarningsService:
 
     @staticmethod
     def _list_dict(row: sqlite3.Row) -> dict:
-        """Строка `warnings` — в форму ответа (payload разбирается из JSON)."""
+        """A `warnings` row — into the answer shape (the payload parsed from JSON)."""
         data = {column: row[column] for column in _LIST_COLUMNS.split(", ")}
         try:
             data["payload"] = json.loads(data["payload"] or "{}")
@@ -360,16 +366,16 @@ class WarningsService:
             data["payload"] = {}
         return data
 
-    # --- прогон джобы ------------------------------------------------------
+    # --- the job run -----------------------------------------------------------
 
     def check_note(self, note_id: int) -> str | None:
-        """Один прогон проверки заметки; kind предупреждения либо None.
+        """One run of the note check; the warning kind or None.
 
-        Читает `title`, `summary`, `namespace`; зовёт классификатор
-        (`title` + `summary`, известные узлы реестра) и принимает решение по
-        §6.5. Отказ классификатора (`ClassificationError`) заметку НЕ помечает
-        (маркер не ставится, повтор следующим прогоном — контракт №39):
-        пишется событие `warnings_classifier_failed` с `outcome`.
+                    Reads `title`, `summary`, `namespace`; calls the classifier
+                    (`title` + `summary`, the registry's known nodes) and decides per §6.5.
+                    A classifier failure (`ClassificationError`) does NOT mark the note
+                    (no marker; a retry by the next run — the #39 contract):
+                    a `warnings_classifier_failed` event with the `outcome` is written.
         """
         self._last_check = "none"
         with self._conn(self._settings) as conn:
@@ -403,15 +409,15 @@ class WarningsService:
         return self._decide(note_id, row["namespace"], result, known)
 
     def _decide(self, note_id: int, namespace: str, result: Any, known: list) -> str | None:
-        """Решение по §6.5: подсветка «не на месте»/«нет узла» без переноса."""
+        """The §6.5 decision: highlight "not in place"/"no node" without a move."""
         hint = result.hint_path
         confidence = result.confidence
         if confidence < self._settings.warnings_min_confidence:
-            return None  # низкая уверенность — мелкий шум не подсвечиваем
+            return None  # low confidence — small noise is not highlighted
         if not hint:
-            return None  # «общая» разметка не спорит с конкретным размещением
+            return None  # a "generic" markup does not argue with a concrete placement
         if namespace == hint:
-            # Разметка совпала с узлом — причина ушла: снимаем открытое.
+            # The markup matched the node — the reason is gone: clear the open one.
             resolved = self.resolve(KIND_NOTE_MISPLACED, "note", note_id)
             resolved += self.resolve(KIND_NOTE_NO_NODE, "note", note_id)
             self._last_check = "resolved" if resolved else "none"
@@ -446,8 +452,8 @@ class WarningsService:
             )
             self._last_check = "opened" if self._last_open_created else "updated"
             return KIND_NOTE_MISPLACED
-        # Общий корень: расхождение «родитель/ребёнок» — предупреждение только
-        # на строгом уровне (FR-3.3, дефолт — мелкий шум).
+        # A shared root: a "parent/child" divergence — a warning only
+        # at the strict level (FR-3.3; the default — small noise).
         if self._settings.warnings_level_strict:
             self.open(
                 KIND_NOTE_MISPLACED,
@@ -470,12 +476,12 @@ class WarningsService:
         return None
 
     def run(self, batch: int | None = None) -> int:
-        """Прогон джобы: партия кандидатов в бюджете классификатора; их число.
+        """The job's run: a batch of candidates within the classifier's budget; their count.
 
-        Бюджет `JOB_WARNINGS_CLASSIFIER_BUDGET` — вызовов модели за прогон:
-        заметки сверх бюджета маркера НЕ получают и попадают в следующий прогон
-        (FR-4.2). Разобранная заметка помечается `notes.warnings_at=now`
-        (анти-зацикливание). Переноса заметок нет (§13.5).
+                    The `JOB_WARNINGS_CLASSIFIER_BUDGET` budget — model calls per run:
+                    notes beyond the budget get no marker and land in the next run
+                    (FR-4.2). A parsed note is marked `notes.warnings_at=now`
+                    (anti-looping). There is no note moving (§13.5).
         """
         limit = self._settings.job_warnings_batch if batch is None else int(batch)
         budget = int(self._settings.job_warnings_classifier_budget)
@@ -491,7 +497,7 @@ class WarningsService:
             kind = self.check_note(int(row["id"]))
             used += 1
             if self._last_check == "failed":
-                continue  # маркера нет — заметка снова кандидат
+                continue  # no marker — the note is a candidate again
             self._mark_checked(int(row["id"]))
             checked += 1
             if self._last_check == "opened":
@@ -509,7 +515,7 @@ class WarningsService:
         return checked
 
     def _mark_checked(self, note_id: int) -> None:
-        """Поставить маркер разбора: заметка не выедает бюджет повторно."""
+        """Set the parsed marker: the note does not eat the budget twice."""
         with self._conn(self._settings) as conn:
             conn.execute(
                 "UPDATE notes SET warnings_at = "
@@ -518,18 +524,18 @@ class WarningsService:
             )
 
     def queue_stat(self) -> dict:
-        """Снимок очереди `warnings` для `/health.queues` — только SQL, без модели."""
+        """The `warnings` queue snapshot for `/health.queues` — SQL only, no model."""
         with self._conn(self._settings) as conn:
             row = conn.execute(_CANDIDATE_STAT_SELECT).fetchone()
         return queue_snapshot(row["pending"], row["oldest_pending_sec"])
 
     def queue_empty(self) -> bool:
-        """Пуста ли очередь `warnings` (дешёвая перепроверка очереди, пул 6)."""
+        """Is the `warnings` queue empty (a cheap queue recheck, pool 6)."""
         return int(self.queue_stat()["pending"] or 0) == 0
 
     @staticmethod
     def _log(message: str, event: str, **fields: Any) -> None:
-        """Событие джобы в общий журнал: `event` + обязательное поле `job`."""
+        """The job's event in the shared journal: `event` + the mandatory `job` field."""
         logging.getLogger("app").info(
             message, extra={"event": event, "job": WARNINGS_JOB, **fields}
         )
@@ -538,17 +544,17 @@ class WarningsService:
 def build_warnings_job(
     worker: "BackgroundWorker", settings: Settings
 ) -> JobSpec | None:
-    """Сборщик джобы `warnings` (FR-1.1): без классификатора — неприменима.
+    """The `warnings` job builder (FR-1.1): without a classifier — not applicable.
 
-    Форма «по интервалу» (без события и без перепроверки очереди): прогон
-    уходит в `to_thread`, очередь — производная от заметок. Слот — `summary`
-    (та же модель, что у `nodes`); ворота слота — как у прочих (3.4.1,
-    LSBN-T-29): `gate` — `_slot_gate` воркера (с пробным стуком), `is_gated`
-    — `_slot_blocked` (снимки очереди без моделей). Прежде джоба заявляла
-    слот, но при разрыве продолжала дёргать мёртвый слот — теперь партию
-    не берёт каркас.
+            The "by interval" form (no event, no queue recheck): the run goes into
+            `to_thread`, the queue is derived from notes. The slot — `summary`
+            (the same model as `nodes`); the slot gate — like the others (3.4.1,
+            LSBN-T-29): `gate` — the worker's `_slot_gate` (with a probe knock),
+            `is_gated` — `_slot_blocked` (queue snapshots without models). Before, the
+            job declared a slot but kept poking the dead slot on a breaker — now the
+            framework does not take the batch.
     """
-    if worker._classifier is None:  # тестовый режим Фазы 3 — петли не было
+    if worker._classifier is None:  # the Phase-3 test mode — there was no loop
         return None
     service = WarningsService(
         settings, classifier=worker._classifier, namespaces=worker._namespaces
@@ -575,6 +581,6 @@ def build_warnings_job(
     )
 
 
-# Регистрация джобы в реестре каркаса (FR-1.1/FR-1.6): своя джоба — в своём
-# модуле (одна строка в `JOB_BUILDERS`); импорт односторонний — warnings → jobs.
+# Registering the job in the framework registry (FR-1.1/FR-1.6): one's own job — in one's own
+# module (one line in `JOB_BUILDERS`); the import is one-way — warnings → jobs.
 jobs.JOB_BUILDERS += (build_warnings_job,)
