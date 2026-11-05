@@ -244,7 +244,6 @@ def _escape_raw_quotes(text: str) -> str:
     fixed: list[str] = []
     in_string = False
     escaped = False
-    length = len(text)
     for index, char in enumerate(text):
         if char != '"' or not (in_string and not escaped):
             # Outside a value any quote is structural (it opens a value);
