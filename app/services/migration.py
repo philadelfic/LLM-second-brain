@@ -1,39 +1,42 @@
-"""Самомиграция схемы, фаза 4 — джоба нарезки (LSBN-F-22, M2) и M3:
-union-контекст чтения, прерывание, сверка для /health.
+"""Schema self-migration, phase 4 — the splitting job (LSBN-F-22, M2) and M3:
+    the union read context, abort, the /health reconciliation.
 
-Невлезающие заметки (migration_notes 'ожидает', M1) нарезаются моделью
-на самодостаточные части по мере обработки — «обработалось, стало
-доступно» (постановка F-22, п. 1). Тексты исходников живут в ПРЕЖНЕЙ
-базе (union-чтение — M3): джоба читает их по legacy-пути из
-`migration.state.prev_file`, проверяет TTL и зовёт `SummaryService.split`
-(операция `split` — SPLIT_* env, слот нарезки отдельный, дефолт локальный)
-и `NoteService.save_migration_parts` — одна транзакция на заметку:
-части + история source="migration_split" + статус 'нарезана'+new_ids.
+    Oversized notes (migration_notes 'waiting', M1) are split by the model into
+    self-sufficient parts as they are processed — "processed, became available"
+    (the F-22 brief, p. 1). The source texts live in the PREVIOUS database (the
+    union read — M3): the job reads them over the legacy path from
+    `migration.state.prev_file`, checks the TTL and calls `SummaryService.split`
+    (the `split` operation — SPLIT_* env, a separate splitting slot, the default is
+    local) and `NoteService.save_migration_parts` — one transaction per note:
+    parts + history source="migration_split" + the 'split' status + new_ids.
 
-M3 (design §4): процессный `MigrationContext` (legacy_path|None, holder
-здесь, дефолт None) — search/notes/dedup читают вторым соединением
-прежнюю базу, пока phase ∈ {pour, split}; `abort_migration` — стоп джобы
-(phase=aborted в активной базе), reverse-pour дельты в прежнюю (части
-исключаются), swap назад — сервис остаётся на прежней базе; фаза 7:
-обнуление очереди нарезки → phase=done; `migration_health` — счётчики
-сверки (old_total/poured — ЗАМЕТКИ, решение пилота) для /health.
+    M3 (design §4): a process-level `MigrationContext` (legacy_path|None, the
+    holder lives here, the default None) — search/notes/dedup read the previous
+    database over a second connection while phase ∈ {pour, split};
+    `abort_migration` — stop the job (phase=aborted in the active database),
+    reverse-pour the delta into the previous one (parts are excluded), swap back —
+    the service stays on the previous database; phase 7: zero the splitting queue →
+    phase=done; `migration_health` — reconciliation counters (old_total/poured —
+    NOTES, the pilot's decision) for /health.
 
-Статусы (design F-22 §3/§4):
-- TTL-истекла (или исходник исчез из прежней базы) → 'expired' — модель
-  не вызывается;
-- части сохранены → 'нарезана' (ставит save_migration_parts);
-- `MergeIncompleteError` (модель теряет содержание; повтор даст те же два
-  раунда) → 'карантин' + запись в warnings, повтор по back-off;
-- транзиент (`SummaryError`) — статус тот же, партия снимается: модель
-  недоступна и для остальных, повтор по back-off петли (NFR-3).
+    Statuses (design F-22 §3/§4):
+    - TTL expired (or the source vanished from the previous database) → 'expired' —
+      the model is not called;
+    - parts saved → 'split' (set by save_migration_parts);
+    - `MergeIncompleteError` (the model loses content; a retry would give the same
+      two rounds) → 'quarantine' + a warnings record, a retry on back-off;
+    - transient (`SummaryError`) — the status unchanged, the batch is released: the
+      model is unavailable for everyone else, a retry on the loop's back-off
+      (NFR-3).
 
-Джоба регистрируется на каркасе lsb-0014 (сборщик + строка в
-`jobs.JOB_BUILDERS`, прецедент warnings/terms_normalize): форма «по
-интервалу», слот summary — разрыв слота нарезки виден в /health и гейтит
-джобу как у прочих (ворота в каркасе, 3.4.1, LSBN-T-29: при разрыве партия
-не берётся). Нет суммаризатора (DI-сборки тестов) — джоба неприменима.
-Миграция не идёт (нет 'ожидает'/'карантин') — прогон пуст и дешев
-(только SQL), очередь видна в /health.queues.
+    The job registers on the lsb-0014 framework (a builder + a line in
+    `jobs.JOB_BUILDERS`, the warnings/terms_normalize precedent): the "by
+    interval" form, the summary slot — the splitting slot's breaker is visible in
+    /health and gates the job like the others (the gate in the framework, 3.4.1,
+    LSBN-T-29: on a breaker the batch is not taken). No summarizer (test DI
+    builds) — the job is not applicable. No migration in progress (no
+    'waiting'/'quarantine') — the run is empty and cheap (SQL only), the queue is
+    visible in /health.queues.
 """
 
 from __future__ import annotations
@@ -66,11 +69,11 @@ from app.storage.migration import (
     swap,
 )
 
-#: Фазы, при которых union-чтение включено (design §4: фазы 3–7; после
-#: обнуления — done, после прерывания — aborted — обе выключают union).
+#: Phases with the union read enabled (design §4: phases 3–7; after
+#: zeroing — done; after an abort — aborted — both disable the union).
 _UNION_PHASES = ("pour", "split")
 
-if TYPE_CHECKING:  # только для аннотаций — модуль остаётся чистым
+if TYPE_CHECKING:  # annotations only — the module stays clean
     from app.services.notes import NoteService
     from app.services.summary import MergeResult, Summarizer
     from app.services.warnings import WarningsService
@@ -78,40 +81,40 @@ if TYPE_CHECKING:  # только для аннотаций — модуль о�
 
 MIGRATION_JOB = "migration"
 
-#: Карантин нарезки (design F-22 §4): открытая запись kind=`split_deferred`
-#: на исходнике (upsert — повторное откладывание двигает updated_at, не
-#: плодит строки; прецедент merge_deferred F-23). Видна оператору в
-#: warnings; модель нарезки недоступна — сервис работает (постановка п. 4).
+#: The splitting quarantine (design F-22 §4): an open kind=`split_deferred` record
+#: on the source (upsert — re-deferring moves updated_at, does not
+#: multiply rows; the merge_deferred precedent of F-23). Visible to the operator in
+#: warnings; with the splitting model unavailable the service works (the brief p. 4).
 SPLIT_DEFERRED_WARNING = "split_deferred"
 
-#: Статусы, которые джоба берёт в работу: 'ожидает' — первично, 'карантин'
-#: — повтор по back-off (design §4: «карантин … повтор по back-off»).
+#: Statuses the job takes into work: 'waiting' — primary, 'quarantine'
+#: — a retry on back-off (design §4: "quarantine … a retry on back-off").
 _TAKEN_STATUSES = ("ожидает", "карантин")
 
 logger = logging.getLogger("app")
 
 
-# --- union-контекст чтения (M3, design §4) -----------------------------------
+# --- union read context (M3, design §4) -------------------------------------
 
 
 @dataclass(frozen=True)
 class MigrationContext:
-    """Процессный union-контекст: где лежит прежняя база и фаза миграции.
+    """The process-level union context: where the previous database is and the migration phase.
 
-    Holder — переменная `_CONTEXT` ниже, дефолт None: без миграции
-    потребители (search/notes/dedup) работают ровно по прежним путям —
-    нулевой оверхед (ни второго соединения, ни лишнего SQL). Контекст
-    выставляет `refresh_migration_context` (lifespan после фаз 0–3, джоба
-    при phase=done, abort после swap) — потребители только читают.
+            The holder — the `_CONTEXT` variable below, the default None: without a
+            migration the consumers (search/notes/dedup) work exactly over the old
+            paths — zero overhead (no second connection, no extra SQL). The context is
+            set by `refresh_migration_context` (lifespan after phases 0–3, the job at
+            phase=done, abort after the swap) — the consumers only read.
     """
 
-    legacy_path: str  # абсолютный путь прежней базы (migration.state.prev_file)
-    phase: str  # pour|split — читающие поверхности по ней не различаются
-    # Резерв диапазона id (design §8.1): нижняя граница НОВЫХ id
-    # (= MAX(id) прежней базы + 1, migration.state.id_floor). NoteService._insert
-    # выдаёт новым заметкам/частям id не ниже — без коллизий с old_id
-    # ждущих исходников (затенение в union, потери при abort). 0 — состояние
-    # без ключа (миграция, начатая до появления id_floor): max+1 как раньше.
+    legacy_path: str  # the previous database's absolute path (migration.state.prev_file)
+    phase: str  # pour|split — the read surfaces do not distinguish by it
+    # The id range reserve (design §8.1): the lower bound of NEW ids
+    # (= MAX(id) of the previous database + 1, migration.state.id_floor). NoteService._insert
+    # issues new notes/parts ids no lower — no collisions with the old_ids
+    # of waiting sources (shadowing in the union, losses on abort). 0 — a state
+    # without the key (a migration started before id_floor existed): max+1 as before.
     id_floor: int = 0
 
 
@@ -119,21 +122,21 @@ _CONTEXT: MigrationContext | None = None
 
 
 def migration_context() -> MigrationContext | None:
-    """Текущий union-контекст процесса; None — миграции нет/выключена."""
+    """The process's current union context; None — no migration / disabled."""
     return _CONTEXT
 
 
 def refresh_migration_context(settings: Settings) -> None:
-    """Синхронизировать контекст с состоянием миграции активной базы.
+    """Sync the context with the active database's migration state.
 
-    Включает union (phase ∈ {pour, split} и prev_file существует) или
-    выключает (нет состояния, done/aborted, файл исчез). Вызывается из
-    lifespan после фаз 0–3 (в т.ч. при возобновлении — рестарт середины
-    миграции поднимает union без нового перелива), джобой при phase=done
-    и abort'ом после swap. Идемпотентно; сбой чтения — union выключен.
-    Файла базы нет — union выключен БЕЗ открытия соединения: sqlite3.connect
-    создаёт пустой файл, а это побочный эффект, которого у чтения быть не
-    должно (свежая база до init_db).
+            Enables the union (phase ∈ {pour, split} and prev_file exists) or disables
+            it (no state, done/aborted, the file vanished). Called from lifespan after
+            phases 0–3 (including on resume — a restart in the middle of a migration
+            raises the union without a new pour), by the job at phase=done, and by
+            abort after the swap. Idempotent; a read failure — the union is off.
+            No database file — the union is disabled WITHOUT opening a connection:
+            sqlite3.connect creates an empty file, a side effect a read must not have
+            (a fresh database before init_db).
     """
     global _CONTEXT
     _CONTEXT = None
@@ -160,16 +163,16 @@ def refresh_migration_context(settings: Settings) -> None:
 
 
 def legacy_visible_ids(settings: Settings) -> set[int]:
-    """id заметок, чья единственная живая копия — прежняя база.
+    """Ids of notes whose only live copy is the previous database.
 
-    Статусы 'ожидает'/'карантин' (текст ещё в прежней базе); 'нарезана' и
-    'expired' НЕ входят — исходник заменён частями либо закрыт, union его
-    не показывает (design §4: «исключая id 'нарезана'/'expired'»).
-    Затенённые id исключаются: активная база выдаёт новым заметкам
-    max(id)+1, что может совпасть с id ждущего исходника — такая заметка
-    в активной базе СВОЯ, а не исходник (иначе union склеил бы разные
-    заметки по одному id). Таблицы migration_notes нет (миграции не было)
-    — множество пусто.
+            The 'waiting'/'quarantine' statuses (the text is still in the previous
+            database); 'split' and 'expired' are NOT included — the source was replaced
+            by parts or closed, the union does not show it (design §4: "excluding the
+            ids of 'split'/'expired'"). Shadowed ids are excluded: the active database
+            issues new notes max(id)+1, which may coincide with a waiting source's id —
+            such a note in the active database is ITS OWN, not a source (otherwise the
+            union would stitch different notes by one id). No migration_notes table
+            (no migration happened) — an empty set.
     """
     try:
         with session(settings) as conn:
@@ -184,16 +187,16 @@ def legacy_visible_ids(settings: Settings) -> set[int]:
 
 
 def _now() -> str:
-    """Текущее время в формате DDL ('%Y-%m-%dT%H:%M:%SZ') — сравнение с TTL.
+    """The current time in the DDL format ('%Y-%m-%dT%H:%M:%SZ') — the TTL comparison.
 
-    Формат совпадает с notes.expires_at (lsb-0004-02) — лексикографическое
-    сравнение строк корректно для одного формата.
+            The format matches notes.expires_at (lsb-0004-02) — a lexicographic string
+            comparison is correct for one format.
     """
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class MigrationService:
-    """Фаза 4 самомиграции: нарезка 'ожидает' частями ≤ целевого лимита."""
+    """Phase 4 of self-migration: splitting 'waiting' notes into parts ≤ the target limit."""
 
     def __init__(
         self,
@@ -206,19 +209,20 @@ class MigrationService:
         self._settings = settings
         self._summarizer = summarizer
         self._notes = notes
-        # Поверхность предупреждений (карантин виден оператору, постановка
-        # п. 4); None — DI-сборки тестов: остаётся только событие журнала
-        # (прецедент _defer_merge_pair).
+        # The warnings surface (the quarantine is visible to the operator, the brief
+        # p. 4); None — test DI builds: only the journal event remains
+        # (the _defer_merge_pair precedent).
         self._warnings = warnings
 
-    # --- очередь (для /health.queues и петли) --------------------------------
+    # --- queue (for /health.queues and the loop) -------------------------------
 
     def queue_stat(self) -> dict[str, int | None]:
-        """Снимок очереди нарезки (только SQL): pending + возраст старейшей.
+        """The splitting queue snapshot (SQL only): pending + the oldest's age.
 
-        Возраст — по `updated_at` взятого статуса (штамп двигают и нарезка,
-        и карантин) — та же семантика «возраст по pending+waiting» (3.3.1).
-        Таблицы migration_notes нет (миграции не было) — очередь пуста.
+                    The age — over `updated_at` of the taken status (the stamp is moved by
+                    splitting and quarantine alike) — the same "age over pending+waiting"
+                    semantics (3.3.1). No migration_notes table (no migration happened) —
+                    the queue is empty.
         """
         try:
             with session(self._settings) as conn:
@@ -234,22 +238,22 @@ class MigrationService:
         return {"pending": int(row["pending"]), "oldest_pending_sec": row["age"]}
 
     def queue_empty(self) -> bool:
-        """Пуста ли очередь нарезки (дешёвая перепроверка очереди, пул 6)."""
+        """Is the splitting queue empty (a cheap queue recheck, pool 6)."""
         return int(self.queue_stat()["pending"] or 0) == 0
 
-    # --- фаза 4: партия нарезки ----------------------------------------------
+    # --- phase 4: the splitting batch -----------------------------------------
 
     def process_batch(self, limit: int | None = None) -> int:
-        """Нарезать партию 'ожидает' (минимальный id вперёд); число обработанных.
+        """Split a batch of 'waiting' notes (lowest id first); the processed count.
 
-        Обработанное = изменённый статус ('нарезана'/'expired'/'карантин');
-        транзиентный отказ статуса не меняет и партию снимает (возврат уже
-        сделанного; пустой прогон растит back-off петли — модель недоступна,
-        постановка п. 4: сервис работает, нарезка ждёт).
+                    Processed = a changed status ('split'/'expired'/'quarantine'); a
+                    transient failure changes no status and releases the batch (return what
+                    is already done; an empty run grows the loop's back-off — the model is
+                    unavailable, the brief p. 4: the service works, splitting waits).
         """
-        # 1) Активна ли миграция и где прежняя база (design §3: state).
-        # phase=done/aborted — джоба стоит (M3): после прерывания и после
-        # обнуления нарезать нечего и нельзя (сервис уже на прежней базе).
+        # 1) Is the migration active and where is the previous database (design §3: state).
+        # phase=done/aborted — the job stands down (M3): after an abort and after
+        # zeroing there is nothing to split and it must not be done (the service is already on the previous database).
         state = self._read_state()
         if state is None or str(state.get("phase")) not in _UNION_PHASES:
             return 0
@@ -258,13 +262,13 @@ class MigrationService:
             return 0
         rows = self._taken_rows(limit)
         if not rows:
-            # Фаза 7 (M3): очередь нарезки пуста — сверка обнулена,
-            # phase=done (union выключается; state остаётся — migration_notes
-            # карта отката). Идемпотентно: следующий прогон — холостой.
+            # Phase 7 (M3): the splitting queue is empty — the reconciliation is zeroed,
+            # phase=done (the union is disabled; the state stays — migration_notes
+            # is the rollback map). Idempotent: the next run is an idle one.
             self._close_if_drained(state)
             return 0
-        # DEF-7a: нарезка началась — фаза видна в state и /health (design §3:
-        # pour — только перелив старта, split — нарезка; done/aborted — M3).
+        # DEF-7a: splitting has started — the phase is visible in state and /health (design §3:
+        # pour — the startup pour only, split — splitting; done/aborted — M3).
         self._mark_split_phase(state)
         done = 0
         legacy_settings = self._settings.model_copy(update={"db_path": legacy_path})
@@ -277,8 +281,8 @@ class MigrationService:
                     (old_id,),
                 ).fetchone()
                 if note is None or note["text"] is None:
-                    # Исходника нет (оператор удалил в прежней базе): нарезать
-                    # нечего — 'expired' закрывает заметку без модели.
+                    # No source (the operator deleted it in the previous database): nothing
+                    # to split — 'expired' closes the note without the model.
                     self._mark(
                         active, old_id, "expired", reason="исходника нет в прежней базе"
                     )
@@ -287,8 +291,8 @@ class MigrationService:
                 if note["expires_at"] is not None and str(
                     note["expires_at"]
                 ) <= _now():
-                    # TTL-истекла (design §4): 'expired' — физическое удаление
-                    # делает штатная джоба зачистки в прежней базе (FR-6).
+                    # TTL expired (design §4): for 'expired' the physical deletion
+                    # is done by the regular cleanup job in the previous database (FR-6).
                     self._mark(active, old_id, "expired", reason="истёк TTL")
                     done += 1
                     continue
@@ -300,25 +304,25 @@ class MigrationService:
                     attempts=int(row["attempts"]),
                 )
                 if outcome == "retry-later":
-                    break  # транзиент: модель лежит — партию снимаем
+                    break  # transient: the model is down — release the batch
                 done += 1
         return done
 
-    # --- внутреннее ----------------------------------------------------------
+    # --- internal --------------------------------------------------------------
 
     def _close_if_drained(self, state: dict) -> None:
-        """Фаза 7: очередь пуста → phase=done и union выключен (M3).
+        """Phase 7: the queue is empty → phase=done and the union is off (M3).
 
-        Вызывается на пустом прогоне при активной фазе: 'ожидает' и
-        'карантин' кончились — каждая заметка либо перелита 1:1, либо
-        нарезана, либо expired. State не снимается (design §3/§7):
-        migration_notes остаётся картой отката, счётчики — в /health.
+                    Called on an empty run during an active phase: 'waiting' and
+                    'quarantine' are exhausted — every note is either poured 1:1, split, or
+                    expired. The state is not removed (design §3/§7): migration_notes stays
+                    the rollback map, the counters — in /health.
         """
         try:
             with session(self._settings) as conn, transaction(conn):
                 set_state_phase(conn, "done")
         except (sqlite3.Error, StorageError):
-            return  # сверка переживает рестарт — done поставит следующий прогон
+            return  # the reconciliation survives a restart — done will be set by the next run
         refresh_migration_context(self._settings)
         logger.info(
             "migration: split queue drained — counters reconciled, phase=done",
@@ -331,12 +335,12 @@ class MigrationService:
         )
 
     def _mark_split_phase(self, state: dict) -> None:
-        """Старт фазы нарезки: phase pour → split в state (DEF-7a, design §3).
+        """The splitting phase start: phase pour → split in state (DEF-7a, design §3).
 
-        Пишется один раз — дальнейшие прогоны фазу не переписывают; done
-        (обнуление очереди) и aborted (прерывание, M3) — как было. Сбой
-        записи не ломает партию: фазу поставит следующий прогон (прецедент
-        _close_if_drained).
+                    Written once — further runs do not rewrite the phase; done (a zeroed
+                    queue) and aborted (an abort, M3) — as they were. A write failure does
+                    not break the batch: the next run sets the phase (the
+                    _close_if_drained precedent).
         """
         if str(state.get("phase")) == "split":
             return
@@ -356,17 +360,17 @@ class MigrationService:
         *,
         attempts: int,
     ) -> str:
-        """Нарезать одну заметку: split → save_migration_parts → статус.
+        """Split one note: split → save_migration_parts → the status.
 
-        Возврат: "done" (статус изменён), "quarantined", "retry-later"
-        (транзиент — статус тот же, партию снимать).
+                    Returns: "done" (the status changed), "quarantined", "retry-later"
+                    (transient — the status unchanged, release the batch).
         """
         try:
             result: MergeResult = self._summarizer.split(text)
         except MergeIncompleteError as exc:
-            # F-22 design §4: за MERGE_MAX_ROUNDS нарезка не сошлась —
-            # 'карантин' + warnings; повтор по back-off (минимальный id
-            # карантин берёт вместе с 'ожидает').
+            # F-22 design §4: splitting did not converge within MERGE_MAX_ROUNDS —
+            # 'quarantine' + warnings; a retry on back-off (the lowest id
+            # of quarantine is taken together with 'waiting').
             self._mark(
                 active,
                 old_id,
@@ -385,8 +389,8 @@ class MigrationService:
             self._open_warning(old_id, str(exc))
             return "quarantined"
         except SummaryError as exc:
-            # Транзиент (модель недоступна / ответ вне контракта): статус
-            # тот же, попытка посчитана, партия снимается — back-off петли.
+            # Transient (the model unavailable / an off-contract response): the status
+            # stays, the attempt is counted, the batch is released — the loop's back-off.
             self._bump_attempt(active, old_id)
             self._log(
                 "migration: split failed — note stays pending, retry by back-off",
@@ -397,8 +401,8 @@ class MigrationService:
             )
             return "retry-later"
         parts = [(part.title, part.text) for part in result.parts]
-        # Наблюдаемость (DEF-6): slot_call на КАЖДЫЙ вызов нарезки — как у
-        # merge/dedup (worker), дозапрос 2-го раунда виден отдельной строкой.
+        # Observability (DEF-6): a slot_call for EVERY splitting call — like
+        # merge/dedup (worker); the 2nd-round follow-up is visible as a separate line.
         self._log_slot_call(old_id, result)
         outcome = self._notes.save_migration_parts(old_id, namespace, parts)
         self._log(
@@ -413,7 +417,7 @@ class MigrationService:
         return "done"
 
     def _read_state(self) -> dict | None:
-        """Состояние миграции активной базы; None — нарезать нечего."""
+        """The active database's migration state; None — nothing to split."""
         try:
             with session(self._settings) as conn:
                 return read_state(conn)
@@ -421,10 +425,11 @@ class MigrationService:
             return None
 
     def _legacy_path(self, state: dict) -> str | None:
-        """Путь прежней базы из state (prev_file); нет — warning и холостой ход.
+        """The previous database's path from state (prev_file); none — a warning and an idle run.
 
-        После снятия состояния (фаза 7, M3) или у немигрировавшей базы
-        prev_file отсутствует — это штатно (джоба просто не нужна).
+                    After the state is removed (phase 7, M3) or for a never-migrated
+                    database prev_file is absent — that is normal (the job is simply not
+                    needed).
         """
         prev_file = state.get("prev_file")
         if not prev_file:
@@ -443,7 +448,7 @@ class MigrationService:
         return str(candidate)
 
     def _taken_rows(self, limit: int | None) -> list[Any]:
-        """Минимальные id взятых статусов ('ожидает' + карантин по back-off)."""
+        """Minimal ids of the taken statuses ('waiting' + quarantine on back-off)."""
         query = (
             f"SELECT old_id, status, attempts FROM {MIGRATION_NOTES_TABLE} "
             f"WHERE status IN (?, ?) ORDER BY old_id"
@@ -454,7 +459,7 @@ class MigrationService:
             with session(self._settings) as conn:
                 return conn.execute(query, _TAKEN_STATUSES).fetchall()
         except (sqlite3.Error, StorageError):
-            return []  # таблицы migration_notes нет — миграции не было
+            return []  # no migration_notes table — no migration happened
 
     @staticmethod
     def _mark(
@@ -465,7 +470,7 @@ class MigrationService:
         reason: str | None = None,
         bump_attempts: bool = False,
     ) -> None:
-        """Сменить статус записи миграции (внутри сессии вызывающего)."""
+        """Change a migration record's status (inside the caller's session)."""
         conn.execute(
             f"UPDATE {MIGRATION_NOTES_TABLE} "
             f"SET status = ?, reason = ?, attempts = attempts + ?, "
@@ -476,7 +481,7 @@ class MigrationService:
 
     @staticmethod
     def _bump_attempt(conn: sqlite3.Connection, old_id: int) -> None:
-        """Посчитать транзиентную попытку (статус не меняется — design §4)."""
+        """Count a transient attempt (the status unchanged — design §4)."""
         conn.execute(
             f"UPDATE {MIGRATION_NOTES_TABLE} SET attempts = attempts + 1, "
             f"updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
@@ -485,7 +490,7 @@ class MigrationService:
         )
 
     def _open_warning(self, old_id: int, reason: str) -> None:
-        """Карантин виден оператору (постановка п. 4); None — только журнал."""
+        """The quarantine is visible to the operator (the brief p. 4); None — journal only."""
         if self._warnings is None:
             return
         try:
@@ -498,7 +503,7 @@ class MigrationService:
                 "the legacy base",
                 {"reason": reason[:500]},
             )
-        except Exception:  # noqa: BLE001 — предупреждение не ломает партию
+        except Exception:  # noqa: BLE001 — a warning does not break the batch
             logger.warning(
                 "migration: failed to record split_deferred warning",
                 extra={
@@ -509,11 +514,12 @@ class MigrationService:
             )
 
     def _log(self, message: str, event: str, **fields: Any) -> None:
-        """Событие джобы в общий журнал: обязательное поле `job` (FR-1.4).
+        """The job's event in the shared journal: the mandatory `job` field (FR-1.4).
 
-        Мета вызова (№49/№50) идёт плоскими полями `meta.model`/`meta.provider`
-        — как у slot_call воркера; rounds/parts/part_ids — наблюдаемость
-        нарезки (постановка: «какой моделью нарезано» — в журнале и отчёте).
+                    The call metadata (#49/#50) goes as flat `meta.model`/`meta.provider`
+                    fields — like the worker's slot_call; rounds/parts/part_ids — splitting
+                    observability (the brief: "split by which model" — in the journal and
+                    the report).
         """
         meta = fields.pop("meta", None)
         payload: dict[str, Any] = {"event": event, "job": MIGRATION_JOB}
@@ -528,13 +534,13 @@ class MigrationService:
         logger.info(message, extra=payload)
 
     def _log_slot_call(self, old_id: int, result: MergeResult) -> None:
-        """slot_call на каждый вызов нарезки (DEF-6; прецедент merge — worker).
+        """A slot_call per splitting call (DEF-6; the merge precedent — worker).
 
-        Те же поля успешного вызова, что у воркера (`_call_log_fields`):
-        операция/модель/бюджет/длительность — «сколько времени ушло» видно
-        по строке на вызов; без метаданных (тестовый двойник) — молча.
-        Импорт по месту: воркер тяжёлый и тянет полсистемы — миграция не
-        должна импортировать его наверх (прецедент lazy-импортов notes).
+                    The same successful-call fields as the worker's (`_call_log_fields`):
+                    the operation/model/budget/duration — "how long it took" is visible per
+                    line per call; without metadata (a test double) — silent. A local
+                    import: the worker is heavy and drags half the system — migration must
+                    not import it at the top (the lazy-import precedent of notes).
         """
         from app.services.worker import SLOT_SUMMARY, _call_log_fields
 
@@ -551,10 +557,10 @@ class MigrationService:
             logger.info("slot_call", extra=payload)
 
 
-# --- прерывание (M3, design §4 «Прерывание») ---------------------------------
+# --- abort (M3, design §4 "Aborting") ---------------------------------------
 
 
-#: Мягкие отказы POST /migration/abort: прерывать нечего / уже прервано.
+#: Soft failures of POST /migration/abort: nothing to abort / already aborted.
 ABORT_HINT_NONE = (
     "no migration to abort: the base is not mid-migration "
     "(phase is done/aborted or there is no migration state)"
@@ -569,25 +575,25 @@ ABORT_HINT_NOTHING_TO_SPLIT = (
 
 
 def abort_migration(settings: Settings) -> dict:
-    """Прервать миграцию без потерь: сервис остаётся на прежней базе.
+    """Abort the migration without losses: the service stays on the previous database.
 
-    Порядок (design §4): 1) «стоп джобы» — phase=aborted в активной базе,
-    следующая партия нарезки берёт ноль заметок (идущая партия успевает
-    только дописать части в уходящую базу — они исключаются из перелива,
-    дизайн риска 5: короткие сессии + снапшот фазы 1); 2) reverse-pour
-    дельты активной базы в прежнюю — апсерт UPDATE-else-INSERT (REPLACE
-    ломает FTS внешнего контента), части (record_versions
-    source='migration_split') и их зависимости исключаются — «id вне
-    отображения частей»; 3) swap: активная (новая) база уходит под имя
-    своего CHECK, прежняя возвращается на db_path — НЕ удаляется;
-    4) phase=aborted в восстановленной базе (ставит reverse_pour) и
-    union-контекст выключен. Повторный вызов после сбоя между (1) и (3)
-    возобновляет abort: reverse_pour идемпотентен (апсерт).
+            The order (design §4): 1) "stop the job" — phase=aborted in the active
+            database, the next splitting batch takes zero notes (the running batch only
+            manages to write parts into the outgoing database — they are excluded from
+            the pour, risk design 5: short sessions + the phase-1 snapshot);
+            2) reverse-pour the active database's delta into the previous one — an
+            upsert of UPDATE-else-INSERT (REPLACE breaks the external content's FTS),
+            parts (record_versions source='migration_split') and their dependencies
+            are excluded — "ids outside the parts mapping"; 3) swap: the active (new)
+            database moves under its CHECK name, the previous one returns to db_path —
+            NOT deleted; 4) phase=aborted in the restored database (set by
+            reverse_pour) and the union context is off. A repeated call after a failure
+            between (1) and (3) resumes the abort: reverse_pour is idempotent (upsert).
 
-    Возврат: {"aborted": True, ...} — прервано этим вызовом; мягкий отказ
-    {"aborted": False, "hint": ...} — прерывать нечего/уже прервано.
-    Прерывание применимо к миграции «вниз» (есть очередь нарезки):
-    возврат «вверх» завершается при старте синхронно — прерывать нечего.
+            Returns: {"aborted": True, ...} — aborted by this call; a soft failure
+            {"aborted": False, "hint": ...} — nothing to abort / already aborted.
+            Aborting applies to a "downward" migration (there is a splitting queue): a
+            return "upward" completes synchronously at startup — nothing to abort.
     """
     with session(settings) as conn:
         state = read_state(conn)
@@ -596,8 +602,8 @@ def abort_migration(settings: Settings) -> dict:
         return {"aborted": False, "hint": ABORT_HINT_NONE}
     prev_name = str(state.get("prev_file") or "")
     if not prev_name or prev_name == Path(settings.db_path).name:
-        # Уже на прежней базе (swap после abort состоялся): prev_file
-        # указывает на уходящую базу, т.е. на сам db_path.
+        # Already on the previous database (the swap after abort happened): prev_file
+        # points at the outgoing database, i.e. at db_path itself.
         return {"aborted": False, "hint": ABORT_HINT_ALREADY}
     legacy_path = str(Path(settings.db_path).parent / prev_name)
     if not Path(legacy_path).is_file():
@@ -605,18 +611,18 @@ def abort_migration(settings: Settings) -> dict:
     if str(state.get("phase")) in _UNION_PHASES:
         pending = _pending_count(settings)
         if pending == 0:
-            # Возврат «вверх»/обнулённая очередь: нарезка не нужна, обратно
-            # переливать нечего (всё и так в обеих базах) — не трогаем.
+            # A return "upward"/a zeroed queue: splitting is not needed, there is nothing
+            # to pour back (everything is already in both databases) — leave it alone.
             return {"aborted": False, "hint": ABORT_HINT_NOTHING_TO_SPLIT}
-        # 1) Стоп джобы: phase=aborted ДО перелива (джоба видит на следующей
-        # партии; юнион-чтение ещё работает — прежняя база целa до swap).
+        # 1) Stop the job: phase=aborted BEFORE the pour (the job sees it on the next
+        # batch; the union read still works — the previous database is intact until the swap).
         with session(settings) as conn, transaction(conn):
             set_state_phase(conn, "aborted")
-    # 2) Дельта активной базы → прежняя (части исключаются); target = CHECK
-    # приёмника (prev_limit): штамп schema.note_chars остаётся её собственным.
-    # exclude — все old_id миграции: новый заметке активная база может
-    # выдать id исходника (max+1), апсерт затер бы оригинал прежней базы;
-    # такая заметка остаётся только в уходящем файле (он не удаляется).
+    # 2) The active database's delta → the previous one (parts excluded); target = the
+    # receiver's CHECK (prev_limit): the schema.note_chars stamp stays its own.
+    # exclude — all the migration's old_ids: the active database may issue a new note
+    # the source's id (max+1); an upsert would overwrite the previous database's original;
+    # such a note remains only in the outgoing file (it is not deleted).
     counters = reverse_pour(
         settings,
         source_path=legacy_path,
@@ -626,10 +632,10 @@ def abort_migration(settings: Settings) -> dict:
         phase="aborted",
         exclude_note_ids=_migration_note_ids(settings),
     )
-    # 3) Swap назад: новая база уходит под имя своего CHECK (не удаляется),
-    # прежняя возвращается на db_path — следующие session() открывают её.
-    # Имя решается ДО reverse_pour (LSBN-D-12): оно расходится в state и
-    # цепочку приёмника; занятое посторонним файлом — суффикс .away.
+    # 3) Swap back: the new database moves under its CHECK name (not deleted),
+    # the previous one returns to db_path — the following session() calls open it.
+    # The name is decided BEFORE reverse_pour (LSBN-D-12): it goes into state and
+    # the receiver's chain; if taken by a foreign file — the .away suffix.
     swap(
         settings,
         away_file=free_away_name(
@@ -637,8 +643,8 @@ def abort_migration(settings: Settings) -> dict:
         ),
         incoming_file=legacy_path,
     )
-    # 4) Состояние восстановленной базы — phase=aborted (reverse_pour);
-    # union-чтение выключается.
+    # 4) The restored database's state — phase=aborted (reverse_pour);
+    # the union read is disabled.
     refresh_migration_context(settings)
     logger.info(
         "migration aborted — service stays on the previous base",
@@ -658,7 +664,7 @@ def abort_migration(settings: Settings) -> dict:
 
 
 def _pending_count(settings: Settings) -> int:
-    """Число заметок в очереди нарезки ('ожидает' + 'карантин')."""
+    """The number of notes in the splitting queue ('waiting' + 'quarantine')."""
     try:
         with session(settings) as conn:
             row = conn.execute(
@@ -671,11 +677,12 @@ def _pending_count(settings: Settings) -> int:
 
 
 def _migration_note_ids(settings: Settings) -> set[int]:
-    """Все old_id миграции (любой статус) — запрет апсерта в прежнюю базу.
+    """All old_ids of the migration (any status) — no upsert into the previous database.
 
-    Для reverse-pour прерывания: id исходника в прежней базе занят его
-    собственной строкой, а активная база могла выдать его новой заметке
-    (sqlite: max(id)+1) — апсерт по такому id затёр бы оригинал.
+            For the abort's reverse-pour: the source id in the previous database is
+            taken by its own row, and the active database may have issued it to a new
+            note (sqlite: max(id)+1) — an upsert by such an id would overwrite the
+            original.
     """
     try:
         with session(settings) as conn:
@@ -687,33 +694,36 @@ def _migration_note_ids(settings: Settings) -> set[int]:
     return {int(row[0]) for row in rows}
 
 
-# --- фаза 7: сверка для /health (M3, design §4/§7) ---------------------------
+# --- phase 7: the /health reconciliation (M3, design §4/§7) ------------------
 
 
 def migration_health(settings: Settings) -> dict:
-    """Блок `migration` для /health: фаза, направление, причина, инвариант.
+    """The `migration` block for /health: phase, direction, reason, invariant.
 
-    Счётчики — ЗАМЕТКИ (решение пилота): old_total — заметки прежней базы
-    (живой COUNT — сверковая база), poured — перелитые 1:1 при старте
-    (зафиксирован в state.counters переливом; после abort'а — всё
-    вернувшееся целым), split_notes/parts/quarantine/expired/waiting —
-    живые статусы migration_notes и история частей. Инвариант сверки:
-    old_total = poured + split_notes + waiting + quarantine + expired
-    (расхождение = прежнюю базу правили в обход миграции — удаление
-    исходника оператором); после abort'а parts=0 и очередь пуста.
-    `slot` — разделитель слота нарезки (3.4.1, LSBN-T-27): партия и пауза
-    из настроек процесса — оператор видит, сколько берётся за прогон и на
-    сколько джоба уходит в паузу. Без состояния миграции — {"phase": None}
-    (slot остаётся: значения — свойства конфигурации, не состояния).
+            The counters are NOTES (the pilot's decision): old_total — the previous
+            database's notes (a live COUNT — the reconciliation database), poured —
+            poured 1:1 at the start (recorded in state.counters by the pour; after an
+            abort — everything that came back whole), split_notes/parts/quarantine/
+            expired/waiting — the live migration_notes statuses and the parts history.
+            The reconciliation invariant:
+            old_total = poured + split_notes + waiting + quarantine + expired
+            (a mismatch = the previous database was edited bypassing the migration —
+            the operator deleted a source); after an abort parts=0 and the queue is
+            empty. `slot` — the splitting slot delimiter (3.4.1, LSBN-T-27): the batch
+            and the pause from the process settings — the operator sees how much is
+            taken per run and how long the job sleeps. Without migration state —
+            {"phase": None} (slot stays: the values are configuration properties, not
+            state).
 
-    Направление (DEF-7b, LSBN-D-11): `direction: forward|reverse`. Состояние
-    reverse-pour (возврат вверх — phase=done, прерывание — aborted) пишется
-    `reverse_pour` с подписью `kept_parts` в counters; в этом режиме счётчик
-    `poured` прямого перелива не существует — показываются `poured_rows`
-    (строки ВСЕХ таблиц дельты) и `kept_parts` (неперелитые части остались
-    в уходящей базе), а forward-инвариант не считается (`invariant_ok=None`):
-    числа строк и заметок несравнимы, прежний вывод читался как ошибка
-    миграции. Для abort'а сохранён прежний вид («всё вернулось целым»).
+            The direction (DEF-7b, LSBN-D-11): `direction: forward|reverse`. The
+            reverse-pour state (a return upward — phase=done; an abort — aborted) is
+            written by `reverse_pour` with the `kept_parts` caption in counters; in
+            this mode the forward pour's `poured` counter does not exist —
+            `poured_rows` (rows of ALL the delta's tables) and `kept_parts` (parts left
+            unpoured in the outgoing database) are shown instead, and the forward
+            invariant is not computed (`invariant_ok=None`): row and note numbers are
+            incomparable, the old output read as a migration error. For an abort the
+            old view is preserved ("everything came back whole").
     """
     slot = {
         "batch": int(settings.migration_batch),
@@ -735,20 +745,20 @@ def migration_health(settings: Settings) -> dict:
     quarantine = statuses.get("карантин", 0)
     expired = statuses.get("expired", 0)
     old_total = _legacy_total(settings, state, phase)
-    # reverse-pour — единственный писец `kept_parts`; прямому переливу это
-    # поле не принадлежит (pour/split/done вниз — old_total/pending).
+    # reverse-pour is the only writer of `kept_parts`; the forward pour does not
+    # own this field (pour/split/done downward — old_total/pending).
     direction = "reverse" if "kept_parts" in counters else "forward"
     if old_total is None:
         poured = None
         invariant_ok = None
     elif phase == "aborted":
-        # После прерывания всё вернулось целым: прежняя база снова полная,
-        # state.counters от reverse_pour (строки перелива) — не про заметки.
+        # After the abort everything came back whole: the previous database is full again,
+        # state.counters from reverse_pour (poured rows) — not about notes.
         poured = old_total
         invariant_ok = old_total == poured + split_notes + waiting + quarantine + expired
     elif direction == "reverse":
-        # Возврат вверх (phase=done): poured прямого перелива не писался,
-        # инвариант прямого хода к этим числам неприменим (DEF-7b).
+        # A return upward (phase=done): the forward pour's poured was never written,
+        # the forward invariant does not apply to these numbers (DEF-7b).
         poured = None
         invariant_ok = None
     else:
@@ -773,8 +783,8 @@ def migration_health(settings: Settings) -> dict:
         "invariant_ok": invariant_ok,
     }
     if direction == "reverse":
-        # Поля reverse-режима: строки дельты (все таблицы) и неперелитые
-        # части; poured прямого хода в этом состоянии не существует.
+        # Reverse-mode fields: the delta's rows (all tables) and the unpoured
+        # parts; the forward poured does not exist in this state.
         block["direction"] = "reverse"
         block["counters"]["poured_rows"] = counters.get("poured")
         block["counters"]["kept_parts"] = counters.get("kept_parts")
@@ -784,7 +794,7 @@ def migration_health(settings: Settings) -> dict:
 
 
 def _status_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    """Статусы migration_notes → {статус: число}; таблицы нет — пусто."""
+    """migration_notes statuses → {status: count}; no table — empty."""
     try:
         rows = conn.execute(
             f"SELECT status, COUNT(*) AS n FROM {MIGRATION_NOTES_TABLE} "
@@ -796,7 +806,7 @@ def _status_counts(conn: sqlite3.Connection) -> dict[str, int]:
 
 
 def _part_count(conn: sqlite3.Connection) -> int:
-    """Число частей нарезки в активной базе (источник record_versions)."""
+    """The number of split parts in the active database (the record_versions source)."""
     try:
         row = conn.execute(
             "SELECT COUNT(DISTINCT entity_id) FROM record_versions "
@@ -809,11 +819,11 @@ def _part_count(conn: sqlite3.Connection) -> int:
 
 
 def _legacy_total(settings: Settings, state: dict, phase: str) -> int | None:
-    """Живое число заметок базы-источника сверки; нет файла — None.
+    """The live note count of the reconciliation's source database; no file — None.
 
-    Во время миграции (pour/split/done) прежняя база — рядом под именем из
-    state.prev_file; после abort'а она и есть активная (prev_file указывает
-    на уходящую базу) — считаем db_path.
+            During the migration (pour/split/done) the previous database sits nearby
+            under the state.prev_file name; after an abort it IS the active one
+            (prev_file points at the outgoing database) — count db_path.
     """
     prev_file = str(state.get("prev_file") or "")
     if phase == "aborted":
@@ -837,27 +847,27 @@ def _legacy_total(settings: Settings, state: dict, phase: str) -> int | None:
 def build_migration_job(
     worker: "BackgroundWorker", settings: Settings
 ) -> jobs.JobSpec | None:
-    """Сборщик джобы `migration`: без суммаризатора — неприменима.
+    """The `migration` job builder: without a summarizer — not applicable.
 
-    Форма «по интервалу» (без события: 'ожидает' появляются только при
-    самом старте миграции — M1); прогон уходит в `to_thread`. Слот —
-    `summary` (нарезка наследует его слот при незаданных SPLIT_*). Ворота
-    слота — как у прочих (3.4.1, LSBN-T-29): `gate` — `_slot_gate`
-    воркера (с пробным стуком по истечении паузы), `is_gated` —
-    `_slot_blocked` (снимки очереди без моделей); прежде джоба заявляла
-    слот, но при разрыве продолжала дёргать мёртвый слот — теперь партию
-    не берёт каркас.
+            The "by interval" form (no event: 'waiting' notes appear only at the very
+            start of a migration — M1); the run goes into `to_thread`. The slot —
+            `summary` (splitting inherits its slot when SPLIT_* are unset). The slot
+            gate — like the others (3.4.1, LSBN-T-29): `gate` — the worker's
+            `_slot_gate` (with a probe knock after the pause expires), `is_gated` —
+            `_slot_blocked` (queue snapshots without models); before, the job declared
+            a slot but kept poking the dead slot on a breaker — now the framework does
+            not take the batch.
 
-    Разделитель слота нарезки (3.4.1, LSBN-T-27):
-    партия — `MIGRATION_BATCH` заметок, после прогона петля спит
-    `MIGRATION_PAUSE_SEC` (pause_after_run), затем берёт следующую —
-    нарезка не монополизирует сервер генерации. Свои числа, НЕ чужие
-    смыслы: `embedding_batch_size` — чанки одного запроса /api/embed
-    векторизации, `pending_retry_sec` — стартовый интервал ретрая
-    до-обработки. Оба значения видны в /health.migration.slot и в
-    стартовом логе (`startup`); крутятся override'ом без релиза.
+            The splitting slot delimiter (3.4.1, LSBN-T-27):
+            a batch is `MIGRATION_BATCH` notes, after a run the loop sleeps
+            `MIGRATION_PAUSE_SEC` (pause_after_run), then takes the next one —
+            splitting does not monopolize the generation server. Own numbers, NOT
+            foreign meanings: `embedding_batch_size` — the chunks of one /api/embed
+            vectorization request, `pending_retry_sec` — the starting retry interval
+            of pre-processing. Both values are visible in /health.migration.slot and in
+            the startup log (`startup`); tuned by an override without a release.
     """
-    if worker._summarizer is None:  # тестовый режим без суммаризатора
+    if worker._summarizer is None:  # a test mode without a summarizer
         return None
     service = MigrationService(
         settings,
@@ -867,8 +877,8 @@ def build_migration_job(
     )
 
     async def process() -> int:
-        # Ровно партия разделителя за прогон (LSBN-T-27): не все 'ожидает'
-        # разом — следующий прогон случится после паузы слота.
+        # Exactly the delimiter's batch per run (LSBN-T-27): not all 'waiting'
+        # at once — the next run comes after the slot's pause.
         return await asyncio.to_thread(
             service.process_batch, settings.migration_batch
         )
@@ -891,6 +901,6 @@ def build_migration_job(
     )
 
 
-# Регистрация джобы в реестре каркаса (FR-1.1/FR-1.6): своя джоба — в своём
-# модуле (одна строка в `JOB_BUILDERS`); импорт односторонний — migration → jobs.
+# Registering the job in the framework registry (FR-1.1/FR-1.6): one's own job — in one's own
+# module (one line in `JOB_BUILDERS`); the import is one-way — migration → jobs.
 jobs.JOB_BUILDERS += (build_migration_job,)
