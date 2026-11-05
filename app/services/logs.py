@@ -1,53 +1,56 @@
-"""LogsService — сервис области «Логи ассистента» (LSBN-F-10, релиз 3.2.0).
+"""LogsService — the "Assistant logs" area service (LSBN-F-10, release 3.2.0).
 
-Форма записи, словарь объекта и связки id/версия/ссылка — arch §7.3; проекция и
-версионирование — §5.4/§11; контракт сервиса — §6.1.
+    The record shape, the object dictionary and the id/version/ref links — arch
+    §7.3; the projection and versioning — §5.4/§11; the service contract — §6.1.
 
-Ключевые свойства
------------------
-* **Запись лога — не знание** (FR-2.4/§4): сервис пишет только по явному вызову
-  агента (`logs_save`) или оператора (REST, 03); автологирования нет, слоты
-  своих вызовов в область не пишут.
-* **Обязательные поля — `action` + `reason`** (§7.3 п.1): «что сделано» и
-  «почему»; объект изменения, результат и «что проверено» необязательны, но
-  структурированы. Форма проверяется **до** БД: каждый отказ — свой дословный
-  hint (`LogValidationError`, прецедент `TermValidationError`), записи нет.
-* **Словарь объекта закрыт** (§5.4): версионные сущности (`note`, `skill`,
-  `term`, `user_fact`, `assistant_log`) требуют `entity_id` (и допускают
-  `entity_version`), внешние (`file`, `commit`, `tracker_task`, `config`,
-  `contour`) — непустой `entity_ref` (путь, хэш коммита, ключ задачи, имя
-  конфига).
-* **`source`/`session` не выдумывает модель** (§7.1/§13.3): по умолчанию они
-  берутся из `history.current_origin()` (`bind_origin` миддлвара), явные
-  значения вызывающего сильнее. В ТАБЛИЦЕ лога `source`/`session` — контентные
-  поля («какой канал/сессия породили действие»), отдельно от
-  `record_versions.source/session` (происхождение самой версии).
-* **Версии — тем же слоем истории** (№41, §11/§13.5): `record_initial` при
-  создании, `record_change` при фактической правке, `record_event('delete')` при
-  мягком удалении — тем же соединением и в той же транзакции. Своих соединений и
-  транзакций для истории сервис не открывает: атомарность держит вызывающий.
-* **Эмбеддинг на пути записи НЕ зовётся**: вектор (непустые `action` + `reason` +
-  `outcome`) догоняет петля `areas` воркера по `vector_status='pending'`, а после
-  успешной записи/правки/удаления сервис её будит (`set_areas_notifier`).
-* **Изоляция области** (§13.2/§13.4): SQL сервиса адресует только
-  `assistant_logs`; состояние объекта изменения (`entity_state`) считает слой
-  истории (04), а не сервис логов.
-* **Поиск и листинг — собственный SQL области** (§13.2, f10-03): гибрид
-  vec0-KNN + FTS5/BM25 → RRF со срезами по объекту/сессии/источнику/абсолютным
-  датам; `entity_state`/`resolve_entity` — 04.
+    Key properties
+    --------------
+    * **A log entry is not knowledge** (FR-2.4/§4): the service writes only on an
+      explicit call by the agent (`logs_save`) or the operator (REST, 03); there is
+      no autologging, slots do not write their own calls into the area.
+    * **Mandatory fields — `action` + `reason`** (§7.3 p.1): "what was done" and
+      "why"; the change object, the outcome and "what was verified" are optional
+      but structured. The shape is checked **before** the DB: each failure has its
+      own verbatim hint (`LogValidationError`, the `TermValidationError`
+      precedent), no record is written.
+    * **The object dictionary is closed** (§5.4): versioned entities (`note`,
+      `skill`, `term`, `user_fact`, `assistant_log`) require `entity_id` (and allow
+      `entity_version`), external ones (`file`, `commit`, `tracker_task`, `config`,
+      `contour`) — a non-empty `entity_ref` (a path, a commit hash, a task key, a
+      config name).
+    * **`source`/`session` are never invented by the model** (§7.1/§13.3): by
+      default they come from `history.current_origin()` (the `bind_origin`
+      middleware), explicit caller values win. In the log TABLE `source`/`session`
+      are content fields ("which channel/session produced the action"), separate
+      from `record_versions.source/session` (the origin of the version itself).
+    * **Versions — by the same history layer** (#41, §11/§13.5): `record_initial`
+      at creation, `record_change` on an actual edit, `record_event('delete')` on a
+      soft delete — with the same connection and in the same transaction. The
+      service opens no connections/transactions of its own for history: the caller
+      holds atomicity.
+    * **Embedding is NOT called on the write path**: the vector (non-empty `action`
+      + `reason` + `outcome`) is caught up by the worker's `areas` loop over
+      `vector_status='pending'`, and after a successful save/update/delete the
+      service wakes the loop (`set_areas_notifier`).
+    * **Area isolation** (§13.2/§13.4): the service's SQL addresses only
+      `assistant_logs`; the change object's state (`entity_state`) is computed by
+      the history layer (04), not by the logs service.
+    * **Search and listing — the area's own SQL** (§13.2, f10-03): a hybrid of
+      vec0-KNN + FTS5/BM25 → RRF with slices by object/session/source/absolute
+      dates; `entity_state`/`resolve_entity` — 04.
 
-Контракты ответов (MCP-слой срезает служебные поля белым списком — f10-02):
-- save   → {created: True, id, version: 1} | {created: False, hint}
-- get    → {id, action, reason, entity, entity_id, entity_version, entity_ref,
-            outcome, verified, source, session, created_at, updated_at};
-           нет/удалена → {id, hint}
-- update → {id, updated: True} | {id, updated: False, hint}
-- delete → {id, deleted: True} | {id, deleted: False, hint}
-- search → {results: [{id, action, entity, entity_id, created_at, score}],
-            warning?, hint?} — `action` обрезан до excerpt (f10-03)
-- list   → {items: [{id, action, entity, entity_id, created_at}], total,
-            has_more, next_offset, next_cursor} — `action` целиком (f10-03);
-           обрезает только MCP-выдача, REST оператора — полный текст
+    Response contracts (the MCP layer trims service fields by a whitelist — f10-02):
+    - save   → {created: True, id, version: 1} | {created: False, hint}
+    - get    → {id, action, reason, entity, entity_id, entity_version, entity_ref,
+                outcome, verified, source, session, created_at, updated_at};
+               missing/deleted → {id, hint}
+    - update → {id, updated: True} | {id, updated: False, hint}
+    - delete → {id, deleted: True} | {id, deleted: False, hint}
+    - search → {results: [{id, action, entity, entity_id, created_at, score}],
+                warning?, hint?} — `action` trimmed to an excerpt (f10-03)
+    - list   → {items: [{id, action, entity, entity_id, created_at}], total,
+                has_more, next_offset, next_cursor} — `action` in full (f10-03);
+               only the MCP output trims it, the operator's REST gets the full text
 """
 
 from __future__ import annotations
@@ -61,11 +64,11 @@ from typing import Any
 from app import __version__
 from app.config import Settings
 from app.services import history
-# Пустые исходы области и деградация FTS-only — общие константы (arch §7.3/§8:
-# «переиспользуются как у других областей»), свои тексты не заводим.
+# The area's empty outcomes and the FTS-only degradation — shared constants (arch §7.3/§8:
+# "reused like other areas'"), no own texts are introduced.
 from app.services.areas import HINT_NO_RESULTS, HINT_SHORT_QUERY
 from app.services.embedding import Embedder, EmbeddingError
-# Абсолютные даты срезов — парсер блока 4 (№29, arch §8/§13.12): свой не пишем.
+# Absolute slice dates — the block-4 parser (#29, arch §8/§13.12): no own parser.
 from app.services.freshness import (
     FreshnessValidationError,
     parse_updated_after,
@@ -79,30 +82,30 @@ from app.storage.db import (
     ASSISTANT_LOGS_FTS_TABLE,
     ASSISTANT_LOGS_TABLE,
 )
-# Соединение области: `session` импортируется под псевдонимом — имя `session`
-# занято контентным параметром лога (`save`/`update`, arch §5.4/§7.1).
+# The area connection: `session` is imported under an alias — the name `session`
+# is taken by the log's content parameter (`save`/`update`, arch §5.4/§7.1).
 from app.storage.db import session as db_session
 from app.storage.db import transaction
 
-# --- Словарь объекта изменения (arch §5.4: «константа в сервисе») ------------
+# --- Change object dictionary (arch §5.4: "a constant in the service") -------
 
-# Версионные сущности памяти — адресуются id (и, если известна, версией).
+# Versioned memory entities — addressed by id (and, if known, by version).
 VERSIONED_ENTITY_KINDS = frozenset(
     {"note", "skill", "term", "user_fact", "assistant_log"}
 )
-# Объекты вне памяти — id у них нет, ссылка только текстовая.
+# Objects outside memory — they have no id, the reference is text-only.
 EXTERNAL_ENTITY_KINDS = frozenset(
     {"file", "commit", "tracker_task", "config", "contour"}
 )
-# Полный закрытый словарь `entity`.
+# The full closed `entity` dictionary.
 ENTITY_KINDS = VERSIONED_ENTITY_KINDS | EXTERNAL_ENTITY_KINDS
 
-# Источники записи (§5.1): канал, которым запись пришла в область. Фоновые
-# джобы пишут `job:<имя>` (набор открыт — префикс, а не элемент словаря).
+# Record sources (§5.1): the channel the record arrived into the area by. Background
+# jobs write `job:<name>` (the set is open — a prefix, not a dictionary element).
 LOG_SOURCES = frozenset({"mcp", "rest", "merge", "migration"})
 JOB_SOURCE_PREFIX = "job:"
 
-# --- Hint'ы мягких отказов (arch §7.3: «дословные константы в коде») --------
+# --- Soft-failure hints (arch §7.3: "verbatim constants in code") -----------
 
 HINT_ACTION_REQUIRED = (
     "not saved: action is required — say what was done (≤500 characters)"
@@ -132,88 +135,89 @@ HINT_NOT_FOUND = (
     "log entry not found — there is no such entry in this area; save it via "
     "logs_save(action, reason) if it is worth keeping"
 )
-# Срезы по дате — только абсолютные (§7.3, §8/§13.12): относительная
-# формулировка отвергается тем же стилем мягкого отказа.
+# Date slices — absolute only (§7.3, §8/§13.12): a relative
+# wording is rejected in the same soft-failure style.
 HINT_DATE_ABSOLUTE = (
     "not filtered: dates are absolute only (YYYY-MM-DD); relative dates "
     "are not supported"
 )
-# Обратный диапазон канон §7.3 не описывает (там только HINT_DATE_ABSOLUTE):
-# текст собран по стилю «not filtered: …» и ведёт к исправлению границ.
-# Отклонение зафиксировано в отчёте f10-03.
+# The §7.3 canon does not describe a reversed range (it has only HINT_DATE_ABSOLUTE):
+# the text follows the "not filtered: …" style and leads to fixing the bounds.
+# The deviation is recorded in the f10-03 report.
 HINT_DATE_RANGE = (
     "not filtered: date_from is later than date_to — swap the bounds"
 )
-# Выгрузка журнала без границ периода не имеет смысла (LSBN-F-26): выгрузить
-# «весь журнал» агент может и так — расширяя период; без хотя бы одной даты
-# ручка не работает, чтобы случайный вызов не рожал файл со всей историей.
+# A journal export without period bounds makes no sense (LSBN-F-26): the agent
+# can export "the whole journal" anyway — by widening the period; without at least one date
+# the handle refuses, so a random call does not spawn a file with the whole history.
 HINT_EXPORT_PERIOD_REQUIRED = (
     "not exported: pass at least one bound — date_from or date_to "
     "(YYYY-MM-DD, UTC)"
 )
 
-# Лимиты текстовых полей §7.3 задаёт только для `action`/`reason`; для
-# `entity_ref`/`outcome`/`verified` (контракт §6.1: «(5) лимиты …») тексты
-# собраны по каноническому шаблону «not saved: <поле> limit is N characters —
-# shorten it». Отклонение зафиксировано в отчёте f10-02.
+# §7.3 sets text field limits only for `action`/`reason`; for
+# `entity_ref`/`outcome`/`verified` (the §6.1 contract: "(5) limits …") the texts
+# follow the canonical template "not saved: <field> limit is N characters —
+# shorten it". The deviation is recorded in the f10-02 report.
 HINT_ENTITY_REF_LIMIT = (
     "not saved: entity_ref limit is 200 characters — shorten it"
 )
 HINT_OUTCOME_LIMIT = "not saved: outcome limit is 500 characters — shorten it"
 HINT_VERIFIED_LIMIT = "not saved: verified limit is 200 characters — shorten it"
 
-# Незнакомый источник записи: таблица §7.3 текста не задаёт (словарь источников
-# описан в §5.1), поэтому текст собран тем же шаблоном «not saved: …
-# — one of: …» и ведёт к допустимым значениям. Отклонение в отчёте f10-02.
+# An unknown record source: the §7.3 table sets no text (the source dictionary
+# is described in §5.1), so the text follows the same template "not saved: …
+# — one of: …" and leads to the valid values. The deviation is in the f10-02 report.
 HINT_SOURCE_UNKNOWN = (
     "not saved: unknown source '{given}' — one of: mcp, rest, merge, migration, "
     "or job:<name>"
 )
 
-# Сентинел «не передано = оставить» (прецедент `memory_update`/`user_update`):
-# отличает «поле не тронуто» от «поле очищено» (пустая строка).
+# The "not passed = keep" sentinel (the `memory_update`/`user_update` precedent):
+# it distinguishes "the field untouched" from "the field cleared" (an empty string).
 _UNSET: Any = object()
 
 
 class LogValidationError(ValueError):
-    """Нарушение формы записи лога (словарь, связки, лимиты, источник).
+    """A violation of the log record shape (dictionary, links, limits, source).
 
-    Текст исключения — дословный hint (§7.3): транспорт MCP отдаёт его как
-    fail + hint, REST (03) — как 422. Запись при этом НЕ идёт: прецеденты
-    `TermValidationError`, `SkillValidationError`, `UserFactValidationError`.
+            The exception text is a verbatim hint (§7.3): the MCP transport returns it
+            as fail + hint, REST (03) — as 422. The record is NOT written: the
+            precedents are `TermValidationError`, `SkillValidationError`,
+            `UserFactValidationError`.
     """
 
 
 class LogsService:
-    """CRUD области «Логи ассистента»: запись, чтение, правка, мягкое удаление.
+    """CRUD of the "Assistant logs" area: save, read, update, soft delete.
 
-    DI: `settings` (лимиты формы, флаг области), `embedding` (кодировщик для
-    поиска — f10-03; путь записи его НЕ зовёт). Собственного `AreaSearch` сервис
-    не держит (§13.2: поиск области — собственный SQL); поиск, листинг и
-    срезы (f10-03) стоят на тех же примитивах (`match_expression`, `fuse_rrf`,
-    `area_vectors.knn`, порог, `WARNING_FTS_ONLY`), но адресуют только свои
-    таблицы (§6.1/§8).
+            DI: `settings` (the shape limits, the area flag), `embedding` (the encoder
+            for search — f10-03; the write path does NOT call it). The service keeps no
+            `AreaSearch` of its own (§13.2: an area's search is its own SQL); search,
+            listing and slices (f10-03) stand on the same primitives
+            (`match_expression`, `fuse_rrf`, `area_vectors.knn`, the threshold,
+            `WARNING_FTS_ONLY`) but address only their own tables (§6.1/§8).
     """
 
     def __init__(
         self, settings: Settings, embedding: Embedder | None = None
     ) -> None:
         self._settings = settings
-        # DI эмбеддера: поиск (03) кодирует запрос тем же слотом, что и заметки.
+        # The embedder DI: search (03) encodes the query with the same slot as notes.
         self._embedding: Embedder | None = embedding
-        # Сигнал воркеру (main.py): будить петлю areas сразу при появлении
-        # pending-записи области, а не ждать выросший back-off.
+        # A signal to the worker (main.py): wake the areas loop as soon as an area's
+        # pending record appears, instead of waiting out the grown back-off.
         self._areas_notifier: Callable[[], None] | None = None
 
     def set_areas_notifier(self, notifier: Callable[[], None] | None) -> None:
-        """Подключить сигнал пробуждения петли `areas` воркера (main.py).
+        """Wire the wakeup signal of the worker's `areas` loop (main.py).
 
-        По образцу `SkillsService`/`TermsService`/`UserFactsService`: сервис
-        собирается раньше воркера, нотификатор приходит после.
+                    Modeled on `SkillsService`/`TermsService`/`UserFactsService`: the
+                    service is assembled before the worker, the notifier arrives after.
         """
         self._areas_notifier = notifier
 
-    # --- запись (arch §6.1, §7.3) -------------------------------------------
+    # --- writes (arch §6.1, §7.3) --------------------------------------------
 
     def save(
         self,
@@ -229,18 +233,21 @@ class LogsService:
         source: str | None = None,
         session: str | None = None,
     ) -> dict[str, Any]:
-        """Записать лог: «что сделано, почему, объект, результат, что проверено».
+        """Save a log entry: "what was done, why, the object, the outcome, what was verified".
 
-        Порядок обязателен: форма проверяется ДО любых обращений к БД (§7.3).
-        Нарушение — `LogValidationError` с дословным hint, записи нет. Текстовые
-        поля берутся у вызывающего как есть, но с `strip()`.
+                    The order is mandatory: the shape is checked BEFORE any DB access
+                    (§7.3). A violation — `LogValidationError` with a verbatim hint, no
+                    record. Text fields are taken from the caller as is, but with
+                    `strip()`.
 
-        `source`/`session` не переданы → берутся из `history.current_origin()`
-        (`bind_origin` миддлвара, §7.1): модель источник не выдумывает.
+                    `source`/`session` not passed → taken from `history.current_origin()`
+                    (the `bind_origin` middleware, §7.1): the model does not invent the
+                    source.
 
-        Запись атомарна: INSERT (`vector_status='pending'`) и baseline-версия
-        (`record_initial`) — в одной транзакции; после коммита сервис будит петлю
-        `areas` (вектор догоняет воркер). Эмбеддинг не вызывается.
+                    The write is atomic: INSERT (`vector_status='pending'`) and the
+                    baseline version (`record_initial`) — in one transaction; after the
+                    commit the service wakes the `areas` loop (the vector is caught up by
+                    the worker). Embedding is not called.
         """
         form = self._checked_form(
             action=action,
@@ -272,7 +279,7 @@ class LogsService:
                 ),
             )
             log_id = int(cursor.lastrowid or 0)
-            # №41 (§13.5): baseline записи — той же транзакцией, проекция §5.4.
+            # #41 (§13.5): the record's baseline — in the same transaction, the §5.4 projection.
             live = self._projection_row(conn, log_id)
             history.record_initial(
                 conn,
@@ -298,20 +305,20 @@ class LogsService:
         source: str | None = _UNSET,
         session: str | None = _UNSET,
     ) -> dict[str, Any]:
-        """Частично править запись по id: «не передано — оставить» (сентинелы).
+        """Partially edit a record by id: "not passed — keep" (sentinels).
 
-        Исходы:
+                    Outcomes:
 
-        * ни одно поле не передано → `{id, updated: False, hint}` с
-          `HINT_UPDATE_EMPTY`, версий не прибавляется, БД не трогается;
-        * записи нет/она мягко удалена → `HINT_NOT_FOUND` (§7.3: удалённая
-          запись — не «чужая», а отсутствующая для агента);
-        * иначе — UPDATE переданных полей (пустая строка у объекта = очистка),
-          `vector_status='pending'`, `updated_at` = now и версия-дельта
-          (`record_change`) той же транзакцией; связки объекта проверяются по
-          эффективным (текущим + переданным) значениям.
+                    * no field passed → `{id, updated: False, hint}` with
+                      `HINT_UPDATE_EMPTY`, no versions added, the DB untouched;
+                    * the record is missing / soft deleted → `HINT_NOT_FOUND` (§7.3: a
+                      deleted record is not "someone else's" — it is absent for the agent);
+                    * otherwise — an update of the passed fields (an empty string at the
+                      object = clearing), `vector_status='pending'`, `updated_at` = now and
+                      a version delta (`record_change`) in the same transaction; the object
+                      links are checked against the effective (current + passed) values.
 
-        После успешной правки сервис будит петлю `areas`.
+                    After a successful edit the service wakes the `areas` loop.
         """
         if all(
             value is _UNSET
@@ -347,15 +354,15 @@ class LogsService:
         if entity_version is not _UNSET:
             changes["entity_version"] = entity_version
         if source is not _UNSET:
-            # Пустой `source` = «не передано»: колонка NOT NULL, источник
-            # контекста вызова уже записан при создании.
+            # An empty `source` = "not passed": the column is NOT NULL, the source
+            # of the call context was already written at creation.
             checked_source = self._checked_source(source)
             if checked_source is not None:
                 changes["source"] = checked_source
         if session is not _UNSET:
             changes["session"] = self._text(session)
         if not changes:
-            # Все переданные поля оказались пустыми (= «не передано»).
+            # All passed fields turned out empty (= "not passed").
             return {"id": id, "updated": False, "hint": HINT_UPDATE_EMPTY}
         with db_session(self._settings) as conn, transaction(conn):
             row = conn.execute(
@@ -369,8 +376,8 @@ class LogsService:
                 field is not _UNSET
                 for field in (entity, entity_id, entity_version, entity_ref)
             ):
-                # Связки объекта — по эффективным значениям: правка одного поля
-                # не должна оставить строку в противоречивом состоянии.
+                # Object links — by effective values: an edit of one field
+                # must not leave the row in an inconsistent state.
                 self._checked_entity_links(
                     changes.get("entity", row["entity"]),
                     changes.get("entity_id", row["entity_id"]),
@@ -384,7 +391,7 @@ class LogsService:
                 "WHERE id = ? AND deleted_at IS NULL",
                 (*changes.values(), id),
             )
-            # №41 (§13.5): правка — версия-дельта той же транзакцией.
+            # #41 (§13.5): the edit — a version delta in the same transaction.
             live = self._projection_row(conn, id)
             history.record_change(
                 conn,
@@ -395,14 +402,14 @@ class LogsService:
         self._notify_areas_pending()
         return {"id": id, "updated": True}
 
-    # --- чтение (arch §6.1) -------------------------------------------------
+    # --- reads (arch §6.1) ----------------------------------------------------
 
     def get(self, id: int) -> dict[str, Any]:
-        """Прочитать запись по id — полный контракт §7.1 (тело не режется).
+        """Read a record by id — the full §7.1 contract (the body is not trimmed).
 
-        Нет записи или она мягко удалена → `{id, hint}` дословного канона §7.3.
-        `entity_state` здесь НЕ считается: состояние объекта — слой истории
-        (04, §13.4), сервис области в чужие таблицы не ходит.
+                    No record or soft deleted → `{id, hint}` of the verbatim §7.3 canon.
+                    `entity_state` is NOT computed here: the object state is the history
+                    layer (04, §13.4); the area service does not walk foreign tables.
         """
         with db_session(self._settings) as conn:
             row = conn.execute(
@@ -430,42 +437,42 @@ class LogsService:
             "updated_at": row["updated_at"],
         }
         if row["entity"] is not None:
-            # Состояние объекта ссылки (f10-04, §11): поле появляется ТОЛЬКО
-            # когда `entity` задан — у записи без ссылки состояния нет.
+            # The referenced object's state (f10-04, §11): the field appears ONLY
+            # when `entity` is set — a record without a reference has no state.
             record.update(self._entity_state_field(row["entity"], row["entity_id"]))
         return record
 
-    # --- состояние объекта ссылки (f10-04, arch §11/§13.4) -------------------
+    # --- referenced object state (f10-04, arch §11/§13.4) ---------------------
 
     def _entity_state(
         self, entity: str | None, entity_id: int | None
     ) -> str | None:
-        """Состояние объекта ссылки — считает слой истории (арх §11, §13.4).
+        """The referenced object's state — computed by the history layer (arch §11, §13.4).
 
-        `"active"`/`"deleted"`/`"unavailable"` — версионные сущности памяти;
-        `"external"` — неверсионные и неизвестные (в т.ч. ссылки нет вовсе).
-        `None` — состояние не достраивается: слой истории выключен
-        (`HISTORY_ENABLED=false`) либо резолв отказал; отказ резолва НЕ роняет
-        выдачу (§11). Сырой SQL по чужим таблицам сервис области не делает —
-        только API слоя истории (§4, изоляция области).
+                    `"active"`/`"deleted"`/`"unavailable"` — versioned memory entities;
+                    `"external"` — non-versioned and unknown (including no reference at
+                    all). `None` — the state is not completed: the history layer is off
+                    (`HISTORY_ENABLED=false`) or the resolve failed; a resolve failure does
+                    NOT crash the output (§11). The area service does no raw SQL over
+                    foreign tables — only the history layer's API (§4, area isolation).
         """
         try:
             resolved = history.resolve_entity(entity, entity_id or 0, self._settings)
-        except Exception:  # noqa: BLE001 — отказ резолва не роняет выдачу (§11)
+        except Exception:  # noqa: BLE001 — a resolve failure does not crash the output (§11)
             return None
         if resolved is not None:
             return resolved["state"]
-        # Неверсионная/неизвестная сущность либо выключенный слой истории.
+        # A non-versioned/unknown entity, or the history layer is off.
         return "external" if self._settings.history_enabled else None
 
     def _entity_state_field(
         self, entity: str | None, entity_id: int | None
     ) -> dict[str, str]:
-        """Поле `entity_state` для элемента выдачи; `{}` — если не достраивается."""
+        """The `entity_state` field for an output item; `{}` — when not completed."""
         state = self._entity_state(entity, entity_id)
         return {} if state is None else {"entity_state": state}
 
-    # --- поиск и срезы (arch §6.1/§8, f10-03) -------------------------------
+    # --- search and slices (arch §6.1/§8, f10-03) -----------------------------
 
     def search(
         self,
@@ -480,21 +487,22 @@ class LogsService:
         date_from: str | None = None,
         date_to: str | None = None,
     ) -> dict[str, Any]:
-        """Гибридный поиск по записям области со срезами (arch §6.1/§8).
+        """Hybrid search over the area's records with slices (arch §6.1/§8).
 
-        Векторная сторона — KNN по `assistant_logs_vec` (top `CANDIDATE_LIMIT`,
-        гейт `settings.score_threshold`); FTS-сторона — BM25 по
-        `assistant_logs_fts`; слияние — `fuse_rrf` (общий `settings.rrf_k`),
-        дедупликация id. **Собственный SQL области** (§13.2): `AreaSearch`
-        не умеет срезы, а расширять общий помощник — трогать чужие области.
+                    Vector side — KNN over `assistant_logs_vec` (top `CANDIDATE_LIMIT`, the
+                    `settings.score_threshold` gate); FTS side — BM25 over
+                    `assistant_logs_fts`; merge — `fuse_rrf` (the shared `settings.rrf_k`),
+                    id deduplication. **The area's own SQL** (§13.2): `AreaSearch` cannot
+                    slice, and extending the shared helper would touch foreign areas.
 
-        Срезы (§8) — по объекту (`entity`/`entity_id`/`entity_version`),
-        сессии, источнику и абсолютным датам; одни и те же предикаты идут в
-        оба `WHERE` (FTS — прямо в SQL, вектор — постовым отсечением в
-        `_filter_rows`). Пустой запрос — мягкий `HINT_SHORT_QUERY`, пустой
-        результат — `HINT_NO_RESULTS`; отказ кодировщика не ломает поиск:
-        FTS-only + `WARNING_FTS_ONLY` (NFR-3). `action` в выдаче обрезается
-        до `logs_search_excerpt_chars` (FR-2.3): тело читается по id.
+                    Slices (§8) — by object (`entity`/`entity_id`/`entity_version`),
+                    session, source and absolute dates; the same predicates go into both
+                    `WHERE`s (FTS — directly in SQL, vector — post-filtering in
+                    `_filter_rows`). An empty query — a soft `HINT_SHORT_QUERY`, an empty
+                    result — `HINT_NO_RESULTS`; an encoder failure does not break the
+                    search: FTS-only + `WARNING_FTS_ONLY` (NFR-3). `action` in the output
+                    is trimmed to `logs_search_excerpt_chars` (FR-2.3): the body is read
+                    by id.
         """
         top_k = self._settings.default_top_k if top_k is None else top_k
         if not 1 <= top_k <= MAX_TOP_K:
@@ -512,7 +520,7 @@ class LogsService:
         )
         stripped = query.strip() if isinstance(query, str) else ""
         if not stripped:
-            # Пустой запрос: искать нечего — мягкий ответ, без эмбеддера.
+            # An empty query: nothing to search — a soft answer, no embedder.
             return {"results": [], "warning": None, "hint": HINT_SHORT_QUERY}
         query_vector = self._query_vector(stripped)
         expression = match_expression(stripped)
@@ -526,8 +534,8 @@ class LogsService:
                     query_vector,
                     CANDIDATE_LIMIT,
                 )
-                # Гейт порога косинуса (прецедент заметок/областей): без него
-                # «пусто» стало бы недостижимым при любой непустой таблице.
+                # The cosine threshold gate (the notes/areas precedent): without it
+                # "empty" would become unreachable on any non-empty table.
                 hits = [
                     (row_id, cosine)
                     for row_id, cosine in hits
@@ -544,8 +552,8 @@ class LogsService:
                     ]
                 )
             scores = fuse_rrf(rankings, self._settings.rrf_k)
-            # Мягкое чтение + тот же срез: удалённые исчезают, чужие срезы
-            # отсекаются и у векторной стороны (vec0 фильтров не знает).
+            # A soft read + the same slice: deleted records vanish, foreign slices
+            # are cut off on the vector side too (vec0 knows no filters).
             rows = self._filter_rows(conn, list(scores), where_sql, params)
         results = self._merged_search_results(scores, rows)[:top_k]
         warning = None if query_vector is not None else WARNING_FTS_ONLY
@@ -572,16 +580,17 @@ class LogsService:
         offset: int = 0,
         max_limit: int | None = None,
     ) -> dict[str, Any]:
-        """Листинг со срезами: новое первым, страница по контракту lsb-0013.
+        """Listing with slices: newest first, a page per the lsb-0013 contract.
 
-        Порядок — `created_at DESC, id DESC` (индекс
-        `idx_assistant_logs_entity_active`); `total` — число активных записей
-        с ТЕМ ЖЕ срезом; page-поля — `listing.page_fields` (`next_cursor`
-        зарезервирован под будущий keyset). Потолок `limit` — `max_limit`
-        (None → `settings.list_max_limit_rest`: MCP передаёт свой, меньший
-        потолок); вне `1..max_limit` и `offset < 0` — мягкий отказ
-        `LogValidationError` (прецедент `SkillsService.list`). Тело `action`
-        не режется: полный текст нужен оператору, MCP режет сам.
+                    Order — `created_at DESC, id DESC` (the
+                    `idx_assistant_logs_entity_active` index); `total` — the number of
+                    active records with THE SAME slice; page fields — `listing.page_fields`
+                    (`next_cursor` is reserved for a future keyset). The `limit` ceiling —
+                    `max_limit` (None → `settings.list_max_limit_rest`: MCP passes its own,
+                    smaller ceiling); outside `1..max_limit` and `offset < 0` — a soft
+                    `LogValidationError` failure (the `SkillsService.list` precedent). The
+                    `action` body is not trimmed: the operator needs the full text, MCP
+                    trims on its side.
         """
         ceiling = (
             self._settings.list_max_limit_rest if max_limit is None
@@ -631,7 +640,7 @@ class LogsService:
         ]
         return {"items": items, **page_fields(total, offset, len(items))}
 
-    # --- выгрузка за период (LSBN-F-26, релиз 3.5.0) -------------------------
+    # --- period export (LSBN-F-26, release 3.5.0) -----------------------------
 
     def export(
         self,
@@ -645,17 +654,18 @@ class LogsService:
         date_to: str | None = None,
         collected_by: str = "logs_export",
     ) -> dict[str, Any]:
-        """Готовая выжимка журнала за период ФАЙЛОМ в `<каталог БД>/exports/`.
+        """A ready-made journal digest for a period as a FILE into `<db dir>/exports/`.
 
-        Релизный гейт собирает выжимку «что, когда, чем проверено» одной
-        ручкой вместо ручной сборки из `logs_search`. Срезы — те же, что у
-        `search`/`list`; обязателен хотя бы один из `date_from`/`date_to`
-        (без периода случайный вызов рожал бы файл со всей историей).
-        Порядок — от старых к новым: журнал читают хронологически. Полный
-        текст полей без обрезки excerpt'ом (это назначение выгрузки);
-        группировка по дням, пустые поля — «—». Read-only: только SELECT
-        и запись файла — память, вектора и сам журнал не трогаются,
-        модели не зовутся. Часовой пояс — UTC, как в `logs_get`.
+                    The release gate assembles the "what, when, verified how" digest with
+                    one handle instead of manual assembly from `logs_search`. The slices
+                    are the same as `search`/`list`; at least one of `date_from`/`date_to`
+                    is required (without a period a random call would produce a file with
+                    the whole history). Order — oldest to newest: the journal is read
+                    chronologically. Full field texts without excerpt trimming (that is the
+                    export's purpose); grouping by days, empty fields — "—". Read-only:
+                    only SELECT and a file write — memory, vectors and the journal itself
+                    are untouched, no models are called. The timezone is UTC, as in
+                    `logs_get`.
         """
         if date_from is None and date_to is None:
             raise LogValidationError(HINT_EXPORT_PERIOD_REQUIRED)
@@ -686,12 +696,12 @@ class LogsService:
     def _fetch_projection(
         self, where_sql: str, params: list[Any]
     ) -> list[dict[str, Any]]:
-        """Полная проекция среза одним запросом, от старых к новым.
+        """The full projection of a slice in one query, oldest to newest.
 
-        Отдельный слой чтения (не N+1 из `logs_get`): MCP-выдача режет текст,
-        выжимке гейта нужен полный (§7.1). Строки сразу словари проекции —
-        без `entity_state` (состояние объекта — слой истории, выжимке гейта
-        не нужно).
+                    A separate read layer (not N+1 from `logs_get`): the MCP output trims
+                    the text, the gate digest needs it in full (§7.1). Rows come out as
+                    projection dicts right away — without `entity_state` (the object state
+                    is the history layer; the gate digest does not need it).
         """
         with db_session(self._settings) as conn:
             cursor = conn.execute(
@@ -726,13 +736,13 @@ class LogsService:
         slice_map: dict[str, Any],
         collected_by: str,
     ) -> Path:
-        """Собрать markdown-выжимку и записать её в `<db_dir>/exports/`.
+        """Assemble the markdown digest and write it into `<db_dir>/exports/`.
 
-        Имя файла — `logs-<from>_<to>.md` (недостающая сторона — `all`):
-        файл за период виден на хосте через том `./data:/data`. Каталог
-        создаётся при первой выгрузке. Шапка несёт период, срез, число
-        записей, версию LSB и момент сборки — гейт проверяет охват одним
-        взглядом.
+                    The file name is `logs-<from>_<to>.md` (a missing side — `all`): the
+                    per-period file is visible on the host through the `./data:/data`
+                    volume. The directory is created at the first export. The header
+                    carries the period, the slice, the record count, the LSB version and
+                    the build moment — the gate checks the coverage at one glance.
         """
         from_label = slice_map["date_from"] or "all"
         to_label = slice_map["date_to"] or "all"
@@ -752,11 +762,12 @@ class LogsService:
         slice_map: dict[str, Any],
         collected_by: str,
     ) -> list[str]:
-        """Строки markdown-выжимки: шапка → группировка по дням → записи.
+        """Lines of the markdown digest: header → grouping by days → records.
 
-        Формат — готовая выжимка, не сырой список: по записи id, время,
-        объект (`entity:entity_id@version` или `entity_ref`) и поля §7.1;
-        пустые поля — «—». Часовой пояс UTC (§7.3), как в `logs_get`.
+                    The format is a ready digest, not a raw list: per record — id, time,
+                    the object (`entity:entity_id@version` or `entity_ref`) and the §7.1
+                    fields; empty fields — "—". The timezone is UTC (§7.3), as in
+                    `logs_get`.
         """
         from_label = slice_map["date_from"] or "all"
         to_label = slice_map["date_to"] or "all"
@@ -788,7 +799,7 @@ class LogsService:
         return lines
 
     def _render_entry(self, row: dict[str, Any]) -> list[str]:
-        """Один блок записи выжимки (без секретов — поля §7.1 и так без них)."""
+        """One record block of the digest (no secrets — the §7.1 fields have none anyway)."""
         missing = "—"
         if row["entity"] is not None:
             object_label = f"{row['entity']}:{row['entity_id']}"
@@ -809,7 +820,7 @@ class LogsService:
         ]
         return lines
 
-    # --- внутреннее: срезы и источники кандидатов (arch §8) ----------------
+    # --- internal: slices and candidate sources (arch §8) ---------------------
 
     def _slice_where(
         self,
@@ -822,13 +833,13 @@ class LogsService:
         date_from: str | None,
         date_to: str | None,
     ) -> tuple[str, list[Any]]:
-        """Один SQL-предикат срезов для `search` и `list` (arch §8).
+        """One SQL predicate of slices for `search` and `list` (arch §8).
 
-        Возвращает `("t.… AND t.…", [параметры])` — готовую часть `WHERE` для
-        алиаса `t` таблицы области: мягкое чтение (`deleted_at IS NULL`) плюс
-        переданные срезы. Фильтры валидируются ДО БД (словарь `entity`, связка
-        `entity_version`↔`entity_id`, абсолютные даты): нарушение —
-        `LogValidationError` с hint'ом канона.
+                    Returns `("t.… AND t.…", [parameters])` — a ready `WHERE` part for the
+                    `t` alias of the area table: a soft read (`deleted_at IS NULL`) plus
+                    the passed slices. Filters are validated BEFORE the DB (the `entity`
+                    dictionary, the `entity_version`↔`entity_id` link, absolute dates): a
+                    violation — `LogValidationError` with the canon's hint.
         """
         checked_entity = self._checked_entity(entity)
         if entity_version is not None and entity_id is None:
@@ -857,7 +868,7 @@ class LogsService:
             clauses.append("t.source = ?")
             params.append(source_value)
         if start is not None:
-            # Абсолютный день UTC, включительно с обеих сторон (§8/§13.12).
+            # An absolute UTC day, inclusive on both sides (§8/§13.12).
             clauses.append("substr(t.created_at, 1, 10) >= ?")
             params.append(start)
         if end is not None:
@@ -866,11 +877,11 @@ class LogsService:
         return " AND ".join(clauses), params
 
     def _checked_date(self, value: str | None) -> str | None:
-        """`date_from`/`date_to`: только абсолютная дата `YYYY-MM-DD` (§8).
+        """`date_from`/`date_to`: only an absolute `YYYY-MM-DD` date (§8).
 
-        Разбор — парсером блока 4 (`freshness.parse_updated_after`, №29):
-        принимается ISO-8601 UTC, но срез держит только день; относительная
-        формулировка → `HINT_DATE_ABSOLUTE` (мягкий отказ, §7.3/§13.12).
+                    Parsing — by the block-4 parser (`freshness.parse_updated_after`, #29):
+                    ISO-8601 UTC is accepted, but the slice keeps only the day; a relative
+                    wording → `HINT_DATE_ABSOLUTE` (a soft failure, §7.3/§13.12).
         """
         text = self._text(value)
         if text is None:
@@ -887,10 +898,10 @@ class LogsService:
         where_sql: str,
         params: list[Any],
     ) -> list[sqlite3.Row]:
-        """Топ-`CANDIDATE_LIMIT` FTS5/BM25 по активным записям со срезом.
+        """Top-`CANDIDATE_LIMIT` FTS5/BM25 over active records with the slice.
 
-        Зеркалит `AreaSearch._fts_candidates`, но по своим таблицам области и
-        с общим предикатом срезов; rank с 1 для RRF.
+                    Mirrors `AreaSearch._fts_candidates`, but over the area's own tables
+                    and with the shared slice predicate; rank from 1 for RRF.
         """
         weights = tuple(1.0 for _ in ASSISTANT_LOGS_FTS_COLUMNS)
         weight_placeholders = ", ".join("?" * len(weights))
@@ -912,10 +923,10 @@ class LogsService:
         where_sql: str,
         params: list[Any],
     ) -> dict[int, sqlite3.Row]:
-        """Активные кандидаты, прошедшие ТОТ ЖЕ срез, что и FTS-сторона.
+        """Active candidates that passed THE SAME slice as the FTS side.
 
-        Векторная сторона vec0 фильтров не знает — срезы применяются здесь,
-        одним предикатом (§8: «фильтры применяются к обеим сторонам»).
+                    The vector side (vec0) knows no filters — slices are applied here, by
+                    one predicate (§8: "filters apply to both sides").
         """
         if not ids:
             return {}
@@ -931,7 +942,7 @@ class LogsService:
     def _merged_search_results(
         self, scores: dict[int, float], rows: dict[int, sqlite3.Row]
     ) -> list[dict[str, Any]]:
-        """Сортировка score DESC → created_at DESC → id DESC и обрезка action."""
+        """Sort score DESC → created_at DESC → id DESC and trim action."""
         excerpt = self._settings.logs_search_excerpt_chars
         candidates = [
             (scores[row_id], row)
@@ -956,10 +967,10 @@ class LogsService:
         ]
 
     def _query_vector(self, query: str) -> list[float] | None:
-        """Кодирование запроса; отказ эмбеддера — деградация к FTS (§8, NFR-3).
+        """Encode the query; an embedder failure — degrade to FTS (§8, NFR-3).
 
-        Эмбеддер не сконфигурирован (DI пустого сервиса) — тоже FTS-only:
-        поиск остаётся живым без внешней зависимости.
+                    No embedder configured (an DI empty service) — FTS-only as well: the
+                    search stays alive without the external dependency.
         """
         if self._embedding is None:
             return None
@@ -970,18 +981,19 @@ class LogsService:
 
     @staticmethod
     def _excerpt(text: str, limit: int) -> str:
-        """Обрезать тело для выдачи поиска (полный текст — `logs_get`)."""
+        """Trim the body for the search output (the full text — `logs_get`)."""
         return text if len(text) <= limit else text[:limit]
 
-    # --- удаление (soft delete, arch §11) -----------------------------------
+    # --- deletion (soft delete, arch §11) -------------------------------------
 
     def delete(self, id: int) -> dict[str, Any]:
-        """Мягко удалить запись: `deleted_at` = now, строка и индексы живы.
+        """Soft-delete a record: `deleted_at` = now, the row and indexes stay alive.
 
-        Идемпотентно по смыслу: повторный/несуществующий id → мягкий ответ
-        `deleted: False` + hint канона §7.3 (восстановление — оператором).
-        Удаление — факт истории (`record_event('delete')`) в той же транзакции:
-        запись лога не исчезает, читается оператором и историей (§11).
+                    Idempotent in meaning: a repeated/nonexistent id → a soft
+                    `deleted: False` answer + the §7.3 canon hint (restoration — by the
+                    operator). The deletion is a history fact (`record_event('delete')`) in
+                    the same transaction: the log record does not vanish; the operator and
+                    the history can read it (§11).
         """
         with db_session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
@@ -997,12 +1009,12 @@ class LogsService:
                 )
         if not deleted:
             return {"id": id, "deleted": False, "hint": HINT_NOT_FOUND}
-        # Сигнал петле areas един по всем изменениям области: у удаления pending
-        # не появляется, но сигнал безвреден и держит одну точку пробуждения.
+        # The signal to the areas loop is one for all area changes: a deletion adds no
+        # pending, but the signal is harmless and keeps a single wakeup point.
         self._notify_areas_pending()
         return {"id": id, "deleted": True}
 
-    # --- внутреннее: форма (§7.3, порядок обязателен) -----------------------
+    # --- internal: shape (§7.3, the order is mandatory) -----------------------
 
     def _checked_form(
         self,
@@ -1016,12 +1028,13 @@ class LogsService:
         outcome: Any,
         verified: Any,
     ) -> dict[str, Any]:
-        """Проверить форму новой записи ДО БД и вернуть её в нормальном виде.
+        """Check the new record's shape BEFORE the DB and return it normalized.
 
-        Порядок §7.3: (1) `action`/`reason` — непустые и в лимитах; (2) `entity`
-        из словаря (пусто — допустимо); (3) связки объекта (id у версионных,
-        текстовая ссылка у внешних, `entity_version` без id — отказ);
-        (4) лимиты `entity_ref`/`outcome`/`verified`. Каждый отказ — свой hint.
+                    The §7.3 order: (1) `action`/`reason` — non-empty and within limits;
+                    (2) `entity` from the dictionary (empty — allowed); (3) the object
+                    links (an id for versioned, a text reference for external,
+                    `entity_version` without an id — a failure); (4) the limits of
+                    `entity_ref`/`outcome`/`verified`. Each failure — its own hint.
         """
         checked_action = self._checked_action(action)
         checked_reason = self._checked_reason(reason)
@@ -1049,7 +1062,7 @@ class LogsService:
         entity_version: int | None,
         entity_ref: str | None,
     ) -> None:
-        """Связки объекта изменения: id / версия / текстовая ссылка (§7.3 п.3)."""
+        """The change object's links: id / version / text reference (§7.3 p.3)."""
         if entity in VERSIONED_ENTITY_KINDS and entity_id is None:
             raise LogValidationError(
                 HINT_ENTITY_ID_REQUIRED.format(given=entity)
@@ -1062,7 +1075,7 @@ class LogsService:
             )
 
     def _checked_action(self, action: str | None) -> str:
-        """Обязательный `action`: непустой и ≤ `logs_action_max_chars`."""
+        """The mandatory `action`: non-empty and ≤ `logs_action_max_chars`."""
         value = self._text(action)
         if not value:
             raise LogValidationError(HINT_ACTION_REQUIRED)
@@ -1071,7 +1084,7 @@ class LogsService:
         return value
 
     def _checked_reason(self, reason: str | None) -> str:
-        """Обязательный `reason`: непустой и ≤ `logs_reason_max_chars`."""
+        """The mandatory `reason`: non-empty and ≤ `logs_reason_max_chars`."""
         value = self._text(reason)
         if not value:
             raise LogValidationError(HINT_REASON_REQUIRED)
@@ -1080,10 +1093,11 @@ class LogsService:
         return value
 
     def _checked_entity(self, entity: str | None) -> str | None:
-        """`entity` — тип объекта изменения: пусто или из закрытого словаря.
+        """`entity` — the change object's type: empty or from the closed dictionary.
 
-        Незнакомый тип → мягкий отказ с перечислением словаря (модель не
-        додумывает тип объекта: он идёт в обратный запрос «почему изменилось»).
+                    An unknown type → a soft failure listing the dictionary (the model does
+                    not guess the object type: it goes into the reverse question "why did
+                    it change").
         """
         value = self._text(entity)
         if value is None:
@@ -1093,7 +1107,7 @@ class LogsService:
         return value
 
     def _checked_entity_ref(self, entity_ref: str | None) -> str | None:
-        """`entity_ref` — текстовая ссылка на объект вне памяти (≤ 200)."""
+        """`entity_ref` — a text reference to an object outside memory (≤ 200)."""
         value = self._text(entity_ref)
         if value is not None and (
             len(value) > self._settings.logs_entity_ref_max_chars
@@ -1102,14 +1116,14 @@ class LogsService:
         return value
 
     def _checked_outcome(self, outcome: str | None) -> str | None:
-        """`outcome` — результат работы (≤ `logs_outcome_max_chars`)."""
+        """`outcome` — the outcome of the work (≤ `logs_outcome_max_chars`)."""
         value = self._text(outcome)
         if value is not None and len(value) > self._settings.logs_outcome_max_chars:
             raise LogValidationError(HINT_OUTCOME_LIMIT)
         return value
 
     def _checked_verified(self, verified: str | None) -> str | None:
-        """`verified` — что проверено (≤ `logs_verified_max_chars`)."""
+        """`verified` — what was verified (≤ `logs_verified_max_chars`)."""
         value = self._text(verified)
         if value is not None and (
             len(value) > self._settings.logs_verified_max_chars
@@ -1118,10 +1132,10 @@ class LogsService:
         return value
 
     def _checked_source(self, source: str | None) -> str | None:
-        """Явно переданный `source` — из словаря §5.1 или `job:<имя>`.
+        """An explicitly passed `source` — from the §5.1 dictionary or `job:<name>`.
 
-        Источник не выдумывается моделью (§7.1): незнакомое значение — мягкий
-        отказ тем же стилем hint. Пустая строка = «не передано».
+                    The source is never invented by the model (§7.1): an unknown value — a
+                    soft failure in the same hint style. An empty string = "not passed".
         """
         value = self._text(source)
         if value is None:
@@ -1133,28 +1147,28 @@ class LogsService:
     def _resolved_origin(
         self, source: str | None, session: str | None
     ) -> tuple[str | None, str | None]:
-        """Источник/сессия записи: явные аргументы сильнее текущего `bind_origin`.
+        """The record's source/session: explicit arguments beat the current `bind_origin`.
 
-        Оба поля независимы: не переданное берётся из `history.current_origin()`
-        (миддлварь вызова), переданное — проверяется (источник) и чистится
-        (`strip`).
+                    Both fields are independent: a not-passed one comes from
+                    `history.current_origin()` (the call middleware), a passed one is
+                    validated (source) and cleaned (`strip`).
         """
         current_source, current_session = history.current_origin()
         if source is None:
             resolved_source: str | None = current_source
         else:
-            # Пустая строка = «не передано»: берём источник контекста вызова.
+            # An empty string = "not passed": the call context's source is used.
             resolved_source = self._checked_source(source) or current_source
         resolved_session = (
             current_session if session is None else self._text(session)
         )
         return resolved_source, resolved_session
 
-    # --- внутреннее: утилиты ------------------------------------------------
+    # --- internal: utilities --------------------------------------------------
 
     @staticmethod
     def _text(value: Any) -> str | None:
-        """Текст поля «как есть», но без краевых пробелов; пусто → `None`."""
+        """The field text "as is" but without edge spaces; empty → `None`."""
         if not isinstance(value, str):
             return None
         stripped = value.strip()
@@ -1162,7 +1176,7 @@ class LogsService:
 
     @staticmethod
     def _projection_row(conn: sqlite3.Connection, log_id: int) -> sqlite3.Row:
-        """Строка проекции лога после записи — одна форма baseline/дельты."""
+        """The log's projection row after a write — one shape for baseline/delta."""
         return conn.execute(
             "SELECT action, reason, entity, entity_id, entity_version, "
             "entity_ref, outcome, verified, source, session "
@@ -1171,6 +1185,6 @@ class LogsService:
         ).fetchone()
 
     def _notify_areas_pending(self) -> None:
-        """Сигнал воркеру: область изменилась (будить петлю `areas` сразу)."""
+        """A signal to the worker: the area changed (wake the `areas` loop at once)."""
         if self._areas_notifier is not None:
             self._areas_notifier()
