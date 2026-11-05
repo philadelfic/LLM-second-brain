@@ -1,48 +1,53 @@
-"""UserFactsService — сервисный слой области «user» (lsb-0009, релиз 3.0.0).
+"""UserFactsService — the "user" area's service layer (lsb-0009, release 3.0.0).
 
-Форма факта и лимиты — arch lsb-0009 §3.1; данные — §3.2; ручки и контракты —
-§3.3; дедуп «есть похожее» без эмбеддинга в момент записи — §3.4; канонические
-тексты (постоянный hint атомарности, hint'ы мягких отказов) — §3.7.
+    The fact shape and limits — arch lsb-0009 §3.1; the data — §3.2; the handles
+    and contracts — §3.3; the "is there something similar" dedup without embedding
+    at write time — §3.4; the canonical texts (the permanent atomicity hint, the
+    soft-failure hints) — §3.7.
 
-Ключевые свойства
------------------
-* **Атомарность** — один факт = одна запись: форма `name` (≤5 слов, контракт
-  `title` заметок) + `body` (≤1200 символов); нарушение →
-  `UserFactValidationError` с дословным hint канона §3.7 (факт НЕ сохраняется).
-* **Дедуп-подсказка ДО записи** (§3.4): кандидаты — FTS5 `trigram` по
-  `name + body` (top-3, только активные), сходство — триграммное
-  (`trigram_similarity` субстрата) по нормализованному тексту. Сильное
-  совпадение (≥ `USER_SIMILAR_STRONG`) → мягкий отказ + `similar` (записи нет);
-  средняя зона (≥ `USER_SIMILAR_WEAK`) → запись идёт + справочный список
-  `related`; ниже порогов — запись без подсказки. Эмбеддинг в момент записи НЕ
-  вызывается (FR-3.5): кандидаты и сходство вычислительны.
-* **Постоянный hint атомарности** (FR-7.2) — в КАЖДОМ успешном ответе `save`.
-* **Сентинелы «не передано» = оставить** (`_UNSET_NAME`/`_UNSET_BODY`,
-  JSON-серизуемые строки — прецедент lsb-0004/`notes.py`); `null` в обязательном
-  поле → мягкий отказ (обязательные поля не сбрасываются).
-* **Правка инвалидирует вектор** (`vector_status='pending'`, `updated_at`
-  обновляется) — вектора догоняет петля `areas` воркера (субстрат §3.3);
-  после успешных записи/правки/удаления сервис её будит
-  (`set_areas_notifier`).
-* **Удаление мягкое** (`deleted_at`): исчезает из всех выдач области;
-  повторный/несуществующий id → мягкий ответ с hint (восстановление —
-  оператором, прецедент заметок).
-* **Поиск — проба области** (§3.3, субстрат §3.5): гибрид `AreaSearch` по
-  `USER_FACTS_AREA` (`user_facts_vec` KNN, вектор = `name + body` +
-  `user_facts_fts` BM25 → RRF); выдача без тел — `excerpt` ≤
-  `USER_SEARCH_EXCERPT_CHARS` (полное тело — `get`); пусто → мягкий ответ с
-  hint канона §3.7. SQL помощника адресует только таблицы области (изоляция).
+    Key properties
+    --------------
+    * **Atomicity** — one fact = one record: the `name` shape (≤5 words, the
+      notes' `title` contract) + `body` (≤1200 characters); a violation →
+      `UserFactValidationError` with the verbatim §3.7 canon hint (the fact is NOT
+      saved).
+    * **The dedup hint BEFORE the write** (§3.4): candidates — FTS5 `trigram` over
+      `name + body` (top-3, active only); the similarity — trigram-based
+      (the substrate's `trigram_similarity`) over the normalized text. A strong
+      match (≥ `USER_SIMILAR_STRONG`) → a soft failure + `similar` (no write);
+      the middle zone (≥ `USER_SIMILAR_WEAK`) → the write happens + a reference
+      `related` list; below the thresholds — the write without a hint. Embedding
+      is NOT called at write time (FR-3.5): candidates and similarity are
+      arithmetic.
+    * **The permanent atomicity hint** (FR-7.2) — in EVERY successful `save`
+      answer.
+    * **The "not passed" sentinels = keep** (`_UNSET_NAME`/`_UNSET_BODY`,
+      JSON-serializable strings — the lsb-0004/`notes.py` precedent); `null` in a
+      mandatory field → a soft failure (mandatory fields are never cleared).
+    * **An edit invalidates the vector** (`vector_status='pending'`, `updated_at`
+      refreshed) — the worker's `areas` loop catches up the vectors (substrate
+      §3.3); after a successful save/edit/delete the service wakes it
+      (`set_areas_notifier`).
+    * **Deletion is soft** (`deleted_at`): the fact vanishes from all the area's
+      outputs; a repeated/nonexistent id → a soft answer with a hint (restoration
+      — by the operator, the notes precedent).
+    * **The search is an area probe** (§3.3, substrate §3.5): the `AreaSearch`
+      hybrid over `USER_FACTS_AREA` (`user_facts_vec` KNN, the vector =
+      `name + body` + `user_facts_fts` BM25 → RRF); the output has no bodies —
+      an `excerpt` ≤ `USER_SEARCH_EXCERPT_CHARS` (the full body — `get`); empty →
+      a soft answer with the §3.7 canon hint. The helper's SQL addresses only the
+      area's tables (isolation).
 
-Контракты ответов (полные; MCP-слой срезает служебные поля белым списком —
-lsb-0009-02, REST-зеркало — lsb-0009-03):
-- save (запись)    → {id, stored: True, hint: <постоянный hint атомарности>}
-                     (+ related/hint средней зоны)
-- save (сильное совпадение) → {stored: False, hint, similar: {id, name}}
-- update           → {id, changed: True} | {id, changed: False, hint}
-- get              → {id, name, body}; не найден → {id, hint}
-- search           → {results: [{id, name, excerpt}], warning?};
-                     пусто → {results: [], warning?, hint}
-- delete           → {id, deleted: True} | {id, deleted: False, hint}
+    Response contracts (full; the MCP layer trims service fields by a whitelist —
+    lsb-0009-02; the REST mirror — lsb-0009-03):
+    - save (a write)    → {id, stored: True, hint: <the permanent atomicity hint>}
+                          (+ the middle zone's related/hint)
+    - save (a strong match) → {stored: False, hint, similar: {id, name}}
+    - update           → {id, changed: True} | {id, changed: False, hint}
+    - get              → {id, name, body}; not found → {id, hint}
+    - search           → {results: [{id, name, excerpt}], warning?};
+                         empty → {results: [], warning?, hint}
+    - delete           → {id, deleted: True} | {id, deleted: False, hint}
 """
 
 from __future__ import annotations
@@ -64,51 +69,51 @@ from app.services.ranking import match_expression
 from app.services.search import MAX_TOP_K
 from app.storage.db import session, transaction
 
-# Кандидаты дедупа — top-3 активных записей области (arch §3.4): проверяем
-# только ближайшие по FTS, полного скана реестра нет.
+# The dedup candidates — the area's top-3 active records (arch §3.4): we check
+# only the FTS-nearest ones; there is no full registry scan.
 DEDUP_CANDIDATES = 3
 
-# --- Hint'ы (канон §3.7: «дословные константы в коде»; тексты английские) ----
-# Постоянный hint успешного save (FR-7.2): правило атомарности закрепляется в
-# момент действия — несколько фактов = несколько отдельных вызовов.
+# --- Hints (canon §3.7: "verbatim constants in code"; English texts) --------
+# The permanent hint of a successful save (FR-7.2): the atomicity rule is anchored at
+# the moment of action — several facts = several separate calls.
 HINT_ATOMIC = "one fact = one record — several facts mean several separate calls"
 
-# Дедуп, сильное совпадение (FR-7.3): запись НЕ идёт, hint ведёт к правке
-# существующего факта; шаблон подставляет id и name ближайшей записи.
+# Dedup, a strong match (FR-7.3): no write; the hint leads to editing
+# the existing fact; the template substitutes the nearest record's id and name.
 HINT_SIMILAR_FACT = (
     "similar fact already exists: {id} — {name}; the same fact? update it via "
     "user_update(id={id}); a new fact — save it as a separate record"
 )
 
-# Дедуп, средняя зона: запись идёт, справочно перечисляются похожие факты.
+# Dedup, the middle zone: the write happens; similar facts are listed for reference.
 HINT_RELATED_FACTS = (
     "possibly related facts: {related}; if this is the same fact, refine it via "
     "user_update instead of creating a duplicate"
 )
 
-# Мягкий отказ при `body` > 1200 (FR-7.4): «похоже на несколько фактов».
+# A soft failure at `body` > 1200 (FR-7.4): "looks like several facts".
 HINT_BODY_LIMIT = (
     "not saved: looks like several facts in one record — split them and save "
     "one fact per call (body limit is 1200 characters)"
 )
 
-# Лимит `name` (канон §3.7): контракт названия заметки (≤5 слов).
+# The `name` limit (canon §3.7): the note title contract (≤5 words).
 HINT_NAME_LIMIT = "not saved: name must be ≤5 words (like a note title)"
 
-# Не найден (`get`/`update`/`delete`) — мягкий ответ с путём к поиску области.
+# Not found (`get`/`update`/`delete`) — a soft answer with the way to the area's search.
 HINT_NOT_FOUND = (
     "fact not found (possibly deleted); search the user area via user_search"
 )
 
-# Пустой поиск области: «факта нет» — валидный исход (проба), модель не лезет
-# в область без причины.
+# An empty area search: "no fact" is a valid outcome (a probe); the model does not enter
+# the area without a reason.
 HINT_SEARCH_EMPTY = (
     "nothing found in the user area — no fact matching this request is stored"
 )
 
-# Hint'ы, которых таблица канона §3.7 не задаёт (канон описывает только лимиты
-# и мягкие отказы выше): пустое обязательное поле формы и `null` в обязательном
-# поле правки. Стиль и язык — как у канонических.
+# Hints the §3.7 canon table does not set (the canon describes only the limits
+# and the soft failures above): an empty mandatory shape field and `null` in a mandatory
+# edit field. The style and language — like the canonical ones.
 HINT_NAME_REQUIRED = "not saved: name is required"
 HINT_BODY_REQUIRED = "not saved: body is required"
 HINT_REQUIRED_UNSET = (
@@ -116,87 +121,88 @@ HINT_REQUIRED_UNSET = (
     "current value, null cannot reset it"
 )
 
-# Сентинелы «не передано» (прецедент lsb-0004): JSON-серизуемые строки —
-# дефолты параметров MCP-инструмента правки, pydantic не ругается на
-# несеризуемый дефолт (NFR-4). Сравнение в сервисе — по идентичности (`is`),
-# поэтому коллизия с реальным содержимым факта невозможна даже при совпадении
-# строки (как `_UNSET_SUMMARY` заметок).
+# The "not passed" sentinels (the lsb-0004 precedent): JSON-serializable strings —
+# the defaults of the edit MCP tool's parameters; pydantic does not complain about a
+# non-serializable default (NFR-4). The comparison in the service — by identity (`is`),
+# so a collision with the fact's real content is impossible even with an equal
+# string (like the notes' `_UNSET_SUMMARY`).
 _UNSET_NAME: str = "__LSB_UNSET_USER_NAME__"
 _UNSET_BODY: str = "__LSB_UNSET_USER_BODY__"
 
 
 class UserFactValidationError(ValueError):
-    """Нарушение доменных ограничений факта (лимиты формы, запрос поиска).
+    """A fact's domain constraint violation (shape limits, search query).
 
-    Текст исключения — hint для модели (транспорт MCP/REST отдаёт его клиенту
-    как fail + hint), факт при этом НЕ сохраняется: прецедент
-    `TitleValidationError`/`TITLE_HINT` и `SkillValidationError`.
+            The exception text is a hint for the model (the MCP/REST transport gives it
+            to the client as fail + hint); the fact is NOT saved: the precedents are
+            `TitleValidationError`/`TITLE_HINT` and `SkillValidationError`.
     """
 
 
 def _fact_text(name: str, body: str) -> str:
-    """Текст факта для сходства и векторизации — `name + body`.
+    """The fact's text for similarity and vectorization — `name + body`.
 
-    Тот же формат, что у вектора области (`AreaSpec.embed_text`, субстрат §3.3:
-    user — `name + body`, непустые поля через перевод строки).
+            The same format as the area's vector (`AreaSpec.embed_text`, substrate
+            §3.3: user — `name + body`, non-empty fields joined by newline).
     """
     return "\n".join(part for part in (name, body) if part)
 
 
 def _related_text(related: list[dict[str, Any]]) -> str:
-    """Справочный список похожих фактов для hint'а средней зоны — `id — name`."""
+    """The reference list of similar facts for the middle zone's hint — `id — name`."""
     return "; ".join(f"{item['id']} — {item['name']}" for item in related)
 
 
 class UserFactsService:
-    """CRUD области «user»: атомарные факты, дедуп-подсказка, изолированный поиск.
+    """The "user" area CRUD: atomic facts, the dedup hint, an isolated search.
 
-    DI: `settings` (лимиты формы, пороги сходства, обрезка выдачи), `embedding`
-    (кодирование запроса гибридного поиска). Путь записи кодировщик НЕ зовёт
-    (FR-3.5, субстрат §3.3): вектора записи догоняет петля `areas` воркера по
-    `vector_status='pending'`. Сид skill-создателя (lsb-0007-04) живёт в таблице
-    `skills` и к этой области отношения не имеет — сервис его не читает и не
-    меняет.
+            DI: `settings` (the shape limits, the similarity thresholds, the output
+            trim), `embedding` (encoding the hybrid search query). The write path does
+            NOT call the encoder (FR-3.5, substrate §3.3): the write's vectors are
+            caught up by the worker's `areas` loop over `vector_status='pending'`.
+            The skill-creator seed (lsb-0007-04) lives in the `skills` table and has
+            nothing to do with this area — the service neither reads nor changes it.
     """
 
     def __init__(
         self, settings: Settings, embedding: Embedder | None = None
     ) -> None:
         self._settings = settings
-        # DI для тестов: HashEmbedder/фейк с журналом вызовов вместо сети.
-        # Запись факта кодировщик не зовёт вовсе (дедуп — FTS + триграммы);
-        # кодировщик нужен только гибридному поиску области.
+        # DI for tests: a HashEmbedder/fake with a call log instead of the network.
+        # The fact write never calls the encoder (dedup — FTS + trigrams);
+        # the encoder is needed only by the area's hybrid search.
         self._embedding: Embedder = (
             embedding if embedding is not None else EmbeddingService(settings)
         )
-        # Гибридный поиск области (субстрат §3.5): vec0-KNN по `user_facts_vec`
-        # (вектор = `name + body`) + FTS5/BM25 по `user_facts_fts` → RRF.
-        # SQL помощника адресует только таблицы области (изоляция).
+        # The area's hybrid search (substrate §3.5): vec0-KNN over `user_facts_vec`
+        # (the vector = `name + body`) + FTS5/BM25 over `user_facts_fts` → RRF.
+        # The helper's SQL addresses only the area's tables (isolation).
         self._area_search = AreaSearch(settings, USER_FACTS_AREA, self._embedding)
-        # Сигнал воркеру (main.py): будить петлю areas сразу при появлении
-        # pending-записи области, а не ждать выросший back-off.
+        # A signal to the worker (main.py): wake the areas loop at once when
+        # an area pending record appears, instead of waiting out the grown back-off.
         self._areas_notifier: Callable[[], None] | None = None
 
     def set_areas_notifier(self, notifier: Callable[[], None] | None) -> None:
-        """Подключить сигнал пробуждения петли `areas` воркера (main.py).
+        """Wire the wakeup signal of the worker's `areas` loop (main.py).
 
-        По образцу `SkillsService.set_areas_notifier`: сервис собирается раньше
-        воркера, нотификатор приходит после его создания.
+                    Modeled on `SkillsService.set_areas_notifier`: the service is assembled
+                    before the worker, the notifier arrives after its creation.
         """
         self._areas_notifier = notifier
 
-    # --- запись: создание (arch §3.4) ---------------------------------------
+    # --- writes: creation (arch §3.4) -----------------------------------------
 
     def save(self, *, name: str, body: str) -> dict[str, Any]:
-        """Сохранить ОДИН атомарный факт (валидация → дедуп → запись).
+        """Save ONE atomic fact (validation → dedup → write).
 
-        Порядок обязателен: форма проверяется ДО дедупа (нарушение лимита →
-        `UserFactValidationError` с дословным hint §3.7), дедуп-скан — ДО
-        записи и без эмбеддинга (§3.4). Сильное совпадение → мягкий отказ
-        `{stored: False, hint, similar}` без записи; средняя зона → запись +
-        `related` + справочный hint; ниже порогов → запись. В любом успешном
-        ответе — постоянный hint атомарности (FR-7.2): несколько фактов =
-        несколько отдельных вызовов.
+                    The order is mandatory: the shape is checked BEFORE the dedup (a limit
+                    violation → `UserFactValidationError` with the verbatim §3.7 hint);
+                    the dedup scan — BEFORE the write and without embedding (§3.4). A
+                    strong match → a soft failure `{stored: False, hint, similar}` without
+                    a write; the middle zone → the write + `related` + a reference hint;
+                    below the thresholds → the write. Every successful answer carries the
+                    permanent atomicity hint (FR-7.2): several facts = several separate
+                    calls.
         """
         checked_name = self._checked_name(name)
         checked_body = self._checked_body(body)
@@ -205,8 +211,8 @@ class UserFactsService:
         if candidates:
             nearest, similarity = candidates[0]
             if similarity >= self._settings.user_similar_strong:
-                # Мягкий отказ (решение О. 2026-09-11): запись НЕ идёт, hint
-                # ведёт к правке существующего факта либо к отдельной записи.
+                # A soft failure: no write; the hint
+                # leads to editing the existing fact or to a separate record.
                 return {
                     "stored": False,
                     "hint": HINT_SIMILAR_FACT.format(
@@ -226,9 +232,9 @@ class UserFactsService:
             "hint": HINT_ATOMIC,
         }
         if related:
-            # Средняя зона: запись состоялась, похожие перечислены справочно.
-            # Оба канонических текста остаются в ответе дословно: постоянный
-            # hint атомарности — всегда, hint средней зоны — только здесь.
+            # The middle zone: the write happened; similar ones are listed for reference.
+            # Both canonical texts stay verbatim in the answer: the permanent
+            # atomicity hint — always; the middle zone's hint — only here.
             answer["related"] = related
             answer["hint"] = (
                 f"{HINT_ATOMIC}; "
@@ -238,10 +244,10 @@ class UserFactsService:
         return answer
 
     def _create(self, name: str, body: str) -> int:
-        """INSERT факта с `vector_status='pending'` (вектора — петля `areas`).
+        """INSERT a fact with `vector_status='pending'` (the vectors — the `areas` loop).
 
-        №41 (§13.5): baseline-версия пишется ТОЙ ЖЕ транзакцией, что и INSERT,
-        — состояния «факт есть, истории нет» не бывает.
+                    #41 (§13.5): the baseline version is written by THE SAME transaction
+                    as the INSERT — the state "the fact exists, no history" never happens.
         """
         with session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
@@ -261,7 +267,7 @@ class UserFactsService:
             )
             return fact_id
 
-    # --- правка (arch §3.3: «не передано» = оставить) -----------------------
+    # --- edit (arch §3.3: "not passed" = keep) --------------------------------
 
     def update(
         self,
@@ -270,15 +276,16 @@ class UserFactsService:
         name: str | None = _UNSET_NAME,
         body: str | None = _UNSET_BODY,
     ) -> dict[str, Any]:
-        """Отредактировать факт по id: `name` и/или `body`.
+        """Edit a fact by id: `name` and/or `body`.
 
-        «Не передано» (сентинел, дефолт параметра) = оставить текущее значение;
-        `null` в обязательном поле — мягкий отказ (обязательные поля не
-        сбрасываются, hint со семантикой «не передано = оставить»). Переданное
-        значение валидируется как при создании. Правка возвращает вектор записи
-        в `pending` и обновляет `updated_at` (вектора догоняет петля `areas`);
-        не найден/удалён → мягкий ответ с hint канона §3.7. Оба параметра не
-        переданы — правки нет (ни `updated_at`, ни вектор не трогаем).
+                    "Not passed" (the sentinel, the parameter default) = keep the current
+                    value; `null` in a mandatory field — a soft failure (mandatory fields
+                    are not cleared; the hint carries the "not passed = keep" semantics).
+                    A passed value is validated as at creation. The edit returns the
+                    record's vector to `pending` and refreshes `updated_at` (the `areas`
+                    loop catches up the vectors); not found/deleted → a soft answer with
+                    the §3.7 canon hint. Both parameters not passed — no edit (neither
+                    `updated_at` nor the vector is touched).
         """
         name_passed = name is not _UNSET_NAME
         body_passed = body is not _UNSET_BODY
@@ -293,11 +300,11 @@ class UserFactsService:
         checked_name = self._checked_name(name) if name_passed else None
         checked_body = self._checked_body(body) if body_passed else None
         if checked_name is None and checked_body is None:
-            # Оба параметра «не передано»: содержимое не меняем (прецедент
-            # lsb-0004 — «не передано» не сбрасывает и не переписывает
-            # запись), но существование строки всё же проверяем: PUT по удалённому
-            # или несуществующему id обязан дать «не найден» (транспорт → 404),
-            # иначе пустой PUT маскировал бы отсутствие факта.
+            # Both parameters "not passed": the content is not changed (the
+            # lsb-0004 precedent — "not passed" neither clears nor rewrites
+            # the record), but we still check the row's existence: a PUT over a deleted
+            # or nonexistent id must give "not found" (the transport → 404),
+            # otherwise an empty PUT would mask the fact's absence.
             with session(self._settings) as conn:
                 exists = conn.execute(
                     "SELECT 1 FROM user_facts WHERE id = ? AND deleted_at IS NULL",
@@ -325,9 +332,9 @@ class UserFactsService:
                     id,
                 ),
             )
-            # №41 (FR-3.3, §13.5): фактическая правка — версия-дельта той же
-            # транзакцией; пустой PUT сюда не доходит (вернулся раньше выше),
-            # а правка без изменений контента версии не создаёт (пустая дельта).
+            # #41 (FR-3.3, §13.5): an actual edit — a version delta in the same
+            # transaction; an empty PUT never reaches here (it returned earlier above),
+            # and an edit without content changes creates no version (an empty delta).
             live = conn.execute(
                 "SELECT name, body FROM user_facts WHERE id = ?", (id,)
             ).fetchone()
@@ -340,12 +347,13 @@ class UserFactsService:
         self._notify_areas_pending()
         return {"id": id, "changed": True}
 
-    # --- чтение (arch §3.3) -------------------------------------------------
+    # --- reads (arch §3.3) ----------------------------------------------------
 
     def get(self, id: int) -> dict[str, Any]:
-        """Прочитать факт: `{id, name, body}`; не найден → мягкий ответ с hint.
+        """Read a fact: `{id, name, body}`; not found → a soft answer with a hint.
 
-        Полное тело отдаёт только эта ручка (поиск — обрезанный `excerpt`).
+                    Only this handle serves the full body (the search — a trimmed
+                    `excerpt`).
         """
         with session(self._settings) as conn:
             row = conn.execute(
@@ -358,18 +366,19 @@ class UserFactsService:
         return {"id": int(row["id"]), "name": row["name"], "body": row["body"]}
 
     def search(self, query: str, top_k: int | None = None) -> dict[str, Any]:
-        """Гибридный поиск по области — «проба» (arch §3.3, субстрат §3.5).
+        """The area's hybrid search — a "probe" (arch §3.3, substrate §3.5).
 
-        Сборка `AreaSearch` под область user: vec0-KNN по `user_facts_vec`
-        (вектор = `name + body`) + FTS5/BM25 по `user_facts_fts` (`name`/`body`)
-        → RRF, фильтр `deleted_at IS NULL`. Выдача без тел: `{results: [{id,
-        name, excerpt}], warning?}`, `excerpt` обрезан до
-        `user_search_excerpt_chars` (полное тело — `get`). Пусто — мягкий ответ
-        с дословным hint канона §3.7 (факта нет — валидный исход). Отказ
-        эмбеддера поиск не ломает: FTS-only + `warning` (NFR-3). Изоляция: SQL
-        помощника адресует только таблицы области — заметки, навыки и термины
-        не читаются. `top_k` — границы как у поиска заметок (`1..MAX_TOP_K`),
-        нарушение — `UserFactValidationError` (мягкий отказ транспорта).
+                    An `AreaSearch` build for the user area: vec0-KNN over `user_facts_vec`
+                    (the vector = `name + body`) + FTS5/BM25 over `user_facts_fts`
+                    (`name`/`body`) → RRF, the `deleted_at IS NULL` filter. The output has
+                    no bodies: `{results: [{id, name, excerpt}], warning?}`, the `excerpt`
+                    trimmed to `user_search_excerpt_chars` (the full body — `get`). Empty —
+                    a soft answer with the verbatim §3.7 canon hint (no fact — a valid
+                    outcome). An embedder failure does not break the search: FTS-only +
+                    `warning` (NFR-3). Isolation: the helper's SQL addresses only the
+                    area's tables — notes, skills and terms are not read. `top_k` — the
+                    bounds like the notes search (`1..MAX_TOP_K`), a violation —
+                    `UserFactValidationError` (a soft transport failure).
         """
         if top_k is not None and not 1 <= top_k <= MAX_TOP_K:
             raise UserFactValidationError(
@@ -377,7 +386,7 @@ class UserFactsService:
             )
         try:
             found = self._area_search.search(query, top_k)
-        except AreaSearchValidationError as exc:  # запрос вне домена области
+        except AreaSearchValidationError as exc:  # a query outside the area's domain
             raise UserFactValidationError(str(exc)) from exc
         answer: dict[str, Any] = {
             "results": [
@@ -394,14 +403,15 @@ class UserFactsService:
             answer["hint"] = HINT_SEARCH_EMPTY
         return answer
 
-    # --- удаление (soft delete, arch §3.4) ---------------------------------
+    # --- deletion (soft delete, arch §3.4) ------------------------------------
 
     def delete(self, id: int) -> dict[str, Any]:
-        """Мягкое удаление факта: `deleted_at` = now, строка/индексы живы.
+        """Soft-delete a fact: `deleted_at` = now; the row/indexes stay alive.
 
-        Идемпотентно по смыслу: повторный/несуществующий id → мягкий ответ
-        `deleted: False` + hint канона §3.7 (восстановление — оператором,
-        прецедент заметок). Удалённый факт исчезает из всех выдач области.
+                    Idempotent in meaning: a repeated/nonexistent id → a soft
+                    `deleted: False` answer + the §3.7 canon hint (restoration — by the
+                    operator, the notes precedent). A deleted fact vanishes from all the
+                    area's outputs.
         """
         with session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
@@ -412,32 +422,32 @@ class UserFactsService:
             )
             deleted = bool(cursor.rowcount)
             if deleted:
-                # №41 (FR-6.1, §13.5): мягкое удаление — версия-событие.
+                # #41 (FR-6.1, §13.5): the soft delete — a version event.
                 history.record_event(
                     conn, history.ENTITY_USER_FACT, id, "delete"
                 )
         if not deleted:
             return {"id": id, "deleted": False, "hint": HINT_NOT_FOUND}
-        # Сигнал петле areas един по всем успешным изменениям области
-        # (постановка lsb-0009-01): у удаления pending не появляется, но
-        # сигнал безвреден и держит одну точку пробуждения воркера.
+        # The signal to the areas loop is one for all successful area changes
+        # (the lsb-0009-01 brief): a deletion adds no pending, but
+        # the signal is harmless and keeps a single worker wakeup point.
         self._notify_areas_pending()
         return {"id": id, "deleted": True}
 
-    # --- внутреннее: дедуп --------------------------------------------------
+    # --- internal: dedup -------------------------------------------------------
 
     def _dedup_candidates(
         self, conn: sqlite3.Connection, name: str, body: str
     ) -> list[tuple[dict[str, Any], float]]:
-        """Кандидаты дедупа с триграммным сходством, по убыванию близости.
+        """Dedup candidates with trigram similarity, by closeness descending.
 
-        Кандидаты — FTS5 `trigram` по `name + body` (top-3 активных записей
-        ИЗОЛИРОВАННОЙ области, arch §3.4): SQL адресует только `user_facts`/
-        `user_facts_fts`. Сходство считается вычислительно по нормализованному
-        тексту (`trigram_similarity` субстрата: lower → trim → пробелы → ё→е) —
-        эмбеддинг в момент записи не вызывается (FR-3.5). Удалённые записи
-        кандидатами не бывают. Нет слов ≥3 символов — триграммный индекс искать
-        не может: кандидатов нет (запись идёт без подсказки).
+                    Candidates — FTS5 `trigram` over `name + body` (the top-3 active
+                    records of the ISOLATED area, arch §3.4): the SQL addresses only
+                    `user_facts`/`user_facts_fts`. The similarity is computed arithmetically
+                    over the normalized text (the substrate's `trigram_similarity`: lower →
+                    trim → spaces → yo→ye) — no embedding at write time (FR-3.5). Deleted
+                    records are never candidates. No words ≥3 characters — the trigram
+                    index cannot search: no candidates (the write goes without a hint).
         """
         expression = match_expression(f"{name} {body}")
         if not expression:
@@ -463,15 +473,16 @@ class UserFactsService:
         scored.sort(key=lambda pair: (pair[1], pair[0]["id"]), reverse=True)
         return scored
 
-    # --- внутреннее: валидация формы ---------------------------------------
+    # --- internal: shape validation -------------------------------------------
 
     def _checked_name(self, name: str | None) -> str:
-        """Обязательное `name`: непустое и ≤ `user_name_max_words` слов.
+        """The mandatory `name`: non-empty and ≤ `user_name_max_words` words.
 
-        Механизм тот же, что у `is_valid_title` заметок (контракт `title`):
-        слова = `len(name.split())`; лимит — из настроек (канон —
-        `TITLE_MAX_WORDS=5`). Нарушение → `UserFactValidationError` с дословным
-        hint канона §3.7; возврат — нормализованное `name` без краевых пробелов.
+                    The mechanism is the same as the notes' `is_valid_title` (the `title`
+                    contract): words = `len(name.split())`; the limit — from settings
+                    (the canon — `TITLE_MAX_WORDS=5`). A violation →
+                    `UserFactValidationError` with the verbatim §3.7 canon hint; returns
+                    the normalized `name` without edge spaces.
         """
         normalized = name.strip() if isinstance(name, str) else ""
         if not normalized:
@@ -481,10 +492,10 @@ class UserFactsService:
         return normalized
 
     def _checked_body(self, body: str | None) -> str:
-        """Обязательное `body`: непустое и ≤ `user_body_max_chars` символов.
+        """The mandatory `body`: non-empty and ≤ `user_body_max_chars` characters.
 
-        Превышение лимита — дословный hint канона §3.7 («похоже на несколько
-        фактов в одной записи — разбей»): запись НЕ сохраняется.
+                    Over the limit — the verbatim §3.7 canon hint ("looks like several
+                    facts in one record — split it"): the record is NOT saved.
         """
         normalized = body.strip() if isinstance(body, str) else ""
         if not normalized:
@@ -493,17 +504,18 @@ class UserFactsService:
             raise UserFactValidationError(HINT_BODY_LIMIT)
         return normalized
 
-    # --- внутреннее: выдача и сигнал ----------------------------------------
+    # --- internal: output and the signal ---------------------------------------
 
     def _excerpt(self, body: str) -> str:
-        """Обрезка тела для выдачи поиска (`excerpt` ≤ лимита настроек).
+        """The body trim for the search output (`excerpt` ≤ the settings limit).
 
-        Полное тело поиск не отдаёт никогда (arch §3.3): детали — через `get`.
+                    The search never serves the full body (arch §3.3): details — via
+                    `get`.
         """
         limit = self._settings.user_search_excerpt_chars
         return body if len(body) <= limit else body[:limit]
 
     def _notify_areas_pending(self) -> None:
-        """Сигнал воркеру: область изменилась (будить петлю `areas` сразу)."""
+        """A signal to the worker: the area changed (wake the `areas` loop at once)."""
         if self._areas_notifier is not None:
             self._areas_notifier()
