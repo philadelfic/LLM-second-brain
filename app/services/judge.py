@@ -1,61 +1,62 @@
-"""JudgeService — LLM-судья дедупа (Фаза 8, Этап 3.1; решение Олега 2026-08-30).
+"""JudgeService — the LLM dedup judge (Phase 8, Stage 3.1).
 
-Третий внешний вызов системы: chat слота judge, модель JUDGE_MODEL
-(`ornith-1.5:35b`). Решает по паре текстов «дубль/не дубль» — та же мысль,
-пересказанная другими словами. Фоновый дедуп (Фаза 8, Этап 2) остаётся
-предфильтром: судью спрашивают только про косинус-кандидатов (топ-N,
-DEDUP_CANDIDATE_*), а не про все заметки (бриф Фазы 8, решение Олега
-«косинус как предфильтр»).
+    The system's third external call: the judge slot's chat, the JUDGE_MODEL model
+    (`ornith-1.5:35b`). It decides on a pair of texts "duplicate / not duplicate" —
+    the same thought retold in other words. Background dedup (Phase 8, Stage 2)
+    stays the prefilter: the judge is asked only about cosine candidates (top-N,
+    DEDUP_CANDIDATE_*), not about all notes (the Phase 8 brief, the "cosine as a
+    prefilter" decision).
 
-Фаза 11: HTTP-транспорт вынесен в `LLMClient` (app/services/llm_client.py)
-— один клиент на слот judge (провайдер `ollama` | `openai`, per-slot
-адрес/модель/ключ из Settings, решение №1; блок env переименован
-DEDUP_JUDGE_* → JUDGE_*). Сервис больше не держит httpx и не собирает
-пейлоады сам: system+user, non-stream, `judge_num_predict` и think уходят
-через `LLMClient.chat`; очередь F1 (ollama_slot — только ollama-провайдер),
-Bearer при заданном ключе и разбор ответа (`message.content`, reasoning-
-поля отбрасываются) — внутри клиента. keep_alive не отправляется никому
-(решение №6: моделью управляет сервер, OLLAMA_KEEP_ALIVE).
+    Phase 11: the HTTP transport is factored out into `LLMClient`
+    (app/services/llm_client.py) — one client per judge slot (provider `ollama` |
+    `openai`, per-slot address/model/key from Settings, decision #1; the env block
+    renamed DEDUP_JUDGE_* → JUDGE_*). The service no longer keeps httpx or builds
+    payloads itself: system+user, non-stream, `judge_num_predict` and think go
+    through `LLMClient.chat`; the F1 queue (ollama_slot — ollama provider only),
+    Bearer when a key is set, and response parsing (`message.content`, reasoning
+    fields discarded) live inside the client. keep_alive is not sent to anyone
+    (decision #6: the server governs the model, OLLAMA_KEEP_ALIVE).
 
-Модель вернула проверку (2026-08-30, бриф Фазы 8): вердикт в `message.content`
-маркированным жирным — `**ДУБЛЬ**` / `**НЕ ДУБЛЬ**` (markdown `**` стрипается,
-далее ищется подстрока; сначала «НЕ ДУБЛЬ» — иначе попадёт в «ДУБЛЬ»).
-Ответы без вердикта — отказ (безопаснее «не сводить»): воркер оставит обе
-заметки и повторит по back-off (NFR-3).
+    Model verification (2026-08-30, the Phase 8 brief): the verdict in
+    `message.content` is marked bold — `**DUPLICATE**` / `**NOT DUPLICATE**`
+    (markdown `**` is stripped, then a substring search; "NOT DUPLICATE" first —
+    otherwise it would match "DUPLICATE"). Answers without a verdict — a failure
+    (safer "not to merge"): the worker keeps both notes and retries on back-off
+    (NFR-3).
 
-`think` в запросе — история решений: на Этапе 3.1 судья не думал
-(быстро); после сквозного теста Фазы 8 (2026-08-30) Олег включил
-размышления — бездумный вердикт давал ложные ДУБЛИ на длинных
-однопроектных заметках (думающий судья на той же паре ответил
-корректно, 46 с). При JUDGE_THINK=false (дефолт кода) в тело идёт
-явное `"think": false`; при true (прод) — поле не отправляется, а
-пришедшее `message.thinking` всё равно отбрасывается (читаем только
-content — как в суммаризаторе); бюджет thinking+вердикта —
-JUDGE_NUM_PREDICT (прод 1024: замер ~1200 токенов, done_reason=stop).
+    `think` in the request — a history of decisions: at Stage 3.1 the judge did not
+    think (fast); after the Phase 8 end-to-end test (2026-08-30) reasoning was
+    enabled — a thoughtless verdict produced false DUPLICATES on long single-project
+    notes (the thinking judge answered correctly on the same pair, 46 s). With
+    JUDGE_THINK=false (the code default) the body carries an explicit
+    `"think": false`; with true (prod) the field is not sent, and an incoming
+    `message.thinking` is discarded anyway (only content is read — as in the
+    summarizer); the thinking+verdict budget is JUDGE_NUM_PREDICT (prod 1024:
+    a measurement of ~1200 tokens, done_reason=stop).
 
-Ключевые решения (по образцу SummaryService, Этап 2.2):
-- Синхронный httpx-транспорт внутри клиента — воркер исполняет его в
-  `asyncio.to_thread`; connect 2 с (LAN), чтение — JUDGE_TIMEOUT_SEC.
-  Дефолт кода (30 с из брифа) устарел: E2E Фазы 8 показал 46 с думающего
-  судьи на длинной паре (промпт ~2.9k токенов), худший живой вызов —
-  ~121 с — прод ставит 300 с (решение О. 2026-08-30).
-  Очередь ollama_slot (F1) гарантирует: read-таймаут тикает только с
-  реальной отправки запроса — ожидание за merge-генерацией не съедает
-  бюджет.
-- Ретраев нет — повтор решает воркер (back-off очереди, NFR-3).
-- Отказ — `JudgeError` и только она: HTTP не-200, не-JSON, пустой content,
-  вердикт не распознан, транспорт недоступен. Текст ошибки клиента
-  сохраняется (включая hint про {SLOT}_API_KEY у auth-отказа, решение №4).
-- `last_attempt_ok` (NFR-4, как у суммаризатора) — источник статуса в /health;
-  стартовая проверка слота (main.py, решение №5) инициализирует его до
-  первого реального вызова.
-- Промпты — из реестра (Фаза 11, решение №7): системный `judge_system` —
-  редактируемый (маркеры «ДУБЛЬ»/«НЕ ДУБЛЬ» валидируются при старте —
-  вердикты парсятся именно по ним), user-шаблон `judge_user` — зашитая
-  константа; `registry` инъектируется сборкой (build_services), без DI —
-  встроенные тексты реестра.
-- DI: юнит-тесты — httpx.MockTransport через `transport`; фейковые судьи
-  (tests/fakes.py) — для тестов интеграции в дедуп (Задача 3.2).
+    Key decisions (modeled on SummaryService, Stage 2.2):
+    - A synchronous httpx transport inside the client — the worker runs it in
+      `asyncio.to_thread`; connect 2 s (LAN), read — JUDGE_TIMEOUT_SEC. The code
+      default (30 s from the brief) is outdated: the Phase 8 E2E showed 46 s of a
+      thinking judge on a long pair (a prompt of ~2.9k tokens), the worst live call
+      — ~121 s — prod sets 300 s.
+      The ollama_slot queue (F1) guarantees: the read timeout ticks only from the
+      actual request send — waiting behind a merge generation does not eat the
+      budget.
+    - No retries — the worker decides on repeats (queue back-off, NFR-3).
+    - Failure — `JudgeError` and only it: non-200 HTTP, non-JSON, empty content,
+      an unrecognized verdict, transport unavailable. The client's error text is
+      preserved (including the {SLOT}_API_KEY hint on an auth failure, decision #4).
+    - `last_attempt_ok` (NFR-4, like the summarizer) — the source of the /health
+      status; the slot startup check (main.py, decision #5) initializes it before
+      the first real call.
+    - Prompts — from the registry (Phase 11, decision #7): the system `judge_system`
+      is editable (the "DUPLICATE"/"NOT DUPLICATE" markers are validated at startup —
+      the verdicts are parsed by exactly them), the user template `judge_user` is a
+      baked-in constant; `registry` is injected by the build (build_services),
+      without DI — the registry's built-in texts.
+    - DI: unit tests — httpx.MockTransport via `transport`; fake judges
+      (tests/fakes.py) — for integration tests in dedup (Task 3.2).
 """
 
 from __future__ import annotations
@@ -74,11 +75,12 @@ from app.services.slot_outcome import SlotOutcome, classify_llm_error
 
 
 class JudgeError(RuntimeError):
-    """Судья не дал вердикта: сервер недоступен или ответ некорректен.
+    """The judge gave no verdict: the server is unavailable or the response is invalid.
 
-    `outcome` — единый тип исхода вызова слота (№39, arch §6.4): отказ
-    клиента классифицируется `classify_llm_error`, а «вердикт не распознан»
-    — явно `OFF_CONTRACT` (дефолт). Воркер пишет исход в журнал.
+            `outcome` — the single call-outcome type of a slot (#39, arch §6.4): a
+            client failure is classified by `classify_llm_error`, and "the verdict is
+            not recognized" — explicitly `OFF_CONTRACT` (the default). The worker
+            writes the outcome to the journal.
     """
 
     def __init__(
@@ -90,47 +92,49 @@ class JudgeError(RuntimeError):
     ) -> None:
         super().__init__(message)
         self.outcome = outcome
-        # Метаданные состоявшегося вызова (№49): отказ после ответа модели
-        # (вердикт не распознан) несёт их воркеру — отказ в журнале виден
-        # теми же полями вызова, что и успех (§7.2).
+        # Metadata of a completed call (#49): a failure after the model's response
+        # (the verdict not recognized) carries them to the worker — the failure is visible in the journal
+        # with the same call fields as success (§7.2).
         self.meta = meta
 
 
 @dataclass(frozen=True)
 class JudgeResult:
-    """Результат судьи вместе с метаданными вызова (№49, §6.3)."""
+    """The judge's result together with the call metadata (#49, §6.3)."""
 
     verdict: bool
     meta: ChatMeta
 
 
 class Judge(Protocol):
-    """Контракт судьи дедупа: природы реализации он не знает.
+    """The dedup judge contract: it knows nothing about the implementation nature.
 
-    Реализации: JudgeService (живой слот judge) и тестовые фейки
-    (tests/fakes.py) — воркер зависит от протокола, а не от класса клиента.
+            Implementations: JudgeService (the live judge slot) and test fakes
+            (tests/fakes.py) — the worker depends on the protocol, not the client
+            class.
     """
 
     def judge(self, text_new: str, text_candidate: str) -> JudgeResult:
-        """Вердикт по паре текстов: True — дубль, False — не дубль.
+        """A verdict on a pair of texts: True — duplicate, False — not duplicate.
 
-        Невозможность дать вердикт — отказ (безопаснее «не сводить»): воркер
-        оставит обе заметки и повторит по back-off (NFR-3).
+                    Inability to give a verdict — a failure (safer "not to merge"): the
+                    worker keeps both notes and retries on back-off (NFR-3).
         """
         ...
 
     def probe(self) -> str:
-        """Дешёвый пробный стук слота (№39, arch §6.4): `check()` без генерации;
-        исход — CheckResult из llm_client."""
+        """A cheap probe knock on the slot (#39, arch §6.4): `check()` without generation;
+                    the outcome — a CheckResult from llm_client.
+        """
         ...
 
     def close(self) -> None:
-        """Закрыть ресурсы (интерфейс-совместимость с остальными клиентами)."""
+        """Close resources (interface-compatible with the other clients)."""
         ...
 
 
 class JudgeService:
-    """Вердикт «дубль/не дубль» через chat слота judge (non-stream)."""
+    """The "duplicate / not duplicate" verdict via the judge slot's chat (non-stream)."""
 
     def __init__(
         self,
@@ -145,14 +149,14 @@ class JudgeService:
     ) -> None:
         self._settings = settings
         self._prompts = registry if registry is not None else PromptRegistry()
-        # LSBN-F-12: decision-слот (None — выключен, поведение v3.1.0).
+        # LSBN-F-12: the decision slot (None — disabled, v3.1.0 behavior).
         self._decider = decider
-        # DI сборки (общий клиент слота judge) или свой клиент с
-        # transport-инъекцией для юнит-тестов (MockTransport). Операция
-        # `judge` (LSBN-F-34): её env и есть env слота — цепочка не добавляет
-        # слоя, spec совпадает с for_judge; переопределение операции действует
-        # только на этом генеративном пути (резервный decision-слот — со
-        # своими DECISION_*).
+        # DI builds (the shared judge slot client) or a dedicated client with
+        # a transport injection for unit tests (MockTransport). The `judge`
+        # operation (LSBN-F-34): its env is the slot's env — the chain adds no
+        # layer, the spec equals for_judge; the operation override acts
+        # only on this generative path (the fallback decision slot has
+        # its own DECISION_*).
         self._llm = (
             llm
             if llm is not None
@@ -160,21 +164,17 @@ class JudgeService:
                 SlotSpec.for_operation("judge", settings)[0], transport=transport
             )
         )
-        # None — попыток не было (health не врёт до первых данных).
+        # None — no attempts yet (health does not lie before the first data).
         self.last_attempt_ok: bool | None = None
-        # Метаданные последнего вызова (№49/№50): диагностика в /health.slots
-        # без чтения журнала (None — вызова ещё не было).
+        # Metadata of the last call (#49/#50): diagnostics in /health.slots
+        # without reading the journal (None — no call yet).
         self.last_meta: ChatMeta | None = None
 
     def judge(self, text_new: str, text_candidate: str) -> JudgeResult:
-        """Вердикт по паре: decision-слот, иначе генеративный путь (§6.3/§13.6).
+        """A verdict on a pair of texts: True — duplicate, False — not duplicate.
 
-        Решение может прийти от decision-слота (state — боевой `judge_user`,
-        один `noul`-вопрос реестра); три причины переключения
-        (`unavailable`/`unsupported`/`low_confidence`) уводят на прежний
-        генеративный путь, а при `DECISION_FALLBACK=false` — в отказ
-        `UNAVAILABLE` (контракт №39: задание ждёт, вердикт не выдумывается).
-        Внешний контракт (`JudgeResult.verdict: bool`) не меняется (FR-5.3).
+                    Inability to give a verdict — a failure (safer "not to merge"): the
+                    worker keeps both notes and retries on back-off (NFR-3).
         """
         if not text_new or not text_new.strip():
             raise ValueError("judge: пустая заметка недопустима")
@@ -185,7 +185,7 @@ class JudgeService:
                 return self._judge_decision(text_new, text_candidate)
             except DecisionUnavailable as exc:
                 if not self._settings.decision_fallback:
-                    # Контракт №39: генеративный вердикт не берём — задание ждёт.
+                    # The #39 contract: no generative verdict is taken — the task waits.
                     self.last_attempt_ok = False
                     raise JudgeError(
                         str(exc), outcome=SlotOutcome.UNAVAILABLE
@@ -195,11 +195,11 @@ class JudgeService:
     def _judge_decision(
         self, text_new: str, text_candidate: str
     ) -> JudgeResult:
-        """Решение decision-слота: `label == "true"` → вердикт «ДУБЛЬ».
+        """The decision slot's verdict: `label == "true"` → the DUPLICATE verdict.
 
-        Журнал (`decision_answer`/`decision_fallback`) — внутри `DecisionService`
-        (arch §7.2/§13.6): потребитель не знает, каким типом слота получено
-        решение (FR-5.3).
+                    The journal (`decision_answer`/`decision_fallback`) lives inside
+                    `DecisionService` (arch §7.2/§13.6): the consumer does not know by which
+                    slot type the decision was obtained (FR-5.3).
         """
         assert self._decider is not None
         questions = self._decider.questions_for("judge")
@@ -224,55 +224,56 @@ class JudgeService:
     def _judge_generative(
         self, text_new: str, text_candidate: str
     ) -> JudgeResult:
-        """Прежний генеративный путь (маркеры `**DUPLICATE**`/`**NOT DUPLICATE**`)."""
+        """The old generative path (the `**DUPLICATE**`/`**NOT DUPLICATE**` markers)."""
         try:
             result = self._llm.chat_result(
                 self._prompts.judge_system,
                 self._prompts.judge_user.format(
                     text_new=text_new, text_candidate=text_candidate
                 ),
-                # Бюджет — цепочка операции (JUDGE_NUM_PREDICT; 0 = авто, №49).
+                # The budget — the operation chain (JUDGE_NUM_PREDICT; 0 = auto, #49).
                 operation="judge",
             )
         except LLMError as exc:
-            # Текст клиента сохраняется: HTTP-статус, адрес слота, hint
-            # про {SLOT}_API_KEY у auth-отказа (решение №4). Исход вызова
-            # (№39, arch §6.4) — единый тип исхода на границе сервиса.
-            self.last_attempt_ok = False  # деградация станет видна в /health
-            self.last_meta = exc.meta  # метаданные вызова для диагностики
+            # The client text is preserved: HTTP status, the slot address, the
+            # {SLOT}_API_KEY hint on an auth failure (decision #4). The call outcome
+            # (#39, arch §6.4) — a single outcome type at the service boundary.
+            self.last_attempt_ok = False  # the degradation becomes visible in /health
+            self.last_meta = exc.meta  # call metadata for diagnostics
             raise JudgeError(
                 str(exc), outcome=classify_llm_error(exc), meta=exc.meta
             ) from exc
         try:
             verdict = self._verdict(result.content)
         except JudgeError as exc:
-            self.last_attempt_ok = False  # нераспознанный вердикт — тоже отказ
+            self.last_attempt_ok = False  # an unrecognized verdict is also a failure
             self.last_meta = result.meta
-            # Вызов состоялся — метаданные уходят воркеру вместе с отказом.
+            # The call happened — the metadata goes to the worker along with the failure.
             raise JudgeError(str(exc), outcome=exc.outcome, meta=result.meta) from exc
         self.last_attempt_ok = True
         self.last_meta = result.meta
         return JudgeResult(verdict=verdict, meta=result.meta)
 
     def close(self) -> None:
-        """Закрыть HTTP-пул (чистое завершение процесса)."""
+        """Close resources (interface-compatible with the other clients)."""
         self._llm.close()
 
     def probe(self) -> str:
-        """Дешёвый пробный стук слота judge (№39, arch §6.4): `check()`
-        без генерации. Исход отдаётся как есть (CheckResult)."""
+        """A cheap probe knock on the slot (#39, arch §6.4): `check()` without generation;
+                    the outcome — a CheckResult from llm_client.
+        """
         return self._llm.check()
 
-    # --- внутреннее ---------------------------------------------------------
+    # --- internal -------------------------------------------------------------
 
     @staticmethod
     def _verdict(content: str) -> bool:
-        """Парсинг вердикта из content (формат брифа: `**DUPLICATE**/…`).
+        """Parse the verdict from content (the brief's format: `**DUPLICATE**/…`).
 
-        Markdown-жирный стрипается, регистр не учитывается; сначала ищем
-        «NOT DUPLICATE» (подстрока содержит «DUPLICATE»), затем «DUPLICATE».
-        Ответ без вердикта — отказ: неопределённость не превращаем в
-        «не дубль».
+                    Markdown-bold is stripped, case does not matter; search "NOT DUPLICATE"
+                    first (the substring contains "DUPLICATE"), then "DUPLICATE". An answer
+                    without a verdict — a failure: uncertainty is never turned into
+                    "not duplicate".
         """
         normalized = " ".join(content.replace("*", " ").upper().split())
         if "NOT DUPLICATE" in normalized:
