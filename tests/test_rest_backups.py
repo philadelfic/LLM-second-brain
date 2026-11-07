@@ -1,9 +1,10 @@
-"""Операторские ручки бэкапов (№14, 3.2.0, arch §7.2/§7.3).
+"""The backups operator handles (#14, 3.2.0, arch §7.2/§7.3).
 
-`GET /backups` — список снапшотов `{items, total}` (свежие первыми, форма
-элемента оговорена); `POST /backups/verify` — проверка по вызову (дефолт =
-свежайший, явный `file`, нет файла → 404 «no such snapshot»); событие
-`backup_verify_ok`/`backup_verify_failed` пишется с оговорёнными полями.
+    `GET /backups` — the snapshot list `{items, total}` (newest first; the item
+    shape agreed); `POST /backups/verify` — on-demand verification (the default =
+    the newest, an explicit `file`, no such file → 404 "no such snapshot"); the
+    `backup_verify_ok`/`backup_verify_failed` event is written with the agreed
+    fields.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ def _with_event(caplog: pytest.LogCaptureFixture, event: str) -> list[Any]:
 
 
 def test_backups_list(client: TestClient, token: str) -> None:
-    """GET /backups: элементы с оговорённой формой, свежие первыми, total."""
+    """GET /backups: items with the agreed shape, newest first, total."""
     backup = _backup(client)
     backup_dir = Path(backup._settings.backup_dir)
     older = backup_dir / "notes-20200101T000000Z.db"
@@ -65,7 +66,7 @@ def test_backups_list(client: TestClient, token: str) -> None:
 
 
 def test_backups_list_marks_bad(client: TestClient, token: str) -> None:
-    """Помеченный снапшот виден как verified=failed, bad=True."""
+    """A marked snapshot shows as verified=failed, bad=True."""
     backup = _backup(client)
     backup_dir = Path(backup._settings.backup_dir)
     marked = backup_dir / "notes-20200303T000000Z.db"
@@ -80,7 +81,7 @@ def test_backups_list_marks_bad(client: TestClient, token: str) -> None:
 
 
 def test_backups_verify_on_demand(client: TestClient, token: str) -> None:
-    """POST /backups/verify: явный file и дефолт (свежайший); нет файла → 404."""
+    """POST /backups/verify: an explicit file and the default (the newest); no file → 404."""
     backup = _backup(client)
     target = backup.snapshot()
     explicit = client.post(
@@ -91,11 +92,11 @@ def test_backups_verify_on_demand(client: TestClient, token: str) -> None:
     assert body["ok"] is True
     assert body["file"] == target.name
     assert body["checks"]["integrity"] == "ok"
-    # Дефолт (нет/пусто file) — свежайший снапшот каталога.
+    # The default (no/empty file) — the directory's newest snapshot.
     default = client.post("/backups/verify", json={}, headers=_auth(token))
     assert default.status_code == 200
     assert default.json()["ok"] is True
-    # Несуществующий файл — 404 с оговорённым текстом.
+    # A nonexistent file — 404 with the agreed text.
     missing = client.post(
         "/backups/verify",
         json={"file": "notes-19700101T000000Z.db"},
@@ -108,7 +109,7 @@ def test_backups_verify_on_demand(client: TestClient, token: str) -> None:
 def test_backup_verify_event(
     client: TestClient, token: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Событие backup_verify_failed несёт file/reason/checks/latency_ms."""
+    """The backup_verify_failed event carries file/reason/checks/latency_ms."""
     backup = _backup(client)
     backup_dir = Path(backup._settings.backup_dir)
     broken = backup_dir / "notes-20190101T000000Z.db"
@@ -131,7 +132,7 @@ def test_backup_verify_event(
 def test_backup_verify_ok_event(
     client: TestClient, token: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Событие backup_verify_ok пишется у годного снапшота."""
+    """The backup_verify_ok event is written for a good snapshot."""
     backup = _backup(client)
     target = backup.snapshot()
     with caplog.at_level(logging.INFO, logger="app"):

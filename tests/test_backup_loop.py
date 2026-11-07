@@ -1,10 +1,11 @@
-"""Интеграция проверки в петлю бэкапов (№14, 3.2.0, arch §6.1/§13.2).
+"""The verification integrated into the backups loop (#14, 3.2.0, arch §6.1/§13.2).
 
-`run()` после успешного снапшота проверяет каждый N-й снапшот по
-`BACKUP_VERIFY_EVERY` (0 — только вручную); отказ проверки петлю не роняет
-(NFR-3), исход — событием журнала. После успешной проверки и при заданной
-команде `BACKUP_SHIP_CMD` копия уносится за пределы сервера (`ship`); отказ
-выноса петлю не роняет и локальную ротацию не ломает (FR-3.2).
+    `run()` after a successful snapshot verifies every N-th snapshot per
+    `BACKUP_VERIFY_EVERY` (0 — manual only); a verify failure does not crash the
+    loop (NFR-3); the outcome — as a journal event. After a successful
+    verification and with `BACKUP_SHIP_CMD` set, the copy ships off the server
+    (`ship`); a ship failure does not crash the loop or break the local rotation
+    (FR-3.2).
 """
 
 from __future__ import annotations
@@ -68,7 +69,7 @@ async def _run_until(service: BackupService, predicate) -> None:
 
 @pytest.mark.asyncio
 async def test_loop_verifies_every_n(service, monkeypatch: pytest.MonkeyPatch) -> None:
-    """При `backup_verify_every=1` после снапшота вызван verify."""
+    """At `backup_verify_every=1` verify is called after a snapshot."""
     build, _backup_dir = service
     instance = build(1)
     calls: list[Any] = []
@@ -85,7 +86,7 @@ async def test_loop_verifies_every_n(service, monkeypatch: pytest.MonkeyPatch) -
 
 @pytest.mark.asyncio
 async def test_loop_does_not_verify_when_zero(service) -> None:
-    """При `backup_verify_every=0` авто-проверка не запускается."""
+    """At `backup_verify_every=0` the auto-verification does not start."""
     build, backup_dir = service
     instance = build(0)
     calls: list[Any] = []
@@ -106,7 +107,7 @@ async def test_loop_does_not_verify_when_zero(service) -> None:
 async def test_verify_failure_does_not_kill_loop(
     service, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Отказ verify → событие backup_verify_failed, петля продолжает снапшоты."""
+    """A verify failure → a backup_verify_failed event; the loop keeps snapshotting."""
     build, backup_dir = service
     instance = build(1)
 
@@ -120,7 +121,7 @@ async def test_verify_failure_does_not_kill_loop(
             lambda: bool(_with_event(caplog, "backup_verify_failed")),
         )
     assert _with_event(caplog, "backup_verify_failed")
-    # Петля жива: снапшоты продолжают сниматься.
+    # The loop is alive: snapshots keep being taken.
     assert len(list(backup_dir.glob(f"{IMAGE_PREFIX}*{IMAGE_SUFFIX}"))) >= 1
 
 
@@ -128,7 +129,7 @@ async def test_verify_failure_does_not_kill_loop(
 async def test_loop_ships_after_verify(
     service, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Задана команда и проверка прошла — `ship` вызван с свежим снапшотом."""
+    """A command set and the verification passed — `ship` called with the fresh snapshot."""
     build, _backup_dir = service
     instance = build(1, backup_ship_cmd="true")
     shipped: list[Path] = []
@@ -148,7 +149,7 @@ async def test_loop_ships_after_verify(
 async def test_loop_does_not_ship_when_verify_failed(
     service, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`verify.ok=False` — вынос не запускается (FR-3.2)."""
+    """`verify.ok=False` — the ship does not start (FR-3.2)."""
     build, _backup_dir = service
     instance = build(1, backup_ship_cmd="true")
     verified: list[Any] = []
@@ -179,9 +180,9 @@ async def test_loop_does_not_ship_when_verify_failed(
 async def test_loop_does_not_ship_when_disabled(
     service, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Пустая `BACKUP_SHIP_CMD` — вынос не зовётся вовсе, хотя verify идёт."""
+    """An empty `BACKUP_SHIP_CMD` — ship is never called, although verify runs."""
     build, _backup_dir = service
-    instance = build(1)  # команда по умолчанию пуста
+    instance = build(1)  # the default command is empty
     verified: list[Any] = []
     shipped: list[Any] = []
     real = instance.verify
