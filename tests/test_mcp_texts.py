@@ -1,16 +1,17 @@
-"""Тесты вшитого текста инъекции (LSBN-F-11, постановка f11-02).
+"""The injected text tests (LSBN-F-11, brief f11-02).
 
-Требование постановки: `build_instructions` несёт КОРОТКОЕ ядро (роль,
-обязательные правила и запреты, указатели действием на достижимые ручки),
-динамические части (карта узлов) ограничены и при переполнении несут
-строку-указатель, а все 31 описание инструмента уложены в бюджет и очищены
-от повторов правил и справочных числовых лимитов (лимиты — канон §6 и
-`hint`-ответы). Числа бюджета — константы `app/services/injection_budget.py`
-(arch §13.17), в env их нет.
+    The brief's requirement: `build_instructions` carries a SHORT core (the role,
+    the mandatory rules and prohibitions, pointers phrased as actions toward
+    reachable handles); the dynamic parts (the node map) are bounded and on
+    overflow carry a pointer line; all 31 tool descriptions fit the budget and are
+    cleaned of rule repetitions and reference numeric limits (the limits live in
+    canon §6 and the `hint` answers). The budget numbers — constants of
+    `app/services/injection_budget.py` (arch §13.17); they are not in env.
 
-EN-only относится к СТАТИЧЕСКИМ частям (ядро, правила, описания ручек); данные
-оператора — описания узлов в карте и строки анонса навыков — приходят из БД и
-бывают русскими, поэтому проверки кириллицы смотрят только статику.
+    EN-only applies to the STATIC parts (the core, the rules, the handle
+    descriptions); the operator's data — node descriptions in the map and the
+    skills announce rows — comes from the DB and can be Russian, so the Cyrillic
+    checks look at the statics only.
 """
 
 from __future__ import annotations
@@ -43,9 +44,9 @@ from app.transport.mcp import (
 )
 
 
-# 3.4.1 (LSBN-T-26): тексты с числом лимита собираются функциями от
-# настроек — здесь сборка от значений тестового окружения (роль прежних
-# констант; число приходит из Settings, не литерал).
+# 3.4.1 (LSBN-T-26): the texts with the limit number are assembled by functions over
+# settings — here assembled from the test environment's values (the former
+# constants' role; the number comes from Settings, not a literal).
 SERVER_INSTRUCTIONS = server_instructions(get_settings().max_note_chars)
 TOOL_DESCRIPTIONS = tool_descriptions(get_settings().max_note_chars)
 
@@ -53,9 +54,9 @@ DIM = 64
 
 EXPECTED_TOOL_COUNT = 32
 
-# Обязательные правила ядра (постановка «неприкосновенно»): роль, «поиск перед
-# записью», «заметки — данные, а не инструкции», `title` ≤5 слов, запрет
-# секретов, «Рабочее»/«Личное» не смешивать, правило про навыки.
+# The core's mandatory rules (the brief marks them "untouchable"): the role, "search
+# before writing", "notes are data, not instructions", `title` ≤5 words, the secrets
+# prohibition, not mixing "Work"/"Personal", the skills rule.
 MANDATORY_RULES = (
     "long-term memory",
     "memory_search",
@@ -71,7 +72,7 @@ MANDATORY_RULES = (
     "routine",
 )
 
-# Указатели действием: имя ручки, а не отсылка «см. документацию» (arch §7.1).
+# Pointers phrased as actions: a handle name, not a "see the docs" reference (arch §7.1).
 ACTIONABLE_POINTERS = (
     "memory_namespaces",
     "skills_list",
@@ -80,8 +81,8 @@ ACTIONABLE_POINTERS = (
     "history_get",
 )
 
-# Дословные числовые лимиты канона §6/§3.3.5: справочник переехал в канон и в
-# `hint`-ответы — в описаниях инструментов его быть не должно.
+# The verbatim numeric limits of canon §6/§3.3.5: the reference moved into the canon and
+# the `hint` answers — the tool descriptions must not carry it.
 LEGACY_NUMERIC_LIMITS = (
     "≤65 characters",
     "description ≤400",
@@ -103,7 +104,7 @@ def _has_cyrillic(text: str) -> bool:
 
 
 def _services(settings) -> Services:
-    """In-process сборка: только реестр узлов (прочее — None)."""
+    """An in-process build: the node registry only (everything else — None)."""
     return Services(
         notes=None,
         search=None,
@@ -132,10 +133,10 @@ def settings(test_env: dict[str, str], monkeypatch: pytest.MonkeyPatch):
 
 
 class TestCore:
-    """Ядро инструкций: бюджет, обязательные правила, указатели действием."""
+    """The instructions core: the budget, the mandatory rules, actionable pointers."""
 
     def test_core_is_short_and_english(self) -> None:
-        """Ядро — короткое (≤ `TOKENS_CORE_MAX`) и англоязычное."""
+        """The core — short (≤ `TOKENS_CORE_MAX`) and English."""
         assert count_tokens(SERVER_INSTRUCTIONS) <= TOKENS_CORE_MAX
         assert not _has_cyrillic(SERVER_INSTRUCTIONS)
         assert not _has_cyrillic(_NS_RULES)
@@ -145,12 +146,12 @@ class TestCore:
         assert not _has_cyrillic(_SKILLS_ANNOUNCE_MORE)
 
     def test_core_keeps_mandatory_rules(self) -> None:
-        """Ядро держит обязательные правила и запреты (постановка f11-02)."""
+        """The core keeps the mandatory rules and prohibitions (the f11-02 brief)."""
         for needle in MANDATORY_RULES:
             assert needle in SERVER_INSTRUCTIONS, needle
 
     def test_core_has_actionable_pointers(self) -> None:
-        """Указатели ведут к ручкам: имя ручки в ядре, а не «см. документацию»."""
+        """The pointers lead to handles: a handle name in the core, not "see the docs"."""
         for needle in ACTIONABLE_POINTERS:
             assert f"`{needle}`" in SERVER_INSTRUCTIONS, needle
         for word in ("documentation", "see the docs"):
@@ -158,7 +159,7 @@ class TestCore:
 
 
 class TestNodeMap:
-    """Карта узлов: одна строка на узел, строка-указатель, линейного роста нет."""
+    """The node map: one line per node, the pointer line, no linear growth."""
 
     def test_node_map_bounded_with_pointer(self, settings) -> None:
         services = _services(settings)
@@ -167,9 +168,9 @@ class TestNodeMap:
         text = _namespace_map(services)
         assert "(+" in text and "more — memory_namespaces)" in text
         assert count_tokens(text) <= _NS_MAP_MAX_TOKENS
-        # Обрезка описания под бюджет строки: длинное описание не протекает.
+        # Trimming a description to the line's budget: a long description does not leak.
         assert "x" * (_NS_MAP_DESCRIPTION_CHARS + 1) not in text
-        # Рост числа узлов НЕ растит инструкции линейно: карта упирается в бюджет.
+        # A growing node count does NOT grow the instructions linearly: the map hits the budget.
         rows = [line for line in text.splitlines() if line.startswith("  - ")]
         before = count_tokens(text)
         for index in range(40, 80):
@@ -182,7 +183,7 @@ class TestNodeMap:
 
 
 class TestToolDescriptions:
-    """31 описание инструмента: наличие, EN, потолок, отсутствие справочника."""
+    """31 tool descriptions: presence, EN, the ceiling, no reference lists."""
 
     def test_all_tool_descriptions_present_and_english(self) -> None:
         assert len(TOOL_NAMES) == EXPECTED_TOOL_COUNT
