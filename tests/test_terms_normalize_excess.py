@@ -1,4 +1,4 @@
-"""№32 (3.2.0): счётчик контекстов и флаг переизбытка (FR-5.1/FR-5.2)."""
+"""#32 (3.2.0): the context counter and the over-abundance flag (FR-5.1/FR-5.2)."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def parts(test_env, monkeypatch):
 
 
 def test_excess_threshold_and_resolve(parts) -> None:
-    """≥ порога разных контекстов → предупреждение со счётчиком; ниже — снято."""
+    """≥ the threshold of distinct contexts → a warning with the counter; below — cleared."""
     settings, terms, _warnings, service = parts
     seed(
         settings,
@@ -33,19 +33,19 @@ def test_excess_threshold_and_resolve(parts) -> None:
             for index, context in enumerate(CONTEXTS, start=1)
         ],
     )
-    # Предупреждение — не правка данных: для петли джобы это НЕ прогресс
-    # (иначе группа с одним лишь предупреждением крутила бы петлю вхолостую,
-    # lsbdef-0011). Разобранные группы видны в событии как `terms`.
+    # A warning is not a data edit: for the job's loop it is NOT progress
+    # (otherwise a group with only a warning would spin the loop idle,
+    # lsbdef-0011). The parsed groups are visible in the event as `terms`.
     assert service.run() == 0
     opened = warnings_rows(settings, "term_contexts_excess")
     assert len(opened) == 1
     assert json.loads(opened[0]["payload"])["contexts"] == 5
     assert opened[0]["resolved_at"] is None
 
-    # Убираем один (не минимальный) контекст → число падает ниже порога.
+    # We drop one (not the minimal) context → the count falls below the threshold.
     assert terms.delete(5)["deleted"] is True
     service.run()
     resolved = warnings_rows(settings, "term_contexts_excess")
-    assert len(resolved) == 1  # строки не плодятся (upsert/снятие)
+    assert len(resolved) == 1  # rows are not multiplied (upsert/clearing)
     assert resolved[0]["resolved_at"] is not None
-    assert normalize_key(CONTEXTS[4]) == "железо"  # контекст действительно ушёл
+    assert normalize_key(CONTEXTS[4]) == "железо"  # the context is really gone
