@@ -1,13 +1,14 @@
-"""Логирование (Фаза 5, NFR-4): JSON в stdout, tool_call-события, приватность.
+"""Logging (Phase 5, NFR-4): JSON to stdout, tool_call events, privacy.
 
-Два уровня проверки:
-- **Юнит** — JsonFormatter (валидный JSON, extra-поля, ts), `preview` (80
-  символов), `log_tool_call` (event/tool/latency_ms), идемпотентность
-  `setup_logging`.
-- **e2e против прод-точки входа** (`python -m app`, subprocess): stdout
-  целиком — JSON-строки (app-логи И uvicorn access/error — см. log_config);
-  вызов инструмента попадает в лог с латентностью и числом результатов;
-  содержимое заметки в лог НЕ попадает (NFR-4), остаётся только длина.
+    Two check levels:
+    - **Unit** — JsonFormatter (valid JSON, extra fields, ts), `preview` (80
+      characters), `log_tool_call` (event/tool/latency_ms), `setup_logging`
+      idempotency.
+    - **e2e against the prod entry point** (`python -m app`, a subprocess): the
+      stdout is entirely JSON lines (the app logs AND uvicorn access/error — see
+      log_config); a tool call lands in the log with latency and the result
+      count; the note's content does NOT reach the log (NFR-4) — only the
+      length remains.
 """
 
 from __future__ import annotations
@@ -41,23 +42,23 @@ from app.observability import (
 )
 from tests.conftest import TEST_ENV
 
-# Порт — уникальный на xdist-воркера (PYTEST_XDIST_WORKER = "gw<N>"; вне xdist
-# индекс 0 → 18768). Module-фикстура ниже поднимает живой сервер: под xdist она
-# может быть активна одновременно с session-фикстурами test_mcp.py другого
-# воркера, раньше порт 18767 у них был общий. Шаг 4 согласован с test_mcp.py.
+# The port — unique per xdist worker (PYTEST_XDIST_WORKER = "gw<N>"; outside xdist
+# index 0 → 18768). The module fixture below raises a live server: under xdist it
+# can be active along with another worker's test_mcp.py session fixtures;
+# port 18767 used to be shared. Step 4 is coordinated with test_mcp.py.
 _XDIST_WORKER = os.environ.get("PYTEST_XDIST_WORKER", "")
 LOG_SERVER_PORT = 18768 + 4 * (int(_XDIST_WORKER[2:]) if _XDIST_WORKER else 0)
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Уникальные подстроки, которые НИ В КОЕМ случае не должны появиться в логах.
+# Unique substrings that must NEVER appear in the logs.
 SECRET_ARCHIVE = "Шифр-сейф-7кв-2026-хранится-в-ячейке-B12"
 
 
-# --- юнит-слой -----------------------------------------------------------
+# --- the unit layer --------------------------------------------------------
 
 
 def make_record(message: str, **extra: object) -> logging.LogRecord:
-    """Собрать LogRecord вручную (минус зависимость от живого логгера)."""
+    """Assemble a LogRecord manually (minus the dependency on a live logger)."""
     record = logging.LogRecord(
         name="app.mcp", level=logging.INFO, pathname=__file__, lineno=1,
         msg=message, args=(), exc_info=None,
@@ -113,7 +114,7 @@ class TestPreview:
 
 
 class TestAccessQueryTruncate:
-    """Фильтр uvicorn.access: query-часть full_path режется до 80 символов."""
+    """The uvicorn.access filter: the full_path's query part trimmed to 80 characters."""
 
     def _access_record(self, full_path: str) -> logging.LogRecord:
         record = make_record('%s - "%s %s HTTP/%s" %d')
@@ -176,7 +177,7 @@ class TestLogToolCall:
 class TestSetupLogging:
     def test_idempotent(self, monkeypatch: pytest.MonkeyPatch) -> None:
         root = logging.getLogger()
-        # Маркер уже стоит → второй вызов не добавляет handler-пара.
+        # The marker is already set → the second call adds no handler pair.
         monkeypatch.setattr(root, "_second_brain_json_handler", True, raising=False)
         before = list(root.handlers)
         setup_logging("INFO")
@@ -185,17 +186,17 @@ class TestSetupLogging:
     def test_sets_level(self) -> None:
         setup_logging("WARNING")
         assert logging.getLogger().level == logging.WARNING
-        setup_logging("INFO")  # вернуть(INFO — по умолчанию тестового env)
+        setup_logging("INFO")  # restore(INFO — the test env's default)
 
 
-# --- e2e: прод-точка входа, stdout = JSON, приватность ---------------------
+# --- e2e: the prod entry point, stdout = JSON, privacy ---------------------
 
 
 @pytest.fixture(scope="module")
 def logged_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
-    """Сервер через `python -m app` — тот же путь логирования, что в проде."""
+    """A server via `python -m app` — the same logging path as in prod."""
     db = tmp_path_factory.mktemp("logging") / "notes.db"
-    log = tempfile.NamedTemporaryFile(  # noqa: SIM115 — закрывается в finally
+    log = tempfile.NamedTemporaryFile(  # noqa: SIM115 — closed in finally
         mode="r", prefix="second-brain-log-", suffix=".log", delete=False
     )
     env = {**os.environ, **TEST_ENV, "PORT": str(LOG_SERVER_PORT), "DB_PATH": str(db)}
@@ -244,7 +245,7 @@ async def mcp_session(base_url: str) -> AsyncIterator[ClientSession]:
 
 
 def log_lines(log_path: str) -> list[dict]:
-    """Прочитать лог сервера; вернуть список распарсенных JSON-объектов."""
+    """Read the server's log; return the list of parsed JSON objects."""
     raw = Path(log_path).read_text(encoding="utf-8", errors="replace")
     return [json.loads(line) for line in raw.splitlines() if line.strip()]
 
@@ -254,7 +255,7 @@ class TestStdoutIsJson:
         with httpx.Client() as http:
             http.get(f"http://127.0.0.1:{LOG_SERVER_PORT}/health")
         records = log_lines(logged_server)
-        assert records  # строки есть
+        assert records  # the lines exist
         for record in records:
             assert "ts" in record and "level" in record and "message" in record
 
@@ -275,7 +276,7 @@ class TestToolCallLogs:
         assert calls
         last = calls[-1]
         assert last["tool"] == "memory_list"
-        assert last["results"] == 0  # новая БД — пусто
+        assert last["results"] == 0  # a new DB — empty
         assert isinstance(last["latency_ms"], (int, float))
         assert last["level"] == "INFO"
 
@@ -284,7 +285,7 @@ class TestToolCallLogs:
         self, logged_server: str
     ) -> None:
         base_url = f"http://127.0.0.1:{LOG_SERVER_PORT}"
-        query = "ЗАПРОС-" + "ф" * 200  # длинный поисковый запрос
+        query = "ЗАПРОС-" + "ф" * 200  # a long search query
         async with mcp_session(base_url) as session:
             await session.call_tool("memory_search", {"query": query, "top_k": 3})
         searches = [
@@ -308,8 +309,8 @@ class TestToolCallLogs:
             f"Для теста приватности логов: {secret}. Заметка содержит секрет."
         )
         async with mcp_session(base_url) as session:
-            # Фаза 11 (решение №9): новые заметки создаются только с title
-            # (≤5 слов) — fail+hint иначе; title не содержит секрет из text.
+            # Phase 11 (decision #9): new notes are created only with a title
+            # (≤5 words) — else fail+hint; the title does not contain the text's secret.
             saved = await session.call_tool(
                 "memory_save", {"text": note_text, "title": "Тест приватности логов"}
             )
@@ -328,7 +329,7 @@ class TestToolCallLogs:
             and record.get("event") == "tool_call"
         ]
         assert saves and saves[-1]["note_chars"] == len(note_text)
-        # Зато сам вызов присутствует — NFR-4 не противоречит приватности.
+        # But the call itself is present — NFR-4 does not contradict privacy.
         updates = [
             record
             for record in records
