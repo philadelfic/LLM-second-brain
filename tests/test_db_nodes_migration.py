@@ -1,10 +1,10 @@
-"""Миграция lsb-0011-01: служебный маркер `notes.node_order_at`.
+"""The lsb-0011-01 migration: the `notes.node_order_at` service marker.
 
-Апгрейд живой БД предыдущей версии (v3.1.0 до постановки 11: колонки
-`node_order_at` нет) — колонка создаётся при старте идемпотентно, данные не
-трогаются, у существующих заметок `node_order_at = NULL`: первый прогон джобы
-`nodes` естественно разбирает накопленный `default` (ретро-прогон). Повторный
-`init_db` — no-op.
+    Upgrading a live DB of the previous version (v3.1.0 before brief 11: no
+    `node_order_at` column) — the column is created idempotently at startup, the
+    data untouched; existing notes have `node_order_at = NULL`: the `nodes` job's
+    first run naturally parses the accumulated `default` (a retro run). A
+    repeated `init_db` — a no-op.
 """
 
 from __future__ import annotations
@@ -29,12 +29,12 @@ def _node_order() -> dict[int, str | None]:
 
 
 def _downgrade_to_prev(settings: Settings) -> None:
-    """Привести свежую БД к состоянию до постановки 11: без маркера обхода.
+    """Bring a fresh DB to the pre-brief-11 state: without the sweep marker.
 
-    Схема строится текущим `init_db` (все прочие таблицы и колонки — как у
-    живой БД), после чего снимается ровно объект этой постановки: колонка
-    `notes.node_order_at` (SQLite 3.35+). Так апгрейд проверяется на живой БД,
-    а не на пустом файле.
+                The schema is built by the current `init_db` (all other tables and
+                columns — as in a live DB), after which exactly this brief's object
+                is removed: the `notes.node_order_at` column (SQLite 3.35+). This way
+                the upgrade is checked on a live DB, not on an empty file.
     """
     with session(settings) as conn:
         conn.execute(
@@ -52,23 +52,23 @@ def _downgrade_to_prev(settings: Settings) -> None:
 
 @pytest.fixture
 def legacy(test_env: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> Settings:
-    """Живая БД предыдущей версии (до постановки 11) с двумя заметками."""
+    """A live DB of the previous version (before brief 11) with two notes."""
     monkeypatch.setenv("EMBEDDING_DIM", "8")
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
     _downgrade_to_prev(settings)
-    # Предусловие: объекта этой постановки на «старой» БД ещё нет.
+    # The precondition: this brief's object is not on the "old" DB yet.
     assert "node_order_at" not in _notes_columns()
     return settings
 
 
 def test_upgrade_adds_marker_and_preserves_notes(legacy: Settings) -> None:
-    """init_db поверх предыдущей версии: колонка node_order_at, данные целы."""
+    """init_db over the previous version: the node_order_at column; the data intact."""
     init_db(get_settings())
 
     assert "node_order_at" in _notes_columns()
-    # У существующих заметок маркер пуст — обход разберёт их первым прогоном.
+    # Existing notes have an empty marker — the sweep parses them on the first run.
     assert _node_order() == {1: None, 2: None}
     with session(get_settings()) as conn:
         rows = [
@@ -84,14 +84,14 @@ def test_upgrade_adds_marker_and_preserves_notes(legacy: Settings) -> None:
 
 
 def test_migration_is_idempotent(legacy: Settings) -> None:
-    """Повторный init_db ничего не пересоздаёт и не затирает маркер."""
+    """A repeated init_db recreates nothing and does not overwrite the marker."""
     init_db(get_settings())
     with session(get_settings()) as conn:
         conn.execute(
             "UPDATE notes SET node_order_at = '2026-01-01T00:00:00Z' WHERE id = 1"
         )
 
-    init_db(get_settings())  # рестарт сервиса
+    init_db(get_settings())  # a service restart
 
     assert "node_order_at" in _notes_columns()
     assert _node_order() == {1: "2026-01-01T00:00:00Z", 2: None}
