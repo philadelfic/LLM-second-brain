@@ -99,7 +99,7 @@ class TestTermsCrud:
         missing = client.get("/terms/999", headers=_headers(token))
         assert missing.status_code == 404
         assert missing.json()["detail"] == HINT_NOT_FOUND
-        # Листинга нет: `/terms` объявлен только на POST (решение О.).
+        # No listing: `/terms` is declared for POST only.
         assert client.get(
             "/terms", headers=_headers(token)
         ).status_code in (404, 405)
