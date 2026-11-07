@@ -1,13 +1,13 @@
-"""Ворота слота в каркасе джоб (№39, релиз 3.2.0; LSBN-T-29; arch §6.2, §6.7).
+"""The slot gate in the job framework (#39, release 3.2.0; LSBN-T-29; arch §6.2, §6.7).
 
-Юнит без сети: при открытом разрыве партия не берётся (вызовы модели не
-жгутся) — с 3.4.1 проверку делает КАРКАС (`JobSpec.gate` в `run_loop`),
-а не ручной `if` в теле джобы; при наступившем пробном стуке один
-`probe()` снимает разрыв (`ok`) или переставляет паузу (`auth_failed`);
-отказ слота попадает в журнал событием с типом исхода, а работа остаётся
-pending. Сквозной прогон петли с закрытыми воротами (0 — не прогресс,
-no39-05) — в tests/test_jobs.py, ворота внешних джоб — в
-tests/test_jobs_slot_gate.py.
+    A unit without the network: with the breaker open no batch is taken (no model
+    calls burn) — since 3.4.1 the check is done by the FRAMEWORK (`JobSpec.gate`
+    in `run_loop`), not a manual `if` in a job body; when the probe knock is due,
+    one `probe()` lifts the breaker (`ok`) or reschedules the pause
+    (`auth_failed`); a slot failure lands in the journal as an event with the
+    outcome kind, and the work stays pending. An end-to-end loop run with closed
+    gates (0 — not progress, no39-05) — in tests/test_jobs.py; external jobs'
+    gates — in tests/test_jobs_slot_gate.py.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ def settings(tmp_path, monkeypatch: pytest.MonkeyPatch):
 
 
 class ProbeJudge:
-    """Судья-фейк с управляемым `probe()` — для ворот слота judge."""
+    """A fake judge with a controllable `probe()` — for the judge slot's gate."""
 
     def __init__(self, result: str = "ok", verdicts: list[bool] | None = None) -> None:
         self._probe_result = result
@@ -62,19 +62,19 @@ class ProbeJudge:
         verdict = self.verdicts.pop(0) if self.verdicts else False
         return JudgeResult(verdict=verdict, meta=fake_meta("judge", "judge"))
 
-    def close(self) -> None:  # интерфейс-совместимость с JudgeService
+    def close(self) -> None:  # interface-compatible with JudgeService
         return None
 
 
 def _freeze(monkeypatch, start: float = 1000.0) -> dict:
-    """Заморозить часы модуля разрыва (детерминированные паузы)."""
+    """Freeze the breaker module's clock (deterministic pauses)."""
     clock = {"t": start}
     monkeypatch.setattr("app.services.slot_breaker.time.time", lambda: clock["t"])
     return clock
 
 
 def _worker_with_dedup_jobs(settings, judge) -> BackgroundWorker:
-    """Две заметки с готовыми векторами → две pending dedup-работы в очередь."""
+    """Two notes with ready vectors → two pending dedup jobs into the queue."""
     notes = NoteService(settings, FailingEmbedder())
     notes.save("первая заметка ворот слота")
     notes.save("вторая заметка ворот слота")
@@ -85,17 +85,18 @@ def _worker_with_dedup_jobs(settings, judge) -> BackgroundWorker:
         RecordingDedup(candidates=[(1, 0.94)]),
         judge=judge,
     )
-    assert worker.process_pending() == 2  # создаёт dedup-работы (очередь judge)
+    assert worker.process_pending() == 2  # creates dedup jobs (the judge queue)
     assert worker._pending_jobs("judge", "dedup", 10)
     return worker
 
 
 @pytest.mark.asyncio
 async def test_gate_skips_batch_when_paused(settings, monkeypatch) -> None:
-    """Разрыв открыт, стук не наступил → ворота закрыты, вызовов модели нет.
+    """The breaker open, the knock not due → the gates closed, no model calls.
 
-    Гейт теперь у каркаса (`JobSpec.gate`, LSBN-T-29): закрытые ворота дают 0
-    ДО `process()` — тело джобы партию не берёт, судья не зовётся.
+                The gate is now at the framework (`JobSpec.gate`, LSBN-T-29): closed
+                gates give 0 BEFORE `process()` — the job body takes no batch, the
+                judge is not called.
     """
     _freeze(monkeypatch)
     judge = ProbeJudge(result="ok")
@@ -104,23 +105,23 @@ async def test_gate_skips_batch_when_paused(settings, monkeypatch) -> None:
     assert worker._breakers["judge"].is_paused() is True
     spec = build_judge_job(worker, settings)
     assert spec.gate is not None and spec.gate() is False
-    assert judge.judge_calls == []  # партия не бралась
-    assert judge.probe_calls == 0  # стук ещё не наступил
-    assert worker._pending_jobs("judge", "dedup", 10)  # работа осталась pending
+    assert judge.judge_calls == []  # no batch was taken
+    assert judge.probe_calls == 0  # the knock is not due yet
+    assert worker._pending_jobs("judge", "dedup", 10)  # the work stayed pending
 
 
 @pytest.mark.asyncio
 async def test_gate_probes_then_runs(settings, monkeypatch) -> None:
-    """Стук наступил, probe() вернул ok → разрыв снят, партия идёт."""
+    """The knock is due, probe() returned ok → the breaker lifted, the batch goes."""
     clock = _freeze(monkeypatch)
     judge = ProbeJudge(result="ok", verdicts=[False])
     worker = _worker_with_dedup_jobs(settings, judge)
     worker._breakers["judge"].note_failure(SlotOutcome.AUTH)
-    clock["t"] += settings.slot_pause_sec + 1  # пауза истекла — пора стучать
+    clock["t"] += settings.slot_pause_sec + 1  # the pause expired — time to knock
     spec = build_judge_job(worker, settings)
-    assert spec.gate() is True  # один стук снял разрыв — партия пойдёт сейчас
+    assert spec.gate() is True  # one knock lifted the breaker — the batch goes now
     assert judge.probe_calls == 1
-    # заметка без ранних кандидатов снимается сразу, вторая — по вердикту судьи
+    # a note with no earlier candidates is released at once; the second one — by the judge's verdict
     assert await spec.process() == 2
     assert len(judge.judge_calls) == 1
     assert worker._breakers["judge"].is_paused() is False
@@ -128,7 +129,7 @@ async def test_gate_probes_then_runs(settings, monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_probe_auth_rearms_pause(settings, monkeypatch) -> None:
-    """probe() вернул auth_failed → пауза переставлена, партии нет."""
+    """probe() returned auth_failed → the pause rescheduled, no batch."""
     clock = _freeze(monkeypatch)
     judge = ProbeJudge(result="auth_failed")
     worker = _worker_with_dedup_jobs(settings, judge)
@@ -143,7 +144,7 @@ async def test_probe_auth_rearms_pause(settings, monkeypatch) -> None:
 
 
 def test_failure_logged_with_outcome(settings, caplog) -> None:
-    """Отказ судьи пишет событие с job, slot, outcome, detail; работа pending."""
+    """A judge failure writes an event with job, slot, outcome, detail; the work stays pending."""
     notes = NoteService(settings, FailingEmbedder())
     notes.save("первая заметка отказа судьи")
     notes.save("вторая заметка отказа судьи")
@@ -156,8 +157,8 @@ def test_failure_logged_with_outcome(settings, caplog) -> None:
     )
     assert worker.process_pending() == 2
     with caplog.at_level(logging.WARNING, logger="app"):
-        # Ранняя заметка (кандидатов нет) снимается сразу — 1; отказавшая
-        # judge-работа остаётся pending (back-off очереди judge).
+        # The earlier note (no candidates) is released at once — 1; the failed
+        # judge job stays pending (the judge queue's back-off).
         assert worker.process_judge_pending() == 1
     events = [
         record
@@ -169,5 +170,5 @@ def test_failure_logged_with_outcome(settings, caplog) -> None:
     assert event.job == "judge"
     assert event.slot == "judge"
     assert event.outcome == "off_contract"
-    assert event.detail  # фрагмент причины не теряется
-    assert worker._pending_jobs("judge", "dedup", 10)  # задание живёт в очереди
+    assert event.detail  # the reason fragment is not lost
+    assert worker._pending_jobs("judge", "dedup", 10)  # the task lives in the queue
