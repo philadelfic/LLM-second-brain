@@ -1,9 +1,9 @@
-"""EmbeddingService (Фаза 3, шаг 3.2; Фаза 11 — транспорт через LLMClient).
+"""EmbeddingService (Phase 3, step 3.2; Phase 11 — the transport via LLMClient).
 
-Контракт embed слота embedding: ollama — POST /api/embed (пейлоад прежний,
-байт-в-байт), openai — POST /v1/embeddings; ретрай, деградации. Юнит-тесты
-через httpx.MockTransport — без сети; живой Ollama — шаг 3.6
-(интеграционные `@pytest.mark.integration`).
+    The embedding slot's embed contract: ollama — POST /api/embed (the same
+    payload, byte-for-byte), openai — POST /v1/embeddings; retries, degradations.
+    Unit tests via httpx.MockTransport — no network; live Ollama — step 3.6
+    (the integration `@pytest.mark.integration`).
 """
 
 from __future__ import annotations
@@ -18,22 +18,22 @@ DIM = 8
 
 
 def make_settings(monkeypatch: pytest.MonkeyPatch, dim: int = DIM):
-    """Settings с малой EMBEDDING_DIM — вектора короче, тесты быстрее."""
+    """Settings with a small EMBEDDING_DIM — shorter vectors, faster tests."""
     monkeypatch.setenv("EMBEDDING_DIM", str(dim))
     get_settings.cache_clear()
     return get_settings()
 
 
 def ok_body(dim: int = DIM, count: int = 1) -> dict:
-    """Штатный ответ /api/embed заданной размерности."""
+    """A regular /api/embed answer of a given dimension."""
     return {"model": "m", "embeddings": [[0.1 * i] * dim for i in range(1, count + 1)]}
 
 
 class Recorder:
-    """Транспорт-лог: считает запросы, раздаёт scripted-ответы по очереди."""
+    """A transport log: counts requests, deals out scripted answers in turn."""
 
     def __init__(self, actions: list) -> None:
-        self.actions = actions  # httpx.Response | Exception, по одной на вызов
+        self.actions = actions  # httpx.Response | Exception, one per call
         self.requests: list[httpx.Request] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -54,7 +54,7 @@ def make_service(settings, actions: list) -> tuple[EmbeddingService, Recorder]:
     return service, recorder
 
 
-# --- успешный путь ---------------------------------------------------------
+# --- the happy path ---------------------------------------------------------
 
 
 def test_embed_single_returns_dim_vector(monkeypatch) -> None:
@@ -73,9 +73,9 @@ def test_embed_batch_preserves_order(monkeypatch) -> None:
     )
     vectors = service.embed_texts(texts)
     assert len(vectors) == 3
-    assert vectors[1][0] > vectors[0][0]  # ok_body: значения по рангу входа
+    assert vectors[1][0] > vectors[0][0]  # ok_body: the values by the input's rank
     body = recorder.requests[0].read().decode()
-    assert '"input":["один","два","три"]' in body  # порядок = порядку входа
+    assert '"input":["один","два","три"]' in body  # the order = the input's order
 
 
 def test_request_has_model_and_url(monkeypatch) -> None:
@@ -90,12 +90,12 @@ def test_request_has_model_and_url(monkeypatch) -> None:
     assert '"model":"' + settings.embedding_model + '"' in request.read().decode()
 
 
-# --- некорректные ответы -----------------------------------------------------
+# --- malformed answers --------------------------------------------------------
 
 
 def test_wrong_vector_count_raises(monkeypatch) -> None:
     settings = make_settings(monkeypatch, dim=DIM)
-    # 2 текста, 1 вектор
+    # 2 texts, 1 vector
     service, _ = make_service(settings, [httpx.Response(200, json=ok_body(DIM, 1))])
     with pytest.raises(EmbeddingError, match="векторов на 2"):
         service.embed_texts(["а", "б"])
@@ -111,8 +111,8 @@ def test_wrong_dimension_raises(monkeypatch) -> None:
 def test_missing_embeddings_raises(monkeypatch) -> None:
     settings = make_settings(monkeypatch, dim=DIM)
     service, _ = make_service(settings, [httpx.Response(200, json={"error": "oops"})])
-    # Формат ответа без списка векторов режектит клиент слота — контракт
-    # EmbeddingError сохранён (мусор не проходит как «валидные вектора»).
+    # An answer format without a vector list is rejected by the slot client — the
+    # EmbeddingError contract holds (garbage does not pass as "valid vectors").
     with pytest.raises(EmbeddingError, match="неожиданный формат"):
         service.embed("а")
 
@@ -125,7 +125,7 @@ def test_non_json_response_raises(monkeypatch) -> None:
 
 
 def test_http_400_no_retry(monkeypatch) -> None:
-    """4xx — не транзиентные: без ретрая (1 попытка)."""
+    """4xx — not transient: no retry (1 attempt)."""
     settings = make_settings(monkeypatch, dim=DIM)
     service, recorder = make_service(
         settings, [httpx.Response(404, text="model not found")]
@@ -135,7 +135,7 @@ def test_http_400_no_retry(monkeypatch) -> None:
     assert recorder.calls == 1
 
 
-# --- транзиентные сбои и ретрай ---------------------------------------------
+# --- transient failures and the retry ---------------------------------------
 
 
 def test_http_500_twice_raises_after_two_attempts(monkeypatch) -> None:
@@ -147,7 +147,7 @@ def test_http_500_twice_raises_after_two_attempts(monkeypatch) -> None:
 
 
 def test_http_500_then_success(monkeypatch) -> None:
-    """Ретрай спасает: сбой один, повтор успешный."""
+    """The retry saves it: one failure, the repeat successful."""
     settings = make_settings(monkeypatch, dim=DIM)
     service, recorder = make_service(
         settings,
@@ -179,7 +179,7 @@ def test_timeout_always_raises_after_two_attempts(monkeypatch) -> None:
 
 
 def test_connection_refused_raises(monkeypatch) -> None:
-    """Сервер «вон» с первой попытки — ретрай, затем EmbeddingError."""
+    """The server "down" from the first attempt — a retry, then EmbeddingError."""
     settings = make_settings(monkeypatch, dim=DIM)
     service, recorder = make_service(settings, [httpx.ConnectError("refused")])
     with pytest.raises(EmbeddingError):
@@ -188,7 +188,7 @@ def test_connection_refused_raises(monkeypatch) -> None:
 
 
 def test_http_429_retried_once(monkeypatch) -> None:
-    """429 (перегрузка, решение №4) — транзиент: единственный ретрай спасает."""
+    """429 (overload) — transient: the single retry saves it."""
     settings = make_settings(monkeypatch, dim=DIM)
     service, recorder = make_service(
         settings,

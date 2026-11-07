@@ -1,18 +1,19 @@
-"""Тесты REST-зеркал области «terms» (lsb-0008-03, arch lsb-0008 §3.6).
+"""The "terms" area's REST mirror tests (lsb-0008-03, arch lsb-0008 §3.6).
 
-Операторская поверхность терминологии: тот же Bearer и тот же сервисный слой,
-что у MCP (`terms_save`/`terms_search`/`terms_get`), но выдачи полные — без
-среза белыми списками. Коды: 201 — создание, 200 — обновление по ключу /
-чтение / правка / удаление, 422 — валидация формы и мягкие отказы сервиса
-(текст = дословный hint канона §3.7), 404 — запись не найдена/удалена
-(soft delete), 409 — новый ключ правки занят другой активной записью
-(субстрат §3.6: конфликт ключа). Листинга нет (решение О.) — единственная
-дорога к определению поиск.
+    The terminology operator surface: the same Bearer and the same service layer
+    as MCP (`terms_save`/`terms_search`/`terms_get`), but full outputs — without
+    the whitelist trim. Codes: 201 — creation; 200 — an update by key / a read /
+    an edit / a deletion; 422 — shape validation and the service's soft failures
+    (the text = the verbatim §3.7 canon hint); 404 — the record not found/deleted
+    (a soft delete); 409 — the edit's new key taken by another active record
+    (substrate §3.6: a key conflict). No listing — the only road to a definition
+    is the search.
 
-Кодировщик в тестовом окружении недоступен (NFR-3): гибридная часть поиска
-деградирует в FTS-only с `warning`, а точный нормализованный lookup по
-`term_norm` детерминирован без сети. Близость контекста — триграммная
-(вычислительная), поэтому мягкий отказ «близкий контекст» проверяется точно.
+    The embedder is unavailable in the test environment (NFR-3): the search's
+    hybrid part degrades to FTS-only with a `warning`, and the exact normalized
+    lookup over `term_norm` is deterministic without the network. Context
+    closeness is trigram-based (arithmetic), so the "close context" soft failure
+    is checked exactly.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from app.services.terms import (
 
 
 def term(**overrides: object) -> dict:
-    """Валидный термин (как в test_terms_service); overrides правят поля."""
+    """A valid term (as in test_terms_service); overrides edit the fields."""
     payload: dict = {
         "term": "ГЗ",
         "context": "студенты МГУ",
@@ -78,7 +79,7 @@ class TestTermsCrud:
             "senses": [{"id": 1, "context": "студенты МГУ"}],
             "contexts": ["студенты МГУ"],
         }
-        # Повтор ключа → 200 (динамический статус) + обновлённое определение.
+        # A repeated key → 200 (a dynamic status) + the updated definition.
         updated = _post(client, token, definition="госэкзамен (МГУ)")
         assert updated.status_code == 200, updated.text
         assert updated.json() == {
@@ -106,7 +107,7 @@ class TestTermsCrud:
     def test_multi_sense_search_full_fields(
         self, client: TestClient, token: str
     ) -> None:
-        """Точный lookup отдаёт ВСЕ смыслы термина с полными полями (§3.4)."""
+        """An exact lookup serves ALL the term's senses with full fields (§3.4)."""
         _create(client, token)
         _create(
             client,
@@ -120,13 +121,13 @@ class TestTermsCrud:
             {"id": 1, "context": "студенты МГУ", "definition": "государственный экзамен"},
             {"id": 2, "context": "бухгалтерия", "definition": "главная задача года"},
         ]
-        # Нормализация снимает регистр и краевые пробелы (ё→е, lower, trim).
+        # Normalization removes case and edge spaces (yo→ye, lower, trim).
         assert _search(client, token, "  гз  ")["senses"] == found["senses"]
-        # Точного нет → ближайшие смыслы помечены `exact: false` или пусто с hint.
+        # No exact one → the nearest senses marked `exact: false`, or empty with a hint.
         absent = _search(client, token, "деплой")
         assert absent["senses"] == [] and absent["exact"] is False
         assert absent["hint"] == HINT_NOT_FOUND
-        # top_k вне границ 1..MAX_TOP_K (20) — нарушение запроса.
+        # top_k outside 1..MAX_TOP_K (20) — a query violation.
         assert client.get(
             "/terms/search",
             params={"q": "ГЗ", "top_k": 99},
@@ -146,10 +147,10 @@ class TestTermsCrud:
             response = _post(client, token, **overrides)
             assert response.status_code == 422, response.text
             assert response.json()["detail"] == hint
-        # Ни один отказ не создал запись: первый валидный термин получает id=1.
+        # No failure created a record: the first valid term gets id=1.
         assert _create(client, token)["id"] == 1
-        # Тот же термин, «слишком близкий» контекст (сходство 1.0 ≥ 0.75)
-        # → мягкий отказ ДО записи с дословным hint'ом (§3.5).
+        # The same term, a "too close" context (similarity 1.0 ≥ 0.75)
+        # → a soft failure BEFORE the write with the verbatim hint (§3.5).
         close = _post(client, token, context="студенты МГУ (весна)")
         assert close.status_code == 422
         assert close.json()["detail"] == HINT_CONTEXT_CLOSE.format(
@@ -168,7 +169,7 @@ class TestTermsCrud:
     ) -> None:
         _create(client, token)
         _create(client, token, context="бухгалтерия")
-        # Новый ключ занят ДРУГОЙ активной записью → 409, чужая запись цела.
+        # The new key taken by ANOTHER active record → 409; the foreign record intact.
         conflict = client.put(
             "/terms/1",
             json=term(context="бухгалтерия", definition="чужой смысл"),
@@ -184,7 +185,7 @@ class TestTermsCrud:
             "context": "студенты МГУ",
             "definition": "государственный экзамен",
         }
-        # Свободный ключ → 200; прежний ключ освобождён.
+        # A free key → 200; the former key freed.
         moved = client.put(
             "/terms/1",
             json=term(context="школьники", definition="экзамен в школе"),
@@ -195,8 +196,8 @@ class TestTermsCrud:
         assert client.get("/terms/1", headers=_headers(token)).json()[
             "context"
         ] == "школьники"
-        assert _create(client, token)["id"] == 3  # старый ключ свободен
-        # Валидация правки — как при создании; запись не меняется.
+        assert _create(client, token)["id"] == 3  # the old key is free
+        # The edit's validation — as at creation; the record unchanged.
         for overrides, hint in (
             ({"term": "я" * 101}, HINT_TERM_LIMIT),
             ({"context": "  "}, HINT_CONTEXT_REQUIRED),
@@ -222,15 +223,15 @@ class TestTermsCrud:
         assert first.status_code == 200
         assert first.json() == {"id": 1, "deleted": True}
         assert client.get("/terms/1", headers=_headers(token)).status_code == 404
-        # Запись не видна ни точным lookup'ом, ни гибридной частью поиска.
+        # The record is visible neither to the exact lookup nor to the search's hybrid part.
         hidden = _search(client, token, "ГЗ")
         assert hidden["senses"] == [] and hidden["hint"] == HINT_NOT_FOUND
         again = client.delete("/terms/1", headers=_headers(token))
-        assert again.status_code == 404  # повторное удаление — уже не найден
+        assert again.status_code == 404  # a repeated deletion — not found anymore
         assert again.json()["detail"] == HINT_NOT_FOUND
-        # Ключ освобождён частичным UNIQUE: тот же ключ создаётся заново.
+        # The key is freed by the partial UNIQUE: the same key can be created anew.
         assert _create(client, token)["id"] == 2
-        # Soft delete: строка жива, проставлен только `deleted_at` (§3.3).
+        # Soft delete: the row alive; only `deleted_at` is set (§3.3).
         with sqlite3.connect(get_settings().db_path) as conn:
             row = conn.execute(
                 "SELECT term, deleted_at FROM terms WHERE id = 1"
@@ -271,7 +272,7 @@ class TestTermsIsolation:
             isolated = _search(client, token, query)
             assert isolated["senses"] == [], query
             assert isolated["hint"] == HINT_NOT_FOUND
-        # Своя запись при этом видна — с полными полями (§3.6).
+        # One's own record is still visible — with full fields (§3.6).
         (hit,) = _search(client, token, "ГЗ")["senses"]
         assert hit == {
             "id": 1,
@@ -285,7 +286,7 @@ class TestTermsIsolation:
 
 class TestTermsAuth:
     def test_bearer_required(self, client: TestClient) -> None:
-        """Bearer на всё, кроме /health (NFR-2)."""
+        """Bearer on everything except /health (NFR-2)."""
         calls = [
             client.post("/terms", json=term()),
             client.get("/terms/search", params={"q": "ГЗ"}),
