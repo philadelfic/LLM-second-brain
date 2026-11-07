@@ -1,10 +1,12 @@
-"""`/health` decision-слот: `decision_ok`, блок `decision` и ключ в `slots` (LSBN-F-12).
+"""`/health` decision slot: `decision_ok`, the `decision` block and the key in `slots` (LSBN-F-12).
 
-Релиз 3.2.0, arch §7.1/§7.3, FR-6.1…FR-6.3. Оператор видит, умеет ли слот,
-сколько решений принято, сколько переключений и по каким причинам, паузу и
-последний исход разрыва. Сбор `/health` — только память/SQL: модели не зовутся.
+    Release 3.2.0, arch §7.1/§7.3, FR-6.1…FR-6.3. The operator sees whether the
+    slot can do it, how many decisions were made, how many switches and for which
+    reasons, the pause and the breaker's last outcome. The `/health` assembly —
+    memory/SQL only: no models called.
 
-Хост-тест: приложение собирается на хосте как в `test_main_decision_check`.
+    A host test: the application is assembled on the host as in
+    `test_main_decision_check`.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ def make_settings(monkeypatch: pytest.MonkeyPatch, **env: str):
 
 
 def decision_app(monkeypatch: pytest.MonkeyPatch, check: str = "ok"):
-    """Приложение с включённым decision-слотом (стартовая проверка — `check`)."""
+    """An application with the decision slot enabled (the startup check — `check`)."""
     monkeypatch.setattr(LLMClient, "check_decision", lambda self: check)
     settings = make_settings(
         monkeypatch,
@@ -45,7 +47,7 @@ def decision_app(monkeypatch: pytest.MonkeyPatch, check: str = "ok"):
 
 
 def answer(noul: float) -> dict:
-    """Канонический ответ вопроса (форма после `_parse_systemone`)."""
+    """A question's canonical answer (the shape after `_parse_systemone`)."""
     return {
         "kind": "noul",
         "label": "true" if noul > 0.5 else "false",
@@ -58,7 +60,7 @@ def answer(noul: float) -> dict:
 
 
 def test_decision_disabled_shape(client: TestClient) -> None:
-    """`decision_enabled=false` → `decision_ok is None`, блок пуст, счётчики нулевые."""
+    """`decision_enabled=false` → `decision_ok is None`, an empty block, zero counters."""
     body = client.get("/health").json()
     assert body["decision_ok"] is None
     assert body["decision"] == {
@@ -71,10 +73,10 @@ def test_decision_disabled_shape(client: TestClient) -> None:
 
 
 def test_by_reason_shape_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Выключенный флагом слот: `/health.decision.by_reason` — ровно три нуля, `fallbacks == 0` (FR-4.4).
+    """A flag-disabled slot: `/health.decision.by_reason` — exactly three zeros; `fallbacks == 0` (FR-4.4).
 
-    Выключенный decision не переключение: счётчики причин не трогаются даже
-    при попытках решения, форма `/health` остаётся с тремя ключами.
+                A disabled decision is not a switch: the reason counters are untouched
+                even at decision attempts; the `/health` shape keeps its three keys.
     """
     settings = make_settings(
         monkeypatch,
@@ -93,11 +95,11 @@ def test_by_reason_shape_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_reason_not_counted_twice(monkeypatch: pytest.MonkeyPatch, caplog) -> None:
-    """Один отказ → ровно одно событие `decision_fallback` и один инкремент (§7.3)."""
+    """One failure → exactly one `decision_fallback` event and one increment (§7.3)."""
     app = decision_app(monkeypatch)
     with TestClient(app) as client:
         service = app.state.services.decision
-        # Разрыв открыт (auth): отказ виден без обращения к модели.
+        # The breaker open (auth): the failure is visible without a model call.
         service._breaker.note_failure(SlotOutcome.AUTH)
         question = DecisionQuestion(name="q", text="Is Q true?", kind="noul")
         with caplog.at_level(logging.INFO, logger="app"):
@@ -118,7 +120,7 @@ def test_reason_not_counted_twice(monkeypatch: pytest.MonkeyPatch, caplog) -> No
 
 
 def test_decision_ok_after_check(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`ok` → слот жив (`decision_ok is True`); `unsupported` → слот погашен (False)."""
+    """`ok` → the slot alive (`decision_ok is True`); `unsupported` → the slot suppressed (False)."""
     app_ok = decision_app(monkeypatch, check="ok")
     with TestClient(app_ok) as client:
         body = client.get("/health").json()
@@ -135,7 +137,7 @@ def test_decision_ok_after_check(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_decision_aggregates(monkeypatch: pytest.MonkeyPatch) -> None:
-    """N принятых решений и M переключений → `answers=N`, `fallbacks=M`, `by_reason`."""
+    """N accepted decisions and M switches → `answers=N`, `fallbacks=M`, `by_reason`."""
     app = decision_app(monkeypatch)
     with TestClient(app) as client:
         service = app.state.services.decision
@@ -164,7 +166,7 @@ def test_decision_aggregates(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_slots_contains_decision(client: TestClient, monkeypatch) -> None:
-    """`/health.slots.decision` есть всегда; при разрыве — пауза и исход."""
+    """`/health.slots.decision` exists always; on a breaker — the pause and the outcome."""
     assert "decision" in client.get("/health").json()["slots"]
 
     app = decision_app(monkeypatch)
@@ -177,7 +179,7 @@ def test_slots_contains_decision(client: TestClient, monkeypatch) -> None:
 
 
 def test_health_no_model_calls(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Сбор `/health` не вызывает decision-модель (счётчик заглушки = 0)."""
+    """Assembling /health calls no decision model (the stub's counter = 0)."""
     app = decision_app(monkeypatch)
     calls = {"n": 0}
 

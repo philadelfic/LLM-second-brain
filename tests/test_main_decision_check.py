@@ -1,9 +1,9 @@
-"""Стартовая проверка decision-слота (LSBN-F-12, релиз 3.2.0; arch §6.5/§13.6).
+"""The decision slot's startup check (LSBN-F-12, release 3.2.0; arch §6.5/§13.6).
 
-Модель не умеет decision → WARN, событие `decision_check`, слот погашен,
-приложение поднимается, `/health` отвечает. Осознанное отступление от
-фатальности auth генеративных слотов: у decision есть штатный генеративный
-путь, ронять обязательный слот из-за необязательного нельзя.
+    The model cannot do decision → a WARN, a `decision_check` event, the slot
+    suppressed; the application comes up and `/health` answers. A deliberate
+    deviation from the generative slots' auth fatality: decision has a regular
+    generative path; a mandatory slot must not crash over an optional one.
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ def test_ok_keeps_slot_alive(monkeypatch, caplog) -> None:
 
 
 def _startup_app(monkeypatch, check: str):
-    """Приложение с включённым decision-слотом, стартовая проверка вернула `check`."""
+    """An application with the decision slot enabled; the startup check returned `check`."""
     monkeypatch.setattr(LLMClient, "check_decision", lambda self: check)
     settings = make_settings(
         monkeypatch,
@@ -87,7 +87,7 @@ def _startup_app(monkeypatch, check: str):
 
 
 def _switch_reason(app) -> str:
-    """Причина переключения погашенного слота (без HTTP-вызова)."""
+    """The suppressed slot's switch reason (without an HTTP call)."""
     question = DecisionQuestion(name="q", text="Is Q true?", kind="noul")
     with pytest.raises(DecisionUnavailable) as excinfo:
         app.state.services.decision.decide("state", [question], operation="judge")
@@ -95,10 +95,11 @@ def _switch_reason(app) -> str:
 
 
 def test_unsupported_check_switches_as_unsupported(monkeypatch) -> None:
-    """Проверка вернула `unsupported` → причина переключения `unsupported` («модель не умеет»).
+    """The check returned `unsupported` → the switch reason `unsupported` ("the model cannot do it").
 
-    Исход стартовой проверки известен `main.py`; именно он определяет причину,
-    а не общий «слота нет» (f12-04, приёмка 12.10.2026).
+                The startup check's outcome is known to `main.py`; it is exactly what
+                defines the reason, not the generic "no slot" (f12-04, the 2026-10-12
+                acceptance).
     """
     app = _startup_app(monkeypatch, DECISION_CHECK_UNSUPPORTED)
     with TestClient(app):
@@ -112,7 +113,7 @@ def test_unsupported_check_switches_as_unsupported(monkeypatch) -> None:
     "check", (DECISION_CHECK_UNREACHABLE, DECISION_CHECK_AUTH_FAILED)
 )
 def test_transport_check_switches_as_unavailable(monkeypatch, check: str) -> None:
-    """Проверка вернула `unreachable`/`auth_failed` → причина `unavailable` («слота сейчас нет»)."""
+    """The check returned `unreachable`/`auth_failed` → the reason `unavailable` ("the slot is not there now")."""
     app = _startup_app(monkeypatch, check)
     with TestClient(app):
         assert _switch_reason(app) == "unavailable"

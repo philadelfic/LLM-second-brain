@@ -1,10 +1,11 @@
-"""Совместимость после волны decision (LSBN-F-12, релиз 3.2.0; arch §13.7).
+"""Compatibility after the decision wave (LSBN-F-12, release 3.2.0; arch §13.7).
 
-Регресс: внешние контракты судьи (`DUPLICATE`/`NOT DUPLICATE`) и классификатора
-(`hint_path`+`confidence`) после перевода на decision-слот НЕ изменились; набор
-«дубль / не дубль» на фиксированном фейковом транспорте даёт те же вердикты;
-журнал джоб обратно совместим — обязательные поля блока 2 (`event`/`job`/`slot`/
-`outcome`) на месте, новые поля только добавлены, старые не удалены.
+    Regression: the judge's external contracts (`DUPLICATE`/`NOT DUPLICATE`) and
+    the classifier's (`hint_path`+`confidence`) did NOT change after the move to
+    the decision slot; the "duplicate / not duplicate" set on a fixed fake
+    transport gives the same verdicts; the jobs journal is backward compatible —
+    the block-2 mandatory fields (`event`/`job`/`slot`/`outcome`) in place, new
+    fields only added, old ones not removed.
 """
 
 from __future__ import annotations
@@ -38,14 +39,14 @@ from test_judge_decision import (
 
 
 def test_judge_and_classifier_contracts(monkeypatch) -> None:
-    """Внешние контракты судьи и классификатора после волны не изменились."""
+    """The judge's and classifier's external contracts unchanged after the wave."""
     settings = decision_settings(monkeypatch)
-    # Судья: решение приходит от decision, но вердикт — прежний bool.
+    # The judge: the decision comes from decision, but the verdict — the same bool.
     judge, _, _, _ = make_judge(settings, [noul(0.95)], [chat_body()])
     assert judge.judge(TEXT_NEW, TEXT_CANDIDATE).verdict is True
     assert JudgeService._verdict("**DUPLICATE**") is True
     assert JudgeService._verdict("**NOT DUPLICATE**") is False
-    # Классификатор: метка → `hint_path`, вероятность метки → `confidence` 0..1.
+    # The classifier: the label → `hint_path`; the label's probability → `confidence` 0..1.
     classifier, _, _, _ = make_classifier(
         settings, [choice("life", {"life": 0.9})], [classify_body()]
     )
@@ -55,7 +56,7 @@ def test_judge_and_classifier_contracts(monkeypatch) -> None:
 
 
 def test_dedup_behaviour_unchanged(monkeypatch) -> None:
-    """Набор «дубль / не дубль» на фиксированном транспорте даёт те же вердикты."""
+    """The "duplicate / not duplicate" set on a fixed transport gives the same verdicts."""
     settings = decision_settings(monkeypatch)
     for content, expected in (
         ("**DUPLICATE**", True),
@@ -70,11 +71,12 @@ def test_dedup_behaviour_unchanged(monkeypatch) -> None:
 
 
 def test_decision_skipped_is_not_fallback(monkeypatch, caplog) -> None:
-    """«Решение не применимо» — не переключение: `decision_skipped`, счётчики и разрыв целы (FR-4.5).
+    """"The decision is not applicable" — not a switch: `decision_skipped`; the counters and the breaker intact (FR-4.5).
 
-    У `choice`-вопроса один кандидат (выбирать не из чего): вызова решения нет,
-    событие `decision_skipped` (не `decision_fallback`), `fallbacks`/`by_reason`
-    и разрыв decision-слота не двигаются — сразу генеративный путь.
+                The `choice` question has one candidate (nothing to choose from): no
+                decision call; a `decision_skipped` event (not `decision_fallback`);
+                `fallbacks`/`by_reason` and the decision slot's breaker do not move —
+                straight to the generative path.
     """
     settings = decision_settings(monkeypatch)
     with caplog.at_level(logging.INFO, logger="app"):
@@ -108,7 +110,7 @@ def test_decision_skipped_is_not_fallback(monkeypatch, caplog) -> None:
 
 
 def test_journal_backward_compatible(monkeypatch, caplog) -> None:
-    """Журнал джоб: обязательные поля блока 2 на месте, новые — только добавлены."""
+    """The jobs journal: the block-2 mandatory fields in place; new ones only added."""
     settings = decision_settings(monkeypatch)
     worker = BackgroundWorker(settings, FailingEmbedder())
     with caplog.at_level(logging.INFO, logger="app"):
