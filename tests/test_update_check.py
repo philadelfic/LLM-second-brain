@@ -1,10 +1,10 @@
-"""Проверка «свежий релиз»: источник, деградация, троттлинг (№45, 3.2.0).
+"""The "fresh release" check: the source, degradation, throttling (#45, 3.2.0).
 
-Юниты без сети и без БД: чистые функции и `UpdateChecker` над временным
-файлом-источником. Источник — локальный JSON (`UPDATE_SOURCE_FILE`), HTTP —
-опция; отсутствие/мусор/недоступность деградируют тихо (одно событие
-`update_check_failed`, без исключений наружу). Хинт — не чаще периода
-(`UPDATE_HINT_EVERY_SEC`; 0 — один раз на процесс).
+    Units without the network and the DB: pure functions and an `UpdateChecker`
+    over a temp file source. The source — a local JSON (`UPDATE_SOURCE_FILE`);
+    HTTP — an option; absence/garbage/unavailability degrade quietly (one
+    `update_check_failed` event, no exceptions outward). The hint — no more often
+    than the period (`UPDATE_HINT_EVERY_SEC`; 0 — once per process).
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ def _write_source(tmp_path, payload: dict) -> str:
 
 
 def test_parse_version() -> None:
-    """`3.2.0` / `v3.2.0` → тройка; мусор → None (arch §13.9)."""
+    """`3.2.0` / `v3.2.0` → a triple; garbage → None (arch §13.9)."""
     assert parse_version("3.2.0") == (3, 2, 0)
     assert parse_version("v3.2.0") == (3, 2, 0)
     assert parse_version("  3.10.1 ") == (3, 10, 1)
@@ -53,7 +53,7 @@ def test_parse_version() -> None:
 
 
 def test_newer_release_detected(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Файл-источник с 3.2.0 при __version__=3.1.0 → latest.version == 3.2.0."""
+    """A source file with 3.2.0 at __version__=3.1.0 → latest.version == 3.2.0."""
     source = _write_source(tmp_path, {"version": "3.2.0", "notes": "short what's new"})
     settings = _settings(
         monkeypatch, UPDATE_CHECK_ENABLED="true", UPDATE_SOURCE_FILE=source
@@ -68,7 +68,7 @@ def test_newer_release_detected(tmp_path, monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_same_or_older_no_hint(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Версия равна/старше текущей (3.1.0) → хинта нет."""
+    """A version equal/older than the current one (3.1.0) → no hint."""
     for version in ("3.1.0", "2.9.9", "v0.1.0"):
         source = _write_source(tmp_path, {"version": version})
         settings = _settings(
@@ -82,14 +82,14 @@ def test_same_or_older_no_hint(tmp_path, monkeypatch: pytest.MonkeyPatch) -> Non
 def test_source_missing_degrades(
     tmp_path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Нет файла-источника → latest None, hint None, update_check_failed, без сбоя."""
+    """No source file → latest None, hint None, update_check_failed, no crash."""
     missing = str(tmp_path / "absent.json")
     settings = _settings(
         monkeypatch, UPDATE_CHECK_ENABLED="true", UPDATE_SOURCE_FILE=missing
     )
     checker = UpdateChecker(settings)
     with caplog.at_level(logging.WARNING, logger="app"):
-        checker.refresh()  # исключений наружу нет
+        checker.refresh()  # no exceptions outward
     assert checker.latest() is None
     assert checker.hint() is None
     events = [getattr(record, "event", None) for record in caplog.records]
@@ -99,7 +99,7 @@ def test_source_missing_degrades(
 def test_malformed_json_degrades(
     tmp_path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Битый JSON → деградация, update_check_failed, без исключений."""
+    """Broken JSON → a degradation, update_check_failed, no exceptions."""
     path = tmp_path / "release.json"
     path.write_text("{not json", encoding="utf-8")
     settings = _settings(
@@ -116,7 +116,7 @@ def test_malformed_json_degrades(
 def test_hint_throttled_per_period(
     tmp_path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Первый вызов даёт текст, второй (в окне периода) — None."""
+    """The first call gives the text; the second (within the period window) — None."""
     source = _write_source(tmp_path, {"version": "9.9.9", "notes": "big new release"})
     settings = _settings(
         monkeypatch,
@@ -141,7 +141,7 @@ def test_hint_throttled_per_period(
 def test_hint_once_per_process_when_every_zero(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """UPDATE_HINT_EVERY_SEC=0 — ровно один хинт на процесс."""
+    """UPDATE_HINT_EVERY_SEC=0 — exactly one hint per process."""
     source = _write_source(tmp_path, {"version": "9.9.9", "notes": "n"})
     settings = _settings(
         monkeypatch,
@@ -158,7 +158,7 @@ def test_hint_once_per_process_when_every_zero(
 def test_hint_respects_max_chars(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Текст хинта не длиннее UPDATE_HINT_MAX_CHARS (ограничение §8)."""
+    """The hint text is no longer than UPDATE_HINT_MAX_CHARS (the §8 constraint)."""
     source = _write_source(tmp_path, {"version": "9.9.9", "notes": "x" * 500})
     settings = _settings(
         monkeypatch,
@@ -175,7 +175,7 @@ def test_hint_respects_max_chars(
 
 @pytest.mark.asyncio
 async def test_disabled_no_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    """UPDATE_CHECK_ENABLED=false → run не стартует, источник не читается."""
+    """UPDATE_CHECK_ENABLED=false → run does not start, the source is not read."""
     calls: list[int] = []
 
     def fetcher() -> dict | None:
@@ -188,14 +188,14 @@ async def test_disabled_no_network(monkeypatch: pytest.MonkeyPatch) -> None:
         UPDATE_SOURCE_FILE="/tmp/should-not-be-read.json",
     )
     checker = UpdateChecker(settings, fetcher=fetcher)
-    await checker.run()  # завершается сразу
+    await checker.run()  # it exits at once
     assert calls == []
     assert checker.latest() is None
     assert checker.hint() is None
 
 
 def test_config_invalid_fatal(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Включено без источника / UPDATE_HINT_MAX_CHARS=0 → ConfigError (NFR-6)."""
+    """Enabled without a source / UPDATE_HINT_MAX_CHARS=0 → ConfigError (NFR-6)."""
     with pytest.raises(ConfigError, match="update_check_enabled"):
         _settings(monkeypatch, UPDATE_CHECK_ENABLED="true")
     with pytest.raises(ConfigError, match="update_hint_max_chars"):
