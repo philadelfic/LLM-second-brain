@@ -1,8 +1,9 @@
-"""Хинт «слот не работает — предупреди своего человека» (№39 FR-4.4/FR-4.5).
+"""The "the slot is down — warn your human" hint (#39 FR-4.4/FR-4.5).
 
-Юнит без MCP-клиента: middleware дописывает в ответ инструмента короткий
-обезличенный хинт при паузе слота, с троттлингом (не чаще
-`SLOT_HINT_EVERY_SEC` на слот). Имён людей и слова «оператор» в тексте нет.
+    A unit without an MCP client: the middleware appends a short impersonal hint
+    to a tool's answer at a slot pause, throttled (no more than
+    `SLOT_HINT_EVERY_SEC` per slot). No people's names and no word "operator" in
+    the text.
 """
 
 from __future__ import annotations
@@ -15,13 +16,13 @@ from app.transport.mcp import SlotHintMiddleware
 
 
 class _Ctx:
-    """Минимальный контекст MCP-запроса: middleware читает только метод."""
+    """A minimal MCP request context: the middleware reads only the method."""
 
     method = "tools/call"
 
 
 class _Worker:
-    """Снимок слотов: то, что middleware берёт у воркера."""
+    """The slots snapshot: what the middleware takes from the worker."""
 
     def __init__(self, states: dict) -> None:
         self._states = states
@@ -47,7 +48,7 @@ async def _call(mw: SlotHintMiddleware, result: CallToolResult) -> CallToolResul
 
 @pytest.mark.asyncio
 async def test_hint_on_paused_slot() -> None:
-    """При разрыве ответ инструмента несёт hint с именем слота и исходом."""
+    """On a breaker the tool's answer carries a hint with the slot name and the outcome."""
     settings = get_settings()
     worker = _Worker(
         {
@@ -65,12 +66,12 @@ async def test_hint_on_paused_slot() -> None:
     assert "summary" in hint
     assert "auth" in hint
     assert "tell your human" in hint
-    assert "operator" not in hint.lower()  # обезличенность (FR-4.7)
+    assert "operator" not in hint.lower()  # impersonality (FR-4.7)
 
 
 @pytest.mark.asyncio
 async def test_hint_throttled() -> None:
-    """Второй вызов подряд хинта не несёт до SLOT_HINT_EVERY_SEC."""
+    """A second call in a row carries no hint until SLOT_HINT_EVERY_SEC."""
     settings = get_settings()
     worker = _Worker(
         {
@@ -92,7 +93,7 @@ async def test_hint_throttled() -> None:
 
 @pytest.mark.asyncio
 async def test_no_hint_when_slots_closed() -> None:
-    """Все слоты закрыты — ответ не трогаем."""
+    """All slots closed — the answer untouched."""
     settings = get_settings()
     worker = _Worker(
         {

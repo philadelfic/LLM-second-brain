@@ -1,10 +1,10 @@
-"""NoteService.merge_into_parts (LSBN-F-23, п. 5): след и связи частей.
+"""NoteService.merge_into_parts (LSBN-F-23, p. 5): the trace and the parts' links.
 
-Слияние заменяет пару дубликатов списком самодостаточных частей ОДНОЙ
-транзакцией: части — обычные заметки (схема БД не меняется, это F-22),
-наследуют связи ОБЕИХ исходных и ссылаются на исходники mention-связью;
-обе исходные уходят в корзину штатным soft delete и остаются в истории
-(версия-событие delete, source="merge"). LLM не вызывается.
+    The merge replaces a duplicate pair with a list of self-sufficient parts in
+    ONE transaction: the parts are regular notes (the DB schema does not change —
+    that is F-22); they inherit the links of BOTH originals and reference them by
+    mention links; both originals go to trash by the regular soft delete and stay
+    in history (a delete version-event, source="merge"). No LLM is called.
 """
 
 from __future__ import annotations
@@ -40,15 +40,16 @@ def _links(settings, note_id: int) -> list[tuple[int, int, str]]:
 def test_parts_inherit_links_of_both_sources_and_mention_them(
     notes, tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Части наследуют связи ОБЕИХ исходных (kind/score сохраняются) и несут
-    явную mention-связь на каждый исходник (п. 5)."""
+    """The parts inherit BOTH originals' links (kind/score preserved) and carry
+            an explicit mention link to each original (p. 5).
+    """
     older_id = notes.save("ранняя заметка пары", title="Ранняя пара")["id"]
     newer_id = notes.save("поздняя заметка пары", title="Поздняя пара")["id"]
     third_id = notes.save("третья заметка рядом", title="Третья рядом")["id"]
     settings = get_settings()
     with session(settings) as conn, conn:
-        # Связи обеих исходных наружу: ранняя→третья (entities), поздняя→третья
-        # (cosine); между собой пара без строки (судья решал по косинусу).
+        # Both originals' outward links: the earlier one→the third (entities), the later one→the third
+        # (cosine); the pair itself has no row (the judge decided by cosine).
         conn.execute(
             "INSERT INTO links (note_a, note_b, kind, score) VALUES (?, ?, 'entities', 0.5)",
             (min(older_id, third_id), max(older_id, third_id)),
@@ -65,9 +66,9 @@ def test_parts_inherit_links_of_both_sources_and_mention_them(
     assert outcome["merged"] is True
     assert [p["title"] for p in outcome["parts"]] == ["Встреча", "Роадстран"]
     part_a, part_b = outcome["parts"][0]["id"], outcome["parts"][1]["id"]
-    # Каждая часть: связь к третьей (наследие обеих исходных идёт на ОДНУ
-    # пару «часть↔третья» — канон одного kind на пару: entities старше
-    # cosine) + mention на ОБЕ исходные (в корзине).
+    # Each part: a link to the third (both originals' inheritance goes onto ONE
+    # "part↔third" pair — the one-kind-per-pair canon: entities beats
+    # cosine) + a mention to BOTH originals (in trash).
     for part_id in (part_a, part_b):
         got = {(a, b, k) for a, b, k in _links(settings, part_id)}
         assert (min(part_id, third_id), max(part_id, third_id), "entities") in got
@@ -79,8 +80,9 @@ def test_parts_inherit_links_of_both_sources_and_mention_them(
 def test_sources_go_to_trash_and_stay_in_history(
     notes, tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Обе исходные — в корзине штатным soft delete; в истории — версия-
-    событие delete с source="merge" на каждую и контент-версии частей."""
+    """Both originals — in trash by the regular soft delete; in history — a delete
+            version-event with source="merge" on each and the parts' content versions.
+    """
     older_id = notes.save("текст первой", title="Первая")["id"]
     newer_id = notes.save("текст второй", title="Вторая")["id"]
     settings = get_settings()
@@ -114,8 +116,9 @@ def test_sources_go_to_trash_and_stay_in_history(
 
 
 def test_part_validation_and_guards(notes) -> None:
-    """Часть длиннее мягкого лимита и часть без названия — отказ ДО записи;
-    пустой список частей — отказ; активной ранней нет — merged=False."""
+    """A part longer than the soft limit and a titleless part — a failure BEFORE the
+            write; an empty parts list — a failure; no active earlier note — merged=False.
+    """
     older_id = notes.save("текст ранней", title="Ранняя")["id"]
     newer_id = notes.save("текст поздней", title="Поздняя")["id"]
     limit = get_settings().max_note_chars
