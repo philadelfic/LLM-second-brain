@@ -1,10 +1,10 @@
-"""Фаза 10 (Шаг 2): namespace-фильтры поиска/обзора и дедуп в пределах неймспейса.
+"""Phase 10 (Step 2): the search/listing namespace filters and dedup within a namespace.
 
-Проверяются (REQUIREMENTS §5.7): запрос по узлу = его поддерево (лист — только
-себя), namespace_exact — только сам узел, глобальный поиск без namespace не
-меняется; поле namespace в выдачах search/list/get (белые списки §5.6
-пополняются одним ключом); FTS-ветка фильтруется JOIN'ом; дедуп — в пределах
-неймспейса (меж-узловые дубли легитимны).
+    Checked (REQUIREMENTS §5.7): a query by node = its subtree (a leaf — itself
+    only); namespace_exact — the node itself only; a global search without
+    namespace unchanged; the namespace field in the search/list/get outputs (the
+    §5.6 whitelists extended by one key); the FTS branch filtered by a JOIN;
+    dedup — within the namespace (cross-node duplicates are legitimate).
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ NOTES = [
     (4, "Общий конспект: методика конспектирования заметок", "default"),
 ]
 
-# Одинаковый текст в двух узлах — дословный «меж-узловой» дубль для дедупа.
+# The same text in two nodes — a verbatim "cross-node" duplicate for dedup.
 CROSS_NOTE = "СУБО 2020: реестр зарплат на сервере appsrv payroll"
 
 
@@ -51,7 +51,7 @@ def seeded(monkeypatch: pytest.MonkeyPatch) -> tuple[SearchService, HashEmbedder
                 (note_id, text, namespace),
             )
             chunks.replace_note_chunks(conn, note_id, [(text, len(text))])
-        # вектора чанков — после вставки чанков (по одному на заметку)
+        # the chunk vectors — after the chunks are inserted (one per note)
         for note_id, text, namespace in NOTES:
             chunk_ids = [
                 row[0]
@@ -69,8 +69,8 @@ class TestSearchNamespace:
     def test_global_search_unaffected_and_exposes_namespace(
         self, seeded: tuple[SearchService, HashEmbedder]
     ) -> None:
-        """Без namespace — глобальный поиск (как в Фазе 9), каждый результат
-        несёт свой namespace."""
+        """Without a namespace — a global search (as in Phase 9); every result carries its namespace.
+        """
         search, _ = seeded
         result = search.search("реестр зарплат", top_k=10)
         assert [r["id"] for r in result["results"]][:1] == [1]
@@ -80,7 +80,7 @@ class TestSearchNamespace:
     def test_search_domain_covers_subtree(
         self, seeded: tuple[SearchService, HashEmbedder]
     ) -> None:
-        """work → work + work/sbos2020; projects в выдачу не попадает."""
+        """work → work + work/sbos2020; projects does not enter the output."""
         search, _ = seeded
         result = search.search("реестр зарплат docker", namespace="work", top_k=10)
         ids = [r["id"] for r in result["results"]]
@@ -105,7 +105,7 @@ class TestSearchNamespace:
         )
         ids = [r["id"] for r in result["results"]]
         assert 2 in ids
-        assert 1 not in ids  # лист work/sbos2020 исключён точным фильтром
+        assert 1 not in ids  # the work/sbos2020 leaf excluded by the exact filter
 
     def test_search_unknown_namespace_is_error(
         self, seeded: tuple[SearchService, HashEmbedder]
@@ -117,8 +117,9 @@ class TestSearchNamespace:
     def test_fts_branch_respects_namespace(
         self, seeded: tuple[SearchService, HashEmbedder]
     ) -> None:
-        """Слово «portfolio» есть только в projects-заметке: поиск по work
-        через FTS-ветку не должен его вернуть (фильтр — JOIN'ом)."""
+        """The word exists only in the projects note: a search over work must not return
+                    it via the FTS branch (the filter — by a JOIN).
+        """
         search, _ = seeded
         result = search.search("portfolio", namespace="work", top_k=10)
         assert result["results"] == []
@@ -163,13 +164,13 @@ class TestGetNamespace:
 
 
 class TestDedupWithinNamespace:
-    """Дедуп — в пределах неймспейса (§5.7): меж-узловые дубли легитимны."""
+    """Dedup — within a namespace (§5.7): cross-node duplicates are legitimate."""
 
     def test_find_by_text_scoped(self, seeded: tuple[SearchService, HashEmbedder]) -> None:
         init_db(get_settings())
         dedup = DeduplicationService(get_settings())
         text = "СУБО 2020: реестр зарплат на сервере appsrv payroll"
-        # Дословный дубль в СВОЕМ узле — найден; в ЧУЖОМ — нет.
+        # A verbatim duplicate in one's OWN node — found; in a FOREIGN one — not.
         assert dedup.find_by_text(text, namespace="work/sbos2020") is not None
         assert dedup.find_by_text(text, namespace="projects") is None
 
@@ -177,8 +178,8 @@ class TestDedupWithinNamespace:
         init_db(get_settings())
         dedup = DeduplicationService(get_settings())
         text = "Дублирующийся текст для проверки меж-узловой изоляции"
-        # Одинаковый текст в двух узлах (раскладка руками: Шаг 3 добавит
-        # namespace-параметр в save): вектора идентичны — cosine 1.0.
+        # The same text in two nodes (laid out by hand: Step 3 will add the
+        # namespace parameter to save): the vectors identical — cosine 1.0.
         with session(get_settings()) as conn:
             conn.execute(
                 "INSERT INTO notes (id, text, namespace) VALUES (21, ?, 'work')",
@@ -193,7 +194,7 @@ class TestDedupWithinNamespace:
             vector = HashEmbedder(dim=DIM).embed(text)
             vectors.upsert(conn, 21, vector, ns="work")
             vectors.upsert(conn, 22, vector, ns="projects")
-        # В своём узле — кандидат найден; в чужом — нет (партиция изолирует).
+        # In one's own node — a candidate found; in a foreign one — not (the partition isolates).
         found_work = dedup.find_candidates(vector, exclude_id=22, namespace="work")
         assert [candidate_id for candidate_id, _ in found_work] == [21]
         found_projects = dedup.find_candidates(vector, exclude_id=22, namespace="projects")

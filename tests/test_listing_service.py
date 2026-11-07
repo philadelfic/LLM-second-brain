@@ -194,11 +194,11 @@ class TestNotesListFields:
 
 
 class TestNotesListFreshness:
-    """no29-01: `updated_after` — включающая граница свежести страницы и total."""
+    """no29-01: `updated_after` — an inclusive freshness bound of the page and total."""
 
     @staticmethod
     def _set_updated_at(note_id: int, stamp: str) -> None:
-        """Прямая правка updated_at (триггер FTS — UPDATE OF text,title — не срабатывает)."""
+        """A direct updated_at edit (the FTS trigger — UPDATE OF text,title — does not fire)."""
         with session(get_settings()) as conn, transaction(conn):
             conn.execute(
                 "UPDATE notes SET updated_at = ? WHERE id = ?", (stamp, note_id)
@@ -211,9 +211,9 @@ class TestNotesListFreshness:
         self._set_updated_at(2, "2026-02-01T00:00:00Z")
         self._set_updated_at(3, "2026-03-01T00:00:00Z")
         result = notes.list(limit=REST_LIMIT, updated_after="2026-02-01T00:00:00Z")
-        # только не старше границы; порядок updated_at DESC, id DESC
+        # only not older than the bound; the order updated_at DESC, id DESC
         assert [item["id"] for item in result["items"]] == [3, 2]
-        assert result["total"] == 2  # total согласован с фильтром страницы
+        assert result["total"] == 2  # total consistent with the page filter
         assert result["has_more"] is False
 
     def test_list_updated_after_inclusive_boundary(self, notes: NoteService) -> None:
@@ -222,27 +222,29 @@ class TestNotesListFreshness:
         self._set_updated_at(1, "2026-01-01T00:00:00Z")
         self._set_updated_at(2, "2026-02-01T00:00:00Z")
         result = notes.list(limit=REST_LIMIT, updated_after="2026-02-01T00:00:00Z")
-        # заметка ровно на границе остаётся (>= , не >)
+        # a note exactly at the bound stays (>=, not >)
         assert [item["id"] for item in result["items"]] == [2]
         assert result["total"] == 1
 
     def test_list_updated_after_counts_the_boundary_note_on_a_full_page(
         self, notes: NoteService
     ) -> None:
-        """Граница включающая — заметка РОВНО на границе входит в окно и тогда,
-        когда страница полна: она просто последняя в окне, а не потеряна.
+        """The bound is inclusive — a note EXACTLY at the bound enters the window even
+                    when the page is full: it is simply the last one in the window, not
+                    lost.
 
-        Почему: приёмочный сценарий №29 отодвигает пробу ровно НА границу
-        (2001-01-01) и спрашивает `memory_list` с limit=20. В окне свежести
-        живого контура больше двадцати записей, поэтому проба — самая
-        старая в окне — остаётся за страницей. Это пагинация, а не «строго
-        после»: граница видна в `total`, `has_more`/`next_offset` ведут к
-        ней. При сравнении `>` запись не попала бы ни в страницу, ни в
-        `total` — регресс на смену границы.
+                    Why: acceptance scenario #29 pushes the probe exactly TO the bound
+                    (2001-01-01) and asks `memory_list` with limit=20. The live contour's
+                    freshness window holds more than twenty records, so the probe — the
+                    oldest in the window — stays behind the page. That is pagination, not
+                    "strictly after": the bound is visible in `total`, and
+                    `has_more`/`next_offset` lead to it. With a `>` comparison the record
+                    would enter neither the page nor `total` — a boundary-change
+                    regression.
         """
         boundary = "2001-01-01T00:00:00Z"
         older = "2000-01-01T00:00:00Z"
-        for i in range(MCP_LIMIT):  # полная страница записей свежее границы
+        for i in range(MCP_LIMIT):  # a full page of records fresher than the bound
             notes.save(unique(f"note {i}"))
         on_boundary = notes.save(unique("ровно на границе"))
         stale = notes.save(unique("строго старее границы"))
@@ -251,10 +253,10 @@ class TestNotesListFreshness:
 
         page = notes.list(limit=MCP_LIMIT, max_limit=MCP_LIMIT, updated_after=boundary)
         assert on_boundary["id"] not in [item["id"] for item in page["items"]]
-        assert page["total"] == MCP_LIMIT + 1  # граница ВНУТРИ окна
+        assert page["total"] == MCP_LIMIT + 1  # the bound INSIDE the window
         assert page["has_more"] is True
         assert page["next_offset"] == MCP_LIMIT
-        # вторая страница — это и есть заметка на границе (и ничего старше)
+        # the second page is exactly the note at the bound (and nothing older)
         tail = notes.list(
             limit=MCP_LIMIT, offset=MCP_LIMIT, max_limit=MCP_LIMIT,
             updated_after=boundary,
@@ -278,7 +280,7 @@ class TestNotesListFreshness:
             namespace_exact=True,
             updated_after="2026-02-01T00:00:00Z",
         )
-        # пересечение фильтров: узел work И свежесть; заметка в default не входит
+        # the filters' intersection: the work node AND freshness; a default note does not enter
         assert [item["id"] for item in fresh["items"]] == [1]
         assert fresh["total"] == 1
 
