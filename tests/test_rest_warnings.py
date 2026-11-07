@@ -1,9 +1,9 @@
-"""№12 (no12-02, 3.2.0): REST-поверхность предупреждений (arch §7.1/§13.4).
+"""#12 (no12-02, 3.2.0): the warnings REST surface (arch §7.1/§13.4).
 
-`GET /warnings` отдаёт ПОЛНЫЙ контракт (без среза белыми списками, как все
-операторские ручки) с потолком `WARNINGS_MAX_LIMIT_REST`; `POST
-/warnings/{id}/dismiss` снимает предупреждение человеком, повторно/без записи
-— 404. Чтение — только SQL, без вызова модели.
+    `GET /warnings` serves the FULL contract (no whitelist trim — like all
+    operator handles) with the `WARNINGS_MAX_LIMIT_REST` ceiling; `POST
+    /warnings/{id}/dismiss` clears a warning by a human; a repeat/without the
+    record — 404. Reads — SQL only, no model call.
 """
 
 from __future__ import annotations
@@ -31,13 +31,13 @@ def _seed(
     subject_type: str = "note",
     subject_id: int = 1,
 ) -> int:
-    """Открыть предупреждение сервисом — SQL, без модели (seed для чтения)."""
+    """Open a warning by the service — SQL, no model (a seed for reading)."""
     service = client.app.state.services.warnings  # type: ignore[attr-defined]
     return service.open(kind, subject_type, subject_id, "misplaced", {"a": 1})
 
 
 def test_get_warnings_full_contract(client: TestClient) -> None:
-    """`GET /warnings` — полный контракт строки + поля страницы."""
+    """`GET /warnings` — the row's full contract + the page fields."""
     _seed(client, subject_id=1)
     _seed(client, kind=KIND_NOTE_NO_NODE, subject_id=2)
     body = client.get("/warnings", headers=_headers()).json()
@@ -55,7 +55,7 @@ def test_get_warnings_full_contract(client: TestClient) -> None:
 
 
 def test_rest_ceiling(client: TestClient) -> None:
-    """Потолок поверхности REST (`WARNINGS_MAX_LIMIT_REST`): выше — 422."""
+    """The REST surface's ceiling (`WARNINGS_MAX_LIMIT_REST`): above — 422."""
     settings = get_settings()
     _seed(client, subject_id=1)
     full = client.get(
@@ -73,7 +73,7 @@ def test_rest_ceiling(client: TestClient) -> None:
 
 
 def test_dismiss(client: TestClient) -> None:
-    """`POST /warnings/{id}/dismiss` → dismissed; повторно — 404."""
+    """`POST /warnings/{id}/dismiss` → dismissed; a repeat — 404."""
     warning_id = _seed(client, subject_id=1)
     first = client.post(f"/warnings/{warning_id}/dismiss", headers=_headers())
     assert first.status_code == 200
@@ -90,7 +90,7 @@ def test_dismiss(client: TestClient) -> None:
 
 
 def test_dismissed_absent_from_open(client: TestClient) -> None:
-    """Снятое не приходит в `status=open`, но видно в `status=dismissed`."""
+    """A cleared one does not come at `status=open` but shows at `status=dismissed`."""
     warning_id = _seed(
         client,
         kind=KIND_TERM_CONTEXTS_EXCESS,
