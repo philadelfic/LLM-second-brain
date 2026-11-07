@@ -1,16 +1,18 @@
-"""Снятие «требует вмешательства» по смене конфигурации слота (lsbdef0008-02/-03).
+"""Releasing "needs attention" on a slot configuration change (lsbdef0008-02/-03).
 
-Старт воркера сравнивает текущий отпечаток конфигурации слотов
-(`slot_budget.slot_config_fingerprint`) с записанным в `meta` (блок 2,
-`SLOT_CONFIG_META_KEY`): отпечатка нет или он отличается — «причина ушла»,
-внимание снимается у заданий ВСЕХ слотов (`attention_at=NULL`, `attempts=0`),
-событие `job_attention_released` с `reason="startup"`; отпечаток тот же —
-ничего не снимаем. `SLOT_ATTENTION_RESET_ON_START=false` отключает шаг целиком
-(воля оператора). Отпечаток включает «думать / не думать» (`*_THINK`) и
-клиентский таймаут (`*_TIMEOUT_SEC`) — смена любого из них снимает внимание
-сама (дефект приёмки 12.10.2026: обход `JUDGE_THINK=false` + малый бюджет не
-размораживал пары). Счётчик попыток, back-off и наблюдаемость очередей —
-блок 2 (no39-02), здесь не дублируются.
+    The worker's start compares the current slot configuration fingerprint
+    (`slot_budget.slot_config_fingerprint`) with the one recorded in `meta`
+    (block 2, `SLOT_CONFIG_META_KEY`): no fingerprint or a different one — "the
+    reason is gone"; attention is cleared for the tasks of ALL slots
+    (`attention_at=NULL`, `attempts=0`) with a `job_attention_released` event of
+    `reason="startup"`; the same fingerprint — nothing is cleared.
+    `SLOT_ATTENTION_RESET_ON_START=false` disables the step entirely (the
+    operator's will). The fingerprint includes "think / not think" (`*_THINK`)
+    and the client timeout (`*_TIMEOUT_SEC`) — changing either clears the
+    attention by itself (the 2026-10-12 acceptance defect: the `JUDGE_THINK=false`
+    workaround + a small budget did not unfreeze pairs). The attempt counter, the
+    back-off and the queue observability — block 2 (no39-02), not duplicated
+    here.
 """
 
 from __future__ import annotations
@@ -66,7 +68,7 @@ def _seed_job(
 
 
 def _frozen_job(settings, job_id: int) -> None:
-    """Задание «требует вмешательства»: attempts исчерпан, attention_at стоит."""
+    """A "needs attention" task: attempts exhausted, attention_at set."""
     with session(settings) as conn, transaction(conn):
         conn.execute(
             "UPDATE worker_jobs SET attempts = 8, last_outcome = 'truncated', "
@@ -92,12 +94,13 @@ def _stored_fingerprint(settings) -> str | None:
 
 
 def _fingerprint_with(settings, **overrides: object) -> str:
-    """Отпечаток «прежней» конфигурации слота: поля из `Settings`, часть — с заменой.
+    """A fingerprint of the "old" slot configuration: the fields from `Settings`, some replaced.
 
-    Носитель строится по `FINGERPRINT_FIELDS` и читает значения из `Settings`
-    (дефолты — как в бою), поэтому тесту не нужен второй экземпляр настроек и
-    БД: он подаёт в `meta` отпечаток конфигурации «до правки», а воркер стартует
-    уже «после».
+                The carrier is built over `FINGERPRINT_FIELDS` and reads the values
+                from `Settings` (the defaults — as in battle), so the test needs no
+                second settings instance or DB: it puts the "before the change"
+                configuration fingerprint into `meta`, while the worker starts
+                "after".
     """
     values = {
         name: getattr(settings, name, FINGERPRINT_DEFAULTS.get(name, ""))
@@ -124,7 +127,7 @@ def _events(caplog, event: str) -> list:
 
 
 def test_changed_fingerprint_releases_attention(tmp_path, monkeypatch, caplog) -> None:
-    """Сменился отпечаток → внимание снято, счётчик сброшен, событие `startup`."""
+    """The fingerprint changed → attention cleared, the counter reset, a `startup` event."""
     settings = _settings(tmp_path, monkeypatch)
     caplog.set_level(logging.INFO, logger="app")
     worker = _worker(settings)
@@ -138,14 +141,14 @@ def test_changed_fingerprint_releases_attention(tmp_path, monkeypatch, caplog) -
     row = _job_row(settings, job_id)
     assert row["attention_at"] is None
     assert row["attempts"] == 0
-    assert row["status"] == "pending"  # задание живо, не «мёртвое»
+    assert row["status"] == "pending"  # the task is alive, not "dead"
     events = _events(caplog, "job_attention_released")
     assert events and getattr(events[-1], "reason", None) == "startup"
     assert _stored_fingerprint(settings) == slot_config_fingerprint(settings)
 
 
 def test_missing_fingerprint_releases_attention(tmp_path, monkeypatch) -> None:
-    """Отпечатка в `meta` нет (первый старт с механизмом) → внимание снято."""
+    """No fingerprint in `meta` (the first start with the mechanism) → attention cleared."""
     settings = _settings(tmp_path, monkeypatch)
     worker = _worker(settings)
     job_id = _seed_job(settings, note_id=1)
@@ -158,7 +161,7 @@ def test_missing_fingerprint_releases_attention(tmp_path, monkeypatch) -> None:
 
 
 def test_same_fingerprint_keeps_attention(tmp_path, monkeypatch) -> None:
-    """Тот же отпечаток → ничего не снимаем (отпечаток не «дёргается»)."""
+    """The same fingerprint → nothing is cleared (the fingerprint does not "jerk")."""
     settings = _settings(tmp_path, monkeypatch)
     worker = _worker(settings)
     job_id = _seed_job(settings, note_id=1)
@@ -173,18 +176,19 @@ def test_same_fingerprint_keeps_attention(tmp_path, monkeypatch) -> None:
 
 
 def test_think_change_releases_attention(tmp_path, monkeypatch, caplog) -> None:
-    """Смена «думать / не думать» на старте размораживает пары (дефект 12.10.2026).
+    """A "think / not think" change at startup unfreezes the pairs (the 2026-10-12 defect).
 
-    Слоты стояли на временном обходе `SUMMARY_THINK=false` + `JUDGE_THINK=true`;
-    после возврата к штатному размышлению внимание снимается без ручных действий
-    (FR-2.3), отпечаток в `meta` перезаписывается текущим.
+                The slots were on the temporary `SUMMARY_THINK=false` +
+                `JUDGE_THINK=true` workaround; after returning to regular reasoning
+                the attention clears without manual actions (FR-2.3); the fingerprint
+                in `meta` is rewritten with the current one.
     """
     settings = _settings(tmp_path, monkeypatch)
     caplog.set_level(logging.INFO, logger="app")
     worker = _worker(settings)
     job_id = _seed_job(settings, note_id=1)
     _frozen_job(settings, job_id)
-    # конфигурация «до правки»: размышление выключено у summary и включено у judge
+    # the "before the change" configuration: reasoning off at summary, on at judge
     _write_fingerprint(
         settings, _fingerprint_with(settings, summary_think=False, judge_think=True)
     )
@@ -201,7 +205,7 @@ def test_think_change_releases_attention(tmp_path, monkeypatch, caplog) -> None:
 
 
 def test_same_think_keeps_attention(tmp_path, monkeypatch) -> None:
-    """Тот же `THINK` → внимание не снимается (нет ложных сбросов)."""
+    """The same `THINK` → attention is not cleared (no false resets)."""
     settings = _settings(
         tmp_path, monkeypatch, SUMMARY_THINK="true", JUDGE_THINK="true"
     )
@@ -215,7 +219,7 @@ def test_same_think_keeps_attention(tmp_path, monkeypatch) -> None:
     row = _job_row(settings, job_id)
     assert row["attention_at"] is not None
     assert row["attempts"] == 8
-    # поле реально участвует в сверке: иначе тест «того же THINK» ничего не значит
+    # the field really takes part in the comparison: otherwise the "same THINK" test means nothing
     assert _fingerprint_with(settings, judge_think=False) != _stored_fingerprint(
         settings
     )
@@ -229,10 +233,11 @@ def test_same_think_keeps_attention(tmp_path, monkeypatch) -> None:
 def test_timeout_change_releases_attention(
     tmp_path, monkeypatch, caplog, override
 ) -> None:
-    """Смена одного лишь `*_TIMEOUT_SEC` (без бюджета) тоже снимает внимание.
+    """Changing only `*_TIMEOUT_SEC` (without the budget) also clears the attention.
 
-    Таймаут меняет исход вызова (`timeout` вместо ответа) — это часть «причины
-    ушла», поэтому правка таймаута размораживает пару (arch §13.4).
+                The timeout changes the call's outcome (`timeout` instead of an
+                answer) — part of "the reason is gone", so a timeout edit unfreezes
+                the pair (arch §13.4).
     """
     settings = _settings(tmp_path, monkeypatch)
     caplog.set_level(logging.INFO, logger="app")
@@ -252,7 +257,7 @@ def test_timeout_change_releases_attention(
 
 
 def test_reset_disabled_by_flag(tmp_path, monkeypatch) -> None:
-    """`SLOT_ATTENTION_RESET_ON_START=false` отключает шаг целиком."""
+    """`SLOT_ATTENTION_RESET_ON_START=false` disables the step entirely."""
     settings = _settings(
         tmp_path, monkeypatch, SLOT_ATTENTION_RESET_ON_START="false"
     )
@@ -268,13 +273,13 @@ def test_reset_disabled_by_flag(tmp_path, monkeypatch) -> None:
 
 
 def test_release_then_queue_drains(tmp_path, monkeypatch) -> None:
-    """Граница с блоком 2: после снятия внимания очередь судьи снова берётся."""
+    """The block-2 boundary: after the attention is cleared the judge queue is taken again."""
     settings = _settings(tmp_path, monkeypatch)
     worker = _worker(settings)
     job_id = _seed_job(settings, slot="judge", kind="dedup", note_id=1)
     _frozen_job(settings, job_id)
     _write_fingerprint(settings, "old-fingerprint")
-    # замороженное задание петлю не гонит (busy-loop'а нет)
+    # a frozen task does not drive the loop (no busy-loop)
     assert worker._judge_queue_empty() is True
 
     assert worker._startup_attention_reset() == 1
