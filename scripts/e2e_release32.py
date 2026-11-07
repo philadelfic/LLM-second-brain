@@ -1,97 +1,97 @@
 #!/usr/bin/env python3
 """Acceptance E2E of release 3.2.0 (test contour, MCP + REST).
 
-Spec: `release/3.2.0/staging_for_development/no39-03-observability-and-acceptance.md`
-(scenario 8 — `.../lsbdef0008-02-attention-release-and-acceptance.md`);
-requirements — `release/3.2.0/documents/req/no39-queue-unavailable-requirements.md`
-(FR-1.1…FR-7.2, lsbdef-0008 FR-1.3/FR-2.4); architecture — §6.9, §7.2, §7.4,
-§13.9, §13.13 of `release/3.2.0/documents/arch/jobs-and-terms-architecture.md`.
+    Spec: `release/3.2.0/staging_for_development/no39-03-observability-and-acceptance.md`
+    (scenario 8 — `.../lsbdef0008-02-attention-release-and-acceptance.md`);
+    requirements — `release/3.2.0/documents/req/no39-queue-unavailable-requirements.md`
+    (FR-1.1…FR-7.2, lsbdef-0008 FR-1.3/FR-2.4); architecture — §6.9, §7.2, §7.4,
+    §13.9, §13.13 of `release/3.2.0/documents/arch/jobs-and-terms-architecture.md`.
 
-This is the BASE script of the 3.2.0 acceptance: it carries the shared harness
-(observable-state waiting, idempotent probe data, teardown trace, report) and the
-mandatory №39 scenario "models unavailable → jobs wait → models are back → jobs
-finish WITHOUT a container restart", checked PER SLOT (`summary`, `judge`,
-`embedding` — in that order, see `SLOT_OUTAGE_ORDER`) and over the new queues,
-plus the observability checks (queues carry
-`pending`/`waiting`/`attention`, `/health.slots` carries the cause and the pause,
-`queue_waiting` is written for deferred work, a deferred job never spins the loop
-in a busy-loop).
+    This is the BASE script of the 3.2.0 acceptance: it carries the shared harness
+    (observable-state waiting, idempotent probe data, teardown trace, report) and the
+    mandatory №39 scenario "models unavailable → jobs wait → models are back → jobs
+    finish WITHOUT a container restart", checked PER SLOT (`summary`, `judge`,
+    `embedding` — in that order, see `SLOT_OUTAGE_ORDER`) and over the new queues,
+    plus the observability checks (queues carry
+    `pending`/`waiting`/`attention`, `/health.slots` carries the cause and the pause,
+    `queue_waiting` is written for deferred work, a deferred job never spins the loop
+    in a busy-loop).
 
-Structure and extension rules (IMPORTANT for the follow-up blocks)
-----------------------------------------------------------------
-The script is split into explicit sections marked with `# ====` banners:
+    Structure and extension rules (IMPORTANT for the follow-up blocks)
+    ----------------------------------------------------------------
+    The script is split into explicit sections marked with `# ====` banners:
 
-  * harness — counters/report, teardown trace, MCP/REST clients, `wait_until`,
-    `/health` helpers (`queue_stat`, `slot_stat`, predicates), external hooks;
-  * probe data — marking by the attempt tag in titles (unique per attempt, so a
-    retry never collides with its own note), idempotent pre-cleanup and
-    teardown (the prefix still matches every attempt);
-  * scenarios — one `async def scenario_<n>_<name>(...)` per block, each opening
-    with `scenario(n, "<title>")` and ending with its own `check()`/`skip()`;
-  * `# TODO(3.2.0 future blocks)` — the empty section a follow-up postановка
-    fills with its own scenarios WITHOUT touching the ones below (see
-    `future_block_todo`).
+      * harness — counters/report, teardown trace, MCP/REST clients, `wait_until`,
+        `/health` helpers (`queue_stat`, `slot_stat`, predicates), external hooks;
+      * probe data — marking by the attempt tag in titles (unique per attempt, so a
+        retry never collides with its own note), idempotent pre-cleanup and
+        teardown (the prefix still matches every attempt);
+      * scenarios — one `async def scenario_<n>_<name>(...)` per block, each opening
+        with `scenario(n, "<title>")` and ending with its own `check()`/`skip()`;
+      * `# TODO(3.2.0 future blocks)` — the empty section a follow-up brief
+        fills with its own scenarios WITHOUT touching the ones below (see
+        `future_block_todo`).
 
-A follow-up block:
-  1. writes `scenario_<n>_<name>()` next to the existing ones (own section);
-  2. registers it in `run_all()` in the right order;
-  3. replaces/manual-notes the matching placeholder in `future_block_todo()`.
+    A follow-up block:
+      1. writes `scenario_<n>_<name>()` next to the existing ones (own section);
+      2. registers it in `run_all()` in the right order;
+      3. replaces/manual-notes the matching placeholder in `future_block_todo()`.
 
-Waiting is driven by an OBSERVABLE state (`/health.queues`, `/health.slots`,
-`vector_status`/`summary_status` in the DB) and never by a fixed pause. Hooks
-(`LSB_SLOT_OFF_CMD`/`LSB_SLOT_ON_CMD` and the auth/off-contract pairs) are the
-only contour-specific bits: an unset hook → the scenario is SKIPPED with a manual
-step, never a false FAIL.
+    Waiting is driven by an OBSERVABLE state (`/health.queues`, `/health.slots`,
+    `vector_status`/`summary_status` in the DB) and never by a fixed pause. Hooks
+    (`LSB_SLOT_OFF_CMD`/`LSB_SLOT_ON_CMD` and the auth/off-contract pairs) are the
+    only contour-specific bits: an unset hook → the scenario is SKIPPED with a manual
+    step, never a false FAIL.
 
-Scenarios (this base version):
-  0. MCP surface and readiness: 24 tools, `/health` shape including `queues`
-     (`pending`/`waiting`/`attention`) and `slots` (`embedding`/`summary`/`judge`
-     with `ok`/`last_outcome`/`paused_until`/`attention`), version, DB size.
-  1. Queue and slot observability baseline (before the outage): queues are
-     reported, `waiting`/`attention` are numbers, `/health` answers without models.
-  2. №39 core: for EACH slot `summary`/`judge`/`embedding` (in that order) —
-     stop the slot by the contour hook, wait for the queue to grow
-     (`pending`/`waiting` and the age of the oldest), check `/health` stays alive
-     and no request flood appears in the log, then start the slot back and see
-     the queue drain WITHOUT a restart. The `summary`/`judge` queues count only
-     the notes with a READY vector: those branches first wait for the vector of
-     their probe notes and refuse to run while the embedding slot is paused
-     (an honest SKIP, not a FAIL); `embedding` itself goes LAST because its own
-     queue `vector` needs no embedding at all.
-  3. Auth branch: the slot provider answers `401` (fake-provider hook) →
-     `slot_paused` in the log, `/health.slots.<slot>.last_outcome='auth'`,
-     `paused_until` set, the tool hint; after the fix — `slot_probe` +
-     `slot_resumed` and the queue drains.
-  4. Attention pair: the judge gets a repeated `off_contract` answer → the number
-     of retries is bounded, the job lands in `GET /jobs/attention`; after the
-     answer changes the job is released and finishes.
-  5. Restart inside the outage window: pending work survives the restart and is
-     neither lost nor duplicated (no restarts if no hook).
-  6. Regression: unit tests + the existing E2E scripts — only with
-     `--run-regression` (otherwise MANUAL).
-  7. TODO of the future blocks (slots/budget/decision, memory handles) —
-     placeholders for the follow-up postановки.
-  8. lsbdef-0008 (defect): reasoning eats the budget → truncation → the pair
-     lands in attention → the budget is raised → BOTH queues drain by themselves
-     (no manual step), numbers before/after into `release/3.2.0/ACCEPTANCE.md`.
-  14. LSBN-F-10 (f10-02/03/04): the assistant-logs area — the entry is written and
-     read back by id, sliced by object in the list, found by the reason in the
-     search, edited and soft-deleted over MCP (with the REST operator mirror); the
-     linked object and its state are visible in the entry; memory search does NOT
-     mix the log in (isolation); a token-like value in the body never reaches the
-     contour journal. The scenario removes its own log entry (idempotent).
-  15. №14 (no14-01): the backups contour — `GET /backups` lists the snapshots,
-     `POST /backups/verify` opens the newest one as a working base (integrity +
-     vec0) READ-ONLY (size/mtime unchanged) and `/health.backups` carries
-     `last_verify`/`last_ship`; no snapshot → an honest SKIP, never a FAIL.
+    Scenarios (this base version):
+      0. MCP surface and readiness: 24 tools, `/health` shape including `queues`
+         (`pending`/`waiting`/`attention`) and `slots` (`embedding`/`summary`/`judge`
+         with `ok`/`last_outcome`/`paused_until`/`attention`), version, DB size.
+      1. Queue and slot observability baseline (before the outage): queues are
+         reported, `waiting`/`attention` are numbers, `/health` answers without models.
+      2. №39 core: for EACH slot `summary`/`judge`/`embedding` (in that order) —
+         stop the slot by the contour hook, wait for the queue to grow
+         (`pending`/`waiting` and the age of the oldest), check `/health` stays alive
+         and no request flood appears in the log, then start the slot back and see
+         the queue drain WITHOUT a restart. The `summary`/`judge` queues count only
+         the notes with a READY vector: those branches first wait for the vector of
+         their probe notes and refuse to run while the embedding slot is paused
+         (an honest SKIP, not a FAIL); `embedding` itself goes LAST because its own
+         queue `vector` needs no embedding at all.
+      3. Auth branch: the slot provider answers `401` (fake-provider hook) →
+         `slot_paused` in the log, `/health.slots.<slot>.last_outcome='auth'`,
+         `paused_until` set, the tool hint; after the fix — `slot_probe` +
+         `slot_resumed` and the queue drains.
+      4. Attention pair: the judge gets a repeated `off_contract` answer → the number
+         of retries is bounded, the job lands in `GET /jobs/attention`; after the
+         answer changes the job is released and finishes.
+      5. Restart inside the outage window: pending work survives the restart and is
+         neither lost nor duplicated (no restarts if no hook).
+      6. Regression: unit tests + the existing E2E scripts — only with
+         `--run-regression` (otherwise MANUAL).
+      7. TODO of the future blocks (slots/budget/decision, memory handles) —
+         placeholders for the follow-up briefs.
+      8. lsbdef-0008 (defect): reasoning eats the budget → truncation → the pair
+         lands in attention → the budget is raised → BOTH queues drain by themselves
+         (no manual step), numbers before/after into `release/3.2.0/ACCEPTANCE.md`.
+      14. LSBN-F-10 (f10-02/03/04): the assistant-logs area — the entry is written and
+         read back by id, sliced by object in the list, found by the reason in the
+         search, edited and soft-deleted over MCP (with the REST operator mirror); the
+         linked object and its state are visible in the entry; memory search does NOT
+         mix the log in (isolation); a token-like value in the body never reaches the
+         contour journal. The scenario removes its own log entry (idempotent).
+      15. №14 (no14-01): the backups contour — `GET /backups` lists the snapshots,
+         `POST /backups/verify` opens the newest one as a working base (integrity +
+         vec0) READ-ONLY (size/mtime unchanged) and `/health.backups` carries
+         `last_verify`/`last_ship`; no snapshot → an honest SKIP, never a FAIL.
 
-Run (normally inside the test container):
-    MCP_AUTH_TOKEN=... python scripts/e2e_release32.py
-    python scripts/e2e_release32.py --help
+    Run (normally inside the test container):
+        MCP_AUTH_TOKEN=... python scripts/e2e_release32.py
+        python scripts/e2e_release32.py --help
 
-Configuration comes from environment variables only (defaults are for the test
-contour); no secret ever reaches the code or the output — the token is printed
-masked.
+    Configuration comes from environment variables only (defaults are for the test
+    contour); no secret ever reaches the code or the output — the token is printed
+    masked.
 """
 from __future__ import annotations
 
@@ -130,8 +130,8 @@ if REPO_ROOT not in sys.path:
 MCP_LIMIT = 20
 REST_LIMIT = 50
 MCP_TOOLS_TOTAL = 31  # 3.1.0 surface (21) + warnings_list + 2 history + memory_comment_search + 6 logs tools
-# Литерал намеренно, а не len(TOOL_NAMES): рост поверхности должен остаться
-# осознанным решением с пересмотром бюджетов текста (F-11, f11-03).
+# The literal is deliberate, not len(TOOL_NAMES): the surface's growth must remain
+# a conscious decision with a text-budget review (F-11, f11-03).
 HEALTH_LEGACY = ("status", "embedding_ok", "summarizer_ok", "judge_ok",
                  "notes_count", "pending_vector", "pending_summary")
 # №39: the queues of the contour (jobs registered on the job framework).
@@ -141,12 +141,12 @@ HEALTH_QUEUES = ("vector", "summary", "judge", "areas", "links", "nodes",
 SLOTS = ("embedding", "summary", "judge", "decision")
 # Queue that belongs to each slot for the "queue grows while the slot is down".
 SLOT_QUEUE = {"embedding": "vector", "summary": "summary", "judge": "judge"}
-# №39 + LSBN-F-12: слот решения (`/health.slots.decision`) — не «слот модели», но у
-# него свой канал: ветвь `judge` сценария 2 глушит и его (см. `_outage_for_slot`).
+# #39 + LSBN-F-12: the decision slot (`/health.slots.decision`) is not a "model slot", but it
+# has its own channel: scenario 2's `judge` branch mutes it too (see `_outage_for_slot`).
 SLOT_DECISION = "decision"
-# Регрессия сценария 6: у этих старых E2E есть ключи адреса и базы; остальные
-# (`e2e_release22`, `e2e_lsb0004/0005/0006`) жёстко ходят на `localhost:8080` и
-# потому запускаются в сети контура (см. `legacy_e2e_cmd`).
+# Scenario 6's regression: these old E2E have address and database keys; the others
+# (`e2e_release22`, `e2e_lsb0004/0005/0006`) go hard-coded to `localhost:8080` and
+# therefore run in the contour's network (see `legacy_e2e_cmd`).
 LEGACY_ARG_SCRIPTS = ("e2e_release31.py", "e2e_release30.py")
 # №39: the outage walk of scenario 2 — only the slots that OWN a queue, and the
 # ORDER MATTERS. `embedding` goes LAST: its own queue `vector` needs no embedding
@@ -175,9 +175,9 @@ SKIPS: list[str] = []
 MANUALS: list[str] = []
 SCENARIO: dict[str, Any] = {}
 REPORT: list[dict[str, Any]] = []
-# Сценарии прогона дошли до конца. Попытка, дошедшая сюда, состоялась: разрыв
-# транспорта на ЗАКРЫТИИ (чужой `cancel scope`) не обнуляет её и не запускает
-# повтор — иначе живые 20–40 минут прогона тратились бы трижды (12.10.2026).
+# The run's scenarios reached the end. An attempt that got here did happen: a transport
+# break at CLOSING (a foreign `cancel scope`) does not zero it and does not start
+# a retry — otherwise the run's live 20–40 minutes would be spent three times (2026-10-12).
 RUN_FINISHED = False
 
 
@@ -259,18 +259,19 @@ def note_detail(result: dict) -> str:
 
 async def run_scenario(n: int, title: str,
                        body: Callable[[], Awaitable[None]]) -> None:
-    """Один сценарий в обёртке: его падение не отменяет остальные (8–13).
+    """One scenario in a wrapper: its failure does not cancel the others (8–13).
 
-    До 12.10.2026 исключение сценария 8/9 обрывало прогон целиком: сценарии
-    10–13 и блок f11-03 `ACCEPTANCE.md` не выполнялись НИКОГДА. Отчёт пишется
-    независимо от исхода сценариев наблюдаемости, поэтому здесь — изоляция
-    (`warn` и продолжение), а не молчание: причина остаётся в отчёте.
+            Until 2026-10-12 a scenario 8/9 exception cut the whole run short:
+            scenarios 10–13 and the f11-03 block of `ACCEPTANCE.md` never ran. The
+            report is written independently of the observability scenarios' outcomes,
+            so here — isolation (`warn` and continue), not silence: the reason stays
+            in the report.
     """
     try:
         await body()
-    except Exception as exc:  # noqa: BLE001 — изолируем сценарий, не глотаем причину
+    except Exception as exc:  # noqa: BLE001 — we isolate the scenario, not swallow the reason
         if SCENARIO.get("n") != n:
-            scenario(n, title)  # сценарий упал до своего заголовка
+            scenario(n, title)  # the scenario fell before its own heading
         warn("the scenario broke before its own checks", describe(exc))
     finally:
         close_scenario()
@@ -317,14 +318,14 @@ def describe(exc: BaseException) -> str:
 
 
 def is_closing_cancel_scope(exc: BaseException) -> bool:
-    """Падение ЗАКРЫТИЯ MCP-сессии из-за чужого cancel scope — не дефект продукта.
+    """An MCP session CLOSING failure over a foreign cancel scope — not a product defect.
 
-    anyio/asyncio бросает `RuntimeError: Attempted to exit a cancel scope ...`
-    (текст бывает и про другую задачу: `... in a different task than it was
-    entered in`), а `ExceptionGroup` несёт его первым корнем. Живой прогон
-    12.10.2026: это падение обрывало прогон на выходе — сценарии 10–13 и блок
-    f11-03 не выполнялись никогда, «Total:» не печатался. Такой разрыв считаем
-    наблюдением закрытия, а не ошибкой прогона.
+            anyio/asyncio throws `RuntimeError: Attempted to exit a cancel scope ...`
+            (the text sometimes names another task: `... in a different task than it
+            was entered in`), and the `ExceptionGroup` carries it as the first root.
+            The live run of 2026-10-12: this failure cut the run at exit — scenarios
+            10–13 and the f11-03 block never ran, "Total:" never printed. We count
+            such a break a closing observation, not a run error.
     """
     if isinstance(exc, BaseExceptionGroup):
         return any(is_closing_cancel_scope(inner) for inner in exc.exceptions)
@@ -335,13 +336,14 @@ def is_closing_cancel_scope(exc: BaseException) -> bool:
 
 
 def is_transport_break(exc: BaseException) -> bool:
-    """Разрыв транспорта MCP, а не доменная ошибка продукта.
+    """An MCP transport break, not a product's domain error.
 
-    Живой прогон 10.10.2026: разрыв приходит и как `ExceptionGroup: unhandled
-    errors in a TaskGroup (1 sub-exception)` (anyio), поэтому группу разбираем
-    рекурсивно — «транспортной» она считается, только если внутри транспорт.
-    Сюда же — разрыв закрытия сессии (чужой `cancel scope`): для вызывающего это
-    тот же обрыв транспорта, но не доменный отказ продукта.
+            The live run of 2026-10-10: the break also arrives as
+            `ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)` (anyio),
+            so the group is unwrapped recursively — it counts as "transport" only when
+            a transport is inside. The session-closing break (a foreign `cancel scope`)
+            belongs here too: for the caller it is the same transport drop, but not a
+            domain failure of the product.
     """
     if isinstance(exc, MCPError):
         return True
@@ -353,8 +355,8 @@ def is_transport_break(exc: BaseException) -> bool:
                         anyio.BrokenResourceError, anyio.ClosedResourceError,
                         anyio.EndOfStream)):
         return True
-    # MCP SDK 2.x тянет и httpx 1.x, и anyio: транспорт ловим и по модулю класса,
-    # а не только по типам своего httpx2 (иначе любой чужой клиент проскочит).
+    # MCP SDK 2.x drags in both httpx 1.x and anyio: we catch the transport by the class's module too,
+    # not only by our httpx2's types (otherwise any foreign client would slip through).
     root = (getattr(type(exc), "__module__", "") or "").split(".")[0]
     return root in ("httpx", "httpx2", "httpcore", "anyio", "h11")
 
@@ -427,8 +429,8 @@ class Client:
     def __init__(self, session: ClientSession, stack: AsyncExitStack | None = None):
         self.session = session
         self._stack = stack
-        # Сессии, открытые ПОСЛЕ рестарта контура (`reconnect`): их стеки живут до
-        # конца процесса и закрываются в `close()` — самая свежая первой.
+        # Sessions opened AFTER the contour restart (`reconnect`): their stacks live until
+        # the end of the process and are closed in `close()` — the newest first.
         self._keepalive: list[AsyncExitStack] = []
 
     async def call(self, tool: str, args: dict) -> dict:
@@ -437,12 +439,12 @@ class Client:
     async def close(self, *, quiet: bool = False) -> None:
         """Close every live session stack, newest first: idempotent, never fatal.
 
-        Порядок — обратный порядку открытия: `cancel scope` свежей сессии вложен
-        глубже всех, а выход из старого scope раньше нового и есть тот
-        `RuntimeError` про cancel scope, которым обрывался прогон (12.10.2026,
-        воспроизведено точечным прогоном). Разрыв закрытия — наблюдение
-        (`info` + одна строка teardown), не ошибка: сессия контура к этому
-        моменту уже не нужна.
+                    The order — the reverse of the opening order: a fresh session's
+                    `cancel scope` is nested deepest, and exiting an older scope earlier
+                    than a newer one is exactly that RuntimeError about a cancel scope
+                    which cut runs short (2026-10-12, reproduced by a targeted run). A
+                    closing break — an observation (`info` + one teardown line), not an
+                    error: the contour session is no longer needed by then.
         """
         stacks = [*self._keepalive[::-1], self._stack]
         self._keepalive, self._stack = [], None
@@ -455,40 +457,42 @@ class Client:
                 await stack.aclose()
             except (KeyboardInterrupt, SystemExit):
                 raise
-            except BaseException as exc:  # noqa: BLE001 — закрытие не предмет проверок
+            except BaseException as exc:  # noqa: BLE001 — closing is not the checks' subject
                 note = (" (a cancel-scope break on the way out)"
                         if is_closing_cancel_scope(exc) else "")
                 info(f"closing the MCP session: {describe(exc)}")
                 teardown_note(f"closing the MCP session raised {describe(exc)}{note}")
         if closed and not quiet:
-            # След корректного закрытия в журнале прогона и в trace (те же задачи,
-            # что и у открытия: закрываем в своей задаче, до выхода из AsyncExitStack).
+            # A trace of the correct closing in the run's journal and in the trace (the same tasks
+            # as at opening: we close in our own task, before leaving the AsyncExitStack).
             info("the MCP session is closed")
             teardown_note("the MCP session is closed")
 
     async def reconnect(self) -> Any:
         """Re-open the MCP session after a contour restart (the old socket is dead).
 
-        Сценарий 5 по своей сути перезапускает контейнер контура — сессия раннера
-        при этом рвётся, и без переоткрытия весь прогон уходит в повторы попыток
-        и завершается FATAL, хотя продукт жив (проверено 10.10.2026).
+                    Scenario 5 by its nature restarts the contour container — the
+                    runner's session tears with it, and without a re-open the whole run
+                    goes into attempt retries and ends FATAL although the product is
+                    alive (verified 2026-10-10).
 
-        Старую сессию закрываем ЗДЕСЬ, в этой же задаче и до открытия новой: её
-        сокет уже мёртв, а живой `AsyncExitStack` старой сессии, оставленный до
-        конца прогона, вкладывал cancel-scope'ы не по LIFO — закрытие на выходе
-        падало `RuntimeError: Attempted to exit cancel scope ...`, отменённый
-        scope «травил» задачу прогона, и сценарии 10–13 не выполнялись вовсе
-        (живой прогон 12.10.2026; воспроизведено точечными прогонами). Новую
-        сессию держим в `_keepalive` и закрываем в `close()`.
+                    We close the old session HERE, in this same task and before opening
+                    the new one: its socket is already dead, and a live `AsyncExitStack`
+                    of the old session left until the end of the run nested cancel scopes
+                    not by LIFO — the closing at exit failed with
+                    `RuntimeError: Attempted to exit cancel scope ...`, the cancelled
+                    scope "poisoned" the run's task, and scenarios 10–13 never ran (the
+                    live run of 2026-10-12; reproduced by targeted runs). The new session
+                    is kept in `_keepalive` and closed in `close()`.
         """
         await self.close(quiet=True)
         fresh, init = await fresh_session(AsyncExitStack(), own_stack=True)
-        # В `_keepalive` кладём СТЕК сессии, а не сам `Client`: иначе стек некому
-        # закрыть, его асинхронный генератор доживает до сборки мусора — и та
-        # закрывает его в ЧУЖОЙ задаче (`Attempted to exit cancel scope in a
-        # different task...`), отменяя попытку прогона (живой прогон 12.10.2026:
-        # обрыв в сценарии 5, до сценариев 10–13 дело не дошло).
-        self._keepalive.append(fresh._stack)  # стек новой сессии живёт до close()
+        # We put the session's STACK into `_keepalive`, not the `Client` itself: otherwise nobody
+        # closes the stack; its async generator survives until garbage collection — and that
+        # collection closes it in a FOREIGN task (`Attempted to exit cancel scope in a
+        # different task...`), cancelling the run's attempt (the live run of 2026-10-12:
+        # the break at scenario 5; scenarios 10–13 were never reached).
+        self._keepalive.append(fresh._stack)  # the new session's stack lives until close()
         self.session = fresh.session
         return init
 
@@ -496,15 +500,15 @@ class Client:
 async def call_with_reconnect(c: Client, tool: str, args: dict) -> dict:
     """MCP call right after a contour hook: a transport break is re-opened once.
 
-    Хуки (рестарт контура, глушение/подъём слота) рвут живую сессию раннера, и
-    первый же вызов после хука падает — не только `MCPError`, но и
-    `ExceptionGroup`/anyio/httpx-транспортом (живой прогон 10.10.2026). Здесь
-    такой разрыв переоткрывается один раз, а доменная ошибка уходит наверх как
-    есть: продукт от неё не прикрываем.
+            The hooks (a contour restart, muting/raising a slot) tear the runner's
+            live session, and the first call after the hook fails — not only with
+            `MCPError` but with an `ExceptionGroup`/anyio/httpx transport too (the
+            live run of 2026-10-10). Here such a break is re-opened once, and a
+            domain error propagates as is: we do not shield the product with it.
     """
     try:
         return await c.call(tool, args)
-    except Exception as exc:  # noqa: BLE001 — решаем по типу, а не глотаем
+    except Exception as exc:  # noqa: BLE001 — we decide by type, not swallow
         if not is_transport_break(exc):
             raise
         info(f"the MCP transport broke on {tool} ({describe(exc)}) — "
@@ -655,14 +659,14 @@ def queue_drained(rest: httpx2.AsyncClient,
 
 def queue_waiting(rest: httpx2.AsyncClient, queue: str, *,
                  min_waiting: int = 1) -> Callable[[], Awaitable[tuple[bool, str]]]:
-    """Predicate: работа ОТЛОЖЕНА причиной — видна в `waiting`, а не в `attention`.
+    """Predicate: the work is DEFERRED by a reason — visible in `waiting`, not in `attention`.
 
-    Фаза открытого разрыва слота (№39 arch §6.9, no39-04): петля партию не
-    берёт, вся текущая работа уезжает из `pending` в `waiting`; `attention`
-    («требует человека») — подмножество `waiting` и появляется только после
-    `SLOT_MAX_ATTEMPTS` нетранзиентных отказов ПАРЫ. Ждать `attention` в этой
-    фазе — ложная краснота (живой прогон 12.10.2026: сценарий 8 краснел
-    «безнадёжная пара waits for a human»).
+            The open slot-breaker phase (#39 arch §6.9, no39-04): the loop takes no
+            batch, all current work moves from `pending` to `waiting`; `attention`
+            ("needs a human") is a `waiting` subset and appears only after
+            `SLOT_MAX_ATTEMPTS` non-transient failures of the PAIR. Waiting for
+            `attention` in this phase — false red (the live run of 2026-10-12:
+            scenario 8 went red over "the hopeless pair waits for a human").
     """
 
     async def predicate() -> tuple[bool, str]:
@@ -683,12 +687,12 @@ def queue_waiting(rest: httpx2.AsyncClient, queue: str, *,
 
 def queue_deferred(rest: httpx2.AsyncClient, queue: str, *,
                    min_work: int = 1) -> Callable[[], Awaitable[tuple[bool, str]]]:
-    """Predicate: пара ПЕРЕСТАЛА ЖЕЧЬ ВЫЗОВЫ — работа отложена причиной.
+    """Predicate: the pair STOPPED BURNING CALLS — the work is deferred by a reason.
 
-    `waiting + attention >= min_work` и `pending == 0`: работа либо отложена
-    слотом, либо уже замерла в «требует человека» — в обоих случаях вызовы
-    модели не жгутся (FR-2.3/FR-5.1, no39-04). Жёсткое ожидание `attention`
-    вместо этого — предпосылка ветви, а не её факт.
+            `waiting + attention >= min_work` and `pending == 0`: the work is either
+            deferred by the slot or already frozen in "needs a human" — in both cases
+            no model calls burn (FR-2.3/FR-5.1, no39-04). A hard `attention` wait
+            instead is the branch's premise, not its fact.
     """
 
     async def predicate() -> tuple[bool, str]:
@@ -708,10 +712,10 @@ def queue_deferred(rest: httpx2.AsyncClient, queue: str, *,
 
 
 async def attention_jobs(rest: httpx2.AsyncClient) -> list[dict] | None:
-    """Задания, ждущие человека (`GET /jobs/attention`); None — ручка не ответила."""
+    """Tasks waiting for a human (`GET /jobs/attention`); None — the handle did not answer."""
     try:
         answer = await rest.get("/jobs/attention")
-    except Exception:  # noqa: BLE001 — транзиентная ошибка REST не ответ
+    except Exception:  # noqa: BLE001 — a transient REST error is not an answer
         return None
     if answer.status_code != 200:
         return None
@@ -719,13 +723,14 @@ async def attention_jobs(rest: httpx2.AsyncClient) -> list[dict] | None:
 
 
 async def check_attention_threshold(rest: httpx2.AsyncClient, prefix: str) -> None:
-    """Проверка достижимости порога: `attention` — только после серии отказов (no39-04).
+    """Checking the threshold's reachability: `attention` — only after a failure series (no39-04).
 
-    «Пауза — на слот, счёт — на пару»: в `attention` задание попадает, исчерпав
-    `SLOT_MAX_ATTEMPTS` НЕТРАНЗИЕНТНЫХ отказов пары, а не на первом же. Предел
-    в ветви заглушки ниже кодового (`scripts/slot_fake.sh` опускает его для
-    быстрой приёмки), поэтому сверяем факт задания (серия отказов), а не число из
-    env контура: сцену красным не делает ни один вариант окружения.
+            "The pause is per slot, the count per pair": a task enters `attention`
+            after exhausting `SLOT_MAX_ATTEMPTS` NON-TRANSIENT failures of the pair,
+            not at the first one. The stub branch's limit is below the code's
+            (`scripts/slot_fake.sh` lowers it for a fast acceptance), so we compare
+            the fact of the task (a failure series), not the number from the
+            contour's env: no environment variant makes the scene red.
     """
     jobs = await attention_jobs(rest)
     if jobs is None:
@@ -779,11 +784,12 @@ def slot_ok(rest: httpx2.AsyncClient, slot: str,
             ) -> Callable[[], Awaitable[tuple[bool, str]]]:
     """Predicate: the slot really answers again — the last attempt succeeded.
 
-    №39: маркер `slot_resumed` пишется только при снятии паузы В ТОМ ЖЕ процессе
-    (`app/services/worker.py`). Ветвь, чья «починка» пересоздаёт контейнер
-    (`scripts/slot_fake.sh on ok ...`), маркера не увидит: пауза жила в памяти и
-    при пересоздании её нет. Наблюдаемый факт «доступ вернулся» — успешная
-    последняя попытка слота (`/health.slots.<slot>.ok`) и снятый разрыв.
+            №39: the `slot_resumed` marker is written only when the pause is lifted in
+            the SAME process (`app/services/worker.py`). A branch whose "fix"
+            recreates the container (`scripts/slot_fake.sh on ok ...`) will never see
+            the marker: the pause lived in memory and is gone at recreation. The
+            observable fact "access is back" — the slot's successful last attempt
+            (`/health.slots.<slot>.ok`) and the breaker lifted.
     """
 
     async def predicate() -> tuple[bool, str]:
@@ -905,7 +911,7 @@ def log_events(*needles: str) -> Callable[[], Awaitable[tuple[bool, str]]]:
 
 
 def utc_now_iso() -> str:
-    """Момент в ISO-8601 UTC — окно «после начала ветви» для журнальных проверок."""
+    """A moment in ISO-8601 UTC — the "after the branch started" window for journal checks."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
 
 
@@ -914,12 +920,13 @@ def log_slot_event(event: str, *, slot: str, outcome: str,
                    ) -> Callable[[], Awaitable[tuple[bool, str]]]:
     """Predicate: the contour log carries THIS event of THIS slot with THIS cause.
 
-    Строка журнала — JSON (`ts`/`event`/`slot`/`outcome`), поэтому проверка
-    читает ПОЛЯ, а не подстроку: `log_events("slot_paused")` находил событие
-    любой ветви прогона (окно хука — 2 часа) и объявлял PASS даже когда причина
-    была чужой — живой прогон 13.10.2026: `slot_paused` с
-    `outcome=off_contract` прошёл как «событие с причиной», хотя ветвь ждёт
-    `auth`. `since` (UTC ISO, секунды) сужает окно до начала ветви.
+            A journal line is JSON (`ts`/`event`/`slot`/`outcome`), so the check reads
+            FIELDS, not a substring: `log_events("slot_paused")` matched any run
+            branch's event (the hook window — 2 hours) and declared PASS even when the
+            cause was foreign — the live run of 2026-10-13: `slot_paused` with
+            `outcome=off_contract` passed as "the event with the cause" while the
+            branch expected `auth`. `since` (UTC ISO, seconds) narrows the window to
+            the branch's start.
     """
 
     async def predicate() -> tuple[bool, str]:
@@ -1001,17 +1008,18 @@ def acceptance_path() -> Path:
 
 
 def block_markers(text: str, start: str, end: str) -> tuple[int, int]:
-    """Границы блока по МАРКЕРАМ-СТРОКАМ: `(index начала, index конца)` или `(-1, -1)`.
+    """A block's bounds by MARKER LINES: `(the start index, the end index)` or `(-1, -1)`.
 
-    Маркеры ищем целыми строками (`(?m)^…$`), а не подстроками: тело блока
-    `f12-03` само содержало слово-в-слово `<!-- f12-03:end -->`, поиск по подстроке
-    находил его раньше настоящего конца — и каждый прогон дописывал лишнюю
-    строку-маркер (живой дефект 12.10.2026: три дубля в `ACCEPTANCE.md`).
+            Markers are searched as whole lines (`(?m)^…$`), not substrings: the body
+            of the `f12-03` block itself contained the word-for-word
+            `<!-- f12-03:end -->`; the substring search found it before the real end —
+            and every run appended an extra marker line (the live defect of
+            2026-10-12: three duplicates in `ACCEPTANCE.md`).
     """
     start_match = re.search(rf"(?m)^{re.escape(start)}$", text)
     if start_match is None:
         return -1, -1
-    # `re.search` не знает `pos=`: ищем конец в хвосте после начала и складываем смещения.
+    # `re.search` does not know `pos=`: we search the end in the tail after the start and add up the offsets.
     end_match = re.search(rf"(?m)^{re.escape(end)}$", text[start_match.end():])
     if end_match is None:
         return -1, -1
@@ -1023,19 +1031,20 @@ MARKER_WORDS = {"f12-03": "HTML-маркеры блока — комментар
 
 def write_acceptance_block(block: str, lines: list[str], *,
                            path: Path | None = None) -> str:
-    """Write/replace the block of ONE postановка in `ACCEPTANCE.md` (idempotent).
+    """Write/replace the block of ONE brief in `ACCEPTANCE.md` (idempotent).
 
-    The block is fenced with HTML markers `<!-- <block>:start -->` /
-    `<!-- <block>:end -->`: a repeated run of the scenario REPLACES its own block
-    instead of appending a second copy, so the second run of the E2E leaves the
-    report byte-identical (идемпотентность прогона). The numbers live outside the
-    code: the file is the evidence, the script only fills it.
+            The block is fenced with HTML markers `<!-- <block>:start -->` /
+            `<!-- <block>:end -->`: a repeated run of the scenario REPLACES its own block
+            instead of appending a second copy, so the second run of the E2E leaves the
+            report byte-identical (the run's idempotency). The numbers live outside the
+            code: the file is the evidence, the script only fills it.
 
-    Две защыты идемпотентности: (1) маркеры сверяются как ЦЕЛЫЕ СТРОКИ — тело
-    блока не может «прикинуться» концом (`block_markers`); (2) перед записью
-    проверяем, что маркеров в файле ровно два и блок не вырос по строкам: при
-    расхождении — `warn`, файл не трогаем (лучше старый отчёт, чем испорченный).
-    Тело блока обязано быть без дословных маркеров (`MARKER_WORDS` — словами).
+            Two idempotency protections: (1) markers are compared as WHOLE LINES — the
+            block body cannot "impersonate" the end (`block_markers`); (2) before
+            writing we check the file has exactly two markers and the block has not
+            grown by lines: on a mismatch — `warn`, the file is untouched (better the
+            old report than a spoiled one). The block body must be free of verbatim
+            markers (`MARKER_WORDS` — as words).
     """
     target = path or acceptance_path()
     start, end = f"<!-- {block}:start -->", f"<!-- {block}:end -->"
@@ -1067,19 +1076,20 @@ def write_acceptance_block(block: str, lines: list[str], *,
 
 
 def self_test_acceptance() -> int:
-    """Идемпотентность блока отчёта без контура (гейт этапа 6).
+    """The report block's idempotency without a contour (the stage-6 gate).
 
-    Пишем блок `f12-03` ДВАЖДЫ во временный файл и сверяем содержимое побайтово:
-    повтор обязан ЗАМЕНИТЬ блок, а не дописать его. Ловит и поиск маркеров
-    подстрокой (дефект 12.10.2026 — три дубля в `ACCEPTANCE.md`), и дословные
-    маркеры в теле блока, и соседние блоки (не должны расти от чужой записи).
-    Числа берём из пустого набора: проверяется идемпотентность, а не они.
+            We write the `f12-03` block TWICE into a temp file and compare the content
+            byte-by-byte: the repeat must REPLACE the block, not append to it. It
+            catches both the substring marker search (the 2026-10-12 defect — three
+            duplicates in `ACCEPTANCE.md`) and verbatim markers in the block body, and
+            the neighboring blocks (they must not grow from a foreign write). The
+            numbers come from an empty set: the idempotency is checked, not them.
     """
     print("=== self-test: the acceptance block of one постановка is idempotent "
           "(the contour is not needed)")
     failures: list[str] = []
-    # Самопроверке контур не нужен: подставляем минимальный контекст отчёта
-    # (иначе шапка блока читает `CFG['base_url']` и `RUN['tag']`).
+    # The self-check needs no contour: we substitute a minimal report context
+    # (otherwise the block's header reads `CFG['base_url']` and `RUN['tag']`).
     CFG.setdefault("base_url", "http://lsb-test:8080 (self-test)")
     RUN.setdefault("tag", "e2e32-self-test")
     lines = _decision_acceptance_lines({})
@@ -1091,7 +1101,7 @@ def self_test_acceptance() -> int:
         twice = path.read_text(encoding="utf-8")
         if once != twice:
             failures.append("the second write changed the file: the block is not idempotent")
-        # Соседние блоки: запись f12-03 их не трогает и сама остаётся одна.
+        # Neighboring blocks: the f12-03 write does not touch them and stays single itself.
         write_acceptance_block("lsbdef0008-02", ["### блок дефекта", "", "числа"], path=path)
         write_acceptance_block("f11-03", ["### блок вшитого текста", "", "числа"], path=path)
         write_acceptance_block("f12-03", lines, path=path)
@@ -1196,7 +1206,7 @@ async def cleanup_own_data() -> None:
 
 
 def contour_alive(rest: httpx2.AsyncClient) -> Callable[[], Awaitable[tuple[bool, str]]]:
-    """Zero-arg `wait_until` predicate: the contour answers `/health` (см. `_http_alive`)."""
+    """A zero-arg `wait_until` predicate: the contour answers `/health` (see `_http_alive`)."""
 
     async def predicate() -> tuple[bool, str]:
         return await _http_alive(rest)
@@ -1205,13 +1215,14 @@ def contour_alive(rest: httpx2.AsyncClient) -> Callable[[], Awaitable[tuple[bool
 
 
 async def _await_contour_ready(rest: httpx2.AsyncClient) -> None:
-    """Дождаться живости контура перед повторной попыткой сохранить заметку.
+    """Wait for the contour's liveness before retrying the note save.
 
-    Переоткрытие сессии после хука могло застать контур перезапускающимся
-    (хук рестарта, смена конфигурации слота): тогда повторный `memory_save`
-    падает так же, как первая попытка, и пробная заметка молча не создаётся
-    (живой прогон 10.10.2026). Живость уже проверяет `_http_alive` — ждём только
-    если она ещё не наступила, чтобы не плодить пустые строки в таблице ожиданий.
+            Re-opening a session after a hook could catch the contour restarting (the
+            restart hook, a slot configuration change): then the repeated
+            `memory_save` fails like the first attempt and the probe note silently
+            never appears (the live run of 2026-10-10). `_http_alive` already checks
+            the liveness — we wait only if it has not happened yet, to avoid piling
+            empty rows into the waits table.
     """
     alive, detail = await _http_alive(rest)
     if alive:
@@ -1224,17 +1235,18 @@ async def _await_contour_ready(rest: httpx2.AsyncClient) -> None:
 
 
 async def resume_after_hooks(c: Client, rest: httpx2.AsyncClient, where: str) -> None:
-    """Живая MCP-сессия сценария после хука контура (пересоздание рвёт сокет).
+    """The scenario's live MCP session after a contour hook (the recreation tears the socket).
 
-    Ветви 3/4/8/9 пересоздают контейнер контура, а вместе с ним умирает и сокет
-    раннера: первая же ручка следующего сценария падала бы разрывом транспорта.
-    Сценарии 10–13 из-за этого не выполнялись НИКОГДА (живой прогон 12.10.2026).
-    Дешёвая проверка + одно переоткрытие сессии; живую сессию не трогаем.
+            Branches 3/4/8/9 recreate the contour container, and the runner's socket
+            dies with it: the first handle of the next scenario would fail with a
+            transport break. Scenarios 10–13 never ran because of that (the live run
+            of 2026-10-12). A cheap check + one session re-open; the live session is
+            untouched.
     """
     try:
         await c.call("memory_list", {"limit": 1, "detail": "titles"})
         return
-    except Exception as exc:  # noqa: BLE001 — разрыв решаем по типу, не глотаем
+    except Exception as exc:  # noqa: BLE001 — we decide the break by type, not swallow
         if not is_transport_break(exc):
             raise
         info(f"{where}: the MCP session does not answer after a contour hook "
@@ -1245,28 +1257,29 @@ async def resume_after_hooks(c: Client, rest: httpx2.AsyncClient, where: str) ->
 
 async def _save_probe_once(c: Client, args: dict, *,
                            reconnect: bool = False) -> tuple[int | None, str]:
-    """One `memory_save` of a probe note → `(id, detail)`; не глотает доменную ошибку.
+    """One `memory_save` of a probe note → `(id, detail)`; does not swallow a domain error.
 
-    `reconnect=True` — вызов идёт через `call_with_reconnect` (разрыв транспорта
-    переоткрывает сессию один раз). Разрыв, оставшийся разрывом, возвращается
-    причиной, а не исключением: вызывающий сам решает, повторять ли.
+            `reconnect=True` — the call goes through `call_with_reconnect` (a transport
+            break re-opens the session once). A break that remains a break is returned
+            as the reason, not an exception: the caller decides itself whether to
+            retry.
     """
     try:
         answer = (await call_with_reconnect(c, "memory_save", args) if reconnect
                   else await c.call("memory_save", args))
-    except Exception as exc:  # noqa: BLE001 — разрыв решаем по типу, не глотаем
+    except Exception as exc:  # noqa: BLE001 — we decide the break by type, not swallow
         if not is_transport_break(exc):
             raise
         return None, f"transport broke: {describe(exc)}"
     if not isinstance(answer, dict):
         return None, f"unexpected answer: {answer!r}"
     if answer.get("duplicated") or answer.get("stored") is False:
-        # Продукт заметку НЕ записал: дословный дубль существующей (`stored:
-        # false`/`duplicated: true`) или отказ валидации. В ответе дубля есть
-        # `id` — но это id СУЩЕСТВУЮЩЕЙ заметки, не заметки этой ветви: принять
-        # его за успех значит мерить очередь чужой заметки (живой прогон
-        # 10.10.2026, ветка [judge]: своей пробной заметки в базе нет вообще, а
-        # «2 из 2» ожидания вектора — заметка сценария 1 и близнец).
+        # The product did NOT save the note: a verbatim duplicate of an existing one (`stored:
+        # false`/`duplicated: true`) or a validation refusal. The duplicate's answer carries
+        # an `id` — but that is the EXISTING note's id, not this branch's note's: taking
+        # it for success means measuring a foreign note's queue (the live run
+        # of 2026-10-10, the [judge] branch: this branch's probe note is not in the database at all, and
+        # the "2 of 2" of the vector wait — scenario 1's note and its twin).
         return None, ("the note was NOT created — the product answered "
                       f"{note_detail(answer)}")
     if answer.get("id") is not None:
@@ -1281,15 +1294,16 @@ async def save_probe_note_result(c: Client, title: str, *, text: str | None = No
                                  ) -> tuple[int | None, str]:
     """Create one probe note, CHECK that it exists, retry once → `(id, detail)`.
 
-    Ответ без `id` — это не «заметка создана»: продукт мог отказать (дословный
-    дубль, лимит) или транспорт мог оборваться, оставив ответ пустым. Живой
-    прогон 10.10.2026: сессия раннера умерла на хуке, переоткрытие прошло, но
-    заметка так и не создалась — ветка обрыва ждала пустую очередь 180 с и
-    краснела ложным FAIL. Здесь сохраняем не больше двух раз: первый — сразу
-    (после хука через `call_with_reconnect`), второй — снова через
-    `call_with_reconnect` и, если контур ещё поднимается, после ожидания его
-    живости (`rest`). `detail` — причина неудачи (ответ продукта / разрыв), при
-    успехе — `id=<n>`.
+            An answer without `id` is not "the note created": the product could have
+            refused (a verbatim duplicate, a limit) or the transport could have broken,
+            leaving the answer empty. The live run of 2026-10-10: the runner's session
+            died at the hook, the re-open went through, but the note was never created
+            — the outage branch waited 180 s on an empty queue and went red with a
+            false FAIL. Here we save at most twice: the first — right away (after the
+            hook, via `call_with_reconnect`); the second — again via
+            `call_with_reconnect` and, if the contour is still coming up, after
+            waiting for its liveness (`rest`). `detail` — the failure reason (the
+            product's answer / the break); on success — `id=<n>`.
     """
     args = {
         "text": text or f"{RUN['tag']} probe note text (observability acceptance).",
@@ -1305,14 +1319,14 @@ async def save_probe_note_result(c: Client, title: str, *, text: str | None = No
     return await _save_probe_once(c, args, reconnect=True)
 
 
-# --- пара-«почти-дубль» (сценарии 8 и 9: судья должен получить пару) -----------------
-# Пробы всех сценариев пишутся ОДНИМ текстом-заглушкой, поэтому вторая проба
-# отвергается продуктом как дословный дубль (`stored: false`) — и пара до судьи
-# не доходит. Прогон 12.10.2026: ветвь бюджета ждала «безнадёжную пару» 300 с
-# при пустой очереди judge, а шаг 3 ветви decision — задание, которое должно
-# ждать (№39), тоже смотрел в пустую очередь. Тексты пары обязаны быть
-# близкими по смыслу (кандидат от DEDUP_CANDIDATE_SIMILARITY = 0.80), но НЕ
-# совпадать дословно.
+# --- the near-duplicate pair (scenarios 8 and 9: the judge must receive a pair) -------
+# All scenarios' probes are written with ONE stub text, so the second probe
+# is rejected by the product as a verbatim duplicate (`stored: false`) — and the pair never
+# reaches the judge. The 2026-10-12 run: the budget branch waited 300 s for a "hopeless pair"
+# over an empty judge queue, and the decision branch's step 3 — a task that must
+# wait (#39) — also stared at an empty queue. The pair's texts must be
+# close in meaning (a candidate from DEDUP_CANDIDATE_SIMILARITY = 0.80) but NOT
+# verbatim equal.
 NEAR_DUPLICATE_BODY = (
     "Acceptance probe of the dedup hand-off: the contour keeps a pair of notes "
     "of the same meaning, the candidate search finds the neighbour by cosine, "
@@ -1323,13 +1337,14 @@ NEAR_DUPLICATE_BODY = (
 
 
 def near_duplicate_texts(tag: str, label: str = "dedup hand-off pair") -> tuple[str, str]:
-    """Два текста пары: близкие по смыслу, но не дословные дубли.
+    """The pair's two texts: close in meaning, but not verbatim duplicates.
 
-    `label` обязан быть СВОИМ у каждой пары прогона: дословно одинаковые тексты
-    продукт отвергает (`stored: false`), и вторая пара просто не создаётся —
-    ветвь читается ложной краснотой. Прогон 12.10.2026: шаг 3 сценария 9 получил
-    те же тексты, что и ветвь бюджета, вторые заметки не появились, и проверка
-    «задание ждёт» крутила guard в пустую очередь.
+            `label` must be one's OWN per each pair of the run: word-for-word equal
+            texts are rejected by the product (`stored: false`), and the second pair
+            simply never appears — the branch reads false red. The 2026-10-12 run:
+            scenario 9's step 3 received the same texts as the budget branch, the
+            second notes never appeared, and the "the task waits" check spun its guard
+            on an empty queue.
     """
     return (
         f"{tag} {label}, first note. {NEAR_DUPLICATE_BODY}"
@@ -1342,20 +1357,22 @@ def near_duplicate_texts(tag: str, label: str = "dedup hand-off pair") -> tuple[
 async def save_near_duplicate_pair(c: Client, title_first: str,
                                    title_second: str,
                                    ) -> tuple[list[int | None], bool]:
-    """Сохранить пару-«почти-дубль» → `([id первого, id второго], vector_ready)`.
+    """Save a near-duplicate pair → `([the first id, the second id], vector_ready)`.
 
-    Пара нужна ветвям, которым нужен вердикт судьи: без кандидата (cosine ≥
-    0.80) судья не спрашивается, очередь judge пуста и проверки читаются
-    ложной краснотой.
+            The pair is needed by the branches that need the judge's verdict: without
+            a candidate (cosine ≥ 0.80) the judge is not asked, the judge queue stays
+            empty and the checks read false red.
 
-    Кандидат ищется по ВЕКТОРУ первой заметки: пока её вектор не готов
-    (`vector_status='ok'`), соседа не находит никто, и второй заметке не с чем
-    образовать пару (проверено живьём 12.10.2026 — судья не получал пары вовсе).
-    Поэтому после первой заметки ждём её вектор и только потом сохраняем вторую.
-    `vector_ready` (готовность вектора первой заметки) отдаём наружу: вызывающий
-    отличает «пары нет» от «пара есть, но вектор не дождались» и оставляет
-    честный `skip`/`manual` вместо ложного FAIL. Нового доступа к БД не заводим:
-    используется тот же `probe_vectors_ready` (`db_count` по `vector_status='ok'`).
+            The candidate is searched over the FIRST note's vector: until its vector
+            is ready (`vector_status='ok'`), nobody finds a neighbor, and the second
+            note has nothing to form a pair with (verified live on 2026-10-12 — the
+            judge received no pairs at all). So after the first note we wait for its
+            vector and only then save the second. `vector_ready` (the first note's
+            vector readiness) is returned outward: the caller distinguishes "no pair"
+            from "a pair exists but its vector was not waited for" and leaves an
+            honest `skip`/`manual` instead of a false FAIL. No new DB access is
+            introduced: the same `probe_vectors_ready` (`db_count` over
+            `vector_status='ok'`) is used.
     """
     first, second = near_duplicate_texts(RUN["tag"], label=title_first)
     ids: list[int | None] = []
@@ -1381,9 +1398,9 @@ async def save_probe_note(c: Client, title: str, *, after_hook: bool = False,
                           rest: httpx2.AsyncClient | None = None) -> int | None:
     """Create one probe note (marked by the run tag in its title); return its id.
 
-    Обёртка над `save_probe_note_result`: там — проверка «заметка создана» и
-    единственный повтор через переоткрытие сессии; тем, кому причина не нужна,
-    здесь возвращается только `id` (или None).
+            A wrapper over `save_probe_note_result`: there — the "the note was
+            created" check and the single retry via a session re-open; for those who
+            do not need the reason, only `id` (or None) is returned here.
     """
     note_id, _detail = await save_probe_note_result(c, title, after_hook=after_hook,
                                                     rest=rest)
@@ -1520,26 +1537,26 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
     if proc.returncode != 0:
         return
     teardown_note(f"[{slot}] the slot was stopped and started back by the scenario hook")
-    # Окно журнальных проверок ветви (для ветви `judge` — ниже).
+    # The branch's journal-check window (for the `judge` branch — below).
     judge_started = utc_now_iso()
 
-    # №39 + LSBN-F-12 (живой прогон 13.10.2026): очередь `judge` наполняет пара
-    # «судья дедупа», и решение по ней может принять decision-слот — тогда
-    # генеративный судья не вызывается вовсе, работа завершается за секунды и
-    # очередь честно пустеет: проверки «работа видна» и «возраст старейшего
-    # растёт» читаются ложной краснотой (прогон №13, 12.10.2026 — единственный
-    # оставшийся красный). Ветвь мерит ГЕНЕРАТИВНЫЙ путь, поэтому вместе с судьёй
-    # глушится и канал decision: продукт уходит на генеративный путь по контракту
-    # переключения (`decision_fallback reason=unavailable`) и упирается в
-    # выключенного судью — работа ЖДЁТ (замер 13.10.2026: oldest 3 → 77 с,
-    # `queue_waiting` записан, после возврата каналов очередь дренируется). Контур
-    # при этом не пересоздаётся: тот же хук, тот же способ, только вторая цель.
+    # #39 + LSBN-F-12 (the live run of 2026-10-13): the `judge` queue is filled by the
+    # "dedup judge" pair, and the decision slot may make the decision on it — then
+    # the generative judge is not called at all; the work finishes in seconds and
+    # the queue honestly empties: the "the work is visible" and "the oldest's age
+    # grows" checks read false red (run #13, 2026-10-13 — the only
+    # one left red). The branch measures the GENERATIVE path, so together with the judge
+    # the decision channel is muted too: the product takes the generative path per the switch
+    # contract (`decision_fallback reason=unavailable`) and runs into
+    # the muted judge — the work WAITS (the 2026-10-13 measurement: oldest 3 → 77 s,
+    # `queue_waiting` written; after the channels return the queue drains). The contour
+    # is not recreated meanwhile: the same hook, the same way, only a second target.
     decision_cut = False
     if slot == "judge":
-        # «Включён ли decision-слот» читаем у агрегата `/health.decision.enabled`:
-        # у `/health.slots.decision` поля `enabled` НЕТ (модель `SlotStat` его не
-        # несёт — прогон 13.10.2026: условие молча не сработало, канал decision
-        # остался живым, пару снова решил он, ветвь краснела).
+        # "Is the decision slot enabled" is read from the `/health.decision.enabled` aggregate:
+        # `/health.slots.decision` has NO `enabled` field (the `SlotStat` model does not
+        # carry it — the 2026-10-13 run: the condition silently did not fire, the decision channel
+        # stayed alive, it decided the pair again, and the branch went red).
         decision_stat = (await health_snapshot(rest)).get("decision") or {}
         if decision_stat.get("enabled"):
             cut = await run_shell(slot_cmd(CFG["slot_off_cmd"], SLOT_DECISION))
@@ -1548,9 +1565,9 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
                 teardown_note(f"[{slot}] the decision channel was stopped and "
                               f"started back by the scenario hook")
             else:
-                # Хук не знает цель `decision` (чужой контур со старым
-                # scripts/slot_gate.sh): ветвь честно пропускается — иначе она
-                # мерит не тот канал и краснеет ложно. Слот поднимаем обратно.
+                # The hook does not know the `decision` target (a foreign contour with an old
+                # scripts/slot_gate.sh): the branch is honestly skipped — otherwise it
+                # measures the wrong channel and goes red falsely. We raise the slot back.
                 back = await run_shell(slot_cmd(CFG["slot_on_cmd"], slot))
                 teardown_note(f"[{slot}] the slot was started back (the branch "
                               "was left before its probe notes)")
@@ -1571,17 +1588,17 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
     try:
         # Push work into the slot's queue so the wait is observable (a probe note
         # lands in vector+summary; the judge queue grows from the dedup hand-off).
-        # Ветви разные: `judge` просит пару-«почти-дубль» (судья спрашивается
-        # только про пару близких заметок), остальные — одну заметку.
+        # The branches differ: `judge` asks for a near-duplicate pair (the judge is asked
+        # only about a pair of close notes); the others — one note.
         if slot == "judge":
-            # Судье нужна ПАРА-«почти-дубль»: одной заметки мало — без близкого
-            # кандидата (cosine ≥ DEDUP_CANDIDATE_SIMILARITY = 0.80) судья не
-            # спрашивается, очередь `judge` остаётся пустой, и проверки «работа
-            # видна, ничего не теряется» читаются ложной краснотой (живой прогон
-            # 12.10.2026: очередь 0/0/0 и «the age of the oldest item grows»).
-            # Хелпер пишет пару своими текстами, различающимися хвостом (не
-            # дословный дубль — продукт их не отбивает), и сам ждёт вектор ПЕРВОЙ
-            # заметки: кандидат ищется по вектору, без него пары не находит никто.
+            # The judge needs a near-duplicate PAIR: one note is not enough — without a close
+            # candidate (cosine ≥ DEDUP_CANDIDATE_SIMILARITY = 0.80) the judge is not
+            # asked, the `judge` queue stays empty, and the "the work is
+            # visible, nothing is lost" checks read false red (the live run
+            # of 2026-10-12: the queue 0/0/0 and "the age of the oldest item grows").
+            # The helper writes the pair with its own texts differing by the tail (not a
+            # verbatim duplicate — the product does not reject them) and waits for the FIRST
+            # note's vector itself: the candidate is searched over the vector; nobody finds a pair without it.
             title_one = RUN[f"note_outage_{slot}"]
             pair_ids, vector_ready = await save_near_duplicate_pair(
                 c, title_one, f"{title_one} pair")
@@ -1593,11 +1610,11 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
                 warn("[judge] the near-duplicate pair of the branch is not usable",
                      f"{probe_detail} — the judge may get no pair")
         else:
-            # Текст — СВОЙ у каждой ветви и попытки: с общим текстом сценария 1
-            # (`<tag> probe note text (observability acceptance).`) продукт
-            # отвечает «дословный дубль» и заметки не пишет, а ветвь получала бы
-            # id ЧУЖОЙ заметки и мерила бы её очередь (живой прогон 10.10.2026,
-            # ветка [judge]).
+            # The text is one's OWN per branch and attempt: with scenario 1's shared text
+            # (`<tag> probe note text (observability acceptance).`) the product
+            # answers "a verbatim duplicate" and saves no note, and the branch would get
+            # a FOREIGN note's id and measure its queue (the live run of 2026-10-10,
+            # the [judge] branch).
             probe_text = (f"{RUN['tag']} {slot} outage probe text "
                           "(observability acceptance).")
             probe, probe_detail = await save_probe_note_result(
@@ -1605,13 +1622,13 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
                 rest=rest)
             probe_ids = [probe] if probe is not None else []
         if probe is None:
-            # Пробная заметка не создалась (ответ без `id`: отказ, разрыв,
-            # дословный дубль). Очередь этого слота гарантированно пуста — её
-            # 180-секундное ожидание дало бы ложный FAIL вместо честного SKIP
-            # (живой прогон 10.10.2026: сессия раннера умерла на хуке, а
-            # пробная заметка не сохранилась даже после переоткрытия). Ветку
-            # оставляем честно: SKIP с причиной, слот поднимаем обратно, ничего
-            # не теряем — как и в случае «слот эмбеддингов в паузе» выше.
+            # The probe note was not created (an answer without `id`: a refusal, a break,
+            # a verbatim duplicate). This slot's queue is guaranteed empty — waiting
+            # 180 seconds on it would give a false FAIL instead of an honest SKIP
+            # (the live run of 2026-10-10: the runner's session died at the hook, and
+            # the probe note did not save even after the re-open). We leave
+            # the branch honestly: a SKIP with the reason; we raise the slot back and lose
+            # nothing — as in the "the embedding slot is paused" case above.
             skip(f"[{slot}] with the slot down the work stays visible (nothing is lost)",
                  f"пробная заметка не создана: {probe_detail}")
             manual(f"scenario 2, branch [{slot}] (№39 FR-1/FR-2/FR-5.1)",
@@ -1658,14 +1675,14 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
                 return
 
         if slot == "judge":
-            # Очередь `judge` держит ПАРУ-«почти-дубль», и её задание живёт не вечно:
-            # неразрешимая пара закрывается и ставится заново (в журнале
-            # «retry queued»), поэтому мгновенный снимок очереди — не
-            # доказательство (живой прогон №17: работа уехала в новый job между
-            # опросами, и обе проверки очереди прочлись ложной краснотой, хотя
-            # отсрочка была честной). Мерим сам факт отсрочки — журналом: отказ
-            # слота с ИСХОДОМ (а не вердикт) значит, что пару отложили, а не
-            # выполнили чужим каналом.
+            # The `judge` queue holds a near-duplicate PAIR, and its task does not live forever:
+            # an unsolvable pair is closed and placed anew ("retry queued" in the
+            # journal), so an instantaneous queue snapshot is not
+            # proof (live run #17: the work moved into a new job between
+            # polls, and both queue checks survived on false red although
+            # the deferral was honest). We measure the fact of the deferral itself — by the journal: a slot
+            # failure with an OUTCOME (not a verdict) means the pair was deferred, not
+            # done by a foreign channel.
             if not CFG["logs_cmd"]:
                 skip(f"[{slot}] the outage defers the judge work (an outcome, "
                      f"not a verdict)",
@@ -1687,11 +1704,11 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
             check(f"[{slot}] with the slot down the work stays visible (nothing is lost)",
                   ok, detail)
             if not ok:
-                # Диагностика (живой прогон 10.10.2026): очередь честно пуста, если
-                # обрыв НЕ перерезал канал слота — контур ходит к другому провайдеру,
-                # и работа ветви завершается за секунды. Типичная причина — остатки
-                # ветви отказа от прерванного прогона: `scripts/slot_fake.sh` оставил
-                # слот на заглушке, а глушится прокси, к которому контур не ходит.
+                # Diagnostics (the live run of 2026-10-10): the queue is honestly empty when
+                # the break did NOT cut the slot's channel — the contour walks to another provider,
+                # and the branch's work finishes in seconds. A typical cause — the leftovers
+                # of an interrupted run's failure branch: `scripts/slot_fake.sh` left
+                # the slot on the stub, while the muted proxy is not the one the contour walks to.
                 snapshot = await health_snapshot(rest)
                 stat = slot_stat(snapshot, slot) or {}
                 warn(f"[{slot}] the outage did not cut the channel of the slot: the "
@@ -1751,12 +1768,12 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
                     warn(f"[{slot}] the decision channel could NOT be started back — "
                          f"start it by hand", f"rc={restored.returncode}")
 
-    # Гард дренажа — ДЛИННЕЕ общего (`wait_sec`): после обрыва работа пары уходит в
-    # back-off (10 → 20 → … с) и возвращается к делу не мгновенно, а живая модель
-    # считает выжимку секундами. Живой прогон 13.10.2026: очередь ДОшла, но на
-    # ~1–2 минуты позже 120-секундного гарда (и `summary`, и `vector`) — ложная
-    # краснота. Быстрый профиль не страдает: там очередь пустеет за секунды и
-    # ожидание возвращается сразу (то же решение, что в смоуке F-11 с его окном 600 с).
+    # The drain guard — LONGER than the shared one (`wait_sec`): after the break the pair's work goes into
+    # back-off (10 → 20 → … s) and does not return to business instantly, while a live model
+    # computes the summary in seconds. The live run of 2026-10-13: the queue DID drain, but
+    # ~1–2 minutes later than the 120-second guard (both `summary` and `vector`) — false
+    # red. The fast profile does not suffer: there the queue empties in seconds and
+    # the wait returns at once (the same decision as the F-11 smoke with its 600 s window).
     ok, detail = await wait_until(
         queue_drained(rest, queue),
         f"[{slot}] the queue {queue} is drained after the slot is back",
@@ -1841,23 +1858,23 @@ async def scenario_3_auth_branch(c: Client, rest: httpx2.AsyncClient) -> None:
           f"rc={proc.returncode}")
     if proc.returncode != 0:
         return
-    # Окно журнальных проверок ветви: раньше этого момента событий ветви быть
-    # не может (хук пересоздаёт контейнер — старые строки пропадают, а с чужим
-    # исходом `slot_paused` из соседней ветви больше не считается своим).
+    # The branch's journal-check window: before this moment the branch's events cannot
+    # exist (the hook recreates the container — old lines vanish, and a foreign
+    # `slot_paused` outcome from a neighboring branch no longer counts as one's own).
     branch_started = utc_now_iso()
     teardown_note(f"[{slot}] the fake provider was switched to 401 and fixed back")
     fixed = False
     try:
-        # Своя работа в очереди — ПОКА РАЗРЫВ ОТКРЫТ: фаза проверяется по факту
-        # «работа ЖДЁТ паузу», а пустая очередь не проверяет ничего. Заметку
-        # создаём ПОСЛЕ перевода фейка на 401: её выжимка не успевает закрыться
-        # здоровым штатным слотом до открытия разрыва (живой прогон 12.10.2026 —
-        # заметка, созданная до хука, была выжата штатным слотом, и очередь
-        # `summary` честно показывала 0/0/0). Текст ветви — СВОЙ: с общим текстом
-        # сценария 0 (`<tag> probe note text (observability acceptance).`) продукт
-        # отвечает «дословный дубль» и заметки не пишет, а ветвь мерила бы чужую
-        # (или пустую) очередь. Первый же реальный вызов заметки открывает разрыв
-        # (слот отвечает 401) — ровно та фаза, которую проверяет ветвь.
+        # One's own work in the queue — WHILE THE BREAK IS OPEN: the phase is checked by the fact
+        # "the work WAITS out the pause"; an empty queue checks nothing. We create
+        # the note AFTER switching the fake to 401: its summary must not manage to close
+        # via the healthy regular slot before the breaker opens (the live run of 2026-10-12 —
+        # a note created before the hook was summarized by the regular slot, and the
+        # `summary` queue honestly showed 0/0/0). The branch's text is its OWN: with the shared
+        # scenario-0 text (`<tag> probe note text (observability acceptance).`) the product
+        # answers "a verbatim duplicate" and saves no note, and the branch would measure a foreign
+        # (or empty) queue. The note's first real call opens the breaker
+        # (the slot answers 401) — exactly the phase the branch checks.
         auth_text = (f"{RUN['tag']} {slot} auth-branch probe text — the summary is "
                      f"deferred by the open break (observability acceptance).")
         probe, probe_detail = await save_probe_note_result(
@@ -1884,10 +1901,10 @@ async def scenario_3_auth_branch(c: Client, rest: httpx2.AsyncClient) -> None:
         check(f"[auth] /health.slots.{slot}.paused_until is filled by the break",
               stat.get("paused_until") is not None, f"{stat}")
 
-        # Фаза открытого разрыва (arch §6.9, no39-04): петля партию не берёт, и вся
-        # текущая работа уезжает из `pending` в `waiting` — это и есть факт «работа
-        # ждёт паузу»; `attention` здесь нулевой, человека зовут только после
-        # SLOT_MAX_ATTEMPTS нетранзиентных отказов ПАРЫ, а 401 — исход транзиентный.
+        # The open-breaker phase (arch §6.9, no39-04): the loop takes no batch, and all
+        # current work moves from `pending` to `waiting` — that is exactly the fact "the work
+        # waits out the pause"; `attention` is zero here; a human is called only after
+        # SLOT_MAX_ATTEMPTS non-transient failures of the PAIR; and 401 is a transient outcome.
         ok, detail = await wait_until(
             queue_waiting(rest, queue),
             f"[auth] the work deferred by the break is visible in `waiting` ({queue}), "
@@ -1911,13 +1928,13 @@ async def scenario_3_auth_branch(c: Client, rest: httpx2.AsyncClient) -> None:
                 warn("[auth] the fake provider could NOT be fixed by hand",
                      f"rc={undo.returncode}")
 
-    # Починка (LSB_SLOT_AUTH_FIX_CMD = `scripts/slot_fake.sh on ok ...`) ПЕРЕСОЗДАЁТ
-    # контейнер: разрыв живёт в памяти процесса (`app/services/slot_breaker.py`),
-    # при пересоздании он теряется, а маркер `slot_resumed` пишется только при
-    # снятии паузы В ТОМ ЖЕ процессе (`app/services/worker.py`) — после
-    # пересоздания его не будет никогда (ложный FAIL живого прогона 12.10.2026).
-    # Проверяем наблюдаемый факт «доступ вернулся»: слот снова отвечает (`ok`, разрыв
-    # снят) и отложенная работа уходит из очереди.
+    # The fix (LSB_SLOT_AUTH_FIX_CMD = `scripts/slot_fake.sh on ok ...`) RECREATES
+    # the container: the breaker lives in process memory (`app/services/slot_breaker.py`),
+    # it is lost at recreation, and the `slot_resumed` marker is written only when
+    # the pause is lifted in the SAME process (`app/services/worker.py`) — after
+    # a recreation it will never appear (the false FAIL of the live run of 2026-10-12).
+    # We check the observable fact "access is back": the slot answers again (`ok`, the breaker
+    # lifted) and the deferred work leaves the queue.
     ok, detail = await wait_until(
         slot_ok(rest, slot),
         f"[auth] after the fix the {slot} slot answers again (ok, the break is gone)")
@@ -1954,11 +1971,11 @@ async def scenario_4_attention_pair(c: Client, rest: httpx2.AsyncClient) -> None
                "fake — the outage of scenarios 2/5 would then stop being visible")
         return
 
-    # Своя работа ДЛЯ СУДЬИ: без пары-«почти-дубль» очередь judge пуста, и ветвь
-    # читалась ложной краснотой (12.10.2026 — «работа для судьи не создаётся»).
-    # Пару сохраняем ДО переключения фейка: вердикт судьи ставит фоновая рука дедупа,
-    # она приходит после вектора и выжимки обеих заметок — то есть уже при открытом
-    # разрыве (хелпер дожидается вектора первой заметки, иначе кандидата не найти).
+    # One's own work FOR THE JUDGE: without a near-duplicate pair the judge queue is empty, and the branch
+    # read false red (2026-10-12 — "no work for the judge is created").
+    # We save the pair BEFORE switching the fake: the judge's verdict is set by the background dedup hand,
+    # which arrives after the vector and summary of both notes — that is, already with the breaker
+    # open (the helper waits out the first note's vector; otherwise no candidate is found).
     pair_ids, vector_ready = await save_near_duplicate_pair(
         c, RUN["note_attention_pair"], RUN["note_attention_pair_2"])
     probes = len([item for item in pair_ids if item is not None])
@@ -1981,9 +1998,9 @@ async def scenario_4_attention_pair(c: Client, rest: httpx2.AsyncClient) -> None
     teardown_note("the fake judge was switched to off-contract and fixed back")
     fixed = False
     try:
-        # Фаза открытого разрыва (no39-04): пара отложена причиной и видна в
-        # `waiting`; `attention` — подмножество `waiting` («требует человека») и
-        # появляется только после SLOT_MAX_ATTEMPTS нетранзиентных отказов ПАРЫ.
+        # The open-breaker phase (no39-04): the pair is deferred by a reason and visible in
+        # `waiting`; `attention` — a `waiting` subset ("needs a human") and
+        # appears only after SLOT_MAX_ATTEMPTS non-transient failures of the PAIR.
         ok, detail = await wait_until(
             queue_waiting(rest, "judge"),
             "[attention] the off-contract pair is deferred by the reason "
@@ -1993,8 +2010,8 @@ async def scenario_4_attention_pair(c: Client, rest: httpx2.AsyncClient) -> None
               "`waiting` instead of burning calls", ok, detail)
         stat = queue_stat(await health_snapshot(rest), "judge") or {}
         if stat.get("attention") or 0:
-            # Порог уже пройден (в ветви заглушки SLOT_MAX_ATTEMPTS опущен) —
-            # отдельная проверка достижимости порога no39-04.
+            # The threshold is already passed (the stub branch lowers SLOT_MAX_ATTEMPTS) —
+            # a separate no39-04 threshold-reachability check.
             await check_attention_threshold(rest, "[attention]")
         else:
             check("[attention] in the phase of the open break `attention == 0`: the "
@@ -2065,12 +2082,12 @@ async def scenario_5_restart_inside_outage(c: Client, rest: httpx2.AsyncClient) 
         return
     teardown_note("the contour was restarted by the scenario hook")
 
-    # Рестарт рвёт MCP-сессию раннера: сначала дожидаемся, что контур отвечает,
-    # и только потом переоткрываем сессию — иначе весь прогон уходит в повторы
-    # попыток и заканчивается FATAL (проверено 10.10.2026).
-    # Предикаты ниже — `async def` и ЖДУТ свои хелперы: лямбда отдала бы
-    # `wait_until` уже созданную корутину (никем не ожидаемую) — ложный FAIL,
-    # см. `log_events`.
+    # The restart tears the runner's MCP session: first we wait for the contour to answer,
+    # and only then re-open the session — otherwise the whole run goes into attempt retries
+    # and ends FATAL (verified 2026-10-10).
+    # The predicates below are `async def` and AWAIT their helpers: a lambda would hand
+    # `wait_until` an already-created coroutine (awaited by nobody) — a false FAIL;
+    # see `log_events`.
     async def contour_alive() -> tuple[bool, str]:
         return await _http_alive(rest)
 
@@ -2109,7 +2126,7 @@ async def _pending_not_below(value: int) -> tuple[bool, str]:
 
 
 async def _http_alive(rest: httpx2.AsyncClient) -> tuple[bool, str]:
-    """Контур отвечает по HTTP (после рестарта — с повторами, сокет мог умереть)."""
+    """The contour answers over HTTP (after a restart — with retries; the socket could die)."""
     last = "no answer"
     for _ in range(3):
         try:
@@ -2118,7 +2135,7 @@ async def _http_alive(rest: httpx2.AsyncClient) -> tuple[bool, str]:
             if body and body.get("status") == "ok":
                 return True, f"status=ok, version={body.get('version')!r}"
             last = f"http {response.status_code}"
-        except Exception as exc:  # noqa: BLE001 — контур мог ещё подниматься
+        except Exception as exc:  # noqa: BLE001 — the contour could still be coming up
             last = describe(exc)
         await asyncio.sleep(2.0)
     return False, last
@@ -2138,11 +2155,11 @@ async def scenario_6_regression() -> None:
                "e2e_lsb0004.py, e2e_lsb0005.py, e2e_lsb0006.py")
         return
 
-    # Юниты — в ЧИСТОМ окружении и со своей временной базой. Раннер живёт с env
-    # контура: живой прогон 13.10.2026 — с чужим `MCP_AUTH_TOKEN` в окружении
-    # 110 тестов из 2136 падают (тестовый клиент шлёт свой токен, а приложение
-    # берёт внешний — `POST /notes` → 401); с `env -u` и изолированной базой
-    # результат совпадает с хостовым: 2136 passed, 13 skipped, 0 failed.
+    # The units — in a CLEAN environment with their own temporary database. The runner lives with the contour's
+    # env: the live run of 2026-10-13 — with a foreign `MCP_AUTH_TOKEN` in the environment
+    # 110 tests of 2136 fail (the test client sends its own token, while the application
+    # takes the external one — `POST /notes` → 401); with `env -u` and an isolated database
+    # the result matches the host one: 2136 passed, 13 skipped, 0 failed.
     proc = await run_shell(
         f"cd {CFG['repo_dir']} && env -u MCP_AUTH_TOKEN "
         f"DB_PATH=\"$(mktemp -d)/unit-notes.db\" "
@@ -2159,12 +2176,12 @@ async def scenario_6_regression() -> None:
         legacy.append(f"{name}: rc={proc.returncode}"
                       + (f" — {tail}" if proc.returncode else ""))
     if legacy:
-        # Старые E2E пиннят поверхность СВОЕГО релиза (число инструментов, состав
-        # /health, тексты промптов) и с 3.2.0 расходятся ПО ДЕЛУ: живой прогон
-        # 13.10.2026 — release31 требует «21 инструмент» и «7 полей /health»,
-        # lsb0006 ищет маркер судьи в старом промпте. Это не регрессия 3.2.0:
-        # поведение держат юнит-регрессия (2136 тестов) и сценарии релиза, поэтому
-        # результат каждого скрипта — ВИДИМОЕ наблюдение, а не красный.
+        # The old E2E pin THEIR release's surface (the tool count, the /health
+        # shape, the prompt texts) and diverge from 3.2.0 FOR A REASON: the live run
+        # of 2026-10-13 — release31 demands "21 tools" and "7 /health fields",
+        # lsb0006 looks for the judge marker in the old prompt. This is not a 3.2.0 regression:
+        # the behavior is held by the unit regression (2136 tests) and the release's scenarios, so
+        # each script's result — a VISIBLE observation, not a red.
         warn("the existing E2E scripts of previous releases",
              "; ".join(legacy))
         manual("existing E2E of previous releases",
@@ -2175,17 +2192,20 @@ async def scenario_6_regression() -> None:
 
 
 def legacy_e2e_cmd(name: str) -> str:
-    """Команда прогона старого E2E-скрипта в регрессии (сценарий 6).
+    """The regression's (scenario 6) command for an old E2E script's run.
 
-    Два вида: у `e2e_release31/30` есть ключи адреса и базы — зовём их из раннера
-    с адресом контура; `e2e_release22` и `e2e_lsb0004/0005/0006` жёстко ходят на
-    `http://localhost:8080` и рассчитаны на запуск ИЗНУТРИ контура — их запускаем в
-    его СЕТЕВОМ пространстве (`--network container:<имя>`), иначе `localhost` ведёт
-    в пустоту раннера (живой прогон 13.10.2026: четыре из шести падали на адресе).
+            Two kinds: `e2e_release31/30` have address and database keys — the runner
+            calls them with the contour's address; `e2e_release22` and
+            `e2e_lsb0004/0005/0006` go hard-coded to `http://localhost:8080` and are
+            meant to run FROM INSIDE the contour — we run them in its NETWORK
+            namespace (`--network container:<name>`), otherwise `localhost` leads to
+            the runner's void (the live run of 2026-10-13: four of six failed on the
+            address).
 
-    Монтируем ХОСТОВЫЙ путь дерева (`--host-root`/LSB_HOST_ROOT): `-v /w:/w` без
-    этого резолвится демоном на хосте, где такого каталога нет, — вложенный
-    контейнер получал пустую папку и падал с кодом 2.
+            We mount the HOST path of the tree (`--host-root`/LSB_HOST_ROOT): without
+            it `-v /w:/w` is resolved by the daemon on the host, where no such
+            directory exists — the nested container got an empty folder and failed
+            with code 2.
     """
     tree = CFG["host_root"] or CFG["repo_dir"]
     if name in LEGACY_ARG_SCRIPTS:
@@ -2202,9 +2222,9 @@ def legacy_e2e_cmd(name: str) -> str:
 async def future_block_todo() -> None:
     """Placeholders of the follow-up blocks of 3.2.0 (this script is a base).
 
-    A follow-up postановка REPLACES the matching placeholder with its own
-    `scenario_<n>_<name>()` and registers it in `run_all()`. Nothing here FAILs:
-    an unclaimed placeholder stays MANUAL so the base run is not red.
+            A follow-up brief REPLACES the matching placeholder with its own
+            `scenario_<n>_<name>()` and registers it in `run_all()`. Nothing here FAILs:
+            an unclaimed placeholder stays MANUAL so the base run is not red.
     """
     scenario(7, "TODO: scenarios of the future 3.2.0 blocks (placeholders)")
     # TODO(3.2.0 future blocks) — slots / output budget / decision:
@@ -2212,12 +2232,12 @@ async def future_block_todo() -> None:
            "the budget/finish_reason part of this placeholder is claimed by "
            "`scenario_8_budget_raise_release()` (lsbdef0008-02); the decision "
            "slot is claimed by `scenario_9_decision_fallback()` (f12-03)")
-    # Заглушки-провайдеры ветвей отказа: `scripts/fake_slot.py` (режимы ok / auth /
-    # empty-length / offcontract / decision-*) и хук `scripts/slot_fake.sh`
-    # (`on <mode> [slot ...]` пересоздаёт контур с env ветви, `off` возвращает
-    # штатный compose). Все четыре сценария остаются пропускаемыми, пока хук не
-    # задан: команды ниже подключает `scripts/acceptance_run.sh` (LSB_FAKE_HOOKS=0
-    # их отключает).
+    # The failure branches' stub providers: `scripts/fake_slot.py` (the ok / auth /
+    # empty-length / offcontract / decision-* modes) and the `scripts/slot_fake.sh` hook
+    # (`on <mode> [slot ...]` recreates the contour with the branch's env; `off` returns
+    # the regular compose). All four scenarios stay skippable until the hook is
+    # set: `scripts/acceptance_run.sh` wires the commands below (LSB_FAKE_HOOKS=0
+    # disables them).
     manual("outage branches: the contour hooks of scenarios 3/4/8/9",
            "LSB_SLOT_AUTH_CMD='scripts/slot_fake.sh auth' + LSB_AUTH_SLOT=summary, "
            "LSB_SLOT_AUTH_FIX_CMD='scripts/slot_fake.sh on ok'; "
@@ -2336,8 +2356,8 @@ async def scenario_8_budget_raise_release(c: Client, rest: httpx2.AsyncClient) -
     try:
         # Push work into both queues: the notes need a summary, their dedup
         # hand-off needs a judge verdict (a hand-off pair is what freezes here).
-        # Пара обязана быть «почти-дублем»: дословно одинаковые тексты продукт
-        # отвергает (stored=false), и судья не получает ни одной пары.
+        # The pair must be a "near-duplicate": word-for-word equal texts are rejected by the product
+        # (stored=false), and the judge receives no pair at all.
         probe_ids, vector_ready = await save_near_duplicate_pair(
             c, RUN["note_budget_break"], RUN["note_budget_break_2"]
         )
@@ -2353,10 +2373,10 @@ async def scenario_8_budget_raise_release(c: Client, rest: httpx2.AsyncClient) -
                                       timeout=min(CFG["wait_sec"], 240.0))
         check("[budget] while the budget is tight the summary queue grows", ok, detail)
 
-        # Фаза тесного бюджета (no39-04): пара ПЕРЕСТАЁТ ЖЕЧЬ ВЫЗОВЫ — работа
-        # отложена причиной (`waiting`/`attention`, при этом `pending == 0`).
-        # Жёсткое ожидание `judge_attention` здесь краснело: `attention` — не
-        # предпосылка ветви, а отдельная проверка достижимости порога.
+        # The tight-budget phase (no39-04): the pair STOPS BURNING CALLS — the work
+        # is deferred by a reason (`waiting`/`attention`, with `pending == 0`).
+        # A hard `judge_attention` wait went red here: `attention` is not
+        # the branch's premise but a separate threshold-reachability check.
         ok, detail = await wait_until(
             queue_deferred(rest, "judge"),
             "[budget] the pair stops burning calls: the judge work is deferred "
@@ -2600,8 +2620,8 @@ async def scenario_9_decision_fallback(c: Client, rest: httpx2.AsyncClient) -> N
         if not await restart("decision_off_cmd",
                              "the slot unreachable + DECISION_FALLBACK=false"):
             return
-        # Задание ждёт только тогда, когда судья реально спрошен: нужна пара-«почти-дубль»
-        # (иначе очередь judge пуста и ожидание читается ложной краснотой).
+        # The task waits only when the judge is really asked: a near-duplicate pair is needed
+        # (otherwise the judge queue is empty and the wait reads false red).
         await save_near_duplicate_pair(
             c, RUN["note_decision_unavailable"],
             f"{RUN['note_decision_unavailable']} pair"
@@ -2700,23 +2720,26 @@ def _decision_acceptance_lines(numbers: dict) -> list[str]:
 
 
 # ==== scenarios: 10. №28 node hint on save without namespace ====================
-# Узел-кандидат подсказки — постоянный путь (повторные прогоны не плодят узлы),
-# описание — с редкими словами темы, чтобы совпадение слов было очевидным.
+# The hint's candidate node — a permanent path (repeated runs do not multiply nodes);
+# the description — with rare topic words so the word match is obvious.
 NODE_HINT_PATH = "e2e-node-hint"
 NODE_HINT_DESCRIPTION = "Отчёты по релизам, реестр зарплат СУБО и доступы"
 
 
 async def scenario_10_node_hint(c: Client, rest: httpx2.AsyncClient) -> None:
-    """№28 (FR-1.1…FR-1.6): запись через MCP БЕЗ `namespace` лежит в `default`,
-    а ответ несёт `namespace_hint` с существующим узлом карты; запись с явным
-    узлом подсказки не несёт; окно вызова `save` не содержит работы слотов.
+    """№28 (FR-1.1…FR-1.6): an MCP write WITHOUT `namespace` lands in `default`,
+            and the answer carries `namespace_hint` with an existing map node; a write
+            with an explicit node carries no hint; the `save` call window has no slot
+            work.
 
-    №30 (FR-3): пересказ уже записанной заметки приходит с `similar` (id
-    ранней) и всё равно сохраняется (её id новый); заметка без похожих поля
-    не несёт; окно `save` остаётся локальным (без работы слотов)."""
+            №30 (FR-3): a retelling of an already saved note arrives with `similar`
+            (the earlier one's id) and is saved anyway (its id is new); a note without
+            similar ones carries no field; the `save` window stays local (no slot
+            work).
+    """
     scenario(10, "№28: node hint on save without namespace — the note stays in "
                  "`default`, the answer points at a node, no model call on write")
-    # Хуки ветвей 3/4/8/9 пересоздали контур: сессия раннера мертва, переоткрываем.
+    # Branches 3/4/8/9's hooks recreated the contour: the runner's session is dead; we re-open it.
     await resume_after_hooks(c, rest, "scenario 10")
 
     created = await c.call("memory_namespace_create", {
@@ -2797,10 +2820,10 @@ async def scenario_10_node_hint(c: Client, rest: httpx2.AsyncClient) -> None:
     check("the `similar` hint is a local FTS read — the save window stays fast "
           "(no slot work, №30/FR-1.6)",
           similar_latency < 3.0, f"memory_save took {similar_latency * 1000:.0f} ms")
-    # «Одинокая» проба — БЕЗ тега прогона (и в тексте, и в титуле): при пороге
-    # memory_similar_threshold = 0.30 заметка с тегом похожа на все ~20 проб
-    # прогона и проверка краснеет (прогон №7: id=493). Строка случайная —
-    # совпадать ей не с чем.
+    # The "lonely" probe — WITHOUT the run tag (in both the text and the title): at the
+    # memory_similar_threshold = 0.30 a tagged note is similar to all ~20 of the run's probes
+    # and the check goes red (run #7: id=493). The line is random —
+    # it has nothing to coincide with.
     lonely = await c.call("memory_save", {
         "text": f"qzvx {os.urandom(8).hex()} {os.urandom(4).hex()} nymq",
         "title": f"qzvx {os.urandom(4).hex()}",
@@ -2811,8 +2834,8 @@ async def scenario_10_node_hint(c: Client, rest: httpx2.AsyncClient) -> None:
           lonely.get("stored") is True and "similar" not in lonely,
           note_detail(lonely))
     if lonely.get("id") is not None:
-        # Уборка по id: тега прогона в титуле нет, а префиксная уборка
-        # (`cleanup_own_data` ищет подстроку в титуле) её не найдёт.
+        # The cleanup by id: the run tag is not in the title, and the prefix cleanup
+        # (`cleanup_own_data` searches a substring in the title) will not find it.
         await c.call("memory_delete", {"id": lonely["id"]})
     snapshot = await health_snapshot(rest)
     check("the contour stays healthy after the writes (the hint is a map read, "
@@ -2827,10 +2850,11 @@ FRESHNESS_OLD = "2000-01-01T00:00:00Z"
 
 
 async def scenario_11_freshness(c: Client, rest: httpx2.AsyncClient) -> None:
-    """№29 (FR-2.1…FR-2.7): `updated_after` — рабочий срез памяти: поиск и
-    листинг отдают только записи за окно (граница включающая), старая
-    релевантная не проходит, невалидное значение даёт hint; та же ручка на
-    REST-поверхности оператора работает так же."""
+    """№29 (FR-2.1…FR-2.7): `updated_after` — a working memory slice: search and
+            listing serve only records inside the window (an inclusive bound); an old
+            relevant one does not pass; an invalid value gives a hint; the same handle
+            on the operator's REST surface works the same.
+    """
     scenario(11, "№29: freshness filter `updated_after` — search/list, MCP + REST")
     await resume_after_hooks(c, rest, "scenario 11")
 
@@ -2850,8 +2874,8 @@ async def scenario_11_freshness(c: Client, rest: httpx2.AsyncClient) -> None:
              f"the probe notes were not created: {note_detail(fresh)} / {note_detail(old)}")
         return
 
-    # Детерминированное окно: старую заметку отодвигаем за границу, свежую
-    # ставим ровно НА границу (проверяется включающая семантика `>=`).
+    # A deterministic window: the old note is pushed beyond the bound; the fresh one
+    # is placed exactly AT the bound (the inclusive `>=` semantics is checked).
     err = db_write("UPDATE notes SET updated_at = ? WHERE id = ?",
                    (FRESHNESS_OLD, old["id"]))
     if err:
@@ -2860,11 +2884,11 @@ async def scenario_11_freshness(c: Client, rest: httpx2.AsyncClient) -> None:
     db_write("UPDATE notes SET updated_at = ? WHERE id = ?",
              (FRESHNESS_BOUNDARY, fresh["id"]))
 
-    # Граница включающая: заметка, обновлённая РОВНО в границу, остаётся в срезе,
-    # а строго старше — выпадает. Проверяем СЧЁТОМ, а не вхождением в страницу:
-    # лимит MCP-листинга (list_max_limit_mcp = 20) меньше числа заметок в памяти,
-    # а проба намеренно самая старая — в первую страницу она не попадает, и
-    # вхождение проверяло бы лимит, а не фильтр (прогон 12.10.2026).
+    # The bound is inclusive: a note updated EXACTLY at the bound stays in the slice,
+    # while strictly older — drops out. We check by the COUNT, not by presence in a page:
+    # the MCP listing limit (list_max_limit_mcp = 20) is smaller than the notes in memory,
+    # and the probe is deliberately the oldest — it does not enter the first page, so
+    # presence would check the limit, not the filter (the 2026-10-12 run).
     listed = await c.call("memory_list", {
         "limit": 20, "updated_after": FRESHNESS_BOUNDARY})
     unfiltered = await c.call("memory_list", {"limit": 20})
@@ -2873,8 +2897,8 @@ async def scenario_11_freshness(c: Client, rest: httpx2.AsyncClient) -> None:
           unfiltered.get("total") == listed.get("total", -1) + 1,
           f"filtered={listed.get('total')}, all={unfiltered.get('total')}, "
           f"fresh={fresh['id']}, old={old['id']}")
-    # Сдвиг границы на секунду вперёд обязан выкинуть и свежую заметку: значит она
-    # стояла РОВНО на границе (сравнение `>=`), а не «где-то после неё».
+    # Shifting the bound a second forward must also throw out the fresh note: meaning it
+    # stood EXACTLY at the bound (the `>=` comparison), not "somewhere after it".
     later = await c.call("memory_list", {
         "limit": 20, "updated_after": FRESHNESS_AFTER_BOUNDARY})
     check("one second after the boundary the fresh note falls out too (the "
@@ -2912,12 +2936,12 @@ async def scenario_11_freshness(c: Client, rest: httpx2.AsyncClient) -> None:
 
 # ==== scenarios: 12. the note `comment` field (№24) ============================
 async def scenario_12_comment(c: Client, rest: httpx2.AsyncClient) -> None:
-    """№24 (FR-5.1…FR-5.8): у заметки есть необязательное поле `comment` —
-    ОТДЕЛЬНЫЙ путь правки: ставится и сбрасывается через `memory_update`,
-    читается в `memory_get` и REST `GET /notes/{id}`, НЕ попадает в листинг и
-    смысловой поиск; превышение лимита (250) — мягкий отказ без частичной
-    записи; правка даёт ровно одну контурную версию с `changed == ['comment']`;
-    текст, объём и дедуп заметки при этом не меняются.
+    """№24 (FR-5.1…FR-5.8): a note has the optional `comment` field — a SEPARATE
+            edit path: set and cleared via `memory_update`, read in `memory_get` and
+            REST `GET /notes/{id}`, never in the listing and the semantic search;
+            over the limit (250) — a soft failure without a partial write; the edit
+            gives exactly one contour version with `changed == ['comment']`; the
+            note's text, volume and dedup do not change meanwhile.
     """
     scenario(12, "№24: the note `comment` field — edit path, reading, versions")
     await resume_after_hooks(c, rest, "scenario 12")
@@ -2967,17 +2991,17 @@ async def scenario_12_comment(c: Client, rest: httpx2.AsyncClient) -> None:
           all("comment" not in hit for hit in found.get("results", [])),
           f"hits={len(found.get('results', []))}")
 
-    # №24 (no24-02): отдельный поиск ПОМЕТОК — finds the note by its comment,
+    # #24 (no24-02): the separate COMMENT search — finds the note by its comment;
     # while the regular semantic search never does (§13.6).
     comment_hits = await c.call("memory_comment_search", {"query": "пригодится"})
     check("memory_comment_search finds the note by its comment (no24-02)",
           any(r.get("id") == note_id
               for r in comment_hits.get("results", [])),
           f"hits={comment_hits.get('results')}")
-    # Изоляция проверяется по FTS/подстрочному пути (`mode=title`): векторная
-    # сторона гибридного поиска возвращает ближайшие заметки независимо от
-    # наличия слова, поэтому на маленьком корпусе она отдаёт пробную заметку и
-    # без утечки комментария. Смысловая сторона — отдельное наблюдение.
+    # The isolation is checked over the FTS/substring path (`mode=title`): the hybrid's
+    # vector side returns the nearest notes regardless of
+    # the word's presence, so on a small corpus it serves the probe note even
+    # without the comment's leak. The semantic side — a separate observation.
     title_search = await c.call("memory_search",
                                 {"query": "пригодится", "mode": "title"})
     check("memory_search (title/substring) does NOT find the note by a "
@@ -3033,56 +3057,58 @@ async def scenario_12_comment(c: Client, rest: httpx2.AsyncClient) -> None:
           all(r.get("id") != note_id for r in dropped.get("results", [])))
 
     duplicate = await c.call("memory_save", {"text": text, "title": title})
-    # MCP-поверхность отдаёт дословный дубль как `stored: false` + hint
-    # (`_compact_save`), служебное `duplicated` из сервиса агенту не видно.
+    # The MCP surface serves a verbatim duplicate as `stored: false` + a hint
+    # (`_compact_save`); the service's service-level `duplicated` is not visible to the agent.
     check("dedup of the note is unaffected by its comment (FR-5.4)",
           duplicate.get("stored") is False and bool(duplicate.get("hint")),
           f"answer={duplicate}")
 
 
 # ==== scenarios: 13. injected-text budget + agent smoke (LSBN-F-11) =============
-# LSBN-F-11 (f11-03): константы бюджета живут в КОДЕ
-# (`app/services/injection_budget.py`, arch §13.17, канон §6 — не env, FR-4.4),
-# а сторож — обычный тест `tests/test_injection_budget.py`, падающий при
-# превышении. Этот сценарий прогоняет ТОТ ЖЕ замер
-# (`scripts/measure_injected_text.py --phase after`, f11-01), сверяет его с
-# бюджетом, с отчётом «до» и с инструкциями, которые контур реально отдаёт,
-# затем смоуком подтверждает, что сокращение текстов не сломало ведение
-# заметок, области и фоновые джобы (FR-6.1/FR-6.2).
+# LSBN-F-11 (f11-03): the budget constants live in CODE
+# (`app/services/injection_budget.py`, arch §13.17, canon §6 — not env, FR-4.4),
+# and the watchdog — a regular test `tests/test_injection_budget.py` failing on
+# an overrun. This scenario runs the SAME measurement
+# (`scripts/measure_injected_text.py --phase after`, f11-01), compares it with
+# the budget, the "before" report and the instructions the contour really serves,
+# then confirms by a smoke that the text reduction did not break the notes
+# handling, the areas or the background jobs (FR-6.1/FR-6.2).
 #
-# Замер пишется во ВРЕМЕННЫЙ каталог: `release/3.2.0/acceptance/
-# injected-text-after.{md,json}` — артефакт f11-01/f11-03 с рукописной дельтой,
-# повторный прогон сценария его не затирает (идемпотентность прогона).
-INJECTED_TEXT_TOOL_COUNT = 31  # бюджетная поверхность блоков 1–5 (arch §7.1)
+# The measurement is written into a TEMP directory: `release/3.2.0/acceptance/
+# injected-text-after.{md,json}` — the f11-01/f11-03 artifact with a hand-written delta;
+# a repeated scenario run does not overwrite it (the run's idempotency).
+INJECTED_TEXT_TOOL_COUNT = 31  # the blocks 1–5 budget surface (arch §7.1)
 INJECTED_TEXT_BEFORE = "injected-text-before.json"
 SMOKE_MARKER = "zblorptsmoke"
 
 
 def acceptance_dir() -> Path:
-    """Каталог приёмочных артефактов релиза (`release/` не версионируется)."""
+    """The release's acceptance artifacts directory (`release/` is not versioned)."""
     return Path(CFG["repo_dir"]) / "release" / RELEASE / "acceptance"
 
 
 def budget_module() -> Any:
-    """Модуль бюджетов вшитого текста из кода приложения; None — недоступен.
+    """The embedded-text budgets module from the application's code; None — unavailable.
 
-    Числа берём ИМЕННО оттуда (единый источник и для сторожа, и для приёмки),
-    а не дублируем в скрипте: иначе бюджет сторожа и бюджет приёмки разошлись бы.
+            The numbers are taken exactly from there (the single source for both the
+            watchdog and the acceptance), not duplicated in the script: otherwise the
+            watchdog's budget and the acceptance's budget would diverge.
     """
     try:
         from app.services import injection_budget
-    except Exception as exc:  # noqa: BLE001 — сценарий обязан жить и вне репозитория
+    except Exception as exc:  # noqa: BLE001 — the scenario must live outside the repository too
         warn("the injected-text budget module is unreadable", describe(exc))
         return None
     return injection_budget
 
 
 def injected_text_measurement() -> dict[str, Any]:
-    """Локальный прогон `measure_injected_text.py --phase after` (временный out).
+    """A local run of `measure_injected_text.py --phase after` (a temp out).
 
-    Контур для самого замера не нужен: он поднимает временную пустую БД, а слоты
-    закрыты на loopback:1 (в сеть не ходит). Возвращает разобранный JSON замера,
-    дополненный отчётом «до» (None, если канонического файла нет).
+            The contour is not needed for the measurement itself: it raises a
+            temporary empty DB, and the slots are closed on loopback:1 (no network).
+            Returns the parsed measurement JSON, extended with the "before" report
+            (None when the canonical file is missing).
     """
     script = Path(CFG["repo_dir"]) / "scripts" / "measure_injected_text.py"
     with tempfile.TemporaryDirectory(prefix="e2e-injected-text-") as out_dir:
@@ -3106,7 +3132,7 @@ def injected_text_measurement() -> dict[str, Any]:
 
 
 def _injected_acceptance_lines(numbers: dict[str, Any]) -> list[str]:
-    """Блок `f11-03` отчёта приёмки: бюджет вшитого текста, числа до/после."""
+    """The `f11-03` block of the acceptance report: the embedded text's budget, the before/after numbers."""
 
     def delta(before_value: Any, after_value: Any) -> str:
         if not isinstance(before_value, int) or not isinstance(after_value, int):
@@ -3182,13 +3208,14 @@ def _injected_acceptance_lines(numbers: dict[str, Any]) -> list[str]:
 
 async def scenario_13_injected_text(c: Client, rest: httpx2.AsyncClient,
                                     instructions: str) -> None:
-    """LSBN-F-11 (f11-03): замер вшитого текста под бюджетом + смоук агента.
+    """LSBN-F-11 (f11-03): the embedded-text measurement under the budget + an agent smoke.
 
-    Сверка: числа «после» ≤ бюджет кода; число инструментов = бюджетному;
-    «после» ≤ «до» по статике подключения и описаниям; инструкции контура — в
-    бюджете. Смоук: запись/поиск/чтение заметки, ответы всех четырёх областей
-    без ошибок, дренаж очереди `summary` по заметкам этого прогона, здоровье
-    контура. Замер локальный — контур нужен только смоуку.
+            The comparison: the "after" numbers ≤ the code's budget; the tool count =
+            the budget's; "after" ≤ "before" over the connect statics and the
+            descriptions; the contour's instructions — within the budget. The smoke:
+            writing/searching/reading a note, all four areas answering without errors,
+            this run's notes' `summary` queue drain, the contour's health. The
+            measurement is local — the contour is needed only by the smoke.
     """
     scenario(13, "LSBN-F-11: the injected-text budget (A/B/C) under the guard and "
                  "the agent smoke (notes, areas, queues)")
@@ -3200,7 +3227,7 @@ async def scenario_13_injected_text(c: Client, rest: httpx2.AsyncClient,
     if module is not None:
         try:
             data = injected_text_measurement()
-        except Exception as exc:  # noqa: BLE001 — прогон замера не удался
+        except Exception as exc:  # noqa: BLE001 — the measurement run failed
             skip("the injected-text measurement run",
                  f"measure_injected_text.py did not complete: {describe(exc)}")
 
@@ -3263,7 +3290,7 @@ async def scenario_13_injected_text(c: Client, rest: httpx2.AsyncClient,
             skip("the live-instructions budget",
                  "the contour handed out no instructions text")
 
-    # --- смоук агента: заметки и области живы (FR-6.1/FR-6.2) -------------------
+    # --- the agent smoke: notes and areas alive (FR-6.1/FR-6.2) ----------------
     smoke_text = (f"{RUN['tag']} smoke: the shortened instructions still let the "
                   f"agent keep notes ({SMOKE_MARKER}).")
     saved = await c.call("memory_save", {"text": smoke_text,
@@ -3290,7 +3317,7 @@ async def scenario_13_injected_text(c: Client, rest: httpx2.AsyncClient,
               any(item.get("id") == note_id for item in titles.get("items", [])),
               f"items={len(titles.get('items', []))}")
 
-    # Области отвечают без ошибок: навыки, термины, факты, логи (FR-6.1).
+    # The areas answer without errors: skills, terms, facts, logs (FR-6.1).
     areas = (
         ("skills", "skills_list", {}, "items"),
         ("terms", "terms_search", {"query": SMOKE_MARKER}, "senses"),
@@ -3300,7 +3327,7 @@ async def scenario_13_injected_text(c: Client, rest: httpx2.AsyncClient,
     for label, tool, args, key in areas:
         try:
             answer = await c.call(tool, args)
-        except Exception as exc:  # noqa: BLE001 — ошибка ручки — это FAIL
+        except Exception as exc:  # noqa: BLE001 — a handle error is a FAIL
             check(f"the {label} area answers {tool} without an error", False,
                   describe(exc))
             continue
@@ -3310,23 +3337,23 @@ async def scenario_13_injected_text(c: Client, rest: httpx2.AsyncClient,
             continue
         payload = answer.get(key)
         why = refusal(answer)
-        # `hint` у областей — не только отказы: «нет точного термина», «ничего
-        # не найдено», «подсказка узла» — информационные подсказки при
-        # нормальной выдаче. Проверка ровно одна: ручка вернула данные (список)
-        # и не бросила исключение; текст подсказки идёт в детали.
+        # The areas' `hint` — not only failures: "no exact term", "nothing
+        # found", "a node hint" — informational hints at a
+        # normal output. Exactly one check: the handle returned data (a list)
+        # and threw no exception; the hint text goes into the details.
         check(f"the {label} area answers {tool} without an error",
               isinstance(payload, list),
               f"{key}=" + (f"{len(payload)}" if isinstance(payload, list)
                            else repr(payload))
               + (f", hint={why!r}" if why else ""))
 
-    # Фоновые джобы: заметки прогона обрабатываются, очередь дренируется (FR-6.2).
+    # The background jobs: the run's notes are processed; the queue drains (FR-6.2).
     if note_id is not None:
-        # Смоук отвечает на вопрос «фон жив после сокращения текстов», а не
-        # «успел ли он выжать ВСЕ ~20 проб приёмки»: ждём выжимку СОБСТВЕННЫХ
-        # заметок смоука (она тут одна). На всех пробах прогона окно истекает
-        # раньше, чем очередь доходит до конца (прогон №7: «14 of 20», хотя в
-        # базе у всех заметок summary_status='ok' и все задания summary — done).
+        # The smoke answers "is the background alive after the text reduction", not
+        # "did it manage to summarize ALL ~20 acceptance probes": we wait for the summary of the smoke's
+        # OWN notes (there is one here). Over all the run's probes the window expires
+        # before the queue reaches the end (run #7: "14 of 20", although in
+        # the database all notes have summary_status='ok' and all summary jobs are done).
         smoke_notes = [note_id]
         marks = ",".join("?" * len(smoke_notes))
 
@@ -3351,31 +3378,31 @@ async def scenario_13_injected_text(c: Client, rest: httpx2.AsyncClient,
     check("the contour stays healthy after the smoke (status ok)",
           snapshot.get("status") == "ok", f"status={snapshot.get('status')!r}")
 
-    # Отчёт релиза: блок f11-03 (идемпотентно по маркерам).
+    # The release's report: the f11-03 block (idempotently, by markers).
     try:
         path = write_acceptance_block("f11-03", _injected_acceptance_lines(numbers))
         info(f"the acceptance block f11-03 is written: {path}")
-    except Exception as exc:  # noqa: BLE001 — отчёт операторский, не контур
+    except Exception as exc:  # noqa: BLE001 — the report is the operator's, not the contour's
         warn("the acceptance block f11-03 was not written", describe(exc))
 
 
 # ==== scenarios: 14. assistant logs (LSBN-F-10) =================================
-# Маркер лежит ТОЛЬКО в причине записи лога: по нему ищем запись в области
-# (`logs_search`) и им же проверяем изоляцию — поиск заметок его не видит.
+# The marker lies ONLY in the log record's reason: we search the area's record by it
+# (`logs_search`) and check the isolation with it too — the notes search does not see it.
 LOGS_ONLY_MARKER = "zblorptlogsonly"
 LOGS_SECRET_PREFIX = "sk-"
 
 
 def _log_marker() -> str:
-    """Маркер попытки, пригодный и для FTS-разбора (одно слово, без дефисов)."""
+    """An attempt marker, also fit for FTS parsing (one word, no hyphens)."""
     return f"{LOGS_ONLY_MARKER}{re.sub(r'[^0-9A-Za-z]', '', RUN['tag'])}"
 
 
 def _fake_log_secret() -> str:
-    """Токеноподобная строка для проверки утечки (фальшивая, своя у попытки).
+    """A token-like string for the leak check (fake, one per attempt).
 
-    Значение НИГДЕ не печатается: проверяется только его ОТСУТСТВИЕ в журнале
-    контура, поэтому в отчёте о нём — ни символа.
+            The value is NEVER printed anywhere: only its ABSENCE in the contour's
+            journal is checked, so the report carries not a character of it.
     """
     tail = re.sub(r"[^0-9A-Za-z]", "", RUN["tag"]).ljust(32, "0")[:32]
     return f"{LOGS_SECRET_PREFIX}{tail}"
@@ -3383,25 +3410,28 @@ def _fake_log_secret() -> str:
 
 async def scenario_14_logs(c: Client, rest: httpx2.AsyncClient,
                            instructions: str) -> None:
-    """LSBN-F-10 (f10-02/03/04): область «Логи ассистента» через MCP + REST.
+    """LSBN-F-10 (f10-02/03/04): the "Assistant logs" area via MCP + REST.
 
-    Что проверяем (наблюдаемо, без моделей на пути записи):
-    * запись причины создаётся (`logs_save` → id, version=1) и читается по id
-      (`logs_get`), тело возвращается как записано;
-    * запись видит листинг со срезом по объекту (`logs_list(entity, entity_id)`)
-      и смысловой поиск (`logs_search`; при недоступном эмбеддере — FTS-only);
-    * правка (`logs_update`) меняет поле и не задевает связку с объектом;
-    * удаление мягкое и идемпотентное (`logs_delete`);
-    * связанный объект (заметка), её версия и состояние (`entity_state`) видны
-      в записи (f10-04/§11);
-    * область не подмешивается в поиск заметок (изоляция, FR-1.2);
-    * токеноподобная строка из тела никогда не попадает в журнал контура
-      (NFR-4/канон §6: в логи — длины и id, а не содержимое);
-    * `/health.areas.logs` показывает область включённой, раздел области есть
-      в инструкциях (№40/f10-04).
+            What we check (observably, no models on the write path):
+            * writing a reason creates the entry (`logs_save` → id, version=1) and it
+              is read by id (`logs_get`); the body comes back as written;
+            * the entry is seen by the listing with an object slice
+              (`logs_list(entity, entity_id)`) and the semantic search (`logs_search`;
+              with the embedder unavailable — FTS-only);
+            * the edit (`logs_update`) changes the field and does not touch the object
+              link;
+            * the deletion is soft and idempotent (`logs_delete`);
+            * the linked object (a note), its version and state (`entity_state`) are
+              visible in the entry (f10-04/§11);
+            * the area does not mix into the notes search (isolation, FR-1.2);
+            * a token-like string from the body never reaches the contour journal
+              (NFR-4/canon §6: lengths and ids into the logs, not content);
+            * `/health.areas.logs` shows the area enabled, the area's section is in
+              the instructions (#40/f10-04).
 
-    Идемпотентность: свою запись лога сценарий удаляет сам (в т.ч. при обрыве —
-    `finally`); пробная заметка убирается общим teardown'ом по префиксу.
+            Idempotency: the scenario deletes its own log entry itself (including on
+            a break — `finally`); the probe note is removed by the shared teardown
+            over the prefix.
     """
     scenario(14, "LSBN-F-10: assistant logs — write/read/list/search/update/"
                  "delete, the entity link, isolation from memory, no secrets in "
@@ -3423,8 +3453,8 @@ async def scenario_14_logs(c: Client, rest: httpx2.AsyncClient,
           "logs_save" in instructions and "logs_search" in instructions,
           f"{len(instructions)} chars of instructions")
 
-    # Объект ссылки — своя пробная заметка (текст СВОЙ: общий текст пробы других
-    # сценариев продукт отверг бы как дословный дубль и объект ссылки не завёлся).
+    # The reference object — one's own probe note (the text is its OWN: the other scenarios'
+    # shared probe text would be rejected by the product as a verbatim duplicate, and no reference object would appear).
     note_id, note_detail = await save_probe_note_result(
         c, f"{RUN['tag']} logs entity probe",
         text=f"{RUN['tag']} assistant-logs entity probe text (acceptance run).",
@@ -3501,9 +3531,9 @@ async def scenario_14_logs(c: Client, rest: httpx2.AsyncClient,
               r_one.status_code == 200 and r_one.json().get("action") == action,
               f"http {r_one.status_code}")
 
-        # Изоляция (FR-1.2/§13.2): слово, лежащее ТОЛЬКО в причине лога, не
-        # находится поиском памяти. Поиск — подстрочный (`mode=title`): векторная
-        # сторона гибридного поиска отдаёт соседей независимо от слов.
+        # Isolation (FR-1.2/§13.2): a word living ONLY in the log's reason is not
+        # found by the memory search. The search — substring-based (`mode=title`): the hybrid's
+        # vector side serves neighbors regardless of words.
         mem = await c.call("memory_search", {"query": marker, "mode": "title"})
         check("memory_search does NOT return the log text (the areas are isolated, "
               "FR-1.2/§13.2)",
@@ -3522,8 +3552,8 @@ async def scenario_14_logs(c: Client, rest: httpx2.AsyncClient,
               and after.get("entity_id") == note_id,
               f"reason_chars={len(after.get('reason') or '')}")
 
-        # Секреты — не в журнал (NFR-4/§6: маскировка 4 симв. + `***`):
-        # токеноподобная строка в теле записи в журнале контура не появляется.
+        # Secrets — never into the journal (NFR-4/§6: masking to 4 chars + `***`):
+        # a token-like string in the record's body never appears in the contour's journal.
         text = await log_text()
         if text:
             seen = bool(log_lines(text, "tool_call", "logs_save"))
@@ -3562,38 +3592,41 @@ async def scenario_14_logs(c: Client, rest: httpx2.AsyncClient,
                 await c.call("logs_delete", {"id": log_id})
                 teardown_note(f"scenario 14 removed its log entry {log_id} in the "
                               "teardown (the scenario did not reach its own delete)")
-            except Exception as exc:  # noqa: BLE001 — уборка не маскирует причину
+            except Exception as exc:  # noqa: BLE001 — the cleanup does not mask the reason
                 warn("the probe log entry was not removed by the teardown",
                      f"id={log_id} ({describe(exc)})")
 
 
 # ==== scenarios: 15. backups (№14) =============================================
 def backup_file_path(name: str) -> Path:
-    """Путь снапшота в BACKUP_DIR (раннер монтирует /data, как и контейнер).
+    """A snapshot path in BACKUP_DIR (the runner mounts /data like the container).
 
-    Каталог — `--backup-dir` / `LSB_BACKUP_DIR`; по умолчанию он выводится из
-    пути БД (`<каталог БД>/backups`, как в compose).
+            The directory — `--backup-dir` / `LSB_BACKUP_DIR`; by default it is
+            derived from the DB path (`<the DB's directory>/backups`, as in compose).
     """
     return Path(CFG["backup_dir"]) / name
 
 
 async def scenario_15_backups(rest: httpx2.AsyncClient) -> None:
-    """№14 (no14-01, arch §6.1/§7.2): список снапшотов, проверка восстановления
-    свежайшего и наблюдаемость бэкапов в `/health`.
+    """№14 (no14-01, arch §6.1/§7.2): the snapshot list, verifying the restore of
+            the newest one, and the backups observability in `/health`.
 
-    Что проверяем (только чтение и проверка — ни одна ручка не пишет в снапшот):
-    * `GET /backups` отдаёт список снапшотов с операторскими полями (file,
-      size_bytes, verified, bad, shipped) и согласованным `total`;
-    * `POST /backups/verify` по свежайшему снапшоту открывает его как рабочую
-      базу: `ok=true`, `checks.integrity == "ok"`, все обязательные таблицы и
-      vec0 доступны;
-    * проверка read-only — размер и mtime файла снапшота до и после совпадают;
-    * после проверки `GET /backups` помечает снапшот `verified=ok`, `bad=false`,
-      а `/health.backups` несёт `last_verify` (эта же копия, исход ok) и
-      `last_ship`.
+            What we check (reads and verification only — no handle writes into a
+            snapshot):
+            * `GET /backups` serves the snapshot list with the operator fields (file,
+              size_bytes, verified, bad, shipped) and a consistent `total`;
+            * `POST /backups/verify` over the newest snapshot opens it as a working
+              base: `ok=true`, `checks.integrity == "ok"`, all mandatory tables and
+              vec0 reachable;
+            * the read-only verification — the snapshot file's size and mtime before
+              and after match;
+            * after the verification `GET /backups` marks the snapshot `verified=ok`,
+              `bad=false`, and `/health.backups` carries `last_verify` (the same
+              copy, the ok outcome) and `last_ship`.
 
-    Нет снапшота/каталога — честный SKIP с причиной (петля бэкапов ещё не сделала
-    копию или каталог не смонтирован в раннер), а не FAIL.
+            No snapshot/directory — an honest SKIP with a reason (the backups loop
+            has not made a copy yet, or the directory is not mounted into the
+            runner), not a FAIL.
     """
     scenario(15, "№14: backups — the snapshot list, the restore verify of the "
                  "newest snapshot (read-only) and /health.backups observability")
@@ -3663,8 +3696,8 @@ async def scenario_15_backups(rest: httpx2.AsyncClient) -> None:
           f"vec_unavailable={checks.get('vec_unavailable')!r}")
     info(f"the restore verify took {result.get('latency_ms')} ms")
 
-    # Read-only (FR-2.2): проверка открывает копию `mode=ro` и файл снапшота не
-    # меняет — размер и mtime до/после совпадают; копия остаётся на месте.
+    # Read-only (FR-2.2): the verification opens the copy `mode=ro` and does not change
+    # the snapshot file — the size and mtime before/after match; the copy stays in place.
     relisted = await rest.get("/backups")
     after_items = ((relisted.json().get("items") or [])
                    if relisted.status_code == 200 else [])
@@ -3717,9 +3750,9 @@ async def scenario_15_backups(rest: httpx2.AsyncClient) -> None:
 async def run_all() -> None:
     global RUN_FINISHED
     async with AsyncExitStack() as stack:
-        # Сессию MCP открываем в СВОЁМ стеке (`own_stack`): закрывать её будем
-        # явно, в этой же задаче и до выхода из `AsyncExitStack`, а стек прогона
-        # остаётся REST-клиенту (у него cancel scope нет).
+        # We open the MCP session in its OWN stack (`own_stack`): we will close it
+        # explicitly, in this same task and before leaving the `AsyncExitStack`; the run's stack
+        # stays with the REST client (it has no cancel scope).
         c, init = await fresh_session(AsyncExitStack(), own_stack=True)
         instructions = init.instructions or ""
         rest = await rest_client(stack)
@@ -3741,8 +3774,8 @@ async def run_all() -> None:
             await scenario_4_attention_pair(c, rest)
             await scenario_5_restart_inside_outage(c, rest)
             await scenario_6_regression()
-            # Сценарии 8–13: каждый в обёртке — падение одного не отменяет
-            # остальные, а блок f11-03 (сценарий 13) пишется независимо.
+            # Scenarios 8–13: each in a wrapper — one's failure does not cancel
+            # the others; the f11-03 block (scenario 13) is written independently.
             await run_scenario(8, "Reasoning eats the budget → truncation → attention "
                                 "→ the budget is raised → the queues drain by themselves",
                                lambda: scenario_8_budget_raise_release(c, rest))
@@ -3773,8 +3806,8 @@ async def run_all() -> None:
                                lambda: scenario_15_backups(rest))
             await future_block_todo()
             close_scenario()
-            # Все сценарии выполнены: попытка состоялась (отчёт есть, «Total:»
-            # печатается). Разрыв на закрытии ниже её уже не отменяет.
+            # All scenarios completed: the attempt happened (the report exists; "Total:"
+            # is printed). A closing break below no longer cancels it.
             RUN_FINISHED = True
         finally:
             # Teardown always runs — also after a failed scenario (FR-3.2).
@@ -3783,14 +3816,14 @@ async def run_all() -> None:
             except Exception as exc:  # noqa: BLE001 — the trace must survive anyway
                 teardown_note(f"teardown raised {describe(exc)} — check the probe "
                               f"data with prefix {CFG['prefix']} by hand")
-            # Сессия MCP закрывается ЗДЕСЬ — в своей задаче, до выхода из
-            # `AsyncExitStack`, и с записью в trace: иначе падение на выходе
-            # обрывало прогон и «Total:» не печатался (12.10.2026).
+            # The MCP session is closed HERE — in its own task, before leaving the
+            # `AsyncExitStack`, and with a trace record: otherwise the failure at exit
+            # cut the run short and "Total:" never printed (2026-10-12).
             try:
                 await c.close()
             except (KeyboardInterrupt, SystemExit):
                 raise
-            except BaseException as exc:  # noqa: BLE001 — закрытие не предмет проверок
+            except BaseException as exc:  # noqa: BLE001 — closing is not the checks' subject
                 info(f"closing the MCP session: {describe(exc)}")
                 teardown_note(f"the MCP session was not closed cleanly ({describe(exc)})")
             ENV["db_size"] = db_size_text()
@@ -3846,11 +3879,12 @@ def print_report() -> int:
 def configure_probe_data(run_id: str, attempt: int) -> str:
     """Tag of ONE attempt — the probe data of every attempt must be unique.
 
-    Иначе повтор упирается в дословный дубль собственной заметки (`memory_save`
-    → `stored: false`), очередь `summary` остаётся пустой и проверка «работа
-    видна при выключенном слоте» падает по таймауту (живой прогон 10.10.2026).
-    Уборка по префиксу (--prefix e2e32) ищет подстроку — значит, находит и
-    старые попытки, и текущую. Возвращает фактический тег попытки.
+            Otherwise a retry runs into the verbatim duplicate of its own note
+            (`memory_save` → `stored: false`), the `summary` queue stays empty and the
+            "the work is visible while the slot is down" check fails by timeout (the
+            live run of 2026-10-10). The cleanup by the prefix (--prefix e2e32)
+            searches a substring — so it finds both old attempts and the current one.
+            Returns the attempt's actual tag.
     """
     tag = f"{CFG['prefix']}-{run_id}-a{attempt}"
     RUN.update({
@@ -4053,30 +4087,30 @@ async def main() -> int:
         reset_counters()
         tag = configure_probe_data(run_id, attempts)
         print(f"\n=== attempt {attempts}: probe tag {tag} ===")
-        # Попытку запускаем ОТДЕЛЬНОЙ задачей: области anyio внутри MCP SDK
-        # живут в ней, и отменённая чужая область (живой прогон 12.10.2026:
-        # процесс умирал `CancelledError` на повторе, «Total:» не печатался)
-        # не отравляет задачу раннера — падает попытка, а не отчёт.
+        # We run the attempt as a SEPARATE task: the anyio areas inside the MCP SDK
+        # live in it, and a cancelled foreign area (the live run of 2026-10-12:
+        # the process died with `CancelledError` on a retry; "Total:" never printed)
+        # does not poison the runner's task — the attempt fails, not the report.
         attempt = asyncio.create_task(run_all())
         try:
             await attempt
             break
         except asyncio.CancelledError as exc:
-            # Отмена пришла СНАРУЖИ (чужая область anyio в закрытии сессии):
-            # повторять в этом прогоне бессмысленно, но отчёт уже собран.
+            # The cancellation came from OUTSIDE (a foreign anyio area in the session closing):
+            # retrying within this run is pointless, but the report is already assembled.
             print(f"\n[retry] the attempt was cancelled by a foreign scope "
                   f"(attempt {attempts}): {describe(exc)}")
             break
-        except BaseException as exc:  # noqa: BLE001 — разрыв решаем по типу
+        except BaseException as exc:  # noqa: BLE001 — we decide the break by type
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
-            # Разрыв транспорта (в т.ч. `ExceptionGroup` anyio и RuntimeError
-            # про чужой `cancel scope`) — не ошибка продукта.
+            # A transport break (including anyio's `ExceptionGroup` and the RuntimeError
+            # about a foreign `cancel scope`) — not a product error.
             reason = "transport break" if is_transport_break(exc) else "run error"
             print(f"\n[retry] {reason} (attempt {attempts}): {describe(exc)}")
             if RUN_FINISHED and reason == "transport break":
-                # Сценарии выполнены (сценарии 10–13, блок f11-03), а упало только
-                # закрытие сессии: повтор не запускаем — отчёт уже полный.
+                # The scenarios completed (scenarios 10–13, the f11-03 block); only the session
+                # closing failed: we do not start a retry — the report is already complete.
                 print("[retry] the run itself is complete: the close-time break does "
                       "not zero it, the report stands")
                 break
