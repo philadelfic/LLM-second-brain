@@ -1,10 +1,10 @@
-"""Сущность истории `assistant_log` (LSBN-F-10, f10-01): проекция и baseline.
+"""The `assistant_log` history entity (LSBN-F-10, f10-01): the projection and the baseline.
 
-Слой истории (№41) принимает область логов как версионируемую сущность:
-`CONTENT_FIELDS` перечисляет ровно контентные поля арх-дока §5.4 (без
-`vector_status` и времён), а baseline-бэкфилл само-лечаще добирает `version=1,
-event='baseline', source='migration'` там, где версий ещё нет (повторный старт —
-no-op).
+    The history layer (#41) accepts the logs area as a versioned entity:
+    `CONTENT_FIELDS` lists exactly the content fields of arch §5.4 (without
+    `vector_status` and the timestamps), and the baseline backfill self-healing
+    adds `version=1, event='baseline', source='migration'` where no versions
+    exist yet (a repeated start — a no-op).
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ def _logs_versions(settings: Settings, entity_id: int) -> list:
 
 
 def test_assistant_log_projection(settings: Settings) -> None:
-    """Проекция несёт ровно контентные поля §5.4, без служебных полей и времён."""
+    """The projection carries exactly the §5.4 content fields, no service fields or timestamps."""
     assert ENTITY_ASSISTANT_LOG == "assistant_log"
     assert set(CONTENT_FIELDS[ENTITY_ASSISTANT_LOG]) == set(_CONTENT)
 
@@ -77,20 +77,20 @@ def test_assistant_log_projection(settings: Settings) -> None:
     assert projection["entity"] == "note"
     assert projection["entity_id"] == 7
     assert projection["outcome"] == "done"
-    assert projection["source"] == "mcp"  # дефолт DDL
+    assert projection["source"] == "mcp"  # the DDL default
     for service_field in ("vector_status", "created_at", "updated_at", "deleted_at"):
         assert service_field not in projection
 
 
 def test_baseline_backfill_assistant_logs(settings: Settings) -> None:
-    """Строка без истории добирает baseline при следующем старте; повтор — no-op."""
+    """A row without history gets its baseline at the next start; a repeat — a no-op."""
     with session(settings) as conn, transaction(conn):
         conn.execute(
             "INSERT INTO assistant_logs (action, reason, entity, entity_id) "
             "VALUES ('deploy', 'why', 'note', 7)"
         )
 
-    init_db(settings)  # первый проход с записью — baseline
+    init_db(settings)  # the first pass with a write — the baseline
     versions = _logs_versions(settings, 1)
     assert len(versions) == 1
     first = versions[0]
@@ -111,5 +111,5 @@ def test_baseline_backfill_assistant_logs(settings: Settings) -> None:
         "session": None,
     }
 
-    init_db(settings)  # рестарт — новых версий не плодит
+    init_db(settings)  # a restart — no new versions multiplied
     assert len(_logs_versions(settings, 1)) == 1

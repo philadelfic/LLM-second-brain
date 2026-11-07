@@ -1,8 +1,9 @@
-"""Наблюдаемость бэкапов сканом каталога (№14, 3.2.0, arch §5.1/§7.2).
+"""Backups observability by a directory scan (#14, 3.2.0, arch §5.1/§7.2).
 
-`BackupService.status()` — снимок каталога БЕЗ открытия БД: число/возраст/
-объём снапшотов, число помеченных и последние исходы проверки из
-сайдкар-индекса. Индекс переживает рестарт (файл `backups-index.json`).
+    `BackupService.status()` — a directory snapshot WITHOUT opening the DB: the
+    snapshots' count/age/volume, the marked count and the latest verify outcomes
+    from the sidecar index. The index survives a restart (the `backups-index.json`
+    file).
 """
 
 from __future__ import annotations
@@ -56,7 +57,7 @@ class TestStatus:
         first.with_name(first.name + VERIFY_MARKER_SUFFIX).write_text(
             "{}", encoding="utf-8"
         )
-        # Сторонний файл и сам индекс снапшотами не считаются.
+        # A foreign file and the index itself do not count as snapshots.
         (backup_dir / STATE_FILE_NAME).write_text("{}", encoding="utf-8")
         (backup_dir / "operator-notes.txt").write_text("полка", encoding="utf-8")
         status = service.status()
@@ -66,7 +67,7 @@ class TestStatus:
         assert status["newest_age_sec"] is not None
         assert status["oldest_age_sec"] is not None
         assert status["newest_age_sec"] <= status["oldest_age_sec"]
-        assert status["last_verify"] is None  # индекс только что создан
+        assert status["last_verify"] is None  # the index has just been created
 
     def test_status_reads_last_verify_from_index(self, tmp_path: Path) -> None:
         service, _ = _service(tmp_path)
@@ -79,7 +80,7 @@ class TestStatus:
         assert status["count"] >= 1
 
     def test_status_survives_broken_index(self, tmp_path: Path) -> None:
-        """Мусор в сайдкар-индексе не роняет наблюдаемость (last_verify None)."""
+        """Garbage in the sidecar index does not crash observability (last_verify None)."""
         service, backup_dir = _service(tmp_path)
         (backup_dir / STATE_FILE_NAME).write_text("not json", encoding="utf-8")
         status = service.status()

@@ -1,4 +1,4 @@
-"""№32 (3.2.0): кластеризация контекстов (single-linkage, §6.6)."""
+"""#32 (3.2.0): context clustering (single-linkage, §6.6)."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ def parts(test_env, monkeypatch):
 
 
 def test_single_linkage_cluster(parts) -> None:
-    """Цепочка близких контекстов собирается в один кластер."""
+    """A chain of close contexts assembles into one cluster."""
     settings, _terms, _warnings, service = parts
     seed(
         settings,
@@ -33,7 +33,7 @@ def test_single_linkage_cluster(parts) -> None:
 
 
 def test_distinct_contexts_not_clustered(parts) -> None:
-    """Далёкие контексты остаются разными (кластеры размера 1)."""
+    """Far-apart contexts stay separate (clusters of size 1)."""
     settings, _terms, _warnings, service = parts
     seed(
         settings,

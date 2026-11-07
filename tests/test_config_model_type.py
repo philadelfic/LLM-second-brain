@@ -1,9 +1,10 @@
-"""Тип модели по слоту и таймауты (№49, релиз 3.2.0; arch §8, §13.1, §13.4).
+"""The model kind per slot and the timeouts (#49, release 3.2.0; arch §8, §13.1, §13.4).
 
-Дефолт типа — `generation` (честный: не приписывает модели размышление);
-значение вне набора и `decision` у генеративного слота фатальны (NFR-6).
-Новые дефолты таймаутов — 900 с (потолок back-off/паузы, «думать долго»);
-порог `SLOT_REASONING_MIN_OUTPUT_TOKENS` не может быть выше защитного потолка.
+    The kind default — `generation` (honest: it does not attribute reasoning to
+    the model); a value outside the set and `decision` at a generative slot are
+    fatal (NFR-6). The new timeout defaults — 900 s (the back-off/pause ceiling,
+    "think long"); the `SLOT_REASONING_MIN_OUTPUT_TOKENS` threshold cannot exceed
+    the protective ceiling.
 """
 
 from __future__ import annotations

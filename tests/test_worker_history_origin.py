@@ -1,8 +1,8 @@
-"""Источник версий фоновых джоб (№41, постановка no41-02).
+"""The background jobs' versions source (#41, brief no41-02).
 
-Переезд `namespace` джобой `nodes` — контентное изменение (FR-3.1/FR-4.4):
-версия несёт пометку `source='job:nodes'` из `bind_origin` тела джобы (§13.4),
-а не «правил оператор».
+    A `namespace` move by the `nodes` job is a content change (FR-3.1/FR-4.4):
+    the version carries the `source='job:nodes'` mark from the job body's
+    `bind_origin` (§13.4), not "the operator edited it".
 """
 
 from __future__ import annotations
@@ -51,11 +51,11 @@ def _nodes_spec(worker: BackgroundWorker, settings: Settings):
 
 
 def test_nodes_job_source(settings: Settings) -> None:
-    """Переклассификация из джобы `nodes` даёт версию `source='job:nodes'`."""
+    """A reclassification from the `nodes` job gives a `source='job:nodes'` version."""
     NamespaceService(settings).create("work", "Рабочие заметки.")
     service = NoteService(settings, HashEmbedder(DIM))
     note_id = int(service.save("История: переезд джобой", title="Джоба")["id"])
-    # Готовая разметка — быстрый пул обхода (переезд без вызова модели).
+    # A ready markup — the fast sweep pool (a move without a model call).
     with session(settings) as conn:
         conn.execute(
             "UPDATE notes SET hint_path = 'work', confidence = 0.95 WHERE id = ?",
@@ -76,7 +76,7 @@ def test_nodes_job_source(settings: Settings) -> None:
 
 
 def test_summary_job_does_not_write_versions(settings: Settings) -> None:
-    """Джоба `summary` (авто-выжимка) новых версий не пишет (§13.3)."""
+    """The `summary` job (the auto-summary) writes no new versions (§13.3)."""
     service = NoteService(settings, HashEmbedder(DIM))
     note_id = int(service.save("История: фоновая выжимка", title="Фон")["id"])
     worker = BackgroundWorker(

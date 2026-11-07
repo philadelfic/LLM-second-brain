@@ -1,8 +1,8 @@
-"""№12 (no12-02, 3.2.0): чтение предупреждений НЕ зовёт модель (§13.4).
+"""#12 (no12-02, 3.2.0): reading warnings never calls a model (§13.4).
 
-Сторож: `warnings_list`, `GET /warnings` и `/health.warnings` — только `SELECT`
-по таблице `warnings`; ни классификатора, ни суммаризатора, ни эмбеддера, ни
-судьи. Ловим на счётчиках клиентов слотов (`LLMClient.chat`/`embed`).
+    The watchdog: `warnings_list`, `GET /warnings` and `/health.warnings` — only a
+    SELECT over the `warnings` table; no classifier, summarizer, embedder or
+    judge. Caught on the slot clients' call counters (`LLMClient.chat`/`embed`).
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ AUTH = "Bearer test-secret-token"
 def test_read_never_calls_model(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Ни один путь чтения не увеличивает счётчики вызовов клиентов слотов."""
+    """No reading path increases the slot clients' call counters."""
     calls = {"chat": 0, "embed": 0}
 
     def chat(self: LLMClient, *args: object, **kwargs: object) -> str:
@@ -42,7 +42,7 @@ def test_read_never_calls_model(
     services.warnings.open(KIND_NOTE_MISPLACED, "note", 1, "m", {})
     mcp = build_mcp(settings, services)
 
-    # Три пути чтения одной поверхности: MCP, REST-листинг, агрегаты /health.
+    # Three reading paths of one surface: MCP, the REST listing, the /health aggregates.
     asyncio.run(mcp.call_tool("warnings_list", {}))
     client.get("/warnings", headers={"Authorization": AUTH})
     client.get("/health")

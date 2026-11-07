@@ -1,7 +1,8 @@
-"""SummaryResult: результат вместе с метаданными вызова (№49, arch §6.3).
+"""SummaryResult: the result together with the call metadata (#49, arch §6.3).
 
-Проверяется: `summarize()` отдаёт `.text` и `.meta` с операцией; 0 в
-`SUMMARY_NUM_PREDICT` — авто-бюджет, явное значение — `budget_source=explicit`.
+    Checked: `summarize()` serves `.text` and `.meta` with the operation; 0 in
+    `SUMMARY_NUM_PREDICT` — the auto-budget; an explicit value —
+    `budget_source=explicit`.
 """
 
 from __future__ import annotations
@@ -33,14 +34,14 @@ def test_summary_returns_meta(monkeypatch) -> None:
     service = make_service(make_settings(monkeypatch))
     result = service.summarize("Заметка о встрече с командой.")
     assert result.text == "Краткое содержание."
-    # LSBN-F-34: реестровое имя операции суммаризации — summarize.
+    # LSBN-F-34: the summarization operation's registry name — summarize.
     assert result.meta.operation == "summarize"
     assert result.meta.slot == "summary"
     service.close()
 
 
 def test_number_predict_zero_means_auto(monkeypatch) -> None:
-    """0 = авто: с заявленным контекстом — «сколько влезет»; явное — explicit."""
+    """0 = auto: with a declared context — "as much as fits"; an explicit one — explicit."""
     auto = make_service(
         make_settings(monkeypatch, SUMMARY_CONTEXT_TOKENS="8192"), "Выжимка."
     )
@@ -52,8 +53,8 @@ def test_number_predict_zero_means_auto(monkeypatch) -> None:
     )
     result = explicit.summarize("Заметка.")
     assert result.meta.budget_source == "explicit"
-    # LSBN-T-33: budget — суммарный sent (ответ + резерв рассуждения),
-    # заявка на ответ — answer_budget.
+    # LSBN-T-33: budget — the total sent (the answer + the reasoning reserve);
+    # the answer's allotment — answer_budget.
     assert result.meta.answer_budget == 1234
     assert result.meta.budget == result.meta.sent_budget
     assert result.meta.budget > 1234

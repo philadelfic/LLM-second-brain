@@ -1,4 +1,4 @@
-"""№12 (3.2.0): конфигурация джобы `warnings` — дефолты и валидация (arch §8)."""
+"""#12 (3.2.0): the `warnings` job's configuration — defaults and validation (arch §8)."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ def test_defaults(test_env: dict[str, str]) -> None:
 
 
 def test_invalid_reports_all_violations(test_env, monkeypatch) -> None:
-    """Бюджет > батча и порог вне 0..1 → `ConfigError` со ВСЕМИ нарушениями."""
+    """A budget > batch and a threshold outside 0..1 → a `ConfigError` with ALL violations."""
     monkeypatch.setenv("JOB_WARNINGS_BATCH", "5")
     monkeypatch.setenv("JOB_WARNINGS_CLASSIFIER_BUDGET", "9")
     monkeypatch.setenv("WARNINGS_MIN_CONFIDENCE", "1.5")

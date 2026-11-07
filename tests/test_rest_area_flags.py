@@ -1,10 +1,11 @@
-"""REST оператора при выключенной области (№40, постановка no40-02, §13.10).
+"""The operator's REST with an area disabled (#40, brief no40-02, §13.10).
 
-Выключение области скрывает её ТОЛЬКО от агента (§7.1: MCP-ручки, инструкция,
-карта, анонс, фон). Оператор — тот, кто включает и выключает: при любом
-значении флага его REST-ручки области работают, а история сущностей области
-остаётся доступной (решение владельца 2026-10-08: «не видна совсем» относится
-к агенту; гейт `AREA_*_ENABLED` на операторскую поверхность не распространяется).
+    Disabling an area hides it from the AGENT only (§7.1: MCP handles, the
+    instruction, the map, the announce, the background). The operator is the one
+    who enables and disables: at any flag value the area's REST handles work for
+    them, and the area's entity history stays reachable (the owner's 2026-10-08
+    decision: "invisible entirely" refers to the agent; the `AREA_*_ENABLED` gate
+    does not extend to the operator surface).
 """
 
 from __future__ import annotations
@@ -22,12 +23,12 @@ def _headers(token: str) -> dict[str, str]:
 
 
 def test_operator_rest_kept(monkeypatch: pytest.MonkeyPatch, token: str) -> None:
-    """AREA_TERMS_ENABLED=false: ручки `terms` и история термина у оператора живы."""
+    """AREA_TERMS_ENABLED=false: the `terms` handles and the term history stay alive for the operator."""
     monkeypatch.setenv("AREA_TERMS_ENABLED", "false")
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
-    assert settings.area_terms_enabled is False  # флаг области действительно снят
+    assert settings.area_terms_enabled is False  # the area flag is indeed off
 
     with TestClient(create_app(settings)) as client:
         created = client.post(
@@ -42,12 +43,12 @@ def test_operator_rest_kept(monkeypatch: pytest.MonkeyPatch, token: str) -> None
         assert created.status_code == 201, created.text
         term_id = created.json()["id"]
 
-        # Ручка области отвечает оператору и отдаёт данные (не 404/403).
+        # The area's handle answers the operator and serves the data (not 404/403).
         read = client.get(f"/terms/{term_id}", headers=_headers(token))
         assert read.status_code == 200, read.text
         assert read.json()["term"] == "ГЗ"
 
-        # История сущности выключенной области тоже доступна оператору (§13.10).
+        # A disabled area's entity history is available to the operator too (§13.10).
         listing = client.get(f"/history/term/{term_id}", headers=_headers(token))
         assert listing.status_code == 200, listing.text
         body = listing.json()

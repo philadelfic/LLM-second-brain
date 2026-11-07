@@ -1,4 +1,4 @@
-"""HashEmbedder (tests/fakes.py) — детерминированный мок-эмбеддер (ARCH §7)."""
+"""HashEmbedder (tests/fakes.py) — a deterministic mock embedder (ARCH §7)."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def test_dim_respected() -> None:
 
 
 def test_short_text_fallback_deterministic() -> None:
-    """Текст короче 3 символов — канонический вектор, не нулевой."""
+    """A text shorter than 3 characters — the canonical vector, not zero."""
     embedder = HashEmbedder(dim=8)
     first = embedder.embed("он")
     assert first != [0.0] * 8
