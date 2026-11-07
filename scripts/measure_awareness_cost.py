@@ -1,32 +1,33 @@
-"""Метрика «цена осведомлённости» — LSBN-S-2, релиз 3.4.0.
+"""The "cost of awareness" metric — LSBN-S-2, release 3.4.0.
 
-Одно число из трёх частей (бриф 3.4.0, «Зачем этот релиз»):
+    One number of three parts (the 3.4.0 brief, "Why this release"):
 
-* расход контекста одного агентного хода =
-  **(фиксированный блок + выдача за шаг) × число шагов**;
-* фикс замера OWUI 15.10.2026: кэш чтения нулевой, каждый шаг присылает
-  контекст целиком — потому фиксированный блок платится на КАЖДОМ шаге;
-* фиксированный блок = инструкции при подключении (место A) + описания
-  инструментов со схемами (место B) + подкладываемый текст `--embedded`
-  (L0-директива/анонс/карта — если передан);
-* выдача за шаг = вес ответа одного вызова (место C): поиск, листинг,
-  чтение; среднее по образцам приёмки.
+    * one agent turn's context spend =
+      **(the fixed block + the output per step) × the number of steps**;
+    * the OWUI measurement of 2026-10-15: the read cache is zero, every step
+      receives the whole context — hence the fixed block is paid on EVERY step;
+    * the fixed block = the connect-time instructions (place A) + the tool
+      descriptions with schemas (place B) + the text embedded via `--embedded`
+      (the L0 directive/announce/map — when passed);
+    * the output per step = one call's answer weight (place C): search, listing,
+      read; the mean over the acceptance samples.
 
-Скрипт — обёртка над замером LSBN-F-11 (`scripts/measure_injected_text.py`,
-места A/B/C, энкодер один на проект — `injection_budget.count_tokens`);
-сеть не используется, боевая БД не открывается на запись.
+    The script is a wrapper over the LSBN-F-11 measurement
+    (`scripts/measure_injected_text.py`; places A/B/C; one encoder per project —
+    `injection_budget.count_tokens`); the network is not used, the battle DB is
+    never opened for writing.
 
-Запуск (одна команда — критерий закрытия S-2):
-    .venv/bin/python scripts/measure_awareness_cost.py --phase before
-    .venv/bin/python scripts/measure_awareness_cost.py --phase after \\
-        --samples samples.json --embedded l0.txt
+    Run (one command — the S-2 closure criterion):
+        .venv/bin/python scripts/measure_awareness_cost.py --phase before
+        .venv/bin/python scripts/measure_awareness_cost.py --phase after \
+            --samples samples.json --embedded l0.txt
 
-Выход: `awareness-cost-<phase>.json` и `.md` в `--out` (дефолт
-`release/3.4.0/acceptance/`), в stdout — три части и итог.
+    The output: `awareness-cost-<phase>.json` and `.md` in `--out` (default
+    `release/3.4.0/acceptance/`); the three parts and the total go to stdout.
 
-Тест-сторож регресса — `tests/test_awareness_cost.py`: потолок «до»
-зафиксирован константой; улучшение (F-13/F-16) проходит свободно,
-рост сверх допуска роняет тест.
+    The regression test watchdog — `tests/test_awareness_cost.py`: the "before"
+    ceiling is pinned by a constant; an improvement (F-13/F-16) passes freely,
+    growth beyond the tolerance fails the test.
 """
 
 from __future__ import annotations
@@ -38,27 +39,27 @@ import sys
 from typing import Any
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if REPO_ROOT not in sys.path:  # запуск скрипта из любого каталога
+if REPO_ROOT not in sys.path:  # running the script from any directory
     sys.path.insert(0, REPO_ROOT)
 
 from scripts.measure_injected_text import collect_measurement  # noqa: E402
 
-#: Дефолтный каталог отчёта (внутри репозитория, по образцу 3.2.0).
+#: The default report directory (inside the repository, after the 3.2.0 example).
 DEFAULT_OUT_DIR = os.path.join(REPO_ROOT, "release", "3.4.0", "acceptance")
 
-#: Сценарии «итога» в отчёте: сколько шагов показываем besides --steps.
+#: The report's "totals" scenarios: how many steps we show besides --steps.
 STEP_SCENARIOS = (1, 5, 10, 25, 50)
 
 
 def compute_awareness_cost(
     measurement: dict[str, Any],
 ) -> dict[str, Any]:
-    """Три части метрики и итог из замера мест A/B/C.
+    """The metric's three parts and the total from the A/B/C measurement.
 
-    `fixed_tokens` — то, что платится каждый шаг при нулевом кэше чтения:
-    инструкции (A) + поверхность инструментов (B) + подкладываемый текст
-    (строка `tool == "embedded"` места C — L0/память, не выдача вызова).
-    `per_step` — образцы выдачи по одному вызову и их среднее.
+            `fixed_tokens` — what is paid every step at a zero read cache: the
+            instructions (A) + the tools surface (B) + the embedded text (the
+            `tool == "embedded"` row of place C — L0/memory, not a call's output).
+            `per_step` — the per-call output samples and their mean.
     """
     embedded = [s for s in measurement["place_c"]["samples"] if s["tool"] == "embedded"]
     calls = [s for s in measurement["place_c"]["samples"] if s["tool"] != "embedded"]
@@ -88,7 +89,7 @@ def compute_awareness_cost(
 
 
 def totals(cost: dict[str, Any], steps: int) -> dict[str, int]:
-    """Итог по формуле релиза: (фиксированный блок + выдача за шаг) × шаги."""
+    """The total by the release's formula: (the fixed block + the output per step) × steps."""
     per_step = cost["per_step_mean_tokens"]
     fixed = cost["fixed_block"]["total_tokens"]
     return {

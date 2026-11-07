@@ -38,14 +38,14 @@ TOKEN = os.environ["MCP_AUTH_TOKEN"]  # Bearer token from the container env (sec
 
 CYRILLIC = re.compile(r"[\u0400-\u04FF]")
 
-# --- идемпотентность повторного прогона (techdebt-0036, item 2) ---------------
-# Узлы-зонды `e2e22*` переиспользуются: ручки удаления узла в MCP-поверхности
-# нет, поэтому повторный прогон получает от антисинонимии приложения мягкий
-# отказ с `nearest`, равным самому запрошенному пути, — это успех
-# (`node_creation`), а не FAIL. Заметки-зонды прошлого прогона, наоборот,
-# убирает пред-очистка (`cleanup_previous_run`): повторный `memory_save` того же
-# текста получает отказ дедупа `stored=False` и возвращает id СТАРОЙ заметки,
-# из-за чего проверка TTL упиралась в заметку прошлого прогона с уже снятым
+# --- a repeated run's idempotency (techdebt-0036, item 2) ------------------
+# # The `e2e22*` probe nodes are reused: the MCP surface has no node-deletion
+# # handle, so a repeated run gets from the application's anti-synonymy a soft
+# # failure with `nearest` equal to the very requested path — that is a success
+# # (`node_creation`), not a FAIL. Past runs' probe notes, on the contrary,
+# # are removed by the pre-cleanup (`cleanup_previous_run`): a repeated `memory_save` of the same
+# # text gets the `stored=False` dedup failure and returns the OLD note's id,
+# # which made the TTL check hit the past run's note with its TTL already cleared.
 # `expires_at`.
 RUN_FAMILY = re.compile(r"^e2e22r?\d*(?:/|$)")
 _SYNONYM_HINT = re.compile(r"there is a similar one:\s*(\S+)")
@@ -68,7 +68,7 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def refusal(result: dict) -> str:
-    """Текст мягкого отказа приложения (`hint`, иначе `reason`), иначе — пусто."""
+    """The application's soft-failure text (`hint`, else `reason`), else empty."""
     for field in ("hint", "reason"):
         value = result.get(field)
         if value not in (None, ""):
@@ -77,16 +77,17 @@ def refusal(result: dict) -> str:
 
 
 def node_creation(path: str, result: dict) -> tuple[bool, str]:
-    """Итог идемпотентной регистрации узла-зонда: `(успех, деталь для отчёта)`.
+    """The outcome of the idempotent probe-node registration: `(success, report detail)`.
 
-    Успех — узел создан ЭТИМ прогоном (`created=True`, статус `confirmed`) ЛИБО
-    уже зарегистрирован (повторный прогон). Имя и описание зонда фиксированы,
-    поэтому антисинонимия приложения (порог косинуса описаний 0.90) отдаёт
-    мягкий отказ `created=False` с подсказкой `hint='there is a similar one:
-    <nearest>'`, где `nearest` равен самому запрошенному пути (описание
-    сравнивается с самим собой) — это и есть «узел на месте». Любой другой
-    отказ (в том числе `nearest` на ЧУЖОЙ узел) — FAIL с причиной и `nearest`:
-    имя/описание зонда надо развести с существующим узлом.
+            Success — the node was created BY THIS RUN (`created=True`, the `confirmed`
+            status) OR is already registered (a repeated run). The probe's name and
+            description are fixed, so the application's anti-synonymy (the description
+            cosine threshold 0.90) serves a soft `created=False` failure with the hint
+            `hint='there is a similar one: <nearest>'`, where `nearest` equals the very
+            requested path (the description is compared with itself) — that is exactly
+            "the node is in place". Any other failure (including a `nearest` pointing
+            at a FOREIGN node) — a FAIL with the reason and `nearest`: the probe's
+            name/description must be moved apart from the existing node.
     """
     if result.get("created") is True:
         if result.get("status") != "confirmed":
@@ -107,7 +108,7 @@ def node_creation(path: str, result: dict) -> tuple[bool, str]:
 
 
 def check_node_creation(label: str, path: str, result: dict) -> None:
-    """Проверка регистрации узла-зонда по идемпотентным правилам `node_creation`."""
+    """Checking the probe-node registration by the idempotent `node_creation` rules."""
     ok, detail = node_creation(path, result)
     check(label, ok, detail)
 
@@ -169,11 +170,11 @@ async def get_list_item(c: Client, note_id: int) -> dict | None:
 
 
 async def cleanup_previous_run(c: Client) -> None:
-    """Пред-очистка заметок-зондов прошлых прогонов (идемпотентность, item 2).
+    """Pre-cleanup of past runs' probe notes (idempotency, item 2).
 
-    Удаляются только заметки в узлах семейства зондов (`RUN_FAMILY`): узлы и
-    чужие данные не трогаем. Без очистки повторный `memory_save` упирается в
-    дедуп заметки прошлого прогона и возвращает её же id.
+            Only notes in the probe family's nodes (`RUN_FAMILY`) are deleted: nodes
+            and foreign data are untouched. Without the cleanup a repeated
+            `memory_save` runs into the past run's note dedup and gets its id back.
     """
     removed = 0
     for item in await list_notes(c, detail="titles"):

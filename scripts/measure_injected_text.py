@@ -1,39 +1,40 @@
-"""Замер вшитого агенту текста — LSBN-F-11, постановка f11-01.
+"""Measuring the text embedded into the agent — LSBN-F-11, brief f11-01.
 
-Методика «до»/«после»/«сторож» одна на весь релиз 3.2.0. Единая метрика —
-`tiktoken cl100k_base` (`app.services.injection_budget.count_tokens`); для
-каждого блока печатаются СИМВОЛЫ и ТОКЕНЫ (а для образцов ответов ещё и
-БАЙТЫ — метрика веса вызова 3.1.0).
+    One "before/after/watchdog" method for the whole release 3.2.0. The single
+    metric — `tiktoken cl100k_base`
+    (`app.services.injection_budget.count_tokens`); for every block both
+    CHARACTERS and TOKENS are printed (and BYTES for the answer samples — the
+    3.1.0 call-weight metric).
 
-Три места (arch §13.16, крит. 7):
-* **A — статика подключения:** `build_instructions(services)` целиком и
-  разбивка по слагаемым (ядро, правило неймспейсов, карта узлов, анонс
-  навыков, раздел логов, строка про lifetime заметки);
-* **B — описания инструментов со схемами:** по каждому зарегистрированному
-  инструменту MCP-поверхности (на блоках 1–5 — 31) описание + схема
-  параметров как они уходят на провод; сортировка по объёму (топ);
-* **C — вес вызова:** образцы ответов (набор приёмки: `memory_search` top_k=5,
-  `memory_list` detail=summaries/titles, `memory_save`, `skills_search`
-  пустой/непустой, `logs_search`) в байтах и токенах, плюс размер
-  подкладываемого, если он передан файлом (`--embedded`).
+    Three places (arch §13.16, crit. 7):
+    * **A — the connect-time statics:** `build_instructions(services)` whole and
+      the breakdown by terms (the core, the namespace rule, the node map, the
+      skills announce, the logs section, the note-lifetime line);
+    * **B — the tool descriptions with schemas:** per every registered tool of
+      the MCP surface (31 on blocks 1–5) the description + the parameter schema
+      as they go on the wire; sorted by volume (the top);
+    * **C — the call weight:** answer samples (the acceptance set: `memory_search`
+      top_k=5, `memory_list` detail=summaries/titles, `memory_save`,
+      `skills_search` empty/non-empty, `logs_search`) in bytes and tokens, plus
+      the size of the embedded text when passed as a file (`--embedded`).
 
-Запуск:
-    .venv/bin/python scripts/measure_injected_text.py --phase before
-    .venv/bin/python scripts/measure_injected_text.py --phase after --samples samples.json
+    Run:
+        .venv/bin/python scripts/measure_injected_text.py --phase before
+        .venv/bin/python scripts/measure_injected_text.py --phase after --samples samples.json
 
-CLI: `--phase before|after` (имя отчёта), `--out DIR` (дефолт
-`release/3.2.0/acceptance/`), `--samples FILE`, плюс два локальных ключа:
-`--db PATH` — читаемая копия БД заметок, `--embedded FILE` — подкладываемый
-текст (L0-директива/анонс/карта).
+    CLI: `--phase before|after` (the report name), `--out DIR` (default
+    `release/3.2.0/acceptance/`), `--samples FILE`, plus two local keys:
+    `--db PATH` — a readable copy of the notes DB; `--embedded FILE` — the
+    embedded text (an L0 directive/announce/map).
 
-Границы: сеть не используется, боевая БД не открывается на запись. По
-умолчанию поднимается ВРЕМЕННАЯ пустая БД (`init_db` в temp) — иначе карта
-узлов и анонс навыков собирались бы в вырожденном виде; состояния реестра
-при этом нет, поэтому замер A — нижняя граница (карта = дефолтный узел).
-Переданный `--db` инициализацией НЕ трогается (только чтение).
+    Bounds: the network is not used; the battle DB is never opened for writing.
+    By default a TEMPORARY empty DB is raised (`init_db` in temp) — otherwise the
+    node map and the skills announce would assemble in a degenerate form; there
+    is no registry state, so the A measurement is a lower bound (the map = the
+    default node). A passed `--db` is NOT touched by initialization (read-only).
 
-Детерминизм: одинаковый вход → одинаковый выход; порядок ключей и строк
-стабилен, время и длительность в метрики не попадают.
+    Determinism: the same input → the same output; the key and row order is
+    stable; time and duration never enter the metrics.
 """
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ import tempfile
 from typing import Any, Iterator
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if REPO_ROOT not in sys.path:  # запуск скрипта из любого каталога
+if REPO_ROOT not in sys.path:  # running the script from any directory
     sys.path.insert(0, REPO_ROOT)
 
 from app.config import get_settings  # noqa: E402
@@ -68,8 +69,8 @@ from app.transport.mcp import (  # noqa: E402
 
 DEFAULT_OUT_DIR = os.path.join(REPO_ROOT, "release", "3.2.0", "acceptance")
 
-# Обязательные env приложения (app/config.py) — значения как в tests/conftest.py:
-# loopback:1 гарантированно закрыт, и ни один вызов в сеть не делается.
+# The application's mandatory env (app/config.py) — the values as in tests/conftest.py:
+# loopback:1 is guaranteed closed, and no network call is made.
 REQUIRED_ENV: dict[str, str] = {
     "EMBEDDING_BASE_URL": "http://127.0.0.1:1",
     "SUMMARY_BASE_URL": "http://127.0.0.1:1",
@@ -81,7 +82,7 @@ REQUIRED_ENV: dict[str, str] = {
 
 
 def _measure(text: str) -> dict[str, int]:
-    """Символы, байты (UTF-8) и токены одного блока."""
+    """Characters, bytes (UTF-8) and tokens of one block."""
     return {
         "chars": len(text),
         "bytes": len(text.encode("utf-8")),
@@ -90,17 +91,17 @@ def _measure(text: str) -> dict[str, int]:
 
 
 # --------------------------------------------------------------------------
-# Место A — статика подключения
+# Place A — the connect-time statics
 # --------------------------------------------------------------------------
 
 
 def _count_lines(text: str, prefix: str = "  -") -> int:
-    """Сколько строк реестра попало в блок инструкций."""
+    """How many registry rows made it into the instructions block."""
     return sum(1 for line in text.splitlines() if line.startswith(prefix))
 
 
 def _place_a(services: Any, settings: Any) -> dict[str, Any]:
-    """`build_instructions` целиком + разбивка по слагаемым (в порядке сборки)."""
+    """`build_instructions` whole + the breakdown by terms (in assembly order)."""
     namespace_map = _namespace_map(services)
     skills_announce = _skills_announce(services)
     logs_section = _logs_section(services, settings)
@@ -165,18 +166,18 @@ def _place_a(services: Any, settings: Any) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# Место B — описания инструментов со схемами
+# Place B — the tool descriptions with schemas
 # --------------------------------------------------------------------------
 
 
 def _place_b(mcp: Any) -> dict[str, Any]:
-    """Все зарегистрированные инструменты: описание + схема параметров."""
+    """All registered tools: the description + the parameter schema."""
     tools = asyncio.run(mcp.list_tools())
     rows: list[dict[str, Any]] = []
     for tool in tools:
         description = tool.description or ""
-        # Схема — ровно то, что уходит на провод в tools/list: стабильная
-        # сериализация (sort_keys, без пробелов) — иначе замер «плыл» бы.
+        # The schema — exactly what goes on the wire in tools/list: a stable
+        # serialization (sort_keys, no spaces) — otherwise the measurement would drift.
         schema = json.dumps(
             tool.input_schema,
             ensure_ascii=False,
@@ -202,8 +203,8 @@ def _place_b(mcp: Any) -> dict[str, Any]:
             }
         )
     rows.sort(key=lambda row: (-row["tokens"], row["name"]))
-    # Рейтинг «самые тяжёлые описания»: сравним с замером 3.1.0, где топ считался
-    # по описаниям (TOOL_DESCRIPTIONS), а не по описанию со схемой.
+    # The "heaviest descriptions" ranking: comparable with the 3.1.0 measurement, where the top was counted
+    # over descriptions (TOOL_DESCRIPTIONS), not over a description with a schema.
     top_description = sorted(
         rows,
         key=lambda row: (-row["description_tokens"], row["name"]),
@@ -237,7 +238,7 @@ def _place_b(mcp: Any) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# Место C — вес вызова (образцы ответов)
+# Place C — the call weight (the answer samples)
 # --------------------------------------------------------------------------
 
 _SEARCH_SUMMARY = (
@@ -255,7 +256,7 @@ _LOG_ACTION = (
 
 
 def _payload(structure: Any) -> str:
-    """Стабильная сериализация образца: тот же вид, что видит модель."""
+    """A stable serialization of a sample: the same view the model sees."""
     return json.dumps(
         structure, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
@@ -273,10 +274,11 @@ def _search_sample(index: int) -> dict[str, Any]:
 
 
 def default_samples() -> list[dict[str, str]]:
-    """Набор образцов приёмки (f11-01): ответы инструментов как их видит модель.
+    """The acceptance sample set (f11-01): the tool answers as the model sees them.
 
-    Образцы фиксированы в коде — это эталон для сравнения «до/после», а не
-    выгрузка боевых данных; файл `--samples` полностью заменяет набор.
+            The samples are pinned in code — the reference for the "before/after"
+            comparison, not a battle-data dump; a `--samples` file replaces the set
+            entirely.
     """
     return [
         {
@@ -403,7 +405,7 @@ def default_samples() -> list[dict[str, str]]:
 
 
 def _load_samples(samples_path: str | None) -> list[dict[str, str]]:
-    """Образцы ответов: из файла `--samples` либо встроенный набор приёмки."""
+    """The answer samples: from the `--samples` file or the built-in acceptance set."""
     if not samples_path:
         return default_samples()
     with open(samples_path, encoding="utf-8") as handle:
@@ -427,7 +429,7 @@ def _load_samples(samples_path: str | None) -> list[dict[str, str]]:
 def _place_c(
     samples_path: str | None, embedded_path: str | None = None
 ) -> dict[str, Any]:
-    """Вес вызова: образцы ответов (байты и токены) + подкладываемый файл."""
+    """The call weight: the answer samples (bytes and tokens) + the embedded file."""
     rows: list[dict[str, Any]] = []
     for sample in _load_samples(samples_path):
         measured = _measure(sample["payload"])
@@ -467,13 +469,13 @@ def _place_c(
 
 
 # --------------------------------------------------------------------------
-# Сборка замера, отчёты, CLI
+# Assembling the measurement, the reports, the CLI
 # --------------------------------------------------------------------------
 
 
 @contextlib.contextmanager
 def _isolated_env(db_path: str | None) -> Iterator[str]:
-    """Изолированное окружение замера: своя БД, восстановление env по выходу."""
+    """The measurement's isolated environment: its own DB, env restoration on exit."""
     names = [*REQUIRED_ENV, "DB_PATH", "BACKUP_DIR"]
     saved = {name: os.environ.get(name) for name in names}
     workspace: str | None = None
@@ -502,12 +504,12 @@ def collect_measurement(
     db_path: str | None = None,
     embedded_path: str | None = None,
 ) -> dict[str, Any]:
-    """Собрать замер: три места, символы и токены (и байты для места C)."""
+    """Assemble the measurement: three places, characters and tokens (and bytes for place C)."""
     with _isolated_env(db_path) as resolved_db:
         settings = get_settings()
         if db_path is None:
-            # Свою временную БД инициализируем (карта узлов и анонс навыков);
-            # переданную читаемую копию не трогаем вовсе.
+            # We initialize our own temporary DB (the node map and the skills announce);
+            # the passed readable copy is not touched at all.
             init_db(settings)
         services = build_services(settings)
         mcp = build_mcp(settings, services)
@@ -535,7 +537,7 @@ def _row(
 
 
 def render_markdown(data: dict[str, Any]) -> str:
-    """Markdown-отчёт: одна таблица «место, блок, символы, токены, комментарий»."""
+    """The markdown report: one table "place, block, characters, tokens, note"."""
     place_a = data["place_a"]
     place_b = data["place_b"]
     place_c = data["place_c"]
@@ -633,7 +635,7 @@ def render_markdown(data: dict[str, Any]) -> str:
 def write_reports(
     data: dict[str, Any], out_dir: str = DEFAULT_OUT_DIR
 ) -> tuple[str, str]:
-    """Записать `injected-text-<phase>.json` и `.md`; вернуть пути."""
+    """Write `injected-text-<phase>.json` and `.md`; return the paths."""
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.join(out_dir, f"injected-text-{data['phase']}")
     json_path, md_path = f"{stem}.json", f"{stem}.md"

@@ -1,25 +1,25 @@
-"""Скрипт переиндексации векторного индекса (REQUIREMENTS §8, Фаза 3).
+"""The vector index reindexing script (REQUIREMENTS §8, Phase 3).
 
-Зачем: `EMBEDDING_DIM` (и смена embedding-модели) делает существующие
-вектора невалидными — размерность фиксируется в DDL vec0-таблицы при создании
-БД; при несовпадении с env `init_db` отказывает в запуске. Этот скрипт:
+    Why: `EMBEDDING_DIM` (and an embedding model change) makes existing vectors
+    invalid — the dimension is pinned in the vec0 table's DDL at DB creation; on
+    mismatch with env `init_db` refuses to start. This script:
 
-1) сбрасывает векторный индекс (DROP notes_vec) и помечает ВСЕ заметки
-   `vector_status='pending'` (включая trash — у удалённых заметок векторов
-   тоже больше нет, это согласованное состояние trash: FTS остаётся);
-2) создаёт notes_vec заново под текущую `EMBEDDING_DIM` (init_db проходит
-   гейт размерности);
-3) если живая Ollama доступна — сразу пере-векторизует очередь партиями
-   (batch, тем же кодом, что фоновой воркер); если недоступна — заметки
-   остаются в pending, воркер приложения догонит позже (NFR-3: операция
-   безопасна при любых отказах).
+    1) resets the vector index (DROP notes_vec) and marks ALL notes
+       `vector_status='pending'` (trash included — deleted notes have no vectors
+       anymore either; that is the consistent trash state: FTS stays);
+    2) creates notes_vec anew under the current `EMBEDDING_DIM` (init_db passes
+       the dimension gate);
+    3) if a live Ollama is available — re-vectorizes the queue in batches right
+       away (batch, the same code as the background worker); if unavailable — the
+       notes stay pending; the application's worker catches up later (NFR-3: the
+       operation is safe under any failures).
 
-Запуск из корня проекта::
+    Run from the project root::
 
-    python -m scripts.reindex [--yes]
+        python -m scripts.reindex [--yes]
 
-Подтверждение не спрашивается с `--yes`. Код возврата: 0 — успех, 1 — отменено
-оператором, 2 — конфигурация/БД недоступны.
+    No confirmation is asked with `--yes`. The return code: 0 — success; 1 —
+    cancelled by the operator; 2 — the config/DB is unavailable.
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-# Работоспособно и как `python scripts/reindex.py` (sys.path[0] = scripts/),
-# и как `python -m scripts.reindex` — корень проекта встаёт в пути импорта.
+# It works both as `python scripts/reindex.py` (sys.path[0] = scripts/) and
+# as `python -m scripts.reindex` — the project root enters the import paths.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import ConfigError, load_settings
@@ -72,21 +72,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("Отменено оператором — БД не тронута.")
             return 1
 
-    # 1) Сброс индекса: DROP vec-таблицы (пересоздастся с новой размерностью)
-    #    и все вектороносители — обратно в очередь pending (trash тоже:
-    #    у него больше нет векторов, а после undo заметка ждёт воркера).
+    # 1) Index reset: DROP the vec tables (they will be recreated with the new dimension)
+    #    and all vector carriers — back into the pending queue (trash too:
+    #    it has no vectors anymore, and after an undo the note waits for the worker).
     try:
         with session(settings) as conn, transaction(conn):
             conn.execute("DROP TABLE IF EXISTS notes_vec")
             conn.execute("UPDATE notes SET vector_status = 'pending'")
-        init_db(settings)  # создаст notes_vec под новую размерность
+        init_db(settings)  # will create notes_vec under the new dimension
     except StorageError as exc:
         print(f"FATAL: {exc}", file=sys.stderr)
         return 2
     print(f"Индекс сброшен; notes_vec создан под {settings.embedding_dim}.")
 
-    # 2) Попытка до-векторизовать очередь прямо здесь (тот же код, что и
-    #    у фонового воркера); при недоступности Ollama — просто pending.
+    # 2) An attempt to finish vectorizing the queue right here (the same code as
+    #    the background worker's); with Ollama unavailable — simply pending.
     embedding = EmbeddingService(settings)
     worker = BackgroundWorker(settings, embedding)
     total = 0
