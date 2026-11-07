@@ -221,7 +221,7 @@ def _copy_rows(
             f"VALUES ({placeholders}) ON CONFLICT({', '.join(pk)})"
             + (f" DO UPDATE SET {updates}" if updates else "")
         )
-    else:  # без PK апсерт невозможен — таблиц реестра без PK нет
+    else:  # no PK — no upsert; no registry tables exist without a PK
         sql = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})"
     dst.executemany(sql, [tuple(row) for row in rows])
     return len(rows)
@@ -303,7 +303,7 @@ _POUR_SPECS: tuple[tuple[str, str], ...] = (
     ("terms", "1=1"),
     ("user_facts", "1=1"),
     ("assistant_logs", "1=1"),
-    ("meta", "1=1"),  # мета эмбеддинга/чанков; migration.* переставляются ниже
+    ("meta", "1=1"),  # the embedding/chunks meta; migration.* keys are re-ordered below
 )
 
 # vec tables: (table, key column, row filter). Area vecs are poured whole
@@ -409,12 +409,12 @@ def create_new_base(
                 "incoming": Path(temp_path).name,
             },
         )
-    for suffix in ("", "-wal", "-shm"):  # сайдкары не должны пережить пересоздание
+    for suffix in ("", "-wal", "-shm"):  # sidecars must not survive the recreation
         Path(temp_path + suffix).unlink(missing_ok=True)
     new_settings = settings.model_copy(
         update={"db_path": temp_path, "max_note_chars": target}
     )
-    init_db(new_settings)  # полная схема + сиды + vec-таблицы (design §3)
+    init_db(new_settings)  # the full schema + seeds + vec tables (design §3)
     src_settings = settings.model_copy(update={"db_path": source_path})
     with session(src_settings) as src, session(new_settings) as dst:
         old_total = int(
@@ -698,7 +698,7 @@ def reverse_pour(
             ("terms", "1=1", ()),
             ("user_facts", "1=1", ()),
             ("assistant_logs", "1=1", ()),
-            ("meta", "1=1", ()),  # миграционные ключи переставляются ниже
+            ("meta", "1=1", ()),  # migration keys are re-ordered below
         )
         vec_specs: tuple[tuple[str, str, str, tuple], ...] = (
             # The vec table's key is note_id (not notes.id!), its own filter.
@@ -767,7 +767,7 @@ def startup_plan(settings: Settings) -> dict:
     """
     path = Path(settings.db_path)
     target = settings.max_note_chars
-    if not path.is_file():  # свежая база — init_db создал её под env
+    if not path.is_file():  # a fresh database — init_db created it under env
         return {"mode": "none", "target": target, "schema_limit": None, "pending": 0}
     with session(settings) as conn:
         live = note_chars_limit(conn)
@@ -837,7 +837,7 @@ def startup_plan(settings: Settings) -> dict:
 def _chain_source(settings: Settings, conn: sqlite3.Connection, target: int) -> str | None:
     """The path of the chain base with CHECK = target (newest fitting first)."""
     directory = Path(settings.db_path).parent
-    for entry in reversed(read_chain(conn)):  # новые впереди
+    for entry in reversed(read_chain(conn)):  # newest first
         file_name = str(entry.get("file", ""))
         if not file_name or entry.get("note_chars") != target:
             continue

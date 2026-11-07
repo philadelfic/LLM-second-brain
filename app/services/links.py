@@ -67,7 +67,7 @@ if TYPE_CHECKING:  # annotations only: no runtime dependency on the worker
 # highest priority wins (arch §3.2: mention > entities > cosine).
 _KIND_PRIORITY = {"mention": 3, "entities": 2, "cosine": 1}
 
-# Significant words (arch §3.3): lowercase, the tokens [a-zа-яё0-9-]; the FTS
+# Significant words (arch §3.3): lowercase; the tokens are latin/digits/hyphen
 # query takes up to the _FTS_MAX_WORDS longest words - a query cost cap
 # (a code constant, not env).
 _TOKEN_RE = re.compile(r"[a-zа-яё0-9-]+")
