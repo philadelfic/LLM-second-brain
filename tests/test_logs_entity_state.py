@@ -1,13 +1,13 @@
-"""Тесты состояния объекта ссылки лога (LSBN-F-10, f10-04).
+"""The log reference object's state tests (LSBN-F-10, f10-04).
 
-Arch assistant-logs §11/§13.4: чтение лога отвечает на вопрос «что стало с
-объектом» — состояние считает СЛОЙ ИСТОРИИ (`history.resolve_entity`), сервис
-области в чужие таблицы сырым SQL не ходит (изоляция области). `LogsService`
-добавляет `entity_state` в `get` (только когда `entity` задан) и в каждый
-элемент `list`/`search`: `active` / `deleted` / `unavailable` (объекта нет либо
-его область выключена — не раскрываем, что область существует) / `external`
-(неверсионный объект). `HISTORY_ENABLED=false` — состояние не достраивается,
-выдача остаётся живой.
+    Arch assistant-logs §11/§13.4: reading a log answers "what happened to the
+    object" — the state is computed by the HISTORY LAYER (`history.resolve_entity`);
+    the area service does no raw SQL over foreign tables (area isolation).
+    `LogsService` adds `entity_state` to `get` (only when `entity` is set) and to
+    every `list`/`search` item: `active` / `deleted` / `unavailable` (the object
+    is missing or its area is disabled — we do not reveal the area exists) /
+    `external` (a non-versioned object). `HISTORY_ENABLED=false` — the state is
+    not completed; the output stays alive.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def settings(test_env: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> Setti
 
 @pytest.fixture
 def embedding() -> HashEmbedder:
-    """Детерминированный эмбеддер: поиск области работает без сети."""
+    """A deterministic embedder: the area's search works without the network."""
     return HashEmbedder(DIM)
 
 
@@ -54,14 +54,14 @@ def _save(logs: LogsService, **extra: object) -> int:
 
 
 def _note(settings: Settings, text: str = "Заметка про слот") -> int:
-    """Живая заметка настоящим сервисом: у неё есть версия 1 (№41)."""
+    """A live note by the real service: it has version 1 (#41)."""
     result = NoteService(settings, HashEmbedder(DIM)).save(text, title="Слот")
     return int(result["id"])
 
 
 class TestResolveEntity:
     def test_state_active(self, settings: Settings, logs: LogsService) -> None:
-        """Активная заметка → `active`, `current_version` — головная версия."""
+        """An active note → `active`; `current_version` — the head version."""
         note_id = _note(settings)
         log_id = _save(logs, entity="note", entity_id=note_id)
         assert history.resolve_entity("note", note_id, settings) == {
@@ -71,7 +71,7 @@ class TestResolveEntity:
         assert logs.get(log_id)["entity_state"] == "active"
 
     def test_state_deleted(self, settings: Settings, logs: LogsService) -> None:
-        """Мягко удалённый объект → `deleted`; запись лога жива (FR-4.3)."""
+        """A soft-deleted object → `deleted`; the log record alive (FR-4.3)."""
         note_id = _note(settings)
         NoteService(settings, HashEmbedder(DIM)).delete(note_id)
         log_id = _save(logs, entity="note", entity_id=note_id)
@@ -82,14 +82,14 @@ class TestResolveEntity:
     def test_state_unavailable_missing(
         self, settings: Settings, logs: LogsService
     ) -> None:
-        """Объекта нет → `unavailable`."""
+        """No object → `unavailable`."""
         log_id = _save(logs, entity="note", entity_id=999_999)
         assert logs.get(log_id)["entity_state"] == "unavailable"
 
     def test_state_unavailable_area_disabled(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Область объекта выключена → `unavailable`: область не раскрывается."""
+        """The object's area disabled → `unavailable`: the area is not revealed."""
         monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
         monkeypatch.setenv("AREA_TERMS_ENABLED", "false")
         get_settings.cache_clear()
@@ -102,20 +102,20 @@ class TestResolveEntity:
         assert logs.get(log_id)["entity_state"] == "unavailable"
 
     def test_state_external(self, settings: Settings, logs: LogsService) -> None:
-        """Неверсионный объект (`commit`) → `external` (ссылка только текстом)."""
+        """A non-versioned object (`commit`) → `external` (a text-only reference)."""
         log_id = _save(logs, entity="commit", entity_ref="deadbeef")
         assert history.resolve_entity("commit", 0, settings) is None
         assert logs.get(log_id)["entity_state"] == "external"
 
     def test_state_without_entity(self, settings: Settings, logs: LogsService) -> None:
-        """`entity` не задан → поля `entity_state` в записи нет."""
+        """`entity` not set → no `entity_state` field in the record."""
         log_id = _save(logs)
         record = logs.get(log_id)
         assert record["action"] == ACTION
         assert "entity_state" not in record
 
     def test_resolve_history_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """`HISTORY_ENABLED=false` → состояние не достраивается, выдача жива."""
+        """`HISTORY_ENABLED=false` → the state is not completed; the output alive."""
         monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
         monkeypatch.setenv("HISTORY_ENABLED", "false")
         get_settings.cache_clear()
@@ -133,7 +133,7 @@ class TestListAndSearchStates:
     def test_items_annotated(
         self, settings: Settings, embedding: HashEmbedder, logs: LogsService
     ) -> None:
-        """Каждый элемент list/search несёт состояние своего объекта (§11)."""
+        """Every list/search item carries its own object's state (§11)."""
         note_id = _note(settings)
         active = _save(logs, entity="note", entity_id=note_id)
         external = _save(logs, entity="commit", entity_ref="deadbeef")
