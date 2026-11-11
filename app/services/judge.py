@@ -133,6 +133,21 @@ class Judge(Protocol):
         ...
 
 
+#: The split verdict (Oleg's decision of 2026-11-11): the source note and ALL
+#: fact-notes it was split into go to the judge with one question - was anything
+#: from the source lost. Not a prompt file: a hardwired constant like the other
+#: judge strings.
+SPLIT_VERDICT_SYSTEM = (
+    "You check how one long note was decomposed into atomic fact-notes. You are "
+    "given the SOURCE note and the NOTES it was split into. Check whether every "
+    "fact of the source - names, numbers, dates, statuses, configs, paths, "
+    "decisions - is present in the notes, and nothing is lost or distorted. "
+    "Rewording the connecting prose is NOT a loss; a missing or changed fact IS. "
+    "Answer with exactly one line, no explanations: COMPLETE - if nothing is "
+    "lost; MISSING: <what exactly is lost> - otherwise."
+)
+
+
 class JudgeService:
     """The "duplicate / not duplicate" verdict via the judge slot's chat (non-stream)."""
 
@@ -253,6 +268,47 @@ class JudgeService:
         self.last_attempt_ok = True
         self.last_meta = result.meta
         return JudgeResult(verdict=verdict, meta=result.meta)
+
+    def verify_split(self, source: str, parts: list[str]) -> str | None:
+        """The split verdict: None — nothing is lost, else the judge's reason.
+
+            Oleg's decision of 2026-11-11: the split is accepted only after the
+            judge looks at the source and ALL the new notes and confirms that
+            everything was decomposed and nothing was missed. Always the
+            generative path: the decision slot is schema-bounded (8k context,
+            64 KiB input) and cannot take a long note plus its parts.
+        """
+        if not source or not source.strip():
+            raise ValueError("verify_split: пустой источник")
+        if not parts:
+            raise ValueError("verify_split: пустой список частей")
+        listing = "\n\n".join(
+            f"NOTE {number}:\n{text}" for number, text in enumerate(parts, start=1)
+        )
+        user_text = f"SOURCE:\n{source}\n\nNOTES:\n{listing}"
+        try:
+            result = self._llm.chat_result(
+                SPLIT_VERDICT_SYSTEM, user_text, operation="judge"
+            )
+        except LLMError as exc:
+            self.last_attempt_ok = False
+            self.last_meta = exc.meta
+            raise JudgeError(
+                str(exc), outcome=classify_llm_error(exc), meta=exc.meta
+            ) from exc
+        self.last_meta = result.meta
+        text = (result.content or "").strip()
+        upper = text.upper()
+        if "MISSING" in upper:
+            self.last_attempt_ok = True
+            return text[:500] or "MISSING"
+        if "COMPLETE" in upper:
+            self.last_attempt_ok = True
+            return None
+        self.last_attempt_ok = False
+        raise JudgeError(
+            "verify_split: нераспознанный вердикт судьи", outcome=SlotOutcome.OFF_CONTRACT
+        )
 
     def close(self) -> None:
         """Close resources (interface-compatible with the other clients)."""

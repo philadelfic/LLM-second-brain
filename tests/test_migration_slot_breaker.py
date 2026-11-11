@@ -62,6 +62,7 @@ class _FakeWorker:
         self._summarizer = FixedSummarizer()
         self._notes = NoteService(settings)
         self._warnings = None
+        self._judge = None
 
 
 def _waiting_ids() -> list[int]:
