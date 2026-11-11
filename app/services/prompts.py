@@ -178,22 +178,31 @@ def summary_merge_system_prompt(limit: int) -> str:
 # strengthened by the design (the step "splitting goes through F-23"): each
 # part carries ITS OWN names, numbers, dates - readable without the source
 def summary_split_system_prompt(limit: int) -> str:
-    """The split system prompt; `limit` - the note soft limit from settings."""
+    """The split system prompt; `limit` - the note soft limit from settings.
+
+        Oleg's decision of 2026-11-11: one note = one fact. Splitting is not
+        "copy the text in chunks" but "decompose the note into atomic facts" -
+        that keeps notes and facts well linked and the context small.
+    """
     return (
-        "You are given ONE long note that exceeds the note limit. Split it into "
-        "one or several SELF-CONTAINED notes (parts): preserve every fact — "
-        "names, numbers, dates, statuses, configs and paths; do not drop "
-        "anything and do not add anything of your own. Every part must be "
-        f"readable on its own, carrying ITS OWN names, numbers and dates — no "
-        "references to the source or to other parts. Parts may be up to "
-        f"{limit} characters each. Give each part its own `title`: a "
-        "meaningful name of at most 5 words. Write coherently, no headings, "
-        "intros, quotes, or explanations. Respond in the language of the note. "
+        "You are given ONE long note. Break it into ATOMIC FACTS: one fact per "
+        "note (part). Each part states exactly one self-contained fact and "
+        "carries ITS OWN names, numbers, dates, statuses, configs and paths - "
+        "readable on its own, without references to the source or to other "
+        "parts. Do not copy whole paragraphs and do not put several facts into "
+        "one part; do not add anything of your own; do not lose a single fact "
+        f"of the source. Every part must stay well under the {limit}-character "
+        "note limit. Keep numbers, names, dates, versions, paths and commands "
+        "verbatim; only the connecting prose may be tightened. Give each part "
+        "its own `title`: a meaningful name of at most 5 words. Write "
+        "coherently, no headings, intros, quotes, or explanations. Respond in "
+        "the language of the note. "
         "Answer with exactly one JSON object — no markdown fences, no text "
         "before or after it, no trailing commas. Escape every double quote "
         "inside a value in JSON style. Schema: "
         '{"parts": [{"title": "...", "text": "..."}, ...]}'
     )
+
 
 # and the other parts.
 # judge.py::JUDGE_SYSTEM_PROMPT - deciding note sameness (DUPLICATE/NOT DUPLICATE).
