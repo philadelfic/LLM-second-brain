@@ -478,11 +478,15 @@ def test_merge_system_prompt_and_marked_texts(monkeypatch) -> None:
     assert f"{get_settings().max_note_chars}-character note limit" in messages[0]["content"]
     # числового бюджета вывода в промпте нет: потолок держит код, не модель
     assert "35000" not in messages[0]["content"]
-    # оба текста в ОДНОМ user-сообщении: ранний — TEXT 1, поздний — TEXT 2
-    assert messages[1] == {
-        "role": "user",
-        "content": "TEXT 1:\n" + TEXT_A + "\n\nTEXT 2:\n" + TEXT_B,
-    }
+    # оба текста в ОДНОМ user-сообщении: ранний — TEXT 1, поздний — TEXT 2;
+    # в конце — подсказка о размере и минимальном числе частей (LSBN-D-13)
+    assert messages[1]["role"] == "user"
+    assert messages[1]["content"].startswith(
+        "TEXT 1:\n" + TEXT_A + "\n\nTEXT 2:\n" + TEXT_B
+    )
+    expected_parts = -(-(len(TEXT_A) + len(TEXT_B)) // settings.max_note_chars)
+    assert "SIZE:" in messages[1]["content"]
+    assert f"at least {expected_parts} part" in messages[1]["content"]
     # rest — как у summarize (та же модель и параметры, ARCH §4.7)
     assert payload["model"] == settings.summary_model
     assert payload["stream"] is False
