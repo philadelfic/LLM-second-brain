@@ -5,4 +5,4 @@ the MCP protocol. Package layers follow ARCHITECTURE §3: transport / services /
 storage.
 """
 
-__version__ = "3.5.1"
+__version__ = "3.5.2"
