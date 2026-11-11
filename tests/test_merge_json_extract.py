@@ -102,3 +102,45 @@ def test_split_uses_fact_check_not_word_check():
     assert "ATOMIC FACTS" in prompt
     assert "one fact per" in prompt
     assert "5000" in prompt
+
+
+# --- вердикт судьи по нарезке (решение О. 11.11.2026) -------------------
+
+def _judge_with(answer):
+    import httpx
+
+    from app.services.judge import JudgeService
+    from tests.test_summary_service import make_settings
+
+    class _MP:  # минимальная замена monkeypatch: настройки по умолчанию
+        def setenv(self, *_a, **_k):
+            pass
+
+    settings = make_settings(_MP())
+    body = {"message": {"content": answer, "role": "assistant"}, "done": True}
+
+    def handler(request):
+        return httpx.Response(200, json=body)
+
+    return JudgeService(settings, transport=httpx.MockTransport(handler))
+
+
+def test_verify_split_accepts_complete():
+    judge = _judge_with("COMPLETE")
+    assert judge.verify_split("исходник", ["факт 1", "факт 2"]) is None
+
+
+def test_verify_split_reports_missing():
+    judge = _judge_with("MISSING: потерян таймаут 3600")
+    verdict = judge.verify_split("исходник", ["факт 1"])
+    assert verdict is not None and "MISSING" in verdict
+
+
+def test_verify_split_rejects_garbage():
+    import pytest
+
+    from app.services.judge import JudgeError
+
+    judge = _judge_with("ну не знаю")
+    with pytest.raises(JudgeError):
+        judge.verify_split("исходник", ["факт"])

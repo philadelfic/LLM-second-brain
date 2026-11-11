@@ -83,7 +83,7 @@ class _CountingSplitService:
 
     instances: ClassVar[list[_CountingSplitService]] = []
 
-    def __init__(self, settings, *, summarizer, notes, warnings=None) -> None:
+    def __init__(self, settings, *, summarizer, notes, warnings=None, judge=None) -> None:
         self.process_calls = 0
         type(self).instances.append(self)
 
