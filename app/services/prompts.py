@@ -159,13 +159,15 @@ def summary_merge_system_prompt(limit: int) -> str:
         "SELF-CONTAINED notes (parts): combine all information from both — facts, "
         "names, numbers, dates, statuses, configs and paths; state each fact once, "
         "omit repetitions; do not drop anything and do not add anything of your "
-        "own. Every part must be readable on its own, without references to other "
+        "own — a shortened retelling is a failure, not a merge. Every part must be readable on its own, without references to other "
         "parts. Use ONE part only if the merged text fits the "
         f"{limit}-character note limit; otherwise split the content into "
         "several parts, each within the same limit. Give each part its own `title`: "
         "a meaningful name of at most 5 words. Write coherently, no headings, "
         "intros, quotes, or explanations. Respond in the language of the notes. "
-        "Answer with exactly one JSON object, no explanations: "
+        "Answer with exactly one JSON object — no markdown fences, no text "
+        "before or after it, no trailing commas. Escape every double quote "
+        "inside a value in JSON style. Schema: "
         '{"parts": [{"title": "...", "text": "..."}, ...]}'
     )
 
@@ -187,7 +189,9 @@ def summary_split_system_prompt(limit: int) -> str:
         f"{limit} characters each. Give each part its own `title`: a "
         "meaningful name of at most 5 words. Write coherently, no headings, "
         "intros, quotes, or explanations. Respond in the language of the note. "
-        "Answer with exactly one JSON object, no explanations: "
+        "Answer with exactly one JSON object — no markdown fences, no text "
+        "before or after it, no trailing commas. Escape every double quote "
+        "inside a value in JSON style. Schema: "
         '{"parts": [{"title": "...", "text": "..."}, ...]}'
     )
 
