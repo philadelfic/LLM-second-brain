@@ -355,16 +355,37 @@ class TestSummarySplit:
         )
         service.close()
 
-    def test_split_incomplete_after_two_rounds(
+    def test_split_coverage_does_not_block_the_judge(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Полнота <1.0 после обоих раундов — MergeIncompleteError."""
+        """Полнота фактов — диагностика, а не ворота (3.5.8, решение О. 11.11.2026).
+
+        Решение принимает судья: нарезка с низким покрытием должна дойти до него,
+        а не упасть в MergeIncompleteError на арифметике.
+        """
         settings = _split_settings(monkeypatch)
         service, _ = _split_service(
             settings,
             [
                 _parts_body([{"title": "Мало", "text": "совсем другой текст без фактов"}]),
-                _parts_body([{"title": "Опять мало", "text": "снова не то содержание"}]),
+            ],
+        )
+        result = service.split(SOURCE)
+        assert result.parts, "нарезка с низким покрытием должна вернуться, а не упасть"
+        assert result.rounds == 1
+        service.close()
+
+    def test_split_long_part_still_triggers_followup_and_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Лимит длины части — по-прежнему жёсткий: две длинные части → отказ."""
+        settings = _split_settings(monkeypatch)
+        long_text = "x" * (settings.max_note_chars + 10)
+        service, _ = _split_service(
+            settings,
+            [
+                _parts_body([{"title": "Длинно", "text": long_text}]),
+                _parts_body([{"title": "Опять длинно", "text": long_text}]),
             ],
         )
         from app.services.summary import MergeIncompleteError

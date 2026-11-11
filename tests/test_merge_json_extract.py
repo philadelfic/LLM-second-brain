@@ -151,3 +151,18 @@ def test_facts_coverage_folds_number_separators():
     source = "Лимит 5000 символов, таймаут 3600 с"
     parts = ["Лимит 5 000 символов", "таймаут 3 600 с"]
     assert _facts(source, parts) == 1.0
+
+
+def test_split_prompt_forbids_fragments():
+    from app.services.prompts import summary_split_system_prompt
+
+    prompt = summary_split_system_prompt(5000)
+    assert "never a bare heading" in prompt
+    assert "shorter than 100 characters is a fragment" in prompt
+
+
+def test_split_verdict_prompt_checks_self_containment():
+    from app.services.judge import SPLIT_VERDICT_SYSTEM
+
+    assert "self-contained" in SPLIT_VERDICT_SYSTEM
+    assert "FRAGMENTS" in SPLIT_VERDICT_SYSTEM
