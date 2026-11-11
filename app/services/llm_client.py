@@ -1057,6 +1057,22 @@ class LLMClient:
                     (OLLAMA_KEEP_ALIVE); in v2.0 the client sent "15m" - removed.
 
         """
+        # The generation parameters belong INSIDE `options` (LSBN-D-14, live
+        # 2026-11-11): ollama ignores unknown top-level fields, so a top-level
+        # `num_predict` was silently dropped - the model generated with its own
+        # default (unlimited) and the whole answer/reasoning budget arithmetic was
+        # never applied. Proven on the stand: top-level num_predict=4 returned 45
+        # tokens, options.num_predict=4 returned 4 (done_reason=length).
+        options: dict[str, Any] = {
+            "num_predict": int(num_predict),
+            "temperature": TEMPERATURE,
+        }
+        # The declared context is also the request's num_ctx: without it the server
+        # allocates its own default (262 144 on the AI server), the model no longer
+        # fits the GPU and generation degrades several times (the slow "thinking"
+        # of 2026-11-11).
+        if self.spec.context_tokens and self.spec.context_tokens > 0:
+            options["num_ctx"] = int(self.spec.context_tokens)
         payload: dict[str, Any] = {
             "model": self.spec.model,
             "messages": [
@@ -1064,8 +1080,7 @@ class LLMClient:
                 {"role": "user", "content": user_text},
             ],
             "stream": False,
-            "num_predict": num_predict,
-            "temperature": TEMPERATURE,
+            "options": options,
         }
         if think_flag is False:
             # An explicit thinking ban (as in v2.0: think:false saves seconds on
