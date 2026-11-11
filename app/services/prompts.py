@@ -186,7 +186,10 @@ def summary_split_system_prompt(limit: int) -> str:
     """
     return (
         "You are given ONE long note. Break it into ATOMIC FACTS: one fact per "
-        "note (part). Each part states exactly one self-contained fact and "
+        "note (part). A part is a complete self-contained STATEMENT of one "
+        "fact — one to three sentences, never a bare heading, never a "
+        "fragment, never a list of items, never a phrase cut in the middle. "
+        "A part shorter than 100 characters is a fragment and is wrong.  Each part states exactly one self-contained fact and "
         "carries ITS OWN names, numbers, dates, statuses, configs and paths - "
         "readable on its own, without references to the source or to other "
         "parts. Do not copy whole paragraphs and do not put several facts into "

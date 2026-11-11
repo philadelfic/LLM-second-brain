@@ -282,7 +282,7 @@ class MigrationService:
             for row in rows:
                 old_id = int(row["old_id"])
                 note = legacy.execute(
-                    "SELECT id, text, namespace, expires_at FROM notes "
+                    "SELECT id, text, namespace, expires_at, deleted_at FROM notes "
                     "WHERE id = ?",
                     (old_id,),
                 ).fetchone()
@@ -291,6 +291,16 @@ class MigrationService:
                     # to split — 'expired' closes the note without the model.
                     self._mark(
                         active, old_id, "expired", reason="исходника нет в прежней базе"
+                    )
+                    done += 1
+                    continue
+                if note["deleted_at"] is not None:
+                    # A note from the trash (live case 2026-11-11: the queue carried
+                    # five trashed notes and one of them was split into 75 fragments).
+                    # Splitting the trash spends the slot and pollutes nothing useful:
+                    # the note is closed, the union will not show it anyway.
+                    self._mark(
+                        active, old_id, "expired", reason="заметка в корзине"
                     )
                     done += 1
                     continue
