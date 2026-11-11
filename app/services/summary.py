@@ -109,6 +109,14 @@ MERGE_MAX_ROUNDS = 2
 #: number (silent truncation is forbidden).
 MERGE_COVERAGE_MIN = 1.0
 
+#: The split's own mechanical floor (LSBN-D-13). The strict word coverage is for
+#: merging; a fact-split legitimately rephrases the prose, so the mechanical check
+#: only catches gross loss. The authoritative verdict is the judge's
+#: (`JudgeService.verify_split`): the source and ALL parts go to it with the
+#: "nothing missed" question. Live 2026-11-11: two live splits stopped at 0.72 and
+#: 0.90 and never reached the judge — the gate was stricter than the reviewer.
+SPLIT_FACTS_MIN = 0.90
+
 
 @dataclass(frozen=True)
 class MergePart:
@@ -650,7 +658,7 @@ class SummaryService:
         if operation == "split":
             # one note = one fact: prose may be tightened, the fact skeleton may not
             coverage = facts_coverage(merged_source, texts)
-            if coverage < 1.0:
+            if coverage < SPLIT_FACTS_MIN:
                 return (
                     "the parts lost hard facts of the source — numbers, dates, "
                     f"versions or paths are missing (fact coverage {coverage:.2f}); "
