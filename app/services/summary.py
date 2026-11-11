@@ -195,6 +195,10 @@ _ELLIPSIS = "…"
 #: verbatim even when the connecting prose is tightened.
 _HARD_TOKEN_RE = re.compile(r"[0-9A-Za-z_./:=-]{2,}")
 
+#: Separators INSIDE a digit group ("5 000", "1_000", "3-5"): folded away
+#: before the fact comparison so formatting is not mistaken for a lost fact.
+_DIGIT_SEPARATOR_RE = re.compile(r"(?<=\d)[\s_.\u00a0]+(?=\d)")
+
 
 def facts_coverage(source: str, parts: list[str]) -> float:
     """The share of the source's HARD tokens (numbers, latin identifiers,
@@ -208,9 +212,14 @@ def facts_coverage(source: str, parts: list[str]) -> float:
             to change; a missing number or path is still a lost fact.
     """
     def hard(text: str) -> set[str]:
+        # Number shapes drift in the model's answer: "5 000" / "5_000" / "5-000"
+        # instead of "5000", or "1 000 000". The separators inside digit groups are
+        # folded before the tokens are compared (LSBN-D-13, the live 0.72 coverage
+        # case: facts that were present but written with a space).
+        folded = _DIGIT_SEPARATOR_RE.sub("", text)
         return {
             token.casefold()
-            for token in _HARD_TOKEN_RE.findall(text)
+            for token in _HARD_TOKEN_RE.findall(folded)
             if any(char.isdigit() for char in token)
         }
 

@@ -144,3 +144,10 @@ def test_verify_split_rejects_garbage():
     judge = _judge_with("ну не знаю")
     with pytest.raises(JudgeError):
         judge.verify_split("исходник", ["факт"])
+
+
+def test_facts_coverage_folds_number_separators():
+    """«5 000» и «5000» — один и тот же факт (живой случай покрытия 0.72)."""
+    source = "Лимит 5000 символов, таймаут 3600 с"
+    parts = ["Лимит 5 000 символов", "таймаут 3 600 с"]
+    assert _facts(source, parts) == 1.0
