@@ -163,8 +163,8 @@ def test_stream_disabled_and_generation_params(monkeypatch) -> None:
     # №49: дефолт кода — авто (0); при неизвестном контексте действует прежний
     # потолок v3.1.0 (legacy 35000) — поведение не изменилось.
     assert settings.summary_num_predict == 0
-    assert payload["num_predict"] == 35000
-    assert payload["temperature"] == 0.1
+    assert payload["options"]["num_predict"] == 35000
+    assert payload["options"]["temperature"] == 0.1
     assert "keep_alive" not in payload  # решение №6: моделью управляет сервер
 
 
@@ -185,8 +185,7 @@ def test_ollama_payload_bytes_minus_keep_alive(monkeypatch) -> None:
             {"role": "user", "content": NOTE},
         ],
         "stream": False,
-        "num_predict": 35000,  # №49: legacy-потолок (контекст неизвестен)
-        "temperature": 0.1,
+        "options": {"num_predict": 35000, "temperature": 0.1},  # №49: legacy-потолок
     }
     assert recorder.requests[0].read() == json.dumps(
         expected, separators=(",", ":"), ensure_ascii=False
@@ -207,8 +206,7 @@ def test_think_false_payload_bytes_minus_keep_alive(monkeypatch) -> None:
             {"role": "user", "content": NOTE},
         ],
         "stream": False,
-        "num_predict": 35000,  # №49: legacy-потолок (контекст неизвестен)
-        "temperature": 0.1,
+        "options": {"num_predict": 35000, "temperature": 0.1},  # №49: legacy-потолок
         "think": False,
     }
     assert recorder.requests[0].read() == json.dumps(
@@ -491,7 +489,7 @@ def test_merge_system_prompt_and_marked_texts(monkeypatch) -> None:
     assert payload["model"] == settings.summary_model
     assert payload["stream"] is False
     assert settings.merge_num_predict == 0  # №49: дефолт кода — авто
-    assert payload["num_predict"] == 35000  # legacy-потолок слияния
+    assert payload["options"]["num_predict"] == 35000  # legacy-потолок слияния
     service.close()
 
 
