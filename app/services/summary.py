@@ -493,6 +493,7 @@ class SummaryService:
             metas: list[ChatMeta] = []
             system = self._prompts.summary_merge_system
             base_user = self._prompts.merge_user.format(text_a=text_a, text_b=text_b)
+            base_user += self._size_hint(len(text_a) + len(text_b))
             parts, raw, meta = self._merge_round(system, base_user)
             metas.append(meta)
             rounds = 1
@@ -530,6 +531,7 @@ class SummaryService:
             metas: list[ChatMeta] = []
             system = self._prompts.summary_split_system
             base_user = self._prompts.split_user.format(text=text)
+            base_user += self._size_hint(len(text))
             parts, raw, meta = self._merge_round(system, base_user, operation="split")
             metas.append(meta)
             rounds = 1
@@ -613,6 +615,63 @@ class SummaryService:
             )
         return None
 
+    def _size_hint(self, chars: int) -> str:
+        """The part-count hint for merge/split (LSBN-D-13).
+
+            The model is bad at arithmetic under a limit: without the number it
+            returns one oversized part or silently shortens the text. The hint gives
+            the exact size of the source and the MINIMUM number of parts, so "two
+            notes instead of one" is asked for in numbers, not in prose.
+        """
+        limit = max(1, int(self._settings.max_note_chars))
+        parts = max(1, -(-chars // limit))
+        return (
+            f"\n\nSIZE: the source is {chars} characters; the note limit is {limit}. "
+            f"Return at least {parts} part(s), each within {limit} characters. "
+            "Dropping, shortening or summarizing the content is a failure: every fact, "
+            "name, number and date must be present in the parts."
+        )
+
+    @staticmethod
+    @staticmethod
+    def _balanced_objects(text: str) -> list[str]:
+        """Every balanced JSON object/array in the answer, in order of appearance.
+
+            A greedy `first '{' .. last '}'` slice breaks on answers where the model
+            adds prose with braces after the object or writes two objects in a row
+            (the live case of 2026-11-11: "не-JSON объект" on a real duplicate pair).
+            The scanner is string-aware: braces inside string values and escaped
+            quotes do not close the structure.
+        """
+        found: list[str] = []
+        start: int | None = None
+        depth = 0
+        in_string = False
+        escaped = False
+        for index, char in enumerate(text):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+                continue
+            if char in "{[":
+                if depth == 0:
+                    start = index
+                depth += 1
+            elif char in "}]":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start is not None:
+                        found.append(text[start : index + 1])
+                        start = None
+        return found
+
     @staticmethod
     def _extract_json(content: str) -> Any:
         """Extract the JSON object from the answer (robust to code fences and wrappers).
@@ -636,18 +695,19 @@ class SummaryService:
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             text = "\n".join(lines).strip()
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end > start:
-            text = text[start : end + 1]
-        try:
-            return json.loads(text)
-        except ValueError:
-            pass
-        try:
-            return json.loads(_escape_raw_quotes(text))
-        except ValueError as exc:
-            raise SummaryError("merge: не-JSON объект в ответе модели") from exc
+        def _as_parts(value: Any) -> Any:
+            # A bare array is the same answer in a different shape: {"parts": [...]}.
+            if isinstance(value, list):
+                return {"parts": value}
+            return value
+
+        for candidate in [text, *SummaryService._balanced_objects(text)]:
+            for prepared in (candidate, _escape_raw_quotes(candidate)):
+                try:
+                    return _as_parts(json.loads(prepared))
+                except ValueError:
+                    continue
+        raise SummaryError("merge: не-JSON объект в ответе модели")
 
     def close(self) -> None:
         """Close resources (interface-compatible with EmbeddingService)."""
