@@ -109,13 +109,18 @@ MERGE_MAX_ROUNDS = 2
 #: number (silent truncation is forbidden).
 MERGE_COVERAGE_MIN = 1.0
 
-#: The split's own mechanical floor (LSBN-D-13). The strict word coverage is for
+#: The split's own mechanical floor (LSBN-D-13) — 0.0: the split is NOT blocked by
+#: arithmetic at all, the only gate is the judge's verdict (`verify_split`).
+#: Oleg's decision: "проверка в конце должна быть обязательно: сама заметка и все
+#: новые заметки должны отправляться судье". Live 2026-11-11: four attempts on one
+#: note landed at 0.72/0.90/0.88/0.67 and never reached the judge — the mechanical
+#: check was the gate instead of the reviewer. The strict word coverage is for
 #: merging; a fact-split legitimately rephrases the prose, so the mechanical check
 #: only catches gross loss. The authoritative verdict is the judge's
 #: (`JudgeService.verify_split`): the source and ALL parts go to it with the
 #: "nothing missed" question. Live 2026-11-11: two live splits stopped at 0.72 and
 #: 0.90 and never reached the judge — the gate was stricter than the reviewer.
-SPLIT_FACTS_MIN = 0.85
+SPLIT_FACTS_MIN = 0.0
 
 
 @dataclass(frozen=True)
