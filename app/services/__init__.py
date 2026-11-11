@@ -1,21 +1,21 @@
-"""Service-слой (ARCHITECTURE §3.2): один код для MCP и REST.
+"""Service layer (ARCHITECTURE §3.2): one codebase for MCP and REST.
 
-`build_services` собирает все сервисы поверх одного `Settings` (frozen на
-время жизни процесса); главное приложение держит их на `app.state`.
-Фаза 3: EmbeddingService один на процесс — общий httpx-пул для гибридного
-поиска и дедупа записи; NoteService через DeduplicationService решает
-«дубликат / сохранить» (FR-4), SearchService — гибридный поиск (ARCH §4.2).
-Фаза 10: NamespaceService — реестр иерархических неймспейсов (карта для
-`memory_namespaces`; NoteService/SearchService держат собственный реестр
-для валидации записи и фильтров выдачи); ClassificationService — фоновая
-причёска default-заметок (Шаг 4).
-Фаза 11: три клиента LLM-слотов собираются здесь же — по одному на слот
-embedding/summary/judge (`LLMClient` по SlotSpec из Settings, решение №1);
-судья структуры и генератор описаний делят клиентов своих слотов, а
-стартовая проверка провайдеров (main.py, решение №5) идёт по этим же
-клиентам (`Services.llm_embedding/llm_summary/llm_judge`). Промпты
-клиентам инъектируются одним `PromptRegistry` (решение №7: системные
-редактируемые — с файловыми переопределениями, user-шаблоны — зашитые).
+    `build_services` wires all services on top of a single `Settings` (frozen for
+    the lifetime of the process); the main application keeps them on `app.state`.
+    Phase 3: EmbeddingService is one per process — a shared httpx pool for hybrid
+    search and write-time dedup; NoteService via DeduplicationService decides
+    "duplicate / save" (FR-4), SearchService — hybrid search (ARCH §4.2).
+    Phase 10: NamespaceService — registry of hierarchical namespaces (the map for
+    `memory_namespaces`; NoteService/SearchService keep their own registry for
+    write validation and output filters); ClassificationService — background
+    grooming of default notes (Step 4).
+    Phase 11: three LLM slot clients are wired here too — one per slot
+    embedding/summary/judge (`LLMClient` per SlotSpec from Settings, decision #1);
+    the structure judge and the description generator share their slots' clients,
+    and the startup provider check (main.py, decision #5) walks the same clients
+    (`Services.llm_embedding/llm_summary/llm_judge`). Prompts are injected into
+    the clients by a single `PromptRegistry` (decision #7: system prompts are
+    editable with file overrides, user templates are baked in).
 """
 
 from __future__ import annotations
@@ -32,9 +32,9 @@ from app.services.judge import JudgeService
 from app.services.links import LinksService
 from app.services.llm_client import LLMClient, SlotSpec
 from app.services.logs import LogsService
-# LSBN-F-22 (M2): импорт модуля регистрирует джобу `migration` в реестре
-# каркаса (`jobs.JOB_BUILDERS`) — как `warnings`/`terms_normalize`
-# (импорт односторонний: migration → jobs).
+# LSBN-F-22 (M2): importing the module registers the `migration` job in the framework
+# registry (`jobs.JOB_BUILDERS`) — same as `warnings`/`terms_normalize`
+# (one-way import: migration → jobs).
 from app.services.migration import MigrationService
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
@@ -45,9 +45,9 @@ from app.services.search import SearchService
 from app.services.skills import SkillsService
 from app.services.summary import SummaryService
 from app.services.terms import TermsService
-# №32 (3.2.0): импорт модуля регистрирует джобу `terms-normalize` в реестре
-# каркаса (`jobs.JOB_BUILDERS`) — как `warnings` строкой выше (импорт
-# односторонний: terms_normalize → jobs).
+# #32 (3.2.0): importing the module registers the `terms-normalize` job in the registry
+# (`jobs.JOB_BUILDERS`) — same as `warnings` above (one-way import:
+# terms_normalize → jobs).
 from app.services.terms_normalize import TermsNormalizerService
 from app.services.user_facts import UserFactsService
 from app.services.warnings import WarningsService
@@ -81,62 +81,62 @@ __all__ = [
 
 @dataclass(frozen=True)
 class Services:
-    """Контейнер сервисов; собирается один раз при старте приложения.
+    """Service container; assembled once at application startup.
 
-    `llm_embedding/llm_summary/llm_judge` — клиенты трёх LLM-слотов
-    (решение №1): потребители делят клиент своего слота, а стартовая
-    проверка провайдеров (main.py, решение №5) ходит по ним же. Поля
-    опциональны (None) только для DI-сборок тестов, где сервисы
-    подменяются фейками без клиентов: стартовая проверка у такой сборки —
-    заглушка (бриф §3).
+            `llm_embedding/llm_summary/llm_judge` — clients of the three LLM slots
+            (decision #1): consumers share the client of their slot, and the startup
+            provider check (main.py, decision #5) walks the same clients. The fields
+            are optional (None) only for test DI builds where services are replaced
+            with fakes without clients: the startup check of such a build is a
+            stub (brief §3).
     """
 
     notes: NoteService
     search: SearchService
     embedding: EmbeddingService
     dedup: DeduplicationService
-    summary: SummaryService  # воркер — единственный потребитель (режим «Б»)
-    judge: JudgeService  # судья дедупа — воркер, решение по кандидатам (Этап 3.2)
-    backup: BackupService  # петля снапшотов — asyncio-таска в lifespan
-    namespaces: NamespaceService  # реестр узлов (Фаза 10, memory_namespaces)
-    classifier: ClassificationService  # причёска default-заметок (Фаза 10, Шаг 4)
-    promotion: PromotionService  # триггер домена (Фаза 10, Шаг 5, memory_namespaces + воркер)
-    # 3.0.0: область «user» (lsb-0009-01) — атомарные факты о пользователе.
-    # Обязательна, как notes/search: контейнер в проде и в DI-сборках полный.
-    # embedding — общий экземпляр слота (запись факта его не зовёт — §3.4;
-    # точка сборки для гибридного поиска области).
+    summary: SummaryService  # worker — the only consumer (mode "B")
+    judge: JudgeService  # dedup judge — worker, verdicts on candidates (Stage 3.2)
+    backup: BackupService  # snapshot loop — asyncio task in lifespan
+    namespaces: NamespaceService  # namespace registry (Phase 10, memory_namespaces)
+    classifier: ClassificationService  # grooming of default notes (Phase 10, Step 4)
+    promotion: PromotionService  # domain trigger (Phase 10, Step 5, memory_namespaces + worker)
+    # 3.0.0: the "user" area (lsb-0009-01) — atomic facts about the user.
+    # Mandatory, like notes/search: the container is complete in prod and in DI builds.
+    # embedding — shared slot instance (fact writes never call it — §3.4;
+    # assembly point for the area's hybrid search).
     user_facts: UserFactsService
-    # 3.0.0: область «terms» (lsb-0008-01) — термины с ключом (term + context).
-    # Обязательна, как user_facts: контейнер в проде и в DI-сборках полный.
-    # embedding — общий экземпляр слота (запись его не зовёт — близость
-    # контекста триграммная, §3.5; точка сборки гибридного поиска области).
+    # 3.0.0: the "terms" area (lsb-0008-01) — terms keyed by (term + context).
+    # Mandatory, like user_facts: the container is complete in prod and in DI builds.
+    # embedding — shared slot instance (writes never call it — context similarity
+    # is trigram-based, §3.5; assembly point for the area's hybrid search).
     terms: TermsService
-    # 3.1.0: связи заметок (lsb-0010) — уровень 0 («ленивый граф»). В проде (build_services)
-    # всегда с общим экземпляром search; DI-сборки тестов без связей передают None.
+    # 3.1.0: note links (lsb-0010) — level 0 ("lazy graph"). In prod (build_services)
+    # it is always wired with the shared search instance; test DI builds without links pass None.
     links: LinksService
-    # 3.2.0 (LSBN-F-10, arch §6.2/§13.11): область «Логи ассистента» — журнал
-    # действий ассистента («что сделано, почему, объект, результат, что
-    # проверено»). Собирается ВСЕГДА, как notes/terms/user_facts: REST оператора
-    # и слой истории обязаны работать и у выключенной области (§13.11) — флаг
-    # `AREA_LOGS_ENABLED` гейтит только поверхность MCP и фон. `embedding` —
-    # общий экземпляр слота (путь записи его не зовёт; точка сборки поиска 03).
+    # 3.2.0 (LSBN-F-10, arch §6.2/§13.11): the "Assistant logs" area — a journal of
+    # assistant actions ("what was done, why, the object, the outcome, what was
+    # verified"). Collected ALWAYS, like notes/terms/user_facts: operator REST
+    # and the history layer must work with the area disabled (§13.11) — the flag
+    # `AREA_LOGS_ENABLED` gates only the MCP surface and the background. `embedding` —
+    # shared slot instance (the write path never calls it; assembly point for search 03).
     logs: LogsService | None = None
-    llm_embedding: LLMClient | None = None  # клиент слота embedding (Фаза 11, решение №5)
-    llm_summary: LLMClient | None = None  # клиент слота summary (summarize/merge/classify/describe)
-    llm_judge: LLMClient | None = None  # клиент слота judge (дедуп + судья структуры)
-    # LSBN-F-12 (3.2.0): decision-слот — клиент (/v1/systemone) и сервис решений.
-    # Пара собирается ТОЛЬКО при settings.decision_enabled (симметрично флагам
-    # областей): выключенный слот — None, потребители ходят генеративным путём.
-    llm_decision: LLMClient | None = None  # клиент слота decision
-    decision: DecisionService | None = None  # решения: порог/зона/разрыв
-    # 3.0.0: область навыков (lsb-0007). Опционально — только для DI-сборок
-    # тестов, созданных до появления области (их Services(...) без skills
-    # остаются валидны); в проде build_services всегда кладёт сервис.
+    llm_embedding: LLMClient | None = None  # embedding slot client (Phase 11, decision #5)
+    llm_summary: LLMClient | None = None  # summary slot client (summarize/merge/classify/describe)
+    llm_judge: LLMClient | None = None  # judge slot client (dedup + structure judge)
+    # LSBN-F-12 (3.2.0): the decision slot — client (/v1/systemone) and decision service.
+    # The pair is built ONLY when settings.decision_enabled is on (symmetric with the area
+    # flags): a disabled slot is None, consumers fall back to the generative path.
+    llm_decision: LLMClient | None = None  # decision slot client
+    decision: DecisionService | None = None  # decisions: threshold/zone/gap
+    # 3.0.0: skills area (lsb-0007). Optional — only for test DI builds created
+    # before the area existed (their Services(...) without skills remain valid);
+    # in prod build_services always provides the service.
     skills: SkillsService | None = None
-    # 3.2.0 (№12, no12-01/no12-02): состояние общей поверхности предупреждений
-    # `warnings` — читается MCP `warnings_list`, REST `/warnings` и
-    # `/health.warnings`. Классификатор при сборке не нужен (чтение — только
-    # SQL); опционально ради старых DI-сборок, как `skills`.
+    # 3.2.0 (#12, no12-01/no12-02): shared warnings surface state
+    # `warnings` — read by MCP `warnings_list`, REST `/warnings` and
+    # `/health.warnings`. No classifier needed at build time (reads are pure SQL);
+    # optional for legacy DI builds, like `skills`.
     warnings: WarningsService | None = None
 
 
@@ -145,41 +145,41 @@ def build_services(
     summary: SummaryService | None = None,
     judge: JudgeService | None = None,
 ) -> Services:
-    """Собрать сервисы из настроек (Settings frozen — снимок на процесс).
+    """Assemble services from settings (Settings frozen — a snapshot per process).
 
-    `summary` — DI e2e-тестов (фейк вместо живого слота summary);
-    по умолчанию — настоящий SummaryService. `judge` — DI судьи дедупа
-    (Фаза 8, Этап 3.1), по тому же принципу. Клиенты трёх слотов
-    собираются из Settings всегда (стартовая проверка №5 проверяет
-    конфигурацию слотов, даже если сервисы подменены фейками).
+            `summary` — DI of e2e tests (a fake instead of a live summary slot);
+            default — the real SummaryService. `judge` — DI of the dedup judge
+            (Phase 8, Stage 3.1), same principle. The clients of the three slots
+            are always built from Settings (the startup check #5 verifies slot
+            configuration even when services are replaced with fakes).
 
-    Сервисы областей (skills/terms/user_facts/logs) собираются ВСЕГДА, независимо
-    от флагов `AREA_*_ENABLED` (№40, релиз 3.2.0): операторский REST и слой
-    истории должны иметь доступ к данным выключенной области (решение
-    владельца 2026-10-08). Флаг гейтит только поверхность MCP, раздел/анонс в
-    инструкции и фоновую петлю `areas` — не сборку.
+            Area services (skills/terms/user_facts/logs) are ALWAYS built,
+            regardless of the `AREA_*_ENABLED` flags (#40, release 3.2.0): operator
+            REST and the history layer must be able to read a disabled area's data.
+            The flag gates only the MCP surface, the instruction section/announcement
+            and the background `areas` loop — not the assembly.
 
-    Raises:
-        ConfigError: реестр промптов невалиден (например, judge_system
-            из файла без маркеров «ДУБЛЬ»/«НЕ ДУБЛЬ») — старт сервиса
-            обязан прерваться.
+            Raises:
+                ConfigError: the prompt registry is invalid (for example, judge_system
+                    loaded from a file without the required duplicate/no-duplicate
+                    markers) — service startup must abort.
     """
     registry = PromptRegistry(
         settings.prompts_dir,
         decision_max_questions=settings.decision_max_questions,
-        # 3.4.1 (LSBN-T-26): число в промптах merge/split — то же, что
-        # валидация записи и цель миграции (одно число — одно место).
+        # 3.4.1 (LSBN-T-26): the number in merge/split prompts equals the write
+        # validation limit and the migration target (one number — one place).
         max_note_chars=settings.max_note_chars,
     )
-    # Клиенты слотов — по одному на слот (решение №1); их делят сервисы
-    # слота, и по ним же идёт стартовая проверка (решение №5).
+    # Slot clients — one per slot (decision #1); slot services share them, and
+    # the startup provider check walks the same clients (decision #5).
     llm_embedding = LLMClient(SlotSpec.for_embedding(settings))
     llm_summary = LLMClient(SlotSpec.for_summary(settings))
     llm_judge = LLMClient(SlotSpec.for_judge(settings))
-    # Клиенты ОПЕРАЦИЙ (LSBN-F-34): плоский env `<ОПЕРАЦИЯ>_<ПОЛЕ>` (цепочка
-    # env операции → env слота → дефолт) поверх слот-групп. Одинаковые specs
-    # (операции без переопределения) делят один HTTP-пул — раскладка по
-    # клиентам меняется только там, где оператор переопределил процесс.
+    # Operation clients (LSBN-F-34): flat env `<OPERATION>_<FIELD>` (chain:
+    # operation env → slot env → default) on top of slot groups. Identical specs
+    # (operations without overrides) share one HTTP pool — the client layout
+    # changes only where the operator overrode the model.
     operation_clients: dict[str, LLMClient] = {}
     by_spec: dict[SlotSpec, LLMClient] = {}
     for operation in OPERATIONS:
@@ -189,8 +189,8 @@ def build_services(
             client = LLMClient(spec)
             by_spec[spec] = client
         operation_clients[operation] = client
-    # LSBN-F-12: пара decision собирается только при включённом слоте
-    # (выключенный не делает ни одного вызова — FR-1.1).
+    # LSBN-F-12: the decision pair is built only when the slot is enabled
+    # (a disabled slot makes no calls — FR-1.1).
     llm_decision: LLMClient | None = None
     decision: DecisionService | None = None
     if settings.decision_enabled:
@@ -200,8 +200,8 @@ def build_services(
     dedup = DeduplicationService(settings)
     namespaces = NamespaceService(settings)
     search = SearchService(settings, embedding)
-    # 3.1.0: связи заметок (lsb-0010) — уровень 0 живёт над тем же search
-    # (общий экземпляр: тот же эмбеддер/пороги, без второй точки сборки).
+    # 3.1.0: note links (lsb-0010) — level 0 runs on the same search instance
+    # (shared instance: same embedder/thresholds, no second assembly point).
     links = LinksService(settings, search=search)
     promotion = PromotionService(
         settings,
@@ -214,8 +214,8 @@ def build_services(
         ),
         namespaces=namespaces,
     )
-    # №30 (3.2.0): save получает подсказку «похожее» — той же точкой поиска,
-    # что и гибрид (FTS+Dice, без модели); контейнер кладёт тот же notes.
+    # #30 (3.2.0): save receives the "similar" hint from the same search point
+    # as the hybrid path (FTS+Dice, no model); the container wires the same notes.
     notes = NoteService(settings, embedding, dedup)
     notes.set_similar_finder(search.similar_by_text)
     return Services(
@@ -230,8 +230,8 @@ def build_services(
                 settings,
                 llm={
                     operation: operation_clients[operation]
-                    # "split" — нарезка миграции (LSBN-F-22 M2): тот же
-                    # реестр операций, SPLIT_* env → наследование слота.
+                    # "split" — migration splitting (LSBN-F-22 M2): the same operations
+                    # registry, SPLIT_* env → slot inheritance.
                     for operation in ("summarize", "title", "merge", "split")
                 },
                 registry=registry,
@@ -249,9 +249,9 @@ def build_services(
         ),
         backup=BackupService(settings, namespaces=namespaces),
         namespaces=namespaces,
-        # LSBN-F-12: судья и классификатор получают decision-сервис как
-        # `decider` (выключенный слот — None, поведение v3.1.0); вероятности
-        # решений видны только в журнале (пишет сам DecisionService).
+        # LSBN-F-12: the judge and the classifier receive the decision service as
+        # `decider` (disabled slot — None, v3.1.0 behavior); decision probabilities
+        # are visible only in the logs (written by DecisionService itself).
         classifier=ClassificationService(
             settings, llm=operation_clients["classify"], registry=registry, decider=decision
         ),
@@ -261,24 +261,24 @@ def build_services(
         llm_judge=llm_judge,
         llm_decision=llm_decision,
         decision=decision,
-        # Субстрат 3.0.0: сервис области навыков (lsb-0007-01); embedding —
-        # общий экземпляр слота (запись его не зовёт — точка сборки для
-        # поиска/антисинонимии трека).
+        # 3.0.0 substrate: skills area service (lsb-0007-01); embedding — shared
+        # slot instance (writes never call it — assembly point for track
+        # search/anti-synonymy).
         skills=SkillsService(settings, embedding=embedding),
-        # Субстрат 3.0.0: сервис области «user» (lsb-0009-01); embedding —
-        # общий экземпляр слота (запись факта его не зовёт — дедуп триграммами,
-        # arch lsb-0009 §3.4; точка сборки гибридного поиска области).
+        # 3.0.0 substrate: "user" area service (lsb-0009-01); embedding — shared
+        # slot instance (fact writes never call it — trigram dedup,
+        # arch lsb-0009 §3.4; assembly point for the area's hybrid search).
         user_facts=UserFactsService(settings, embedding=embedding),
-        # Субстрат 3.0.0: сервис области terms (lsb-0008-01); embedding —
-        # общий экземпляр слота (запись его не зовёт — близость контекста
-        # триграммная, arch lsb-0008 §3.5; точка сборки гибридного поиска).
+        # 3.0.0 substrate: terms area service (lsb-0008-01); embedding — shared
+        # slot instance (writes never call it — context similarity is
+        # trigram-based, arch lsb-0008 §3.5; assembly point for hybrid search).
         terms=TermsService(settings, embedding=embedding),
         links=links,
-        # 3.2.0 (LSBN-F-10): сервис области «Логи ассистента» (f10-02); embedding —
-        # общий экземпляр слота (запись его не зовёт — вектор догоняет петля
-        # areas; точка сборки поиска области — f10-03).
+        # 3.2.0 (LSBN-F-10): "Assistant logs" area service (f10-02); embedding —
+        # shared slot instance (writes never call it — the areas loop catches up
+        # the vector; area search assembly point — f10-03).
         logs=LogsService(settings, embedding=embedding),
-        # 3.2.0 (№12): общая поверхность предупреждений (no12-02) — только SQL,
-        # классификатор не нужен (пишет джоба `warnings`, №12 FR-3.2/§13.4).
+        # 3.2.0 (#12): shared warnings surface (no12-02) — pure SQL,
+        # no classifier needed (writes come from the `warnings` job, #12 FR-3.2/§13.4).
         warnings=WarningsService(settings, classifier=None, namespaces=namespaces),
     )

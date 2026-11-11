@@ -5,6 +5,57 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.5.0] - 2026-11-01
+
+Release 3.5.0 — "Thinking models without losing the answer": a call now carries
+two independent budgets — the reasoning no longer eats the useful answer
+(the `lsbdef-0008` class, the flint merge case), an answer eaten by reasoning
+is recognized, retried once with a bigger budget and reported as its own
+cause; the merge parser repairs the raw-quote answers of reasoning models;
+the assistant-logs area gains a one-handle period export for release gates;
+the migration health block learns to speak reverse mode, and a down-up cycle
+no longer dies on a taken away-base name.
+
+### Added
+
+* **Answer vs reasoning budget (LSBN-T-33)** — `SLOT_REASONING_NUM_PREDICT`
+  (slot level) and `<OP>_REASONING_NUM_PREDICT` (per operation) set a
+  reasoning budget; the wire limit becomes `answer + reasoning` clamped by
+  the context window and the defensive cap, so thinking stops taking from
+  the answer. Empty content with thinking present is a distinct error
+  (`LLMReasoningBudgetError`) with one auto-retry at a doubled budget (a
+  request-shaping retry — back-off and the slot breaker are not involved).
+  `ChatMeta`, the journal and `/health.slots` carry the split budgets;
+  `/health.operations` shows them per operation; the config fingerprint
+  covers the new fields (attention clears on restart after a change).
+* **Period export of the assistant logs (F-26)** — `logs_export` builds the
+  release-gate journal digest as a ready-made markdown file in
+  `<db_dir>/exports/` (visible on the host volume) plus a short summary in
+  the response: same slices as `logs_search`, at least one period bound
+  required, entries oldest-first grouped by day with full field text.
+  Read-only; the MCP surface grows to 32 tools and the awareness-cost
+  ceiling is rebased accordingly (88500T, reason recorded).
+* **`/health.migration` speaks reverse mode (D-11)** — the block carries
+  `direction: forward|reverse`; reverse states show `poured_rows` (delta
+  rows of all tables) and `kept_parts` instead of the forward note counter
+  and skip the forward invariant — the old output read as a migration
+  failure.
+
+### Fixed
+
+* **Raw quotes inside merge JSON values are repaired (T-33/T-23)** —
+  reasoning models return a meaning-valid parts object with unescaped
+  quotes inside string values; a conservative repair pass escapes them
+  before parsing, parts survive with the text intact, and a still-broken
+  answer is refused exactly as before.
+* **Away-base name resolved before the pour (D-12)** — a down-up cycle
+  leaves a chain-relative base with the same CHECK as the active one; the
+  next return-up or abort died at swap with "the away-base name is taken by
+  a foreign file". The name is now picked before the pour (suffix
+  `.away`/`.awayN` when taken), it fans out into `state.prev_file` and the
+  receiver chain, and swap keeps its fail-closed refusal as defense in
+  depth.
+
 ## [3.4.1] - 2026-10-29
 
 Release 3.4.1 — "One number for the note limit, a background that degrades politely": the note limit leaves the code for a single configuration value, the migration job gets its own slicing cadence, and the background job framework stops grinding through broken providers — a failing slot now pauses whole batches instead of timing out item by item, a broken slot gates every job that shares it (including external ones), and a freshly saved note can no longer miss its vectorization wake-up.

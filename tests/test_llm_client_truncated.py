@@ -1,11 +1,11 @@
-"""Обрезка против пустого ответа: правило первенства (lsbdef-0008, 3.2.0).
+"""The trim versus the empty answer: the precedence rule (lsbdef-0008, 3.2.0).
 
-Юнит через httpx.MockTransport — без сети. Пустой `content` при
-`done_reason`/`finish_reason = length` — это ОБРЕЗКА бюджета (признак
-`truncated`), а не «пустой ответ» (`empty`): ровно этот случай
-(reasoning-модель съела бюджет вывода) гнал очередь судьи в вечный цикл.
-Признаки взаимоисключающие, поэтому `classify_llm_error` штатно даёт
-`SlotOutcome.TRUNCATED`. Непустой обрезанный ответ по-прежнему возвращается.
+    A unit via httpx.MockTransport — no network. An empty `content` at
+    `done_reason`/`finish_reason = length` is a budget TRIM (the `truncated`
+    flag), not an "empty answer" (`empty`): exactly this case (a reasoning model
+    ate the output budget) drove the judge queue into an eternal loop. The flags
+    are mutually exclusive, so `classify_llm_error` regularly gives
+    `SlotOutcome.TRUNCATED`. A non-empty trimmed answer is still returned.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ def openai_body(**over: object) -> dict:
 
 
 def test_empty_with_length_is_truncated() -> None:
-    """`done_reason=length` + пустой content → truncated, а НЕ empty (§13.8)."""
+    """`done_reason=length` + empty content → truncated, NOT empty (§13.8)."""
     body = ollama_body(done_reason="length")
     body["message"]["content"] = ""
     with pytest.raises(LLMError) as excinfo:
@@ -67,7 +67,7 @@ def test_empty_with_length_is_truncated() -> None:
 
 
 def test_empty_without_length_is_empty() -> None:
-    """`done_reason=stop` + пустой content → прежний empty, без truncated."""
+    """`done_reason=stop` + empty content → the old empty, without truncated."""
     body = ollama_body(done_reason="stop")
     body["message"]["content"] = "   "
     with pytest.raises(LLMError) as excinfo:
@@ -77,7 +77,7 @@ def test_empty_without_length_is_empty() -> None:
 
 
 def test_truncated_with_content_returns_content() -> None:
-    """Непустой обрезанный ответ возвращается; признак уходит в ChatMeta."""
+    """A non-empty trimmed answer is returned; the flag goes into ChatMeta."""
     body = ollama_body(done_reason="length")
     result = make_client(make_spec(), body).chat_result("sys", "user")
     assert result.content == "Ответ модели."
@@ -86,7 +86,7 @@ def test_truncated_with_content_returns_content() -> None:
 
 
 def test_openai_length_same_rule() -> None:
-    """openai `finish_reason=length` + пустой content → truncated (то же правило)."""
+    """openai `finish_reason=length` + empty content → truncated (the same rule)."""
     body = openai_body()
     body["choices"][0]["message"]["content"] = ""
     body["choices"][0]["finish_reason"] = "length"

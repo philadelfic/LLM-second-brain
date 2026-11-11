@@ -1,8 +1,8 @@
-"""Ротация с учётом пометок (№14, 3.2.0, arch §13.3).
+"""Rotation with marks (#14, 3.2.0, arch §13.3).
 
-Помеченный сайдкаром `.bad` снапшот исключается из кандидатов ротации: он не
-вытесняет годные и не удаляется молча — решение о судьбе копии принимает
-человек (FR-2.3).
+    A snapshot marked by a `.bad` sidecar is excluded from the rotation
+    candidates: it neither pushes out good ones nor is silently deleted — the
+    copy's fate is decided by a human (FR-2.3).
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def _snapshot(backup_dir: Path, stamp: str) -> Path:
 
 class TestRotateMarked:
     def test_rotate_skips_bad_marked(self, tmp_path: Path) -> None:
-        """Помеченный переживает ротацию; годные ротируются как раньше."""
+        """The marked one survives the rotation; the good ones rotate as before."""
         service, backup_dir = _service(tmp_path, keep=2)
         oldest = _snapshot(backup_dir, "20260101T000000Z")
         second = _snapshot(backup_dir, "20260102T000000Z")
@@ -48,15 +48,15 @@ class TestRotateMarked:
             "{}", encoding="utf-8"
         )
         removed = service.rotate()
-        # Кандидаты — только годные (second, third, newest): вытесняется second.
+        # The candidates — only the good ones (second, third, newest): second is pushed out.
         assert removed == [second]
-        assert oldest.exists()  # помеченный в живых (не удалён молча)
+        assert oldest.exists()  # the marked one alive (not silently deleted)
         assert oldest.with_name(oldest.name + VERIFY_MARKER_SUFFIX).exists()
         assert third.exists()
         assert newest.exists()
 
     def test_rotate_keeps_all_when_marked_exceed_keep(self, tmp_path: Path) -> None:
-        """Если все сверх нормы помечены — не трогаем никого."""
+        """When everything over the norm is marked — nobody is touched."""
         service, backup_dir = _service(tmp_path, keep=1)
         first = _snapshot(backup_dir, "20260101T000000Z")
         second = _snapshot(backup_dir, "20260102T000000Z")

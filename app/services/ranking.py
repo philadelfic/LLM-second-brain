@@ -1,14 +1,14 @@
-"""Общие примитивы ранжирования поиска (релиз 3.0.0): RRF и FTS-выражение.
+"""The shared search ranking primitives (3.0.0): RRF and the FTS expression.
 
-Вынесены из `app.services.search` при добавлении субстрата областей
-(3.0.0): гибридный поиск заметок и гибридный поиск внутри области сливают
-источники одинаково — `score(d) = Σ_sources 1/(RRF_K + rank_source)`,
-rank с 1 — и строят одно и то же FTS-выражение запроса (слова ≥3 символов
-как цитированные подстроки через OR; trigram-контракт, BUG-001).
+    Extracted from `app.services.search` when the area substrate arrived (3.0.0):
+    the hybrid note search and the in-area hybrid search merge their sources the
+    same way - `score(d) = sum over sources of 1/(RRF_K + rank_source)` with ranks
+    from 1 - and build the same FTS query expression (words >= 3 characters as
+    quoted substrings joined by OR; the trigram contract, BUG-001).
 
-Поведение существующего поиска заметок не меняется: `SearchService` зовёт
-эти же функции (RRF-слияние и `_match_expression`), а области —
-`AreaSearch` (app.services.areas).
+    The behavior of the existing note search does not change: `SearchService`
+    calls these very functions (the RRF merge and `_match_expression`), and the
+    areas use `AreaSearch` (app.services.areas).
 """
 
 from __future__ import annotations
@@ -17,36 +17,37 @@ import re
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
-# Разбивка составных токенов запроса (BUG-001): «open-webui» → «open» +
-# «webui» — FTS ловит тексты, где написание отличается («Open WebUI»).
+# The query's compound-token split (BUG-001): "open-webui" -> "open" +
+#"webui" - FTS catches texts whose spelling differs ("Open WebUI").
 _TOKEN_SPLIT_RE = re.compile(r"[^0-9A-Za-zА-Яа-яЁё]+")
 
-# --- бусты ранжирования после RRF (релиз 3.4.0, LSBN-F-14) ------------------
-# Детерминированные множители поверх слияния (`apply_boosts`), без моделей и
-# VRAM. Веса — константы КОДА (не env; фиксируются в каноне через changes.md);
-# операторский выключатель — env RANKING_BOOSTS_ENABLED
-# (app.config.Settings.ranking_boosts_enabled, default true). Бусты задают
-# ТОЛЬКО порядок выдачи — поле rrf_score элемента остаётся сырым RRF
-# (контракт выдачи §4.2.6 / шапки F-13 не меняются).
+#--- ranking boosts after RRF (3.4.0, LSBN-F-14) ------------------
+# Deterministic multipliers over the merge (`apply_boosts`), no models and
+# no VRAM. The weights are CODE constants (not env; pinned in the canon via
+# changes.md); the operator switch is the env RANKING_BOOSTS_ENABLED
+# (app.config.Settings.ranking_boosts_enabled, default true). The boosts shape
+# the OUTPUT ORDER ONLY - an item's rrf_score stays the raw RRF
+# (the §4.2.6 output contract / the F-13 headers do not change).
 
-TITLE_EXACT_BOOST = 0.25  # title совпал со значимыми словами запроса целиком
-TITLE_PREFIX_BOOST = 0.15  # title начинается со строки запроса (casefold)
-FRESHNESS_BOOST_MAX = 0.10  # заметка обновлена только что («сегодня»)
-FRESHNESS_WINDOW_DAYS = 30  # окно линейного спада свежести (дней)
-LINKED_BOOST = 0.05  # у заметки есть строка в links (любая сторона)
+TITLE_EXACT_BOOST = 0.25  # the title matched the query's significant words exactly
+TITLE_PREFIX_BOOST = 0.15  # the title starts with the query string (casefold)
+FRESHNESS_BOOST_MAX = 0.10  # the note was updated just now ("today")
+FRESHNESS_WINDOW_DAYS = 30  # the linear freshness decay window (days)
+LINKED_BOOST = 0.05  # the note has a links row (either side)
 
-# Формат меток времени заметок (DDL: strftime('%Y-%m-%dT%H:%M:%SZ','now')).
+# The note timestamp format (DDL: strftime('%Y-%m-%dT%H:%M:%SZ','now')).
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _SECONDS_PER_DAY = 86400.0
 
 
 def significant_tokens(text: str) -> list[str]:
-    """Значимые токены текста: слова ≥3 символов плюс ≥3-символьные части
-    составных токенов, в порядке текста, без дублей (BUG-001).
+    """The significant tokens of a text: words >= 3 characters plus the >= 3-char
+            parts of compound tokens, in text order, without duplicates (BUG-001).
 
-    «open-webui» → «open-webui», «open», «webui» — FTS ловит тексты, где
-    написание отличается («Open WebUI»); «отчёт» → только «отчёт». Порядок
-    текста сохраняется (первое вхождение), повтор не добавляется.
+            "open-webui" -> "open-webui", "open", "webui" - FTS catches texts whose
+            spelling differs ("Open WebUI"); "report" -> only "report". The text order
+            is preserved (the first occurrence), a repeat is not added.
+
     """
     tokens: list[str] = []
     for word in text.split():
@@ -59,13 +60,14 @@ def significant_tokens(text: str) -> list[str]:
 
 
 def match_expression(query: str) -> str | None:
-    """Значимые слова запроса как цитированные подстроки через OR (FTS).
+    """The significant query words as quoted substrings joined by OR (FTS).
 
-    OR, а не AND (BUG-001): AND выкидывал заметку целиком, если хотя бы одно
-    слово запроса не встречалось в её тексте. При OR BM25 ранжирует по
-    числу/редкости совпавших слов — запись со всеми словами выше; шум
-    отсекается RRF-слиянием и top_k. None — нет ни одного слова, по которому
-    trigram вообще может искать (все слова короче 3 символов).
+            OR, not AND (BUG-001): AND dropped a note entirely when even one query
+            word was absent from its text. With OR, BM25 ranks by the number/rarity of
+            the matched words - a record with all the words ranks higher; the noise is
+            cut by the RRF merge and top_k. None - there is not a single word the
+            trigram could search by (all the words are shorter than 3 characters).
+
     """
     tokens = significant_tokens(query)
     if not tokens:
@@ -76,12 +78,14 @@ def match_expression(query: str) -> str | None:
 
 
 def fuse_rrf(rankings: Sequence[Sequence[int]], rrf_k: int) -> dict[int, float]:
-    """Слияние ранжированных списков id: `score(d) = Σ 1/(RRF_K + rank)`.
+    """Merge ranked id lists: `score(d) = sum of 1/(RRF_K + rank)`.
 
-    RRF устойчив к несопоставимым шкалам (косинус vs BM25); вклад источника —
-    позиция записи в его выдаче (rank с 1). Повтор id внутри одного списка
-    суммируется (в штатных выдачах дублей нет — дедупликация выше), id из
-    разных источников складываются — это и есть дедупликация слияния.
+            RRF is robust to incomparable scales (cosine vs BM25); a source's
+            contribution is the record's position in its output (rank from 1). A
+            repeated id within one list adds up (the routine outputs have no
+            duplicates - deduplication happens above); ids from different sources
+            add up - that is exactly the merge's deduplication.
+
     """
     scores: dict[int, float] = {}
     for ranking in rankings:
@@ -90,23 +94,25 @@ def fuse_rrf(rankings: Sequence[Sequence[int]], rrf_k: int) -> dict[int, float]:
     return scores
 
 
-# --- бусты ранжирования (релиз 3.4.0, LSBN-F-14) -----------------------------
+#--- the ranking boosts (3.4.0, LSBN-F-14) -----------------------------
 
 
 def utc_now_iso() -> str:
-    """Текущий момент UTC в формате меток заметок — вход `now` бустов."""
+    """The current UTC moment in the note-stamp format - the `now` input of the boosts."""
     return datetime.now(timezone.utc).strftime(_TS_FORMAT)
 
 
 def title_boost(query: str, title: str | None) -> float:
-    """Буст заголовка: точное совпадение сильнее префиксного.
+    """The title boost: an exact match outranks a prefix one.
 
-    «Точное» (TITLE_EXACT_BOOST) — значимые слова запроса (`significant_tokens`,
-    в порядке текста) в casefold совпадают с названием ЦЕЛИКОМ; «префиксное»
-    (TITLE_PREFIX_BOOST) — название начинается со строки запроса (casefold,
-    пробелы по краям запроса отброшены). Ступени взаимоисключаемы: точное
-    проверяется первым и префиксное уже не добавляется. None/пустой title —
-    буста нет (легаси-заметки без названия не штрафуются и не поднимаются).
+            "Exact" (TITLE_EXACT_BOOST) - the significant query words
+            (`significant_tokens`, in text order) casefold-match the WHOLE title;
+            "prefix" (TITLE_PREFIX_BOOST) - the title starts with the query string
+            (casefold; the query's edge spaces are dropped). The stages are mutually
+            exclusive: the exact one is checked first and the prefix one is not added.
+            None/empty title - no boost (legacy notes without a title are neither
+            penalized nor lifted).
+
     """
     if not title:
         return 0.0
@@ -121,12 +127,13 @@ def title_boost(query: str, title: str | None) -> float:
 
 
 def freshness_boost(updated_at: str | None, now: str) -> float:
-    """Буст свежести: линейный спад по updated_at за FRESHNESS_WINDOW_DAYS.
+    """The freshness boost: a linear decay over updated_at across FRESHNESS_WINDOW_DAYS.
 
-    «Сегодня» (возраст ≤ 0 — метки в одном часовом поясе UTC) — максимум
-    FRESHNESS_BOOST_MAX; дальше спад до нуля к границе окна; 30+ дней — 0.
-    Неразборчивая/отсутствующая метка — 0 (детерминированная деградация,
-    буст просто не применяется).
+            "Today" (age <= 0 - the stamps share the UTC timezone) - the maximum
+            FRESHNESS_BOOST_MAX; then a decay to zero at the window border; 30+ days -
+            0. An unparseable/absent stamp - 0 (a deterministic degradation: the boost
+            simply does not apply).
+
     """
     if not updated_at:
         return 0.0
@@ -150,19 +157,21 @@ def apply_boosts(
     now: str,
     enabled: bool,
 ) -> dict[int, float]:
-    """Множители после RRF-слияния: `score × (1 + Σ бустов)` (LSBN-F-14).
+    """The multipliers after the RRF merge: `score x (1 + sum of boosts)` (LSBN-F-14).
 
-    `rows[note_id]` — словарь-контракт строки бустов (отсутствует/неполный —
-    буст 0, детерминированная деградация):
-      - "query": str — сам запрос (одинаков у всех строк, вход title-бустов);
-      - "title": str | None — название заметки;
-      - "updated_at": str | None — метка свежести (формат DDL-умолчания);
-      - "has_links": bool — есть строка в links (любая сторона).
-    Возвращает НОВЫЙ словарь; `fuse_rrf` и её вызыватели (в т.ч. поиск
-    областей app.services.areas) не затронуты. `enabled=False` — вход без
-    изменений (значения и порядок ключей) — «золотой» порядок до бустов;
-    строки в этом случае даже не читаются. Порядок применения — суммой:
-    title + свежесть + связи, затем один множитель (арх. брифа 3.4.0).
+            `rows[note_id]` is the row-dict contract of the boosts (absent/incomplete -
+            a boost of 0, a deterministic degradation):
+              - "query": str - the query itself (the same for all rows; the title
+                boosts' input);
+              - "title": str | None - the note's title;
+              - "updated_at": str | None - the freshness stamp (the DDL default format);
+              - "has_links": bool - there is a links row (either side).
+            Returns a NEW dict; `fuse_rrf` and its callers (including the area search
+            in app.services.areas) are untouched. `enabled=False` - the input unchanged
+            (the values and the key order) - the "golden" pre-boost order; the rows are
+            not even read in that case. The application order is by the sum:
+            title + freshness + links, then one multiplier (the 3.4.0 brief).
+
     """
     if not enabled:
         return dict(scores)

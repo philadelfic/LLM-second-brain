@@ -1,9 +1,10 @@
-"""Петля `areas` и её наблюдаемость по флагам областей (№40, FR-2.5/FR-4.3).
+"""The `areas` loop and its observability by the area flags (#40, FR-2.5/FR-4.3).
 
-Выключенная область не забирается фоном: её pending-записи остаются pending,
-снимок очереди `areas` считает только включённые области; при этом
-`areas_health()` отдаёт `{name: {enabled, pending}}` по ВСЕМ областям — накопление
-у выключенной области видно (прецедент JOB_*_ENABLED), обращений к моделям нет.
+    A disabled area is not drained by the background: its pending records stay
+    pending; the `areas` queue snapshot counts only enabled areas; meanwhile
+    `areas_health()` serves `{name: {enabled, pending}}` over ALL areas — a
+    disabled area's accumulation is visible (the JOB_*_ENABLED precedent); no
+    model calls.
 """
 
 from __future__ import annotations
@@ -33,12 +34,12 @@ def _settings(monkeypatch: pytest.MonkeyPatch, **flags: str):
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
-    clear_seeded_skills(settings)  # сид skill-создателя не мешает счёту
+    clear_seeded_skills(settings)  # the skill-creator seed does not disturb the count
     return settings
 
 
 def _seed_pending_areas() -> None:
-    """По одной pending-записи в каждой области (как их пишут сервисы областей)."""
+    """One pending record per area (as the area services write them)."""
     with session(get_settings()) as conn, transaction(conn):
         conn.execute(
             "INSERT INTO skills (name, description, steps, text) "
@@ -61,7 +62,7 @@ def _status(table: str) -> str:
 
 
 def test_loop_skips_disabled_area(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AREA_TERMS_ENABLED=false: terms остаётся pending, прочие обрабатываются."""
+    """AREA_TERMS_ENABLED=false: terms stays pending; the others are processed."""
     settings = _settings(monkeypatch, AREA_TERMS_ENABLED="false")
     _seed_pending_areas()
     worker = BackgroundWorker(settings, HashEmbedder(DIM))
@@ -72,16 +73,16 @@ def test_loop_skips_disabled_area(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_areas_queue_stat_enabled_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Снимок очереди `areas` считает pending только включённых областей."""
+    """The `areas` queue snapshot counts pending of enabled areas only."""
     settings = _settings(monkeypatch, AREA_TERMS_ENABLED="false")
     _seed_pending_areas()
     worker = BackgroundWorker(settings, HashEmbedder(DIM))
     stat = worker._areas_queue_stat()
-    assert stat["pending"] == 2  # skills + user; terms исключён (FR-2.5)
+    assert stat["pending"] == 2  # skills + user; terms excluded (FR-2.5)
 
 
 def test_areas_queue_stat_skips_disabled_logs(monkeypatch: pytest.MonkeyPatch) -> None:
-    """f10-04 (§10): снимок очереди `areas` pending логов у off-области не считает."""
+    """f10-04 (§10): the `areas` queue snapshot does not count an off-area's pending logs."""
     settings = _settings(monkeypatch, AREA_LOGS_ENABLED="false")
     saved = LogsService(settings, embedding=HashEmbedder(DIM)).save("Замер", "повод")
     assert saved["created"] is True
@@ -95,7 +96,7 @@ def test_areas_queue_stat_skips_disabled_logs(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_areas_health_covers_all_areas(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`areas_health()` — по всем областям, накопление у выключенной видно."""
+    """`areas_health()` — over all areas; a disabled one's accumulation is visible."""
     settings = _settings(monkeypatch, AREA_TERMS_ENABLED="false")
     _seed_pending_areas()
     worker = BackgroundWorker(settings, HashEmbedder(DIM))

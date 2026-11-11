@@ -1,50 +1,51 @@
-"""Бюджет вшитого текста (LSBN-F-11, релиз 3.2.0).
+"""The injected-text budget (LSBN-F-11, 3.2.0).
 
-Здесь живёт ЕДИНАЯ метрика токенов на весь релиз: ею пользуются скрипт замера
-`scripts/measure_injected_text.py` (f11-01), тест-«сторож»
-`tests/test_injection_budget.py` (f11-03) и константы бюджетов (f11-02/f11-03).
+    The SINGLE token metric of the whole release lives here: the measurement
+    script `scripts/measure_injected_text.py` (f11-01), the test guard
+    `tests/test_injection_budget.py` (f11-03) and the budget constants
+    (f11-02/f11-03) all use it.
 
-Энкодер НЕ заводится второй раз: берём `cl100k_base` из
-`app.services.splitter` — тот же BPE-словарь, что у токен-сплиттера заметок,
-одна загрузка на процесс. Второй энкодер в проекте означал бы два разных
-числа токенов для одного текста; так этого не будет.
+    The encoder is NOT created a second time: `cl100k_base` is taken from
+    `app.services.splitter` - the same BPE vocabulary as the note token splitter,
+    one load per process. A second encoder in the project would mean two different
+    token numbers for one text; this way that never happens.
 """
 
 from __future__ import annotations
 
 from app.services.splitter import encoding
 
-#: Имя BPE-словаря метрики — то же, что у сплиттера (фикс, не из env).
+#: The metric's BPE vocabulary name - the same as the splitter's (pinned, not from env).
 ENCODING_NAME = "cl100k_base"
 
-# --- Бюджеты вшитого текста (LSBN-F-11, arch §13.17; канон §6) -------------
-# Числа живут В КОДЕ (не env): поднятие любого бюджета — осознанное изменение
-# кода с записью причины (FR-4.4), а не тихая правка окружения. Потребители:
-# тексты `app/transport/mcp.py` (f11-02) и тест-«сторож» (f11-03).
+#--- Injected-text budgets (LSBN-F-11, arch §13.17; canon §6) -------------
+# The numbers live IN CODE (not env): raising any budget is a deliberate code
+# change with the reason recorded (FR-4.4), not a silent env edit. Consumers:
+# the texts of `app/transport/mcp.py` (f11-02) and the test guard (f11-03).
 
-#: Инструкции при подключении целиком — `build_instructions` (ядро + карта и т.д.).
+#: The whole instructions at connect - `build_instructions` (the core + the map etc.).
 TOKENS_INSTRUCTIONS_MAX = 1300
-#: Короткое ядро `SERVER_INSTRUCTIONS` (роль, правила, указатели).
+#: The short `SERVER_INSTRUCTIONS` core (the role, the rules, the pointers).
 TOKENS_CORE_MAX = 300
-#: Одно описание инструмента (`TOOL_DESCRIPTIONS`).
+#: One tool description (`TOOL_DESCRIPTIONS`).
 TOKENS_TOOL_DESCRIPTION_MAX = 120
-#: Все описания поверхности (31 шт.) — суммарно.
+#: All the surface descriptions (32) - the sum.
 TOKENS_TOOL_SURFACE_MAX = 2600
 
-#: Байты на элемент выдачи `memory_search` (метрика веса вызова 3.1.0).
+#: Bytes per `memory_search` output element (the 3.1.0 call-weight metric).
 BYTES_SEARCH_ITEM_MAX = 450
-#: Байты на элемент листинга `memory_list` (деталь summaries).
+#: Bytes per `memory_list` listing element (the summaries detail).
 BYTES_LIST_ITEM_MAX = 500
-#: Байты на элемент листинга `titles` (режим сканирования реестра).
+#: Bytes per `titles` listing element (the registry-scan mode).
 BYTES_LIST_TITLE_ITEM_MAX = 100
-#: Байты на перечень связанных заметок (`links` одиночного чтения).
+#: Bytes for the related-notes list (`links` of a single read).
 BYTES_LINKS_MAX = 500
-#: Байты ответа `memory_save` с новыми полями (`namespace_hint`/`similar`).
+#: The `memory_save` response bytes with the new fields (`namespace_hint`/`similar`).
 BYTES_SAVE_RESPONSE_MAX = 900
 
-#: Символы хинта `skills_search` («тело — только `skills_get`»).
+#: The `skills_search` hint characters ("the body - `skills_get` only").
 CHARS_SKILLS_HINT_MAX = 120
-#: Символы хинта обновления версии (`update_hint`).
+#: The version-update hint characters (`update_hint`).
 CHARS_UPDATE_HINT_MAX = 240
 
 __all__ = [
@@ -65,10 +66,11 @@ __all__ = [
 
 
 def count_tokens(text: str) -> int:
-    """Число токенов `cl100k_base`; пустая строка → 0 (без вызова энкодера).
+    """The `cl100k_base` token count; an empty string -> 0 (no encoder call).
 
-    Кэш энкодера — в `splitter.encoding()` (`lru_cache`): сам BPE-словарь
-    парсится один раз на процесс, счётчик только считает.
+            The encoder cache lives in `splitter.encoding()` (`lru_cache`): the BPE
+            vocabulary is parsed once per process; the counter only counts.
+
     """
     if not text:
         return 0

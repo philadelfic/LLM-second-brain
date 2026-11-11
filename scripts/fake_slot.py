@@ -1,61 +1,66 @@
 #!/usr/bin/env python3
-"""Заглушка-провайдер слотов для ветвей отказа приёмки LSB 3.2.0.
+"""A slot stub provider for the LSB 3.2.0 acceptance failure branches.
 
-Приёмка (`scripts/e2e_release32.py`) проверяет четыре ветви, которым нужен
-провайдер, отвечающий так, как живая модель не отвечает НИКОГДА; без такого
-провайдера ветви остаются честно пропущенными. Этот сервис и есть такой
-провайдер: он отвечает ровно так, как ждёт ветвь, а `scripts/slot_fake.sh`
-наводит на него слот тест-контура и пересобирает контур с нужным env.
+    The acceptance (`scripts/e2e_release32.py`) checks four branches that need a
+    provider answering the way a live model NEVER answers; without such a provider
+    the branches stay honestly skipped. This service is exactly that provider: it
+    answers precisely the way the branch expects, and `scripts/slot_fake.sh` aims
+    a test-contour slot at it and reassembles the contour with the needed env.
 
-Режимы (`--mode`, по одному на ветвь отказа):
+    Modes (`--mode`, one per failure branch):
 
-  ok                      обычный OpenAI/ollama-совместимый ответ: шаг
-                          восстановления любой ветви (слот снова работает);
-  auth                    HTTP 401 на ЛЮБОЙ запрос — сценарий 3 (№39 FR-4.3):
-                          слот сразу открывает разрыв, /health.slots несёт
-                          `last_outcome='auth'` и `paused_until`, затем пробный
-                          стук и возобновление после починки провайдера;
-  empty-length            ответ chat с ПУСТЫМ content и
-                          `finish_reason`/`done_reason='length'` — сценарий 8
-                          (lsbdef-0008): на тесном бюджете reasoning съел весь
-                          бюджет вывода, обрезанный ответ — не потерянная
-                          работа, пара ждёт человека, а очереди разгружаются
-                          сами после подъёма бюджета;
-  offcontract             ответ chat БЕЗ канонического маркера вердикта судьи
-                          (`DUPLICATE`/`NOT DUPLICATE`, см.
-                          `judge.py::_verdict`) — сценарий 4 (no39-02): число
-                          повторов ограничено, задание уходит в
-                          `GET /jobs/attention`, а после смены ответа
-                          освобождается и досчитывается;
-  decision-ok             `/v1/systemone` ПРИНИМАЕТ решение (сценарий 9, шаг 1);
-  decision-unsupported    `/v1/systemone` отвечает 404 (шаг 2): причина
-                          `unsupported`, решение берёт генеративный путь;
-  decision-low-confidence `/v1/systemone` попадает ровно в порог: вероятность
-                          ловит зона неопределённости (шаг 4).
+      ok                      a regular OpenAI/ollama-compatible answer: any
+                              branch's recovery step (the slot works again);
+      auth                    HTTP 401 on ANY request — scenario 3 (#39 FR-4.3):
+                              the slot opens the breaker at once, /health.slots
+                              carries `last_outcome='auth'` and `paused_until`,
+                              then a probe knock and resumption after the provider
+                              is fixed;
+      empty-length            a chat answer with EMPTY content and
+                              `finish_reason`/`done_reason='length'` — scenario 8
+                              (lsbdef-0008): on a tight budget reasoning ate the
+                              whole output budget; the trimmed answer is not lost
+                              work — the pair waits for a human, and the queues
+                              drain by themselves after the budget is raised;
+      offcontract             a chat answer WITHOUT the judge's canonical verdict
+                              marker (`DUPLICATE`/`NOT DUPLICATE`, see
+                              `judge.py::_verdict`) — scenario 4 (no39-02): the
+                              retry count is limited, the task goes to
+                              `GET /jobs/attention`, and after the answer changes
+                              it is released and finishes;
+      decision-ok             `/v1/systemone` ACCEPTS the decision (scenario 9,
+                              step 1);
+      decision-unsupported    `/v1/systemone` answers 404 (step 2): the reason is
+                              `unsupported`; the decision takes the generative
+                              path;
+      decision-low-confidence `/v1/systemone` lands exactly at the threshold: the
+                              probability is caught by the uncertainty zone
+                              (step 4).
 
-Эндпоинты — ровно те, что зовёт приложение (`app/services/llm_client.py`,
-`decision.py`, `judge.py`):
+    The endpoints — exactly those the application calls
+    (`app/services/llm_client.py`, `decision.py`, `judge.py`):
 
-  POST /api/chat             нативный ollama-маршрут chat генеративных слотов;
-  POST /v1/chat/completions  OpenAI-совместимый маршрут chat;
-  POST /v1/systemone         нативный decision-маршрут (`DECISION_PATH`);
-  GET  /api/tags             стартовая проверка ollama-слота (`LLMClient.check()`);
-  GET  /v1/models            стартовая проверка openai-слота;
-  GET  /health               собственное здоровье заглушки (проверка curl-ом).
+      POST /api/chat             the generative slots' native ollama chat route;
+      POST /v1/chat/completions  the OpenAI-compatible chat route;
+      POST /v1/systemone         the native decision route (`DECISION_PATH`);
+      GET  /api/tags             the ollama slot's startup check
+                                 (`LLMClient.check()`);
+      GET  /v1/models            the openai slot's startup check;
+      GET  /health               the stub's own health (checked with curl).
 
-Ответ режима `ok` выбирается по самому запросу: промпт с маркерами судьи
-получает вердикт судьи, промпт пересказа — текст пересказа. Один экземпляр
-заглушки обслуживает обе роли сразу: шаг починки ветви — одна команда на все
-слоты этой ветви.
+    The `ok` mode's answer is chosen by the request itself: a prompt with the
+    judge's markers gets the judge verdict; a retelling prompt — the retelling
+    text. One stub instance serves both roles at once: a branch's fix step — one
+    command for all the slots of that branch.
 
-Маршруты эмбеддингов намеренно НЕ эмулируются (501): ветви 3/4/8/9 слот
-векторизации не трогают, а полу-вектор неверной размерности только спрятал бы
-настоящий отказ.
+    The embedding routes are deliberately NOT emulated (501): branches 3/4/8/9 do
+    not touch the vectorization slot, and a half-vector of a wrong dimension
+    would only hide the real failure.
 
-Ничего контурного здесь нет: ни адресов, ни токенов, ни секретов.
+    Nothing contour-specific here: no addresses, no tokens, no secrets.
 
-Запуск:
-  python scripts/fake_slot.py --mode auth [--port 8080] [--model NAME ...] [--verbose]
+    Run:
+      python scripts/fake_slot.py --mode auth [--port 8080] [--model NAME ...] [--verbose]
 """
 
 from __future__ import annotations
@@ -67,7 +72,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-# Режимы заглушки (по одному на ветвь отказа приёмки).
+# The stub's modes (one per acceptance failure branch).
 MODES = (
     "ok",
     "auth",
@@ -83,21 +88,21 @@ DECISION_PATH = "/v1/systemone"
 TAGS_PATHS = ("/api/tags", "/v1/models")
 EMBED_PATHS = ("/api/embed", "/v1/embeddings")
 
-# Вердикт судьи: маркер, который парсит `judge.py::_verdict` (markdown `**`
-# стрипается, регистр не важен). «НЕ ДУБЛЬ» — безопасная сторона: обе заметки
-# остаются, работа завершается успешно.
+# The judge verdict: the marker parsed by `judge.py::_verdict` (markdown `**`
+# is stripped, case does not matter). "NOT DUPLICATE" — the safe side: both notes
+# stay; the job completes successfully.
 JUDGE_VERDICT = "NOT DUPLICATE"
-# Текст «нормального» ответа суммаризатору (без маркеров судьи).
+# The "normal" summarizer answer's text (without the judge's markers).
 SUMMARY_TEXT = "This note is about the fake slot provider of the test contour."
-# Прочие генеративные роли (классификатор, описание узла): просто непустой ответ.
+# Other generative roles (the classifier, the node description): just a non-empty answer.
 GENERIC_TEXT = "fake slot: an ordinary answer."
-# Ответ судьи БЕЗ маркера вердикта (ветвь off-contract): ни DUPLICATE, ни
-# NOT DUPLICATE в тексте быть не должно.
+# The judge's answer WITHOUT the verdict marker (the off-contract branch): neither DUPLICATE nor
+# NOT DUPLICATE must be in the text.
 OFF_CONTRACT_TEXT = "Both notes speak of the same thing, most likely."
 
-# Модель в списке заглушки по умолчанию — тест-контур (публичное имя модели из
-# docker-compose.test.yml) плюс имя decision-модели самой заглушки: стартовая
-# проверка слота сверяет имя модели ТОЧНО (`LLMClient.check()` → `_model_names`).
+# The model in the stub's default list — the test contour (the public model name from
+# docker-compose.test.yml) plus the stub's own decision-model name: the slot's startup
+# check compares the model name EXACTLY (`LLMClient.check()` → `_model_names`).
 DEFAULT_MODELS = (
     "hf.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q6_K",
     "qwen3-embedding:8b",
@@ -107,15 +112,15 @@ DEFAULT_MODELS = (
 DecisionAnswer = dict[str, Any]
 
 
-# Вероятности decision-слота: порог контура 0.5, зона неопределённости 0.05.
-# `decision-ok` — уверенное «нет» (label=false): решение принято, слияния нет;
-# `decision-low-confidence` — ровно на пороге: |p − 0.5| < 0.05 → зона.
+# The decision slot's probabilities: the contour's threshold 0.5, the uncertainty zone 0.05.
+# `decision-ok` — a confident "no" (label=false): the decision is made, no merge;
+# `decision-low-confidence` — exactly at the threshold: |p − 0.5| < 0.05 → the zone.
 def _confidence_of(mode: str) -> float:
     return 0.5 if mode == "decision-low-confidence" else 0.9
 
 
 def _probability_of(mode: str, kind: str) -> float:
-    """Вероятность ответа: низкая — у decision-ok (уверенное «нет»), порог — у зоны."""
+    """The answer's probability: low — at decision-ok (a confident "no"); the threshold — at the zone."""
     if mode == "decision-low-confidence":
         return 0.5
     if kind == "noul":
@@ -124,20 +129,21 @@ def _probability_of(mode: str, kind: str) -> float:
 
 
 def _question_items(questions: Any) -> list[tuple[str, dict[str, Any]]] | None:
-    """Вопросы запроса `/v1/systemone` → [(имя, вопрос)]; None — контракт нарушен.
+    """The `/v1/systemone` request's questions → [(name, question)]; None — the contract is broken.
 
-    Фактический контракт сервера (ollama ≥ 0.35.1; сверено живым запросом
-    2026-10-10 и закреплено в `llm_client._systemone_payload`): `questions` —
-    ОБЪЕКТ «имя вопроса → вопрос», у вопроса `type` (`choice`/`noul`/`score`)
-    и `instructions`, а варианты `choice` — ключи `criteria`. Список вопросов
-    с полем `name` (форма пилота LSBN-T-13) принимается тоже: заглушка не
-    диктует контракт приложению, но и не молчит про чужую форму.
+            The server's factual contract (ollama ≥ 0.35.1; verified by a live request
+            on 2026-10-10 and pinned in `llm_client._systemone_payload`): `questions`
+            is an OBJECT "question name → question"; a question has `type`
+            (`choice`/`noul`/`score`) and `instructions`; the `choice` options — the
+            `criteria` keys. A list of questions with a `name` field (the LSBN-T-13
+            pilot's shape) is accepted too: the stub does not dictate the contract to
+            the application but does not stay silent about a foreign shape either.
 
-    Ловушка, из-за которой ветви decision в приёмке 12.10.2026 читались ложной
-    краснотой: заглушка знала ТОЛЬКО список и отвечала 422 на объект;
-    `check_decision()` читает 422 как «модель не умеет decision» → слот
-    погашен (`/health.decision` = enabled=true, ok=false, answers=0) и ни один
-    вызов решения не делается.
+            The trap that made the decision branches read as false red in the
+            2026-10-12 acceptance: the stub knew ONLY the list and answered 422 to the
+            object; `check_decision()` reads 422 as "the model cannot do decision" →
+            the slot is suppressed (`/health.decision` = enabled=true, ok=false,
+            answers=0) and no decision call is made at all.
     """
     items: list[tuple[str, dict[str, Any]]] = []
     if isinstance(questions, dict):
@@ -157,7 +163,7 @@ def _question_items(questions: Any) -> list[tuple[str, dict[str, Any]]] | None:
 
 
 def _question_labels(question: dict[str, Any]) -> list[str]:
-    """Варианты `choice`-вопроса: ключи `criteria` (контракт) либо `labels` (пилот)."""
+    """A `choice` question's options: the `criteria` keys (the contract) or `labels` (the pilot)."""
     criteria = question.get("criteria")
     if isinstance(criteria, dict):
         return [str(label) for label in criteria]
@@ -168,14 +174,14 @@ def _question_labels(question: dict[str, Any]) -> list[str]:
 
 
 def _chat_answer(mode: str, prompt: str) -> tuple[str, str]:
-    """(content, finish_reason) ответа chat-маршрута для режима и промпта."""
+    """(content, finish_reason) of the chat route's answer for a mode and prompt."""
     if mode == "empty-length":
-        # Reasoning съел бюджет: ответ пуст, причина — обрезка по лимиту вывода.
+        # Reasoning ate the budget: the answer is empty; the reason — a trim by the output limit.
         return "", "length"
     if mode == "offcontract":
         return OFF_CONTRACT_TEXT, "stop"
     lowered = prompt.lower()
-    if "duplicate" in lowered:  # системный промпт судьи дедупа
+    if "duplicate" in lowered:  # the dedup judge's system prompt
         return JUDGE_VERDICT, "stop"
     if "summar" in lowered or "пересказ" in lowered:
         return SUMMARY_TEXT, "stop"
@@ -183,7 +189,7 @@ def _chat_answer(mode: str, prompt: str) -> tuple[str, str]:
 
 
 def _spent_budget(payload: dict[str, Any], path: str) -> int:
-    """Сколько токенов «съел» бюджет вывода (счётчики ответа на обрезке)."""
+    """How many tokens "ate" the output budget (the counters of a trimmed answer)."""
     if path == "/v1/chat/completions":
         value = payload.get("max_tokens")
     else:
@@ -193,12 +199,12 @@ def _spent_budget(payload: dict[str, Any], path: str) -> int:
 
 
 class FakeSlotHandler(BaseHTTPRequestHandler):
-    """Обработчик заглушки; режим и модели живут на классе сервера."""
+    """The stub's handler; the mode and models live on the server class."""
 
     server_version = "lsb-fake-slot/1.0"
     protocol_version = "HTTP/1.1"
 
-    # --- инфраструктура -------------------------------------------------------
+    # --- infrastructure ---------------------------------------------------------
 
     @property
     def mode(self) -> str:
@@ -242,13 +248,13 @@ class FakeSlotHandler(BaseHTTPRequestHandler):
             return None
         return data if isinstance(data, dict) else None
 
-    # --- GET: стартовая проба слота и собственное здоровье --------------------
+    # --- GET: the slot's startup probe and one's own health --------------------
 
-    def do_GET(self) -> None:  # noqa: N802 — имя задано базовым классом
+    def do_GET(self) -> None:  # noqa: N802 — the name is set by the base class
         path = self._path()
         if self.mode == "auth":
-            # 401 отказывает ВСЕМУ: и стартовой пробе, и реальному вызову —
-            # иначе пробный стук снял бы разрыв сразу (arch §6.2).
+            # 401 refuses EVERYTHING: both the startup probe and the real call —
+            # otherwise the probe knock would lift the breaker immediately (arch §6.2).
             return self._error(401, "fake slot: the API rejected the key (mode auth)")
         if path == "/health":
             return self._send(200, {
@@ -270,19 +276,19 @@ class FakeSlotHandler(BaseHTTPRequestHandler):
 
     # --- POST: chat / decision / embeddings -----------------------------------
 
-    def do_POST(self) -> None:  # noqa: N802 — имя задано базовым классом
+    def do_POST(self) -> None:  # noqa: N802 — the name is set by the base class
         path = self._path()
         if self.mode == "auth":
             return self._error(401, "fake slot: the API rejected the key (mode auth)")
         if path == DECISION_PATH:
             return self._decision()
         if path in CHAT_PATHS:
-            # Быстрый профиль приёмки: ответ приходит с заданной задержкой. Мгновенные
-            # ответы делают проверки «работа видна в очереди, пока слот стоит»
-            # слепыми — работа успевает завершиться до опроса (прогон №9: шесть
-            # красных в сценариях 2/4/8). Задержка возвращает наблюдаемость, а
-            # прогон всё равно в разы быстрее живых моделей. Решение-слот (ниже)
-            # задержки НЕ получает: его проверки в скорости не нуждаются.
+            # The acceptance's fast profile: the answer arrives with a set delay. Instant
+            # answers make the "work is visible in the queue while the slot is down" checks
+            # blind — the work manages to finish before the poll (run #9: six
+            # reds in scenarios 2/4/8). The delay restores observability, and
+            # the run is still several times faster than live models. The decision slot (below)
+            # gets NO delay: its checks do not need speed.
             delay = getattr(self.server, "delay", 0.0)
             if delay > 0:
                 time.sleep(delay)
@@ -319,9 +325,9 @@ class FakeSlotHandler(BaseHTTPRequestHandler):
                     "total_tokens": 64 + len(content),
                 },
             })
-        # Нативный ollama-маршрут: поля `message`/`done_reason`/`eval_count`.
-        # На обрезке счётчики показывают полностью израсходованный бюджет, а
-        # `message.thinking` — факт размышления (метаданные вызова, №49/№50).
+        # The native ollama route: the `message`/`done_reason`/`eval_count` fields.
+        # On a trim the counters show the fully spent budget, and
+        # `message.thinking` — the fact of reasoning (the call metadata, #49/#50).
         return self._send(200, {
             "model": model,
             "done": True,
@@ -339,7 +345,7 @@ class FakeSlotHandler(BaseHTTPRequestHandler):
 
     def _decision(self) -> None:
         if self.mode == "decision-unsupported":
-            # 400/404/405/422 → исход `unsupported`
+            # 400/404/405/422 → the `unsupported` outcome
             # (llm_client._DECISION_UNSUPPORTED_STATUSES).
             return self._error(
                 404, "fake slot: /v1/systemone is not supported by this model"
@@ -361,7 +367,7 @@ class FakeSlotHandler(BaseHTTPRequestHandler):
         })
 
     def _decision_answer(self, kind: str, labels: Any) -> DecisionAnswer:
-        """Ответ одного вопроса в форме пилота LSBN-T-13 (`noul`/`choice`/`score`)."""
+        """One question's answer in the LSBN-T-13 pilot's shape (`noul`/`choice`/`score`)."""
         probability = _probability_of(self.mode, kind)
         confidence = _confidence_of(self.mode)
         if kind == "choice":
@@ -378,7 +384,7 @@ class FakeSlotHandler(BaseHTTPRequestHandler):
 
 
 class FakeSlotServer(ThreadingHTTPServer):
-    """HTTP-сервер заглушки: режим и список моделей живут на сервере."""
+    """The stub's HTTP server: the mode and the model list live on the server."""
 
     daemon_threads = True
     allow_reuse_address = True

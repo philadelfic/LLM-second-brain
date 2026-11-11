@@ -1,4 +1,4 @@
-"""№32 (3.2.0): разные определения → предупреждение, переименования нет (FR-3.2)."""
+"""#32 (3.2.0): different definitions → a warning, no rename (FR-3.2)."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def parts(test_env, monkeypatch):
 
 
 def test_cluster_flagged_not_renamed(parts) -> None:
-    """Разные определения → `term_context_cluster` в `warnings`, terms не тронуты."""
+    """Different definitions → `term_context_cluster` in `warnings`; the terms untouched."""
     settings, _terms, _warnings, service = parts
     seed(
         settings,

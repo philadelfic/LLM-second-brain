@@ -1,8 +1,9 @@
-"""Дедуп-хинт чужого узла при save (Фаза 10, Шаг 5, US-8).
+"""The foreign-node dedup hint at save (Phase 10, Step 5, US-8).
 
-Близкий (дословный) дубль в другом узле — легитимен: запись не блокирует,
-но в ответе — hint «похожее есть в <ns>» (сигнал ориентирования §5.7).
-Дубль в своём узле по-прежнему блокирует запись (duplicated).
+    A close (verbatim) duplicate in another node is legitimate: the write is not
+    blocked, but the answer carries the "similar exists in <ns>" hint (the §5.7
+    orientation signal). A duplicate in one's own node still blocks the write
+    (duplicated).
 """
 
 from __future__ import annotations
@@ -39,19 +40,19 @@ def _id_of(settings, namespace: str, text: str) -> int:
 
 class TestForeignDuplicateHint:
     def test_exact_duplicate_in_other_node_gives_hint(self, settings) -> None:
-        """Дословный дубль в чужом узле: запись создаётся, hint указывает узел."""
+        """A verbatim duplicate in a foreign node: the note is created; the hint names the node."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         notes = NoteService(settings)
         first = notes.save(TEXT, namespace="work")
         assert first["stored"] is True
-        second = notes.save(TEXT)  # в default
+        second = notes.save(TEXT)  # in default
         assert second["stored"] is True
         assert second["id"] != first["id"]
         assert "work" in second["hint"]
         assert "blocked" in second["hint"]
 
     def test_normalized_duplicate_gives_hint(self, settings) -> None:
-        """«Почти дословный» дубль (регистр/пробелы) — тоже hint."""
+        """A "near-verbatim" duplicate (case/spaces) — a hint too."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         notes = NoteService(settings)
         notes.save(TEXT, namespace="work")
@@ -61,7 +62,7 @@ class TestForeignDuplicateHint:
         assert "work" in second["hint"]
 
     def test_same_node_duplicate_still_blocks(self, settings) -> None:
-        """Дословный дубль в своём узле — прежний контракт (duplicated)."""
+        """A verbatim duplicate in one's own node — the old contract (duplicated)."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         notes = NoteService(settings)
         notes.save(TEXT, namespace="work")
@@ -70,14 +71,14 @@ class TestForeignDuplicateHint:
         assert second["id"] == _id_of(settings, "work", TEXT)
 
     def test_no_hint_without_duplicates(self, settings) -> None:
-        """Обычная запись — без hint (контракт ответа не растёт)."""
+        """A regular write — without a hint (the answer contract does not grow)."""
         notes = NoteService(settings)
         result = notes.save("уникальный текст заметки")
         assert "hint" not in result
         assert result["stored"] is True
 
     def test_no_hint_for_distinct_texts_in_other_node(self, settings) -> None:
-        """Похожая по словам, но другая заметка в чужом узле — без hint."""
+        """A similar-by-words but different note in a foreign node — without a hint."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         notes = NoteService(settings)
         notes.save(TEXT, namespace="work")

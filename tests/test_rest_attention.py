@@ -1,9 +1,10 @@
-"""REST оператора: состояние «требует вмешательства» (№39, no39-02; arch §7.4).
+"""The operator's REST: the "needs attention" state (#39, no39-02; arch §7.4).
 
-`GET /jobs/attention` отдаёт замороженные задания (только SQL, без моделей),
-`POST /jobs/attention/{job_id}/retry` возвращает задание в работу и сбрасывает
-счётчик пары; вне внимания/без задания — 404. Внимание заданий — зона воркера:
-в поверхность предупреждений (`warnings`, no12) ручка не пишет.
+    `GET /jobs/attention` serves the frozen tasks (SQL only, no models);
+    `POST /jobs/attention/{job_id}/retry` returns the task to work and resets the
+    pair counter; outside attention / without the task — 404. Task attention is
+    the worker's zone: the handle writes nothing into the warnings surface
+    (`warnings`, no12).
 """
 
 from __future__ import annotations
@@ -25,10 +26,11 @@ def _headers() -> dict[str, str]:
 
 
 def _await_startup_reset(settings, timeout: float = 5.0) -> None:
-    """Дождаться стартового сброса внимания (воркер пишет отпечаток в meta).
+    """Wait for the startup attention reset (the worker writes the fingerprint into meta).
 
-    Иначе задание, посеянное до `run()`, снимет фоновый стартовый сброс
-    (`SLOT_ATTENTION_RESET_ON_START`) — гонка теста и жизни приложения.
+                Otherwise a task seeded before `run()` would be cleared by the
+                background startup reset (`SLOT_ATTENTION_RESET_ON_START`) — a race
+                between the test and the live application.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -43,7 +45,7 @@ def _await_startup_reset(settings, timeout: float = 5.0) -> None:
 
 
 def _seed_attention(client: TestClient, *, note_id: int = 1) -> int:
-    """Прямой INSERT: замороженная dedup-работа в очереди судьи."""
+    """A direct INSERT: a frozen dedup job in the judge's queue."""
     settings = get_settings()
     _await_startup_reset(settings)
     client.app.state.worker._ensure_job_table()
@@ -82,7 +84,7 @@ def test_list_and_retry(client: TestClient) -> None:
 
 
 def test_retry_does_not_touch_warnings(client: TestClient) -> None:
-    """Внимание заданий — не контент памяти: в `warnings` ручка не пишет."""
+    """Task attention is not memory content: the handle writes nothing into `warnings`."""
     settings = get_settings()
     job_id = _seed_attention(client)
 

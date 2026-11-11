@@ -1,8 +1,8 @@
-"""Стартовые предупреждения конфигурации слота (№49, релиз 3.2.0; arch §7.2, §13.5).
+"""Slot configuration startup warnings (#49, release 3.2.0; arch §7.2, §13.5).
 
-Плохая конфигурация слота называема и не смертельна: стартовая проверка
-пишет событие `slot_config_warning` уровня WARNING и продолжает работу;
-фатален по-прежнему только отказ авторизации (auth_failed → SystemExit(2)).
+    A bad slot configuration is nameable and not fatal: the startup check writes a
+    WARNING-level `slot_config_warning` event and keeps going; the only fatal
+    failure remains an authorization one (auth_failed → SystemExit(2)).
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def _ok_handler(model: str):
 
 
 def _with_mock_slots(settings) -> Services:
-    """build_services с MockTransport-клиентами трёх слотов (без сети)."""
+    """build_services with MockTransport clients of the three slots (no network)."""
     services = build_services(settings)
     ok = lambda model: _ok_handler(model)  # noqa: E731
     return dataclasses.replace(
@@ -67,7 +67,7 @@ def _warning_records(caplog) -> list:
 
 
 def test_warn_not_fatal(monkeypatch, caplog: pytest.LogCaptureFixture) -> None:
-    """reasoning + явный бюджет 256 → WARN на старте, старт продолжается."""
+    """reasoning + an explicit 256 budget → a WARN at startup; the startup continues."""
     settings = make_settings(
         monkeypatch,
         SUMMARY_MODEL_TYPE="reasoning",
@@ -75,7 +75,7 @@ def test_warn_not_fatal(monkeypatch, caplog: pytest.LogCaptureFixture) -> None:
     )
     services = _with_mock_slots(settings)
     with caplog.at_level(logging.WARNING, logger="app"):
-        asyncio.run(_provider_startup_check(services))  # не бросает
+        asyncio.run(_provider_startup_check(services))  # does not raise
     warnings = _warning_records(caplog)
     assert any(
         getattr(record, "code", None) == "reasoning_tight_budget"
@@ -86,7 +86,7 @@ def test_warn_not_fatal(monkeypatch, caplog: pytest.LogCaptureFixture) -> None:
 
 
 def test_auth_still_fatal(monkeypatch) -> None:
-    """Регресс: отказ авторизации по-прежнему роняет старт (SystemExit 2)."""
+    """Regression: an authorization failure still crashes the startup (SystemExit 2)."""
     monkeypatch.setattr(LLMClient, "check", lambda self: CHECK_AUTH_FAILED)
     services = _with_mock_slots(make_settings(monkeypatch))
     with pytest.raises(SystemExit) as excinfo:

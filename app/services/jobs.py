@@ -1,54 +1,55 @@
-"""Каркас фоновых джоб (lsb-0014, релиз 3.1.0): реестр, единый цикл, журнал.
+"""Background job framework (lsb-0014, release 3.1.0): registry, single loop, journal.
 
-Задача №48: джоба описывается структурой `JobSpec` и обслуживается одним
-циклом `run_loop` — новая джоба добавляется **регистрацией, а не копией
-петли**. Существующие петли `BackgroundWorker` переехали на этот каркас
-(постановка 4): тела цикла в воркере не дублируются — он описывает свои
-джобы сборщиками `build_*_job` и регистрирует их в `JOB_BUILDERS` (та же
-точка расширения собирает `build_job_specs(worker, settings)`).
+    Task #48: a job is described by a `JobSpec` structure and served by one
+    `run_loop` — a new job is added **by registration, not by copying the loop**.
+    The existing `BackgroundWorker` loops moved onto this framework (brief 4):
+    the worker does not duplicate loop bodies — it describes its jobs with
+    `build_*_job` builders and registers them in `JOB_BUILDERS` (the same extension
+    point assembles `build_job_specs(worker, settings)`).
 
-Контракт надёжности (REQUIREMENTS §5.2, job-framework arch §3.3) здесь не
-переизобретается, а переносится как есть: back-off `PENDING_RETRY_SEC` (30 с)
-→ ×2 → `MAX_INTERVAL_SEC` (15 мин) со сбросом при прогрессе
-(`next_interval`/`MAX_INTERVAL_SEC` живут в этом модуле — каркас владеет
-контрактом, воркер переиспользует те же имена); исключение итерации не
-убивает петлю (событие `loop_iteration_failed` с обязательным полем `job`).
-Форма расписания читается из `JobSpec` и бывает трёх видов: «по интервалу»
-(`wait_event is None`), «по интервалу + событие» (`wait_event` без
-`queue_empty`: интервал остаётся страховкой, а событие будит петлю раньше) и
-«по требованию» (`wait_event` + `queue_empty`: после `clear()` очередь
-перепроверяется — пул 6, lost wakeup; так `summary`, `judge`, `areas`,
-`links` и `nodes` (перепроверка с 2026-09-20: сигнал после сшивания не
-теряется), а с 3.4.1 LSBN-T-30 и `embedding` (свежая pending-заметка,
-gate 2026-09-19): сигнал, сработавший между пустым прогоном и `clear()`,
-иначе стирался бы — берущаяся работа ждала бы выросший back-off до 15 мин;
-шторма при недоступных моделях перепроверка не даёт — отказ не прогресс,
-arch §3.2).
+    The reliability contract (REQUIREMENTS §5.2, job-framework arch §3.3) is not
+    reinvented here but carried over as is: back-off `PENDING_RETRY_SEC` (30 s)
+    → ×2 → `MAX_INTERVAL_SEC` (15 min) with a reset on progress
+    (`next_interval`/`MAX_INTERVAL_SEC` live in this module — the framework owns
+    the contract, the worker reuses the same names); a loop-iteration exception
+    does not kill the loop (a `loop_iteration_failed` event with the mandatory
+    `job` field). The schedule shape is read from `JobSpec` and comes in three
+    forms: "by interval" (`wait_event is None`), "by interval + event" (`wait_event`
+    without `queue_empty`: the interval remains the safety net, the event wakes the
+    loop earlier) and "on demand" (`wait_event` + `queue_empty`: after `clear()`
+    the queue is rechecked — pool 6, lost wakeup; this is how `summary`, `judge`,
+    `areas`, `links` and `nodes` (rechecked since 2026-09-20: a signal after
+    stitching is not lost) work, and since 3.4.1 LSBN-T-30 also `embedding` (a
+    fresh pending note, gate 2026-09-19): a signal fired between an empty run and
+    `clear()` would otherwise be erased — takeable work would wait out the grown
+    back-off up to 15 min; the recheck does not cause storms with unavailable
+    models — a failure is not progress, arch §3.2).
 
-Джоба без очереди и без события (периодический обход, `expiration`)
-обслуживается **фиксированным** интервалом: `backoff_state.fixed=True` —
-пауза всегда равна `interval_sec`, back-off не растёт (FR-1.5 — поведение
-сохранено дословно).
+    A job with no queue and no event (a periodic sweep, `expiration`) is served by
+    a **fixed** interval: `backoff_state.fixed=True` — the pause always equals
+    `interval_sec`, the back-off does not grow (FR-1.5 — the behavior is preserved
+    verbatim).
 
-Ключевое правило отложенных заданий (arch §3.2): `process()` возвращает
-число **фактически обработанных** заданий. Задание, ждущее модель или
-готовую суммари, остаётся pending и прогрессом не считается — иначе петля
-крутилась бы вхолостую без back-off.
+    The key rule of deferred tasks (arch §3.2): `process()` returns the number of
+    **actually processed** tasks. A task waiting for a model or a ready summary
+    stays pending and does not count as progress — otherwise the loop would spin
+    idly without back-off.
 
-Наблюдаемость очередей (lsb-0014-03, FR-2.2/FR-2.3): очередь описывает сама
-джоба (`JobSpec.queue_stat` — снимок `{"pending", "oldest_pending_sec"}`,
-возраст — по pending+waiting, 3.3.1),
-каркас лишь собирает объект по реестру и пишет событие `queue_waiting`,
-когда петля уходит в ожидание при непустой своей очереди — «работа есть, но
-она не выполняется» видно в журнале, а не только в `/health`.
+    Queue observability (lsb-0014-03, FR-2.2/FR-2.3): the queue is described by the
+    job itself (`JobSpec.queue_stat` — a `{"pending", "oldest_pending_sec"}`
+    snapshot; the age — over pending+waiting, 3.3.1);
+    the framework only assembles the object over the registry and writes a
+    `queue_waiting` event when the loop goes to sleep with a non-empty queue —
+    "there is work, but it is not being done" is visible in the journal, not only
+    in `/health`.
 
-Ворота слота (3.4.1, LSBN-T-29; arch §6.2/§6.7): проверка разрыва слота —
-ЕДИНАЯ ТОЧКА в каркасе, а не ручные `if` в телах джоб. Джоба объявляет два
-предиката: `gate` («можно ли брать партию», для `run_loop`, С побочным
-эффектом — пробный стук по истечении паузы) и `is_gated` («слот заблокирован
-прямо сейчас», для снимков очередей — только память/SQL, без вызовов моделей).
-Гейт-0 («партия не взята») — не прогресс петли (no39-05): штатные пути
-`run_loop` дают `queue_waiting` + сон по back-off.
+    The slot gate (3.4.1, LSBN-T-29; arch §6.2/§6.7): the slot-breaker check is a
+    SINGLE POINT in the framework, not manual `if`s in job bodies. A job declares
+    two predicates: `gate` ("may the batch be taken", for `run_loop`, WITH a side
+    effect — a probe knock after the pause expires) and `is_gated` ("the slot is
+    blocked right now", for queue snapshots — memory/SQL only, no model calls).
+    Gate-0 ("the batch was not taken") is not loop progress (no39-05): the regular
+    `run_loop` paths produce `queue_waiting` + a back-off sleep.
 """
 
 from __future__ import annotations
@@ -60,16 +61,16 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-if TYPE_CHECKING:  # только аннотации: рантайм-зависимостей у каркаса нет
+if TYPE_CHECKING:  # annotations only: the framework has no runtime dependencies
     from app.config import Settings
     from app.services.worker import BackgroundWorker
 
-# Потолок back-off (REQUIREMENTS §5.3 «max 15 мин»), env не настраивается.
+# The back-off ceiling (REQUIREMENTS §5.3 "max 15 min"), not configurable via env.
 MAX_INTERVAL_SEC = 15 * 60
 
 
 def next_interval(current: float, start: int) -> float:
-    """Шаг back-off: интервал удваивается, потолок — 15 минут (§3.4)."""
+    """Back-off step: the interval doubles, the ceiling is 15 minutes (§3.4)."""
     return min(max(current * 2.0, float(start)), float(MAX_INTERVAL_SEC))
 
 
@@ -80,27 +81,27 @@ def queue_snapshot(
     waiting: int = 0,
     attention: int = 0,
 ) -> dict[str, int | None]:
-    """Снимок очереди для `/health.queues` (FR-2.2, №39 arch §6.9/§7.2).
+    """A queue snapshot for `/health.queues` (FR-2.2, #39 arch §6.9/§7.2).
 
-    Единая форма для всех джоб: `{"pending": int, "oldest_pending_sec":
-    int | null, "waiting": int, "attention": int}`. Возраст — секунды,
-    посчитанные в SQL (`now - MIN(ts)`), поэтому его отдаёт вызывающая сторона
-    уже числом; 3.3.1 (LSBN-S-3): возраст — по pending+waiting (вся работа,
-    ждущая исполнения), `null` — обе категории пусты (или возраст не передан
-    вызывавшей стороной). Защита от расхождения часов и неожиданного NULL у
-    непустой очереди — `max(0, ...)`/`null`.
+            One shape for all jobs: `{"pending": int, "oldest_pending_sec":
+            int | null, "waiting": int, "attention": int}`. The age is seconds computed
+            in SQL (`now - MIN(ts)`), so the caller already provides it as a number;
+            3.3.1 (LSBN-S-3): the age is over pending+waiting (all work waiting to be
+            done), `null` — both categories empty (or the age was not passed by the
+            caller). Protection against clock skew and an unexpected NULL on a
+            non-empty queue — `max(0, ...)`/`null`.
 
-    `waiting`/`attention` — обратно совместимое расширение №39: `pending` —
-    работа, которую петля может взять **сейчас**; `waiting` — отложено слотом
-    или готовностью зависимого слота (ожидание модели видно без опроса
-    журнала); `attention` — подмножество `waiting`, ждущее человека (no39-02).
-    Старый вызов `queue_snapshot(n, age)` остаётся валидным: счётчики просто
-    нулевые.
+            `waiting`/`attention` — the backward-compatible #39 extension: `pending` —
+            work the loop can take **now**; `waiting` — deferred by the slot or by a
+            dependent slot's readiness (model waiting is visible without polling the
+            journal); `attention` — a subset of `waiting` waiting for a human
+            (no39-02). The old `queue_snapshot(n, age)` call remains valid: the
+            counters are simply zero.
     """
     count = int(pending or 0)
-    # 3.3.1 (LSBN-S-3): при разрыве слота работа переезжает pending → waiting
-    # (возраст тот же) — гасить его только когда ждущая исполнения работа
-    # кончилась совсем (pending == 0 И waiting == 0) или не передана.
+    # 3.3.1 (LSBN-S-3): on a slot breaker the work moves pending → waiting
+    # (same age) — zero it only when the work waiting to be done
+    # is gone entirely (pending == 0 AND waiting == 0) or was not passed.
     if (count == 0 and int(waiting or 0) == 0) or oldest_pending_sec is None:
         oldest = None
     else:
@@ -114,18 +115,19 @@ def queue_snapshot(
 
 
 def gated_queue_stat(stat: dict) -> dict:
-    """Снимок очереди при недоступном слоте: pending уезжает в waiting (№39).
+    """A queue snapshot with the slot unavailable: pending moves to waiting (#39).
 
-    Тело прежнего `worker._gated_queue_stat`, ветка gated (3.4.1, LSBN-T-29):
-    пока слот заблокирован, петля партию не берёт, поэтому вся текущая работа
-    из `pending` переезжает в `waiting` (`pending=0`), а
-    `oldest_pending_sec`/`attention` сохраняются (3.3.1: возраст гасится
-    только при пустых pending+waiting — сохранение фактическое): ожидание
-    видно в `/health.queues` и в событии `queue_waiting`, но петля не крутится
-    вхолостую. Применяется вызывающей стороной ТОЛЬКО при
-    `spec.is_gated() is True` (см. `queues_health` воркера и
-    `_log_queue_waiting`) — у здорового слота снимок джобы отдаётся как есть
-    (форма снимка — забота самой джобы, например двухключевая у `migration`).
+            The body of the former `worker._gated_queue_stat`, the gated branch (3.4.1,
+            LSBN-T-29): while the slot is blocked the loop takes no batch, so all
+            current work moves from `pending` to `waiting` (`pending=0`), while
+            `oldest_pending_sec`/`attention` are preserved (3.3.1: the age is zeroed
+            only when pending+waiting are both empty — the preservation is factual):
+            the waiting is visible in `/health.queues` and in the `queue_waiting`
+            event, but the loop does not spin idly. Applied by the caller ONLY when
+            `spec.is_gated() is True` (see the worker's `queues_health` and
+            `_log_queue_waiting`) — with a healthy slot the job's snapshot is returned
+            as is (the snapshot shape is the job's own concern, e.g. the two-key one at
+            `migration`).
     """
     pending = int(stat.get("pending", 0) or 0)
     waiting = int(stat.get("waiting", 0) or 0)
@@ -140,41 +142,41 @@ def gated_queue_stat(stat: dict) -> dict:
 
 @dataclass(frozen=True)
 class JobSpec:
-    """Описание фоновой джобы (FR-1.1): регистрация вместо копии цикла.
+    """A background job description (FR-1.1): registration instead of a loop copy.
 
-    `name` — имя джобы в журнале (`job=...`); `queue` — имя очереди для
-    `/health.queues` (None — очередь не наблюдаемая); `interval_sec` —
-    стартовая пауза ожидания (= старт back-off); `batch` — размер батча за
-    прогон (если применимо); `enabled=False` — джоба вообще не запускается
-    (но из реестра не исчезает: очередь выключенной джобы должна быть видна);
-    `process` — прогон, возвращает число ОБРАБОТАННЫХ заданий; `queue_empty` —
-    дешёвая перепроверка очереди (пул 6); `wait_event` — пробуждение по
-    событию («по интервалу + событие»/«по требованию»: без `queue_empty`
-    интервал остаётся страховкой, с ним — перепроверка очереди после
-    `clear()`); `idle_hook` — гигиена в idle-ветке (например
-    retention `worker_jobs`); `queue_stat` — снимок своей очереди
-    `{"pending": int, "oldest_pending_sec": int | null}` для `/health.queues`
-    (возраст — по pending+waiting, 3.3.1);
-    `slot` — LLM-слот джобы (№39, arch §6.2): `embedding`/`summary`/`judge`
-    или None (разрыва нет; `nodes` объявляет `summary` — его классификатор
-    ходит в слот summary);
-    `pause_after_run` — разделитель слота (3.4.1, LSBN-T-27): после
-    ПРОДУКТИВНОГО прогона петля спит `interval_sec` перед следующей партией,
-    даже если очередь ещё не пуста (если пуста — пауза пропускается, джоба
-    просто засыпает по пустому прогону). Для нарезки миграции: партия
-    отработана — слот генерации уступлен; без флага петля выгребала бы
-    очередь партия за партией без паузы;
-    `gate` — ворота слота для `run_loop` (3.4.1, LSBN-T-29; arch §6.2/§6.7):
-    «можно ли брать партию» (True — можно). Проверка С побочным эффектом:
-    при истёкшей паузе разрыва делается один пробный стук (`probe`) и разрыв
-    может быть снят. Единая точка проверки разрыва слота: ручные
-    `if not gate: return 0` в телах джоб убраны — каркас оборачивает оба
-    вызова `process()` (основной цикл и перепроверка «по требованию»), а
-    гейт-0 — не прогресс петли (no39-05) → `queue_waiting` + сон по back-off;
-    `is_gated` — «слот заблокирован прямо сейчас» (True — заблокирован) для
-    снимков очередей (`queues_health`, `queue_waiting`): БЕЗ побочных
-    эффектов — только память/SQL, никогда не зовёт модели (контракт
-    `/health.queues`: наблюдаемость не жжёт вызовы и не переставляет паузы).
+            `name` — the job name in the journal (`job=...`); `queue` — the queue name
+            for `/health.queues` (None — the queue is not observable); `interval_sec` —
+            the starting wait pause (= the back-off start); `batch` — the batch size
+            per run (if applicable); `enabled=False` — the job is not started at all
+            (but does not vanish from the registry: a disabled job's queue must be
+            visible); `process` — a run, returns the number of PROCESSED tasks;
+            `queue_empty` — a cheap queue recheck (pool 6); `wait_event` — wakeup by
+            event ("by interval + event"/"on demand": without `queue_empty` the
+            interval remains the safety net; with it — a queue recheck after `clear()`);
+            `idle_hook` — hygiene in the idle branch (e.g. `worker_jobs` retention);
+            `queue_stat` — the snapshot of one's own queue
+            `{"pending": int, "oldest_pending_sec": int | null}` for `/health.queues`
+            (the age — over pending+waiting, 3.3.1);
+            `slot` — the job's LLM slot (#39, arch §6.2): `embedding`/`summary`/`judge`
+            or None (no breaker; `nodes` declares `summary` — its classifier walks into
+            the summary slot);
+            `pause_after_run` — the slot delimiter (3.4.1, LSBN-T-27): after a
+            PRODUCTIVE run the loop sleeps `interval_sec` before the next batch, even
+            if the queue is not empty (if empty — the pause is skipped, the job simply
+            falls asleep on an empty run). For migration splitting: a batch is done —
+            the generation slot is yielded; without the flag the loop would drain the
+            queue batch after batch without a pause;
+            `gate` — the slot gate for `run_loop` (3.4.1, LSBN-T-29; arch §6.2/§6.7):
+            "may the batch be taken" (True — yes). The check comes WITH a side effect:
+            when the breaker pause has expired, one probe knock (`probe`) is made and
+            the breaker may be lifted. The single point of the slot-breaker check: the
+            manual `if not gate: return 0` in job bodies are gone — the framework wraps
+            both `process()` calls (the main loop and the "on demand" recheck), and
+            gate-0 is not loop progress (no39-05) → `queue_waiting` + a back-off sleep;
+            `is_gated` — "the slot is blocked right now" (True — blocked) for queue
+            snapshots (`queues_health`, `queue_waiting`): WITHOUT side effects —
+            memory/SQL only, never calls models (the `/health.queues` contract:
+            observability does not burn calls and does not move pauses).
     """
 
     name: str
@@ -187,32 +189,33 @@ class JobSpec:
     wait_event: asyncio.Event | None
     idle_hook: Callable[[], None] | None
     queue_stat: Callable[[], dict] | None
-    # №39 (3.2.0): слот джобы — значение по умолчанию сохраняет сборщики
-    # без слота (links/areas/expiration) валидными, обратная совместимость.
+    # #39 (3.2.0): the job slot — the default value keeps builders
+    # without a slot (links/areas/expiration) valid, backward compatibility.
     slot: str | None = None
-    # 3.4.1 (LSBN-T-27): пауза ПОСЛЕ продуктивного прогона (разделитель
-    # слота нарезки) — дефолт False сохраняет прежнее выгребание без паузы.
+    # 3.4.1 (LSBN-T-27): a pause AFTER a productive run (the slot
+    # delimiter of splitting) — the default False keeps the former pauseless draining.
     pause_after_run: bool = False
-    # 3.4.1 (LSBN-T-29): ворота слота — единая точка проверки разрыва:
-    # `gate` в `run_loop` (с пробным стуком), `is_gated` в снимках очередей
-    # (без моделей). Дефолты None сохраняют прежние сборщики валидными
-    # (джобы без слота — links/expiration/terms_normalize — гейта не имеют),
-    # обратная совместимость по позиционным/ключевым конструкциям.
+    # 3.4.1 (LSBN-T-29): the slot gate — the single point of the breaker check:
+    # `gate` in `run_loop` (with a probe knock), `is_gated` in queue snapshots
+    # (no models). The None defaults keep former builders valid
+    # (slotless jobs — links/expiration/terms_normalize — have no gate),
+    # backward compatibility across positional/keyword constructions.
     gate: Callable[[], bool] | None = None
     is_gated: Callable[[], bool] | None = None
 
 
 class BackoffState:
-    """Мутабельное состояние back-off петли: текущий интервал ожидания.
+    """Mutable back-off state of the loop: the current wait interval.
 
-    Хранится вызывающей стороной (воркером), а не внутри `run_loop`: интервал
-    переживает итерации и сбрасывается в `spec.interval_sec` при прогрессе,
-    поэтому его видно в диагностике (`worker.interval` в тестах).
+            Kept by the caller (the worker), not inside `run_loop`: the interval
+            survives iterations and resets to `spec.interval_sec` on progress, so it is
+            visible in diagnostics (`worker.interval` in tests).
 
-    `fixed=True` — расписание БЕЗ back-off: рост интервала выключен, пауза
-    всегда равна стартовому интервалу джобы (`expiration`, arch §3.6: 300 с
-    «фикс, как сейчас») — периодический обход не зависит от внешних сервисов,
-    и сбой итерации не ускоряет/замедляет расписание (FR-1.5).
+            `fixed=True` — a schedule WITHOUT back-off: interval growth is off, the
+            pause always equals the job's starting interval (`expiration`, arch §3.6:
+            300 s "fixed, as now") — a periodic sweep does not depend on external
+            services, and an iteration failure neither speeds up nor slows down the
+            schedule (FR-1.5).
     """
 
     __slots__ = ("interval", "fixed")
@@ -222,11 +225,11 @@ class BackoffState:
         self.fixed = fixed
 
     def grow(self, start_sec: int) -> None:
-        """Следующий интервал ожидания: back-off до потолка или фиксированный.
+        """The next wait interval: back-off up to the ceiling, or fixed.
 
-        Единая точка роста интервала для `run_loop`: у обычных джоб —
-        `next_interval` (удвоение до `MAX_INTERVAL_SEC`), у джоб с фиксированным
-        расписанием — стартовый интервал без изменений.
+                    The single point of interval growth for `run_loop`: for regular jobs —
+                    `next_interval` (doubling up to `MAX_INTERVAL_SEC`); for fixed-schedule
+                    jobs — the starting interval unchanged.
         """
         self.interval = (
             float(max(start_sec, 0))
@@ -245,13 +248,14 @@ def log_job(
     target: str | None = None,
     **extra: Any,
 ) -> None:
-    """Записать событие джобы в общий журнал (FR-1.4): обязательное поле `job`.
+    """Write a job event to the shared journal (FR-1.4): the mandatory `job` field.
 
-    Формат един для всех джоб: имя события + `job` и общие поля по факту —
-    `note_id`, `outcome`, `reason`, `target` (None не пишется: поле появляется
-    только там, где применимо) плюс служебные поля из `extra`. Уровень — INFO;
-    непредвиденный сбой итерации цикл логирует сам (warning с traceback,
-    событие `loop_iteration_failed` — те же поля `event`/`job`).
+            The format is one for all jobs: the event name + `job` and common fields as
+            available — `note_id`, `outcome`, `reason`, `target` (None is not written:
+            the field appears only where applicable) plus service fields from `extra`.
+            The level is INFO; an unexpected iteration failure is logged by the loop
+            itself (a warning with traceback, the `loop_iteration_failed` event — the
+            same `event`/`job` fields).
     """
     fields: dict[str, Any] = {"event": event, "job": job.name}
     for key, value in (
@@ -267,12 +271,12 @@ def log_job(
 
 
 async def _call_hook(hook: Callable[[], Any]) -> Any:
-    """Вызвать `queue_empty`/`idle_hook`: корутина — напрямую, sync — в to_thread.
+    """Call `queue_empty`/`idle_hook`: a coroutine — directly, sync — in to_thread.
 
-    Существующие петли зовут проверки очереди и гигиену через
-    `asyncio.to_thread` (внутри синхронный SQL): каркас сохраняет это
-    поведение — синхронный хук уходит в поток и не занимает event loop,
-    корутина ожидается как есть.
+            The existing loops call queue checks and hygiene through
+            `asyncio.to_thread` (synchronous SQL inside): the framework preserves that
+            behavior — a sync hook goes to a thread and does not occupy the event loop;
+            a coroutine is awaited as is.
     """
     if inspect.iscoroutinefunction(hook):
         return await hook()
@@ -280,15 +284,16 @@ async def _call_hook(hook: Callable[[], Any]) -> Any:
 
 
 async def _log_queue_waiting(spec: JobSpec) -> None:
-    """Событие `queue_waiting` перед сном при непустой своей очереди (FR-2.3).
+    """The `queue_waiting` event before the sleep with a non-empty own queue (FR-2.3).
 
-    «Работа есть, но она не выполняется» (модель недоступна, задание ждёт) —
-    залипание видно в журнале без опроса `/health`. Снимок берётся у самой
-    джобы (`queue_stat`, только SQL через поток — как прочие хуки); джоба без
-    очереди или с пустой очередью молчит. При заблокированном слоте
-    (`spec.is_gated`, LSBN-T-29) снимок прогоняется через `gated_queue_stat`:
-    событие видит фактическое состояние «работа ждёт слот» (pending=0,
-    waiting>0), а не сырой снимок, как будто слот здоров.
+            "There is work, but it is not being done" (a model unavailable, a task
+            waiting) — the sticking is visible in the journal without polling
+            `/health`. The snapshot is taken from the job itself (`queue_stat`, SQL
+            only through a thread — like the other hooks); a job without a queue or
+            with an empty queue stays silent. With a blocked slot (`spec.is_gated`,
+            LSBN-T-29) the snapshot goes through `gated_queue_stat`: the event sees the
+            factual state "work waits for the slot" (pending=0, waiting>0), not a raw
+            snapshot as if the slot were healthy.
     """
     if spec.queue is None or spec.queue_stat is None:
         return
@@ -297,8 +302,8 @@ async def _log_queue_waiting(spec: JobSpec) -> None:
         stat = gated_queue_stat(stat)
     pending = int(stat.get("pending", 0) or 0)
     waiting = int(stat.get("waiting", 0) or 0)
-    # №39 (arch §6.9): ожидание отложенного задания — тоже видимая работа, хотя
-    # петлю в busy-loop оно не гонит (драйвер `queue_empty` считает берущееся).
+    # #39 (arch §6.9): waiting for a deferred task is visible work too, although
+    # it does not drive the loop into a busy-loop (the `queue_empty` driver counts takeable work).
     if pending + waiting <= 0:
         return
     log_job(
@@ -312,18 +317,18 @@ async def _log_queue_waiting(spec: JobSpec) -> None:
 
 
 async def _gated_process(spec: JobSpec) -> int:
-    """Прогон партии через ворота слота (3.4.1, LSBN-T-29; arch §6.2/§6.7).
+    """A batch run through the slot gate (3.4.1, LSBN-T-29; arch §6.2/§6.7).
 
-    Единая точка проверки разрыва слота: если у джобы есть `gate` и он
-    закрыт (разрыв открыт, пробный стук не удался) — партия НЕ берётся,
-    `process()` не зовётся, модели не жгутся, возврат 0. Дальше работают
-    штатные пути каркаса: 0 — «отказ джобы не считается прогрессом»
-    (no39-05, живой случай 12.10.2026: ≈11 вызовов/с) → `queue_waiting` +
-    сон по back-off, никакого busy-loop. Обёрнуты ОБА вызова `process()`
-    петли: основной цикл и перепроверка «по требованию» после `clear()`
-    (ветка `pause_after_run` повторного прогона не делает — там оборачивать
-    нечего). Джоба без `gate` (слота нет — links/expiration/terms_normalize)
-    идёт в прогон напрямую.
+            The single point of the slot-breaker check: if the job has a `gate` and it
+            is closed (the breaker open, the probe knock failed) — the batch is NOT
+            taken, `process()` is not called, no models burn, return 0. Then the
+            framework's regular paths apply: 0 — "a job failure is not progress"
+            (no39-05, the live case of 2026-10-12: ≈11 calls/s) → `queue_waiting` +
+            a back-off sleep, no busy-loop. BOTH `process()` calls of the loop are
+            wrapped: the main cycle and the "on demand" recheck after `clear()`
+            (the `pause_after_run` branch makes no second run — nothing to wrap
+            there). A job without a `gate` (no slot — links/expiration/terms_normalize)
+            goes into the run directly.
     """
     if spec.gate is not None and not spec.gate():
         return 0
@@ -335,42 +340,44 @@ async def run_loop(
     stopping: Callable[[], bool],
     backoff_state: BackoffState,
 ) -> None:
-    """Единый цикл джобы (arch §3.2): прогон → idle → ожидание с back-off.
+    """The single job loop (arch §3.2): run → idle → wait with back-off.
 
-    `stopping` — предикат мягкой остановки (проверяется в начале каждой
-    итерации); `backoff_state` — текущий интервал ожидания, который цикл
-    сбрасывает в `spec.interval_sec` при прогрессе и растит при таймауте.
+            `stopping` — the soft-stop predicate (checked at the start of every
+            iteration); `backoff_state` — the current wait interval, which the loop
+            resets to `spec.interval_sec` on progress and grows on a timeout.
 
-    Прогон вернул > 0 обработанных заданий — интервал сбрасывается и следующая
-    партия идёт сразу (очередь выгребаем); у джобы с `pause_after_run`
-    (разделитель слота, 3.4.1) между партиями — пауза `interval_sec`, пока
-    очередь не опустеет. Пустой прогон — `idle_hook`, затем
-    ожидание: у формы с `wait_event` очередь (если задана `queue_empty`)
-    перепроверяется **после** `clear()` события (пул 6: работа до clear() видна
-    селекту, после — будит событие), и петля ждёт `wait_for(event.wait(),
-    timeout=interval)` — событие будит раньше (форма «по интервалу + событие» у
-    `embedding`), таймаут растит back-off; у формы без события —
-    `sleep(interval)`. Таймаут ожидания — `next_interval()`. `CancelledError`
-    пробрасывается (graceful stop); прочее исключение не убивает петлю —
-    warning с traceback, пауза, back-off.
+            A run returned > 0 processed tasks — the interval resets and the next batch
+            goes immediately (the queue is drained); for a job with `pause_after_run`
+            (the slot delimiter, 3.4.1) there is an `interval_sec` pause between
+            batches until the queue empties. An empty run — `idle_hook`, then the
+            wait: in the form with `wait_event` the queue (if `queue_empty` is set) is
+            rechecked **after** the event's `clear()` (pool 6: work before clear() is
+            visible to the select, after — it wakes the event), and the loop waits in
+            `wait_for(event.wait(), timeout=interval)` — the event wakes earlier (the
+            "by interval + event" form at `embedding`), the timeout grows the back-off;
+            in the form without an event — `sleep(interval)`. The wait timeout is
+            `next_interval()`. `CancelledError` is propagated (graceful stop); any
+            other exception does not kill the loop — a warning with traceback, a pause,
+            back-off.
 
-    Расписание может быть фиксированным (`backoff_state.fixed` — периодический
-    обход без очереди, `expiration`, arch §3.6): пауза всегда равна стартовому
-    интервалу джобы, back-off не растёт, прогон расписание не сдвигает
-    (FR-1.5 — поведение сохранено дословно).
+            The schedule may be fixed (`backoff_state.fixed` — a periodic sweep without
+            a queue, `expiration`, arch §3.6): the pause always equals the job's
+            starting interval, the back-off does not grow, a run does not shift the
+            schedule (FR-1.5 — the behavior is preserved verbatim).
 
-    Выключенная джоба (`enabled=False`) цикл не запускает вовсе: реестр её
-    сохраняет (очередь видна в `/health`), но обслуживать нечего.
+            A disabled job (`enabled=False`) is not started at all: the registry keeps
+            it (its queue is visible in `/health`), but there is nothing to serve.
 
-    Перед каждым ожиданием пишется событие `queue_waiting`, если своя очередь
-    не пуста (FR-2.3): «работа есть, но не выполняется» — в журнале.
+            Before every wait a `queue_waiting` event is written if the own queue is
+            not empty (FR-2.3): "there is work, but it is not being done" — in the
+            journal.
 
-    Ворота слота (3.4.1, LSBN-T-29): оба вызова прогона — основной цикл и
-    перепроверка «по требованию» — идут через `_gated_process` (arch §6.2/
-    §6.7). Закрытые ворота дают 0 без вызова `process()`: разрыв слота —
-    не прогресс петли (no39-05), петля уходит в `queue_waiting` + back-off;
-    при истёкшей паузе `gate` сам делает один пробный стук и может снять
-    разрыв (партия идёт в этом же прогоне).
+            The slot gate (3.4.1, LSBN-T-29): both run calls — the main cycle and the
+            "on demand" recheck — go through `_gated_process` (arch §6.2/§6.7). Closed
+            gates give 0 without calling `process()`: a slot breaker is not loop
+            progress (no39-05), the loop goes into `queue_waiting` + back-off; when the
+            pause has expired the `gate` itself makes one probe knock and may lift the
+            breaker (the batch goes in the same run).
     """
     if not spec.enabled:
         return
@@ -378,25 +385,25 @@ async def run_loop(
         try:
             processed = await _gated_process(spec)
             if backoff_state.fixed:
-                # Периодический обход с фиксированным расписанием: пауза — это
-                # интервал джобы, а не наличие работы (выгребать нечего).
+                # A periodic sweep with a fixed schedule: the pause is the
+                # job interval, not the presence of work (nothing to drain).
                 await _log_queue_waiting(spec)
                 await asyncio.sleep(backoff_state.interval)
                 continue
             if processed > 0:
                 backoff_state.interval = float(spec.interval_sec)
-                # Разделитель слота (3.4.1, LSBN-T-27): партия отработана —
-                # пауза ПОСЛЕ прогона перед следующей, даже если очередь ещё
-                # не пуста (нарезка не монополизирует слот генерации). Пустая
-                # после прогона очередь паузы не требует: дальше штатный
-                # холостой прогон с обычным ожиданием.
+                # The slot delimiter (3.4.1, LSBN-T-27): a batch is done —
+                # a pause AFTER the run before the next one, even if the queue is
+                # not empty yet (splitting does not monopolize the generation slot). An empty
+                # queue after the run needs no pause: then the regular
+                # empty run with the usual wait applies.
                 if spec.pause_after_run and not (
                     spec.queue_empty is not None
                     and await _call_hook(spec.queue_empty)
                 ):
                     await asyncio.sleep(spec.interval_sec)
                 continue
-            # Пустой прогон: гигиена idle-ветки (если она у джобы есть).
+            # An empty run: idle-branch hygiene (if the job has one).
             if spec.idle_hook is not None:
                 await _call_hook(spec.idle_hook)
             if spec.wait_event is None:
@@ -404,21 +411,21 @@ async def run_loop(
                 await asyncio.sleep(backoff_state.interval)
                 backoff_state.grow(spec.interval_sec)
                 continue
-            # Форма «по требованию»: перепроверка очереди ПОСЛЕ clear() (пул 6,
-            # lost wakeup) — работа, появившаяся до clear(), видна селекту,
-            # значит ей даётся ОДИН немедленный прогон; появившаяся после —
-            # будит уже очищенное событие, сигнал не стирается.
+            # The "on demand" form: the queue recheck AFTER clear() (pool 6,
+            # lost wakeup) — work that appeared before clear() is visible to the select,
+            # so it gets ONE immediate run; work that appeared after —
+            # wakes the already-cleared event, the signal is not erased.
             spec.wait_event.clear()
             if spec.queue_empty is not None and not await _call_hook(spec.queue_empty):
                 processed = await _gated_process(spec)
                 if processed > 0:
                     backoff_state.interval = float(spec.interval_sec)
                     continue
-                # Прогон пуст: работа в очереди есть, но взять её не удалось
-                # (слот отказывает заданию — оно остаётся pending). Отказ
-                # джобы не считается прогрессом петли (№39, no39-05): иначе
-                # повтор без сна превращался бы в холостой шторм (живой
-                # случай 12.10.2026: ≈11 вызовов/с).
+                # The run was empty: there is work in the queue but it could not be taken
+                # (the slot refuses the task — it stays pending). A job
+                # failure does not count as loop progress (#39, no39-05): otherwise
+                # a sleepless retry would become an idle storm (the live
+                # case of 2026-10-12: ≈11 calls/s).
                 await _log_queue_waiting(spec)
                 await asyncio.sleep(backoff_state.interval)
                 backoff_state.grow(spec.interval_sec)
@@ -431,10 +438,10 @@ async def run_loop(
             except asyncio.TimeoutError:
                 backoff_state.grow(spec.interval_sec)
         except asyncio.CancelledError:
-            raise  # отмена петли (graceful stop) — не глотать
+            raise  # loop cancellation (graceful stop) — do not swallow
         except Exception:
-            # Супервизор итерации (пул 4): непредвиденный сбой не убивает
-            # корутину — warning с traceback, пауза и повтор по back-off.
+            # The iteration supervisor (pool 4): an unexpected failure does not kill
+            # the coroutine — a warning with traceback, a pause and a retry on back-off.
             logging.getLogger("app").warning(
                 "job loop iteration failed — loop continues",
                 extra={"event": "loop_iteration_failed", "job": spec.name},
@@ -444,26 +451,26 @@ async def run_loop(
             backoff_state.grow(spec.interval_sec)
 
 
-# Сборщик джобы: описывает свою джобу и возвращает None, если она неприменима
-# в текущей сборке (например, джоба суммаризации без суммаризатора).
+# A job builder: describes its job and returns None when the job is not applicable
+# in the current build (e.g. the summarization job without a summarizer).
 JobBuilder = Callable[["BackgroundWorker", "Settings"], JobSpec | None]
 
-# Реестр сборщиков — точка расширения каркаса (FR-1.6). Новая джоба = функция
-# `build_job(worker, settings)` в своём модуле + строка в этом кортеже.
-# Выключенные джобы из реестра не исчезают: их очередь должна быть видна в
-# `/health` (деградация видна, а не молчит) — цикл такие джобы не запускает.
+# The builder registry is the framework's extension point (FR-1.6). A new job = a
+# `build_job(worker, settings)` function in its own module + a line in this tuple.
+# Disabled jobs do not vanish from the registry: their queue must be visible in
+# `/health` (the degradation is visible, not silent) — the loop does not start such jobs.
 JOB_BUILDERS: tuple[JobBuilder, ...] = ()
 
 
 def build_job_specs(
     worker: BackgroundWorker, settings: Settings
 ) -> list[JobSpec]:
-    """Собрать реестр джоб по зарегистрированным сборщикам (FR-1.1).
+    """Assemble the job registry over the registered builders (FR-1.1).
 
-    Сборщик, вернувший None (джоба неприменима в этой сборке), в реестр не
-    попадает. Свои сборщики в реестр дописывает модуль, которому принадлежат
-    джобы: существующие петли воркера регистрируются в `worker.py`
-    (постановка 4), новые джобы — каждый в своём модуле (FR-1.6).
+            A builder that returned None (the job is not applicable in this build) does
+            not enter the registry. Own builders are appended to the registry by the
+            module owning the jobs: the existing worker loops register in `worker.py`
+            (brief 4), new jobs — each in its own module (FR-1.6).
     """
     specs: list[JobSpec] = []
     for build in JOB_BUILDERS:

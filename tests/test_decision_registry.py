@@ -1,9 +1,9 @@
-"""Реестр decision-вопросов (LSBN-F-12, релиз 3.2.0; arch §6.4/§13.6).
+"""The decision questions registry (LSBN-F-12, release 3.2.0; arch §6.4/§13.6).
 
-Встроенные группы проходят валидацию (тексты EN, обезличенные); файл
-`decision_questions.json` переопределяет группу целиком; нарушения
-(неизвестный kind, choice без меток/критериев, дубль имени, вопросов больше
-DECISION_MAX_QUESTIONS) — фатальный `ConfigError` при старте.
+    The built-in groups pass validation (EN texts, impersonal); a
+    `decision_questions.json` file overrides a group entirely; violations (an
+    unknown kind, a choice without labels/criteria, a duplicate name, more
+    questions than DECISION_MAX_QUESTIONS) — a fatal `ConfigError` at startup.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ def test_builtin_questions_valid() -> None:
     assert judge.name == "is_text_duplicate"
     assert judge.kind == "noul"
     assert judge.text.strip()
-    # Тексты EN и обезличенные (без имён людей).
+    # The texts are EN and impersonal (no people's names).
     for items in groups.values():
         for question in items:
             assert not any(name in question.text for name in ("Олег", "Oleg", "Phil"))

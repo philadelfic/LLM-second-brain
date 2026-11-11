@@ -1,37 +1,40 @@
-"""Decision-слот (LSBN-F-12, релиз 3.2.0; arch §6.4/§13.6).
+"""Decision slot (LSBN-F-12, release 3.2.0; arch §6.4/§13.6).
 
-Третий тип слота рядом с генеративным и embedding: клиентская ветка
-`POST /v1/systemone` (state + типизированные вопросы → вероятности). Этот
-модуль — доменный слой решения: типы, порог/зона неопределённости и СВОЙ
-разрыв слота (`SlotBreaker` класса блока 2 — переиспользуется, не дублируется).
+    The third slot type next to the generative and embedding ones: the client branch
+    of `POST /v1/systemone` (state + typed questions → probabilities). This module
+    is the decision domain layer: types, the threshold/uncertainty zone and ITS OWN
+    slot breaker (`SlotBreaker` of block 2 — reused, not duplicated).
 
-Три причины переключения на генеративный слот (ровно эти, §13.6):
+    Three switch reasons to the generative slot (exactly these, §13.6):
 
-- `unavailable` — слота СЕЙЧАС НЕТ: сеть/5xx/таймаут/разрыв слота decision,
-  пауза, а равно погашенный стартовой проверкой исход `unreachable`/
-  `auth_failed` и выключенный флагом `DECISION_ENABLED=false` путь (но
-  выключенный флаг — не переключение вовсе, счётчиков он не двигает, FR-4.4);
-- `unsupported` — контракт не сходится: сервер не знает `/v1/systemone`, не
-  принимает тип вопроса, меток больше `DECISION_MAX_LABELS`, либо в ответе нет
-  решения этого вопроса; тем же именем помечен слот, погашенный проверкой с
-  исходом `unsupported` («модель не умеет decision»);
-- `low_confidence` — вероятность/уверенность в зоне неопределённости вокруг
-  порога (`|p − threshold| < zone`) либо `choice` ниже `threshold + zone`.
+    - `unavailable` — the slot is NOT THERE NOW: network/5xx/timeout/the decision
+      slot breaker, a pause, as well as the `unreachable`/`auth_failed` outcome
+      suppressed by the startup check and the `DECISION_ENABLED=false` flag-off path
+      (but a flag-off is not a switch at all — it moves no counters, FR-4.4);
+    - `unsupported` — the contract does not add up: the server does not know
+      `/v1/systemone`, does not accept the question kind, there are more labels
+      than `DECISION_MAX_LABELS`, or the answer has no solution for this question;
+      the same name marks a slot suppressed by a check with the `unsupported`
+      outcome ("the model cannot do decision");
+    - `low_confidence` — the probability/confidence is in the uncertainty zone
+      around the threshold (`|p − threshold| < zone`), or `choice` is below
+      `threshold + zone`.
 
-Словарь причин закрыт: чужое имя в `_fallback` — ошибка разработки
-(`ValueError`), а «решение не применимо» (у `choice` меньше двух кандидатов)
-переключением не считается (`decision_skipped`, `f12-02`).
+    The reason dictionary is closed: a foreign name in `_fallback` is a development
+    error (`ValueError`), and "the decision is not applicable" (a `choice` with
+    fewer than two candidates) does not count as a switch (`decision_skipped`,
+    `f12-02`).
 
-`DecisionService.decide` не бросает чужих исключений: любая причина переключения
-— `DecisionUnavailable` с полем `reason` (и `answer`, когда решение разобрано,
-но отвергнуто по уверенности). В БД вероятности не хранятся (FR-3.3) — только
-журнал (`decision_answer`/`decision_fallback`, пишет сам сервис: он единственный
-знает вопрос, вероятность и причину, §7.2/§13.6) и счётчики в памяти процесса
-(`snapshot()`).
+    `DecisionService.decide` does not throw foreign exceptions: any switch reason is
+    a `DecisionUnavailable` with the `reason` field (and `answer` when the solution
+    was parsed but rejected by confidence). Probabilities are not stored in the DB
+    (FR-3.3) — only the journal (`decision_answer`/`decision_fallback`, written by
+    the service itself: it is the only one that knows the question, the probability
+    and the reason, §7.2/§13.6) and in-process counters (`snapshot()`).
 
-Разрыв decision живёт ЗДЕСЬ, а не в воркере (arch §13.8): вызов решения
-происходит внутри сервиса, воркер его не видит; «одна точка разрыва на слот»
-сохранена — класс `SlotBreaker` тот же.
+    The decision breaker lives HERE, not in the worker (arch §13.8): the decision
+    call happens inside the service, the worker does not see it; "one breaker point
+    per slot" is preserved — the `SlotBreaker` class is the same.
 """
 
 from __future__ import annotations
@@ -54,35 +57,36 @@ from app.services.llm_client import (
 from app.services.slot_breaker import SlotBreaker
 from app.services.slot_outcome import SlotOutcome, classify_llm_error
 
-if TYPE_CHECKING:  # pragma: no cover — реестр инъектируется, цикл импортов исключён
+if TYPE_CHECKING:  # pragma: no cover — the registry is injected, no import cycle
     from app.services.prompts import PromptRegistry
 
-# Типы вопросов decision-модели (arch §6.4): иных не бывает.
+# Decision-model question kinds (arch §6.4): there are no others.
 DECISION_KINDS = ("choice", "noul", "score")
 
-# Ровно три причины переключения (arch §13.6, FR-4.2): иных нет и быть не может —
-# причина проходит этот белый список в `_fallback`, чужое имя сразу ValueError.
+# Exactly three switch reasons (arch §13.6, FR-4.2): there are and can be no others —
+# the reason passes this whitelist in `_fallback`; a foreign name is an immediate ValueError.
 DECISION_REASONS = ("unavailable", "unsupported", "low_confidence")
 
-# Статусы отказа, означающие «ждать бессмысленно»: разрыв открывается сразу
-# (как AUTH генеративных слотов, блок 2).
+# Failure statuses meaning "waiting is pointless": the breaker opens immediately
+# (like AUTH of generative slots, block 2).
 _AUTH_STATUSES = frozenset({401, 403})
 
-# Статусы, означающие «сервер не знает маршрут/тип вопроса».
+# Statuses meaning "the server does not know the route/question kind".
 _UNSUPPORTED_STATUSES = frozenset({400, 404, 405, 422})
 
-# Слот decision: имя в журнале и в snapshot (§6.4).
+# The decision slot: the name in the journal and in snapshot (§6.4).
 SLOT_DECISION = "decision"
 
 
 @dataclass(frozen=True)
 class DecisionQuestion:
-    """Вопрос decision-модели (arch §6.4): имя, формулировка, тип, критерии.
+    """A decision-model question (arch §6.4): name, wording, kind, criteria.
 
-    `name` — ключ вопроса (он же ключ в `answers`); `text` — формулировка
-    (EN, обезличенная); `kind` — choice | noul | score; `labels` — варианты
-    `choice`; `criteria` — критерий на метку (`choice`) или массив критериев
-    (`score`); `threshold` — порог вопроса (None → `DECISION_THRESHOLD`).
+            `name` — the question key (also the key in `answers`); `text` — the wording
+            (EN, impersonal); `kind` — choice | noul | score; `labels` — the options
+            of `choice`; `criteria` — a criterion per label (`choice`) or an array of
+            criteria (`score`); `threshold` — the question threshold (None →
+            `DECISION_THRESHOLD`).
     """
 
     name: str
@@ -95,13 +99,13 @@ class DecisionQuestion:
 
 @dataclass(frozen=True)
 class DecisionAnswer:
-    """Ответ decision-модели на один вопрос (arch §6.4).
+    """The decision model's answer to one question (arch §6.4).
 
-    `label` — выбранная метка (`choice`), 'true'|'false' (`noul`), None
-    (`score`); `probability` — вероятность выбранного/истинного; `confidence`
-    — уверенность ответа (если отдаётся); `probabilities` — распределение;
-    `score` — балл типа `score`; `raw` — сырой ответ вопроса (для журнала,
-    в БД не пишется).
+            `label` — the chosen label (`choice`), 'true'|'false' (`noul`), None
+            (`score`); `probability` — the probability of the chosen/true one;
+            `confidence` — the answer confidence (if provided); `probabilities` —
+            the distribution; `score` — a `score`-kind score; `raw` — the question's
+            raw answer (for the journal, not written to the DB).
     """
 
     question: str
@@ -116,17 +120,17 @@ class DecisionAnswer:
 
 @dataclass(frozen=True)
 class DecisionResult:
-    """Принятое решение: ответы по вопросам + метаданные вызова (§6.4)."""
+    """The accepted decision: answers per question + call metadata (§6.4)."""
 
     answers: dict[str, DecisionAnswer]
     meta: ChatMeta
 
 
 class DecisionUnavailable(RuntimeError):
-    """Решение не принято — переключение на генеративный слот (§13.6).
+    """No decision — switch to the generative slot (§13.6).
 
-    `reason` ∈ {'unavailable','unsupported','low_confidence'}; `answer` —
-    разобранный ответ вопроса, если решение отвергнуто по уверенности.
+            `reason` ∈ {'unavailable','unsupported','low_confidence'}; `answer` —
+            the parsed question answer when the decision was rejected by confidence.
     """
 
     def __init__(
@@ -142,11 +146,12 @@ class DecisionUnavailable(RuntimeError):
 
 
 def answer_from_parsed(question: str, parsed: Mapping[str, Any]) -> DecisionAnswer:
-    """Канонический ответ `_parse_systemone` → `DecisionAnswer` (§6.2/§6.4).
+    """Canonical `_parse_systemone` answer → `DecisionAnswer` (§6.2/§6.4).
 
-    Канонические ключи (`kind`/`label`/`probability`/`confidence`/
-    `probabilities`/`score`/`raw`) выбирает РОВНО пара функций клиента — здесь
-    их только переносим в доменный тип, имён полей сервера не знаем.
+            The canonical keys (`kind`/`label`/`probability`/`confidence`/
+            `probabilities`/`score`/`raw`) are picked by EXACTLY the client's pair of
+            functions — here we only carry them into the domain type; the server's
+            field names are unknown here.
     """
     return DecisionAnswer(
         question=question,
@@ -161,7 +166,7 @@ def answer_from_parsed(question: str, parsed: Mapping[str, Any]) -> DecisionAnsw
 
 
 def _outcome_of_check(result: DecisionCheck) -> SlotOutcome | None:
-    """Исход пробного стука `check_decision()` → исход разрыва (None у ok)."""
+    """The probe outcome of `check_decision()` → the breaker outcome (None for ok)."""
     if result == DECISION_CHECK_OK:
         return None
     if result == DECISION_CHECK_AUTH_FAILED:
@@ -172,12 +177,12 @@ def _outcome_of_check(result: DecisionCheck) -> SlotOutcome | None:
 
 
 class DecisionService:
-    """Сервис решений: порог/зона, свой разрыв, счётчики (arch §6.4).
+    """The decision service: threshold/zone, its own breaker, counters (arch §6.4).
 
-    Собирается ТОЛЬКО при `settings.decision_enabled` (точка сборки —
-    `build_services`); при выключенном флаге `can_decide()` ложно и ни один
-    вызов транспорта не делается. Потребители (судья, классификатор)
-    подключаются отдельной постановкой `f12-02`.
+            Built ONLY when `settings.decision_enabled` (the assembly point is
+            `build_services`); with the flag off `can_decide()` is false and no
+            transport call is made. Consumers (the judge, the classifier) connect via
+            a separate brief `f12-02`.
     """
 
     def __init__(
@@ -191,10 +196,10 @@ class DecisionService:
         self._llm = llm
         self._registry = registry
         self._enabled = bool(settings.decision_enabled)
-        # Стартовая проверка может погасить слот (disable()); до неё слот жив.
+        # The startup check may suppress the slot (disable()); before it the slot is alive.
         self._ok = self._enabled
-        # Причина переключения погашенного слота: по умолчанию «слота сейчас
-        # нет»; `disable(outcome=unsupported)` поднимет её до «не умеет».
+        # The suppressed slot's switch reason: by default "the slot is not
+        # there now"; `disable(outcome=unsupported)` raises it to "cannot do it".
         self._disabled_reason = "unavailable"
         self._breaker = SlotBreaker(
             SLOT_DECISION,
@@ -205,22 +210,23 @@ class DecisionService:
         self._fallbacks = 0
         self._by_reason: dict[str, int] = {reason: 0 for reason in DECISION_REASONS}
 
-    # --- состояние -----------------------------------------------------------
+    # --- state ----------------------------------------------------------------
 
     def can_decide(self) -> bool:
-        """Можно ли спрашивать решение (включён и стартовая проверка не погасила)."""
+        """May we ask for a decision (enabled and not suppressed by the startup check)."""
         return self._enabled and self._ok and self._llm is not None
 
     def disable(self, *, outcome: str | None = None) -> None:
-        """Погасить слот: стартовая проверка не подтвердила «умеет decision».
+        """Suppress the slot: the startup check did not confirm "can do decision".
 
-        `outcome` — исход `check_decision()` (константы `DECISION_CHECK_*`,
-        известные `main.py`). Он определяет причину будущего переключения:
-        `unsupported` — «модель не умеет decision» (сервер не знает маршрут /
-        не принимает тип вопроса), любой иной исход (`unreachable`/
-        `auth_failed`) и вызов без исхода — «слота сейчас нет» (`unavailable`).
-        Причину запоминаем здесь: `decide()` отдаёт её на ветке погашенного
-        слота, чтобы оператор видел честную картину (§13.6).
+                    `outcome` — the `check_decision()` outcome (`DECISION_CHECK_*` constants
+                    known to `main.py`). It defines the reason of the future switch:
+                    `unsupported` — "the model cannot do decision" (the server does not
+                    know the route / does not accept the question kind), any other outcome
+                    (`unreachable`/`auth_failed`) and a call without an outcome — "the
+                    slot is not there now" (`unavailable`). The reason is memorized here:
+                    `decide()` returns it on the suppressed-slot branch so the operator
+                    sees an honest picture (§13.6).
         """
         self._ok = False
         self._disabled_reason = (
@@ -230,16 +236,16 @@ class DecisionService:
         )
 
     def close(self) -> None:
-        """Закрыть HTTP-пул клиента (чистое завершение процесса)."""
+        """Close the client's HTTP pool (clean process shutdown)."""
         if self._llm is not None:
             self._llm.close()
 
     def snapshot(self) -> dict:
-        """Снимок состояния слота для /health (arch §6.4/§7.1): только память.
+        """A slot state snapshot for /health (arch §6.4/§7.1): memory only.
 
-        `by_reason` всегда несёт ровно три ключа (нулевые — тоже), так что
-        `fallbacks == sum(by_reason.values())` держится и при пустом слоте
-        (§7.3/FR-6.3): оператор видит честную картину причин.
+                    `by_reason` always carries exactly three keys (zeros included), so
+                    `fallbacks == sum(by_reason.values())` holds for an empty slot too
+                    (§7.3/FR-6.3): the operator sees an honest picture of reasons.
         """
         return {
             "enabled": self._enabled,
@@ -252,21 +258,22 @@ class DecisionService:
             },
         }
 
-    # --- реестр вопросов -----------------------------------------------------
+    # --- question registry ----------------------------------------------------
 
     def questions_for(self, group: str) -> list[DecisionQuestion]:
-        """Вопросы группы ('judge'/'classify') из реестра; нет — пустой список."""
+        """Questions of a group ('judge'/'classify') from the registry; none — an empty list."""
         if self._registry is None:
             return []
         return list(self._registry.decision_questions.get(group, ()))
 
     def probe(self, operation: str | None = None) -> DecisionCheck:
-        """Пробный стук слота: `check_decision()`, успех снимает разрыв (§6.4).
+        """A probe knock on the slot: `check_decision()`, success lifts the breaker (§6.4).
 
-        Пишет события разрыва блока 2 (`slot_probe`/`slot_resumed`/
-        `slot_paused`, §7.2): разрыв decision живёт ЗДЕСЬ, воркер его не видит
-        (§13.8), поэтому журналит сам сервис — формат событий тот же.
-        `operation` — имя джобы для поля `job` (нет — сам слот).
+                    Writes the block-2 breaker events (`slot_probe`/`slot_resumed`/
+                    `slot_paused`, §7.2): the decision breaker lives HERE, the worker does
+                    not see it (§13.8), so the service journals it itself — the event
+                    format is the same. `operation` — the job name for the `job` field
+                    (none — the slot itself).
         """
         if self._llm is None:
             return DECISION_CHECK_UNSUPPORTED
@@ -289,7 +296,7 @@ class DecisionService:
             )
         return result
 
-    # --- решение -------------------------------------------------------------
+    # --- decision --------------------------------------------------------------
 
     def decide(
         self,
@@ -301,13 +308,13 @@ class DecisionService:
         older_id: int | None = None,
         candidate_id: int | None = None,
     ) -> DecisionResult:
-        """Спросить решение одним вызовом; иначе — `DecisionUnavailable` (§6.4).
+        """Ask for a decision in one call; otherwise — `DecisionUnavailable` (§6.4).
 
-        Порядок: выключенный слот → потолок меток → разрыв слота (без вызова);
-        затем один `POST /v1/systemone` со всеми вопросами, разбор ответа,
-        проверка порога/зоны по каждому вопросу. Оба пути видны в журнале:
-        `decision_answer` (вероятности и длительность) и `decision_fallback`
-        (причина переключения) — вероятности живут ТОЛЬКО там (FR-3.3).
+                    Order: a disabled slot → the label ceiling → the slot breaker (no call);
+                    then one `POST /v1/systemone` with all questions, response parsing,
+                    threshold/zone check per question. Both paths are visible in the journal:
+                    `decision_answer` (probabilities and duration) and `decision_fallback`
+                    (the switch reason) — probabilities live ONLY there (FR-3.3).
         """
         ids: dict[str, object] = {
             "note_id": note_id,
@@ -315,18 +322,18 @@ class DecisionService:
             "candidate_id": candidate_id,
         }
         if not self._settings.decision_enabled:
-            # Выключенный флагом путь — НЕ переключение (FR-4.4): ни счётчиков,
-            # ни события, ни разрыва. Защитная ветка: обычно сервис при
-            # выключенном флаге не собирается вовсе (`Services.decision is
-            # None`), но решение с неё обязано быть честным.
+            # The flag-off path is NOT a switch (FR-4.4): no counters,
+            # no event, no breaker. A defensive branch: normally the service is
+            # not built at all with the flag off (`Services.decision is
+            # None`), but the decision on this branch must be honest.
             detail = "decision-слот выключен флагом DECISION_ENABLED"
             raise DecisionUnavailable(detail, reason="unavailable")
         if not self.can_decide():
-            # Слот ВКЛЮЧЁН, но его сейчас нет: погашен стартовой проверкой
-            # (`check_decision() != ok`) или `disable()`. Причина — та, что
-            # запомнил `disable(outcome)`: `unsupported` («модель не умеет»)
-            # при контрактном исходе проверки, иначе `unavailable` («слота
-            # сейчас нет», дефект приёмки 12.10.2026).
+            # The slot is ENABLED but not there now: suppressed by the startup check
+            # (`check_decision() != ok`) or `disable()`. The reason is the one
+            # memorized by `disable(outcome)`: `unsupported` ("the model cannot do it")
+            # on a contract check outcome, otherwise `unavailable` ("the slot
+            # is not there now", an acceptance defect of 2026-10-12).
             reason = self._disabled_reason
             detail = (
                 "decision-слот недоступен (погашен проверкой) — решения идут "
@@ -336,16 +343,16 @@ class DecisionService:
                 reason, operation=operation, detail=detail, ids=ids
             )
             raise DecisionUnavailable(detail, reason=reason)
-        assert self._llm is not None  # can_decide() гарантирует клиента
+        assert self._llm is not None  # can_decide() guarantees the client
         if any(len(q.labels) > self._settings.decision_max_labels for q in questions):
-            # Потолок вариантов (arch §8): список узлов больше лимита модели.
+            # The options ceiling (arch §8): the node list exceeds the model's limit.
             detail = "вариантов в choice-вопросе больше DECISION_MAX_LABELS"
             self._fallback(
                 "unsupported", operation=operation, detail=detail, ids=ids
             )
             raise DecisionUnavailable(detail, reason="unsupported")
         if self._breaker.is_paused():
-            # Разрыв открыт и стук не наступил — экономим вызов (§6.4).
+            # The breaker is open and no knock happened — save the call (§6.4).
             detail = "разрыв decision-слота открыт — вызов пропущен"
             self._fallback(
                 "unavailable", operation=operation, detail=detail, ids=ids
@@ -413,11 +420,11 @@ class DecisionService:
         self._log_answer(operation, questions, answers, meta, ids=ids)
         return DecisionResult(answers=answers, meta=meta)
 
-    # --- внутреннее ----------------------------------------------------------
+    # --- internal --------------------------------------------------------------
 
     @staticmethod
     def _question_payload(question: DecisionQuestion) -> dict:
-        """Вопрос → канонический dict для клиента (имена полей сервера — там)."""
+        """A question → the client's canonical dict (the server's field names live there)."""
         return {
             "name": question.name,
             "kind": question.kind,
@@ -427,12 +434,13 @@ class DecisionService:
         }
 
     def _accepted(self, answer: DecisionAnswer, question: DecisionQuestion) -> bool:
-        """Прошла ли вероятность выбранного варианта порог и зону (§6.4).
+        """Whether the chosen option's probability passed the threshold and zone (§6.4).
 
-        `|p − threshold| < zone` → low_confidence; `p ≥ threshold + zone` →
-        принято (метка ответа); для `noul` «противоположное» решение
-        (`p ≤ threshold − zone`) тоже принято; `choice`/`score` ниже порога —
-        low_confidence (у многовариантного вопроса нет «противоположного»).
+                    `|p − threshold| < zone` → low_confidence; `p ≥ threshold + zone` →
+                    accepted (the answer label); for `noul` the "opposite" decision
+                    (`p ≤ threshold − zone`) is accepted too; `choice`/`score` below the
+                    threshold — low_confidence (a multi-option question has no
+                    "opposite").
         """
         threshold = (
             question.threshold
@@ -450,14 +458,14 @@ class DecisionService:
         return answer.kind == "noul" and probability <= threshold - zone
 
     def _outcome_of_error(self, exc: LLMError) -> SlotOutcome:
-        """Ошибка клиента → исход разрыва; 401/403 (нативный ollama) — AUTH."""
+        """A client error → the breaker outcome; 401/403 (native ollama) — AUTH."""
         outcome = classify_llm_error(exc)
         if outcome is not SlotOutcome.AUTH and getattr(exc, "status", None) in _AUTH_STATUSES:
             return SlotOutcome.AUTH
         return outcome
 
     def _meta(self, operation: str, duration_ms: int) -> ChatMeta:
-        """Метаданные вызова decision (§6.4): генерации нет — бюджета нет."""
+        """Decision call metadata (§6.4): no generation — no output budget."""
         spec = self._llm.spec  # type: ignore[union-attr]
         return ChatMeta(
             slot=SLOT_DECISION,
@@ -488,15 +496,16 @@ class DecisionService:
         answer: DecisionAnswer | None = None,
         ids: Mapping[str, object] | None = None,
     ) -> None:
-        """Учесть переключение: счётчики (§7.3/FR-6.3) + событие журнала.
+        """Account for the switch: counters (§7.3/FR-6.3) + a journal event.
 
-        Журнал пишет сам `DecisionService` (arch §7.2/§13.6): он единственный
-        знает вопрос, вероятность и причину переключения. В событие уходят
-        только цифры и фрагмент `detail` — тел ответов там нет (§7.2).
+                    The journal is written by `DecisionService` itself (arch §7.2/§13.6):
+                    it is the only one that knows the question, the probability and the
+                    switch reason. Only numbers and a `detail` fragment go into the event —
+                    no response bodies there (§7.2).
 
-        `reason` — ЕДИНСТВЕННАЯ точка инкремента счётчиков и записи события; имя
-        причины проходит белый список `DECISION_REASONS` (§13.6): чужое имя —
-        ошибка разработки, а не четвёртый счётчик.
+                    `reason` is the SINGLE point of counter increments and event writes;
+                    the reason name passes the `DECISION_REASONS` whitelist (§13.6): a
+                    foreign name is a development error, not a fourth counter.
         """
         if reason not in DECISION_REASONS:
             raise ValueError(
@@ -524,11 +533,11 @@ class DecisionService:
         *,
         ids: Mapping[str, object] | None = None,
     ) -> None:
-        """Событие `decision_answer` (§7.2): вероятности — ТОЛЬКО в журнале.
+        """The `decision_answer` event (§7.2): probabilities — ONLY in the journal.
 
-        Поля: `slot`, `operation`, имена вопросов, ответы (`kind`/`label`/
-        `probability`/`confidence`), порог, модель и `duration_ms`. В БД
-        вероятности не пишутся вовсе (FR-3.3).
+                    Fields: `slot`, `operation`, question names, answers (`kind`/`label`/
+                    `probability`/`confidence`), the threshold, the model and `duration_ms`.
+                    Probabilities are not written to the DB at all (FR-3.3).
         """
         fields: dict[str, object] = {
             "operation": operation,
@@ -552,7 +561,7 @@ class DecisionService:
 
     @staticmethod
     def _log(event: str, fields: Mapping[str, object]) -> None:
-        """JSON-событие журнала: `event` + `slot` + поля по факту (None — мимо)."""
+        """A journal JSON event: `event` + `slot` + fields as available (None — skipped)."""
         payload: dict[str, object] = {"event": event, "slot": SLOT_DECISION}
         for key, value in fields.items():
             if value is not None:
@@ -563,10 +572,10 @@ class DecisionService:
     def _log_slot_event(
         event: str, job: str, *, level: int = logging.INFO, **fields: object
     ) -> None:
-        """Событие разрыва/стука decision-слота (блок 2, §7.2): `slot`=decision.
+        """A decision-slot breaker/probe event (block 2, §7.2): `slot`=decision.
 
-        Формат тот же, что у воркера (`event`/`slot`/`job` + поля по факту),
-        чтобы разрыв decision читался оператором наравне с прочими слотами.
+                    The format is the same as the worker's (`event`/`slot`/`job` + fields
+                    as available), so the decision breaker reads on par with other slots.
         """
         payload: dict[str, object] = {
             "event": event,

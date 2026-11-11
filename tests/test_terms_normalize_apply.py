@@ -1,9 +1,9 @@
-"""№32 (3.2.0): применение плана — авто-переименование, слияние, история (§6.6).
+"""#32 (3.2.0): applying the plan — the auto-rename, the merge, history (§6.6).
 
-Авто — только при ТОЧНОМ равенстве нормализованных определений (FR-3.1/FR-3.3);
-конфликт ключа разрешается без потери данных (выживает меньший id, проигравший
-в мягкое удаление, FR-4.1/FR-4.2); история (№41) фиксирует переименование
-(`source='job:terms-normalize'`) и удаление.
+    The automatic path — only at EXACT equality of the normalized definitions
+    (FR-3.1/FR-3.3); a key conflict resolves without data loss (the smaller id
+    survives, the loser goes to soft delete, FR-4.1/FR-4.2); history (#41)
+    records the rename (`source='job:terms-normalize'`) and the deletion.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ def parts(test_env, monkeypatch):
 
 
 def test_auto_only_when_definitions_equal(parts) -> None:
-    """Одинаковые определения → авто; различающиеся → предупреждение без правок."""
+    """Equal definitions → auto; differing ones → a warning without edits."""
     settings, _terms, _warnings, service = parts
     seed(
         settings,
@@ -47,7 +47,7 @@ def test_auto_only_when_definitions_equal(parts) -> None:
     assert rows[0]["context_norm"] == normalize_key("проекте")
     assert rows[0]["definition"] == "одно и то же"
 
-    # Разные определения: авто запрещено, данные не тронуты.
+    # Different definitions: the automatic path is forbidden; the data untouched.
     seed(
         settings,
         [
@@ -65,7 +65,7 @@ def test_auto_only_when_definitions_equal(parts) -> None:
 
 
 def test_rename_recomputes_key_and_vector(parts) -> None:
-    """После переименования ключ каноничен, вектор — pending (догонит areas)."""
+    """After the rename the key is canonical; the vector — pending (the areas loop catches up)."""
     settings, _terms, _warnings, service = parts
     seed(
         settings,
@@ -83,7 +83,7 @@ def test_rename_recomputes_key_and_vector(parts) -> None:
 
 
 def test_key_conflict_soft_deletes_loser(parts) -> None:
-    """Занятый каноничный ключ: выживает меньший id, проигравший — в trash."""
+    """The canonical key taken: the smaller id survives; the loser — to trash."""
     settings, _terms, _warnings, service = parts
     seed(
         settings,
@@ -100,11 +100,11 @@ def test_key_conflict_soft_deletes_loser(parts) -> None:
     for loser_id in (2, 3):
         loser = row_by_id(settings, loser_id)
         assert loser["deleted_at"] is not None
-        assert loser["definition"] == "д"  # данные живы в trash
+        assert loser["definition"] == "д"  # the data alive in trash
 
 
 def test_history_records_rename_and_delete(parts) -> None:
-    """История фиксирует переименование (джоба) и удаление (событие `delete`)."""
+    """History records the rename (the job) and the deletion (a `delete` event)."""
     settings, _terms, _warnings, service = parts
     seed(
         settings,
@@ -122,7 +122,7 @@ def test_history_records_rename_and_delete(parts) -> None:
 
 
 def test_hint_shrinks(parts) -> None:
-    """После нормализации hint `terms_save` показывает короткий список контекстов."""
+    """After the normalization the `terms_save` hint shows a short context list."""
     settings, terms, _warnings, service = parts
     originals = {
         normalize_key(context)

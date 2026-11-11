@@ -1,19 +1,21 @@
-"""Векторное хранилище — notes_vec, vec0 (ARCHITECTURE §3.3, Фаза 3).
+"""The vector store — notes_vec, vec0 (ARCHITECTURE §3.3, Phase 3).
 
-Слой без доменных правил: сериализация векторов (float32 little-endian),
-запись/чтение и KNN-запрос к vec0-таблице. Доменные правила (когда кодировать
-текст, пороги близости) — в сервисных слоях (`embedding`, `search`, `dedup`).
+A layer without domain rules: vector serialization (float32 little-endian),
+write/read and the KNN query against the vec0 table. Domain rules (when to
+encode text, closeness thresholds) live in the service layers (`embedding`,
+`search`, `dedup`).
 
-Ключевые решения:
-- `distance_metric=cosine` (sqlite-vec 0.1.6): в консистентных единицах —
-  `distance = 1 - cosine`, поэтому `cosine = 1 - distance` (косинус нечувствителен
-  к норме — векторизация Ollama не обязана быть нормированной); шкала задана
-  REQUIREMENTS §8 (пороги SCORE_THRESHOLD/DEDUP_SIMILAR даны как косинусная
-  близость), не как евклидово расстояние.
-- До 50 000 заметок brute-force скан vec0 приемлем (NFR-5) — не нужен отдельный
-  ANN-индекс, один файл БД.
-- Размерность — `float[{dim}]` из env при создании БД; сверка БД↔env — в
-  `db.init_db` (несовпадение → отказ старта, переиндексация — scripts/reindex.py).
+Key decisions:
+- `distance_metric=cosine` (sqlite-vec 0.1.6): in consistent units —
+  `distance = 1 - cosine`, hence `cosine = 1 - distance` (cosine ignores the
+  norm — the Ollama embedding need not be normalized); the scale is fixed by
+  REQUIREMENTS §8 (the SCORE_THRESHOLD/DEDUP_SIMILAR thresholds are given as
+  cosine closeness), not as a Euclidean distance.
+- Up to 50 000 notes a brute-force vec0 scan is acceptable (NFR-5) — no
+  separate ANN index, one DB file.
+- The dimension is `float[{dim}]` from env at database creation; the DB↔env
+  check lives in `db.init_db` (a mismatch → startup refusal; reindex —
+  scripts/reindex.py).
 """
 
 from __future__ import annotations
@@ -23,23 +25,23 @@ import sqlite3
 import struct
 from collections.abc import Sequence
 
-# В sqlite_master хранится исходный текст CREATE VIRTUAL TABLE — размерность
-# вынимаем оттуда (шедоу-таблицы vec0 считаются приватными деталями версии).
+# sqlite_master stores the original CREATE VIRTUAL TABLE text — the dimension
+# is extracted from there (vec0 shadow tables are private version details).
 _VEC_DIM_RE = re.compile(r"float\[(\d+)\]")
 
-# Партиция namespace (Фаза 10): колонка `+ns` в DDL — partition key sqlite-vec
-# 0.1.6: KNN с фильтром сканирует только свою партицию.
+# The namespace partition (Phase 10): the `+ns` column in the DDL is the
+# sqlite-vec 0.1.6 partition key: a filtered KNN scans only its partition.
 _PARTITION_RE = re.compile(r"\+\s*ns\s+TEXT")
 
 VEC_TABLE = "notes_vec"
 
 
 class VectorError(RuntimeError):
-    """Ошибка векторного слоя: схема сбита или вектор неподходящей размерности."""
+    """A vector-layer error: a broken schema or a wrong-dimension vector."""
 
 
 def existing_vec_dim(conn: sqlite3.Connection) -> int | None:
-    """Размерность из DDL в sqlite_master; None — таблицы ещё нет."""
+    """The dimension from the sqlite_master DDL; None — no table yet."""
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='notes_vec'"
     ).fetchone()
@@ -52,10 +54,11 @@ def existing_vec_dim(conn: sqlite3.Connection) -> int | None:
 
 
 def create_vec_table(conn: sqlite3.Connection, dim: int) -> None:
-    """Создать notes_vec с фиксированной размерностью (вызов один раз на БД).
+    """Create notes_vec with the pinned dimension (called once per database).
 
-    Фаза 10: колонка `+ns` — partition key по неймспейсу заметки (sqlite-vec
-    0.1.6): KNN с фильтром `+ns IN (...)` сканирует только партиции поддерева.
+    Phase 10: the `+ns` column is the partition key over the note namespace
+    (sqlite-vec 0.1.6): a KNN with the `+ns IN (...)` filter scans only the
+    subtree's partitions.
     """
     conn.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS notes_vec USING vec0("
@@ -67,7 +70,7 @@ def create_vec_table(conn: sqlite3.Connection, dim: int) -> None:
 
 
 def has_partition(conn: sqlite3.Connection) -> bool:
-    """Есть ли партиция `+ns` в notes_vec (миграция Фазы 10); нет таблицы — False."""
+    """Whether notes_vec carries the `+ns` partition (the Phase 10 migration); no table — False."""
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='notes_vec'"
     ).fetchone()
@@ -76,21 +79,21 @@ def has_partition(conn: sqlite3.Connection) -> bool:
     return _PARTITION_RE.search(row[0] or "") is not None
 
 
-# --- сериализация ---------------------------------------------------------
+# --- serialization ---------------------------------------------------------
 
 
 def pack(vector: list[float]) -> bytes:
-    """list[float] → BLOB vec0: float32 little-endian (платформо-независимо)."""
+    """list[float] → a vec0 BLOB: float32 little-endian (platform-independent)."""
     return struct.pack(f"<{len(vector)}f", *vector)
 
 
 def unpack(blob: bytes) -> list[float]:
-    """BLOB → list[float] (float32); len байт обязан быть кратен 4."""
+    """BLOB → list[float] (float32); the byte length must be a multiple of 4."""
     size = len(blob) // struct.calcsize("<f")
     return list(struct.unpack(f"<{size}f", blob))
 
 
-# --- операции -----------------------------------------------------------
+# --- operations -----------------------------------------------------------
 
 
 def upsert(
@@ -99,14 +102,14 @@ def upsert(
     vector: list[float],
     ns: str = "default",
 ) -> None:
-    """Записать/перезаписать вектор заметки (save/update/re-векторизация).
+    """Write/overwrite a note vector (save/update/re-vectorization).
 
-    DELETE + INSERT, а не INSERT OR REPLACE: vec0-виртуальная таблица
-    не гарантирует поддержку REPLACE/ON CONFLICT — DELETE+INSERT идёт через
-    публичный протокол xUpdate и устойчив к версии расширения. Ошибка
-    размерности доходит наверх как sqlite3.Error (мешок session()).
-    Фаза 10: `ns` — партиция неймспейса заметки (дефолт — обратная
-    совместимость: тесты и legacy-пути пишут в default).
+    DELETE + INSERT, not INSERT OR REPLACE: a vec0 virtual table does not
+    guarantee REPLACE/ON CONFLICT support — DELETE+INSERT goes through the
+    public xUpdate protocol and survives extension version changes. A
+    dimension error surfaces as sqlite3.Error (the session() bag).
+    Phase 10: `ns` is the note-namespace partition (the default keeps backward
+    compatibility: tests and legacy paths write to default).
     """
     drop(conn, note_id)
     conn.execute(
@@ -116,12 +119,12 @@ def upsert(
 
 
 def drop(conn: sqlite3.Connection, note_id: int) -> None:
-    """Жёстко убрать вектор (reindex, физическая чистка trash — не soft delete)."""
+    """Hard-remove a vector (reindex, physical trash cleanup — not a soft delete)."""
     conn.execute("DELETE FROM notes_vec WHERE note_id = ?", (note_id,))
 
 
 def get_vector(conn: sqlite3.Connection, note_id: int) -> list[float] | None:
-    """Вектор заметки или None (вектора ещё нет — pending)."""
+    """The note vector, or None (no vector yet — pending)."""
     row = conn.execute(
         "SELECT embedding FROM notes_vec WHERE note_id = ?", (note_id,)
     ).fetchone()
@@ -134,13 +137,13 @@ def knn(
     k: int,
     ns_filter: Sequence[str] | None = None,
 ) -> list[tuple[int, float]]:
-    """Топ-k заметок по косинусной близости к запросу (KNN brute-force vec0).
+    """Top-k notes by cosine closeness to the query (KNN brute-force vec0).
 
-    Часть soft-deleted заметок (trash) вектора сохраняют (ARCH §3.3) —
-    фильтрация удалённых — выше vec0, в SearchService (постовое отсечение).
-    Фаза 10: `ns_filter` — список путей узлов поддерева (KNN сканирует только
-    их партиции); None/пустой — глобальный поиск по всей таблице.
-    Возвращает [(note_id, cosine)], по убыванию близости, cosine = 1 - distance.
+    Some soft-deleted notes (trash) keep their vectors (ARCH §3.3) — deleted
+    rows are filtered above vec0, in SearchService (per-item cutoff).
+    Phase 10: `ns_filter` is the list of subtree node paths (the KNN scans
+    only their partitions); None/empty — a global search over the whole table.
+    Returns [(note_id, cosine)] by descending closeness, cosine = 1 - distance.
     """
     if ns_filter:
         placeholders = ",".join("?" * len(ns_filter))
@@ -160,5 +163,5 @@ def knn(
 
 
 def count(conn: sqlite3.Connection) -> int:
-    """Число векторов в индексе (диагностика /health, скрипты оператора)."""
+    """The number of vectors in the index (/health diagnostics, operator scripts)."""
     return int(conn.execute("SELECT COUNT(*) FROM notes_vec").fetchone()[0])

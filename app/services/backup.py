@@ -1,46 +1,47 @@
-"""BackupService (ARCHITECTURE §3.2, NFR-3): периодические снапшоты БД.
+"""BackupService (ARCHITECTURE §3.2, NFR-3): periodic DB snapshots.
 
-Зачем: единственные данные сервиса — один файл SQLite; сценарии питания и
-повреждение WAL переживаются только свежей копией. Снапшот делается штатным
-SQLite backup API (`Connection.backup`) — **онлайн**: читает согласованное
-состояние БД по WAL, не останавливая бытовые чтения/записи (сокет заблокирует
-на миллисекунды, длинных блокировок нет).
+    Why: the service's only data is a single SQLite file; power scenarios and WAL
+    corruption survive only via a fresh copy. A snapshot uses the standard SQLite
+    backup API (`Connection.backup`) — **online**: it reads a consistent DB state
+    over WAL without stopping routine reads/writes (the socket blocks for
+    milliseconds, no long locks).
 
-Параметры (REQUIREMENTS §8): `BACKUP_DIR` (каталог копий, создаётся при
-снапшоте), `BACKUP_INTERVAL_SEC` (интервал петли; первый снапшот — сразу
-после старта), `BACKUP_KEEP` (число хранимых копий; ротация после каждого
-снапшота), `BACKUP_VERIFY_EVERY` (проверка каждого N-го снапшота; 0 — только
-вручную, `POST /backups/verify`), `BACKUP_SHIP_CMD` (операторская команда
-выноса проверенной копии за пределы сервера; пусто — вынос выключен) и
-`BACKUP_SHIP_TIMEOUT_SEC` (таймаут команды выноса, с).
+    Parameters (REQUIREMENTS §8): `BACKUP_DIR` (the copies directory, created at
+    snapshot time), `BACKUP_INTERVAL_SEC` (the loop interval; the first snapshot
+    comes right after the start), `BACKUP_KEEP` (the number of stored copies;
+    rotation after each snapshot), `BACKUP_VERIFY_EVERY` (verify every N-th
+    snapshot; 0 — manual only, `POST /backups/verify`), `BACKUP_SHIP_CMD` (the
+    operator command that ships a verified copy off the server; empty — shipping
+    off) and `BACKUP_SHIP_TIMEOUT_SEC` (the ship command timeout, s).
 
-Файл снапшота: `notes-YYYYmmddTHHMMSSZ.db` (UTC — лексикографический порядок
-имён совпадает с хронологией; vec0-таблица требует sqlite-vec на открытии —
-обычный читатель видит `notes` без расширения).
+    Snapshot file: `notes-YYYYmmddTHHMMSSZ.db` (UTC — the lexicographic name order
+    matches the chronology; the vec0 table requires sqlite-vec on open — a plain
+    reader sees `notes` without the extension).
 
-№14 (релиз 3.2.0, arch §5.1/§6.1/§13.1-13.3): сервис умеет **проверять
-восстановление** снапшота (`verify`): открывает копию read-only с загруженным
-sqlite-vec, гоняет `PRAGMA integrity_check`, сверяет наличие обязательных
-таблиц (список — из реестров `app.storage`, не хардкод) и доступность каждой
-vec0 (`SELECT 1 ... LIMIT 1`); расхождение `meta.embedding_model` — замечание,
-а не отказ. Негодный снапшот **помечается** сайдкаром `<file>.bad`, а не
-удаляется молча (FR-2.3); при удачной повторной проверке маркер снимается.
-`status()` — наблюдаемость сканом каталога (без открытия БД), исходы проверки
-переживают рестарт в сайдкар-индексе `backups-index.json`.
+    #14 (release 3.2.0, arch §5.1/§6.1/§13.1-13.3): the service can **verify the
+    restore** of a snapshot (`verify`): opens the copy read-only with sqlite-vec
+    loaded, runs `PRAGMA integrity_check`, checks the required tables (the list —
+    from the `app.storage` registries, not hardcoded) and the reachability of each
+    vec0 (`SELECT 1 ... LIMIT 1`); a `meta.embedding_model` mismatch is a remark,
+    not a failure. A bad snapshot is **marked** with a `<file>.bad` sidecar, not
+    silently deleted (FR-2.3); a successful re-check removes the marker.
+    `status()` — observability by scanning the directory (no DB open), check
+    outcomes survive a restart in the `backups-index.json` sidecar index.
 
-Отказы: ошибка снапшота не убивает процесс — событие `backup_failed` в
-логе (NFR-4), петля продолжит по интервалу. Отказ проверки петлю не роняет
-(NFR-3). Петля запускается lifespan-ом отдельной asyncio-таской; тяжёлая
-часть (I/O) — в `asyncio.to_thread`.
+    Failures: a snapshot error does not kill the process — a `backup_failed` event
+    in the log (NFR-4), the loop continues on schedule. A verify failure does not
+    crash the loop (NFR-3). The loop is started by lifespan as a separate asyncio
+    task; the heavy part (I/O) goes through `asyncio.to_thread`.
 
-Вынос копии (`ship`, no14-02, arch §6.1/§13.4): после успешной проверки
-операторская команда `BACKUP_SHIP_CMD` уносит копию за пределы сервера;
-назначение и учётки живут ВНЕ репозитория и образа — сервис передаёт команде
-только путь к файлу (`LSB_BACKUP_FILE`/`LSB_BACKUP_NAME`). Успех — только
-`returncode == 0` И отчёт `size=<N>` в stdout, равный размеру файла; иначе
-отказ с `reason` и событием. Команда и её вывод в логи НЕ попадают (никаких
-секретов). Отказ выноса петлю не роняет и локальную ротацию не ломает
-(FR-3.2).
+    Shipping a copy (`ship`, no14-02, arch §6.1/§13.4): after a successful verify
+    the operator command `BACKUP_SHIP_CMD` carries the copy off the server;
+    the destination and credentials live OUTSIDE the repository and image — the
+    service passes only the file path to the command (`LSB_BACKUP_FILE`/
+    `LSB_BACKUP_NAME`). Success — only `returncode == 0` AND a `size=<N>` report
+    on stdout equal to the file size; otherwise a failure with a `reason` and an
+    event. The command and its output never reach the logs (no secrets). A ship
+    failure does not crash the loop and does not break local rotation
+    (FR-3.2).
 """
 
 from __future__ import annotations
@@ -61,28 +62,28 @@ from app.config import Settings
 from app.services.namespaces import NamespaceService
 from app.storage import area_vectors, chunks, db, vectors
 
-# Коллекция снапшотов внутри BACKUP_DIR (имя = фиксированный префикс + UTC).
+# The snapshot collection inside BACKUP_DIR (name = fixed prefix + UTC).
 IMAGE_PREFIX = "notes-"
 IMAGE_SUFFIX = ".db"
 SNAPSHOT_RE = re.compile(rf"^{IMAGE_PREFIX}\d{{8}}T\d{{6}}Z{IMAGE_SUFFIX}$")
 
-# №14 (arch §5.1/§6.1): артефакты наблюдаемости рядом со снапшотами.
-VERIFY_MARKER_SUFFIX = ".bad"  # сайдкар негодного снапшота
-STATE_FILE_NAME = "backups-index.json"  # сайдкар-индекс последних исходов
-# Значения `reason` для verify (дословно EN, arch §6.1).
+# #14 (arch §5.1/§6.1): observability artifacts next to the snapshots.
+VERIFY_MARKER_SUFFIX = ".bad"  # the bad-snapshot sidecar
+STATE_FILE_NAME = "backups-index.json"  # the sidecar index of latest outcomes
+# `reason` values for verify (verbatim EN, arch §6.1).
 VERIFY_REASONS = (
     "not_openable",
     "integrity_failed",
     "missing_tables",
     "vec_unavailable",
 )
-# Мягкое замечание (не делает ok=false): копия снята до смены модели
-# эмбеддинга — валидная база, при открытии просто переиндексируется (§13.1).
+# A soft remark (does not make ok=false): the copy was taken before the
+# embedding model change — a valid base, simply reindexed on open (§13.1).
 EMBEDDING_MISMATCH = "embedding_mismatch"
 
-# №14 (arch §6.1/§13.4): контракт выноса копии за пределы сервера.
-MIN_SHIP_REPORT = "size="  # отчёт команды выноса: `size=<N>`, N = размер копии
-# Значения `reason` для ship (дословно EN, arch §6.1).
+# #14 (arch §6.1/§13.4): the contract of shipping a copy off the server.
+MIN_SHIP_REPORT = "size="  # the ship command's report: `size=<N>`, N = the copy size
+# `reason` values for ship (verbatim EN, arch §6.1).
 SHIP_REASONS = ("disabled", "command_failed", "size_mismatch", "timeout")
 
 _STAMP_FMT = "%Y%m%dT%H%M%SZ"
@@ -90,13 +91,13 @@ _LATENCY = time.perf_counter
 
 
 def _required_tables() -> tuple[str, ...]:
-    """Обязательные таблицы снапшота — из реестров `app.storage` (не хардкод).
+    """Required snapshot tables — from the `app.storage` registries (not hardcoded).
 
-    Ядро — `db.CORE_TABLES`; плюс оба векторных индекса заметок
-    (`vectors.VEC_TABLE`, `chunks.CHUNKS_VEC_TABLE`) и area-vec (включая
-    vec-таблицу логов) — из `area_vectors.VEC_TABLES`. Список собирается
-    динамически: добавление области/индекса в реестр автоматически расширяет
-    проверку (arch §6.1/§13.1).
+            The core — `db.CORE_TABLES`; plus both note vector indexes
+            (`vectors.VEC_TABLE`, `chunks.CHUNKS_VEC_TABLE`) and area-vecs (including
+            the logs vec table) — from `area_vectors.VEC_TABLES`. The list is assembled
+            dynamically: adding an area/index to the registry extends the check
+            automatically (arch §6.1/§13.1).
     """
     return (
         db.CORE_TABLES
@@ -106,19 +107,19 @@ def _required_tables() -> tuple[str, ...]:
 
 
 def _vec_tables() -> tuple[str, ...]:
-    """vec0-таблицы, доступность которых проверяется запросом (arch §13.1)."""
+    """vec0 tables whose reachability is checked by a query (arch §13.1)."""
     return (vectors.VEC_TABLE, chunks.CHUNKS_VEC_TABLE) + tuple(
         table for table, _id_column in area_vectors.VEC_TABLES
     )
 
 
 def _now_iso() -> str:
-    """Метка времени артефактов (UTC, как в именах снапшотов)."""
+    """Artifact timestamp (UTC, as in snapshot names)."""
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _created_at(name: str) -> str | None:
-    """Время создания из имени снапшота (сортируемо, без чтения файла)."""
+    """Creation time parsed from the snapshot name (sortable, no file read)."""
     match = SNAPSHOT_RE.match(name)
     if match is None:
         return None
@@ -127,44 +128,45 @@ def _created_at(name: str) -> str | None:
 
 
 def _parse_ship_size(stdout: str) -> int | None:
-    """Размер копии из отчёта команды выноса (`size=<N>`, первое вхождение)."""
+    """The copy size from the ship command's report (`size=<N>`, first occurrence)."""
     match = re.search(rf"{re.escape(MIN_SHIP_REPORT)}(\d+)", stdout)
     return int(match.group(1)) if match is not None else None
 
 
 class BackupService:
-    """Периодический снапшот + ротация; петля — asyncio-таска в lifespan.
+    """Periodic snapshot + rotation; the loop is an asyncio task in lifespan.
 
-    Фаза 10 (Шаг 6): после каждого снапшота — груминг реестра неймспейсов
-    (`NamespaceService.groom`): пустые provisional-листы чистятся, мелкие
-    и пустые confirmed — сигнал оператору в логах. Ритм — раз в сутки,
-    штатный интервал backup-петли (бриф Ф10 §3 «груминг в backup-цикл»);
-    отдельный сервис не нужен — структурная автоматика редка.
+            Phase 10 (Step 6): after each snapshot — grooming of the namespace registry
+            (`NamespaceService.groom`): empty provisional lists are cleaned, small and
+            empty confirmed ones — a signal to the operator in the logs. The rhythm —
+            once a day, the regular backup-loop interval (Ph10 brief §3 "grooming into
+            the backup cycle"); a separate service is unnecessary — structural
+            automation is rare.
     """
 
     def __init__(self, settings: Settings, namespaces: NamespaceService | None = None) -> None:
         self._settings = settings
-        # Реестр неймспейсов для груминга (Фаза 10): общий экземпляр из
-        # build_services; None — создать свой (тесты/юниты).
+        # The namespace registry for grooming (Phase 10): the shared instance from
+        # build_services; None — create one's own (tests/units).
         self._namespaces = namespaces if namespaces is not None else NamespaceService(settings)
         self._stopping = False
-        self._verify_counter = 0  # №14: счётчик успешных снапшотов в петле
+        self._verify_counter = 0  # #14: the counter of successful snapshots in the loop
 
     def stop(self) -> None:
-        """Мягкая остановка: петля не начнёт новый снапшот."""
+        """Soft stop: the loop will not start a new snapshot."""
         self._stopping = True
 
-    # --- синхронная часть (зывается из to_thread) ----------------------------
+    # --- synchronous part (called from to_thread) -----------------------------
 
     def snapshot(self) -> Path:
-        """Онлайн-снапшот БД (SQLite backup API) + ротация; путь нового файла.
+        """Online DB snapshot (SQLite backup API) + rotation; the new file path.
 
-        При отказе копирования частичный target-файл убирается — в ротации
-        остаются только целые снапшоты (битый файл не занимает слот).
+                    On a copy failure the partial target file is removed — only whole
+                    snapshots stay in rotation (a broken file takes no slot).
 
-        Raises:
-            sqlite3.Error / OSError: пробрасываются — интерпретация и лог
-            на стороне петли (`run`) или теста.
+                    Raises:
+                        sqlite3.Error / OSError: propagated — interpretation and logging
+                        belong to the loop (`run`) or the test.
         """
         started = _LATENCY()
         backup_dir = Path(self._settings.backup_dir)
@@ -191,7 +193,7 @@ class BackupService:
 
     @staticmethod
     def _copy(source_path: str, target_path: Path) -> None:
-        """SQLite backup API: копия консистентного состояния без остановки."""
+        """SQLite backup API: a copy of a consistent state without stopping."""
         source = sqlite3.connect(source_path)
         try:
             dest = sqlite3.connect(target_path)
@@ -203,13 +205,13 @@ class BackupService:
             source.close()
 
     def rotate(self) -> list[Path]:
-        """Оставить BACKUP_KEEP свежайших снапшотов; вернуть удалённые.
+        """Keep the BACKUP_KEEP newest snapshots; return the removed ones.
 
-        Порядок — по имени (UTC-таймштамп в имени, лексикография = время).
-        Сторонние файлы (не `notes-*.db`) не трогаем — оператор мог положить
-        в каталог что-то своё. №14 (FR-2.3): снапшоты с сайдкаром `<file>.bad`
-        исключаются из кандидатов — негодный не вытесняет годные, решение о
-        его удалении принимает человек.
+                    Order — by name (a UTC timestamp in the name; lexicography = time).
+                    Foreign files (not `notes-*.db`) are untouched — the operator may keep
+                    something of their own in the directory. #14 (FR-2.3): snapshots with a
+                    `<file>.bad` sidecar are excluded from candidates — a bad one does not
+                    push out good ones; the removal decision belongs to a human.
         """
         backups = sorted(self._backup_dir().glob(f"{IMAGE_PREFIX}*{IMAGE_SUFFIX}"))
         candidates = [path for path in backups if not self._marker_path(path).exists()]
@@ -222,7 +224,7 @@ class BackupService:
         return Path(self._settings.backup_dir)
 
     def _snapshots(self) -> list[Path]:
-        """Снапшоты каталога по имени (сортировка = хронология); без открытия БД."""
+        """Directory snapshots by name (sort = chronology); no DB open."""
         backup_dir = self._backup_dir()
         if not backup_dir.is_dir():
             return []
@@ -233,15 +235,15 @@ class BackupService:
         )
 
     def newest_snapshot(self) -> Path | None:
-        """Свежайший по имени снапшот или None (пустой каталог)."""
+        """The newest-by-name snapshot or None (empty directory)."""
         snapshots = self._snapshots()
         return snapshots[-1] if snapshots else None
 
     def resolve(self, name: str) -> Path | None:
-        """Снапшот каталога по имени файла (без выхода за BACKUP_DIR) или None.
+        """A directory snapshot by file name (no escape from BACKUP_DIR) or None.
 
-        Имя приводится к базовому элементу (`Path(name).name`) — операторская
-        ручка не даёт прочитать произвольный файл хоста.
+                    The name is reduced to its base element (`Path(name).name`) — the
+                    operator handle cannot read an arbitrary host file.
         """
         candidate = self._backup_dir() / Path(name).name
         if SNAPSHOT_RE.match(candidate.name) and candidate.is_file():
@@ -249,27 +251,28 @@ class BackupService:
         return None
 
     def groom(self) -> dict[str, Any]:
-        """Груминг реестра после снапшота (Фаза 10, Шаг 6): NamespaceService.
+        """Registry grooming after a snapshot (Phase 10, Step 6): NamespaceService.
 
-        Отдельный метод — точка DI и теста: петля зовёт его после снапшота,
-        отказ пробрасывается (интерпретация — на стороне run).
+                    A separate method — the DI and test point: the loop calls it after the
+                    snapshot; a failure is propagated (interpretation belongs to run).
         """
         return self._namespaces.groom()
 
-    # --- проверка восстановления (№14, arch §6.1) ---------------------------
+    # --- restore verification (#14, arch §6.1) --------------------------------
 
     def verify(self, path: Path | None = None) -> dict[str, Any]:
-        """Проверить снапшот (read-only) и пометить негодный (arch §6.1/§13.1).
+        """Verify a snapshot (read-only) and mark a bad one (arch §6.1/§13.1).
 
-        `path=None` → свежайший по имени снапшот. Открывает копию read-only с
-        загруженным sqlite-vec, гоняет `PRAGMA integrity_check`, сверяет
-        обязательные таблицы (реестры `app.storage`) и доступность каждой
-        vec0; `meta.embedding_model` — замечание, не отказ. `ok=false` →
-        сайдкар `<file>.bad` (не удаляем!), `ok=true` → маркер снимается.
-        Отсутствие файла — `{"ok": False, "reason": "not_openable"}` без падения.
+                    `path=None` → the newest-by-name snapshot. Opens the copy read-only
+                    with sqlite-vec loaded, runs `PRAGMA integrity_check`, checks the
+                    required tables (the `app.storage` registries) and the reachability of
+                    each vec0; `meta.embedding_model` — a remark, not a failure.
+                    `ok=false` → the `<file>.bad` sidecar (never deleted!), `ok=true` →
+                    the marker is removed. A missing file —
+                    `{"ok": False, "reason": "not_openable"}` without a crash.
 
-        Returns:
-            `{"file", "ok", "reason"? , "checks": {...}, "latency_ms"}`.
+                    Returns:
+                        `{"file", "ok", "reason"? , "checks": {...}, "latency_ms"}`.
         """
         started = _LATENCY()
         if path is None:
@@ -307,7 +310,7 @@ class BackupService:
         return result
 
     def _inspect(self, path: Path) -> dict[str, Any]:
-        """Разобрать снапшот: integrity → таблицы → vec0 → meta (read-only)."""
+        """Inspect a snapshot: integrity → tables → vec0 → meta (read-only)."""
         checks: dict[str, Any] = {}
         try:
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
@@ -378,7 +381,7 @@ class BackupService:
             conn.close()
 
     def _embedding_mismatch(self, conn: sqlite3.Connection) -> bool:
-        """`meta.embedding_model` разошёлся с env — замечание (не отказ, §13.1)."""
+        """`meta.embedding_model` diverged from env — a remark (not a failure, §13.1)."""
         try:
             row = conn.execute(
                 "SELECT value FROM meta WHERE key = 'embedding_model'"
@@ -388,41 +391,42 @@ class BackupService:
         return row is not None and str(row[0]) != self._settings.embedding_model
 
     def _marker_path(self, path: Path) -> Path:
-        """Сайдкар негодного снапшота: `<file>.bad`."""
+        """The bad-snapshot sidecar: `<file>.bad`."""
         return path.with_name(path.name + VERIFY_MARKER_SUFFIX)
 
     def _write_marker(self, path: Path, reason: str, checks: dict[str, Any]) -> None:
-        """Записать сайдкар негодного снапшота (`reason`/`at`/`checks`)."""
+        """Write the bad-snapshot sidecar (`reason`/`at`/`checks`)."""
         payload = {"reason": reason, "at": _now_iso(), "checks": checks}
         self._marker_path(path).write_text(
             json.dumps(payload, sort_keys=True), encoding="utf-8"
         )
 
-    # --- вынос копии за пределы сервера (№14, arch §6.1/§13.4) ---------------
+    # --- shipping a copy off the server (#14, arch §6.1/§13.4) ----------------
 
     def ship(self, path: Path) -> dict[str, Any]:
-        """Вынести проверенную копию снапшота за пределы сервера (FR-3.1/FR-3.2).
+        """Ship a verified snapshot copy off the server (FR-3.1/FR-3.2).
 
-        Команда — операторская (`BACKUP_SHIP_CMD`); назначение и учётки живут
-        ВНЕ репозитория и образа, сервис передаёт команде только путь к файлу в
-        `LSB_BACKUP_FILE` (+ имя в `LSB_BACKUP_NAME`) и запускает команду через
-        `shell` с таймаутом `BACKUP_SHIP_TIMEOUT_SEC`. Пустая команда — тихий
-        no-op: `{\"ok\": None, \"skipped\": True, \"reason\": \"disabled\"}`; событие НЕ
-        пишется и сайдкар-индекс не трогается.
+                    The command is operator-owned (`BACKUP_SHIP_CMD`); the destination and
+                    credentials live OUTSIDE the repository and image — the service passes
+                    only the file path in `LSB_BACKUP_FILE` (+ the name in
+                    `LSB_BACKUP_NAME`) and runs the command via `shell` with the
+                    `BACKUP_SHIP_TIMEOUT_SEC` timeout. An empty command — a silent no-op:
+                    `{"ok": None, "skipped": True, "reason": "disabled"}`; NO event is
+                    written and the sidecar index is untouched.
 
-        Успех — только `returncode == 0` И отчёт `size=<N>` в stdout, равный
-        размеру локального файла; иначе `reason` ∈ `SHIP_REASONS`
-        (`command_failed` — ненулевой код, нет отчёта или файл исчез;
-        `size_mismatch` — отчёт есть, размер другой; `timeout` — таймаут).
-        Исход пишется в сайдкар-индекс (`last_ship`) и событием
-        `backup_shipped`/`backup_ship_failed`. Значения команды и её вывода в
-        логи НЕ попадают (никаких секретов); отказ выноса локальные снапшоты и
-        ротацию не трогает (FR-3.2).
+                    Success — only `returncode == 0` AND a `size=<N>` report on stdout
+                    equal to the local file size; otherwise `reason` ∈ `SHIP_REASONS`
+                    (`command_failed` — a non-zero code, no report or the file vanished;
+                    `size_mismatch` — a report exists, the size differs; `timeout`).
+                    The outcome is written to the sidecar index (`last_ship`) and to the
+                    `backup_shipped`/`backup_ship_failed` event. The command value and its
+                    output never reach the logs (no secrets); a ship failure does not touch
+                    local snapshots or rotation (FR-3.2).
 
-        Returns:
-            `{\"file\", \"ok\", \"size_bytes\"?, \"reason\"?, \"latency_ms\"}`; для
-            выключенного выноса — `{\"file\", \"ok\": None, \"skipped\": True,
-            \"reason\": \"disabled\"}`.
+                    Returns:
+                        `{"file", "ok", "size_bytes"?, "reason"?, "latency_ms"}`; for
+                        shipping off — `{"file", "ok": None, "skipped": True,
+                        "reason": "disabled"}`.
         """
         started = _LATENCY()
         target = Path(path)
@@ -437,7 +441,7 @@ class BackupService:
         try:
             local_size = target.stat().st_size
         except OSError:
-            # Локальной копии нет — подтвердить вынос нечем; команду не зовём.
+            # No local copy — nothing to confirm the ship with; the command is not called.
             return self._finish_ship(
                 target, ok=False, size_bytes=None, reason="command_failed", started=started
             )
@@ -460,7 +464,7 @@ class BackupService:
                 target, ok=False, size_bytes=local_size, reason="timeout", started=started
             )
         except OSError:
-            # Команда не запустилась (нет оболочки/прав) — как отказ команды.
+            # The command did not start (no shell/permissions) — treated as a command failure.
             return self._finish_ship(
                 target, ok=False, size_bytes=local_size, reason="command_failed", started=started
             )
@@ -470,7 +474,7 @@ class BackupService:
             )
         reported = _parse_ship_size(completed.stdout)
         if reported is None:
-            # Код 0, но контрактного отчёта `size=<N>` нет — вынос не подтверждён.
+            # Code 0, but no contract report `size=<N>` — the ship is not confirmed.
             return self._finish_ship(
                 target, ok=False, size_bytes=local_size, reason="command_failed", started=started
             )
@@ -491,7 +495,7 @@ class BackupService:
         reason: str | None,
         started: float,
     ) -> dict[str, Any]:
-        """Записать исход выноса в сайдкар-индекс и журнал (без секретов)."""
+        """Write the ship outcome to the sidecar index and the journal (no secrets)."""
         latency_ms = round((_LATENCY() - started) * 1000, 1)
         result: dict[str, Any] = {"file": path.name, "ok": ok, "latency_ms": latency_ms}
         if size_bytes is not None:
@@ -515,13 +519,13 @@ class BackupService:
         )
         return result
 
-    # --- сайдкар-индекс (наблюдаемость переживает рестарт, arch §5.1) --------
+    # --- sidecar index (observability survives a restart, arch §5.1) ----------
 
     def _state_path(self) -> Path:
         return self._backup_dir() / STATE_FILE_NAME
 
     def _read_state(self) -> dict[str, Any]:
-        """Прочитать сайдкар-индекс; нет файла/мусор → пустой словарь."""
+        """Read the sidecar index; no file/garbage → an empty dict."""
         try:
             raw = self._state_path().read_text(encoding="utf-8")
             state = json.loads(raw)
@@ -530,7 +534,7 @@ class BackupService:
         return state if isinstance(state, dict) else {}
 
     def _write_state(self, state: dict[str, Any]) -> None:
-        """Записать сайдкар-индекс (атомарность не критична: наблюдаемость)."""
+        """Write the sidecar index (atomicity is not critical: observability)."""
         try:
             self._backup_dir().mkdir(parents=True, exist_ok=True)
             self._state_path().write_text(
@@ -542,7 +546,7 @@ class BackupService:
             )
 
     def _record_verify(self, path: Path, ok: bool, reason: str | None) -> None:
-        """Обновить исход проверки в сайдкар-индексе (last_verify + по файлам)."""
+        """Update the verify outcome in the sidecar index (last_verify + per file)."""
         record: dict[str, Any] = {
             "at": _now_iso(),
             "file": path.name,
@@ -560,11 +564,11 @@ class BackupService:
         self._write_state(state)
 
     def _record_ship(self, path: Path, result: dict[str, Any]) -> None:
-        """Обновить исход выноса в сайдкар-индексе (`last_ship` + `shipped`).
+        """Update the ship outcome in the sidecar index (`last_ship` + `shipped`).
 
-        Метка `shipped` ставится только при подтверждённом выносе; неудача уже
-        подтверждённую копию не разметает — файл снапшота неизменяем, а
-        наблюдаемость выноса живёт отдельной записью.
+                    The `shipped` mark is set only for a confirmed ship; a failure does not
+                    smudge an already confirmed copy — the snapshot file is immutable, and
+                    ship observability lives in a separate record.
         """
         record: dict[str, Any] = {
             "at": _now_iso(),
@@ -585,15 +589,15 @@ class BackupService:
             shipped[path.name] = record
         self._write_state(state)
 
-    # --- наблюдаемость ------------------------------------------------------
+    # --- observability --------------------------------------------------------
 
     def status(self) -> dict[str, Any]:
-        """Снимок каталога бэкапов (скан, БЕЗ открытия БД) + сайдкар-индекс.
+        """A snapshot of the backups directory (a scan, NO DB open) + the sidecar index.
 
-        Значения — как в `/health.backups` (arch §7.2): `count`,
-        `newest_age_sec`, `oldest_age_sec`, `total_bytes`, `bad` (число
-        помеченных) и последние исходы `last_verify`/`last_ship` из
-        `backups-index.json` (нет файла → None).
+                    Values — as in `/health.backups` (arch §7.2): `count`,
+                    `newest_age_sec`, `oldest_age_sec`, `total_bytes`, `bad` (the number of
+                    marked ones) and the latest `last_verify`/`last_ship` outcomes from
+                    `backups-index.json` (no file → None).
         """
         snapshots = self._snapshots()
         now = time.time()
@@ -602,7 +606,7 @@ class BackupService:
             try:
                 info = path.stat()
             except OSError:
-                continue  # файл исчез между glob и stat (гонка с ротацией)
+                continue  # the file vanished between glob and stat (a race with rotation)
             sized.append((path, info.st_mtime, info.st_size))
         ages = sorted(now - mtime for _path, mtime, _size in sized)
         state = self._read_state()
@@ -617,11 +621,11 @@ class BackupService:
         }
 
     def list_snapshots(self) -> list[dict[str, Any]]:
-        """Детальный список снапшотов (операторский `GET /backups`, arch §7.2).
+        """A detailed snapshot list (operator `GET /backups`, arch §7.2).
 
-        Свежие первыми; `verified` ∈ ok/failed/unknown (маркер `.bad` — явный
-        `failed`), `bad` — есть сайдкар, `shipped` — по сайдкар-индексу
-        (подтверждённый вынос копии за пределы сервера).
+                    Newest first; `verified` ∈ ok/failed/unknown (a `.bad` marker — an
+                    explicit `failed`), `bad` — a sidecar exists, `shipped` — per the
+                    sidecar index (a confirmed ship of the copy off the server).
         """
         state = self._read_state()
         verified_map = state.get("verified")
@@ -629,11 +633,11 @@ class BackupService:
         shipped_map = state.get("shipped")
         shipped_map = shipped_map if isinstance(shipped_map, dict) else {}
         items: list[dict[str, Any]] = []
-        for path in reversed(self._snapshots()):  # свежие первыми
+        for path in reversed(self._snapshots()):  # newest first
             try:
                 size = path.stat().st_size
             except OSError:
-                continue  # файл исчез между glob и stat (гонка с ротацией)
+                continue  # the file vanished between glob and stat (a race with rotation)
             bad = self._marker_path(path).exists()
             if bad:
                 verified_state = "failed"
@@ -656,31 +660,32 @@ class BackupService:
             )
         return items
 
-    # --- Петля ---------------------------------------------------------------
+    # --- Loop ------------------------------------------------------------------
 
     async def run(self) -> None:
-        """Снапшот сразу после старта, далее — раз в BACKUP_INTERVAL_SEC.
+        """A snapshot right after the start, then once per BACKUP_INTERVAL_SEC.
 
-        №14 (arch §6.1): после успешного снапшота, если `BACKUP_VERIFY_EVERY`
-        > 0 и счётчик дошёл до кратного значения, — проверка восстановления
-        (`verify`); её отказ петлю не роняет (NFR-3), исход — событием.
+                    #14 (arch §6.1): after a successful snapshot, when `BACKUP_VERIFY_EVERY`
+                    > 0 and the counter reaches the multiple, — a restore verification
+                    (`verify`); its failure does not crash the loop (NFR-3), the outcome —
+                    as an event.
 
-        №14 (no14-02, arch §6.1): если проверка прошла (`verify.ok=True`) и задана
-        операторская команда выноса (`BACKUP_SHIP_CMD`) — копия уносится за
-        пределы сервера (`ship`, FR-3.1); отказ выноса петлю не роняет и
-        локальную ротацию не ломает (FR-3.2).
+                    #14 (no14-02, arch §6.1): if the verification passed (`verify.ok=True`)
+                    and the operator ship command is set (`BACKUP_SHIP_CMD`) — the copy is
+                    shipped off the server (`ship`, FR-3.1); a ship failure does not crash
+                    the loop and does not break local rotation (FR-3.2).
 
-        Фаза 10: после каждого снапшота — груминг реестра неймспейсов;
-        отказ груминга не убивает петлю (как отказ снапшота, NFR-3):
-        событие groom_failed в логе, повтор — следующий интервал.
+                    Phase 10: after each snapshot — namespace registry grooming; a grooming
+                    failure does not kill the loop (like a snapshot failure, NFR-3):
+                    a groom_failed event in the log, a retry — the next interval.
         """
         while not self._stopping:
             target: Path | None = None
             try:
                 target = await asyncio.to_thread(self.snapshot)
             except (sqlite3.Error, OSError):
-                # БД/каталог недоступны — процесс должен жить (NFR-3);
-                # подробности — в JSON-лог, повтор по интервалу.
+                # The DB/directory is unreachable — the process must live (NFR-3);
+                # details — to the JSON log, a retry on the interval.
                 logging.getLogger("app").exception(
                     "backup snapshot failed", extra={"event": "backup_failed"}
                 )
@@ -702,15 +707,15 @@ class BackupService:
             await asyncio.sleep(self._settings.backup_interval_sec)
 
     async def _maybe_verify(self) -> bool:
-        """Проверить снапшот по расписанию `BACKUP_VERIFY_EVERY` (0 — вручную).
+        """Verify a snapshot on the `BACKUP_VERIFY_EVERY` schedule (0 — manual).
 
-        Отказ проверки не роняет петлю: событие `backup_verify_failed`
-        (NFR-3). Счётчик — в памяти процесса (после рестарта начинается заново
-        — проверка редкая и дешёвая, состояние на диск не выносим).
+                    A verify failure does not crash the loop: a `backup_verify_failed`
+                    event (NFR-3). The counter is in-process (after a restart it starts
+                    over — verification is rare and cheap; no state on disk).
 
-        Returns:
-            True — проверка выполнена и снапшот годен (`ok=True`); иначе False
-            (проверка выключена, не пришла очередь или отказ).
+                    Returns:
+                        True — the verification ran and the snapshot is good (`ok=True`);
+                        otherwise False (verification off, not its turn, or a failure).
         """
         every = self._settings.backup_verify_every
         if every <= 0:
@@ -728,10 +733,10 @@ class BackupService:
         return bool(result.get("ok"))
 
     async def _maybe_ship(self, target: Path) -> None:
-        """Вынести копию после успешной проверки (FR-3.1/FR-3.2).
+        """Ship a copy after a successful verification (FR-3.1/FR-3.2).
 
-        Отказ выноса петлю не роняет (NFR-3): исход — событие
-        `backup_ship_failed`, локальная ротация работает как прежде.
+                    A ship failure does not crash the loop (NFR-3): the outcome — a
+                    `backup_ship_failed` event, local rotation works as before.
         """
         try:
             await asyncio.to_thread(self.ship, target)
@@ -742,6 +747,6 @@ class BackupService:
 
 
 def _snapshot_name(moment: datetime | None = None) -> str:
-    """Имя файла снапшота: notes-<UTC до секунды>.db (сортируемо)."""
+    """Snapshot file name: notes-<UTC to the second>.db (sortable)."""
     moment = moment or datetime.now(UTC)
     return f"{IMAGE_PREFIX}{moment.strftime('%Y%m%dT%H%M%SZ')}{IMAGE_SUFFIX}"

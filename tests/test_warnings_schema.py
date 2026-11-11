@@ -1,9 +1,9 @@
-"""№12 (3.2.0): схема предупреждений — таблица `warnings`, индексы, маркер.
+"""#12 (3.2.0): the warnings schema — the `warnings` table, indexes, the marker.
 
-Общая поверхность предупреждений памяти и терминов (№12 + №32, arch §5.1):
-таблица `warnings`, частичный уникальный индекс открытого ключа и рабочий
-индекс листинга, плюс служебный маркер `notes.warnings_at` (§5.3/§5.4).
-Запись состояния идемпотентна: повторный `init_db` (рестарт) — no-op.
+    The shared surface of memory and term warnings (#12 + #32, arch §5.1): the
+    `warnings` table, the open key's partial unique index and the listing's
+    working index, plus the `notes.warnings_at` service marker (§5.3/§5.4). The
+    state write is idempotent: a repeated `init_db` (a restart) — a no-op.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from app.storage.db import init_db, session
 
 @pytest.fixture
 def settings(test_env: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> Settings:
-    """Схема в тестовой БД; размерность 8 — модели не участвуют."""
+    """The schema in a test DB; dimension 8 — no models involved."""
     monkeypatch.setenv("EMBEDDING_DIM", "8")
     get_settings.cache_clear()
     settings = get_settings()
@@ -44,7 +44,7 @@ def _warning_count(settings: Settings) -> int:
 
 
 def test_schema_and_marker_idempotent(settings: Settings) -> None:
-    """Маркер и таблица/индексы есть; повторный `init_db` число строк не растит."""
+    """The marker and the table/indexes exist; a repeated `init_db` does not grow the rows."""
     assert "warnings_at" in _notes_columns(settings)
     objects = _objects(settings)
     assert "warnings" in objects
@@ -55,17 +55,17 @@ def test_schema_and_marker_idempotent(settings: Settings) -> None:
         KIND_NOTE_MISPLACED, "note", 1, "m", {"v": 1}
     )
     before = _warning_count(settings)
-    init_db(settings)  # рестарт сервиса — no-op
+    init_db(settings)  # a service restart — a no-op
     assert _warning_count(settings) == before == 1
     assert "warnings_at" in _notes_columns(settings)
 
 
 def test_open_unique_partial(settings: Settings) -> None:
-    """Второй `open` того же ключа обновляет строку; после `resolve` — новая."""
+    """A second `open` of the same key updates the row; after a `resolve` — a new one."""
     service = WarningsService(settings, classifier=None, namespaces=None)
     first = service.open(KIND_NOTE_MISPLACED, "note", 1, "m1", {"v": 1})
     second = service.open(KIND_NOTE_MISPLACED, "note", 1, "m2", {"v": 2})
-    assert first == second  # upsert, а не вторая строка
+    assert first == second  # an upsert, not a second row
     with session(settings) as conn:
         rows = conn.execute(
             "SELECT message FROM warnings WHERE id = ?", (first,)
@@ -74,5 +74,5 @@ def test_open_unique_partial(settings: Settings) -> None:
 
     assert service.resolve(KIND_NOTE_MISPLACED, "note", 1) == 1
     third = service.open(KIND_NOTE_MISPLACED, "note", 1, "m3", {})
-    assert third != first  # причина вернулась — открывается новая строка
+    assert third != first  # the reason returned — a new row opens
     assert _warning_count(settings) == 2

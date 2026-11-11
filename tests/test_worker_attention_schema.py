@@ -1,9 +1,10 @@
-"""Схема worker_jobs: колонки внимания и индекс (№39, no39-02; arch §5.2).
+"""The worker_jobs schema: the attention columns and the index (#39, no39-02; arch §5.2).
 
-Миграция ленивая (зона воркера): `_ensure_job_table` расширяет DDL и
-идемпотентно добавляет недостающие колонки по `PRAGMA table_info(worker_jobs)`
-— старая база (до 3.2.0) получает `attempts`/`last_outcome`/`last_error`/
-`attention_at` и индекс `idx_worker_jobs_attention`; повторный вызов — no-op.
+    The migration is lazy (the worker's zone): `_ensure_job_table` extends the DDL
+    and idempotently adds the missing columns by `PRAGMA table_info(worker_jobs)`
+    — an old (pre-3.2.0) database gets `attempts`/`last_outcome`/`last_error`/
+    `attention_at` and the `idx_worker_jobs_attention` index; a repeated call —
+    a no-op.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ def _indexes(settings) -> set[str]:
 
 
 def test_columns_added_idempotent(settings) -> None:
-    """Старая схема (без колонок внимания) мигрируется; повтор — no-op."""
+    """The old schema (without the attention columns) migrates; a repeat — a no-op."""
     with session(settings) as conn, transaction(conn):
         conn.execute(
             "CREATE TABLE worker_jobs ("
@@ -61,7 +62,7 @@ def test_columns_added_idempotent(settings) -> None:
     assert {"attempts", "last_outcome", "last_error", "attention_at"} <= columns
     assert "idx_worker_jobs_attention" in _indexes(settings)
 
-    # повторный вызов (и в памяти, и после сброса мемоизации) — no-op
+    # a repeated call (both in memory and after the memoization reset) — a no-op
     worker._ensure_job_table()
     worker._jobs_table_ready = False
     worker._ensure_job_table()
@@ -69,7 +70,7 @@ def test_columns_added_idempotent(settings) -> None:
 
 
 class _NoopEmbedder:
-    """Заглушка эмбеддера: схема внимания кодировщика не касается."""
+    """An embedder stub: the attention schema does not touch the encoder."""
 
     def embed(self, text: str) -> list[float]:
         return []

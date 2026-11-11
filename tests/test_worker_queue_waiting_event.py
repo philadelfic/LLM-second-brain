@@ -1,8 +1,9 @@
-"""Событие `queue_waiting` при отложенной работе (№39, 3.2.0; arch §6.9/§7.4).
+"""The `queue_waiting` event at deferred work (#39, 3.2.0; arch §6.9/§7.4).
 
-FR-2.3/№39: «работа есть, но она не выполняется» видно в журнале не только по
-`pending`, но и по `waiting` — ожидание отложенного слота/зависимости остаётся
-видимым, хотя петлю в busy-loop оно не гонит. Совсем пустая очередь молчит.
+    FR-2.3/#39: "there is work, but it is not being done" is visible in the journal
+    not only by `pending` but by `waiting` too — waiting for a deferred
+    slot/dependency stays visible although it does not drive the loop into a
+    busy-loop. A fully empty queue stays silent.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from app.services.jobs import BackoffState, JobSpec, _log_queue_waiting, run_loo
 
 
 def patch_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    """Мгновенный `asyncio.sleep` с записью запрошенных пауз (back-off не ждём)."""
+    """An instant `asyncio.sleep` recording the requested pauses (no back-off waiting)."""
     real_sleep = asyncio.sleep
     delays: list[float] = []
 
@@ -33,7 +34,7 @@ async def _noop() -> int:
 
 
 def _spec(queue_stat) -> JobSpec:
-    """Минимальная джоба с очередью: важна только `queue_stat` для события."""
+    """A minimal job with a queue: only `queue_stat` matters for the event."""
     return JobSpec(
         name="probe",
         queue="probe",
@@ -58,7 +59,7 @@ def _waiting_records(caplog) -> list:
 
 @pytest.mark.asyncio
 async def test_event_on_waiting_only(caplog) -> None:
-    """pending=0, но waiting>0 → событие `queue_waiting` несёт `waiting`."""
+    """pending=0 but waiting>0 → the `queue_waiting` event carries `waiting`."""
     caplog.clear()
     spec = _spec(lambda: {
         "pending": 0, "oldest_pending_sec": None, "waiting": 2, "attention": 1,
@@ -74,7 +75,7 @@ async def test_event_on_waiting_only(caplog) -> None:
 
 @pytest.mark.asyncio
 async def test_event_silent_on_fully_empty(caplog) -> None:
-    """Совсем пустая очередь (pending=0, waiting=0) — события нет."""
+    """A fully empty queue (pending=0, waiting=0) — no event."""
     caplog.clear()
     empty = _spec(lambda: {
         "pending": 0, "oldest_pending_sec": None, "waiting": 0, "attention": 0,
@@ -86,12 +87,12 @@ async def test_event_silent_on_fully_empty(caplog) -> None:
 
 @pytest.mark.asyncio
 async def test_event_once_per_iteration_on_idle_run(monkeypatch, caplog) -> None:
-    """Холостой прогон: `queue_waiting` — ровно один раз на итерацию петли (№39).
+    """An idle run: `queue_waiting` — exactly once per loop iteration (#39).
 
-    Задание, которому слот отказывает, для петли не работа (no39-05): после
-    одного шанса на lost wakeup петля уходит в ожидание и пишет событие ОДИН раз
-    — иначе шквал `queue_waiting` был бы зеркалом холостого шторма 12.10.2026
-    (событие на каждый прогон без сна).
+                A task the slot refuses is not work for the loop (no39-05): after one
+                lost-wakeup chance the loop goes into a wait and writes the event ONCE
+                — otherwise a hail of `queue_waiting` would mirror the idle storm of
+                2026-10-12 (an event per run without sleep).
     """
     caplog.clear()
     delays = patch_sleep(monkeypatch)
@@ -119,6 +120,6 @@ async def test_event_once_per_iteration_on_idle_run(monkeypatch, caplog) -> None
         await asyncio.wait_for(
             run_loop(spec, lambda: len(delays) >= 2, BackoffState(30)), timeout=1.0
         )
-    # Две итерации ожидания: по одному событию каждая (прогоны — 2 × lost wakeup).
+    # Two wait iterations: one event each (the runs — 2 × lost wakeup).
     assert calls["runs"] == 4
     assert len(_waiting_records(caplog)) == 2

@@ -77,7 +77,8 @@ def test_registry_maps_operations_to_slot_groups() -> None:
 
 
 def test_operation_fields_cover_the_brief_list() -> None:
-    """Поля переопределения — список брифа (9 полей, плоские имена)."""
+    """Поля переопределения — список брифа (9 полей, плоские имена);
+    LSBN-T-33 добавляет десятый — бюджет рассуждения `reasoning_num_predict`."""
     assert OPERATION_FIELDS == (
         "model",
         "provider",
@@ -85,6 +86,7 @@ def test_operation_fields_cover_the_brief_list() -> None:
         "api_key",
         "think",
         "num_predict",
+        "reasoning_num_predict",
         "timeout_sec",
         "context_tokens",
         "model_type",
@@ -139,6 +141,7 @@ def test_every_field_is_resolved_from_operation_env(monkeypatch) -> None:
         MERGE_TIMEOUT_SEC="120",
         MERGE_THINK="false",
         MERGE_NUM_PREDICT="777",
+        MERGE_REASONING_NUM_PREDICT="4000",
         MERGE_CONTEXT_TOKENS="8192",
         MERGE_MODEL_TYPE="reasoning",
         MERGE_PROVIDER="openai",
@@ -150,6 +153,7 @@ def test_every_field_is_resolved_from_operation_env(monkeypatch) -> None:
     assert spec.read_timeout == 120.0
     assert spec.think is False
     assert spec.num_predict == 777
+    assert spec.reasoning_num_predict == 4000
     assert spec.context_tokens == 8192
     assert spec.model_type == "reasoning"
     assert spec.provider == "openai"
@@ -308,15 +312,27 @@ def test_operations_health_block_hides_addresses(monkeypatch) -> None:
     settings = load(monkeypatch, MERGE_MODEL="merge-only-model")
     block = operations_health(settings)
     assert set(block) == set(OPERATIONS)
-    assert block["merge"] == {
-        "model": "merge-only-model",
-        "provider": "ollama",
-        "source": "op",
-    }
+    assert block["merge"]["model"] == "merge-only-model"
+    assert block["merge"]["provider"] == "ollama"
+    assert block["merge"]["source"] == "op"
+    # LSBN-T-33: рядом с моделью — раздельные бюджеты операции; контекст
+    # неизвестен → деградация к прежнему потолку слияния (35000), reasoning=0.
+    assert block["merge"]["answer_budget"] == 35000
+    assert block["merge"]["reasoning_budget"] == 0
+    assert block["merge"]["sent_budget"] == 35000
     assert block["title"]["source"] == "slot"
     assert block["embed"]["source"] == "default"  # EMBEDDING_MODEL не задан
     for snapshot in block.values():
-        assert set(snapshot) == {"model", "provider", "source"}
+        assert set(snapshot) == {
+            "model",
+            "provider",
+            "source",
+            "answer_budget",
+            "reasoning_budget",
+            "sent_budget",
+            "answer_source",
+            "reasoning_source",
+        }
         assert "base_url" not in snapshot
         assert "http" not in str(snapshot)
 

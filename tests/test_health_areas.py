@@ -1,10 +1,11 @@
-"""Наблюдаемость области логов (LSBN-F-10, f10-04, arch §10).
+"""The logs area's observability (LSBN-F-10, f10-04, arch §10).
 
-`/health.areas.logs = {enabled, pending}` собирается из реестра `ALL_AREAS`
-(№40) — накопление pending видно и у выключенной области (флаг гейтит только
-агентскую поверхность и фон, §13.11); стартовое событие `areas_enabled` несёт
-текущее значение флага; петля `areas` выключенную область не забирает — pending
-лога не уменьшается, а при включении запись обрабатывается.
+    `/health.areas.logs = {enabled, pending}` is assembled from the `ALL_AREAS`
+    registry (#40) — pending accumulation is visible for a disabled area too
+    (the flag gates only the agent surface and the background, §13.11); the
+    startup `areas_enabled` event carries the flag's current value; the `areas`
+    loop does not drain a disabled area — the log's pending does not decrease,
+    and on enabling the record is processed.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ REASON = "нужно было решить про слот"
 
 
 def _settings(monkeypatch: pytest.MonkeyPatch, **env: str) -> Settings:
-    """Настройки теста: флаг области логов снят, заданные — выставлены."""
+    """The test's settings: the logs area flag off; the given ones — set."""
     monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
     monkeypatch.delenv("AREA_LOGS_ENABLED", raising=False)
     for name, value in env.items():
@@ -41,7 +42,7 @@ def _settings(monkeypatch: pytest.MonkeyPatch, **env: str) -> Settings:
 
 
 def _save_log(settings: Settings) -> int:
-    """Запись лога своим сервисом (собирается и у выключенной области, §13.11)."""
+    """A log record by its own service (assembled even with the area disabled, §13.11)."""
     result = LogsService(settings, embedding=HashEmbedder(DIM)).save(ACTION, REASON)
     assert result["created"] is True, result
     return int(result["id"])
@@ -55,7 +56,7 @@ def _status(settings: Settings, log_id: int) -> str:
 
 
 def _areas(settings: Settings) -> dict:
-    """Снимок `/health.areas` как его видит оператор."""
+    """The `/health.areas` snapshot as the operator sees it."""
     with TestClient(create_app(settings)) as client:
         return client.get("/health").json()["areas"]
 
@@ -69,7 +70,7 @@ def _areas_enabled_events(caplog: pytest.LogCaptureFixture) -> list:
 
 
 def test_health_areas_includes_logs(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`/health.areas.logs` = {enabled, pending}; pending виден и под off-флагом."""
+    """`/health.areas.logs` = {enabled, pending}; pending visible under the off flag too."""
     settings = _settings(monkeypatch)
     log_id = _save_log(settings)
     assert _status(settings, log_id) == "pending"
@@ -82,7 +83,7 @@ def test_health_areas_includes_logs(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_startup_areas_event_includes_logs(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Событие старта `areas_enabled` несёт `logs` с текущим значением флага."""
+    """The startup `areas_enabled` event carries `logs` with the flag's current value."""
     on = _settings(monkeypatch)
     with caplog.at_level(logging.INFO, logger="app"):
         with TestClient(create_app(on)):
@@ -102,7 +103,7 @@ def test_startup_areas_event_includes_logs(
 
 
 def test_area_loop_skips_disabled_logs(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Петля `areas`: выключенная область pending лога не забирает (§10)."""
+    """The `areas` loop: a disabled area does not drain the log's pending (§10)."""
     settings = _settings(monkeypatch, AREA_LOGS_ENABLED="false")
     log_id = _save_log(settings)
     assert BackgroundWorker(settings, HashEmbedder(DIM)).process_pending_areas() == 0

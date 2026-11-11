@@ -1,9 +1,9 @@
-"""Конфигурация decision-слота (LSBN-F-12, релиз 3.2.0; arch §8).
+"""The decision slot's configuration (LSBN-F-12, release 3.2.0; arch §8).
 
-Дефолты (выключен, таймаут 300, порог 0.5, зона 0.05, переключение вкл,
-потолки 64/40); при `DECISION_ENABLED=true` обязательны адрес (http(s)) и
-модель; порог ± зона обязаны лежать внутри 0..1 — иначе фатальный `ConfigError`
-(NFR-6).
+    Defaults (off, timeout 300, threshold 0.5, zone 0.05, fallback on,
+    ceilings 64/40); at `DECISION_ENABLED=true` an address (http(s)) and a model
+    are mandatory; threshold ± zone must lie within 0..1 — else a fatal
+    `ConfigError` (NFR-6).
 """
 
 from __future__ import annotations

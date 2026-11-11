@@ -1,14 +1,15 @@
-"""№12 (no12-02, 3.2.0): MCP `warnings_list` — единая поверхность предупреждений.
+"""#12 (no12-02, 3.2.0): MCP `warnings_list` — the single warnings surface.
 
-Arch `jobs-and-terms-architecture.md` §7.1/§13.4: один инструмент на систему
-(предупреждения памяти и терминов пишут в общую таблицу `warnings`); выдача —
-белый список (`id`, `kind`, `subject{type,id}`, `message`, `payload`,
-`created_at`) без тел заметок/терминов и без служебных `status`/`resolved_at`;
-поля страницы — из общего `page_fields`; сверх потолка `WARNINGS_MAX_LIMIT_MCP`
-— мягкий отказ с hint (не schema-error). Чтение — только SQL, без модели.
+    Arch `jobs-and-terms-architecture.md` §7.1/§13.4: one tool per system (memory
+    and term warnings write into the shared `warnings` table); the output — a
+    whitelist (`id`, `kind`, `subject{type,id}`, `message`, `payload`,
+    `created_at`) without note/term bodies and without the service
+    `status`/`resolved_at`; the page fields — from the shared `page_fields`;
+    over the `WARNINGS_MAX_LIMIT_MCP` ceiling — a soft failure with a hint (not a
+    schema-error). Reads — SQL only, no model.
 
-Поверхность — in-process MCP (один код с REST); полный контракт страницы и
-`/health.warnings` — tests/test_rest_warnings.py и test_health_warnings.py.
+    The surface — in-process MCP (one codebase with REST); the full page contract
+    and `/health.warnings` — tests/test_rest_warnings.py and test_health_warnings.py.
 """
 
 from __future__ import annotations
@@ -33,18 +34,18 @@ DIM = 64
 def settings_and_services(
     test_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Settings, Services]:
-    """Свежая БД + полная сборка сервисов (пустой реестр навыков)."""
+    """A fresh DB + the full services build (an empty skills registry)."""
     monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
-    clear_seeded_skills(settings)  # пустой реестр: счётчики предупреждений точны
+    clear_seeded_skills(settings)  # an empty registry: the warning counters are exact
     return settings, build_services(settings)
 
 
 @pytest.fixture
 def mcp_server(settings_and_services: tuple[Settings, Services]):
-    """In-process MCP поверх тех же сервисов (один код с REST)."""
+    """An in-process MCP over the same services (one codebase with REST)."""
     settings, services = settings_and_services
     return build_mcp(settings, services)
 
@@ -57,7 +58,7 @@ def seed_warning(
     subject_id: int = 1,
     message: str = "note 1 is in 'default' but the classifier places it in 'work'",
 ) -> int:
-    """Открыть предупреждение сервисом — SQL, без модели (seed для чтения)."""
+    """Open a warning by the service — SQL, no model (a seed for reading)."""
     return services.warnings.open(  # type: ignore[union-attr]
         kind, subject_type, subject_id, message, {"hint_path": "work"}
     )
@@ -67,7 +68,7 @@ def seed_warning(
 async def test_list_compact_shape(
     settings_and_services: tuple[Settings, Services], mcp_server
 ) -> None:
-    """Выдача — белый список: subject{type,id}; тел и служебных полей нет."""
+    """The output — a whitelist: subject{type,id}; no bodies or service fields."""
     _, services = settings_and_services
     warning_id = seed_warning(services)
     got = (await mcp_server.call_tool("warnings_list", {})).structured_content
@@ -81,7 +82,7 @@ async def test_list_compact_shape(
     assert item["kind"] == KIND_NOTE_MISPLACED
     assert item["subject"] == {"type": "note", "id": 1}
     assert item["payload"] == {"hint_path": "work"}
-    # Служебные поля и тексты тел в MCP не просачиваются (§7.1, бюджет F-11).
+    # Service fields and body texts do not leak into MCP (§7.1, the F-11 budget).
     assert set(got) <= {"warnings", "total", "has_more", "next_offset", "hint"}
     assert "status" not in item and "resolved_at" not in item
     assert "text" not in item and "summary" not in item
@@ -91,7 +92,7 @@ async def test_list_compact_shape(
 async def test_list_filters(
     settings_and_services: tuple[Settings, Services], mcp_server
 ) -> None:
-    """Фильтры kind/subject_type/subject_id/status отбирают правильно."""
+    """The kind/subject_type/subject_id/status filters select correctly."""
     _, services = settings_and_services
     seed_warning(services, subject_id=1)
     seed_warning(services, kind=KIND_NOTE_NO_NODE, subject_id=2)
@@ -130,7 +131,7 @@ async def test_list_filters(
 async def test_pagination(
     settings_and_services: tuple[Settings, Services], mcp_server
 ) -> None:
-    """limit/offset дают has_more/next_offset, total не зависит от страницы."""
+    """limit/offset give has_more/next_offset; total does not depend on the page."""
     _, services = settings_and_services
     for i in range(5):
         seed_warning(services, subject_id=i + 1)
@@ -149,7 +150,7 @@ async def test_pagination(
         )
     ).structured_content
     assert len(last["warnings"]) == 1
-    assert last["total"] == 5  # total — по всему фильтру, не по странице
+    assert last["total"] == 5  # total — over the whole filter, not the page
     assert last["has_more"] is False
     assert last["next_offset"] is None
 
@@ -158,7 +159,7 @@ async def test_pagination(
 async def test_limit_over_max_is_soft(
     settings_and_services: tuple[Settings, Services], mcp_server
 ) -> None:
-    """limit выше потолка MCP — мягкий ответ с hint, не schema-error."""
+    """A limit above the MCP ceiling — a soft answer with a hint, not a schema-error."""
     settings, _ = settings_and_services
     over = settings.warnings_max_limit_mcp + 1
     call = await mcp_server.call_tool("warnings_list", {"limit": over})
@@ -172,9 +173,10 @@ async def test_limit_over_max_is_soft(
 
 @pytest.mark.asyncio
 async def test_surface_grew_by_exactly_one(mcp_server) -> None:
-    """Регресс поверхности: словарь TOOL_NAMES целиком (№12 + пометки + 6 ручек
-    логов LSBN-F-10: 4 в f10-02, ещё 2 в f10-03)."""
+    """The surface regression: the TOOL_NAMES dictionary whole (#12 + comments + 6
+            logs handles of LSBN-F-10: 4 in f10-02, 2 more in f10-03).
+    """
     names = {tool.name for tool in await mcp_server.list_tools()}
-    assert len(names) == 31
+    assert len(names) == 32
     assert names == TOOL_NAMES
     assert "warnings_list" in names

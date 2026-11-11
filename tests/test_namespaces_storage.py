@@ -1,9 +1,9 @@
-"""Тесты слоя хранения неймспейсов (Фаза 10, Шаг 1): миграция, реестр, партиции.
+"""The namespaces storage layer tests (Phase 10, Step 1): migration, registry, partitions.
 
-Проверяем: нулевую миграцию колонок notes.namespace/classified_at поверх живой
-БД; партицию `+ns` vec0-таблиц (sqlite-vec 0.1.6 partition keys); KNN с
-фильтром поддерева; дефолт-узел 'default' в реестре; pending_chunk_rows с
-namespace заметки-владельца. Размерность БД в тестах — 4 (быстрые вектора).
+    Checked: the zero migration of notes.namespace/classified_at over a live DB;
+    the `+ns` partitioning of vec0 tables (sqlite-vec 0.1.6 partition keys); KNN
+    with a subtree filter; the 'default' node in the registry; pending_chunk_rows
+    with the owner note's namespace. The tests' DB dimension — 4 (fast vectors).
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from app.storage.db import init_db, session
 
 @pytest.fixture(autouse=True)
 def _small_dim(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Маленькая размерность: pack/insert 4-мерных литералов в тестах."""
+    """A small dimension: packing/inserting 4-dimensional literals in tests."""
     monkeypatch.setenv("EMBEDDING_DIM", "4")
     get_settings.cache_clear()
     yield
@@ -33,8 +33,9 @@ def _vec(*components: float) -> bytes:
 
 
 def _legacy_schema(conn: sqlite3.Connection) -> None:
-    """Схема БД «до Фазы 10»: notes без namespace/classified_at, vec0 без
-    партиции (как HEAD f57aeb6 — миграционная база для US-12)."""
+    """The DB schema "before Phase 10": notes without namespace/classified_at, vec0
+            without a partition (as at HEAD f57aeb6 — the migration base for US-12).
+    """
     conn.execute(
         """
         CREATE TABLE notes (
@@ -76,8 +77,8 @@ def _legacy_schema(conn: sqlite3.Connection) -> None:
 
 @pytest.fixture
 def legacy_db() -> None:
-    """Живая БД старой схемы с данными: 2 заметки, вектор, чанк."""
-    init_db(get_settings())  # создать свежую (забрать tmp-путь из test_env)
+    """A live old-schema DB with data: 2 notes, a vector, a chunk."""
+    init_db(get_settings())  # create a fresh one (take the tmp path from test_env)
     with session(get_settings()) as conn:
         conn.execute("DROP TABLE notes_vec")
         conn.execute("DROP TABLE notes_chunks_vec")
@@ -100,7 +101,7 @@ def legacy_db() -> None:
         )
 
 
-# --- схема свежей БД ---------------------------------------------------------
+# --- a fresh DB's schema ----------------------------------------------------
 
 
 class TestFreshSchema:
@@ -115,14 +116,14 @@ class TestFreshSchema:
             "summary_status", "created_at", "updated_at", "deleted_at",
             "namespace", "classified_at", "hint_path", "confidence",
             "expires_at", "links_at", "node_order_at", "warnings_at",
-            "comment",  # no24-01 (3.2.0): пометка заметки (NULL = нет)
+            "comment",  # no24-01 (3.2.0): the note's comment (NULL = none)
         }
         assert columns["namespace"]["dflt_value"] == "'default'"
         assert columns["classified_at"]["notnull"] == 0
-        assert columns["expires_at"]["notnull"] == 0  # lsb-0004-02: NULL = постоянная
+        assert columns["expires_at"]["notnull"] == 0  # lsb-0004-02: NULL = permanent
 
     def test_namespaces_registry_with_default_node(self) -> None:
-        """Реестр создан; узел 'default' существует (confirmed)."""
+        """The registry is created; the 'default' node exists (confirmed)."""
         init_db(get_settings())
         with session(get_settings()) as conn:
             row = conn.execute(
@@ -142,7 +143,7 @@ class TestFreshSchema:
             assert "+ns" in ddl
 
 
-# --- миграция живой БД старой схемы (US-12) ----------------------------------
+# --- migrating a live old-schema DB (US-12) ---------------------------------
 
 
 class TestLegacyMigration:
@@ -154,13 +155,13 @@ class TestLegacyMigration:
             notes = conn.execute(
                 "SELECT id, namespace, classified_at, vector_status FROM notes ORDER BY id"
             ).fetchall()
-            # Существующие заметки → 'default', классификации нет, вектора —
-            # в очередь пере-кодирования (партиция).
+            # Existing notes → 'default', no classification; the vectors —
+            # into the re-encoding queue (the partition).
             assert [row["namespace"] for row in notes] == ["default", "default"]
             assert all(row["classified_at"] is None for row in notes)
             assert all(row["vector_status"] == "pending" for row in notes)
-            # vec-таблицы пересозданы с партицией и пусты (вектора невалидны),
-            # тексты и чанки живы (trash-семантика Фазы 7)
+            # The vec tables are recreated with the partition and empty (the vectors invalid);
+            # the texts and chunks are alive (the Phase-7 trash semantics)
             assert vectors.has_partition(conn)
             assert chunks.has_partition(conn)
             assert vectors.count(conn) == 0
@@ -187,7 +188,7 @@ class TestLegacyMigration:
             )
 
 
-# --- партиции и KNN-фильтры ---------------------------------------------------
+# --- partitions and KNN filters ----------------------------------------------
 
 
 class TestPartitionKnn:
@@ -207,7 +208,7 @@ class TestPartitionKnn:
         assert [note_id for note_id, _ in hits] == [1]
 
     def test_knn_filters_by_subtree_node_list(self, seeded: None) -> None:
-        """Поддерево work + work/sbos2020 — два узла, один IN-фильтр партиций."""
+        """The work + work/sbos2020 subtree — two nodes, one IN filter over partitions."""
         with session(get_settings()) as conn:
             hits = vectors.knn(
                 conn, [1.0, 0.0, 0.0, 0.0], k=10, ns_filter=["work", "work/sbos2020"]
@@ -220,14 +221,14 @@ class TestPartitionKnn:
         assert {note_id for note_id, _ in hits} == {1, 2, 3}
 
     def test_partition_value_can_be_updated(self, seeded: None) -> None:
-        """UPDATE партиции (переезд заметки) — sqlite-vec 0.1.6 поддерживает."""
+        """A partition UPDATE (a note move) — sqlite-vec 0.1.6 supports it."""
         with session(get_settings()) as conn:
             conn.execute("UPDATE notes_vec SET ns = 'projects' WHERE note_id = 1")
             hits = vectors.knn(conn, [1.0, 0.0, 0.0, 0.0], k=10, ns_filter=["work"])
         assert hits == []
 
     def test_upsert_default_partition(self, seeded: None) -> None:
-        """Вызов без ns (legacy-совместимость) — пишет в партицию default."""
+        """A call without ns (legacy compatibility) — writes into the default partition."""
         with session(get_settings()) as conn:
             vectors.upsert(conn, 4, [0.0, 0.0, 1.0, 0.0])
             rows = conn.execute(
@@ -270,7 +271,7 @@ class TestChunksPartition:
         assert row[0] == "work/sbos2020"
 
     def test_pending_chunk_rows_expose_owner_namespace(self) -> None:
-        """Воркер получает namespace заметки-владельца (партиция при вставке)."""
+        """The worker receives the owner note's namespace (the partition at insert)."""
         init_db(get_settings())
         with session(get_settings()) as conn:
             conn.execute(

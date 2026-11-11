@@ -1,25 +1,25 @@
-"""Наблюдаемость (NFR-4): JSON-логи в stdout + инструментация tool-вызовов.
+"""Observability (NFR-4): JSON logs to stdout + tool-call instrumentation.
 
-Ключевые решения:
-- **Один JSON на строку** — парсер docker logs / journalctl без regexp:
-  `JsonFormatter` сериализует LogRecord в `{"ts", "level", "logger",
-  "message", ...}`, произвольные поля (event, tool, latency_ms, …) приходят
-  через `extra=`.
-- **stdout, не stderr**: логи собираются вместе с обычным выводом процесса
-  (`docker logs`). `setup_logging` вешает JSON-handler на корневой логгер
-  (идемпотентно — create_app вызывается на каждый тест/рестарт) — свои и
-  библиотечные записи идут единым форматом.
-- **uvicorn** — тот же формат: `uvicorn_log_config` подменяет фирменные
-  цветные логи на JSON (access/error/default), чтобы stdout процесса был
-  полностью парсим.
-- **Приватность (NFR-4)**: содержимое заметок в логи НЕ пишется —
-  `log_tool_call` принимает только агрегаты (число результатов, длину
-  текста `note_chars`, id, флаги); поисковые запросы — обрезка `preview`
-  до 80 символов (это запрос, а не заметка). uvicorn access-лог — второй
-  канал: `AccessQueryTruncate` режет query-часть full_path до тех же 80
-  символов, чтобы полный query string не попадал в JSON-лог.
+Key decisions:
+- **One JSON per line** — docker logs / journalctl parsing without regexp:
+  `JsonFormatter` serializes a LogRecord into `{"ts", "level", "logger",
+  "message", ...}`; arbitrary fields (event, tool, latency_ms, ...) arrive
+  via `extra=`.
+- **stdout, not stderr**: the logs are collected together with the process's
+  regular output (`docker logs`). `setup_logging` hangs a JSON handler on the
+  root logger (idempotent — create_app runs on every test/restart) — own and
+  library records share one format.
+- **uvicorn** — the same format: `uvicorn_log_config` replaces the branded
+  colored logs with JSON (access/error/default) so the process stdout is
+  fully parseable.
+- **Privacy (NFR-4)**: note content is NEVER logged — `log_tool_call` takes
+  aggregates only (the result count, the `note_chars` text length, ids,
+  flags); search queries get a `preview` cut to 80 characters (a query, not a
+  note). The uvicorn access log is a second channel: `AccessQueryTruncate`
+  cuts the query part of full_path to the same 80 characters so a full query
+  string never reaches the JSON log.
 
-`latency_ms` — `perf_counter()` (монотонные часы, не wall time).
+`latency_ms` — `perf_counter()` (monotonic clock, not wall time).
 """
 
 from __future__ import annotations
@@ -30,34 +30,34 @@ import sys
 import time
 from datetime import UTC, datetime
 
-# Логгер всего приложения: дети app.* и корень — единый JSON-поток stdout.
+# The application logger: app.* children and the root — one JSON stdout flow.
 APP_LOGGER = "app"
 
-# NFR-4: тексты запросов — первые 80 символов (заметки — не пишем вовсе).
+# NFR-4: query texts — the first 80 characters (notes are not logged at all).
 QUERY_PREVIEW_CHARS = 80
 
-# Стандартные атрибуты LogRecord не попадают в JSON как «extra» — иначе
-# formatException-поля и служебное содержимое засоряют строку.
+# Standard LogRecord attributes never reach the JSON as "extra" — otherwise
+# formatException fields and service content would clutter the line.
 _RESERVED_FIELDS = frozenset(
     {
         "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
         "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
         "created", "msecs", "relativeCreated", "thread", "threadName",
         "processName", "process", "taskName", "message", "asctime",
-        # uvicorn кладёт раскрашенную копию message в extra — в JSON она шум.
+        # uvicorn puts a colored copy of message into extra — noise in JSON.
         "color_message",
     }
 )
 
 
 class AccessQueryTruncate(logging.Filter):
-    """Обрезает query-часть full_path в uvicorn.access до QUERY_PREVIEW_CHARS.
+    """Cuts the query part of full_path in uvicorn.access to QUERY_PREVIEW_CHARS.
 
-    uvicorn.access кладёт в record.args кортеж
-    `(client_addr, method, full_path, http_version, status)`; full_path может
-    содержать полный query string. NFR-4 требует превью запросов ≤80 символов
-    — режем только query, путь сохраняем. Записи без query (или не-доступа)
-    не меняются.
+    uvicorn.access puts the tuple
+    `(client_addr, method, full_path, http_version, status)` into record.args;
+    full_path may carry the full query string. NFR-4 requires query previews
+    of at most 80 characters — only the query is cut, the path is kept.
+    Records without a query (or non-access ones) are untouched.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -75,7 +75,7 @@ class AccessQueryTruncate(logging.Filter):
 
 
 class JsonFormatter(logging.Formatter):
-    """Каждая запись — одна строка JSON (ts/level/logger/message + extra)."""
+    """Every record — one JSON line (ts/level/logger/message + extra)."""
 
     def format(self, record: logging.LogRecord) -> str:
         timestamp = datetime.fromtimestamp(record.created, tz=UTC)
@@ -93,18 +93,18 @@ class JsonFormatter(logging.Formatter):
             payload[key] = value
         if record.exc_info is not None:
             payload["exception"] = self.formatException(record.exc_info)
-        # ensure_ascii=False: лог остаётся читаемым ВО ВНЕ, у docker-логов
-        # нет кодировки без UTF-8. JSON-мусор от чужих extra-объектов не
-        # прячем: сериализация должна падать громко, а не молча резаться.
+        # ensure_ascii=False: the log stays readable OUTSIDE; docker logs have
+        # no encoding other than UTF-8. JSON garbage from foreign extra objects
+        # is not hidden: serialization must fail loudly, not silently trim.
         return json.dumps(payload, ensure_ascii=False)
 
 
 def setup_logging(level: str) -> None:
-    """Настроить корневой логгер на JSON-stdout (идемпотентно).
+    """Point the root logger at JSON stdout (idempotent).
 
-    Повторные вызовы (pytest создаёт приложение на каждый тест) не дублируют
-    handler и не роняют уровень ниже существующей конфигурации — просто
-    приводят его к заданному.
+    Repeated calls (pytest builds an application per test) do not duplicate
+    the handler and do not lower the level below the existing configuration —
+    they just set it to the given one.
     """
     root = logging.getLogger()
     root.setLevel(level)
@@ -116,10 +116,10 @@ def setup_logging(level: str) -> None:
 
 
 def uvicorn_log_config(level: str) -> dict[str, object]:
-    """dictConfig для uvicorn.run: access/error — тем же JSON-форматом.
+    """A dictConfig for uvicorn.run: access/error in the same JSON format.
 
-    `access` — полный HTTP-запрос (путь/статус/латентность), `error` —
-    ошибки жизненного цикла и приложение. Оба — в stdout (docker logs).
+    `access` — the full HTTP request (path/status/latency), `error` —
+    lifecycle errors and the application. Both go to stdout (docker logs).
     """
     return {
         "version": 1,
@@ -144,10 +144,10 @@ def uvicorn_log_config(level: str) -> dict[str, object]:
                 "level": level,
                 "propagate": False,
             },
-            # error/loggers унаследуют uvicorn-хендлер (propagate=True).
+            # error/loggers inherit the uvicorn handler (propagate=True).
             "uvicorn.error": {"level": level},
-            # access — собственный handler: не мешает error-уровням,
-            # отключается по LOG_LEVEL (например, WARNING).
+            # access — its own handler: does not disturb error levels,
+            # is switched off by LOG_LEVEL (for example, WARNING).
             "uvicorn.access": {
                 "handlers": ["stdout"],
                 "level": level,
@@ -158,16 +158,16 @@ def uvicorn_log_config(level: str) -> dict[str, object]:
 
 
 def preview(text: str, limit: int = QUERY_PREVIEW_CHARS) -> str:
-    """Первые `limit` символов запроса (NFR-4: 80) — без приклеивания суффиксов."""
+    """The first `limit` characters of a query (NFR-4: 80) — no suffix gluing."""
     return text[:limit]
 
 
 def log_tool_call(tool: str, started: float, **fields: object) -> None:
-    """Событие `tool_call` (NFR-4): латентность + поля результата.
+    """The `tool_call` event (NFR-4): latency + result fields.
 
-    Латентность — с момента `started` (perf_counter) до записи лога; значения
-    обогащения (results / query / id / флаги) отдаёт транспортный слой —
-    они уже очищены от содержимого заметок.
+    Latency — from `started` (perf_counter) to the log write; the enrichment
+    values (results / query / id / flags) come from the transport layer —
+    already stripped of note content.
     """
     logging.getLogger(APP_LOGGER).info(
         "tool call",

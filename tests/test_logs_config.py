@@ -1,9 +1,9 @@
-"""Конфигурация области «Логи ассистента» (LSBN-F-10, f10-01).
+"""The "Assistant logs" area's configuration (LSBN-F-10, f10-01).
 
-FR-1.3/NFR-6: флаг `area_logs_enabled` (дефолт «включено») и лимиты формы
-`logs_*` читаются `Settings`; невалидное значение (int < 1 или невалидный bool)
-— фатальный старт `ConfigError` с перечислением ВСЕХ нарушений, а не молчаливое
-выключение (arch §9).
+    FR-1.3/NFR-6: the `area_logs_enabled` flag (the default "enabled") and the
+    `logs_*` shape limits are read by `Settings`; an invalid value (an int < 1 or
+    an invalid bool) — a fatal `ConfigError` startup listing ALL violations, not a
+    silent disabling (arch §9).
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ _LOGS_ENV = (
 
 
 def _settings(monkeypatch: pytest.MonkeyPatch):
-    """Дефолты области логов (env снят — берём значения модели)."""
+    """The logs area's defaults (env off — the model's values are taken)."""
     for name in _LOGS_ENV:
         monkeypatch.delenv(name, raising=False)
     get_settings.cache_clear()
@@ -32,7 +32,7 @@ def _settings(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_logs_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Дефолты §9: флаг включён, лимиты 500/500/200/500/200/300."""
+    """The §9 defaults: the flag on; the limits 500/500/200/500/200/300."""
     settings = _settings(monkeypatch)
     assert settings.area_logs_enabled is True
     assert settings.logs_action_max_chars == 500
@@ -44,15 +44,15 @@ def test_logs_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_logs_invalid_fatal(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Невалидный лимит и невалидный bool — фатальный старт (NFR-6)."""
-    # Лимит < 1: сообщение несёт имя поля-нарушителя (собираются ВСЕ диапазоны).
+    """An invalid limit and an invalid bool — a fatal startup (NFR-6)."""
+    # A limit < 1: the message names the violating field (ALL ranges collected).
     get_settings.cache_clear()
     monkeypatch.setenv("LOGS_ACTION_MAX_CHARS", "0")
     with pytest.raises(ConfigError) as exc:
         load_settings()
     assert "logs_action_max_chars" in str(exc.value)
 
-    # Невалидный bool: pydantic-bool отказывает до диапазонов — фатальный старт.
+    # An invalid bool: the pydantic bool refuses before the ranges — a fatal startup.
     get_settings.cache_clear()
     monkeypatch.setenv("AREA_LOGS_ENABLED", "maybe")
     with pytest.raises(ConfigError) as exc:

@@ -1,8 +1,8 @@
-"""№32 (3.2.0): выбор каноничной формулировки кластера (§6.6, FR-2.3).
+"""#32 (3.2.0): choosing a cluster's canonical wording (§6.6, FR-2.3).
 
-Канон — по данным, детерминированно: максимум `uses` (частота `context_norm`
-по активным строкам области, как в `_contexts`), затем позднейший `MAX(id)`,
-затем короче, затем лексикографически меньше.
+    The canon is data-driven and deterministic: the maximum `uses` (the frequency
+    of `context_norm` over the area's active rows, as in `_contexts`), then the
+    latest `MAX(id)`, then the shorter one, then the lexicographically smaller.
 """
 
 from __future__ import annotations
@@ -19,10 +19,10 @@ def service(test_env, monkeypatch):
 
 
 def test_canonical_by_frequency_then_id(service) -> None:
-    """Частота важнее id; при равенстве частоты — позднейший id (устойчиво)."""
+    """Frequency beats id; at equal frequency — the latest id (stable)."""
     settings, normalizer = service
-    # Термин «альфа»: «проект» (id 5) vs «проекте» (id 2). Частота у «проект»
-    # поднята записью другого термина → канон = id 5, несмотря на поздний id 2.
+    # The term "alpha": form A (id 5) vs form B (id 2). A's frequency
+    # is raised by another term's record → the canon = id 5 despite the later id 2.
     seed(
         settings,
         [
@@ -36,8 +36,8 @@ def test_canonical_by_frequency_then_id(service) -> None:
     assert plan["clusters"][0]["canonical_id"] == 5
     assert plan["clusters"][0]["canonical"] == "проект"
 
-    # Термин «гамма»: «отчет» (id 10) vs «отчете» (id 20), частоты равны →
-    # канон = позднейший id 20; повторный прогон даёт тот же выбор.
+    # The term "gamma": form C (id 10) vs form D (id 20), equal frequencies →
+    # the canon = the latest id 20; a repeated run makes the same choice.
     seed(
         settings,
         [

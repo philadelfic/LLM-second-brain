@@ -1,8 +1,8 @@
-"""Дефолты и валидация бюджета слотов (№49, релиз 3.2.0; arch §8, §13.2).
+"""The slot budget's defaults and validation (#49, release 3.2.0; arch §8, §13.2).
 
-Дефолты бюджета — авто («сколько влезет»): 0 в `*_NUM_PREDICT`, 0 в контекстах;
-запас и защитный потолок заданы. Запас, не меньший заявленного контекста, —
-фатальная ошибка конфигурации.
+    The budget defaults — auto ("as much as fits"): 0 in `*_NUM_PREDICT`, 0 in the
+    contexts; the reserve and the protective ceiling are set. A reserve smaller
+    than the declared context — a fatal configuration error.
 """
 
 from __future__ import annotations

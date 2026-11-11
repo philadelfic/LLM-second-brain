@@ -1,63 +1,76 @@
 #!/usr/bin/env python3
-"""Единый E2E релиза 3.0.0 «Скиллы и знания» (тест-контур lsb-test, MCP + REST).
+"""The release 3.0.0 "Skills and knowledge" unified E2E (the lsb-test contour, MCP + REST).
 
-Сценарии — обязательный минимум постановки
-`release/3.0.0/staging_for_development/e2e-3.0.0.md` (9 штук):
+    The scenarios — the brief `release/3.0.0/staging_for_development/e2e-3.0.0.md`
+    mandatory minimum (9 of them):
 
-  1. Апгрейд. Старт 3.0.0 поверх БД v2.2.1 без ручных миграций: `/health` = ok,
-     заметки целы и ищутся, таблицы областей созданы, повторный старт — no-op.
-  2. Изоляция. Заметка не видна в `skills_search`/`skills_list`/`terms_search`/
-     `user_search`; навык/термин/факт не видны в `memory_search`/`memory_list`;
-     области не видят друг друга. Проверка в обе стороны.
-  3. Область skills. Анонс при `initialize` содержит сид skill-создателя; поиск
-     по формулировке задачи; композит + `instruction_template`; запись; лимит →
-     мягкий отказ с дословным hint; почти-дубль → отказ + hint с `id`/`name`;
-     правка по `id` + копия в `GET /skills/{id}/versions`; удаление убирает из
-     поиска/листинга/анонса; свежесть анонса во втором `initialize`.
-  4. Область terms. Запись по ключу; повтор ключа — обновление; тот же термин с
-     другим контекстом — новый смысл; `terms_search` отдаёт ВСЕ смыслы; близкий
-     контекст → мягкий отказ + hint существующего; REST-правка меняет
-     определение; удаление освобождает ключ.
-  5. Область user. Постоянный hint атомарности; почти-дословный дубль → отказ +
-     hint с `id`/`name`; `body` > 1200 → отказ с hint «разбей»; поиск/чтение/
-     правка/удаление; блока «user» в `instructions` нет.
-  6. Векторизация. Сразу после записи поиск находит по FTS; после петли `areas`
-     запись векторизована (`vector_status='ok'` + строка в vec0-таблице области)
-     и поиск её отдаёт; при выключенном эмбеддере области ищутся по FTS с
-     `warning` (проверка через REST — MCP срезает `warning`).
-  7. REST-зеркала. Коды 201/200/422/404/409; Bearer обязателен (401 без токена).
-  8. Бюджет инструкций. Блок анонса скиллов в `instructions` ≤ 2000 символов;
-     деградация при недоступной БД не роняет сервер (`LSB_DEGRADED_URL`).
-  9. Регресс. Юнит-регресс + существующие E2E (2.2/2.2.1) — опционально
-     (`--run-regression`); пост-деплойные проверки боя — РУЧНЫЕ (скрипт их
-     не делает, печатает в отчёт как MANUAL).
+      1. Upgrade. Starting 3.0.0 over a v2.2.1 DB without manual migrations:
+         `/health` = ok, the notes are intact and searchable, the area tables are
+         created, a repeated start — a no-op.
+      2. Isolation. A note is not visible in `skills_search`/`skills_list`/
+         `terms_search`/`user_search`; a skill/term/fact is not visible in
+         `memory_search`/`memory_list`; the areas do not see each other. Checked
+         both ways.
+      3. The skills area. The announce at `initialize` contains the skill-creator
+         seed; search by a task wording; the composite + `instruction_template`;
+         a write; a limit → a soft failure with the verbatim hint; a near-duplicate
+         → a failure + a hint with `id`/`name`; an edit by `id` + a copy into
+         `GET /skills/{id}/versions`; deletion removes it from the search/listing/
+         announce; the announce's freshness in the second `initialize`.
+      4. The terms area. A write by key; a repeated key — an update; the same term
+         with another context — a new sense; `terms_search` serves ALL senses; a
+         close context → a soft failure + the existing one's hint; a REST edit
+         changes the definition; deletion frees the key.
+      5. The user area. The permanent atomicity hint; a near-verbatim duplicate →
+         a failure + a hint with `id`/`name`; `body` > 1200 → a failure with the
+         "split it" hint; search/read/edit/deletion; no "user" section in
+         `instructions`.
+      6. Vectorization. Right after the write the search finds by FTS; after the
+         `areas` loop the record is vectorized (`vector_status='ok'` + a row in
+         the area's vec0 table) and the search serves it; with the embedder off
+         the areas are searched by FTS with a `warning` (checked via REST — MCP
+         trims the `warning`).
+      7. REST mirrors. The codes 201/200/422/404/409; Bearer is mandatory (401
+         without a token).
+      8. The instructions budget. The skills announce block in `instructions`
+         ≤ 2000 characters; degradation at an unavailable DB does not crash the
+         server (`LSB_DEGRADED_URL`).
+      9. Regression. The unit regression + the existing E2E (2.2/2.2.1) —
+         optional (`--run-regression`); the battle post-deploy checks are MANUAL
+         (the script does not do them; it prints them into the report as MANUAL).
 
-Спорные места (минимально-согласованные решения, этап 6):
+    Contested places (minimally-agreed decisions, stage 6):
 
-* «Повторный старт — no-op» проверяется только при заданном `LSB_RESTART_CMD`
-  (изнутри контейнера процесс себя не перезапускает). Без хука — SKIP + прямые
-  DB-признаки идемпотентности init_db (маркер сида ровно один, сид-навык один).
-* Деградация при недоступной БД (сценарий 8) требует второго контура
-  (`LSB_DEGRADED_URL`), иначе SKIP — контур поднимает оператор.
-* Регресс (сценарий 9) — только по `--run-regression` (pytest + скрипты из
-  `LSB_E2E_SCRIPTS`); пост-деплойные проверки боя печатаются как MANUAL.
-* `warning` деградации MCP срезает (белые списки выдач) — проверка FTS-only
-  идёт через REST-зеркала, где выдача полная.
-* Поиск по перефразировке («по вектору») — WARN, а не FAIL: FTS области
-  триграммный, случайные 3-граммы дают хит и без vec0. Строгий критерий
-  вектора — `vector_status='ok'` + строка вектора в vec0-таблице области.
-* Проверки дедупа/антисинонимии (косинус) мягкие (WARN), когда
-  `/health.embedding_ok = False`: без эмбеддера отказ физически невозможен.
-  Лимиты формы и близкий контекст термина — вычислительные, они строгие.
-* Пред-очистка остатков прошлых прогонов (по `LSB_E2E_PREFIX`) — служебный
-  шаг вне сценариев: без неё повторный прогон ловил бы свой же дедуп.
+    * "A repeated start — a no-op" is checked only when `LSB_RESTART_CMD` is set
+      (a process does not restart itself from inside the container). Without the
+      hook — SKIP + direct DB signs of init_db idempotency (exactly one seed
+      marker, one seed skill).
+    * The degradation at an unavailable DB (scenario 8) needs a second contour
+      (`LSB_DEGRADED_URL`), else SKIP — the operator raises the contour.
+    * The regression (scenario 9) — only with `--run-regression` (pytest + the
+      scripts from `LSB_E2E_SCRIPTS`); the battle post-deploy checks are printed
+      as MANUAL.
+    * MCP trims the degradation's `warning` (the output whitelists) — the
+      FTS-only check goes through the REST mirrors, where the output is full.
+    * The paraphrase search ("by vector") — a WARN, not a FAIL: the area's FTS is
+      trigram-based; random 3-grams give a hit even without vec0. The vector's
+      strict criterion — `vector_status='ok'` + a vector row in the area's vec0
+      table.
+    * The dedup/anti-synonymy (cosine) checks are soft (WARN) when
+      `/health.embedding_ok = False`: without an embedder the failure is
+      physically impossible. The shape limits and a term's close context are
+      arithmetic — they are strict.
+    * The pre-cleanup of past runs' leftovers (by `LSB_E2E_PREFIX`) — a service
+      step outside the scenarios: without it a repeated run would catch its own
+      dedup.
 
-Запуск (из ~/projects/llm-second-brain/test, внутри тест-контейнера):
-    MCP_AUTH_TOKEN=... python scripts/e2e_release30.py
-    python scripts/e2e_release30.py --help
+    Run (from ~/projects/llm-second-brain/test, inside the test container):
+        MCP_AUTH_TOKEN=... python scripts/e2e_release30.py
+        python scripts/e2e_release30.py --help
 
-Конфигурация — только переменные окружения (умолчания — для контейнера
-lsb-test); секреты в код и вывод не попадают, токен печатается маской.
+    The configuration — environment variables only (the defaults are for the
+    lsb-test container); no secrets get into the code or the output; the token is
+    printed masked.
 """
 from __future__ import annotations
 
@@ -79,8 +92,8 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 
-# --- канонические тексты сервисов (app/services/*, app/storage/db.py) ---------
-# Сид skill-создателя (CREATOR_SKILL_NAME) и маркеры хвоста инструкций
+# --- the services' canonical texts (app/services/*, app/storage/db.py) -----
+# The skill-creator seed (CREATOR_SKILL_NAME) and the instructions-tail markers
 # (_SKILLS_ANNOUNCE_RULES / _SKILLS_ANNOUNCE_DEGRADED / _namespace_map).
 SEED_SKILL_NAME = "Create skills"
 ANNOUNCE_MARKER = "Skills are stored procedures (how-to), kept separately from notes."
@@ -88,23 +101,23 @@ ANNOUNCE_DEGRADED_MARKER = "skills announce loads at startup"
 NS_MAP_DEGRADED_MARKER = "node map loads at startup"
 CREATOR_SEED_KEY = "creator_skill_seed"
 
-# Таблицы областей (субстрат + области): проверка «апгрейд создал таблицы».
+# The area tables (substrate + areas): the "the upgrade created the tables" check.
 AREA_TABLES = ("skills", "skill_versions", "skills_meta", "terms", "user_facts")
 AREA_FTS_TABLES = ("skills_fts", "terms_fts", "user_facts_fts")
 AREA_VEC_TABLES = ("skills_vec", "terms_vec", "user_facts_vec")
 
-# Инструменты областей, которых НЕ должно быть в instructions (инъекции нет).
+# The area tools that must NOT be in instructions (no injections).
 USER_TOOLS = ("user_search", "user_save", "user_get", "user_update", "user_delete")
 TERMS_TOOLS = ("terms_search", "terms_save", "terms_get")
 
-# --- конфигурация прогона (заполняется в main из окружения/аргументов) --------
+# --- the run configuration (filled in main from env/arguments) -------------
 CFG: dict[str, Any] = {}
-# Идентификаторы прогона: уникальные токены пробы + префикс для пред-очистки.
+# The run identifiers: unique probe tokens + the pre-cleanup prefix.
 RUN: dict[str, str] = {}
-# Прогрев /health: доступен ли эмбеддер (мягкие проверки дедупа/вектора).
+# The /health warm-up: is the embedder available (the soft dedup/vector checks).
 HEALTH: dict[str, Any] = {}
 
-# --- счётчики и отчёт ---------------------------------------------------------
+# --- counters and the report ------------------------------------------------
 PASS = 0
 FAIL = 0
 SKIP = 0
@@ -118,7 +131,7 @@ REPORT: list[dict[str, Any]] = []
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
-    """Обязательная проверка: FAIL влияет на итоговый exit-код."""
+    """A mandatory check: a FAIL affects the final exit code."""
     global PASS, FAIL
     if ok:
         PASS += 1
@@ -133,12 +146,13 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def check_llm(name: str, ok: bool, detail: str = "") -> None:
-    """Проверка, зависящая от эмбеддера/LLM: без эмбеддера — мягкая (WARN).
+    """A check depending on the embedder/LLM: without an embedder — soft (WARN).
 
-    Антисинонимия скиллов и дедуп фактов считают косинус: если слот
-    embedding недоступен (health.embedding_ok is False), отказ дедупа физически
-    невозможен, и FAIL здесь был бы ложным. Остальные отказы (лимиты формы,
-    близкий контекст термина) — вычислительные и проверяются строго.
+            The skills anti-synonymy and the fact dedup compute a cosine: if the
+            embedding slot is unavailable (health.embedding_ok is False), the dedup
+            failure is physically impossible, and a FAIL here would be false. The
+            other failures (the shape limits, a term's close context) are arithmetic
+            and are checked strictly.
     """
     if not ok and HEALTH.get("embedding_ok") is False:
         warn(f"{name} (эмбеддер недоступен — проверка мягкая)", detail)
@@ -147,7 +161,7 @@ def check_llm(name: str, ok: bool, detail: str = "") -> None:
 
 
 def skip(name: str, reason: str) -> None:
-    """Проверка невозможна на этом контуре (нет БД/эмбеддера/внешнего шага)."""
+    """A check impossible on this contour (no DB/embedder/external step)."""
     global SKIP
     SKIP += 1
     SCENARIO["skip"] += 1
@@ -156,7 +170,7 @@ def skip(name: str, reason: str) -> None:
 
 
 def warn(name: str, detail: str = "") -> None:
-    """Наблюдение вне контракта (качество эмбеддинга, статус деградации)."""
+    """An observation outside the contract (the embedding quality, the degradation status)."""
     global WARN
     WARN += 1
     SCENARIO["warn"] += 1
@@ -169,7 +183,7 @@ def info(message: str) -> None:
 
 
 def manual(name: str, note: str = "") -> None:
-    """Шаг, который делается руками (пост-деплой/оператор)."""
+    """A step done by hand (post-deploy/operator)."""
     MANUALS.append(name + (f" — {note}" if note else ""))
     print(f"  [MANUAL] {name}" + (f" — {note}" if note else ""))
 
@@ -191,7 +205,7 @@ def close_scenario() -> None:
 
 
 def reset_counters() -> None:
-    """Сброс перед повторной попыткой (обрыв сессии — прогон целиком заново)."""
+    """A reset before a retry (a session drop — the whole run starts over)."""
     global PASS, FAIL, SKIP, WARN, FAILURES, WARNINGS, SKIPS, MANUALS, SCENARIO, REPORT
     PASS = FAIL = SKIP = WARN = 0
     FAILURES, WARNINGS, SKIPS, MANUALS = [], [], [], []
@@ -199,15 +213,15 @@ def reset_counters() -> None:
 
 
 def mask(token: str) -> str:
-    """Маска секрета для вывода: 4 символа + *** (директива памяти)."""
+    """A secret mask for output: 4 characters + *** (the memory directive)."""
     return f"{token[:4]}***" if token else "(не задан)"
 
 
 def describe(exc: BaseException) -> str:
-    """Читаемое описание ошибки: ExceptionGroup → первое вложенное исключение.
+    """A readable error description: an ExceptionGroup → the first nested exception.
 
-    MCP SDK гонит транспорт в TaskGroup (SDK 2.x): без разворачивания в лог
-    попадает бесполезное «unhandled errors in a TaskGroup».
+            The MCP SDK drives the transport in a TaskGroup (SDK 2.x): without
+            unwrapping, a useless "unhandled errors in a TaskGroup" gets into the log.
     """
     if isinstance(exc, BaseExceptionGroup) and exc.exceptions:
         inner = exc.exceptions[0]
@@ -215,10 +229,10 @@ def describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-# --- MCP-клиент ---------------------------------------------------------------
+# --- the MCP client ----------------------------------------------------------
 
 def extract(result: Any) -> dict:
-    """Развернуть результат инструмента: structuredContent либо JSON в text."""
+    """Unwrap a tool result: structuredContent or the JSON in text."""
     sc = getattr(result, "structuredContent", None)
     if sc is not None:
         return sc
@@ -232,11 +246,11 @@ def extract(result: Any) -> dict:
 
 
 class Client:
-    """Тонкая обёртка над ClientSession: вызов инструмента → dict.
+    """A thin wrapper over ClientSession: a tool call → dict.
 
-    `stack` (необязательный) — собственный AsyncExitStack сеанса: он нужен,
-    когда сеанс закрывается ДО конца прогона (шаг «повторный старт — no-op»).
-    Сеансы без собственного стека закрываются общим стеком `run_all`.
+            `stack` (optional) — the session's own AsyncExitStack: it is needed when a
+            session closes BEFORE the run ends (the "repeated start — a no-op" step).
+            Sessions without their own stack are closed by `run_all`'s shared stack.
     """
 
     def __init__(self, session: ClientSession,
@@ -248,35 +262,38 @@ class Client:
         return extract(await self.session.call_tool(tool, args))
 
     async def close(self) -> None:
-        """Закрыть сеанс и транспорт: идемпотентно, ошибки не валят прогон."""
+        """Close the session and transport: idempotently; errors do not crash the run."""
         stack, self._stack = self._stack, None
         if stack is None:
             return
         try:
             await stack.aclose()
-        except Exception as exc:  # noqa: BLE001 — закрытие не предмет проверки
+        except Exception as exc:  # noqa: BLE001 — closing is not the check's subject
             info(f"закрытие MCP-сеанса: {describe(exc)}")
 
 
 async def fresh_session(stack: AsyncExitStack, url: str | None = None,
                          token: str | None = None,
                          own_stack: bool = False) -> tuple[Client, Any]:
-    """Новый MCP-сеанс: свой `initialize` (инструкции пересобираются сервером).
+    """A new MCP session: its own `initialize` (the server reassembles the instructions).
 
-    ClientSession кэширует результат `initialize()` (SDK mcp 2.x) — второй
-    `initialize()` в ТОМ ЖЕ сеансе не идёт на сервер. Поэтому свежесть анонса
-    навыков проверяется новым соединением: только оно даёт новый handshake.
+            ClientSession caches the `initialize()` result (SDK mcp 2.x) — a second
+            `initialize()` in the SAME session does not reach the server. That is why
+            the skills announce's freshness is checked with a new connection: only it
+            gives a new handshake.
 
-    Сеансы живут в общем стеке прогона и закрываются штатно в конце `run_all`.
+            The sessions live in the run's shared stack and are closed regularly at
+            the end of `run_all`.
 
-    `own_stack=True` — сеанс со своим стеком: его закрывает `Client.close`.
-    Так делается для первого сеанса, который после рестарта контура теряет
-    session_id: закрыть его можно только до рестарта (шаг «повторный старт —
-    no-op»), иначе разорванный SSE-поток отдаёт ошибку в общий TaskGroup.
+            `own_stack=True` — a session with its own stack: `Client.close` closes it.
+            This is done for the first session, which loses its session_id after the
+            contour restart: it can only be closed before the restart (the "repeated
+            start — a no-op" step); otherwise a broken SSE stream feeds an error into
+            the shared TaskGroup.
 
-    Таймауты — как в e2e_release22.py (30s connect/write/pool, 300s read):
-    вызовы с синхронным эмбеддингом под нагрузкой воркера не должны рвать
-    сессию дефолтными 5s (lsbdef-0005).
+            The timeouts — as in e2e_release22.py (30s connect/write/pool, 300s read):
+            calls with synchronous embedding under the worker's load must not have
+            their session torn by the default 5s (lsbdef-0005).
     """
     target = AsyncExitStack() if own_stack else stack
     http_client = await target.enter_async_context(
@@ -295,7 +312,7 @@ async def fresh_session(stack: AsyncExitStack, url: str | None = None,
 
 async def rest_client(stack: AsyncExitStack, base_url: str | None = None,
                       token: str | None = None, auth: bool = True) -> httpx2.AsyncClient:
-    """REST-клиент контура (Bearer — как у MCP; /health отвечает без токена)."""
+    """The contour's REST client (Bearer — as MCP; /health answers without a token)."""
     headers = {"Authorization": f"Bearer {token or CFG['token']}"} if auth else {}
     return await stack.enter_async_context(
         httpx2.AsyncClient(
@@ -306,19 +323,19 @@ async def rest_client(stack: AsyncExitStack, base_url: str | None = None,
     )
 
 
-# --- прямой доступ к БД контура (только SELECT) -------------------------------
+# --- direct access to the contour DB (SELECT only) ---------------------------
 
 def db_ready() -> bool:
     return bool(CFG.get("db")) and Path(CFG["db"]).exists()
 
 
 def _load_vec_extension(conn: sqlite3.Connection) -> None:
-    """Подключить sqlite-vec к соединению скрипта (как app.storage.db).
+    """Load sqlite-vec into the script's connection (like app.storage.db).
 
-    Расширение — свойство соединения, а не файла БД: без него vec0-таблицы не
-    читаются вовсе («no such module: vec0»), и проверка векторной строки
-    области уходит в SKIP. Ошибки загрузки глушим: вызывающий сам решит, как
-    трактовать отсутствие модуля.
+            The extension is a connection property, not a DB file property: without it
+            the vec0 tables are not readable at all ("no such module: vec0"), and the
+            area's vector-row check goes to SKIP. Load errors are silenced: the caller
+            decides itself how to treat a missing module.
     """
     try:
         import sqlite_vec
@@ -333,11 +350,12 @@ def _load_vec_extension(conn: sqlite3.Connection) -> None:
 
 
 def db_try(sql: str, params: tuple = ()) -> tuple[list[dict] | None, str]:
-    """Прочитать БД контура: (строки | None, текст ошибки).
+    """Read the contour DB: (rows | None, the error text).
 
-    БД открывается read-only; WAL-база под писателем может отказать ro-режиму —
-    тогда второй попыткой идёт обычное соединение (запросы всё равно только
-    SELECT). Вне контейнера файла нет — вызывающий обязан сделать SKIP.
+            The DB opens read-only; a WAL database under a writer may refuse the ro
+            mode — then a regular connection is the second attempt (the queries are
+            SELECT-only anyway). Outside the container there is no file — the caller
+            must SKIP.
     """
     path = str(CFG["db"])
     last = "неизвестная ошибка"
@@ -371,9 +389,9 @@ def db_scalar(sql: str, params: tuple = ()) -> tuple[Any, str]:
 
 
 async def wait_area_vector(table: str, row_id: int, timeout: float) -> tuple[bool, Any]:
-    """Ждать, пока петля `areas` закроет вектор записи области (`ok`).
+    """Wait until the `areas` loop closes an area record's vector (`ok`).
 
-    Возврат: (закрыт ли вектор, последнее виденное значение vector_status).
+            Returns: (whether the vector closed, the last seen vector_status).
     """
     deadline = time.monotonic() + timeout
     last: Any = None
@@ -388,7 +406,7 @@ async def wait_area_vector(table: str, row_id: int, timeout: float) -> tuple[boo
 
 
 def contains(haystack: Any, needle: str) -> bool:
-    """Есть ли подстрока в произвольном значении (dict/list → JSON)."""
+    """Is the substring in an arbitrary value (dict/list → JSON)."""
     if isinstance(haystack, str):
         return needle in haystack
     return needle in json.dumps(haystack, ensure_ascii=False)
@@ -396,12 +414,13 @@ def contains(haystack: Any, needle: str) -> bool:
 
 async def list_notes(c: Client, *, detail: str = "summaries",
                      max_pages: int = 25) -> list[dict]:
-    """Все страницы memory_list: с 3.1.0 потолок MCP-листинга равен 20.
+    """All memory_list pages: since 3.1.0 the MCP listing ceiling is 20.
 
-    `limit=50` на MCP — мягкий отказ (lsb-0013 FR-2.1), а одна страница
-    `limit=20` перестала бы видеть записи глубже первой (проверка «токен не
-    виден в листинге» должна смотреть ВСЕ записи, как раньше с limit=50).
-    Страницы идут по `next_offset`, пока `has_more`; ограничение — max_pages.
+            `limit=50` on MCP — a soft failure (lsb-0013 FR-2.1), and a single
+            `limit=20` page would stop seeing records deeper than the first (the
+            "the token is not visible in the listing" check must look at ALL records,
+            as before with limit=50). The pages follow `next_offset` while `has_more`;
+            the cap — max_pages.
     """
     items: list[dict] = []
     offset = 0
@@ -420,12 +439,12 @@ async def health_snapshot(rest: httpx2.AsyncClient) -> dict:
     try:
         r = await rest.get("/health")
         return r.json() if r.status_code == 200 else {"status": f"http {r.status_code}"}
-    except Exception as exc:  # контур недоступен — вызывающий сам решит
+    except Exception as exc:  # the contour is unreachable — the caller will decide
         return {"status": f"ошибка: {type(exc).__name__}"}
 
 
 async def wait_health(rest: httpx2.AsyncClient, timeout: float = 120.0) -> dict:
-    """Ждать ответа /health со статусом ok (после рестарта контейнера)."""
+    """Wait for a /health answer with the ok status (after a container restart)."""
     deadline = time.monotonic() + timeout
     snapshot: dict = {}
     while time.monotonic() < deadline:
@@ -437,10 +456,11 @@ async def wait_health(rest: httpx2.AsyncClient, timeout: float = 120.0) -> dict:
 
 
 async def refresh_health(rest: httpx2.AsyncClient) -> dict:
-    """Обновить снимок /health: `embedding_ok` меняется после первой попытки.
+    """Refresh the /health snapshot: `embedding_ok` changes after the first attempt.
 
-    До первой векторизации поле `embedding_ok` = None; мягкие проверки дедупа
-    (`check_llm`) должны видеть актуальное значение, а не стартовое.
+            Before the first vectorization the `embedding_ok` field is None; the soft
+            dedup checks (`check_llm`) must see the current value, not the startup
+            one.
     """
     snapshot = await health_snapshot(rest)
     if snapshot.get("status") == "ok":
@@ -448,15 +468,16 @@ async def refresh_health(rest: httpx2.AsyncClient) -> dict:
     return HEALTH
 
 
-# --- пред-очистка остатков прошлых прогонов -----------------------------------
+# --- pre-cleanup of past runs' leftovers -------------------------------------
 
 async def prepare(c: Client) -> None:
-    """Убрать через публичный API остатки прошлых прогонов (идемпотентность).
+    """Remove past runs' leftovers via the public API (idempotency).
 
-    Повторный прогон на той же БД без очистки ловил бы антисинонимию скиллов
-    и дедуп фактов/заметок на своих же прошлых записях. Удаляются только
-    объекты, в имени/названии которых есть префикс прогона (`LSB_E2E_PREFIX`).
-    `--no-cleanup` / `LSB_KEEP=1` — очистку выключить (диагностика).
+            A repeated run on the same DB without cleanup would catch the skills
+            anti-synonymy and the fact/note dedup on its own past records. Only
+            objects whose name/title contains the run prefix (`LSB_E2E_PREFIX`) are
+            deleted. `--no-cleanup` / `LSB_KEEP=1` — turn the cleanup off
+            (diagnostics).
     """
     prefix = CFG["prefix"]
     if CFG["no_cleanup"]:
@@ -480,14 +501,14 @@ async def prepare(c: Client) -> None:
             if prefix in (hit.get("name") or "") or prefix in (hit.get("excerpt") or ""):
                 res = await c.call("user_delete", {"id": hit["id"]})
                 removed["facts"] += int(bool(res.get("deleted")))
-    except Exception as exc:  # очистка — вспомогательный шаг, не сценарий
+    except Exception as exc:  # the cleanup — a service step, not a scenario
         warn("пред-очистка остатков не выполнена", f"{type(exc).__name__}: {exc}")
         return
     info(f"пред-очистка: удалено скиллов {removed['skills']}, заметок "
          f"{removed['notes']}, фактов {removed['facts']}")
 
 
-# --- сценарий 1: апгрейд ------------------------------------------------------
+# --- scenario 1: the upgrade --------------------------------------------------
 
 async def scenario_1_upgrade(c: Client, rest: httpx2.AsyncClient,
                              stack: AsyncExitStack) -> None:
@@ -509,7 +530,7 @@ async def scenario_1_upgrade(c: Client, rest: httpx2.AsyncClient,
     info(f"эмбеддер: embedding_ok={health.get('embedding_ok')}, "
          f"pending_vector={health.get('pending_vector')}")
 
-    # заметки целы и ищутся
+    # the notes are intact and searchable
     listing = await c.call("memory_list", {"limit": 20, "detail": "titles"})
     items = listing.get("items", [])
     check("memory_list отдаёт заметки после апгрейда (регресс заметок не сломан)",
@@ -534,7 +555,7 @@ async def scenario_1_upgrade(c: Client, rest: httpx2.AsyncClient,
               any(hit.get("id") == nid for hit in hits),
               f"query={word!r}, n={len(hits)}")
 
-    # таблицы/индексы областей созданы апгрейдом
+    # the areas' tables/indexes were created by the upgrade
     if not db_ready():
         skip("таблицы областей созданы апгрейдом",
              f"БД недоступна ({CFG['db']}) — запусти скрипт внутри контейнера")
@@ -558,7 +579,7 @@ async def scenario_1_upgrade(c: Client, rest: httpx2.AsyncClient,
             check("сид skill-создателя ровно один (повторный init_db не плодит копий)",
                   seeded == 1, f"n={seeded}")
 
-    # повторный старт — no-op
+    # a repeated start — a no-op
     if not CFG["restart_cmd"]:
         skip("повторный старт контейнера — no-op",
              "нужен внешний рестарт: задай LSB_RESTART_CMD (ручной шаг этапа 6)")
@@ -566,8 +587,8 @@ async def scenario_1_upgrade(c: Client, rest: httpx2.AsyncClient,
         before_health = await health_snapshot(rest)
         before_skills = await rest.get("/skills", params={"limit": 50})
         before_total = before_skills.json().get("total") if before_skills.status_code == 200 else None
-        # Сеанс закрываем ДО рестарта: сервер ещё помнит session_id — DELETE
-        # проходит штатно, и мёртвый SSE-поток не остаётся в общем стеке.
+        # We close the session BEFORE the restart: the server still remembers the session_id — the DELETE
+        # goes through regularly, and no dead SSE stream stays in the shared stack.
         await c.close()
         proc = await asyncio.to_thread(
             subprocess.run, CFG["restart_cmd"], shell=True,
@@ -578,9 +599,9 @@ async def scenario_1_upgrade(c: Client, rest: httpx2.AsyncClient,
         after_health = await wait_health(rest)
         check("повторный старт: /health снова ok", after_health.get("status") == "ok",
               f"status={after_health.get('status')}")
-        # Новый handshake после рестарта: прежний session_id сервер не помнит,
-        # а обращение по нему — 404 и падение TaskGroup (SDK mcp 2.x). Сеанс
-        # подменяем в текущем клиенте, дальше сценарии идут по свежему.
+        # A new handshake after the restart: the server does not remember the old session_id,
+        # and addressing it — a 404 and a TaskGroup crash (SDK mcp 2.x). We swap
+        # the session in the current client; the scenarios go on over the fresh one.
         revived, _init_after = await fresh_session(stack)
         c.session = revived.session
         relisting = await c.call("memory_list", {"limit": 5, "detail": "titles"})
@@ -596,7 +617,7 @@ async def scenario_1_upgrade(c: Client, rest: httpx2.AsyncClient,
               before_total == after_total, f"{before_total} → {after_total}")
 
 
-# --- сценарий 2: изоляция -----------------------------------------------------
+# --- scenario 2: isolation ----------------------------------------------------
 
 async def scenario_2_isolation(c: Client) -> None:
     scenario(2, "Изоляция областей в обе стороны")
@@ -634,7 +655,7 @@ async def scenario_2_isolation(c: Client) -> None:
     check("термин-проба заведён", bool(term.get("created") and tid),
           f"id={tid}, hint={term.get('hint')}")
 
-    # заметка не видна в областях
+    # the note is not visible in the areas
     res = await c.call("skills_search", {"query": note_tok, "top_k": 20})
     hits = res.get("results", [])
     check("заметка не видна в skills_search",
@@ -651,7 +672,7 @@ async def scenario_2_isolation(c: Client) -> None:
           not any(contains(hit, note_tok) for hit in res.get("results", [])),
           f"n={len(res.get('results', []))}")
 
-    # навык/термин/факт не видны в заметках
+    # the skill/term/fact are not visible in the notes
     for area, token in (("навык", skill_tok), ("термин", term_tok), ("факт", fact_tok)):
         res = await c.call("memory_search", {"query": token, "top_k": 20})
         hits = res.get("results", [])
@@ -660,7 +681,7 @@ async def scenario_2_isolation(c: Client) -> None:
         check(f"{area} не виден в memory_list",
               not any(contains(item, token) for item in await list_notes(c)))
 
-    # области не видят друг друга
+    # the areas do not see each other
     res = await c.call("skills_search", {"query": fact_tok, "top_k": 20})
     check("факт не виден в skills_search",
           not any(contains(hit, fact_tok) for hit in res.get("results", [])))
@@ -683,7 +704,7 @@ async def scenario_2_isolation(c: Client) -> None:
     info(f"пробы изоляции: note#{nid}, skill#{sid}, fact#{fid}, term#{tid}")
 
 
-# --- сценарий 3: область skills ----------------------------------------------
+# --- scenario 3: the skills area ----------------------------------------------
 
 async def scenario_3_skills(c: Client, rest: httpx2.AsyncClient,
                             stack: AsyncExitStack, instructions: str) -> None:
@@ -711,7 +732,7 @@ async def scenario_3_skills(c: Client, rest: httpx2.AsyncClient,
     check("новый навык получает version=1", created.get("version") == 1,
           f"version={created.get('version')}")
 
-    # превышение лимита формы → мягкий отказ с дословным hint
+    # a shape limit violation → a soft failure with the verbatim hint
     over = await c.call("skills_save", {
         "name": "N" * 70, "description": "too long name probe",
         "steps": "1) step", "text": "body",
@@ -721,7 +742,7 @@ async def scenario_3_skills(c: Client, rest: httpx2.AsyncClient,
           over.get("created") is False and "name limit is 65 characters" in hint,
           f"hint={hint!r}")
 
-    # почти-дубль → отказ с hint, ведущим к существующему навыку
+    # a near-duplicate → a failure with the hint leading to the existing skill
     dup = await c.call("skills_save", {
         "name": name, "description": description,
         "steps": "1) totally different order", "text": "totally different body",
@@ -732,7 +753,7 @@ async def scenario_3_skills(c: Client, rest: httpx2.AsyncClient,
               and str(sid) in hint and name in hint,
               f"hint={hint!r}")
 
-    # поиск по формулировке задачи
+    # a search by the task wording
     found = await c.call("skills_search",
                          {"query": "how to rotate the storage access keys", "top_k": 20})
     hits = found.get("results", [])
@@ -740,7 +761,7 @@ async def scenario_3_skills(c: Client, rest: httpx2.AsyncClient,
           any(hit.get("id") == sid for hit in hits),
           f"top={[h.get('name') for h in hits[:3]]}")
 
-    # композит + instruction_template
+    # the composite + instruction_template
     got = await c.call("skills_get", {"id": sid})
     check("skills_get отдаёт композит (name/description/steps/text)",
           got.get("name") == name and got.get("steps") == steps
@@ -750,7 +771,7 @@ async def scenario_3_skills(c: Client, rest: httpx2.AsyncClient,
           bool((got.get("instruction_template") or "").strip()),
           f"len={len(got.get('instruction_template') or '')}")
 
-    # правка по id + архив версий (REST)
+    # an edit by id + the version archive (REST)
     text_new = "Add the new key, reload the storage, verify, then drop the old key."
     updated = await c.call("skills_save", {
         "id": sid, "name": name, "description": description,
@@ -770,7 +791,7 @@ async def scenario_3_skills(c: Client, rest: httpx2.AsyncClient,
     check("правка заменила тело навыка", current.get("text") == text_new,
           f"text={str(current.get('text'))[:40]!r}")
 
-    # удаление: пропадает из поиска/листинга/анонса
+    # deletion: it vanishes from the search/listing/announce
     deleted = await c.call("skills_delete", {"id": sid})
     check("skills_delete удаляет навык (soft delete)", deleted.get("deleted") is True,
           f"id={deleted.get('id')}, hint={deleted.get('hint')}")
@@ -785,7 +806,7 @@ async def scenario_3_skills(c: Client, rest: httpx2.AsyncClient,
     check("второй initialize: удалённый навык исчез из анонса",
           name not in (init2.instructions or ""))
 
-    # свежесть анонса: новый навык виден в следующем initialize
+    # the announce's freshness: a new skill is visible in the next initialize
     fresh_name = f"Revive idle workers {tok}B"
     fresh = await c2.call("skills_save", {
         "name": fresh_name,
@@ -806,7 +827,7 @@ async def scenario_3_skills(c: Client, rest: httpx2.AsyncClient,
           len(tools3) == 21, f"n={len(tools3)}")
 
 
-# --- сценарий 4: область terms ------------------------------------------------
+# --- scenario 4: the terms area -----------------------------------------------
 
 async def scenario_4_terms(c: Client, rest: httpx2.AsyncClient) -> None:
     scenario(4, "Область terms: ключ, обновление, второй контекст, все смыслы, "
@@ -863,7 +884,7 @@ async def scenario_4_terms(c: Client, rest: httpx2.AsyncClient) -> None:
           and ctx_a in hint and str(id_a) in hint,
           f"hint={hint!r}")
 
-    # REST-правка меняет определение
+    # a REST edit changes the definition
     def_d = "Staging tier, final wording owned by the operator."
     put = await rest.put(f"/terms/{id_a}",
                          json={"term": term, "context": ctx_a, "definition": def_d})
@@ -875,7 +896,7 @@ async def scenario_4_terms(c: Client, rest: httpx2.AsyncClient) -> None:
           reread.status_code == 200 and reread.json().get("definition") == def_d,
           f"definition={str(reread.json().get('definition'))[:40]!r}")
 
-    # удаление освобождает ключ
+    # deletion frees the key
     deleted = await rest.delete(f"/terms/{id_a}")
     check("DELETE /terms/{id} удаляет запись (200)",
           deleted.status_code == 200 and deleted.json().get("deleted") is True,
@@ -889,7 +910,7 @@ async def scenario_4_terms(c: Client, rest: httpx2.AsyncClient) -> None:
           f"status={recreated.status_code}, id={body.get('id')}")
 
 
-# --- сценарий 5: область user -------------------------------------------------
+# --- scenario 5: the user area ------------------------------------------------
 
 async def scenario_5_user(c: Client, rest: httpx2.AsyncClient,
                           instructions: str) -> None:
@@ -959,7 +980,7 @@ async def scenario_5_user(c: Client, rest: httpx2.AsyncClient,
           and "atomic facts about the user" not in instructions)
 
 
-# --- сценарий 6: векторизация -------------------------------------------------
+# --- scenario 6: vectorization -------------------------------------------------
 
 async def scenario_6_vector(c: Client, rest: httpx2.AsyncClient, cfg: dict) -> None:
     scenario(6, "Векторизация: FTS сразу, вектор после петли areas, деградация "
@@ -969,7 +990,7 @@ async def scenario_6_vector(c: Client, rest: httpx2.AsyncClient, cfg: dict) -> N
     if not sid:
         check("навык для проверки векторизации создан", False, "нет id (см. сценарий 3)")
         return
-    # сразу после записи — находит FTS-ветка гибрида
+    # right after the write — the hybrid's FTS branch finds it
     found = await c.call("skills_search", {"query": "idle workers supervisor", "top_k": 20})
     check("сразу после записи поиск находит навык (FTS/FTS-гибрид)",
           any(hit.get("id") == sid for hit in found.get("results", [])),
@@ -1002,9 +1023,9 @@ async def scenario_6_vector(c: Client, rest: httpx2.AsyncClient, cfg: dict) -> N
               after.status_code == 200
               and any(item.get("id") == sid for item in payload.get("results", [])),
               f"status={after.status_code}, n={len(payload.get('results', []))}")
-        # Векторная сторона гибрида: поиск по перефразировке без ключевых слов
-        # записи. Не обязательная проверка: FTS области — триграммный, поэтому
-        # случайные 3-граммы могут дать хит и без ветки vec0 (это наблюдение).
+        # The hybrid's vector side: a search by a paraphrase without the record's
+        # keywords. Not a mandatory check: the area's FTS is trigram-based, so
+        # random 3-grams may give a hit even without the vec0 branch (an observation).
         para = await rest.get("/skills/search",
                               params={"q": "helpers are no longer consuming tasks"})
         para_payload = para.json() if para.status_code == 200 else {}
@@ -1013,7 +1034,7 @@ async def scenario_6_vector(c: Client, rest: httpx2.AsyncClient, cfg: dict) -> N
         else:
             warn("поиск по перефразировке не нашёл навык",
                  f"status={para.status_code} — качество эмбеддинга, не контракт")
-    # деградация при выключенном эмбеддере (warning виден только в REST)
+    # the degradation with the embedder off (the warning is visible only in REST)
     embedder_off = bool(cfg["embedder_off"]) or HEALTH.get("embedding_ok") is False
     if not embedder_off:
         skip("выключенный эмбеддер: область ищется по FTS с warning",
@@ -1039,7 +1060,7 @@ async def scenario_6_vector(c: Client, rest: httpx2.AsyncClient, cfg: dict) -> N
           f"status={res.status_code}, warning={payload.get('warning')!r}")
 
 
-# --- сценарий 7: REST-зеркала -------------------------------------------------
+# --- scenario 7: the REST mirrors ----------------------------------------------
 
 async def scenario_7_rest(rest: httpx2.AsyncClient, stack: AsyncExitStack) -> None:
     scenario(7, "REST-зеркала: коды 201/200/422/404/409, Bearer обязателен (401)")
@@ -1059,7 +1080,7 @@ async def scenario_7_rest(rest: httpx2.AsyncClient, stack: AsyncExitStack) -> No
     check("/health без токена доступен (исключение из NFR-2)",
           (await anon.get("/health")).status_code == 200)
 
-    # 201: создание навыка
+    # 201: skill creation
     skill_payload = {
         "name": f"REST mirror probe {tok}",
         "description": "Operational check of the HTTP surface: create, read, edit, delete",
@@ -1071,7 +1092,7 @@ async def scenario_7_rest(rest: httpx2.AsyncClient, stack: AsyncExitStack) -> No
     check("POST /skills → 201 + id", created.status_code == 201 and bool(sid),
           f"status={created.status_code}, id={sid}")
 
-    # 200: чтение/правка/удаление
+    # 200: read/edit/delete
     got = await rest.get(f"/skills/{sid}")
     check("GET /skills/{id} → 200", got.status_code == 200, f"status={got.status_code}")
     check("REST-чтение навыка полно (композит + instruction_template)",
@@ -1089,7 +1110,7 @@ async def scenario_7_rest(rest: httpx2.AsyncClient, stack: AsyncExitStack) -> No
     check("DELETE /skills/{id} → 200", deleted.status_code == 200
           and deleted.json().get("deleted") is True, f"status={deleted.status_code}")
 
-    # 422: форма и мягкие отказы сервиса
+    # 422: the shape and the service's soft failures
     r = await rest.post("/skills", json={**skill_payload, "name": "N" * 70})
     check("POST /skills с превышением лимита → 422 + дословный hint",
           r.status_code == 422 and "name limit is 65 characters" in str(r.json().get("detail")),
@@ -1104,12 +1125,12 @@ async def scenario_7_rest(rest: httpx2.AsyncClient, stack: AsyncExitStack) -> No
           r.status_code == 422 and "context is required" in str(r.json().get("detail")),
           f"status={r.status_code}")
 
-    # 404: несуществующие записи
+    # 404: nonexistent records
     for path in (f"/skills/99999999", "/user-facts/99999999", "/terms/99999999"):
         r = await rest.get(path)
         check(f"GET {path} → 404", r.status_code == 404, f"status={r.status_code}")
 
-    # 409: правка на занятый ключ (термин)
+    # 409: an edit onto a taken key (a term)
     term = f"{tok}-conflict"
     first = await rest.post("/terms", json={"term": term, "context": "staging",
                                             "definition": "first sense"})
@@ -1128,14 +1149,14 @@ async def scenario_7_rest(rest: httpx2.AsyncClient, stack: AsyncExitStack) -> No
           f"detail={str(conflict.json().get('detail'))[:60]!r}")
 
 
-# --- сценарий 8: бюджет инструкций и деградация -------------------------------
+# --- scenario 8: the instructions budget and degradation -----------------------
 
 async def scenario_8_instructions(stack: AsyncExitStack,
                                   instructions: str) -> None:
     scenario(8, "Бюджет инструкций: анонс скиллов ≤ 2000 символов; деградация без БД")
     budget = int(CFG["announce_budget"])
-    # Замер на первом initialize и на свежем (после записей прогона): бюджет
-    # считается по блоку целиком (правило + строки реестра), см. _skills_announce.
+    # The measurement at the first initialize and at a fresh one (after the run's writes): the budget
+    # is counted over the whole block (the rule + the registry rows), see _skills_announce.
     _c8, init8 = await fresh_session(stack)
     for label, text in (("стартовый initialize", instructions),
                         ("свежий initialize", init8.instructions or "")):
@@ -1179,7 +1200,7 @@ async def scenario_8_instructions(stack: AsyncExitStack,
           bool(text.strip()), f"len={len(text)}")
 
 
-# --- сценарий 9: регресс (опционально) и пост-деплой ---------------------------
+# --- scenario 9: regression (optional) and post-deploy -------------------------
 
 async def scenario_9_regression(cfg: dict) -> None:
     scenario(9, "Регресс: юнит-регресс + существующие E2E; пост-деплой — ручной шаг")
@@ -1214,13 +1235,13 @@ async def scenario_9_regression(cfg: dict) -> None:
            "выполняет оператор на боевом контуре после тега v3.0.0")
 
 
-# --- прогон целиком -----------------------------------------------------------
+# --- the whole run -------------------------------------------------------------
 
 async def run_all() -> None:
     async with AsyncExitStack() as stack:
-        # Первый сеанс живёт в своём стеке: его закрывает шаг «повторный старт —
-        # no-op» (сеанс до рестарта контура), остальные сеансы закрывает
-        # общий стек прогона.
+        # The first session lives in its own stack: the "repeated start —
+        # a no-op" step closes it (the session from before the contour restart); the other sessions are closed
+        # by the run's shared stack.
         c, init = await fresh_session(stack, own_stack=True)
         instructions = init.instructions or ""
         rest = await rest_client(stack)
@@ -1364,8 +1385,8 @@ async def main() -> int:
         "term": f"{base}T", "rest": base,
     })
 
-    # до 3 попыток: обрыв MCP-сессии (перезапуск воркера/сети) не должен
-    # обнулять прогон — счётчики сбрасываются, пред-очистка идемпотентна.
+    # up to 3 attempts: an MCP session drop (a worker/network restart) must not
+    # zero the run — the counters reset; the pre-cleanup is idempotent.
     attempts = 0
     while attempts < 3:
         attempts += 1
@@ -1389,8 +1410,8 @@ async def main() -> int:
         print("\n[FATAL] прогон не завершился за 3 попытки")
 
     if not REPORT and FAIL == 0:
-        # Ни один сценарий не стартовал: контур не отвечает (или токен не принят
-        # настолько рано) — это НЕ «всё зелёно».
+        # No scenario started: the contour does not answer (or the token was rejected
+        # that early) — this is NOT "all green".
         print("\n[FATAL] прогон не дал ни одного сценария: контур недоступен — "
               "проверь BASE_URL, MCP_AUTH_TOKEN и что контейнер lsb-test поднят")
         return 3

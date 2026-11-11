@@ -1,10 +1,10 @@
-"""Свежесть `updated_after` (no29-01, релиз 3.2.0) — разбор входного значения.
+"""The `updated_after` freshness (no29-01, release 3.2.0) — parsing the input value.
 
-Arch §6.1/§6.6/§13.3: принимается только абсолютная ISO-8601 UTC — дата
-(`YYYY-MM-DD`, полночь) или момент с секундами (`YYYY-MM-DDTHH:MM:SSZ`).
-Любая иная форма (пустая строка, мусор, время без даты, смещение `+03:00`,
-относительные выражения) отклоняется FreshnessValidationError — транспорты
-ловят её как мягкий отказ (fail + hint), а не как падение.
+    Arch §6.1/§6.6/§13.3: only an absolute ISO-8601 UTC is accepted — a date
+    (`YYYY-MM-DD`, midnight) or a moment with seconds (`YYYY-MM-DDTHH:MM:SSZ`).
+    Any other form (an empty string, garbage, a time without a date, a `+03:00`
+    offset, relative wording) is rejected with FreshnessValidationError — the
+    transports catch it as a soft failure (fail + hint), not a crash.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from app.services.freshness import FreshnessValidationError, parse_updated_after
 
 
 def test_parse_accepts_date_and_datetime() -> None:
-    """Дата → полночь UTC; момент — как есть (нормализация к `...Z`)."""
+    """A date → UTC midnight; a moment — as is (normalized to `...Z`)."""
     assert parse_updated_after("2026-10-08") == "2026-10-08T00:00:00Z"
     assert parse_updated_after("2026-10-08T12:34:56Z") == "2026-10-08T12:34:56Z"
 
@@ -25,6 +25,6 @@ def test_parse_accepts_date_and_datetime() -> None:
     ["", "за неделю", "2026-10-08T12:34", "2026-10-08+03:00"],
 )
 def test_parse_rejects_garbage(value: str) -> None:
-    """Не-ISO-8601-UTC формы — единый отказ (мягкий отказ транспорта)."""
+    """Non-ISO-8601-UTC forms — one failure (a transport's soft failure)."""
     with pytest.raises(FreshnessValidationError):
         parse_updated_after(value)

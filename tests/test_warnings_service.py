@@ -1,8 +1,8 @@
-"""№12 (3.2.0): сервис предупреждений — upsert, снятие, агрегаты (arch §6.5).
+"""#12 (3.2.0): the warnings service — upsert, clearing, aggregates (arch §6.5).
 
-`WarningsService` — состояние общей поверхности `warnings`: открытие/обновление
-по открытому ключу, снятие авто и человеком, листинг и счётчики. Только SQL,
-без обращений к моделям (§13.4).
+    `WarningsService` — the shared `warnings` surface's state: opening/updating
+    by the open key, clearing by the system and by a human, the listing and the
+    counters. SQL only, no model calls (§13.4).
 """
 
 from __future__ import annotations
@@ -49,11 +49,11 @@ def _events(caplog, event: str) -> list:
 
 
 def test_open_upsert_updates_payload(settings: Settings, caplog) -> None:
-    """Upsert двигает message/payload/updated_at; `warning_opened` — один раз."""
+    """The upsert moves message/payload/updated_at; `warning_opened` — once."""
     service = _service(settings)
     with caplog.at_level(logging.INFO, logger="app"):
         warning_id = service.open(KIND_NOTE_MISPLACED, "note", 1, "m1", {"v": 1})
-        # Отодвигаем updated_at в прошлое: видно, что upsert его двигает.
+        # We push updated_at into the past: the upsert moving it becomes visible.
         with session(settings) as conn, transaction(conn):
             conn.execute(
                 "UPDATE warnings SET updated_at = '2000-01-01T00:00:00Z' "
@@ -66,11 +66,11 @@ def test_open_upsert_updates_payload(settings: Settings, caplog) -> None:
     assert row["message"] == "m2"
     assert json.loads(row["payload"]) == {"v": 2}
     assert row["updated_at"] > "2000-01-01T00:00:00Z"
-    assert len(_events(caplog, "warning_opened")) == 1  # обновление не плодит
+    assert len(_events(caplog, "warning_opened")) == 1  # the update does not multiply
 
 
 def test_dismiss_and_idempotent(settings: Settings, caplog) -> None:
-    """`dismiss` → dismissed/resolved_at; повтор — мягкий ответ с hint."""
+    """`dismiss` → dismissed/resolved_at; a repeat — a soft answer with a hint."""
     service = _service(settings)
     warning_id = service.open(KIND_NOTE_MISPLACED, "note", 1, "m", {})
     with caplog.at_level(logging.INFO, logger="app"):
@@ -88,7 +88,7 @@ def test_dismiss_and_idempotent(settings: Settings, caplog) -> None:
 
 
 def test_resolve_for_subject_clears_all(settings: Settings) -> None:
-    """Снимаются ВСЕ открытые предупреждения субъекта, чужие — нет."""
+    """ALL of a subject's open warnings are cleared; foreign ones — not."""
     service = _service(settings)
     service.open(KIND_NOTE_MISPLACED, "note", 1, "m1", {})
     service.open(KIND_NOTE_NO_NODE, "note", 1, "m2", {})
@@ -104,11 +104,11 @@ def test_resolve_for_subject_clears_all(settings: Settings) -> None:
             "SELECT resolved_at FROM warnings WHERE subject_id = 2"
         ).fetchone()
     assert row["n"] == 0
-    assert other["resolved_at"] is None  # чужая заметка не тронута
+    assert other["resolved_at"] is None  # a foreign note is untouched
 
 
 def test_counts_by_kind(settings: Settings) -> None:
-    """`counts()` группирует открытые по видам; снятые/отклонённые не считает."""
+    """`counts()` groups the open ones by kind; cleared/dismissed not counted."""
     service = _service(settings)
     service.open(KIND_NOTE_MISPLACED, "note", 1, "m1", {})
     service.open(KIND_NOTE_MISPLACED, "note", 2, "m2", {})

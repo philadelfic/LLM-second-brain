@@ -53,7 +53,17 @@ class TestHealth:
             "embed",
         }
         for snapshot in operations.values():
-            assert set(snapshot) == {"model", "provider", "source"}
+            # LSBN-T-33: рядом с моделью — раздельные бюджеты операции.
+            assert set(snapshot) == {
+                "model",
+                "provider",
+                "source",
+                "answer_budget",
+                "reasoning_budget",
+                "sent_budget",
+                "answer_source",
+                "reasoning_source",
+            }
         assert body == {
             "status": "ok",
             "version": __version__,
@@ -81,6 +91,9 @@ class TestHealth:
                     "last_budget": None,
                     "last_budget_source": None,
                     "last_had_thinking": None,
+                    "last_answer_budget": None,
+                    "last_reasoning_budget": None,
+                    "last_sent_budget": None,
                 }
                 for slot in ("embedding", "summary", "judge", "decision")
             },
@@ -168,6 +181,10 @@ class TestHealth:
                 "last_budget",
                 "last_budget_source",
                 "last_had_thinking",
+                # LSBN-T-33: раздельные бюджеты последнего вызова.
+                "last_answer_budget",
+                "last_reasoning_budget",
+                "last_sent_budget",
             }
         # №40 (FR-4.3): /health.areas — по всем областям {enabled, pending}.
         assert set(body["areas"]) == {"skills", "terms", "user", "logs"}

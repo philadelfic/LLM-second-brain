@@ -1,21 +1,22 @@
-"""Векторные индексы областей (субстрат 3.0.0): skills_vec / terms_vec /
+"""Area vector indexes (the 3.0.0 substrate): skills_vec / terms_vec /
 user_facts_vec / assistant_logs_vec — vec0.
 
-Слой без доменных правил (как `app.storage.vectors` для notes_vec): создание,
-дроп, запись/чтение векторов и KNN. Доменные правила (когда кодировать текст,
-какие поля склеивать, пороги) — в сервисных слоях (`app.services.areas`,
-`app.services.worker`).
+A layer without domain rules (like `app.storage.vectors` for notes_vec):
+creation, drop, vector write/read and KNN. The domain rules (when to encode
+text, which fields to concatenate, the thresholds) live in the service layers
+(`app.services.areas`, `app.services.worker`).
 
-Ключевые решения:
-- Одна vec0-таблица на область, размерность = `embedding_dim` инсталляции
-  (общая на всё, как у notes_vec); метрика `cosine`, поэтому
-  `cosine = 1 - distance` (архитектура субстрата §3.2).
-- Смена модели/размерности (существующая автореиндексация по `meta`, см.
-  `app.storage.db._sync_embedding_meta`) дропает и area-вектора: все записи
-  областей → `vector_status='pending'`, догоняет петля `areas` воркера.
-- Имена ключевой колонки vec0 и таблиц — здесь, в одном месте: сервисные
-  регистрации областей (`app.services.areas`) собирают свои AreaSpec по этим
-  константам, db.py создаёт/дропает те же таблицы.
+Key decisions:
+- One vec0 table per area, the dimension = the installation's `embedding_dim`
+  (shared across everything, like notes_vec); the metric is `cosine`, so
+  `cosine = 1 - distance` (substrate architecture §3.2).
+- A model/dimension change (the existing auto-reindex over `meta`, see
+  `app.storage.db._sync_embedding_meta`) drops the area vectors too: every
+  area record → `vector_status='pending'`, the worker's `areas` loop catches
+  up.
+- The vec0 key column and table names live here, in one place: the service
+  area registrations (`app.services.areas`) assemble their AreaSpec from
+  these constants, and db.py creates/drops the same tables.
 """
 
 from __future__ import annotations
@@ -30,12 +31,13 @@ TERMS_VEC_TABLE = "terms_vec"
 TERMS_VEC_ID_COLUMN = "term_id"
 USER_FACTS_VEC_TABLE = "user_facts_vec"
 USER_FACTS_VEC_ID_COLUMN = "fact_id"
-# Область логов ассистента (LSBN-F-10, arch §5.3): одна vec0 на область, ключ —
-# id строки `assistant_logs`; размерность/метрика — общие (`create_vec_tables`).
+# The assistant-logs area (LSBN-F-10, arch §5.3): one vec0 per area, the key —
+# the id of an `assistant_logs` row; dimension/metric are shared
+# (`create_vec_tables`).
 ASSISTANT_LOGS_VEC_TABLE = "assistant_logs_vec"
 ASSISTANT_LOGS_VEC_ID_COLUMN = "log_id"
 
-# (таблица vec0, ключевая колонка) — реестр для создания/дропа всех area-vec.
+# (vec0 table, key column) — the registry for creating/dropping all area vecs.
 VEC_TABLES: tuple[tuple[str, str], ...] = (
     (SKILLS_VEC_TABLE, SKILLS_VEC_ID_COLUMN),
     (TERMS_VEC_TABLE, TERMS_VEC_ID_COLUMN),
@@ -45,7 +47,7 @@ VEC_TABLES: tuple[tuple[str, str], ...] = (
 
 
 def create_vec_tables(conn: sqlite3.Connection, dim: int) -> None:
-    """Создать отсутствующие area-vec с фиксированной размерностью (идемпотентно)."""
+    """Create the missing area vecs with the pinned dimension (idempotent)."""
     for table, id_column in VEC_TABLES:
         conn.execute(
             f"CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0("
@@ -56,13 +58,13 @@ def create_vec_tables(conn: sqlite3.Connection, dim: int) -> None:
 
 
 def drop_vec_tables(conn: sqlite3.Connection) -> None:
-    """Дропнуть все area-vec (автореиндексация при смене модели/размерности)."""
+    """Drop every area vec (auto-reindex on a model/dimension change)."""
     for table, _id_column in VEC_TABLES:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
 
 
 def vec_tables_exist(conn: sqlite3.Connection) -> bool:
-    """Все area-vec на месте (живая БД, пережившая апгрейд, — нет)."""
+    """All area vecs present (a live DB that survived an upgrade — not)."""
     names = {
         row[0]
         for row in conn.execute(
@@ -72,7 +74,7 @@ def vec_tables_exist(conn: sqlite3.Connection) -> bool:
     return all(table in names for table, _id_column in VEC_TABLES)
 
 
-# --- операции -------------------------------------------------------------
+# --- operations ------------------------------------------------------------
 
 
 def upsert(
@@ -82,11 +84,11 @@ def upsert(
     row_id: int,
     vector: list[float],
 ) -> None:
-    """Записать/перезаписать вектор записи области.
+    """Write/overwrite the vector of an area record.
 
-    DELETE + INSERT, а не INSERT OR REPLACE (прецедент notes_vec):
-    vec0-виртуальная таблица не гарантирует поддержку REPLACE/ON CONFLICT.
-    Ошибка размерности доходит наверх как sqlite3.Error (мешок session()).
+    DELETE + INSERT, not INSERT OR REPLACE (the notes_vec precedent): a vec0
+    virtual table does not guarantee REPLACE/ON CONFLICT support. A dimension
+    error surfaces as sqlite3.Error (the session() bag).
     """
     conn.execute(f"DELETE FROM {table} WHERE {id_column} = ?", (row_id,))
     conn.execute(
@@ -98,7 +100,7 @@ def upsert(
 def get_vector(
     conn: sqlite3.Connection, table: str, id_column: str, row_id: int
 ) -> list[float] | None:
-    """Вектор записи области или None (вектора ещё нет — pending)."""
+    """The vector of an area record, or None (no vector yet — pending)."""
     row = conn.execute(
         f"SELECT embedding FROM {table} WHERE {id_column} = ?", (row_id,)
     ).fetchone()
@@ -112,11 +114,11 @@ def knn(
     query_vector: list[float],
     k: int,
 ) -> list[tuple[int, float]]:
-    """Топ-k записей области по косинусной близости (brute-force vec0).
+    """Top-k area records by cosine closeness (brute-force vec0).
 
-    Часть soft-deleted записей (trash) вектора сохраняет (архитектура §3.2) —
-    фильтрация удалённых выше vec0, в `AreaSearch` (постовое отсечение).
-    Возвращает [(id, cosine)], по убыванию близости, `cosine = 1 - distance`.
+    Some soft-deleted records (trash) keep their vector (architecture §3.2) —
+    deleted rows are filtered above vec0, in `AreaSearch` (per-item cutoff).
+    Returns [(id, cosine)] by descending closeness, `cosine = 1 - distance`.
     """
     cursor = conn.execute(
         f"SELECT {id_column}, distance FROM {table} "
@@ -127,5 +129,5 @@ def knn(
 
 
 def count(conn: sqlite3.Connection, table: str) -> int:
-    """Число векторов в area-vec (диагностика, тесты, скрипты оператора)."""
+    """The number of vectors in an area vec (diagnostics, tests, operator scripts)."""
     return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])

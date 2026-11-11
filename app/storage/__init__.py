@@ -1,5 +1,5 @@
-"""Storage-слой (ARCHITECTURE §3.3): SQLite.
+"""The storage layer (ARCHITECTURE §3.3): SQLite.
 
-Здесь живут: схема notes + FTS5 (trigram) + vec0, работа с соединением
-(WAL, busy_timeout), миграции/инициализация.
+This package holds: the notes schema + FTS5 (trigram) + vec0, connection
+handling (WAL, busy_timeout), migrations/initialization.
 """

@@ -1,41 +1,43 @@
-"""Джоба `terms-normalize` (№32, релиз 3.2.0; arch §6.6/§7.4/§13.6/§13.10-13.12).
+"""The `terms-normalize` job (No32, 3.2.0; arch §6.6/§7.4/§13.6/§13.10-13.12).
 
-Фоновая джоба ищет **кластеры контекстов одного термина, которые про одно и
-то же**, и приводит формулировки к каноничной. Работает **полностью без LLM**:
-кластеризация — нормализация ключа + собственный лёгкий стеммер русских
-словоформ (`token_stem`) + существующая триграммная метрика области
-(`areas.trigram_similarity`); внешняя морфология (`pymorphy2`) не вводится
-(§13.6).
+    The background job finds CLUSTERS of one term's contexts that are about the
+    same thing and brings the wordings to a canonical one. It runs entirely
+    WITHOUT an LLM: the clustering - key normalization + its own light stemmer of
+    Russian word forms (`token_stem`) + the area's existing trigram metric
+    (`areas.trigram_similarity`); no external morphology (`pymorphy2`) is
+    introduced (§13.6).
 
-Ключевые инварианты:
+    Key invariants:
 
-* **Авто — только при точном равенстве определений** (FR-3.1/FR-3.3): кластер
-  нормализуется автоматически, только если `normalize_key(definition)` у ВСЕХ
-  его строк равны; иначе — предупреждение `term_context_cluster` человеку,
-  переименования нет.
-* **Канон — по данным, детерминированно** (FR-2.3): максимум `uses` (число
-  активных строк области с этим `context_norm`, как в `TermsService._contexts`),
-  затем позднейший `MAX(id)`, затем короче, затем лексикографически меньше.
-  Повторный прогон даёт тот же выбор — контекст не «переименовывается
-  туда-обратно».
-* **Конфликт ключа — без потери данных** (FR-4.1/FR-4.2): если каноничный ключ
-  занят активной записью, выживает запись с меньшим `id`, проигравшая уходит в
-  мягкое удаление (данные живы в trash). История (№41) фиксирует и
-  переименование (`source='job:terms-normalize'`), и удаление.
-* **Флаг переизбытка** (FR-5.1/FR-5.2): `term_contexts_excess` по числу РАЗНЫХ
-  активных `context_norm` ≥ `JOB_TERMS_CONTEXTS_EXCESS`, `payload.contexts` —
-  счётчик; снимается, когда число контекстов упало ниже порога.
-* **Идемпотентность** (§13.11): состояние — сами данные, без новой колонки. После
-  авто-нормализации у группы один `context_norm` → отбор её не берёт;
-  предупреждения — upsert по уникальному открытому индексу (no12-01).
-* **Отбор — только SQL** (`HAVING COUNT(DISTINCT context_norm) > 1` либо
-  `>= JOB_TERMS_CONTEXTS_EXCESS`), порядок по `term_norm`, лимит
-  `JOB_TERMS_BATCH`; модели не зовутся.
+    * **Auto - only on exact definition equality** (FR-3.1/FR-3.3): a cluster is
+      normalized automatically only when `normalize_key(definition)` is equal for
+      ALL of its rows; otherwise - the `term_context_cluster` warning to a human,
+      no rename.
+    * **The canon - by the data, deterministically** (FR-2.3): the maximum `uses`
+      (the count of the area's live rows with this `context_norm`, as in
+      `TermsService._contexts`), then the latest `MAX(id)`, then the shorter one,
+      then the lexicographically smaller. A repeated run makes the same choice -
+      a context does not "rename back and forth".
+    * **A key conflict - without data loss** (FR-4.1/FR-4.2): when the canonical
+      key is taken by a live record, the record with the smaller id survives and
+      the loser goes to a soft delete (the data lives in trash). The history
+      (No41) records both the rename (`source='job:terms-normalize'`) and the
+      deletion.
+    * **The excess flag** (FR-5.1/FR-5.2): `term_contexts_excess` by the number of
+      DIFFERENT live `context_norm` >= `JOB_TERMS_CONTEXTS_EXCESS`,
+      `payload.contexts` - the counter; cleared when the context count drops
+      below the threshold.
+    * **Idempotency** (§13.11): the state is the data itself, no new column. After
+      an auto-normalization a group has one `context_norm` -> the selection skips
+      it; the warnings - an upsert over the unique open index (no12-01).
+    * **The selection - SQL only** (`HAVING COUNT(DISTINCT context_norm) > 1` or
+      `>= JOB_TERMS_CONTEXTS_EXCESS`), the order by `term_norm`, the
+      `JOB_TERMS_BATCH` limit; no models called.
 
-Джоба регистрируется на каркасе lsb-0014 сборщиком `build_terms_normalize_job`
-и строкой в `jobs.JOB_BUILDERS` (импорт односторонний: terms_normalize → jobs,
-круга нет). Дополнительно подчиняется `AREA_TERMS_ENABLED` (§6.6): выключенная
-область фоном не обрабатывается.
+    The job registers on the lsb-0014 framework by `build_terms_normalize_job` and
+    a line in `jobs.JOB_BUILDERS` (a one-way import: terms_normalize -> jobs, no
+    cycle). It additionally obeys `AREA_TERMS_ENABLED` (§6.6): a disabled area is
+    not processed in the background.
 """
 
 from __future__ import annotations
@@ -58,28 +60,28 @@ from app.services.warnings import (
 )
 from app.storage.db import session
 
-if TYPE_CHECKING:  # рантайм-зависимостей у сервиса нет (DI)
+if TYPE_CHECKING:  # the service has no runtime dependencies (DI)
     from app.services.worker import BackgroundWorker
 
-# Имя джобы в журнале и очередь для `/health.queues`.
+# The job name in the journal and the queue for `/health.queues`.
 TERMS_NORMALIZE_JOB = "terms-normalize"
 
-# Источник версий истории (№41, §13.4): тела джобы несут `job:<имя>`.
+# The history versions' source (No41, §13.4): the job bodies carry `job:<name>`.
 _ORIGIN = f"job:{TERMS_NORMALIZE_JOB}"
 
-# Курируемый список частых русских словоизменительных окончаний (§13.6):
-# длиннейшее совпадение, остаток должен остаться ≥ 4 символов. Порядок —
-# по УБЫВАНИЮ длины: `token_stem` берёт первое подходящее (самое длинное).
+# A curated list of frequent Russian inflection suffixes (§13.6):
+# the longest match; the remainder must stay >= 4 characters. The order -
+# by DESCENDING length: `token_stem` takes the first fitting (the longest).
 STEM_SUFFIXES: tuple[str, ...] = (
-    # 4 символа
+    # 4 characters
     "иями",
-    # 3 символа
+    # 3 characters
     "ами",
     "ями",
     "ыми",
     "ими",
     "иях",
-    # 2 символа
+    # 2 characters
     "ов",
     "ев",
     "ей",
@@ -92,7 +94,7 @@ STEM_SUFFIXES: tuple[str, ...] = (
     "ия",
     "ии",
     "ью",
-    # 1 символ
+    # 1 character
     "а",
     "я",
     "у",
@@ -104,7 +106,7 @@ STEM_SUFFIXES: tuple[str, ...] = (
     "ь",
 )
 
-# Обезличенные английские тексты предупреждений (стиль §6.5/§7.1).
+# Depersonalized English warning texts (the §6.5/§7.1 style).
 MESSAGE_CLUSTER_FLAGGED = (
     "term '{term_norm}' has {count} similar contexts with different "
     "definitions — review them by hand"
@@ -114,17 +116,19 @@ MESSAGE_CONTEXTS_EXCESS = (
     "reviewing its terminology"
 )
 
-# Минимальная длина остатка после среза окончания (§13.6): короткие слова не
-# режем — «дом»/«дома» остаются разными.
+# The minimum remainder length after a suffix cut (§13.6): short words are
+# not cut - "house"/"houses" stay distinct.
 _MIN_STEM = 4
 
 
 def token_stem(token: str) -> str:
-    """Стем слова: нормализация ключа + срез длиннейшего подходящего окончания.
+    """A word's stem: the key normalization + cutting the longest fitting suffix.
 
-    `normalize_key` (lower → trim → пробелы схлопнуты → ё→е) → первое (самое
-    длинное) окончание из `STEM_SUFFIXES`, если остаток ≥ 4 символов; иначе —
-    слово как есть. Детерминировано (без внешней морфологии, §13.6).
+            `normalize_key` (lower -> trim -> collapsed spaces -> e -> e) -> the first
+            (longest) suffix from `STEM_SUFFIXES` when the remainder is >= 4
+            characters; otherwise - the word as is. Deterministic (no external
+            morphology, §13.6).
+
     """
     normalized = normalize_key(token)
     for suffix in STEM_SUFFIXES:
@@ -136,12 +140,12 @@ def token_stem(token: str) -> str:
 
 
 def _stems(text: str) -> set[str]:
-    """Множество стеммов значимых слов текста (по нормализованным токенам)."""
+    """The stem set of a text's significant words (over the normalized tokens)."""
     return {token_stem(token) for token in normalize_key(text).split() if token}
 
 
 def stem_overlap(left: str, right: str) -> float:
-    """Доля общих стеммов: |A ∩ B| / min(|A|, |B|); пусто — 0.0."""
+    """The shared-stem share: |A intersect B| / min(|A|, |B|); empty - 0.0."""
     left_stems = _stems(left)
     right_stems = _stems(right)
     if not left_stems or not right_stems:
@@ -150,22 +154,24 @@ def stem_overlap(left: str, right: str) -> float:
 
 
 def context_similarity(left: str, right: str) -> float:
-    """Близость контекстов: max(триграммы, доля общих стеммов).
+    """The context closeness: max(trigrams, the shared-stem share).
 
-    Метрика области — триграммная (`trigram_similarity`), плюс морфология:
-    «проект»/«проекте»/«проекта» без стеммера триграммами не свести.
-    Вычислительно, без эмбеддинга (§6.6).
+            The area metric is trigram-based (`trigram_similarity`), plus morphology:
+            "project"/"project's" without a stemmer never converge by trigrams.
+            Computed without an embedding (§6.6).
+
     """
     return max(trigram_similarity(left, right), stem_overlap(left, right))
 
 
 class TermsNormalizerService:
-    """Кластеры контекстов, канон и слияние ключей (arch §6.6).
+    """The context clusters, the canon and the key merges (arch §6.6).
 
-    DI: `settings` (порог кластеризации, порог переизбытка), `terms`
-    (читающий хелпер `group` + существующие `update`/`delete`), `warnings`
-    (единая поверхность предупреждений). Своих соединений к домену область не
-    заводит: план и применение идут через `TermsService`.
+            DI: `settings` (the clustering threshold, the excess threshold), `terms`
+            (the reading helper `group` + the existing `update`/`delete`), `warnings`
+            (the shared warnings surface). The area keeps no connections of its own to
+            the domain: the plan and the application go through `TermsService`.
+
     """
 
     def __init__(
@@ -179,15 +185,17 @@ class TermsNormalizerService:
         self._terms = terms
         self._warnings = warnings
 
-    # --- план (ничего не пишет) ---------------------------------------------
+    #--- the plan (writes nothing) ---------------------------------------------
 
     def plan(self, term_norm: str) -> dict[str, Any]:
-        """Кластеры группы + каноничная форма + вердикт; БД не меняется.
+        """A group's clusters + the canonical form + the verdict; the DB is untouched.
 
-        Возвращает: `{term_norm, contexts, excess, clusters}`, где кластер —
-        `{context_norm, canonical, canonical_id, members, verdict, reason}`,
-        а `members` — активные строки кластера. `verdict` — `auto` (определения
-        совпали, либо кластер размера 1) / `flag` (определения различаются).
+                    Returns: `{term_norm, contexts, excess, clusters}` where a cluster is
+                    `{context_norm, canonical, canonical_id, members, verdict, reason}`,
+                    and `members` are the cluster's live rows. `verdict` - `auto` (the
+                    definitions matched, or a size-1 cluster) / `flag` (the definitions
+                    differ).
+
         """
         rows = self._terms.group(term_norm)
         contexts = len({row["context_norm"] for row in rows})
@@ -203,7 +211,7 @@ class TermsNormalizerService:
     def _build_clusters(
         self, term_norm: str, rows: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Single-linkage кластеры по `context_similarity` + канон и вердикт."""
+        """Single-linkage clusters over `context_similarity` + the canon and the verdict."""
         threshold = float(self._settings.job_terms_cluster_similarity)
         components = _connected_components(rows, threshold)
         uses = self._uses([row["context_norm"] for row in rows])
@@ -231,7 +239,7 @@ class TermsNormalizerService:
         return clusters
 
     def _uses(self, context_norms: list[str]) -> dict[str, int]:
-        """Частота `context_norm` по активным строкам области (как `_contexts`)."""
+        """The `context_norm` frequency over the area's live rows (as in `_contexts`)."""
         unique = sorted(set(context_norms))
         if not unique:
             return {}
@@ -246,14 +254,15 @@ class TermsNormalizerService:
             ).fetchall()
         return {str(row["context_norm"]): int(row["uses"]) for row in rows}
 
-    # --- применение плана ----------------------------------------------------
+    #--- applying the plan ----------------------------------------------------
 
     def normalize(self, term_norm: str) -> dict[str, Any]:
-        """Применить план: авто-переименование/слияние или предупреждение.
+        """Apply the plan: an auto-rename/merge or a warning.
 
-        Возвращает счётчики: `{term_norm, contexts, clusters, renamed, merged,
-        flagged, excess}`. Идемпотентно: повторный прогон на нормализованных
-        данных — no-op (§13.11).
+                    Returns the counters: `{term_norm, contexts, clusters, renamed,
+                    merged, flagged, excess}`. Idempotent: a repeated run over normalized
+                    data is a no-op (§13.11).
+
         """
         plan = self.plan(term_norm)
         renamed = 0
@@ -287,7 +296,7 @@ class TermsNormalizerService:
         renamed: int,
         merged: int,
     ) -> tuple[int, int]:
-        """Переименовать неканоничные строки кластера; вернуть (renamed, merged)."""
+        """Rename the cluster's non-canonical rows; return (renamed, merged)."""
         canonical = cluster["canonical"]
         canon_norm = cluster["context_norm"]
         canonical_id = cluster["canonical_id"]
@@ -321,9 +330,9 @@ class TermsNormalizerService:
         renamed: int,
         merged: int,
     ) -> tuple[int, int]:
-        """Разрешить конфликт ключа: выживает меньший id, проигравший — в trash."""
+        """Resolve a key conflict: the smaller id survives, the loser goes to trash."""
         occupant = self._occupant(term_norm, canon_norm)
-        if occupant is None:  # гонки нет: ключ освободился — просто переименовать
+        if occupant is None:  # no race: the key is freed - just rename
             self._terms.update(
                 member["id"], member["term"], canonical, member["definition"]
             )
@@ -357,7 +366,7 @@ class TermsNormalizerService:
         return renamed, merged
 
     def _flag_cluster(self, plan: dict[str, Any], cluster: dict[str, Any]) -> None:
-        """Разные определения — предупреждение человеку, переименования нет."""
+        """Different definitions - a warning to a human, no rename."""
         contexts = [member["context"] for member in cluster["members"]]
         subject_id = min(member["id"] for member in cluster["members"])
         self._warnings.open(
@@ -378,7 +387,7 @@ class TermsNormalizerService:
         )
 
     def _apply_excess(self, term_norm: str) -> bool:
-        """Открыть/снять `term_contexts_excess` по числу разных контекстов."""
+        """Open/clear `term_contexts_excess` by the distinct-context count."""
         contexts = self._context_count(term_norm)
         subject_id = self._smallest_id(term_norm)
         if subject_id is None:
@@ -397,22 +406,24 @@ class TermsNormalizerService:
         self._warnings.resolve(KIND_TERM_CONTEXTS_EXCESS, "term", subject_id)
         return False
 
-    # --- прогон джобы --------------------------------------------------------
+    #--- the job run --------------------------------------------------------
 
     def run(self, batch: int | None = None) -> int:
-        """Партия групп (лимит `JOB_TERMS_BATCH`, порядок по `term_norm`).
+        """A batch of groups (the `JOB_TERMS_BATCH` limit, the order by `term_norm`).
 
-        Возвращает число групп, где произошла ФАКТИЧЕСКАЯ правка данных
-        (переименование/слияние контекстов). Событие `terms_normalize_run` несёт
-        агрегаты за прогон (FR-8.1), включая число разобранных групп (`terms`).
+                    Returns the number of groups where the data was ACTUALLY edited (a
+                    rename/merge of contexts). The `terms_normalize_run` event carries the
+                    run's aggregates (FR-8.1), including the drained group count
+                    (`terms`).
 
-        Возврат кормит петлю джобы (`run_loop`: `processed > 0` — выгребаем
-        сразу, без ожидания интервала). Группа, где правка невозможна (два
-        контекста расходятся определениями — только предупреждение) или где
-        нужны лишь идемпотентные предупреждения, прогрессом НЕ считается: иначе
-        петля крутится вхолостую (в тест-контуре — 30 прогонов в секунду,
-        lsbdef-0011), потому что отбор групп (`contexts > 1`) сам по себе не
-        гарантирует, что есть что менять.
+                    The return feeds the job loop (`run_loop`: `processed > 0` - keep
+                    draining immediately, no interval wait). A group where an edit is
+                    impossible (two contexts diverge in definitions - only a warning) or
+                    where only idempotent warnings are needed does NOT count as progress:
+                    otherwise the loop spins idle (30 runs a second in the test contour,
+                    lsbdef-0011), because the group selection (`contexts > 1`) by itself
+                    does not guarantee there is anything to change.
+
         """
         limit = int(self._settings.job_terms_batch if batch is None else batch)
         rows = self._selected_groups(limit)
@@ -440,7 +451,7 @@ class TermsNormalizerService:
         return progressed
 
     def queue_stat(self) -> dict:
-        """Снимок очереди `terms-normalize` — только SQL, без моделей (§6.6)."""
+        """The `terms-normalize` queue snapshot - SQL only, no models (§6.6)."""
         if not self._active():
             return queue_snapshot(0, None)
         with session(self._settings) as conn:
@@ -463,20 +474,20 @@ class TermsNormalizerService:
         return queue_snapshot(pending, oldest)
 
     def queue_empty(self) -> bool:
-        """Пуста ли очередь `terms-normalize` (дешёвая перепроверка, пул 6)."""
+        """Whether the `terms-normalize` queue is empty (a cheap recheck, pool 6)."""
         return int(self.queue_stat()["pending"] or 0) == 0
 
-    # --- отбор и мелкие чтения (SQL, без моделей) ---------------------------
+    #--- the selection and small reads (SQL, no models) ---------------------------
 
     def _active(self) -> bool:
-        """Джоба включена и область terms включена (№40, §6.6)."""
+        """The job is enabled and the terms area is enabled (No40, §6.6)."""
         return bool(
             self._settings.job_terms_enabled
             and self._settings.area_terms_enabled
         )
 
     def _selected_groups(self, limit: int | None = None) -> list[sqlite3.Row]:
-        """Активные группы, подпадающие под отбор (SQL, §6.6)."""
+        """The live groups matching the selection (SQL, §6.6)."""
         sql = (
             "SELECT term_norm FROM terms WHERE deleted_at IS NULL "
             "GROUP BY term_norm HAVING COUNT(DISTINCT context_norm) > 1 "
@@ -509,7 +520,7 @@ class TermsNormalizerService:
         return int(value) if value is not None else None
 
     def _occupant(self, term_norm: str, context_norm: str) -> int | None:
-        """Активная запись-владелец каноничного ключа (или None)."""
+        """The live record holding the canonical key (or None)."""
         with session(self._settings) as conn:
             row = conn.execute(
                 "SELECT id FROM terms WHERE term_norm = ? AND context_norm = ? "
@@ -520,7 +531,7 @@ class TermsNormalizerService:
 
     @staticmethod
     def _log(message: str, event: str, **fields: Any) -> None:
-        """Событие джобы в общий журнал: `event` + обязательное поле `job`."""
+        """The job event into the shared journal: `event` + the mandatory `job` field."""
         logging.getLogger("app").info(
             message, extra={"event": event, "job": TERMS_NORMALIZE_JOB, **fields}
         )
@@ -529,7 +540,7 @@ class TermsNormalizerService:
 def _connected_components(
     rows: list[dict[str, Any]], threshold: float
 ) -> list[list[dict[str, Any]]]:
-    """Single-linkage связывание при `context_similarity >= threshold`."""
+    """Single-linkage binding at `context_similarity >= threshold`."""
     parent = list(range(len(rows)))
 
     def find(index: int) -> int:
@@ -558,7 +569,7 @@ def _connected_components(
 def _canonical(
     members: list[dict[str, Any]], uses: dict[str, int]
 ) -> dict[str, Any]:
-    """Каноничная формулировка кластера — детерминированно по данным (§6.6)."""
+    """A cluster's canonical wording - deterministic over the data (§6.6)."""
     return min(
         members,
         key=lambda member: (
@@ -573,15 +584,16 @@ def _canonical(
 def build_terms_normalize_job(
     worker: "BackgroundWorker", settings: Settings
 ) -> JobSpec | None:
-    """Сборщик джобы `terms-normalize` (FR-7.1): без области terms — неприменима.
+    """The `terms-normalize` job builder (FR-7.1): without the terms area - inapplicable.
 
-    Форма «по интервалу» (без события и без перепроверки очереди): прогон уходит
-    в `to_thread`, очередь — производная от `terms`. Слота нет: джоба работает
-    без LLM (§13.10) и не вытесняет боевые слоты (FR-7.4). Гейт — свой
-    выключатель И `AREA_TERMS_ENABLED` (№40, §6.6): выключенная область фоном
-    не обрабатывается.
+            The shape "by interval" (no event, no queue recheck): a run goes into
+            `to_thread`; the queue is derived from `terms`. No slot: the job works
+            without an LLM (§13.10) and never evicts the production slots (FR-7.4).
+            The gate - its own switch AND `AREA_TERMS_ENABLED` (No40, §6.6): a
+            disabled area is not processed in the background.
+
     """
-    if worker._terms is None:  # DI-сборка без области — петли нет
+    if worker._terms is None:  # a DI build without the area - no loop
         return None
     service = TermsNormalizerService(
         settings,
@@ -608,6 +620,6 @@ def build_terms_normalize_job(
     )
 
 
-# Регистрация джобы в реестре каркаса (FR-7.1): своя джоба — в своём модуле
-# (одна строка в `JOB_BUILDERS`); импорт односторонний — terms_normalize → jobs.
+# The job registration in the framework registry (FR-7.1): a job lives in its
+# own module (one line in `JOB_BUILDERS`); the import is one-way - terms_normalize -> jobs.
 jobs.JOB_BUILDERS += (build_terms_normalize_job,)

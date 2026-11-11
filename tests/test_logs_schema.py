@@ -1,9 +1,10 @@
-"""Схема области «Логи ассистента» (LSBN-F-10, f10-01): таблица, FTS, vec0, индексы.
+"""The "Assistant logs" area's schema (LSBN-F-10, f10-01): the table, FTS, vec0, indexes.
 
-Область — таблица `assistant_logs` + FTS5 внешнего контента (`tokenize='trigram'`)
-+ vec0 (`log_id`, размерность инсталляции) + два частичных индекса обратного
-запроса (arch §5.1/§5.2/§5.3). Миграция идемпотентна и применима с любой
-предыдущей версии: повторный `init_db` набор объектов и число строк не меняет.
+    The area — the `assistant_logs` table + FTS5 of external content
+    (`tokenize='trigram'`) + vec0 (`log_id`, the installation's dimension) + two
+    partial reverse-query indexes (arch §5.1/§5.2/§5.3). The migration is
+    idempotent and applicable from any previous version: a repeated `init_db`
+    changes neither the object set nor the row count.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ DIM = 8
 
 @pytest.fixture
 def settings(test_env: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> Settings:
-    """Схема в тестовой БД; размерность 8 — модели не участвуют."""
+    """The schema in a test DB; dimension 8 — no models involved."""
     monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
     get_settings.cache_clear()
     settings = get_settings()
@@ -58,7 +59,7 @@ def _fts_hits(settings: Settings, term: str) -> int:
 
 
 def test_logs_tables_created(settings: Settings) -> None:
-    """Таблицы, FTS (trigram, внешний контент) и vec0 (log_id, dim) созданы."""
+    """The tables, the FTS (trigram, external content) and the vec0 (log_id, dim) created."""
     objects = _objects(settings)
     assert {"assistant_logs", "assistant_logs_fts", "assistant_logs_vec"} <= objects
 
@@ -72,7 +73,7 @@ def test_logs_tables_created(settings: Settings) -> None:
     assert f"embedding float[{DIM}]" in vec
     assert "distance_metric=cosine" in vec
 
-    # DDL §5.1: колонки записи, дефолты source/vector_status — точно как в арх-доке.
+    # The §5.1 DDL: the record columns; the source/vector_status defaults — exactly as in the arch doc.
     with session(settings) as conn:
         columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(assistant_logs)")
@@ -97,22 +98,22 @@ def test_logs_tables_created(settings: Settings) -> None:
 
 
 def test_init_idempotent(settings: Settings) -> None:
-    """Повторный `init_db`: набор объектов и число строк логов не меняются."""
+    """A repeated `init_db`: the object set and the logs' row count unchanged."""
     before = _objects(settings)
-    init_db(settings)  # рестарт без записей — no-op
+    init_db(settings)  # a restart without records — a no-op
     assert _objects(settings) == before
 
     with session(settings) as conn, transaction(conn):
         conn.execute(
             "INSERT INTO assistant_logs (action, reason) VALUES ('deploy', 'out')"
         )
-    init_db(settings)  # рестарт с записью — no-op
+    init_db(settings)  # a restart with a record — a no-op
     assert _objects(settings) == before
     assert _log_count(settings) == 1
 
 
 def test_logs_indexes_present(settings: Settings) -> None:
-    """Оба частичных индекса обратного запроса есть; оба — по активным записям."""
+    """Both partial reverse-query indexes exist; both over active records."""
     objects = _objects(settings)
     assert {"idx_assistant_logs_entity_active", "idx_assistant_logs_created_active"} <= (
         objects
@@ -128,7 +129,7 @@ def test_logs_indexes_present(settings: Settings) -> None:
 
 
 def test_logs_fts_triggers(settings: Settings) -> None:
-    """INSERT и UPDATE синхронизируют FTS: поиск по `reason` находит строку."""
+    """INSERT and UPDATE sync the FTS: a search by `reason` finds the row."""
     objects = _objects(settings)
     assert {"assistant_logs_fts_ai", "assistant_logs_fts_au"} <= objects
 
@@ -143,5 +144,5 @@ def test_logs_fts_triggers(settings: Settings) -> None:
         conn.execute(
             "UPDATE assistant_logs SET reason = 'reverted the patch' WHERE id = 1"
         )
-    assert _fts_hits(settings, "release") == 0  # старый текст ушёл (delete + insert)
-    assert _fts_hits(settings, "reverted") == 1  # новый текст проиндексирован
+    assert _fts_hits(settings, "release") == 0  # the old text gone (delete + insert)
+    assert _fts_hits(settings, "reverted") == 1  # the new text indexed

@@ -1,12 +1,13 @@
-"""Тесты листинга области «Логи ассистента» (LSBN-F-10, f10-03).
+"""The "Assistant logs" area's listing tests (LSBN-F-10, f10-03).
 
-Arch assistant-logs §6.1/§7.1/§7.2/§8/§13.16: `LogsService.list` отдаёт страницу
-активных записей по контракту lsb-0013 (`total`/`has_more`/`next_offset`/
-`next_cursor`), порядок — `created_at DESC, id DESC`, срезы — те же, что у
-поиска (один SQL-предикат). Потолок `limit` параметризуется: MCP передаёт
-`list_max_limit_mcp`, REST по умолчанию берёт `list_max_limit_rest` — тексты
-отказа различаются (FR-5.4/NFR-2). Относительная дата отвергается тем же
-`HINT_DATE_ABSOLUTE`, `offset < 0` — мягкий отказ (прецедент `SkillsService.list`).
+    Arch assistant-logs §6.1/§7.1/§7.2/§8/§13.16: `LogsService.list` serves a page
+    of active records per the lsb-0013 contract (`total`/`has_more`/`next_offset`/
+    `next_cursor`); the order — `created_at DESC, id DESC`; the slices — the same
+    as the search's (one SQL predicate). The `limit` ceiling is parameterized: MCP
+    passes `list_max_limit_mcp`, REST defaults to `list_max_limit_rest` — the
+    failure texts differ (FR-5.4/NFR-2). A relative date is rejected by the same
+    `HINT_DATE_ABSOLUTE`; `offset < 0` — a soft failure (the `SkillsService.list`
+    precedent).
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ ACTION = "перенёс слот эмбеддингов на mainsrv"
 
 @pytest.fixture
 def settings(test_env: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> Settings:
-    """Схема в тестовой БД (размерность не важна: листинг модель не зовёт)."""
+    """The schema in a test DB (the dimension does not matter: the listing calls no model)."""
     monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
     get_settings.cache_clear()
     settings = get_settings()
@@ -39,19 +40,19 @@ def settings(test_env: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> Setti
 
 @pytest.fixture
 def logs(settings: Settings) -> LogsService:
-    """Сервис области без эмбеддера: листинг его не зовёт."""
+    """The area service without an embedder: the listing never calls it."""
     return LogsService(settings)
 
 
 def _save(logs: LogsService, action: str = ACTION, **extra: object) -> int:
-    """Записать лог и вернуть id."""
+    """Save a log and return its id."""
     result = logs.save(action, REASON, **extra)
     assert result["created"] is True
     return int(result["id"])
 
 
 def _set_created(settings: Settings, log_id: int, moment: str) -> None:
-    """Выставить `created_at` записи вручную (проверка порядка и срезов)."""
+    """Set the record's `created_at` manually (checking the order and the slices)."""
     with session(settings) as conn:
         conn.execute(
             "UPDATE assistant_logs SET created_at = ? WHERE id = ?",
@@ -65,7 +66,7 @@ def _ids(page: dict) -> list[int]:
 
 class TestListing:
     def test_list_pagination(self, logs: LogsService) -> None:
-        """`total`/`has_more`/`next_offset` по контракту page_fields, cursor None."""
+        """`total`/`has_more`/`next_offset` per the page_fields contract; the cursor None."""
         for index in range(3):
             _save(logs, action=f"{ACTION} #{index}")
         first = logs.list(limit=2)
@@ -84,7 +85,7 @@ class TestListing:
         assert tail["next_offset"] is None and tail["total"] == 3
 
     def test_list_limit_ceiling(self, logs: LogsService) -> None:
-        """MCP- и REST-потолки дают РАЗНЫЙ текст отказа `limit: expected 1..…`."""
+        """The MCP and REST ceilings give a DIFFERENT `limit: expected 1..…` failure text."""
         with pytest.raises(LogValidationError) as exc:
             logs.list(limit=50, max_limit=20)
         assert str(exc.value) == "limit: expected 1..20, got 50"
@@ -99,7 +100,7 @@ class TestListing:
         assert str(exc.value) == "offset: expected 0 or greater, got -1"
 
     def test_list_order(self, settings: Settings, logs: LogsService) -> None:
-        """Порядок `created_at DESC, id DESC`; удалённые не видны."""
+        """The order `created_at DESC, id DESC`; deleted ones are not visible."""
         old = _save(logs, action="старое")
         newest = _save(logs, action="новое")
         middle = _save(logs, action="среднее")
@@ -110,12 +111,12 @@ class TestListing:
         logs.delete(middle)
         page = logs.list()
         assert _ids(page) == [newest, old] and page["total"] == 2
-        # Одинаковый момент времени — тай-брейк по id DESC: выше id — первый.
+        # The same moment — the id DESC tie-break: the higher id first.
         _set_created(settings, old, "2026-01-03T10:00:00Z")
         assert _ids(logs.list()) == [newest, old]
 
     def test_list_slices(self, logs: LogsService) -> None:
-        """Срезы те же, что у поиска (один SQL-предикат §8)."""
+        """The slices are the same as the search's (one SQL predicate, §8)."""
         first = _save(logs, entity="skill", entity_id=5, entity_version=1)
         other = _save(logs, entity="skill", entity_id=6, session="agent-2")
         assert _ids(logs.list(entity="skill", entity_id=5)) == [first]
@@ -129,13 +130,13 @@ class TestListing:
         assert _ids(logs.list(date_to="2000-01-01")) == []
 
     def test_list_relative_date_refused(self, logs: LogsService) -> None:
-        """Относительная дата в листинге — тот же HINT_DATE_ABSOLUTE (§13.12)."""
+        """A relative date in the listing — the same HINT_DATE_ABSOLUTE (§13.12)."""
         with pytest.raises(LogValidationError) as exc:
             logs.list(date_to="вчера")
         assert str(exc.value) == HINT_DATE_ABSOLUTE
 
     def test_list_empty_is_valid(self, logs: LogsService) -> None:
-        """Пустой листинг — валидный исход без hint (не тот же, что поиск)."""
+        """An empty listing — a valid outcome without a hint (not the same as search)."""
         page = logs.list()
         assert page["items"] == [] and page["total"] == 0
         assert page["has_more"] is False and page["next_offset"] is None

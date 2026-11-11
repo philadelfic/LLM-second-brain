@@ -1,66 +1,71 @@
-"""REST-ручки (ARCHITECTURE §3.1): внутренняя поверхность оператора/диагностики.
+"""REST handles (ARCHITECTURE §3.1): the internal operator/diagnostics surface.
 
-Тонкие обёртки над тем же service-слоем, что и MCP-инструменты (ARCH §1):
-один код сервисов, идентичное поведение. Валидация домена — в сервисе
-(`NoteValidationError`/`SearchValidationError` → 422), ограничения
-пагинации — фиксированные контракты FR (limit 1..50, offset ≥ 0).
+    Thin wrappers over the same service layer as the MCP tools (ARCH §1): one
+    service codebase, identical behavior. Domain validation — in the service
+    (`NoteValidationError`/`SearchValidationError` → 422); pagination constraints
+    — fixed FR contracts (limit 1..50, offset ≥ 0).
 
-Фаза 2: /notes CRUD + /search + счётчики /health из БД (NFR-4).
-Фаза 10 (Шаг 6): операторские ручки структуры — GET/POST/PATCH/DELETE
-/namespaces + merge (все с перекладкой заметок, ничего не теряется, §5.7);
-структурные ручки — НЕ в MCP (клиент-модели не рулят структурой). Ошибки:
-422 — валидация пути/описания, 404 — узел не найден, 409 — защита/конфликт
-(default, merge в себя, корень с детьми, занятый путь).
+    Phase 2: /notes CRUD + /search + /health counters from the DB (NFR-4).
+    Phase 10 (Step 6): the operator's structure handles — GET/POST/PATCH/DELETE
+    /namespaces + merge (all with note moving; nothing is lost, §5.7);
+    the structure handles are NOT in MCP (client models do not govern structure).
+    Errors: 422 — path/description validation; 404 — node not found; 409 —
+    protection/conflict (default, a merge into itself, a root with children, a
+    taken path).
 
-Фаза 11 (решение №9, follow-up 5b): `title` в теле POST/PUT /notes (передан —
-валидируется сервисом, невалидный → 422 «задай title ≤5 слов»; в PUT
-не передан — прежний остаётся) и в выдачах get/search/list (оператору;
-null — миграционная заметка без названия). Контракт «новые всегда с
-title» един на обеих поверхностях: POST /notes без title или с невалидным
-→ 422 fail+hint, заметка НЕ создаётся. Сентинел-легаси NoteService.save(text)
-без title — путь миграции/скриптов на сервис-слое, транспортам недоступен.
+    Phase 11 (decision #9, follow-up 5b): `title` in the POST/PUT /notes body
+    (passed — validated by the service, invalid → 422 "set a title ≤5 words";
+    in PUT not passed — the old one stays) and in the get/search/list outputs (to
+    the operator; null — a titleless migration note). The "new notes always have
+    a title" contract is one for both surfaces: POST /notes without a title or
+    with an invalid one → 422 fail+hint, the note is NOT created. The
+    sentinel-legacy NoteService.save(text) without a title — the migration/script
+    path at the service layer, unreachable from the transports.
 
-Релиз 3.0.0 (lsb-0007-05): REST-зеркала области навыков — /skills
-(создание/листинг/поиск/чтение/правка/soft delete), глобальный
-`/skills/instruction-template` и архив копий версий (GET /skills/{id}/versions;
-только REST, в MCP не выводится). Тот же Bearer и тот же сервисный слой;
-выдачи полные — без MCP-среза белыми списками. Коды: 201 — создание, 200 —
-чтение/правка/удаление, 422 — валидация формы и мягкие отказы (текст
-сервиса = hint), 404 — навык не найден (в т.ч. удалённый).
+    Release 3.0.0 (lsb-0007-05): the skills area's REST mirrors — /skills
+    (creation/listing/search/read/edit/soft delete), the global
+    `/skills/instruction-template` and the version-copies archive
+    (GET /skills/{id}/versions; REST only, not output to MCP). The same Bearer
+    and the same service layer; full outputs — without the MCP whitelist trim.
+    Codes: 201 — creation; 200 — read/edit/delete; 422 — shape validation and
+    soft failures (the service's text = a hint); 404 — the skill not found
+    (including a deleted one).
 
-Релиз 3.0.0 (lsb-0009-03): REST-зеркала области «user» — /user-facts
-(создание с дедуп-подсказкой, поиск, чтение, правка, soft delete). Тот же
-Bearer и тот же сервисный слой, что у MCP (`user_save`/`user_search`/
-`user_get`/`user_update`/`user_delete`); выдачи полные — без MCP-среза.
-Листинга нет (зеркала однотипны ручкам области). Коды: 201 — создание,
-200 — чтение/правка/удаление, 422 — валидация формы и мягкие отказы
-сервиса (текст = дословный hint канона lsb-0009 §3.7, включая сильное
-совпадение дедупа), 404 — факт не найден (в т.ч. удалённый).
+    Release 3.0.0 (lsb-0009-03): the "user" area's REST mirrors — /user-facts
+    (creation with a dedup hint, search, read, edit, soft delete). The same
+    Bearer and the same service layer as MCP (`user_save`/`user_search`/
+    `user_get`/`user_update`/`user_delete`); full outputs — without the MCP trim.
+    No listing (the mirrors mirror the area's handles). Codes: 201 — creation;
+    200 — read/edit/delete; 422 — shape validation and the service's soft
+    failures (the text = the verbatim lsb-0009 §3.7 canon hint, including the
+    dedup's strong match); 404 — the fact not found (including a deleted one).
 
-Релиз 3.0.0 (lsb-0008-03): REST-зеркала области «terms» — /terms (поиск,
-запись по ключу, чтение, правка по id, soft delete). Тот же Bearer и тот же
-сервисный слой, что у MCP (`terms_save`/`terms_search`/`terms_get`); выдачи
-полные — без MCP-среза. Листинга нет (решение О.): единственная дорога к
-определению — поиск. Коды: 201 — создание, 200 — обновление по ключу, чтение,
-правка, удаление, 422 — валидация формы и мягкие отказы сервиса (текст =
-дословный hint канона lsb-0008 §3.7, в т.ч. близкий контекст), 404 — запись
-не найдена (в т.ч. удалённая), 409 — новый ключ правки занят другой активной
-записью (субстрат §3.6).
+    Release 3.0.0 (lsb-0008-03): the "terms" area's REST mirrors — /terms
+    (search, a write by key, read, an edit by id, soft delete). The same Bearer
+    and the same service layer as MCP (`terms_save`/`terms_search`/`terms_get`);
+    full outputs — without the MCP trim. No listing: the only road to a
+    definition is the search. Codes: 201 — creation; 200 — an update by key, a
+    read, an edit, a deletion; 422 — shape validation and the service's soft
+    failures (the text = the verbatim lsb-0008 §3.7 canon hint, including a close
+    context); 404 — the record not found (including a deleted one); 409 — the
+    edit's new key taken by another active record (substrate §3.6).
 
-Релиз 3.1.0 (lsb-0013-02): листинги оператора — тот же контракт страницы,
-что и у MCP (arch lsb-0013 §3.4): `GET /notes` и `GET /skills` передают
-сервису потолок поверхности (`list_max_limit_rest`, 50) и несут в ответе
-`total`/`has_more`/`next_offset`/`next_cursor`. Текстовой подсказки листания
-(«+N more») на REST нет — это признак «есть ещё» для модели в MCP-выдаче;
-собственная подсказка сервиса («memory is empty») остаётся как была.
+    Release 3.1.0 (lsb-0013-02): the operator's listings — the same page contract
+    as MCP (arch lsb-0013 §3.4): `GET /notes` and `GET /skills` pass the surface
+    ceiling to the service (`list_max_limit_rest`, 50) and carry
+    `total`/`has_more`/`next_offset`/`next_cursor` in the answer. There is no
+    "+N more" text hint on REST — that is the "there is more" marker for the
+    model in the MCP output; the service's own hint ("memory is empty") stays as
+    it was.
 
-Релиз 3.1.0 (techdebt-0036): `/health` несёт `version` — версию приложения
-(`app.__version__`), согласованную с тегом релиза; поле `queues` сохранено.
+    Release 3.1.0 (techdebt-0036): `/health` carries `version` — the application
+    version (`app.__version__`), consistent with the release tag; the `queues`
+    field is preserved.
 
-Релиз 3.1.0 (lsb-0010-05): `GET /notes/{id}` несёт связи заметки — `links` из
-ДРУГИХ неймспейсов (элемент {id, title, namespace, chars}, уровень 1 с
-фолбэком на уровень 0, arch §3.5). Новых ручек нет: отдельного просмотра связей
-не вводим (решение О. 2026-09-17).
+    Release 3.1.0 (lsb-0010-05): `GET /notes/{id}` carries the note's links —
+    `links` from OTHER namespaces (an item {id, title, namespace, chars}, level 1
+    with a fallback to level 0, arch §3.5). No new handles: a separate links
+    viewer is not introduced.
 """
 
 from __future__ import annotations
@@ -78,8 +83,8 @@ from app.services import Services
 from app.services import history
 from app.services.backup import BackupService
 from app.services.freshness import FreshnessValidationError
-# LSBN-F-22 (M3): блок /health.migration (фаза/причина/прогресс/инвариант)
-# и операторское прерывание миграции (POST /migration/abort).
+# LSBN-F-22 (M3): the /health.migration block (phase/reason/progress/invariant)
+# and the operator's migration abort (POST /migration/abort).
 from app.services.migration import abort_migration, migration_health
 from app.services.namespaces import NamespaceError, NamespaceValidationError
 from app.services.notes import (
@@ -87,7 +92,7 @@ from app.services.notes import (
     _UNSET_TEXT,
     NoteValidationError,
 )
-# LSBN-F-34: снимок /health.operations (модель/провайдер/источник по операции).
+# LSBN-F-34: the /health.operations snapshot (model/provider/source per operation).
 from app.services.operations import operations_health
 from app.services.search import SearchValidationError
 from app.storage.db import StorageError
@@ -103,15 +108,15 @@ from app.services.terms import (
     TermsService,
 )
 from app.services.logs import LogsService, LogValidationError
-# «Не передано = оставить» в PUT /logs/{id}: тот же сентинел, что у MCP
-# (`_LOG_UNSET`), — REST не заводит своей семантики пустого поля.
+# "Not passed = keep" in PUT /logs/{id}: the same sentinel as MCP's
+# (`_LOG_UNSET`) — REST introduces no empty-field semantics of its own.
 from app.services.logs import _UNSET as _LOG_UNSET
 from app.services.user_facts import UserFactValidationError, UserFactsService
 from app.services.warnings import WarningsService, WarningsValidationError
 
-# Сущности с историей (§5.3): оператору доступны ВСЕ, включая глобальный
-# шаблон навыков — флагов областей на этой поверхности нет (§13.10: REST
-# оператора остаётся доступен и у выключенной области).
+# Entities with history (§5.3): ALL are available to the operator, including the global
+# skills template — no area flags on this surface (§13.10: the operator's REST
+# stays available even with an area disabled).
 _HISTORY_ENTITIES = frozenset(
     {
         history.ENTITY_NOTE,
@@ -124,7 +129,7 @@ _HISTORY_ENTITIES = frozenset(
 
 
 def _check_history_entity(entity: str) -> None:
-    """Неизвестная сущность истории — 404 (исключение слоя наружу не идёт)."""
+    """An unknown history entity — 404 (the layer's exception does not go outward)."""
     if entity not in _HISTORY_ENTITIES:
         raise HTTPException(
             status_code=404,
@@ -137,27 +142,28 @@ def _check_history_entity(entity: str) -> None:
 
 
 class NoteCreate(BaseModel):
-    """Тело POST /notes. Автор — если оператор знает модель-источник.
+    """The POST /notes body. Author — if the operator knows the source model.
 
-    Фаза 11 (решение №9, follow-up 5b): `title` обязателен — отсутствующий
-    (не передан) или невалидный (пустой/длиннее TITLE_MAX_WORDS слов) →
-    422 «задай title ≤5 слов», заметка НЕ создаётся; контракт един
-    с MCP memory_save (сентинел-легаси save(text) — только сервис-слой).
-    no24-01 (3.2.0): необязательный `comment` (≤250) — пометка, известная
-    уже в момент записи (решение О. 2026-10-08).
+            Phase 11 (decision #9, follow-up 5b): `title` is mandatory — absent (not
+            passed) or invalid (empty/longer than TITLE_MAX_WORDS words) → 422 "set a
+            title ≤5 words"; the note is NOT created; the contract is one with MCP
+            memory_save (the sentinel-legacy save(text) — the service layer only).
+            no24-01 (3.2.0): the optional `comment` (≤250) — a note known already at
+            write time.
     """
 
     text: str
     title: str | None = None
     author: str | None = None
-    comment: str | None = None  # no24-01 (3.2.0): пометка заметки (≤250)
+    comment: str | None = None  # no24-01 (3.2.0): the note's comment (≤250)
 
 
 class NamespaceCreate(BaseModel):
-    """Тело POST /namespaces: оператор создаёт confirmed-узел (Шаг 6).
+    """The POST /namespaces body: the operator creates a confirmed node (Step 6).
 
-    Автоматика создаёт provisional сама (триггер Шага 5); ручка — только
-    для стартового набора и корней (авто-корней не бывает, §5.7).
+            The automation creates provisional ones itself (the Step-5 trigger); the
+            handle is only for the starter set and roots (there are no auto-roots,
+            §5.7).
     """
 
     path: str
@@ -165,10 +171,10 @@ class NamespaceCreate(BaseModel):
 
 
 class NamespacePatch(BaseModel):
-    """Тело PATCH /namespaces/{path}: описание, статус и/или переименование.
+    """The PATCH /namespaces/{path} body: the description, the status and/or a rename.
 
-    `path` в теле — новый путь узла (rename с перекладкой заметок, §5.7);
-    опущен — узел остаётся на месте.
+            `path` in the body — the node's new path (a rename with note moving,
+            §5.7); omitted — the node stays in place.
     """
 
     path: str | None = None
@@ -177,20 +183,22 @@ class NamespacePatch(BaseModel):
 
 
 class NamespaceMerge(BaseModel):
-    """Тело POST /namespaces/{path}/merge: целевой канонический узел."""
+    """The POST /namespaces/{path}/merge body: the target canonical node."""
 
     into: str
 
 
 class NoteUpdate(BaseModel):
-    """Тело PUT /notes/{id}: перезапись целой заметки (FR-5).
+    """The PUT /notes/{id} body: a whole-note overwrite (FR-5).
 
-    Фаза 11 (решение №9): `title` опционален — передан и валиден →
-    перезапись, не передан → прежний остаётся (merge-путь не затирает).
-    no24-01 (3.2.0): `comment` — пометка заметки (≤250); наличие поля
-    определяется `model_fields_set` (опущено → сентинел `_UNSET_COMMENT` =
-    не трогаем, `null`/`""` → сброс). `text` тоже опционален: опущен или
-    `null` → текст не перезаписывается (правка только пометки).
+            Phase 11 (decision #9): `title` is optional — passed and valid →
+            overwrite; not passed → the old one stays (the merge path does not
+            overwrite it).
+            no24-01 (3.2.0): `comment` — the note's comment (≤250); the field's
+            presence is determined by `model_fields_set` (omitted → the
+            `_UNSET_COMMENT` sentinel = untouched; `null`/`""` → a reset). `text` is
+            optional too: omitted or `null` → the text is not overwritten (a
+            comment-only edit).
     """
 
     text: str | None = None
@@ -199,12 +207,12 @@ class NoteUpdate(BaseModel):
 
 
 class SkillCreate(BaseModel):
-    """Тело POST /skills: форма навыка (arch lsb-0007 §3.1).
+    """The POST /skills body: the skill shape (arch lsb-0007 §3.1).
 
-    Обязательные поля формы — `name`/`description`/`steps`/`text`;
-    `example` и `extra` (поля класса навыка) опциональны. Лимиты и
-    антисинонимия создания проверяются сервисом: нарушение → 422 с
-    дословным hint канона §3.8.
+            The mandatory shape fields — `name`/`description`/`steps`/`text`;
+            `example` and `extra` (the skill's class fields) are optional. The limits
+            and the creation anti-synonymy are checked by the service: a violation →
+            422 with the verbatim §3.8 canon hint.
     """
 
     name: str
@@ -216,31 +224,32 @@ class SkillCreate(BaseModel):
 
 
 class SkillUpdate(SkillCreate):
-    """Тело PUT /skills/{id}: та же полная форма; прежняя версия — в истории.
+    """The PUT /skills/{id} body: the same full shape; the former version — into history.
 
-    Отдельного частичного обновления нет (§3.4): форма перезаписывается
-    целиком, версия-дельта уходит в общую историю (`record_versions`, №41).
+            There is no separate partial update (§3.4): the shape is overwritten
+            whole; the version delta goes into the shared history (`record_versions`,
+            #41).
     """
 
 
 class InstructionTemplate(BaseModel):
-    """Тело PUT /skills/instruction-template: глобальный шаблон (§3.1).
+    """The PUT /skills/instruction-template body: the global template (§3.1).
 
-    Один шаблон на область («как исполнять шаги», ≤2000 символов); пустое
-    или слишком длинное значение → 422 с hint сервиса.
+            One template per area ("how to execute the steps", ≤2000 characters); an
+            empty or overly long value → 422 with the service's hint.
     """
 
     instruction_template: str
 
 
 class UserFactCreate(BaseModel):
-    """Тело POST /user-facts: один атомарный факт (arch lsb-0009 §3.1).
+    """The POST /user-facts body: one atomic fact (arch lsb-0009 §3.1).
 
-    `name` — название факта, ≤5 слов (контракт `title` заметок); `body` —
-    тело, ≤1200 символов. Лимиты и пустые значения проверяет СЕРВИС (не
-    схема — как у `title` заметок и формы навыка): нарушение →
-    `UserFactValidationError` → 422 с дословным hint канона §3.7, факт НЕ
-    сохраняется.
+            `name` — the fact's title, ≤5 words (the notes' `title` contract); `body`
+            — the body, ≤1200 characters. The limits and empty values are checked by
+            the SERVICE (not the schema — like the notes' `title` and the skill
+            shape): a violation → `UserFactValidationError` → 422 with the verbatim
+            §3.7 canon hint; the fact is NOT saved.
     """
 
     name: str
@@ -248,13 +257,13 @@ class UserFactCreate(BaseModel):
 
 
 class UserFactUpdate(BaseModel):
-    """Тело PUT /user-facts/{id}: правка `name` и/или `body` (arch §3.3).
+    """The PUT /user-facts/{id} body: editing `name` and/or `body` (arch §3.3).
 
-    Семантика сервиса «не передано = оставить» пробрасывается точным
-    набором переданных полей (`model_fields_set`): опущенное поле доходит до
-    сервиса дефолтом-сентинелом `_UNSET_*` (значение остаётся прежним), а
-    `null` в обязательном поле доходит как `None` и получает мягкий отказ
-    422 с hint «не передано = оставить» (обязательные поля не сбрасываются).
+            The service's "not passed = keep" semantics is propagated by the exact set
+            of passed fields (`model_fields_set`): an omitted field reaches the
+            service as the `_UNSET_*` sentinel default (the value stays); `null` in a
+            mandatory field reaches as None and gets a soft 422 failure with the "not
+            passed = keep" hint (mandatory fields are never cleared).
     """
 
     name: str | None = None
@@ -262,12 +271,13 @@ class UserFactUpdate(BaseModel):
 
 
 class TermCreate(BaseModel):
-    """Тело POST /terms: форма термина с обязательным контекстом (§3.1).
+    """The POST /terms body: the term shape with a mandatory context (§3.1).
 
-    Ключ области — (`term` + `context`), повтор ключа = обновление (201/200).
-    Лимиты (term ≤100, context ≤40, definition ≤350) и обязательность
-    контекста проверяет СЕРВИС (не схема — как у формы навыка): нарушение →
-    `TermValidationError` → 422 с дословным hint канона §3.7, запись НЕ идёт.
+            The area key — (`term` + `context`); a repeated key = an update (201/200).
+            The limits (term ≤100, context ≤40, definition ≤350) and the context's
+            obligatoriness are checked by the SERVICE (not the schema — like the
+            skill shape): a violation → `TermValidationError` → 422 with the verbatim
+            §3.7 canon hint; no record is written.
     """
 
     term: str
@@ -276,23 +286,24 @@ class TermCreate(BaseModel):
 
 
 class TermUpdate(TermCreate):
-    """Тело PUT /terms/{id}: та же полная форма ключа (`term` + `context`).
+    """The PUT /terms/{id} body: the same full key shape (`term` + `context`).
 
-    Отдельного частичного обновления нет (прецедент формы навыка): правка
-    адресует запись по id и пересобирает ключ целиком; новый ключ занят
-    другой активной записью → 409 (`TermKeyConflictError`) — чужой смысл
-    не затирается, старый ключ освобождается только при удалении.
+            There is no separate partial update (the skill-shape precedent): the edit
+            addresses the record by id and reassembles the key whole; the new key
+            taken by another active record → 409 (`TermKeyConflictError`) — the
+            foreign sense is not overwritten; the old key is freed only by deletion.
     """
 
 
 class LogCreate(BaseModel):
-    """Тело POST /logs: запись области логов (arch §7.2, f10-03).
+    """The POST /logs body: a logs-area record (arch §7.2, f10-03).
 
-    Поля — как у `logs_save`; `action`/`reason` обязательны (§7.3), но их
-    НЕПУСТОТУ и лимиты проверяет СЕРВИС (не схема — как у формы термина):
-    нарушение → `LogValidationError` → 422 с дословным hint канона §7.3,
-    записи нет. `entity`/связки и `source`/`session` валидируются там же;
-    непереданные `source`/`session` берёт `bind_origin` миддлвари.
+            The fields — like `logs_save`; `action`/`reason` are mandatory (§7.3),
+            but the SERVICE checks their non-emptiness and limits (not the schema —
+            like the term shape): a violation → `LogValidationError` → 422 with the
+            verbatim §7.3 canon hint; no record. `entity`/links and
+            `source`/`session` are validated there too; not-passed
+            `source`/`session` are taken by the `bind_origin` middleware.
     """
 
     action: str
@@ -308,12 +319,13 @@ class LogCreate(BaseModel):
 
 
 class LogUpdate(BaseModel):
-    """Тело PUT /logs/{id}: частичная правка — «не передано = оставить» (§7.2).
+    """The PUT /logs/{id} body: a partial edit — "not passed = keep" (§7.2).
 
-    Все поля опциональны: непереданное (None) уходит сентинелом «оставить как
-    есть» (тот же `_LOG_UNSET`, что у MCP `logs_update`). Сервис вернёт
-    `updated: False` + hint, если ничего не передано или записи нет; связки
-    объекта проверяются по эффективным значениям (как в `logs_update`).
+            All fields are optional: a not-passed one (None) goes as the "keep as is"
+            sentinel (the same `_LOG_UNSET` as MCP's `logs_update`). The service will
+            return `updated: False` + a hint when nothing was passed or the record is
+            missing; the object links are checked by effective values (as in
+            `logs_update`).
     """
 
     action: str | None = None
@@ -329,23 +341,23 @@ class LogUpdate(BaseModel):
 
 
 class HistoryRollback(BaseModel):
-    """Тело POST /history/{entity}/{id}/rollback: номер целевой версии (§7.2).
+    """The POST /history/{entity}/{id}/rollback body: the target version number (§7.2).
 
-    Откат — операторская ручка (FR-5.4): модель возвращает запись к прежнему
-    состоянию НОВОЙ версией, историю не переписывая (§13.6).
+            Rollback — an operator handle (FR-5.4): the model returns the record to
+            its former state by a NEW version without rewriting the history (§13.6).
     """
 
     version: int
 
 
 class QueueStat(BaseModel):
-    """Снимок одной очереди для /health.queues (FR-2.2, №39 arch §7.2).
+    """One queue's snapshot for /health.queues (FR-2.2, #39 arch §7.2).
 
-    `pending` — сколько заданий берётся СЕЙЧАС; `oldest_pending_sec` — возраст
-    старейшего задания, ждущего исполнения (pending или waiting; 3.3.1 —
-    возраст виден и при разрыве слота; null — ни той, ни другой категории
-    нет); `waiting` — отложено из-за слота/готовности (№39); `attention` —
-    подмножество `waiting`, ждущее человека (no39-02).
+            `pending` — how many tasks are takeable NOW; `oldest_pending_sec` — the
+            age of the oldest task waiting to be done (pending or waiting; 3.3.1 —
+            the age is visible during a slot breaker too; null — neither category
+            exists); `waiting` — deferred because of the slot/readiness (#39);
+            `attention` — the `waiting` subset waiting for a human (no39-02).
     """
 
     pending: int
@@ -355,17 +367,22 @@ class QueueStat(BaseModel):
 
 
 class SlotStat(BaseModel):
-    """Снимок одного слота для /health.slots (№39, arch §7.2).
+    """One slot's snapshot for /health.slots (#39, arch §7.2).
 
-    `ok` — исход последней попытки слота (прецедент `embedding_ok`/
-    `summarizer_ok`/`judge_ok`; None — попыток не было); `last_outcome` —
-    исход последнего отказа (словарь `SlotOutcome`); `paused_until` —
-    ISO-8601 UTC, пока разрыв открыт (null — слот работает); `attention` —
-    число заданий слота, ждущих человека (no39-02). №50 (lsbdef-0008):
-    `last_finish_reason`/`last_budget`/`last_budget_source`/`last_had_thinking`
-    — диагностика последнего вызова (None — вызова не было) — оператор видит
-    причину (обрезано по бюджету / размышление съело вывод) без журнала.
-    Собирается воркером, только SQL/память — моделей не зовём.
+            `ok` — the slot's last attempt outcome (the `embedding_ok`/
+            `summarizer_ok`/`judge_ok` precedent; None — no attempts yet);
+            `last_outcome` — the last failure's outcome (the `SlotOutcome`
+            dictionary); `paused_until` — ISO-8601 UTC, while the breaker is open
+            (null — the slot works); `attention` — the slot's tasks waiting for a
+            human (no39-02). #50 (lsbdef-0008):
+            `last_finish_reason`/`last_budget`/`last_budget_source`/`last_had_thinking`
+            — the last call's diagnostics (None — no call) — the operator sees the
+            reason (trimmed by the budget / reasoning ate the output) without the
+            journal.
+            LSBN-T-33: `last_answer_budget`/`last_reasoning_budget`/`last_sent_budget`
+            — the last call's separate budgets; "eaten by reasoning" is visible via
+            `last_outcome=truncated` + `last_had_thinking=true` and the budget split.
+            Assembled by the worker; SQL/memory only — no models called.
     """
 
     ok: bool | None
@@ -376,14 +393,17 @@ class SlotStat(BaseModel):
     last_budget: int | None = None
     last_budget_source: str | None = None
     last_had_thinking: bool | None = None
+    last_answer_budget: int | None = None
+    last_reasoning_budget: int | None = None
+    last_sent_budget: int | None = None
 
 
 class BackupStat(BaseModel):
-    """Наблюдаемость бэкапов для /health (№14, arch §7.2).
+    """The backups observability for /health (#14, arch §7.2).
 
-    Собирается сканом каталога BACKUP_DIR, БЕЗ открытия БД: число/возраст/
-    объём снапшотов, число помеченных (`.bad`) и последние исходы проверки
-    и выноса из сайдкар-индекса (None — ещё не было).
+            Assembled by scanning the BACKUP_DIR directory, WITHOUT opening the DB:
+            the snapshots' count/age/volume, the count of marked ones (`.bad`) and the
+            latest verify/ship outcomes from the sidecar index (None — none yet).
     """
 
     count: int
@@ -396,66 +416,70 @@ class BackupStat(BaseModel):
 
 
 class BackupVerifyRequest(BaseModel):
-    """Тело `POST /backups/verify` (№14, arch §7.2): файл или свежайший.
+    """The `POST /backups/verify` body (#14, arch §7.2): a file or the newest.
 
-    `file` нет/пусто → свежайший снапшот; иначе — имя файла в BACKUP_DIR.
+            No/empty `file` → the newest snapshot; otherwise — a file name in
+            BACKUP_DIR.
     """
 
     file: str | None = None
 
 
 class HealthResponse(BaseModel):
-    """Контракт /health (NFR-4): для docker healthcheck и оператора.
+    """The /health contract (NFR-4): for the docker healthcheck and the operator.
 
-    `version` — версия приложения (FR-4.2, techdebt-0036): источник ровно один
-    — `app.__version__` (§7.1 канона), дублирующего поля в настройках нет.
-    Оператор сверяет её с тегом релиза: «на контуре поднят ровно этот релиз».
+            `version` — the application version (FR-4.2, techdebt-0036): exactly one
+            source — `app.__version__` (the canon's §7.1); no duplicate field in
+            settings. The operator compares it with the release tag: "exactly this
+            release is up on the contour".
     """
 
     status: str
-    version: str  # techdebt-0036 (FR-4.2): версия приложения
-    embedding_ok: bool | None  # Фаза 3
-    summarizer_ok: bool | None  # Фаза 4
-    judge_ok: bool | None  # Фаза 11: судья дедупа/структуры (слот judge)
-    # LSBN-F-12 (arch §7.1): умеет ли decision-слот (None — выключен или
-    # проверки не было; False — стартовая проверка/вызов погасили слот).
+    version: str  # techdebt-0036 (FR-4.2): the application version
+    embedding_ok: bool | None  # Phase 3
+    summarizer_ok: bool | None  # Phase 4
+    judge_ok: bool | None  # Phase 11: the dedup/structure judge (the judge slot)
+    # LSBN-F-12 (arch §7.1): whether the decision slot can do it (None — disabled or
+    # no check yet; False — the startup check/call suppressed the slot).
     decision_ok: bool | None
     notes_count: int
-    # LSBN-S-1: мягкий лимит текста заметки (валидация save/update/merge).
-    # 3.4.1 (LSBN-T-26): из настроек сборки — то же число, что CHECK новых
-    # баз и цель самомиграции (одно число — одно место: MAX_NOTE_CHARS).
+    # LSBN-S-1: the note text's soft limit (the save/update/merge validation).
+    # 3.4.1 (LSBN-T-26): from the build settings — the same number as the new databases' CHECK
+    # and the self-migration target (one number — one place: MAX_NOTE_CHARS).
     note_chars_limit: int
     pending_vector: int
     pending_summary: int
-    queues: dict[str, QueueStat]  # lsb-0014-03: ожидание по каждой очереди
-    # №39 (arch §7.2): по слоту {ok, last_outcome, paused_until, attention} —
-    # причина и пауза разрыва слота, число заданий в внимании. Только SQL/память.
+    queues: dict[str, QueueStat]  # lsb-0014-03: the wait per queue
+    # #39 (arch §7.2): per slot {ok, last_outcome, paused_until, attention} —
+    # the slot breaker's reason and pause, the tasks in attention. SQL/memory only.
     slots: dict[str, SlotStat]
-    # LSBN-F-34 (решение №4 брифа): по операции {model, provider, source} —
-    # эффективная модель/провайдер и источник конфигурации (op|slot|default).
-    # БЕЗ адресов и ключей: /health открыт наружу (NFR-2); адрес живёт только
-    # в журнале (`slot_call`) и в событии джобы при ошибке.
-    operations: dict[str, dict[str, str]]
-    # №40 (FR-4.3): по каждой области {enabled, pending} — по ВСЕМ областям,
-    # включая выключенные (их накопление видно). Собирает воркер, только SQL.
+    # LSBN-F-34 (the brief's decision #4): per operation {model, provider, source} —
+    # the effective model/provider and the configuration source (op|slot|default).
+    # LSBN-T-33: alongside, the operation's separate budgets (answer/reasoning/sent +
+    # their sources) — the configuration ceiling at an empty prompt. NO addresses
+    # or keys: /health is exposed outward (NFR-2); the address lives only
+    # in the journal (`slot_call`) and in the job's event on error.
+    operations: dict[str, dict[str, Any]]
+    # #40 (FR-4.3): per area {enabled, pending} — over ALL areas,
+    # including disabled ones (their accumulation is visible). Assembled by the worker; SQL only.
     areas: dict[str, dict]
-    # №12 (no12-02, §7.1/§7.2): агрегаты открытых предупреждений — {by_kind,
-    # total} по общей таблице `warnings` (память и термины). Только SQL.
+    # #12 (no12-02, §7.1/§7.2): the open warnings' aggregates — {by_kind,
+    # total} over the shared `warnings` table (memory and terms). SQL only.
     warnings: dict[str, Any]
-    # LSBN-F-22 (M3, design §4 фаза 7): блок миграции — {phase, target,
+    # LSBN-F-22 (M3, design §4 phase 7): the migration block — {phase, target,
     # reason, counters{old_total, poured, split_notes, parts, quarantine,
-    # expired, waiting}, invariant_ok} — причина и прогресс видны оператору
-    # (постановка п. 2), счётчики — ЗАМЕТКИ (решение пилота). Только SQL.
+    # expired, waiting}, invariant_ok} — the reason and progress are visible to the operator
+    # (the brief p. 2); the counters — NOTES (the pilot's decision). SQL only.
     migration: dict[str, Any]
-    # LSBN-F-12 (arch §7.1): агрегаты decision-слота — {enabled, ok, answers,
-    # fallbacks, by_reason:{unavailable,unsupported,low_confidence}} из памяти
-    # процесса (вероятности наружу не отдаются — только журнал).
+    # LSBN-F-12 (arch §7.1): the decision slot's aggregates — {enabled, ok, answers,
+    # fallbacks, by_reason:{unavailable,unsupported,low_confidence}} from process
+    # memory (probabilities are never served outward — the journal only).
     decision: dict[str, Any]
-    # №45 (arch §7.2): наблюдаемость версии — {enabled, current, latest,
-    # checked_at, hint_shown_at}; собирается из памяти `UpdateChecker` (без I/O).
+    # #45 (arch §7.2): the version observability — {enabled, current, latest,
+    # checked_at, hint_shown_at}; assembled from the `UpdateChecker` memory (no I/O).
     update: dict[str, Any]
-    # №14 (arch §7.2): наблюдаемость бэкапов — скан каталога BACKUP_DIR без
-    # открытия БД + последние исходы проверки/выноса из сайдкар-индекса.
+    # #14 (arch §7.2): the backups observability — a BACKUP_DIR directory scan without
+    # opening the DB + the latest verify/ship outcomes from the sidecar index.
     backups: BackupStat
 
 
@@ -464,13 +488,14 @@ def _services(request: Request) -> Services:
 
 
 def _decision_health(services: Services) -> tuple[bool | None, dict[str, Any]]:
-    """Снимок decision-слота для /health (LSBN-F-12, arch §7.1/§7.3).
+    """The decision slot's snapshot for /health (LSBN-F-12, arch §7.1/§7.3).
 
-    `decision_ok` — умеет ли слот (None — выключен/не собран); `decision` —
-    агрегаты `{enabled, ok, answers, fallbacks, by_reason}` из памяти сервиса
-    (вероятности наружу не отдаются, только журнал). Модели не зовём: только
-    чтение счётчиков (`DecisionService.snapshot()`); пустой слот — форма
-    «выключен» с нулевыми счётчиками.
+            `decision_ok` — whether the slot can do it (None — disabled/not built);
+            `decision` — the `{enabled, ok, answers, fallbacks, by_reason}` aggregates
+            from the service's memory (probabilities are never served outward — the
+            journal only). No models called: only counter reads
+            (`DecisionService.snapshot()`); an empty slot — the "disabled" shape with
+            zero counters.
     """
     service = services.decision
     if service is None:
@@ -496,11 +521,12 @@ def _decision_health(services: Services) -> tuple[bool | None, dict[str, Any]]:
 
 
 def _skills_service(request: Request) -> SkillsService:
-    """Сервис области навыков — общий для всех REST-ручек /skills.
+    """The skills area service — shared by all /skills REST handles.
 
-    `Services.skills` опционален только ради старых DI-сборок; приложение
-    (`create_app`) всегда собирает область — её недоступность означала бы
-    ошибку конфигурации, поэтому отвечаем 503, а не падаем трейсбеком.
+            `Services.skills` is optional only for legacy DI builds; the application
+            (`create_app`) always assembles the area — its unavailability would mean
+            a configuration error, so we answer 503 instead of crashing with a
+            traceback.
     """
     service = _services(request).skills
     if service is None:
@@ -509,21 +535,22 @@ def _skills_service(request: Request) -> SkillsService:
 
 
 def _user_facts_service(request: Request) -> UserFactsService:
-    """Сервис области «user» — общий для всех REST-ручек /user-facts.
+    """The "user" area service — shared by all /user-facts REST handles.
 
-    Тот же сервисный слой, что у MCP-инструментов `user_*` (субстрат §3.4):
-    поведение областей идентично на обеих поверхностях, отличается только
-    выдача (REST — полные контракты полей).
+            The same service layer as the `user_*` MCP tools (substrate §3.4): the
+            area's behavior is identical on both surfaces; only the output differs
+            (REST — full field contracts).
     """
     return _services(request).user_facts
 
 
 def _warnings_service(request: Request) -> WarningsService:
-    """Сервис общей поверхности предупреждений (№12, no12-02) — для /warnings.
+    """The shared warnings surface service (#12, no12-02) — for /warnings.
 
-    `Services.warnings` опционален только ради старых DI-сборок; приложение
-    (`create_app`/`build_services`) всегда его кладёт — его недоступность
-    означала бы ошибку сборки, отвечаем 503, а не падаем трейсбеком.
+            `Services.warnings` is optional only for legacy DI builds; the application
+            (`create_app`/`build_services`) always provides it — its unavailability
+            would mean an assembly error; we answer 503 instead of crashing with a
+            traceback.
     """
     service = _services(request).warnings
     if service is None:
@@ -534,12 +561,12 @@ def _warnings_service(request: Request) -> WarningsService:
 
 
 def _backup_service(request: Request) -> BackupService:
-    """Сервис бэкапов — для операторских `GET /backups` и `POST /backups/verify`.
+    """The backups service — for the operator's `GET /backups` and `POST /backups/verify`.
 
-    `Services.backup` типизирован необязательным только ради старых DI-сборок
-    тестов (там он None); приложение (`create_app`/`build_services`) всегда его
-    кладёт — его недоступность отвечаем 503, а не падаем трейсбеком (как у
-    `_skills_service`/`_warnings_service`).
+            `Services.backup` is typed optional only for legacy test DI builds (there
+            it is None); the application (`create_app`/`build_services`) always
+            provides it — we answer 503 to its unavailability instead of crashing
+            with a traceback (like `_skills_service`/`_warnings_service`).
     """
     service = _services(request).backup
     if service is None:
@@ -548,22 +575,22 @@ def _backup_service(request: Request) -> BackupService:
 
 
 def _terms_service(request: Request) -> TermsService:
-    """Сервис области «terms» — общий для всех REST-ручек /terms.
+    """The "terms" area service — shared by all /terms REST handles.
 
-    Тот же сервисный слой, что у MCP-инструментов `terms_*` (субстрат §3.4):
-    поведение области идентично на обеих поверхностях, отличается только
-    выдача (REST — полные контракты полей, без среза белыми списками).
+            The same service layer as the `terms_*` MCP tools (substrate §3.4): the
+            area's behavior is identical on both surfaces; only the output differs
+            (REST — full field contracts, no whitelist trim).
     """
     return _services(request).terms
 
 
 def _logs_service(request: Request) -> LogsService:
-    """Сервис области логов — общий для всех REST-ручек /logs (f10-03).
+    """The logs area service — shared by all /logs REST handles (f10-03).
 
-    `Services.logs` опционален только ради старых DI-сборок; приложение
-    (`create_app`/`build_services`) собирает область ВСЕГДА — доступ оператора
-    сохраняется и у выключенного флага (§13.11), поэтому 503 — только для
-    сборок без области (как у `_skills_service`/`_warnings_service`).
+            `Services.logs` is optional only for legacy DI builds; the application
+            (`create_app`/`build_services`) assembles the area ALWAYS — the operator's
+            access survives even a disabled flag (§13.11), so 503 is only for builds
+            without the area (like `_skills_service`/`_warnings_service`).
     """
     service = _services(request).logs
     if service is None:
@@ -572,81 +599,87 @@ def _logs_service(request: Request) -> LogsService:
 
 
 def _unprocessable(exc: ValueError) -> HTTPException:
-    """Доменные нарушения → 422 с текстом сервиса (без внутренностей)."""
+    """Domain violations → 422 with the service's text (no internals)."""
     return HTTPException(status_code=422, detail=str(exc))
 
 
 def _log_field(value: Any) -> Any:
-    """Поле PUT /logs/{id}: не переданное (None) — значит «оставить как есть».
+    """A PUT /logs/{id} field: not passed (None) means "keep as is".
 
-    Мост между схемой REST (у опциональных полей default None) и сервисом, где
-    «не передано» — сентинел `_LOG_UNSET` (один код с MCP `logs_update`); так
-    пустая строка остаётся осмысленной (очистка поля).
+            The bridge between the REST schema (optional fields default to None) and
+            the service, where "not passed" is the `_LOG_UNSET` sentinel (one
+            codebase with MCP's `logs_update`); this way an empty string stays
+            meaningful (a field clearing).
     """
     return _LOG_UNSET if value is None else value
 
 
 def _conflict(exc: NamespaceError) -> HTTPException:
-    """Конфликт структурных ручек (Шаг 6): защита default, дубль пути,
-    merge в себя — 409 с текстом сервиса (не найден — проверяется заранее)."""
+    """A structure-handles conflict (Step 6): the default protection, a duplicate
+            path, a merge into itself — 409 with the service's text (not found —
+            checked in advance).
+    """
     return HTTPException(status_code=409, detail=str(exc))
 
 
 async def _bind_rest_origin(request: Request) -> AsyncIterator[None]:
-    """Обвязать REST-запрос источником версий (§13.4, №41).
+    """Wrap a REST request with the versions source (§13.4, #41).
 
-    `source='rest'`, сессия — заголовок `X-LSB-Session` (не передан → NULL:
-    человекоподобный идентификатор не придумываем). Зависимость роутера
-    держит contextvar на время обработки запроса; `asyncio.to_thread` сервисов
-    контекст пробрасывает — версии правок оператора несут источник `rest`.
+            `source='rest'`; the session — the `X-LSB-Session` header (not passed →
+            NULL: a human-like identifier is never invented). The router dependency
+            holds the contextvar while the request is processed; the services'
+            `asyncio.to_thread` propagates the context — the operator's edit versions
+            carry the `rest` source.
     """
     with history.bind_origin("rest", session=request.headers.get("X-LSB-Session")):
         yield
 
 
 def build_rest_router(settings: Settings) -> APIRouter:
-    """Собрать роутер; умолчания пагинации — из настроек окружения."""
+    """Assemble the router; the pagination defaults — from the environment settings."""
     rest_router = APIRouter(dependencies=[Depends(_bind_rest_origin)])
 
     @rest_router.get("/health", response_model=HealthResponse)
     async def health(request: Request) -> HealthResponse:
-        """Живость процесса. Отвечает без токена (исключение из NFR-2).
+        """The process's liveness. Answers without a token (the NFR-2 exception).
 
-        `embedding_ok` — исход последней попытки векторизации (None — попыток
-        не было; обновляет EmbeddingService — единая точка всех кодирований);
-        `summarizer_ok` — исход последней генерации суммари (None — попыток не
-        было; обновляет SummaryService — все генерации идут из воркера);
-        `judge_ok` — исход последнего вызова судьи (Фаза 11: стартовая
-        проверка при ok даёт True; при недоступности остаётся None — False
-        поставит первый реальный отказ, см. app/main.py).
-        Счётчики — из БД: активные заметки (trash не обслуживается).
-        `queues` — снимки очередей джоб (FR-2.2, lsb-0014-03): по каждой
-        очереди число ожидающих заданий и возраст старейшего; собираются
-        воркером по реестру, только SQL — обращений к моделям нет.
-        Легаси-поля (`pending_vector`/`pending_summary`) сохранены.
-        `version` — версия приложения (FR-4.2, techdebt-0036): оператор
-        сверяет её с тегом релиза при приёмке.
-        `migration` — LSBN-F-22 (M3): фаза/причина/прогресс самомиграции
-        ({"phase": None} — базу миграция не касалась).
+                    `embedding_ok` — the last vectorization attempt's outcome (None — no
+                    attempts; updated by EmbeddingService — the single point of all
+                    encodings);
+                    `summarizer_ok` — the last summary generation's outcome (None — no
+                    attempts; updated by SummaryService — all generations come from the
+                    worker);
+                    `judge_ok` — the last judge call's outcome (Phase 11: the startup
+                    check at ok gives True; at unavailability it stays None — False will
+                    be set by the first real failure, see app/main.py).
+                    The counters — from the DB: active notes (trash is not served).
+                    `queues` — the job queues' snapshots (FR-2.2, lsb-0014-03): per queue,
+                    the waiting task count and the oldest's age; assembled by the worker
+                    over the registry, SQL only — no model calls.
+                    The legacy fields (`pending_vector`/`pending_summary`) are preserved.
+                    `version` — the application version (FR-4.2, techdebt-0036): the
+                    operator compares it with the release tag at acceptance.
+                    `migration` — LSBN-F-22 (M3): the self-migration's phase/reason/
+                    progress ({"phase": None} — the migration never touched the base).
         """
         services = _services(request)
         worker = request.app.state.worker  # type: ignore[attr-defined]
         counts = await asyncio.to_thread(services.notes.health_counts)
         queues = await asyncio.to_thread(worker.queues_health)
-        # №39 (arch §7.2): снимок слотов — причина и пауза разрыва (только
-        # SQL/память, модели не вызываются).
+        # #39 (arch §7.2): the slots snapshot — the breaker's reason and pause (SQL/
+        # memory only, no models called).
         slots = await asyncio.to_thread(worker.slots_health)
         areas = await asyncio.to_thread(worker.areas_health)
-        # №12 (no12-02): агрегаты открытых предупреждений — только SQL.
+        # #12 (no12-02): the open warnings' aggregates — SQL only.
         if services.warnings is None:
             warnings: dict[str, Any] = {"by_kind": {}, "total": 0}
         else:
             warnings = await asyncio.to_thread(services.warnings.counts)
-        # LSBN-F-12 (arch §7.1): `decision_ok` и блок `decision` — из памяти
-        # сервиса (§7.3): сколько решений принято, сколько переключений и по
-        # каким причинам. Модели не зовём (только снимок счётчиков).
+        # LSBN-F-12 (arch §7.1): `decision_ok` and the `decision` block — from the service's
+        # memory (§7.3): how many decisions were made, how many switches and for
+        # which reasons. No models called (a counter snapshot only).
         decision_ok, decision = _decision_health(services)
-        # №45 (arch §7.2): снимок версии — из памяти чекера, без I/O.
+        # #45 (arch §7.2): the version snapshot — from the checker's memory, no I/O.
         checker = getattr(request.app.state, "update_checker", None)
         update = (
             checker.health()
@@ -659,8 +692,8 @@ def build_rest_router(settings: Settings) -> APIRouter:
                 "hint_shown_at": None,
             }
         )
-        # №14 (arch §7.2): наблюдаемость бэкапов — скан каталога без открытия
-        # БД (`BackupService.status`); DI-сборка без сервиса — пустая форма.
+        # #14 (arch §7.2): the backups observability — a directory scan without opening
+        # the DB (`BackupService.status`); a DI build without the service — an empty shape.
         backup = services.backup
         backups = (
             BackupStat(
@@ -675,8 +708,8 @@ def build_rest_router(settings: Settings) -> APIRouter:
             if backup is None
             else BackupStat(**await asyncio.to_thread(backup.status))
         )
-        # LSBN-F-22 (M3): фаза/причина/прогресс миграции — только SQL
-        # (постановка п. 2: «причина и прогресс видны в /health»).
+        # LSBN-F-22 (M3): the migration's phase/reason/progress — SQL only
+        # (the brief p. 2: "the reason and progress are visible in /health").
         migration = await asyncio.to_thread(migration_health, settings)
         return HealthResponse(
             status="ok",
@@ -686,14 +719,14 @@ def build_rest_router(settings: Settings) -> APIRouter:
             judge_ok=services.judge.last_attempt_ok,
             decision_ok=decision_ok,
             notes_count=counts["notes_count"],
-            # LSBN-S-1: мягкий лимит заметки виден оператору (из настроек).
+            # LSBN-S-1: the note's soft limit is visible to the operator (from settings).
             note_chars_limit=settings.max_note_chars,
             pending_vector=counts["pending_vector"],
             pending_summary=counts["pending_summary"],
             queues=queues,
             slots=slots,
-            # LSBN-F-34: блок operations — из реестра и настроек, без I/O
-            # и без вызовов моделей (модель/провайдер/источник по операции).
+            # LSBN-F-34: the operations block — from the registry and settings, no I/O
+            # and no model calls (model/provider/source per operation).
             operations=operations_health(settings),
             areas=areas,
             warnings=warnings,
@@ -705,16 +738,17 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.post("/notes", status_code=201)
     async def create_note(payload: NoteCreate, request: Request) -> dict:
-        """Создать заметку (memory_save FR-4: векторизация + дедуп).
+        """Create a note (memory_save FR-4: vectorization + dedup).
 
-        Среда без Ollama → деградация (pending + warning, дедуп по тексту).
-        Решение №9 (follow-up 5b): title обязателен — без него/невалидный →
-        TitleValidationError → 422 fail+hint (контракт един с MCP).
+                    An environment without Ollama → a degradation (pending + a warning; a
+                    text-based dedup).
+                    Decision #9 (follow-up 5b): the title is mandatory — without one/invalid →
+                    TitleValidationError → 422 fail+hint (the contract is one with MCP).
         """
         try:
-            # title=None от транспорта («клиент не назвал заметку») — отказ
-            # сервиса (TitleValidationError); сентинел-легаси через REST
-            # недостижим: title всегда передаётся явно.
+            # title=None from the transport ("the client did not name the note") — a service
+            # failure (TitleValidationError); the sentinel legacy is unreachable
+            # via REST: title is always passed explicitly.
             return await asyncio.to_thread(
                 _services(request).notes.save,
                 payload.text,
@@ -732,14 +766,14 @@ def build_rest_router(settings: Settings) -> APIRouter:
         offset: int = Query(default=0, ge=0),
         updated_after: str | None = Query(default=None),
     ) -> dict:
-        """Обзор памяти: страница кратких содержаний + поля пагинации (FR-2).
+        """The memory overview: a page of brief summaries + the pagination fields (FR-2).
 
-        lsb-0013-02 (arch §3.4): потолок поверхности (`list_max_limit_rest`,
-        50) проверяет сервис, в ответе — те же поля страницы, что у MCP
-        (`total`/`has_more`/`next_offset`/`next_cursor`); подсказки «+N more»
-        на REST нет — полный контракт оператора. no29-01: `updated_after`
-        (ISO-8601 UTC, включающая граница) фильтрует страницу и `total`;
-        невалидное значение → 422 с текстом-hint.
+                    lsb-0013-02 (arch §3.4): the surface ceiling (`list_max_limit_rest`,
+                    50) is checked by the service; the answer carries the same page fields
+                    as MCP (`total`/`has_more`/`next_offset`/`next_cursor`); there is no
+                    "+N more" hint on REST — the operator's full contract. no29-01:
+                    `updated_after` (ISO-8601 UTC, an inclusive bound) filters the page
+                    and `total`; an invalid value → 422 with a hint text.
         """
         try:
             return await asyncio.to_thread(
@@ -761,14 +795,14 @@ def build_rest_router(settings: Settings) -> APIRouter:
         namespace_exact: bool = Query(default=False),
         updated_after: str | None = Query(default=None),
     ) -> dict:
-        """Отдельный поиск ПОМЕТОК (no24-02, §13.6): только по comment.
+        """A separate COMMENT search (no24-02, §13.6): over comment only.
 
-        Объявлен ДО `GET /notes/{note_id}` (как `/skills/search` до
-        `/skills/{skill_id}`) — иначе «comments» парсился бы как note_id и
-        отдавал 422. Контракт тот же, что у MCP (`{results, hint?}`);
-        результаты не смешиваются со смысловым поиском. Невалидные
-        `q`/`top_k`/`updated_after` и незарегистрированный узел → 422 с
-        текстом-hint.
+                    Declared BEFORE `GET /notes/{note_id}` (like `/skills/search` before
+                    `/skills/{skill_id}`) — otherwise "comments" would parse as note_id
+                    and return 422. The contract is the same as MCP's (`{results, hint?}`);
+                    the results are not mixed with the semantic search. Invalid
+                    `q`/`top_k`/`updated_after` and an unregistered node → 422 with a
+                    hint text.
         """
         try:
             return await asyncio.to_thread(
@@ -782,13 +816,13 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.get("/notes/{note_id}")
     async def get_note(note_id: int, request: Request) -> dict:
-        """Полный текст одной заметки + связи из ДРУГИХ неймспейсов.
+        """One note's full text + links from OTHER namespaces.
 
-        Одиночный алиас batch memory_get: сервисный контракт полный (`chars` —
-        объём текста), lsb-0010-05 добавляет `links` — элемент {id, title,
-        namespace, chars} (сборка — на уровне транспорта, arch §3.5). Отдельной
-        операторской ручки просмотра связей НЕТ (решение О. 2026-09-17): связи
-        видны в чтении заметки, таблица доступна в БД.
+                    The single-id alias of batch memory_get: the service contract is full
+                    (`chars` — the text volume); lsb-0010-05 adds `links` — an item {id,
+                    title, namespace, chars} (the assembly — at the transport level,
+                    arch §3.5). There is NO separate operator handle for viewing links:
+                    links are visible in the note read; the table is available in the DB.
         """
         services = _services(request)
         result = await asyncio.to_thread(services.notes.get, [note_id])
@@ -798,9 +832,9 @@ def build_rest_router(settings: Settings) -> APIRouter:
                 detail=result.get("hint", "заметка не найдена"),
             )
         note = dict(result["notes"][0])
-        # Пустой список — нормальный ответ: без `hint` и без подсказок.
-        # `Services.links` в DI-сборках тестов может быть None (без связей) —
-        # деградируем до пустого списка, как анонс навыков без области (lsb-0007).
+        # An empty list — a normal answer: no `hint` and no pointers.
+        # `Services.links` can be None in test DI builds (no links) —
+        # we degrade to an empty list, like the skills announce without the area (lsb-0007).
         links = services.links
         note["links"] = (
             list(await asyncio.to_thread(links.related, note_id)) if links else []
@@ -809,13 +843,14 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.put("/notes/{note_id}")
     async def update_note(note_id: int, payload: NoteUpdate, request: Request) -> dict:
-        """Перезаписать заметку целиком (FR-5).
+        """Overwrite the note whole (FR-5).
 
-        no24-01 (3.2.0): `comment` — по `model_fields_set` (опущено → сентинел
-        `_UNSET_COMMENT` = не трогаем, `null`/`""` → сброс); `text` не передан
-        (или `null`) → сентинел `_UNSET_TEXT` — правка только пометки, текст
-        не перезаписывается (контракт сервиса lsb-0004-01). ``CommentValidationError``
-        → 422 существующим `except NoteValidationError`.
+                    no24-01 (3.2.0): `comment` — by `model_fields_set` (omitted → the
+                    `_UNSET_COMMENT` sentinel = untouched; `null`/`""` → a reset); `text`
+                    not passed (or `null`) → the `_UNSET_TEXT` sentinel — a comment-only
+                    edit, the text is not overwritten (the lsb-0004-01 service contract).
+                    ``CommentValidationError`` → 422 by the existing
+                    `except NoteValidationError`.
         """
         try:
             result = await asyncio.to_thread(
@@ -840,7 +875,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.delete("/notes/{note_id}")
     async def delete_note(note_id: int, request: Request) -> dict:
-        """Soft delete (FR-6): физически заметка остаётся в trash."""
+        """Soft delete (FR-6): physically the note stays in trash."""
         result = await asyncio.to_thread(_services(request).notes.delete, note_id)
         if not result["deleted"]:
             raise HTTPException(
@@ -856,10 +891,10 @@ def build_rest_router(settings: Settings) -> APIRouter:
         top_k: int | None = Query(default=None, ge=1, le=20),
         updated_after: str | None = Query(default=None),
     ) -> dict:
-        """Поиск (Фаза 3 — гибрид vec0+FTS, выдача FR-1; offline → FTS-only).
+        """Search (Phase 3 — the vec0+FTS hybrid; the FR-1 output; offline → FTS-only).
 
-        no29-01: `updated_after` (ISO-8601 UTC, включающая граница) сужает
-        гибрид до свежих заметок; невалидное значение → 422 с текстом-hint.
+                    no29-01: `updated_after` (ISO-8601 UTC, an inclusive bound) narrows
+                    the hybrid to fresh notes; an invalid value → 422 with a hint text.
         """
         try:
             return await asyncio.to_thread(
@@ -869,25 +904,25 @@ def build_rest_router(settings: Settings) -> APIRouter:
         except (SearchValidationError, FreshnessValidationError) as exc:
             raise _unprocessable(exc) from exc
 
-    # --- неймспейсы: операторские ручки структуры (Фаза 10, Шаг 6) ----------
-    # §5.7: структурные ручки — REST оператора, НЕ в MCP (клиент-модели не
-    # рулят структурой). Один код сервисов; существующие REST-контракты
-    # нетронуты (прецедент Фазы 9 — новые маршруты не меняют старые).
+    # --- namespaces: the operator's structure handles (Phase 10, Step 6) ------
+    # §5.7: the structure handles — the operator's REST, NOT in MCP (client models do
+    # not govern structure). One service codebase; the existing REST contracts
+    # are untouched (the Phase-9 precedent — new routes do not change old ones).
 
     @rest_router.get("/namespaces")
     async def list_namespaces(request: Request) -> dict:
-        """Реестр узлов со счётчиками + promotion_candidates (US-9).
+        """The node registry with counters + promotion_candidates (US-9).
 
-        candidates — живая SQL-агрегация триггера (растущие hint-группы
-        default-заметок, ещё не прогнанные через судью структуры).
+                    candidates — the trigger's live SQL aggregation (growing hint groups
+                    of default notes, not yet run through the structure judge).
         """
         services = _services(request)
         result = await asyncio.to_thread(services.namespaces.list_all)
         try:
             candidates = await asyncio.to_thread(services.promotion.candidates)
         except Exception:
-            # Кандидаты — вспомогательный слой: сбой агрегации не ломает
-            # реестр (деградация, как в MCP memory_namespaces).
+            # candidates — an auxiliary layer: an aggregation failure does not break
+            # the registry (a degradation, as in MCP memory_namespaces).
             candidates = []
         return {
             "namespaces": result["namespaces"],
@@ -896,7 +931,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.post("/namespaces", status_code=201)
     async def create_namespace(payload: NamespaceCreate, request: Request) -> dict:
-        """Зарегистрировать узел (confirmed): стартовый набор/новые корни/листья."""
+        """Register a node (confirmed): the starter set/new roots/leaves."""
         try:
             return await asyncio.to_thread(
                 _services(request).namespaces.create, payload.path, payload.description
@@ -908,11 +943,11 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.patch("/namespaces/{path:path}")
     async def patch_namespace(path: str, payload: NamespacePatch, request: Request) -> dict:
-        """Правка узла: описание, статус (confirm) и/или переименование.
+        """Edit a node: the description, the status (confirm) and/or a rename.
 
-        Rename — перекладка заметок/разметки/вердиктов (§5.7: ничего не
-        теряется); статус — аудит provisional → confirmed (и назад, если
-        оператор передумал). Служебные поля не переданы — узел без изменений.
+                    A rename — moving notes/markup/verdicts (§5.7: nothing is lost); the
+                    status — the provisional → confirmed audit (and back, if the operator
+                    changed their mind). No service fields passed — the node unchanged.
         """
         services = _services(request)
         node = await asyncio.to_thread(services.namespaces.get, path)
@@ -939,7 +974,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.post("/namespaces/{path:path}/merge")
     async def merge_namespace(path: str, payload: NamespaceMerge, request: Request) -> dict:
-        """Слить лист с каноническим узлом: заметки переехали, узел исчез (US-11)."""
+        """Merge a leaf into the canonical node: the notes moved, the node is gone (US-11)."""
         services = _services(request)
         node = await asyncio.to_thread(services.namespaces.get, path)
         if node is None:
@@ -955,7 +990,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.delete("/namespaces/{path:path}")
     async def delete_namespace(path: str, request: Request) -> dict:
-        """Удалить узел с перекладкой заметок (§5.7: ничего не теряется)."""
+        """Delete a node with note moving (§5.7: nothing is lost)."""
         services = _services(request)
         node = await asyncio.to_thread(services.namespaces.get, path)
         if node is None:
@@ -967,22 +1002,23 @@ def build_rest_router(settings: Settings) -> APIRouter:
         except NamespaceError as exc:
             raise _conflict(exc) from exc
 
-    # --- область навыков: REST-зеркала (релиз 3.0.0, lsb-0007-05) ----------
-    # Arch lsb-0007 §3.7 + субстрат §3.6: операторская поверхность навыков —
-    # тот же Bearer и тот же сервисный слой, что у MCP; выдачи полные (срез
-    # белыми списками — только в инструментах). Коды: 201 — создание, 200 —
-    # чтение/правка/удаление, 422 — валидация формы и мягкие отказы сервиса
-    # (текст = hint), 404 — навык не найден/удалён. ПОРЯДОК МАРШРУТОВ:
-    # статические (`/skills/search`, `/skills/instruction-template`) объявлены
-    # ДО `/skills/{skill_id}` — иначе «search» ушёл бы в целочисленный путь.
+    # --- the skills area: REST mirrors (release 3.0.0, lsb-0007-05) ----------
+    # Arch lsb-0007 §3.7 + substrate §3.6: the skills operator surface —
+    # the same Bearer and the same service layer as MCP; full outputs (the whitelist
+    # trimming lives only in the tools). Codes: 201 — creation; 200 —
+    # read/edit/delete; 422 — shape validation and the service's soft failures
+    # (the text = a hint); 404 — the skill not found/deleted. THE ROUTE ORDER:
+    # the static ones (`/skills/search`, `/skills/instruction-template`) are declared
+    # BEFORE `/skills/{skill_id}` — otherwise "search" would fall into the integer path.
 
     @rest_router.post("/skills", status_code=201)
     async def create_skill(payload: SkillCreate, request: Request) -> dict:
-        """Создать навык: валидация формы + антисинонимия как в MCP (§3.4).
+        """Create a skill: the shape validation + the anti-synonymy as in MCP (§3.4).
 
-        Мягкие отказы сервиса → 422 с дословным hint канона §3.8: нарушение
-        лимита формы (`SkillValidationError`) и «слишком похожий» на активный
-        навык кандидат (`created: False` + hint с id/name существующего).
+                    The service's soft failures → 422 with the verbatim §3.8 canon hint:
+                    a shape limit violation (`SkillValidationError`) and a candidate "too
+                    similar" to an active skill (`created: False` + a hint with the
+                    existing one's id/name).
         """
         try:
             result = await asyncio.to_thread(
@@ -1006,21 +1042,21 @@ def build_rest_router(settings: Settings) -> APIRouter:
         limit: int | None = Query(default=None, ge=1, le=50),
         offset: int = Query(default=0, ge=0),
     ) -> dict:
-        """Листинг активных навыков ПОЛНЫМИ записями (пагинация как /notes).
+        """A listing of active skills by FULL records (pagination like /notes).
 
-        MCP `skills_list` отдаёт компактный срез (id/name/description) —
-        оператору нужна полная запись, поэтому на каждый активный навык
-        собирается тот же композит §3.1, что и у `GET /skills/{id}` (включая
-        секцию глобального `instruction_template`). Архив версий и удалённые
-        строки в листинг не попадают.
-        lsb-0013-02 (arch §3.4): в сервис уходит потолок поверхности
-        (`list_max_limit_rest`), в ответе — те же поля страницы, что у MCP;
-        подсказки «+N more» на REST нет.
+                    MCP's `skills_list` serves a compact cut (id/name/description) — the
+                    operator needs the full record, so per active skill the same §3.1
+                    composite as `GET /skills/{id}`'s is assembled (including the global
+                    `instruction_template` section). The version archive and deleted rows
+                    do not enter the listing.
+                    lsb-0013-02 (arch §3.4): the surface ceiling (`list_max_limit_rest`)
+                    goes into the service; the answer carries the same page fields as MCP;
+                    there is no "+N more" hint on REST.
         """
         skills = _skills_service(request)
 
         def _full_listing() -> dict:
-            """Сервисные вызовы в одном потоке: листинг + композит по каждому."""
+            """Service calls in one thread: the listing + a composite per item."""
             listing = skills.list(
                 limit, offset, max_limit=settings.list_max_limit_rest
             )
@@ -1043,11 +1079,12 @@ def build_rest_router(settings: Settings) -> APIRouter:
         q: str = Query(..., min_length=1, max_length=settings.max_query_chars),
         top_k: int | None = Query(default=None, ge=1, le=20),
     ) -> dict:
-        """Гибридный поиск навыка (vec0 + FTS → RRF) — выдача полная.
+        """The skill hybrid search (vec0 + FTS → RRF) — the full output.
 
-        Отличие от MCP `skills_search` — без среза выдачи: `warning`
-        деградации (FTS-only, NFR-3) оператору виден; пустой результат —
-        мягкий ответ с дословным hint канона §3.8 (не ошибка).
+                    The difference from MCP's `skills_search` — no output cut: the
+                    degradation `warning` (FTS-only, NFR-3) is visible to the operator; an
+                    empty result — a soft answer with the verbatim §3.8 canon hint (not an
+                    error).
         """
         try:
             return await asyncio.to_thread(
@@ -1058,7 +1095,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.get("/skills/instruction-template")
     async def get_instruction_template(request: Request) -> dict:
-        """Глобальный `instruction_template` («как исполнять шаги», §3.1)."""
+        """The global `instruction_template` ("how to execute the steps", §3.1)."""
         return await asyncio.to_thread(
             _skills_service(request).instruction_template
         )
@@ -1067,7 +1104,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
     async def put_instruction_template(
         payload: InstructionTemplate, request: Request
     ) -> dict:
-        """Правка глобального шаблона: пусто/длиннее 2000 симв. → 422 + hint."""
+        """Edit the global template: empty/longer than 2000 chars → 422 + a hint."""
         try:
             return await asyncio.to_thread(
                 _skills_service(request).set_instruction_template,
@@ -1078,13 +1115,14 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.get("/skills/{skill_id}")
     async def get_skill(skill_id: int, request: Request) -> dict:
-        """Полная запись навыка + композит (`instruction_template`, `extra`).
+        """The skill's full record + the composite (`instruction_template`, `extra`).
 
-        Удалённый/несуществующий навык не отличается от «нет строки» →
-        404 с hint канона §3.8 (служебное восстановление — оператор).
+                    A deleted/nonexistent skill is indistinguishable from "no row" →
+                    404 with the §3.8 canon hint (the service restoration — the
+                    operator).
         """
         record = await asyncio.to_thread(_skills_service(request).get, skill_id)
-        if "name" not in record:  # мягкий ответ сервиса: строки нет/удалена
+        if "name" not in record:  # the service's soft answer: no row / deleted
             raise HTTPException(
                 status_code=404, detail=record.get("hint", "навык не найден")
             )
@@ -1094,10 +1132,10 @@ def build_rest_router(settings: Settings) -> APIRouter:
     async def update_skill(
         skill_id: int, payload: SkillUpdate, request: Request
     ) -> dict:
-        """Правка формы навыка: прежняя версия уходит в архив (§3.4).
+        """Edit the skill shape: the former version goes into the archive (§3.4).
 
-        Валидация формы — как при создании (422 + hint); `updated: False`
-        сервиса (нет активной строки) → 404 с hint канона.
+                    The shape validation — as at creation (422 + a hint); the service's
+                    `updated: False` (no active row) → 404 with the canon hint.
         """
         try:
             result = await asyncio.to_thread(
@@ -1120,9 +1158,9 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.delete("/skills/{skill_id}")
     async def delete_skill(skill_id: int, request: Request) -> dict:
-        """Soft delete навыка (§3.4): строка/индексы живы, выдачи его не видят.
+        """Soft-delete a skill (§3.4): the row/indexes stay alive; the outputs do not see it.
 
-        Повторное/несуществующее удаление — 404 с hint канона §3.8.
+                    A repeated/nonexistent deletion — 404 with the §3.8 canon hint.
         """
         result = await asyncio.to_thread(
             _skills_service(request).delete, skill_id
@@ -1135,13 +1173,13 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.get("/skills/{skill_id}/versions")
     async def get_skill_versions(skill_id: int, request: Request) -> dict:
-        """Архив версий навыка — REST-псевдоним над ОБЩЕЙ историей (№41).
+        """The skill's version archive — a REST alias over the SHARED history (#41).
 
-        Вторая механика (`skill_versions`) снята в no41-03 (§13.7): ручка
-        читает ту же `record_versions` (`read_versions`/`read_version` по
-        сущности `skill`) и собирает ПРЕЖНЮЮ форму ответа — контракт
-        операторской ссылки не меняется. Навык не найден/удалён → 404 с
-        hint канона §3.8 (как раньше).
+                    The second mechanic (`skill_versions`) was removed in no41-03 (§13.7):
+                    the handle reads the same `record_versions` (`read_versions`/
+                    `read_version` over the `skill` entity) and assembles the FORMER
+                    answer shape — the operator reference's contract does not change. The
+                    skill not found/deleted → 404 with the §3.8 canon hint (as before).
         """
         live = await asyncio.to_thread(
             history.entity_fields, history.ENTITY_SKILL, skill_id, settings
@@ -1150,7 +1188,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
             raise HTTPException(status_code=404, detail=HINT_SKILL_NOT_FOUND)
 
         def _archive() -> dict:
-            """Собрать прежнюю форму архива из версий общей истории."""
+            """Assemble the former archive shape from the shared history's versions."""
             listing = history.read_versions(history.ENTITY_SKILL, skill_id, settings)
             versions = []
             for meta in listing["versions"]:
@@ -1174,29 +1212,30 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
         return await asyncio.to_thread(_archive)
 
-    # --- область user: REST-зеркала (релиз 3.0.0, lsb-0009-03) ------------
-    # Arch lsb-0009 §3.6 + субстрат §3.6: операторская поверхность фактов о
-    # пользователе — тот же Bearer и тот же сервисный слой, что у MCP
+    # --- the user area: REST mirrors (release 3.0.0, lsb-0009-03) -------------
+    # Arch lsb-0009 §3.6 + substrate §3.6: the operator surface of facts about
+    # the user — the same Bearer and the same service layer as MCP
     # (`user_save`/`user_search`/`user_get`/`user_update`/`user_delete`);
-    # выдачи полные (срез белыми списками — только в инструментах). Коды:
-    # 201 — создание, 200 — чтение/правка/удаление, 422 — валидация формы и
-    # мягкие отказы сервиса (текст = дословный hint канона §3.7, в т.ч.
-    # сильное совпадение дедупа `stored: False`), 404 — факт не найден
-    # (в т.ч. удалённый — soft delete). Листинга нет: зеркала однотипны
-    # MCP-ручкам области (arch §3.6). ПОРЯДОК МАРШРУТОВ: статический
-    # `/user-facts/search` объявлен ДО `/user-facts/{fact_id}` — иначе
-    # «search» ушёл бы в целочисленный путь.
+    # full outputs (the whitelist trimming lives only in the tools). Codes:
+    # 201 — creation; 200 — read/edit/delete; 422 — shape validation and
+    # the service's soft failures (the text = the verbatim §3.7 canon hint, including
+    # the dedup's strong match `stored: False`); 404 — the fact not found
+    # (including a deleted one — soft delete). No listing: the mirrors mirror
+    # the area's MCP handles (arch §3.6). THE ROUTE ORDER: the static
+    # `/user-facts/search` is declared BEFORE `/user-facts/{fact_id}` — otherwise
+    # "search" would fall into the integer path.
 
     @rest_router.post("/user-facts", status_code=201)
     async def create_user_fact(payload: UserFactCreate, request: Request) -> dict:
-        """Создать факт: валидация формы + дедуп-подсказка как в MCP (§3.4).
+        """Create a fact: the shape validation + the dedup hint as in MCP (§3.4).
 
-        Порядок и тексты сервисные: нарушение лимита (`name` >5 слов,
-        `body` >1200, пустое обязательное поле) → `UserFactValidationError` →
-        422 с дословным hint; сильное совпадение с активным фактом → мягкий
-        отказ сервиса (`stored: False`) → 422 с hint, ведущим к `user_update`;
-        средняя зона → 201, в ответе `related` (id/name похожих) и hint.
-        Успех всегда несёт постоянный hint атомарности (FR-7.2).
+                    The order and texts are the service's: a limit violation (`name` >5
+                    words, `body` >1200, an empty mandatory field) →
+                    `UserFactValidationError` → 422 with the verbatim hint; a strong match
+                    with an active fact → the service's soft failure (`stored: False`) →
+                    422 with the hint leading to `user_update`; the middle zone → 201,
+                    with `related` (similar facts' id/name) and the hint in the answer.
+                    Success always carries the permanent atomicity hint (FR-7.2).
         """
         try:
             result = await asyncio.to_thread(
@@ -1207,7 +1246,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
         except UserFactValidationError as exc:
             raise _unprocessable(exc) from exc
         if not result.get("stored"):
-            # Мягкий отказ сервиса (сильное совпадение) — 422 с его hint'ом.
+            # A service soft failure (a strong match) — 422 with its hint.
             raise HTTPException(status_code=422, detail=result.get("hint", ""))
         return result
 
@@ -1217,12 +1256,13 @@ def build_rest_router(settings: Settings) -> APIRouter:
         q: str = Query(..., min_length=1, max_length=settings.max_query_chars),
         top_k: int | None = Query(default=None, ge=1, le=20),
     ) -> dict:
-        """Гибридный поиск по области — «проба» (arch §3.3) выдачей ПОЛНОСТЬЮ.
+        """The area's hybrid search — a "probe" (arch §3.3) with the FULL output.
 
-        Отличие от MCP `user_search` — без среза выдачи: `warning` деградации
-        (FTS-only, NFR-3) оператору виден; пустой результат — мягкий ответ с
-        дословным hint канона §3.7 (не ошибка). В выдаче — `excerpt` (≤300
-        символов), полное тело отдаёт только `GET /user-facts/{id}`.
+                    The difference from MCP's `user_search` — no output cut: the
+                    degradation `warning` (FTS-only, NFR-3) is visible to the operator; an
+                    empty result — a soft answer with the verbatim §3.7 canon hint (not an
+                    error). The output — an `excerpt` (≤300 characters); only
+                    `GET /user-facts/{id}` serves the full body.
         """
         try:
             return await asyncio.to_thread(
@@ -1233,13 +1273,13 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.get("/user-facts/{fact_id}")
     async def get_user_fact(fact_id: int, request: Request) -> dict:
-        """Полный факт (`id`, `name`, `body`) — полное тело отдаёт только эта ручка.
+        """The full fact (`id`, `name`, `body`) — only this handle serves the full body.
 
-        Несуществующий/удалённый факт не отличается от «нет строки» → 404 с
-        hint канона §3.7 (служебное восстановление — оператор).
+                    A nonexistent/deleted fact is indistinguishable from "no row" → 404
+                    with the §3.7 canon hint (the service restoration — the operator).
         """
         result = await asyncio.to_thread(_user_facts_service(request).get, fact_id)
-        if "name" not in result:  # мягкий ответ сервиса: строки нет/удалена
+        if "name" not in result:  # the service's soft answer: no row / deleted
             raise HTTPException(
                 status_code=404, detail=result.get("hint", "user fact not found")
             )
@@ -1249,14 +1289,15 @@ def build_rest_router(settings: Settings) -> APIRouter:
     async def update_user_fact(
         fact_id: int, payload: UserFactUpdate, request: Request
     ) -> dict:
-        """Правка факта: «не передано» = оставить, `null` в обязательном — 422.
+        """Edit a fact: "not passed" = keep; `null` in a mandatory one — 422.
 
-        В сервис уходят ТОЛЬКО реально переданные поля (`model_fields_set`):
-        опущенное поле остаётся за сентинелом `_UNSET_*`, поэтому прежнее
-        значение сохраняется; `null` доходит как `None` и сервис отвечает
-        мягким отказом с hint «не передано = оставить» (422). Валидация
-        переданных значений — как при создании (422 + дословный hint);
-        `hint` в ответе сервиса (нет активной строки) → 404 с hint канона.
+                    Only the really passed fields go into the service
+                    (`model_fields_set`): an omitted field stays behind the `_UNSET_*`
+                    sentinel, so the former value is preserved; `null` reaches as None and
+                    the service answers a soft failure with the "not passed = keep" hint
+                    (422). The validation of passed values — as at creation (422 + the
+                    verbatim hint); the service's `hint` (no active row) → 404 with the
+                    canon hint.
         """
         updates: dict[str, str | None] = {}
         if "name" in payload.model_fields_set:
@@ -1269,15 +1310,15 @@ def build_rest_router(settings: Settings) -> APIRouter:
             )
         except UserFactValidationError as exc:
             raise _unprocessable(exc) from exc
-        if "hint" in result:  # не найден/удалён — 404 с hint канона §3.7
+        if "hint" in result:  # not found/deleted — 404 with the §3.7 canon hint
             raise HTTPException(status_code=404, detail=result["hint"])
         return result
 
     @rest_router.delete("/user-facts/{fact_id}")
     async def delete_user_fact(fact_id: int, request: Request) -> dict:
-        """Soft delete факта (§3.4): строка/индексы живы, выдачи его не видят.
+        """Soft-delete a fact (§3.4): the row/indexes stay alive; the outputs do not see it.
 
-        Повторное/несуществующее удаление — 404 с hint канона §3.7.
+                    A repeated/nonexistent deletion — 404 with the §3.7 canon hint.
         """
         result = await asyncio.to_thread(
             _user_facts_service(request).delete, fact_id
@@ -1288,31 +1329,31 @@ def build_rest_router(settings: Settings) -> APIRouter:
             )
         return result
 
-    # --- область terms: REST-зеркала (релиз 3.0.0, lsb-0008-03) ------------
-    # Arch lsb-0008 §3.6 + субстрат §3.6: операторская поверхность области
-    # терминологии — тот же Bearer и тот же сервис, что у MCP (`terms_save`/
-    # `terms_search`/`terms_get`); выдачи полные (срез белыми списками —
-    # только в инструментах). Коды: 201 — создание, 200 — обновление по
-    # ключу/чтение/правка/удаление, 422 — валидация формы и мягкие отказы
-    # сервиса (текст = дословный hint канона §3.7, в т.ч. близкий контекст
-    # `created: False`), 404 — запись не найдена (в т.ч. удалённая),
-    # 409 — новый ключ правки занят другой активной записью (субстрат §3.6).
-    # Листинга НЕТ (решение О.): единственная дорога к определению — поиск;
-    # зеркала однотипны MCP-ручкам области. ПОРЯДОК МАРШРУТОВ: статический
-    # `/terms/search` объявлен ДО `/terms/{term_id}` — иначе «search» ушёл бы
-    # в целочисленный путь.
+    # --- the terms area: REST mirrors (release 3.0.0, lsb-0008-03) ------------
+    # Arch lsb-0008 §3.6 + substrate §3.6: the terminology area's operator surface —
+    # the same Bearer and the same service as MCP (`terms_save`/
+    # `terms_search`/`terms_get`); full outputs (the whitelist trimming
+    # lives only in the tools). Codes: 201 — creation; 200 — a key update, a read,
+    # an edit, a deletion; 422 — shape validation and the service's soft failures
+    # (the text = the verbatim §3.7 canon hint, including the close context
+    # `created: False`); 404 — the record not found (including a deleted one);
+    # 409 — the edit's new key is taken by another active record (substrate §3.6).
+    # There is NO listing: the only road to a definition is the search;
+    # the mirrors mirror the area's MCP handles. THE ROUTE ORDER: the static
+    # `/terms/search` is declared BEFORE `/terms/{term_id}` — otherwise "search" would fall
+    # into the integer path.
 
     @rest_router.post("/terms", status_code=201)
     async def create_term(
         payload: TermCreate, request: Request, response: Response
     ) -> dict:
-        """Записать термин по ключу: 201 — создан, 200 — обновлён (§3.5).
+        """Write a term by key: 201 — created; 200 — updated (§3.5).
 
-        Механика FR-3.1 и тексты — сервисные: ключ совпал → правка
-        существующего смысла (динамический статус ответа 200); близкий
-        контекст (`created: False` + hint с id существующей записи) и
-        нарушение лимитов/пустой контекст (`TermValidationError`)
-        → 422 с дословным hint канона §3.7. Иначе — новый смысл → 201.
+                    The FR-3.1 mechanics and the texts are the service's: the key matched →
+                    an edit of the existing sense (a dynamic 200 status); a close context
+                    (`created: False` + a hint with the existing record's id) and a
+                    limit/empty-context violation (`TermValidationError`) → 422 with the
+                    verbatim §3.7 canon hint. Otherwise — a new sense → 201.
         """
         try:
             result = await asyncio.to_thread(
@@ -1326,9 +1367,9 @@ def build_rest_router(settings: Settings) -> APIRouter:
         if result.get("created"):
             return result
         if result.get("updated"):
-            response.status_code = 200  # правка по ключу — динамический статус
+            response.status_code = 200  # an edit by key — a dynamic status
             return result
-        # Мягкий отказ сервиса (близкий контекст) — 422 с его hint'ом.
+        # A service soft failure (a close context) — 422 with its hint.
         raise HTTPException(status_code=422, detail=result.get("hint", ""))
 
     @rest_router.get("/terms/search")
@@ -1337,13 +1378,14 @@ def build_rest_router(settings: Settings) -> APIRouter:
         q: str = Query(..., min_length=1, max_length=settings.max_query_chars),
         top_k: int | None = Query(default=None, ge=1, le=20),
     ) -> dict:
-        """Двухшаговый поиск термина (§3.4) выдачей ПОЛНОСТЬЮ.
+        """The term's two-step search (§3.4) with the FULL output.
 
-        Шаг 1 — точный нормализованный lookup: ВСЕ смыслы термина с
-        контекстами (`senses`/`exact: true`); шаг 2 — гибрид области
-        (`senses`/`exact: false` + hint «не точное совпадение»); шаг 3 —
-        пусто + hint канона §3.7. Отличие от MCP `terms_search` — без среза
-        выдачи: `warning` деградации (FTS-only, NFR-3) оператору виден.
+                    Step 1 — an exact normalized lookup: ALL the term's senses with
+                    contexts (`senses`/`exact: true`); step 2 — the area hybrid
+                    (`senses`/`exact: false` + the "not an exact match" hint); step 3 —
+                    empty + the §3.7 canon hint. The difference from MCP's `terms_search`
+                    — no output cut: the degradation `warning` (FTS-only, NFR-3) is
+                    visible to the operator.
         """
         try:
             return await asyncio.to_thread(
@@ -1354,13 +1396,14 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.get("/terms/{term_id}")
     async def get_term(term_id: int, request: Request) -> dict:
-        """Прочитать запись (`id`, `term`, `context`, `definition`).
+        """Read the record (`id`, `term`, `context`, `definition`).
 
-        Несуществующая/удалённая запись не отличается от «нет строки» →
-        404 с hint канона §3.7 (служебное восстановление — оператор).
+                    A nonexistent/deleted record is indistinguishable from "no row" →
+                    404 with the §3.7 canon hint (the service restoration — the
+                    operator).
         """
         record = await asyncio.to_thread(_terms_service(request).get, term_id)
-        if "term" not in record:  # мягкий ответ сервиса: строки нет/удалена
+        if "term" not in record:  # the service's soft answer: no row / deleted
             raise HTTPException(
                 status_code=404, detail=record.get("hint", "term not found")
             )
@@ -1370,12 +1413,13 @@ def build_rest_router(settings: Settings) -> APIRouter:
     async def update_term(
         term_id: int, payload: TermUpdate, request: Request
     ) -> dict:
-        """Правка по id: форма целиком, переезд на занятый ключ → 409 (§3.6).
+        """An edit by id: the whole shape; a move to a taken key → 409 (§3.6).
 
-        Валидация формы — как при создании (422 + дословный hint канона);
-        новый ключ занят ДРУГОЙ активной записью → `TermKeyConflictError` →
-        409 с hint'ом (чужой смысл не затирается, оператор правит его или
-        меняет ключ); `updated: False` сервиса (нет активной строки) → 404.
+                    The shape validation — as at creation (422 + the verbatim canon
+                    hint); the new key taken by ANOTHER active record →
+                    `TermKeyConflictError` → 409 with a hint (the foreign sense is not
+                    overwritten; the operator edits it or changes the key); the service's
+                    `updated: False` (no active row) → 404.
         """
         try:
             result = await asyncio.to_thread(
@@ -1397,11 +1441,11 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.delete("/terms/{term_id}")
     async def delete_term(term_id: int, request: Request) -> dict:
-        """Soft delete (§3.3): строка/индексы живы, выдачи его не видят.
+        """Soft delete (§3.3): the row/indexes stay alive; the outputs do not see it.
 
-        Удалённый ключ освобождается (частичный UNIQUE по активным записям):
-        тот же ключ можно создать заново. Повторное/несуществующее удаление →
-        404 с hint канона §3.7.
+                    The deleted key is freed (the partial UNIQUE over active records):
+                    the same key can be created anew. A repeated/nonexistent deletion →
+                    404 with the §3.7 canon hint.
         """
         result = await asyncio.to_thread(
             _terms_service(request).delete, term_id
@@ -1412,18 +1456,19 @@ def build_rest_router(settings: Settings) -> APIRouter:
             )
         return result
 
-    # --- область логов: операторская поверхность (LSBN-F-10, f10-03) --------
-    # §7.2: ПОЛНЫЕ выдачи (тело не режем — оператору нужен полный текст;
-    # MCP режет белыми списками), работают при ЛЮБОМ значении флага области
-    # (§13.11). Порядок: статических подпутей нет — все `/logs/{log_id}`
-    # целочисленные, «search» здесь не идёт REST-дорогой (§7.2).
+    # --- the logs area: the operator surface (LSBN-F-10, f10-03) --------------
+    # §7.2: FULL outputs (the body is not trimmed — the operator needs the full text;
+    # MCP trims by whitelists); they work at ANY value of the area flag
+    # (§13.11). Order: no static subpaths — every `/logs/{log_id}`
+    # is integer; "search" does not take the REST road here (§7.2).
 
     @rest_router.post("/logs", status_code=201)
     async def create_log(payload: LogCreate, request: Request) -> dict:
-        """Создать запись: 201 — ПОЛНАЯ запись, 422 — форма (§7.2).
+        """Create a record: 201 — the FULL record; 422 — the shape (§7.2).
 
-        Форма проверяется сервисом ДО БД (нарушение → дословный hint §7.3);
-        после создания отдаём запись целиком (`get`), а не конверт save.
+                    The shape is checked by the service BEFORE the DB (a violation → the
+                    verbatim §7.3 hint); after creation we serve the record whole
+                    (`get`), not the save envelope.
         """
         service = _logs_service(request)
         try:
@@ -1457,11 +1502,12 @@ def build_rest_router(settings: Settings) -> APIRouter:
         limit: int | None = Query(default=None),
         offset: int = Query(default=0),
     ) -> dict:
-        """Листинг со срезами и пагинацией (§7.2), потолок `list_max_limit_rest`.
+        """A listing with slices and pagination (§7.2), the `list_max_limit_rest` ceiling.
 
-        Обратный запрос «почему изменился объект» — ЭТОТ же маршрут с
-        `entity`+`entity_id`[+`entity_version`] (§8/§13.4), отдельной ручки нет.
-        Потолок лимита и знак offset проверяет сервис → мягкий 422 с hint.
+                    The reverse question "why did the object change" — the SAME route with
+                    `entity`+`entity_id`[+`entity_version`] (§8/§13.4); no separate
+                    handle. The limit ceiling and the offset sign are checked by the
+                    service → a soft 422 with a hint.
         """
         try:
             return await asyncio.to_thread(
@@ -1481,13 +1527,13 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.get("/logs/{log_id}")
     async def get_log(log_id: int, request: Request) -> dict:
-        """Прочитать запись целиком (тело не режется); нет/удалена → 404 (§7.2).
+        """Read the record whole (the body is not trimmed); none/deleted → 404 (§7.2).
 
-        Несуществующая/удалённая запись не отличается от «нет строки» → 404
-        с hint канона §7.3 (служебное восстановление — оператор).
+                    A nonexistent/deleted record is indistinguishable from "no row" → 404
+                    with the §7.3 canon hint (the service restoration — the operator).
         """
         record = await asyncio.to_thread(_logs_service(request).get, log_id)
-        if "action" not in record:  # мягкий ответ сервиса: строки нет/удалена
+        if "action" not in record:  # the service's soft answer: no row / deleted
             raise HTTPException(
                 status_code=404,
                 detail=record.get("hint", "log entry not found"),
@@ -1498,11 +1544,11 @@ def build_rest_router(settings: Settings) -> APIRouter:
     async def update_log(
         log_id: int, payload: LogUpdate, request: Request
     ) -> dict:
-        """Частичная правка: 200 `{updated: true}`, 404 — нет записи, 422 — форма.
+        """A partial edit: 200 `{updated: true}`; 404 — no record; 422 — the shape.
 
-        «Не передано = оставить» (сентинелы); каждая фактическая правка
-        версионируется общим слоем истории (№41, §13.5). Записи нет или ничего
-        не передано → 404 с hint канона §7.3.
+                    "Not passed = keep" (sentinels); every actual edit is versioned by the
+                    shared history layer (#41, §13.5). No record or nothing passed → 404
+                    with the §7.3 canon hint.
         """
         try:
             result = await asyncio.to_thread(
@@ -1530,11 +1576,11 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.delete("/logs/{log_id}")
     async def delete_log(log_id: int, request: Request) -> dict:
-        """Мягко удалить запись: 200 `{id, deleted: true}` / 404 (§7.2).
+        """Soft-delete a record: 200 `{id, deleted: true}` / 404 (§7.2).
 
-        Строка и индексы живы, выдачи агента запись не видят (§11); повторное/
-        несуществующее удаление → 404 с hint канона §7.3 (восстановление —
-        оператором).
+                    The row and indexes stay alive; the agent outputs do not see the
+                    record (§11); a repeated/nonexistent deletion → 404 with the §7.3
+                    canon hint (the restoration — by the operator).
         """
         result = await asyncio.to_thread(
             _logs_service(request).delete, log_id
@@ -1546,16 +1592,16 @@ def build_rest_router(settings: Settings) -> APIRouter:
             )
         return result
 
-    # --- история версий: поверхность оператора (№41, релиз 3.2.0) ----------
-    # §7.2: список версий, чтение версии, откат и статистика. Откат — только
-    # REST (модели не даём, §13.6); при `HISTORY_ENABLED=false` чтение отдаёт
-    # пусто с hint (§8), а не ошибку. ПОРЯДОК МАРШРУТОВ: статический
-    # `/history/stats` объявлен ДО `/history/{entity}/{entity_id}` — иначе
-    # «stats» ушёл бы в {entity}.
+    # --- version history: the operator surface (#41, release 3.2.0) -----------
+    # §7.2: the version list, reading a version, rollback and statistics. Rollback — REST
+    # only (the model is not given it, §13.6); with `HISTORY_ENABLED=false` a read serves
+    # empty with a hint (§8), not an error. THE ROUTE ORDER: the static
+    # `/history/stats` is declared BEFORE `/history/{entity}/{entity_id}` — otherwise
+    # "stats" would fall into {entity}.
 
     @rest_router.get("/history/stats")
     async def get_history_stats(request: Request) -> dict:
-        """Размер истории: счётчики версий по сущностям + общий (FR-10.3)."""
+        """The history's size: version counters per entity + the total (FR-10.3)."""
         return await asyncio.to_thread(history.history_stats, settings)
 
     @rest_router.get("/history/{entity}/{entity_id}")
@@ -1566,12 +1612,13 @@ def build_rest_router(settings: Settings) -> APIRouter:
         limit: int | None = Query(default=None, ge=1, le=50),
         offset: int = Query(default=0, ge=0),
     ) -> dict:
-        """Список версий записи без тел: метаданные + «что изменилось» (FR-5.1).
+        """A record's version list without bodies: metadata + "what changed" (FR-5.1).
 
-        Форма ответа: `{entity, id, versions: [{version, created_at, event,
-        source, session, changed}], total, has_more, next_offset}`; страница —
-        по контракту lsb-0013. Неизвестная сущность → 404, пустая история —
-        валидный ответ (в т.ч. при выключенном слое — с hint §8).
+                    The answer shape: `{entity, id, versions: [{version, created_at,
+                    event, source, session, changed}], total, has_more, next_offset}`;
+                    the page — per the lsb-0013 contract. An unknown entity → 404; an
+                    empty history — a valid answer (including with the layer off — with
+                    the §8 hint).
         """
         _check_history_entity(entity)
         return await asyncio.to_thread(
@@ -1587,12 +1634,12 @@ def build_rest_router(settings: Settings) -> APIRouter:
     async def read_history_version(
         entity: str, entity_id: int, version: int, request: Request
     ) -> dict:
-        """Содержимое конкретной версии: метаданные + реконструированные поля.
+        """A concrete version's content: metadata + reconstructed fields.
 
-        Форма ответа: `{entity, id, version, created_at, event, source,
-        session, changed, fields: {…}}`; нет такой версии/записи → 404
-        (FR-5.2), исключений слой не бросает. При выключенном слое истории —
-        пусто + hint «history is off» (§8), а не ошибка.
+                    The answer shape: `{entity, id, version, created_at, event, source,
+                    session, changed, fields: {…}}`; no such version/record → 404
+                    (FR-5.2); the layer throws no exceptions. With the history layer off —
+                    empty + the "history is off" hint (§8), not an error.
         """
         _check_history_entity(entity)
         result = await asyncio.to_thread(
@@ -1608,16 +1655,17 @@ def build_rest_router(settings: Settings) -> APIRouter:
     async def rollback_history(
         entity: str, entity_id: int, payload: HistoryRollback, request: Request
     ) -> dict:
-        """Откат к прежней версии через штатный путь правки (§7.3, §13.6).
+        """Roll back to a former version through the regular edit path (§7.3, §13.6).
 
-        Целевая версия читается `read_version` (нет → 404), её поля
-        применяются штатной правкой сущности под
-        `bind_origin("rest", …, rollback_to=N)` — поэтому FTS-триггеры заметок
-        срабатывают сами, а перевекторизация идёт тем же кодом
-        (`vector_status='pending'` + дроп вектора). Откат пишет НОВУЮ версию
-        (`event='rollback'`, `restore_from=N`) и историю не переписывает.
-        Заметке `text` передаётся целиком — гарантия перевекторизации при
-        откате `namespace`. Мягкие отказы сервисов → 404/422.
+                    The target version is read by `read_version` (none → 404); its fields
+                    are applied by the entity's regular edit under
+                    `bind_origin("rest", …, rollback_to=N)` — so the notes' FTS triggers
+                    fire by themselves, and re-vectorization goes through the same code
+                    (`vector_status='pending'` + a vector drop). The rollback writes a NEW
+                    version (`event='rollback'`, `restore_from=N`) and does not rewrite
+                    the history. `text` is passed to a note whole — the guarantee of
+                    re-vectorization on a `namespace` rollback. The services' soft
+                    failures → 404/422.
         """
         _check_history_entity(entity)
         target = await asyncio.to_thread(
@@ -1637,7 +1685,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
         session_id = request.headers.get("X-LSB-Session")
 
         def _apply() -> None:
-            """Штатная правка сущности под origin'ом отката (в рабочем потоке)."""
+            """The entity's regular edit under the rollback origin (in a worker thread)."""
             with history.bind_origin(
                 "rest", session=session_id, rollback_to=payload.version
             ):
@@ -1694,7 +1742,7 @@ def build_rest_router(settings: Settings) -> APIRouter:
                             detail=outcome.get("hint", "user fact not found"),
                         )
                     return
-                # skill_template — глобальный шаблон (id 0)
+                # skill_template — the global template (id 0)
                 _skills_service(request).set_instruction_template(
                     fields["instruction_template"]
                 )
@@ -1722,10 +1770,10 @@ def build_rest_router(settings: Settings) -> APIRouter:
             "revectorized": True,
         }
 
-    # --- предупреждения: единая поверхность (№12, no12-02, §7.1) -----------
-    # Одна точка чтения на систему: те же фильтры, что у MCP `warnings_list`,
-    # но ПОЛНЫЙ контракт (без MCP-среза) и потолок `WARNINGS_MAX_LIMIT_REST`.
-    # Чтение — только SQL, без модели (§13.4); снятие — человеком.
+    # --- warnings: the unified surface (#12, no12-02, §7.1) -------------------
+    # One reading point per system: the same filters as MCP's `warnings_list`,
+    # but the FULL contract (no MCP trim) and the `WARNINGS_MAX_LIMIT_REST` ceiling.
+    # Reads — SQL only, no model (§13.4); clearing — by a human.
 
     @rest_router.get("/warnings")
     async def list_warnings(
@@ -1739,10 +1787,11 @@ def build_rest_router(settings: Settings) -> APIRouter:
         ),
         offset: int = Query(default=0, ge=0),
     ) -> dict:
-        """Листинг предупреждений оператора: полный контракт + поля страницы.
+        """The operator's warnings listing: the full contract + the page fields.
 
-        Потолок поверхности проверяет и схема (`le`), и сервис (единый текст
-        отказа, прецедент lsb-0013); лимит по умолчанию — `DEFAULT_LIST_LIMIT`.
+                    The surface ceiling is checked by both the schema (`le`) and the
+                    service (a single failure text; the lsb-0013 precedent); the default
+                    limit — `DEFAULT_LIST_LIMIT`.
         """
         try:
             return await asyncio.to_thread(
@@ -1762,9 +1811,10 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.post("/warnings/{warning_id}/dismiss")
     async def dismiss_warning(warning_id: int, request: Request) -> dict:
-        """Снять предупреждение человеком: `{id, status, resolved_at}`.
+        """Clear a warning by a human: `{id, status, resolved_at}`.
 
-        Нет такой записи / уже снята — 404 (мягкий ответ сервиса ведёт к нему).
+                    No such record / already cleared — 404 (the service's soft answer
+                    leads to it).
         """
         result = await asyncio.to_thread(
             _warnings_service(request).dismiss, warning_id
@@ -1780,18 +1830,18 @@ def build_rest_router(settings: Settings) -> APIRouter:
             "resolved_at": result["resolved_at"],
         }
 
-    # --- очередь заданий: состояние «требует вмешательства» (№39, no39-02) ----
-    # §6.8/§7.4: задания, замороженные повторяющимся нетранзиентным отказом
-    # пары, видны оператору и возвращаются в работу без правок данных. Только
-    # SQL (моделей не зовём); внимание заданий — зона воркера, не контент
-    # памяти (в `warnings` и поверхность предупреждений не пишем).
+    # --- the job queue: the "needs attention" state (#39, no39-02) ------------
+    # §6.8/§7.4: tasks frozen by a pair's repeating non-transient failure
+    # are visible to the operator and return to work without data edits. SQL
+    # only (no models called); task attention — the worker's zone, not memory
+    # content (we write nothing into `warnings` or the warnings surface).
 
     @rest_router.get("/jobs/attention")
     async def list_attention_jobs(request: Request) -> dict:
-        """Список заданий, ждущих человека: `{jobs: [...], total: N}`.
+        """The list of tasks waiting for a human: `{jobs: [...], total: N}`.
 
-        Форма записи — `{job_id, job, slot, note_id, older_id, outcome,
-        attempts, since}` (arch §7.4); собирает воркер, только SQL.
+                    The record shape — `{job_id, job, slot, note_id, older_id, outcome,
+                    attempts, since}` (arch §7.4); assembled by the worker; SQL only.
         """
         worker = request.app.state.worker  # type: ignore[attr-defined]
         jobs = await asyncio.to_thread(worker.attention_jobs)
@@ -1799,11 +1849,11 @@ def build_rest_router(settings: Settings) -> APIRouter:
 
     @rest_router.post("/jobs/attention/{job_id}/retry")
     async def retry_attention_job(job_id: int, request: Request) -> dict:
-        """Операторское возвращение задания в работу: `{job_id, released, attempts}`.
+        """The operator's return of a task to work: `{job_id, released, attempts}`.
 
-        Снимает внимание и сбрасывает счётчик пары (работа остаётся `pending`
-        и берётся петлёй со следующего прогона). Нет такого задания / оно не
-        во внимании → 404.
+                    It clears attention and resets the pair counter (the work stays
+                    `pending` and is taken by the loop from the next run). No such task /
+                    it is not in attention → 404.
         """
         worker = request.app.state.worker  # type: ignore[attr-defined]
         result = await asyncio.to_thread(worker.release_attention, job_id)
@@ -1813,22 +1863,22 @@ def build_rest_router(settings: Settings) -> APIRouter:
             )
         return result
 
-    # --- самомиграция: прерывание (LSBN-F-22, M3, design §4) ----------------
-    # Операторская ручка «миграцию можно прервать без потерь» (постановка
-    # п. 2): сервис остаётся на прежней базе, ничего не удаляется. Не в MCP —
-    # структуры/миграции рулит оператор (§13.6, как /namespaces).
+    # --- self-migration: aborting (LSBN-F-22, M3, design §4) ------------------
+    # The operator handle "the migration can be aborted without losses" (the brief
+    # p. 2): the service stays on the previous database; nothing is deleted. Not in MCP —
+    # structure/migration is governed by the operator (§13.6, like /namespaces).
 
     @rest_router.post("/migration/abort")
     async def abort_migration_route(request: Request) -> dict:
-        """Прервать самомиграцию: стоп джобы нарезки, reverse-pour дельты
-        в прежнюю базу (части исключаются), swap назад, phase=aborted.
+        """Abort the self-migration: stop the splitting job, reverse-pour the delta
+                    into the previous database (parts excluded), swap back, phase=aborted.
 
-        `{aborted: True, phase, prev_file, counters}` — прервано этим
-        вызовом; `{aborted: False, hint}` — мягкий отказ (миграции нет /
-        уже прервана / очереди нарезки нет — возврат «вверх» завершается
-        при старте). Сбой перелива/swap — 500: активная база цела
-        (контракт MigrationError), вызов можно повторить (reverse_pour
-        идемпотентен, phase=aborted уже стоит — джоба стоит).
+                    `{aborted: True, phase, prev_file, counters}` — aborted by this call;
+                    `{aborted: False, hint}` — a soft failure (no migration / already
+                    aborted / no splitting queue — a return "up" completes at startup).
+                    A pour/swap failure — 500: the active database is intact (the
+                    MigrationError contract); the call can be repeated (reverse_pour is
+                    idempotent; phase=aborted is already set — the job stands down).
         """
         try:
             return await asyncio.to_thread(abort_migration, settings)
@@ -1839,26 +1889,27 @@ def build_rest_router(settings: Settings) -> APIRouter:
                 f"the current base: {exc}",
             ) from exc
 
-    # --- бэкапы: наблюдаемость и проверка восстановления (№14, arch §7.2) ---
-    # Операторские ручки: список снапшотов и проверка по вызову. Чтение
-    # каталога/снапшота — без записи в боевую БД (arch §5.1); сами исходы
-    # живут в сайдкар-индексе рядом с копиями.
+    # --- backups: observability and restore verification (#14, arch §7.2) -----
+    # Operator handles: the snapshot list and on-demand verification. Reading
+    # the directory/snapshot — without writing to the battle DB (arch §5.1); the outcomes
+    # themselves live in the sidecar index next to the copies.
 
     @rest_router.get("/backups")
     async def list_backups(request: Request) -> dict:
-        """Список снапшотов оператору: `{items: [...], total}` (свежие первыми).
+        """The snapshot list for the operator: `{items: [...], total}` (newest first).
 
-        Элемент — `{file, size_bytes, created_at, verified, bad, shipped}`;
-        `verified` ∈ ok/failed/unknown (§7.2). Скан каталога, БД не открываем.
+                    An item — `{file, size_bytes, created_at, verified, bad, shipped}`;
+                    `verified` ∈ ok/failed/unknown (§7.2). A directory scan; we do not
+                    open the DB.
         """
         items = await asyncio.to_thread(_backup_service(request).list_snapshots)
         return {"items": items, "total": len(items)}
 
     @rest_router.post("/backups/verify")
     async def verify_backup(payload: BackupVerifyRequest, request: Request) -> dict:
-        """Проверить снапшот по вызову (FR-2.2): результат `verify()` как есть.
+        """Verify a snapshot on demand (FR-2.2): the `verify()` result as is.
 
-        `file` нет/пусто → свежайший; файла нет → 404 «no such snapshot».
+                    No/empty `file` → the newest; no such file → 404 "no such snapshot".
         """
         service = _backup_service(request)
         if payload.file:

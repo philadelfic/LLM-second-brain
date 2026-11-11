@@ -1,21 +1,20 @@
-"""Обвязка областей (субстрат 3.0.0): нормализация, сходство, гибридный поиск.
+"""Area plumbing (substrate 3.0.0): normalization, similarity, hybrid search.
 
-Один переиспользуемый помощник на все области (skills / terms / user /
-logs):
-каждая область описывается `AreaSpec` — своими таблицами, полями индексации
-и проекцией выдачи; `AreaSearch` выполняет гибрид
-vec0-KNN + FTS5(BM25) → RRF (тот же `settings.rrf_k`, примитив
-`app.services.ranking.fuse_rrf`), фильтрует `deleted_at IS NULL` и
-дедуплицирует id.
+    One reusable helper for all areas (skills / terms / user / logs):
+    each area is described by an `AreaSpec` — its own tables, indexed fields
+    and output projection; `AreaSearch` runs the hybrid
+    vec0-KNN + FTS5(BM25) → RRF (the same `settings.rrf_k`, the
+    `app.services.ranking.fuse_rrf` primitive), filters `deleted_at IS NULL`
+    and deduplicates ids.
 
-Деградация (NFR-3): отказ кодирования запроса → поиск FTS-only + `warning`
-(прецедент `WARNING_FTS_ONLY` поиска заметок) — поиск не ломается от внешней
-зависимости. Изоляция — архитектурный инвариант: SQL помощника адресует
-только таблицы своей области, ни `notes*`, ни другие области.
+    Degradation (NFR-3): a query-encoding failure → FTS-only search + `warning`
+    (the notes precedent `WARNING_FTS_ONLY`) — search does not break on an external
+    dependency. Isolation is an architectural invariant: the helper's SQL addresses
+    only its area's tables — no `notes*`, no other areas.
 
-`normalize_key` (ключ терминов и сравнение контекстов/фактов) и
-`trigram_similarity` (близость контекстов и дедуп-подсказки без эмбеддинга)
-— общие для сервисов областей (lsb-0008-01, lsb-0009-01).
+    `normalize_key` (the terms key and context/fact comparison) and
+    `trigram_similarity` (context closeness and dedup hints without embedding)
+    are shared by the area services (lsb-0008-01, lsb-0009-01).
 """
 
 from __future__ import annotations
@@ -51,29 +50,29 @@ from app.storage.db import (
     session,
 )
 
-# Пустой результат области — мягкий ответ с hint (архитектура субстрата §3.5:
-# «не нашлось» — валидный исход, модель не лезет в область без причины).
+# Empty area result — a soft answer with a hint (substrate architecture §3.5:
+# "nothing found" is a valid outcome; the model does not enter an area without a reason).
 HINT_NO_RESULTS = (
     "nothing found in this area; rephrase more broadly "
     "(searches by substrings from 3 characters)"
 )
 
-# Размер триграммы (символьная): как у FTS5 trigram и HashEmbedder тестов.
+# Trigram size (character-based): same as the FTS5 trigram and the tests' HashEmbedder.
 TRIGRAM_SIZE = 3
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
-# --- нормализация и триграммное сходство ----------------------------------
+# --- normalization and trigram similarity ---------------------------------
 
 
 def normalize_key(value: str) -> str:
-    """Нормализовать строку ключа: lower → trim → пробелы схлопнуты → ё→е.
+    """Normalize a key string: lower → trim → collapse inner spaces → yo→ye.
 
-    Канон областей (lsb-0008 §3.2, lsb-0009 §3.4): одна механика на ключ
-    термина (`term_norm` / `context_norm`) и на сравнение фактов. Регистр,
-    хвостовые пробелы и разнобой внутренних пробелов не создают дублей,
-    «ё»/«е» — одна буква.
+            Area canon (lsb-0008 §3.2, lsb-0009 §3.4): one mechanic for the term key
+            (`term_norm` / `context_norm`) and for fact comparison. Case, trailing
+            whitespace and inconsistent inner spacing do not create duplicates;
+            "yo" and "ye" are the same letter.
     """
     lowered = value.lower().strip()
     collapsed = _WHITESPACE_RE.sub(" ", lowered)
@@ -81,22 +80,23 @@ def normalize_key(value: str) -> str:
 
 
 def _trigrams(text: str) -> set[str]:
-    """Множество символьных триграмм текста (скользящее окно по 3)."""
+    """The set of character trigrams of a text (a sliding window of 3)."""
     if len(text) < TRIGRAM_SIZE:
         return set()
     return {text[index : index + TRIGRAM_SIZE] for index in range(len(text) - 2)}
 
 
 def trigram_similarity(left: str, right: str) -> float:
-    """Триграммное сходство нормализованных строк — 0..1, симметрично.
+    """Trigram similarity of normalized strings — 0..1, symmetric.
 
-    Коэффициент перекрытия (Szymkiewicz–Simpson): |A ∩ B| / min(|A|, |B|) по
-    множествам триграмм нормализованных строк. Выбран осознанно: контексты
-    терминов короткие («МГУ» vs «студенты МГУ» — близкие контексты, решение
-    lsb-0008 §3.5), а Dice/Jaccard такие пары недооценивают (1/(1+N)).
-    Границы: 1.0 — строки совпали или триграммы одной содержатся в другой;
-    0.0 — нормализация пуста, триграмм нет или множества не пересекаются.
-    Сходство считается вычислительно, без эмбеддинга (запись мгновенная).
+            Overlap coefficient (Szymkiewicz–Simpson): |A ∩ B| / min(|A|, |B|) over
+            the trigram sets of the normalized strings. Chosen deliberately: term
+            contexts are short ("MGU" vs "MGU students" — close contexts, decision
+            lsb-0008 §3.5), while Dice/Jaccard underestimate such pairs (1/(1+N)).
+            Boundaries: 1.0 — the strings matched, or one's trigrams are contained in
+            the other; 0.0 — normalization is empty, there are no trigrams, or the
+            sets do not intersect. Similarity is computed arithmetically, without
+            embedding (writes stay instant).
     """
     normalized_left = normalize_key(left)
     normalized_right = normalize_key(right)
@@ -113,22 +113,23 @@ def trigram_similarity(left: str, right: str) -> float:
     )
 
 
-# --- регистрация областей ---------------------------------------------------
+# --- area registration -----------------------------------------------------
 
 
 @dataclass(frozen=True)
 class AreaSpec:
-    """Описание области для `AreaSearch`: свои таблицы, поля, проекция выдачи.
+    """Area description for `AreaSearch`: its tables, fields, output projection.
 
-    `fts_columns` — колонки FTS5-индекса (для BM25); `select_columns` — поля
-    проекции выдачи БЕЗ `id` (id добавляется всегда); `embed_fields` — поля,
-    склеиваемые в текст векторизации записи (порядок = порядок склейки);
-    `fts_weights` — веса колонок bm25 (пусто — все 1.0).
+            `fts_columns` — FTS5 index columns (for BM25); `select_columns` — output
+            projection fields WITHOUT `id` (id is always added); `embed_fields` —
+            fields concatenated into the record's vectorization text (order =
+            concatenation order); `fts_weights` — bm25 column weights (empty — all 1.0).
 
-    `settings_flag` — имя bool-поля `Settings`, включающего область
-    (FR-1.1/FR-5.1, №40): выключенная область не отдаёт MCP-ручки, её раздел и
-    анонс не вшиваются, петля `areas` её не обрабатывает. Будущее сужение до
-    групп ручек (LSBN-F-11) добавляется новым уровнем флага, не переделкой имён.
+            `settings_flag` — the name of the `Settings` bool field enabling the area
+            (FR-1.1/FR-5.1, #40): a disabled area serves no MCP handles, its section
+            and announcement are not baked in, and the `areas` loop skips it. A future
+            narrowing to handle groups (LSBN-F-11) is added as a new flag level, not
+            by renaming.
     """
 
     name: str
@@ -143,10 +144,10 @@ class AreaSpec:
     fts_weights: tuple[float, ...] = ()
 
     def embed_text(self, row: sqlite3.Row) -> str:
-        """Текст векторизации записи: непустые поля, склеенные переводом строки.
+        """The record's vectorization text: non-empty fields joined by newline.
 
-        Форматы (архитектура субстрата §3.3): skills — `name + description`;
-        terms — `term + context + definition`; user — `name + body`.
+                    Formats (substrate architecture §3.3): skills — `name + description`;
+                    terms — `term + context + definition`; user — `name + body`.
         """
         return "\n".join(
             str(row[column]) for column in self.embed_fields if row[column]
@@ -186,9 +187,9 @@ USER_FACTS_AREA = AreaSpec(
     select_columns=("name", "body"),
     embed_fields=("name", "body"),
 )
-# Область «Логи ассистента» (LSBN-F-10, arch §5.3/§6.2): текст векторизации —
-# непустые `action` + `reason` + `outcome` через перевод строки; выдача —
-# ссылка на объект изменения и время (полное чтение — f10-02/03).
+# The "Assistant logs" area (LSBN-F-10, arch §5.3/§6.2): vectorization text —
+# non-empty `action` + `reason` + `outcome` joined by newline; output —
+# the change object reference and time (full read — f10-02/03).
 LOGS_AREA = AreaSpec(
     name="logs",
     settings_flag="area_logs_enabled",
@@ -201,7 +202,7 @@ LOGS_AREA = AreaSpec(
     embed_fields=("action", "reason", "outcome"),
 )
 
-# Реестр областей (петля `areas` воркера и тесты изоляции ходят по нему).
+# Area registry (the worker's `areas` loop and the isolation tests walk it).
 ALL_AREAS: tuple[AreaSpec, ...] = (
     SKILLS_AREA,
     TERMS_AREA,
@@ -211,35 +212,35 @@ ALL_AREAS: tuple[AreaSpec, ...] = (
 
 
 def enabled_areas(settings: Settings) -> tuple[AreaSpec, ...]:
-    """Реестр ВКЛЮЧЁННЫХ областей — фильтр `ALL_AREAS` по флагам (FR-1.1, №40).
+    """Registry of ENABLED areas — a filter of `ALL_AREAS` by flags (FR-1.1, #40).
 
-    Единственная точка чтения флагов: поверхность MCP, инструкция/анонс и
-    фоновая петля `areas` ходят по этому реестру, а не по `ALL_AREAS`.
-    Выключенная область не исчезает из данных и наблюдаемости (FR-3.1,
-    `/health.areas` собирается по `ALL_AREAS`), но не участвует в поверхности
-    и фоновой обработке. Точка расширения F-11: сужение состава — правка
-    реестра, а не имён флагов (FR-5.1).
+            The single point of flag reads: the MCP surface, the instruction/announcement
+            and the background `areas` loop walk this registry, not `ALL_AREAS`.
+            A disabled area does not disappear from data or observability (FR-3.1;
+            `/health.areas` is built over `ALL_AREAS`), but takes no part in the
+            surface or background processing. The F-11 extension point: narrowing the
+            set is an edit of the registry, not of flag names (FR-5.1).
     """
     return tuple(
         spec for spec in ALL_AREAS if getattr(settings, spec.settings_flag)
     )
 
 
-# --- гибридный поиск внутри области ----------------------------------------
+# --- hybrid search within an area -----------------------------------------
 
 
 class AreaSearchValidationError(ValueError):
-    """Нарушение доменных ограничений запроса области (длина, top_k)."""
+    """A violation of the area query's domain constraints (length, top_k)."""
 
 
 class AreaSearch:
-    """Гибрид vec0-KNN + FTS5(BM25) → RRF внутри одной области; эмбеддер — DI.
+    """Hybrid vec0-KNN + FTS5(BM25) → RRF within one area; the embedder is DI.
 
-    Область задаётся `AreaSpec`: помощник один на все три области, SQL каждой
-    области адресует только её таблицы. Выдача — проекция области
-    (`select_columns`) + `id` и `score` (RRF-слияние) — ровно те поля, что
-    описаны контрактами фич. Пустой результат — мягкий ответ с hint; отказ
-    эмбеддера — FTS-only + warning (WARNING_FTS_ONLY).
+            The area is given by `AreaSpec`: one helper for all areas, and each area's
+            SQL addresses only its own tables. Output — the area projection
+            (`select_columns`) + `id` and `score` (RRF merge) — exactly the fields the
+            feature contracts describe. An empty result is a soft answer with a hint;
+            an embedder failure — FTS-only + warning (WARNING_FTS_ONLY).
     """
 
     def __init__(
@@ -250,23 +251,23 @@ class AreaSearch:
     ) -> None:
         self._settings = settings
         self._spec = spec
-        # DI для тестов: детерминированный HashEmbedder вместо сети.
+        # DI for tests: a deterministic HashEmbedder instead of the network.
         self._embedding: Embedder = (
             embedding if embedding is not None else EmbeddingService(settings)
         )
 
     @property
     def spec(self) -> AreaSpec:
-        """Описание области, под которое собран помощник (диагностика, тесты)."""
+        """The area description the helper was built for (diagnostics, tests)."""
         return self._spec
 
     def search(self, query: str, top_k: int | None = None) -> dict[str, Any]:
-        """Гибридный поиск внутри области (архитектура субстрата §3.5).
+        """Hybrid search within an area (substrate architecture §3.5).
 
-        Векторная сторона — KNN по vec0 области; FTS-сторона — BM25 по
-        FTS5-индексу области; слияние — RRF (тот же `settings.rrf_k`),
-        фильтр `deleted_at IS NULL` и дедупликация id. Отказ кодирования
-        запроса не ломает поиск: FTS-only + `warning` (NFR-3).
+                    Vector side — KNN over the area's vec0; FTS side — BM25 over the
+                    area's FTS5 index; merge — RRF (the same `settings.rrf_k`), the
+                    `deleted_at IS NULL` filter and id deduplication. A query-encoding
+                    failure does not break the search: FTS-only + `warning` (NFR-3).
         """
         query = self._validate_query(query)
         top_k = self._settings.default_top_k if top_k is None else top_k
@@ -286,12 +287,12 @@ class AreaSearch:
                     query_vector,
                     CANDIDATE_LIMIT,
                 )
-                # Гейт порога косинуса (прецедент заметок, SCORE_THRESHOLD):
-                # vec0-KNN ВСЕГДА отдаёт k ближайших — без порога «проба»
-                # области («пусто = такой записи нет») стала бы недостижимой
-                # при любой непустой таблице, и мягкий hint пустого поиска
-                # (субстрат §3.5) не выдавался бы никогда. Порог — общая
-                # калибровка кодировщика, не отдельная для областей.
+                # Cosine threshold gate (the notes precedent, SCORE_THRESHOLD):
+                # vec0-KNN ALWAYS returns the k nearest — without a threshold the "probe"
+                # of an area ("empty = no such record") would become unreachable
+                # on any non-empty table, and the soft empty-search hint
+                # (substrate §3.5) would never be emitted. The threshold is a shared
+                # encoder calibration, not a per-area one.
                 hits = [
                     (row_id, cosine)
                     for row_id, cosine in hits
@@ -306,8 +307,8 @@ class AreaSearch:
                     ]
                 )
             scores = fuse_rrf(rankings, self._settings.rrf_k)
-            # Мягкое чтение: удалённые (trash) исчезают из выдачи, их id в
-            # FTS/vec физически остаются (архитектура субстрата §3.2).
+            # Soft read: deleted (trash) records vanish from the output; their ids in
+            # FTS/vec physically remain (substrate architecture §3.2).
             rows = self._fetch_rows(conn, list(scores))
         results = self._merge(scores, rows)[:top_k]
         warning = None if query_vector is not None else WARNING_FTS_ONLY
@@ -320,12 +321,12 @@ class AreaSearch:
             return {"results": [], "warning": warning, "hint": hint}
         return {"results": results, "warning": warning}
 
-    # --- источники кандидатов -----------------------------------------------
+    # --- candidate sources --------------------------------------------------
 
     def _fts_candidates(
         self, conn: sqlite3.Connection, expression: str
     ) -> list[sqlite3.Row]:
-        """Топ-50 FTS5/BM25 по активным записям области; rank с 1 — для RRF."""
+        """Top-50 FTS5/BM25 over the area's active records; rank from 1 — for RRF."""
         spec = self._spec
         weights = spec.fts_weights or tuple(1.0 for _ in spec.fts_columns)
         weight_placeholders = ", ".join("?" * len(weights))
@@ -342,7 +343,7 @@ class AreaSearch:
     def _fetch_rows(
         self, conn: sqlite3.Connection, ids: list[int]
     ) -> dict[int, sqlite3.Row]:
-        """Активные записи кандидатов с полями проекции (мягкое чтение)."""
+        """Active candidate records with projection fields (soft read)."""
         if not ids:
             return {}
         spec = self._spec
@@ -355,14 +356,14 @@ class AreaSearch:
         ).fetchall()
         return {int(row["id"]): row for row in rows}
 
-    # --- слияние и выдача ---------------------------------------------------
+    # --- merge and output ----------------------------------------------------
 
     def _merge(
         self,
         scores: dict[int, float],
         rows: dict[int, sqlite3.Row],
     ) -> list[dict[str, Any]]:
-        """Сортировка: score DESC → updated_at DESC → id DESC; сборка проекции."""
+        """Sort: score DESC → updated_at DESC → id DESC; projection assembly."""
         spec = self._spec
         candidates = [
             (scores[row_id], row)
@@ -382,17 +383,17 @@ class AreaSearch:
             for score, row in candidates
         ]
 
-    # --- внутреннее ---------------------------------------------------------
+    # --- internal -------------------------------------------------------------
 
     def _query_vector(self, query: str) -> list[float] | None:
-        """Кодирование запроса; отказ — деградация к FTS, не исключение."""
+        """Encode the query; failure — degrade to FTS, not an exception."""
         try:
             return self._embedding.embed(query)
         except EmbeddingError:
             return None
 
     def _validate_query(self, query: str) -> str:
-        """1..MAX_QUERY_CHARS — доменное правило запроса области."""
+        """1..MAX_QUERY_CHARS — the area query's domain rule."""
         if not 1 <= len(query) <= self._settings.max_query_chars:
             raise AreaSearchValidationError(
                 f"query: length must be 1..{self._settings.max_query_chars} "

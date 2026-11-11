@@ -1,63 +1,65 @@
-"""LLMClient — единый HTTP-клиент внешних LLM-слотов (Фаза 11, решения №1–№6).
+"""LLMClient - the single HTTP client of the external LLM slots (Phase 11).
 
-v2.0 держал по клиенту на операцию (EmbeddingService, SummaryService,
-JudgeService — три копии httpx-обвязки) и умел только нативный Ollama.
-v2.1: каждый из трёх слотов (embedding, summary, judge) получает
-собственный адрес/модель/ключ И провайдера — `EMBEDDING_PROVIDER` /
-`SUMMARY_PROVIDER` / `JUDGE_PROVIDER` ∈ {ollama, openai}. Здесь один
-класс `LLMClient` с API из четырёх операций: `chat`, `embed`, `check`,
-`close`; конфигурация слота — замороженный `SlotSpec` с фабриками
-`SlotSpec.for_embedding/for_summary/for_judge` (по полям Settings).
+    v2.0 kept one client per operation (EmbeddingService, SummaryService,
+    JudgeService - three copies of the httpx wiring) and could only speak native
+    Ollama. v2.1: each of the three slots (embedding, summary, judge) gets its own
+    address/model/key AND provider - `EMBEDDING_PROVIDER` / `SUMMARY_PROVIDER` /
+    `JUDGE_PROVIDER` in {ollama, openai}. Here one `LLMClient` class with a
+    four-operation API: `chat`, `embed`, `check`, `close`; the slot configuration
+    is a frozen `SlotSpec` with the `SlotSpec.for_embedding/for_summary/for_judge`
+    factories (built from Settings fields).
 
-Кто потребляет (пулы 4 и 6):
-- `embed` — EmbeddingService (единая точка кодирований). Проверки
-  контракта ответа (число векторов = числу входов, размерность =
-  EMBEDDING_DIM) и единственный ретрай транзиентных сбоев (ARCH §3.2) —
-  на вызывающей стороне; сигнал для решения о ретрае — `LLMError.transient`.
-- `chat` — SummaryService (+ классификатор/описатель) и JudgeService
-  (+ судья структуры). Ретраев нет ни у клиента, ни у чата — повтор
-  решает воркер по back-off (NFR-3).
-- `check` — main.py при старте (решение №5): возвращает исход, не бросает;
-  фатальность решает вызывающий.
-- `close` — чистое завершение (lifespan приложения).
+    Who consumes it (pools 4 and 6):
+    - `embed` - EmbeddingService (the single encoding point). The response-contract
+      checks (the vector count = the input count, the dimension = EMBEDDING_DIM)
+      and the only retry of transient failures (ARCH SS3.2) live on the caller;
+      the retry signal is `LLMError.transient`.
+    - `chat` - SummaryService (+ the classifier/describer) and JudgeService
+      (+ the structure judge). Neither the client nor chat retries - the repeat is
+      the worker's decision via back-off (NFR-3).
+    - `check` - main.py at startup: returns the outcome, does not raise; the
+      caller decides fatality.
+    - `close` - a clean shutdown (the application lifespan).
 
-Ключевые решения:
-- Очередь F1 (ollama_gate): `ollama_slot` берётся ТОЛЬКО ollama-провайдером
-  слота на время HTTP-вызова — один запрос к серверу в момент времени,
-  read-таймаут тикает с реальной отправки. Openai-провайдер — внешний API,
-  слот не берётся вовсе; `check()` слот тоже не берёт (не генерация).
-- keep_alive НЕ отправляется никому (решение №6): моделью управляет
-  сервер через OLLAMA_KEEP_ALIVE; в v2.0 клиент слал «15m» — снято.
-- Bearer — только openai-провайдеру и только при заданном ключе
-  (решение №4). 401/403 у openai — `LLMAuthError` без ретрая, с hint:
-  пустой ключ — «задай {SLOT}_API_KEY в docker-compose и перезапусти»,
-  заданный (неверный) — «ключ отклонён API». Ollama-провайдер Bearer не
-  ходит, поэтому его 401/403 — обычная статусная ошибка БЕЗ hint про ключ,
-  но с признаком `auth`: исход вызова в обоих случаях `AUTH` (arch §6.1:
-  «401/403 — ждать бессмысленно»; FR-4.3 — пауза сразу, а не после серии).
-- 429/5xx/транспорт/таймаут — `LLMError.transient = True`: эмбеддер
-  ретраит (429 — транзиент, решение №4), чат не ретраит. Сам клиент не
-  ретраит никогда — решение о повторе принимает вызывающий по флагу.
-- Таймауты: connect — ollama 2 с (LAN), openai 10 с (облако); read —
-  per-slot из Settings: summary_timeout_sec / judge_timeout_sec,
-  эмбеддер — фиксированные 720 с (§8 таймаут эмбеддинга не задаёт;
-  решение О. 2026-08-30 под CPU-инференс длинных текстов).
-- check() (решение №5): одна попытка, ~5 с; ollama — GET /api/tags со
-  сверкой модели слота в списке, openai — GET /v1/models (+Bearer).
-  Исходы: ok | auth_failed | unreachable | model_missing. 401/403 →
-  auth_failed; сеть/таймаут/5xx/404/мусор → unreachable (WARN + деградация,
-  не фатально); модель не в списке → model_missing.
-- reasoning-поля ответа (`message.thinking` у ollama; `reasoning_content`/
-  `reasoning` у openai) читаются только в метаданные вызова (№49 §13.3):
-  content остаётся единственным содержимым ответа; пустой content — отказ
-  вызова (§5.5) с признаком `empty` (№39 §6.3).
-- №39 §6.3: `LLMError` несёт признаки `timeout`/`empty`/`truncated` —
-  таймаут и транспорт различаются, пустой ответ не смешивается с
-  недоступностью; исход вызова (SlotOutcome) читает сервисный слой.
-  `finish_reason`/`usage` и заполнение `truncated` — блок №49.
-- DI без сети: `transport` принимает httpx.MockTransport или handler —
-  юнит-тесты (tests/test_llm_client.py); фейки сервисов (tests/fakes.py)
-  не меняются — потребители зависят от протоколов, не от этого класса.
+    Key decisions:
+    - The F1 queue (ollama_gate): `ollama_slot` is taken ONLY by an ollama provider
+      of the slot for the duration of the HTTP call - one request to the server at
+      a time; the read timeout ticks from the actual send. The openai provider is
+      an external API, the slot is not taken at all; `check()` does not take the
+      slot either (not generation).
+    - keep_alive is NOT sent to anyone: the server manages the model through
+      OLLAMA_KEEP_ALIVE; in v2.0 the client sent "15m" - removed.
+    - Bearer - only to the openai provider and only with a key set. 401/403 at
+      openai - `LLMAuthError` without a retry, with a hint: an empty key - "set
+      {SLOT}_API_KEY in docker-compose and restart"; a set (wrong) key - "the key
+      was rejected by the API". The ollama provider never sends Bearer, so its
+      401/403 is a plain status error WITHOUT the key hint but with the `auth`
+      flag: the call outcome is `AUTH` in both cases (arch SS6.1: "401/403 -
+      waiting is pointless"; FR-4.3 - pause immediately, not after a series).
+    - 429/5xx/transport/timeout - `LLMError.transient = True`: the embedder
+      retries (429 is transient), chat does not. The client itself never retries -
+      the repeat decision belongs to the caller reading the flag.
+    - Timeouts: connect - ollama 2 s (LAN), openai 10 s (cloud); read - per-slot
+      from Settings: summary_timeout_sec / judge_timeout_sec; the embedder has a
+      fixed 720 s (SS8 does not set the embedding timeout; it was sized for CPU
+      inference of long texts).
+    - check(): one attempt, about 5 s; ollama - GET /api/tags with the slot model
+      checked against the list; openai - GET /v1/models (+Bearer). Outcomes:
+      ok | auth_failed | unreachable | model_missing. 401/403 -> auth_failed;
+      network/timeout/5xx/404/garbage -> unreachable (WARN + degradation, not
+      fatal); the model not in the list -> model_missing.
+    - The reasoning fields of the response (`message.thinking` at ollama;
+      `reasoning_content`/`reasoning` at openai) are read into the call metadata
+      only (No49 SS13.3): content stays the only response payload; an empty
+      content - the call fails (SS5.5) with the `empty` flag (No39 SS6.3).
+    - No39 SS6.3: `LLMError` carries the `timeout`/`empty`/`truncated` flags -
+      timeout and transport are distinguishable, an empty answer is not mixed with
+      unavailability; the call outcome (SlotOutcome) is read by the service layer.
+      `finish_reason`/`usage` and filling `truncated` - block No49.
+    - DI without the network: `transport` takes an httpx.MockTransport or a
+      handler - unit tests (tests/test_llm_client.py); the service fakes
+      (tests/fakes.py) are unchanged - consumers depend on protocols, not this
+      class.
 """
 
 from __future__ import annotations
@@ -77,57 +79,57 @@ from app.services.operations import (
     resolve_operation,
 )
 from app.services.ollama_gate import ollama_slot
-from app.services.slot_budget import resolve_output_budget
+from app.services.slot_budget import Budgets, resolve_budgets, resolve_output_budget
 from app.services.splitter import count_tokens
 
-# Провайдеры LLM-слотов (Фаза 11, решение №1).
+# The LLM slot providers (Phase 11).
 PROVIDER_OLLAMA = "ollama"
 PROVIDER_OPENAI = "openai"
 
-# Таймауты (сек): connect per-провайдер; чтение — per-slot из Settings,
-# кроме эмбеддера — §8 его таймаут не задаёт, фикс 720 с (решение
-# О. 2026-08-30: qwen3-embedding:8b на CPU-хосте, длинные тексты должны
-# дорабатываться, а не рваться).
+# Timeouts (s): connect per provider; read - per slot from Settings,
+# except the embedder - SS8 sets no timeout for it, a fixed 720 s (sized
+# for CPU inference of long texts: qwen3-embedding:8b on a CPU host, long
+# texts must finish, not tear).
 CONNECT_TIMEOUT_SEC_OLLAMA = 2.0
 CONNECT_TIMEOUT_SEC_OPENAI = 10.0
 EMBEDDING_READ_TIMEOUT_SEC = 720.0
 
-# Стартовая проверка (решение №5): одна попытка, ~5 с — проверка «живости»,
-# а не генерация.
+# The startup check: one attempt, ~5 s - a liveness probe, not generation.
+#
 CHECK_TIMEOUT_SEC = 5.0
 
-# Общая температура генеративных вызовов (как в v2.0): стабильные
-# формулировки суммари и вердиктов важнее разнообразия.
+# The shared temperature of generative calls (as in v2.0): stable
+# summary and verdict wordings matter more than variety.
 TEMPERATURE = 0.1
 
-# 401/403 — ключ не принят: ретраить бессмысленно (решение №4).
+# 401/403 - the key is rejected: retrying is pointless.
 STATUS_UNAUTHORIZED = frozenset({401, 403})
 
-# Транзиентные статусы: 429 (перегрузка, решение №4) + 5xx (как в v2.0).
-# Ретраит по этому сигналу только эмбеддер; чат — нет (NFR-3).
+# Transient statuses: 429 (overload) + 5xx (as in v2.0).
+# Only the embedder retries on this signal; chat does not (NFR-3).
 STATUS_TRANSIENT = frozenset({429, 500, 502, 503, 504})
 
-# Сетевые/временные отказы httpx — кандидаты на ретрай.
+# httpx network/temporary failures - retry candidates.
 _RETRIABLE = (httpx.TimeoutException, httpx.TransportError)
 
-# Кусок тела ответа в тексте ошибки (логи не захламляем).
+# A chunk of the response body in the error text (keep the logs lean).
 _ERROR_BODY_CHARS = 120
 
 
 def _as_int(value: Any) -> int | None:
-    """Счётчик из ответа как int; отсутствие/чужой тип/bool → None (защита)."""
+    """A response counter as int; absent/wrong type/bool -> None (a guard)."""
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _as_float(value: Any) -> float | None:
-    """Число из ответа как float; отсутствие/чужой тип/bool → None (защита)."""
+    """A response number as float; absent/wrong type/bool -> None (a guard)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
 
 
 def _as_probabilities(value: Any) -> dict[str, float]:
-    """Распределение вероятностей ответа: {метка: число}; мусор пропускаем."""
+    """The response probability distribution: {label: number}; garbage skipped."""
     result: dict[str, float] = {}
     if isinstance(value, dict):
         for key, item in value.items():
@@ -136,26 +138,26 @@ def _as_probabilities(value: Any) -> dict[str, float]:
                 result[str(key)] = number
     return result
 
-# Исходы стартовой проверки (решение №5): ok — слот готов; auth_failed —
-# 401/403 (фатально, решает main.py); unreachable — сеть/таймаут/5xx/404/
-# не-JSON (WARN + деградация); model_missing — модели слота нет в списке.
+# The startup check outcomes: ok - the slot is ready; auth_failed -
+# 401/403 (fatal, main.py decides); unreachable - network/timeout/5xx/404/
+# non-JSON (WARN + degradation); model_missing - the slot model is not listed.
 CheckResult = Literal["ok", "auth_failed", "unreachable", "model_missing"]
 CHECK_OK: CheckResult = "ok"
 CHECK_AUTH_FAILED: CheckResult = "auth_failed"
 CHECK_UNREACHABLE: CheckResult = "unreachable"
 CHECK_MODEL_MISSING: CheckResult = "model_missing"
 
-# LSBN-F-12 (arch §6.2/§13.6): тип модели decision-слота (свой конфиг DECISION_*).
+# LSBN-F-12 (arch §6.2/§13.6): the decision slot's model type (its own DECISION_* config).
 SLOT_KIND_DECISION = "decision"
 
-# Нативный маршрут decision-модели (ollama ≥ 0.35.1): НЕ OpenAI-совместимый.
+# The decision model's native route (ollama >= 0.35.1): NOT OpenAI-compatible.
 DECISION_PATH = "/v1/systemone"
 
-# Статусы «сервер не знает маршрут / не принимает тип вопроса» (arch §6.2).
+# The statuses for "the server does not know the route / rejects the question kind" (arch §6.2).
 _DECISION_UNSUPPORTED_STATUSES = frozenset({400, 404, 405, 422})
 
-# Исходы стартовой проверки «модель умеет decision» (FR-1.3/FR-6.2). Свой тип:
-# CheckResult генеративных слотов (блок 2) не трогаем.
+# The startup check outcomes of "the model can do decision" (FR-1.3/FR-6.2). Its own type:
+# the CheckResult of the generative slots (block 2) is untouched.
 DecisionCheck = Literal["ok", "unsupported", "unreachable", "auth_failed"]
 DECISION_CHECK_OK: DecisionCheck = "ok"
 DECISION_CHECK_UNSUPPORTED: DecisionCheck = "unsupported"
@@ -164,18 +166,20 @@ DECISION_CHECK_AUTH_FAILED: DecisionCheck = "auth_failed"
 
 
 class LLMError(RuntimeError):
-    """Вызов LLM-слота не выполнен (статус/транспорт/контракт ответа).
+    """An LLM slot call failed (status/transport/response contract).
 
-    `status` — HTTP-статус ответа, если ошибка от сервера. `transient` —
-    сбой временный (429/5xx/транспорт/таймаут): сигнал для единственного
-    ретрая эмбеддера (ARCH §3.2); чат по флагу не ретраит (NFR-3).
-    `auth` — 401/403 у ЛЮБОГО провайдера (openai несёт ещё и `LLMAuthError`
-    с hint про ключ): исход вызова — `AUTH` (`slot_outcome.classify_llm_error`).
-    `timeout`/`empty`/`truncated` — признаки причины (№39, §6.3): исход
-    вызова различается на границе клиента (`slot_outcome.classify_llm_error`),
-    а не по тексту сообщения. `truncated` заполняет блок №49 (finish_reason).
-    `meta` — метаданные состоявшегося вызова (№49): отказ после ответа модели
-    несёт их сервису/воркеру для диагностики в журнале.
+            `status` - the HTTP status when the error came from the server.
+            `transient` - a temporary failure (429/5xx/transport/timeout): the signal
+            for the embedder's single retry (ARCH SS3.2); chat does not retry by the
+            flag (NFR-3). `auth` - 401/403 from ANY provider (openai also carries
+            `LLMAuthError` with the key hint): the outcome is `AUTH`
+            (`slot_outcome.classify_llm_error`). `timeout`/`empty`/`truncated` - the
+            cause flags (No39, SS6.3): the outcome is distinguished at the client
+            boundary (`slot_outcome.classify_llm_error`), not by the message text.
+            `truncated` is filled by block No49 (finish_reason). `meta` - the metadata
+            of the call that happened (No49): a failure after the model answered
+            carries them for the service/worker journal diagnostics.
+
     """
 
     def __init__(
@@ -201,11 +205,12 @@ class LLMError(RuntimeError):
 
 
 class LLMAuthError(LLMError):
-    """401/403 от openai-провайдера: ключ не задан или отклонён.
+    """401/403 from the openai provider: the key is unset or rejected.
 
-    Не ретраится никогда (решение №4): текст ошибки содержит hint —
-    «задай {SLOT}_API_KEY в docker-compose и перезапусти» при пустом
-    ключе или «ключ отклонён API» при заданном неверном.
+            Never retried: the error text carries the hint - "set {SLOT}_API_KEY in
+            docker-compose and restart" for an empty key, or "the key was rejected by
+            the API" for a set wrong one.
+
     """
 
     def __init__(self, message: str, *, status: int) -> None:
@@ -214,46 +219,51 @@ class LLMAuthError(LLMError):
 
 @dataclass(frozen=True)
 class SlotSpec:
-    """Конфигурация одного LLM-слота: адрес, модель, провайдер, ключ.
+    """The configuration of one LLM slot: address, model, provider, key.
 
-    Провайдер — «ollama» (нативный API) или «openai» (OpenAI-совместимый
-    с Bearer). `think` — флаг рассуждений генеративного слота (None —
-    не отправлять поле; False — отправить явный запрет; True — не
-    отправлять, рассуждения разрешены): только ollama-провайдер.
+            The provider is "ollama" (the native API) or "openai" (OpenAI-compatible
+            with Bearer). `think` - the thinking flag of a generative slot (None - do
+            not send the field; False - send an explicit ban; True - do not send,
+            thinking allowed): the ollama provider only.
+
     """
 
-    name: str  # embedding | summary | judge — для текстов ошибок/hint'ов
+    name: str  # embedding | summary | judge - for the error texts/hints
     provider: str
     base_url: str
     model: str
     api_key: str
     read_timeout: float
     think: bool | None = None
-    # №49 (arch §13.1): тип модели слота — reasoning | generation; влияет на
-    # бюджет, трактовку think и стартовые предупреждения (`slot_config_warnings`),
-    # но НЕ на тело запроса (провод остаётся прежним).
+    # No49 (arch §13.1): the slot model type - reasoning | generation; it affects
+    # the budget, the think treatment and the startup warnings
+    # (`slot_config_warnings`), but NOT the request body (the wire stays the same).
     model_type: str = "generation"
-    # №49 (arch §6.2): заявленный контекст модели (0 — неизвестен; тогда бюджет
-    # деградирует к прежнему потолку), защитный потолок авто-бюджета и запас
-    # на chat-template/служебные поля/рассинхрон токенизатора.
+    # No49 (arch §6.2): the declared model context (0 - unknown; then the budget
+    # degrades to the previous cap), the auto-budget defensive cap and the
+    # reserve for the chat template/service fields/tokenizer drift.
     context_tokens: int = 0
     max_output_tokens: int = 32768
     prompt_reserve_tokens: int = 512
-    # №49 (arch §8): порог WARN «нет места размышлению» и явный операторский
-    # бюджет слота (0 — авто «сколько влезет»); порог WARN «таймаут мал для
-    # "думать долго"» — из Settings (для чистоты `slot_config_warnings`).
+    # No49 (arch §8): the WARN threshold "no room for thinking" and the operator's
+    # explicit slot budget (0 - auto "as much as fits"); the WARN threshold "the
+    # timeout is small for long thinking" - from Settings (for a clean `slot_config_warnings`).
     reasoning_min_output_tokens: int = 4096
     num_predict: int = 0
+    # LSBN-T-33: the operator's REASONING budget (0 - unset: "as much as fits"
+    # within the context). Filled by the factories from the global
+    # SLOT_REASONING_NUM_PREDICT and overridden by the flat operation env.
+    reasoning_num_predict: int = 0
     min_timeout_sec: int = 300
-    # LSBN-F-34: источник МОДЕЛИ этого spec (`op` | `slot` | `default`) —
-    # плоское env операции, env слота или дефолт. Заполняет for_operation;
-    # слот-фабрики оставляют «slot» (их модель — env слота). Идёт в ChatMeta
-    # (журнал) и /health.operations; адрес/ключ здесь не дублируются.
+    # LSBN-F-34: the source of this spec's MODEL (`op` | `slot` | `default`) -
+    # the flat operation env, the slot env, or the default. Filled by for_operation;
+    # the slot factories leave "slot" (their model is the slot env). Goes into
+    # ChatMeta (the journal) and /health.operations; the address/key are not duplicated here.
     model_source: str = "slot"
 
     @classmethod
     def for_embedding(cls, settings: Settings) -> SlotSpec:
-        """Слот векторизации: таймаут фиксированный 720 с, think нет."""
+        """The vectorization slot: a fixed 720 s timeout, no think."""
         return cls(
             name="embedding",
             provider=settings.embedding_provider,
@@ -265,7 +275,7 @@ class SlotSpec:
 
     @classmethod
     def for_summary(cls, settings: Settings) -> SlotSpec:
-        """Слот суммаризации (и классификации/описаний — та же модель)."""
+        """The summarization slot (and classification/descriptions - the same model)."""
         return cls(
             name="summary",
             provider=settings.summary_provider,
@@ -280,12 +290,13 @@ class SlotSpec:
             prompt_reserve_tokens=settings.slot_prompt_reserve_tokens,
             reasoning_min_output_tokens=settings.slot_reasoning_min_output_tokens,
             num_predict=settings.summary_num_predict,
+            reasoning_num_predict=settings.slot_reasoning_num_predict,
             min_timeout_sec=settings.slot_min_timeout_sec,
         )
 
     @classmethod
     def for_judge(cls, settings: Settings) -> SlotSpec:
-        """Слот судьи (дедуп + судья структуры — та же модель)."""
+        """The judge slot (dedup + the structure judge - the same model)."""
         return cls(
             name="judge",
             provider=settings.judge_provider,
@@ -300,6 +311,7 @@ class SlotSpec:
             prompt_reserve_tokens=settings.slot_prompt_reserve_tokens,
             reasoning_min_output_tokens=settings.slot_reasoning_min_output_tokens,
             num_predict=settings.judge_num_predict,
+            reasoning_num_predict=settings.slot_reasoning_num_predict,
             min_timeout_sec=settings.slot_min_timeout_sec,
         )
 
@@ -307,19 +319,19 @@ class SlotSpec:
     def for_operation(
         cls, operation: str, settings: Settings
     ) -> tuple[SlotSpec, dict[str, str]]:
-        """Эффективный spec ОПЕРАЦИИ (LSBN-F-34) + источник каждого поля.
+        """The effective spec of an OPERATION (LSBN-F-34) + the source of every field.
 
-        Цепочка разрешения по каждому полю: плоский env операции
-        (`<ОПЕРАЦИЯ>_<ПОЛЕ>`) → env слот-группы → дефолт (значения слот-
-        фабрики выше). Возвращает `(SlotSpec, sources)`, где `sources` —
-        полное покрытие `OPERATION_FIELDS` значениями `op` | `slot` |
-        `default`; поля слоя `op` в словаре значений содержат ТОЛЬКО
-        переопределённые. Операция, чьё имя совпадает со слот-группой
-        (`judge`), отдельного слоя не имеет — её env и есть env слота.
-        Кодовые дефолты операций (`OPERATION_FIELD_DEFAULTS`, например
-        бюджет описания 128) применяются, когда не заданы ни операция,
-        ни слот. Резервный слот (decision, механика F-12) здесь не участвует:
-        переопределение операции действует только на основном пути.
+                The resolution chain per field: the flat operation env
+                (`<OP>_<FIELD>`) -> the slot-group env -> the default (the slot-factory
+                values above). Returns `(SlotSpec, sources)` where `sources` fully covers
+                `OPERATION_FIELDS` with `op` | `slot` | `default`; the `op`-layer fields in
+                the values dict contain ONLY the overridden ones. An operation whose name
+                equals the slot group (`judge`) has no separate layer - its env IS the
+                slot env. The code defaults of operations (`OPERATION_FIELD_DEFAULTS`,
+                e.g. the 128 describe budget) apply when neither the operation nor the
+                slot sets anything. The reserve slot (decision, the F-12 mechanics) takes
+                no part here: an operation override acts on the primary path only.
+
         """
         slot = OPERATIONS.get(operation)
         if slot is None:
@@ -349,12 +361,13 @@ class SlotSpec:
 
     @classmethod
     def for_decision(cls, settings: Settings) -> SlotSpec:
-        """Слот решения (LSBN-F-12): нативный ollama-маршрут `/v1/systemone`.
+        """The decision slot (LSBN-F-12): the native ollama route `/v1/systemone`.
 
-        Провайдер всегда `ollama` (маршрут нативный, НЕ OpenAI-совместимый);
-        бюджет генерации не применяется (`num_predict` не задаём), флага
-        размышления у decision нет вовсе (think=None, arch §13.1). Bearer
-        уходит только при заданном `DECISION_API_KEY` (см. `_headers`).
+                The provider is always `ollama` (the route is native, NOT
+                OpenAI-compatible); the generation budget does not apply (`num_predict` is
+                not set), decision has no thinking flag at all (think=None, arch SS13.1).
+                Bearer goes only when `DECISION_API_KEY` is set (see `_headers`).
+
         """
         return cls(
             name=SLOT_KIND_DECISION,
@@ -370,14 +383,15 @@ class SlotSpec:
 
 @dataclass(frozen=True)
 class ChatMeta:
-    """Метаданные одного вызова чата слота (№49, arch §6.2/§13.3).
+    """The metadata of one slot chat call (No49, arch SS6.2/SS13.3).
 
-    Заполняются ТОЛЬКО клиентом: `budget`/`budget_source` — политика бюджета
-    вывода (`slot_budget.resolve_output_budget`), счётчики и причина завершения
-    — из ответа провайдера, `truncated` — обрезка по лимиту вывода
-    (`finish_reason`/`done_reason == "length"`). `model_type` берётся из
-    `spec.model_type` (тип модели слота, arch §13.1). Секретов и тел
-    промптов/ответов здесь нет (FR-3.4).
+            Filled ONLY by the client: `budget`/`budget_source` - the output budget
+            policy (`slot_budget.resolve_output_budget`), the counters and the finish
+            reason - from the provider's response, `truncated` - cut by the output
+            limit (`finish_reason`/`done_reason == "length"`). `model_type` comes from
+            `spec.model_type` (the slot model type, arch SS13.1). No secrets and no
+            prompt/response bodies here (FR-3.4).
+
     """
 
     slot: str
@@ -395,29 +409,59 @@ class ChatMeta:
     finish_reason: str | None
     truncated: bool
     duration_ms: int
-    # LSBN-F-34: адрес слота и источник конфигурации операции (`op`/`slot`/
-    # `default`) — решение №4 брифа: наружу (/health) адрес не отдаётся,
-    # в журнал (`slot_call`) и в событие джобы при ошибке — да. Адрес не
-    # секрет (в отличие от ключа, который сюда не попадает никогда).
+    # LSBN-F-34: the slot address and the operation config source (`op`/`slot`/
+    # `default`) - the brief's decision No4: the address is not exposed (/health),
+    # but it goes to the journal (`slot_call`) and the job error event. The address
+    # is not a secret (unlike the key, which never reaches here).
     base_url: str = ""
     config_source: str = "slot"
+    # LSBN-T-33: the split call budgets. `budget` above is the total
+    # (legacy-compatible), equal to `sent_budget`; `budget_source` equals
+    # `answer_source`. `escalated_from` - the first attempt's sent_budget when the
+    # call was retried after "the budget eaten by reasoning" (None - no retry).
+    answer_budget: int = 0
+    reasoning_budget: int = 0
+    sent_budget: int = 0
+    answer_source: str = ""
+    reasoning_source: str = ""
+    escalated_from: int | None = None
 
 
 @dataclass(frozen=True)
 class ChatResult:
-    """Результат вызова чата: content вместе с метаданными вызова (§6.2)."""
+    """The chat call result: content together with the call metadata (SS6.2)."""
 
     content: str
     meta: ChatMeta
 
 
-class LLMClient:
-    """HTTP-клиент одного LLM-слота: chat / embed / check / close.
+class LLMReasoningBudgetError(LLMError):
+    """The answer budget eaten by reasoning (LSBN-T-33; the lsbdef-0008 class).
 
-    Провайдер выбирается по `spec.provider`: ollama — POST /api/chat,
-    /api/embed, GET /api/tags (через очередь ollama_gate для chat/embed);
-    openai — POST /v1/chat/completions, /v1/embeddings, GET /v1/models
-    (+Bearer при заданном ключе, слот очереди не берётся).
+            Content is empty while thinking happened (ollama - a non-empty
+            `message.thinking`; openai - `reasoning_tokens > 0` or a non-empty
+            `reasoning_content`). This is NOT a generic "empty answer" and not a "slot
+            failure": the distinct type lets the caller recognize the outcome and
+            repeat the call with a bigger budget (in the client - one auto-retry up to
+            the context window; beyond that - up the stack). Flags: `truncated=True`
+            (the budget is exhausted), `empty=False`, `transient=False` - the outcome
+            is TRUNCATED (the job waits for attention), but the cause in the error
+            text is its own, readable in the journal.
+
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, truncated=True)
+
+
+class LLMClient:
+    """The HTTP client of one LLM slot: chat / embed / check / close.
+
+            The provider is chosen by `spec.provider`: ollama - POST /api/chat,
+            /api/embed, GET /api/tags (through the ollama_gate queue for chat/embed);
+            openai - POST /v1/chat/completions, /v1/embeddings, GET /v1/models
+            (+Bearer with a key set; the queue slot is not taken).
+
     """
 
     def __init__(
@@ -428,7 +472,7 @@ class LLMClient:
         | None = None,
     ) -> None:
         self.spec = spec
-        # httpx.MockTransport-handler в конструкторе — удобно юнит-тестам.
+        # An httpx.MockTransport handler in the constructor - convenient for unit tests.
         if transport is not None and not isinstance(transport, httpx.BaseTransport):
             transport = httpx.MockTransport(transport)
         connect = (
@@ -442,7 +486,7 @@ class LLMClient:
             transport=transport,
         )
 
-    # --- публичное API -------------------------------------------------------
+    #--- public API -------------------------------------------------------
 
     def chat_result(
         self,
@@ -453,34 +497,111 @@ class LLMClient:
         think: bool | None = None,
         operation: str | None = None,
     ) -> ChatResult:
-        """Одна генерация: system+user, non-stream; возвращает content + метаданные.
+        """One generation: system+user, non-stream; returns content + metadata.
 
-        num_predict — явный бюджет оператора (None — политика «сколько влезет»:
-        из заявленного контекста слота минус промпт и запас, зажатая защитным
-        потолком; при неизвестном контексте — прежний потолок операции).
-        `operation` — имя операции для деградации (`summary`/`title`/`merge`/
-        `judge`/`classify`). think=None — флаг из spec (слота); bool —
-        переопределение (судья структуры: NAMESPACE_JUDGE_THINK).
-        Пустой content — отказ (§5.5); reasoning-поля идут только в метаданные.
-        Любой отказ — LLMError/LLMAuthError.
+                num_predict - the operator's explicit ANSWER budget (None - the "as much
+                as fits" policy: the declared slot context minus the prompt and the
+                reserve, clamped by the defensive cap; with an unknown context - the
+                operation's previous cap). The budgets are split (LSBN-T-33): the call
+                carries `sent_budget = answer_budget + reasoning_budget` (clamped by the
+                context window) because the transport caps the SUM of thinking+content.
+                `operation` - the operation name for degradation
+                (`summary`/`title`/`merge`/`judge`/`classify`). think=None - the flag from
+                the spec (the slot); a bool - an override (the structure judge:
+                NAMESPACE_JUDGE_THINK). An empty content - a refusal (SS5.5); the
+                reasoning fields go to the metadata only. The exception - "the budget
+                eaten by reasoning" (`LLMReasoningBudgetError`): the content is empty
+                while thinking happened - ONE auto-retry with a doubled budget up to the
+                context window (not a slot retry: back-off and the failure counters are
+                untouched); when a retry is impossible (the window exhausted, the context
+                unknown) - the refusal goes up. Any failure - LLMError/LLMAuthError.
+
         """
         think_flag = self.spec.think if think is None else think
-        # Операция по умолчанию — имя слота: клиент вызывается и без явной
-        # операции (юниты, простые вызовы), а деградация бюджета требует ключа.
+        # The default operation is the slot name: the client is also called without an
+        # explicit operation (units, simple calls), and the budget degradation needs a key.
         operation = operation or self.spec.name
         prompt_tokens = count_tokens(system_prompt) + count_tokens(user_text)
-        # Явный бюджет вызывающего старше; не задан — действует операционный
-        # потолок spec (LSBN-F-34: плоский env операции → env слота → 0/авто).
+        # The caller's explicit budget wins; when unset, the operation ceiling of the
+        # spec applies (LSBN-F-34: the flat operation env -> the slot env -> 0/auto).
         if num_predict is None:
             num_predict = self.spec.num_predict or None
-        budget, budget_source = resolve_output_budget(
+        budgets = resolve_budgets(
             operation=operation,
             prompt_tokens=prompt_tokens,
-            explicit=num_predict,
+            explicit_answer=num_predict,
+            explicit_reasoning=self.spec.reasoning_num_predict or None,
             context_tokens=self.spec.context_tokens,
             reserve_tokens=self.spec.prompt_reserve_tokens,
             defensive_cap=self.spec.max_output_tokens,
+            think_enabled=think_flag is not False,
         )
+        try:
+            return self._chat_once(
+                system_prompt,
+                user_text,
+                operation=operation,
+                budgets=budgets,
+                sent_budget=budgets.sent_budget,
+                think_flag=think_flag,
+                prompt_tokens=prompt_tokens,
+                escalated_from=None,
+            )
+        except LLMReasoningBudgetError:
+            escalation = self._escalation_budget(budgets, prompt_tokens)
+            if escalation is None:
+                raise
+            # One auto-retry with a bigger sent_budget: this is request-shaping,
+            # not a slot-failure repeat - the back-off and the slot break
+            # do not engage, the failure counters do not grow.
+            return self._chat_once(
+                system_prompt,
+                user_text,
+                operation=operation,
+                budgets=budgets,
+                sent_budget=escalation,
+                think_flag=think_flag,
+                prompt_tokens=prompt_tokens,
+                escalated_from=budgets.sent_budget,
+            )
+
+    def _escalation_budget(self, budgets: Budgets, prompt_tokens: int) -> int | None:
+        """The bigger sent_budget for the retry after "eaten by reasoning".
+
+                x2 of what was sent, capped by the context window
+                (`context - prompt - reserve`); no retry (None) when the context is
+                unknown, the reasoning was not reserved (think=false/degradation), or the
+                window is already exhausted by the first call - the operator decides next
+                (raise the budget/context or change the model).
+
+        """
+        if budgets.reasoning_budget <= 0:
+            return None  # the degradation (unknown context) or think=false
+        window = self.spec.context_tokens - prompt_tokens - self.spec.prompt_reserve_tokens
+        escalated = min(budgets.sent_budget * 2, window)
+        return escalated if escalated > budgets.sent_budget else None
+
+    def _chat_once(
+        self,
+        system_prompt: str,
+        user_text: str,
+        *,
+        operation: str,
+        budgets: Budgets,
+        sent_budget: int,
+        think_flag: bool | None,
+        prompt_tokens: int,
+        escalated_from: int | None,
+    ) -> ChatResult:
+        """One HTTP call with the given sent_budget + the response parse.
+
+                Split out of `chat_result` (LSBN-T-33): the first call goes with
+                `budgets.sent_budget`, the auto-retry after "the budget eaten by
+                reasoning" - with a bigger one. The metadata always describes the ACTUAL
+                call (`sent_budget`, and `escalated_from` on a retry).
+
+        """
+        budget = sent_budget
         if self.spec.provider == PROVIDER_OPENAI:
             path = "/v1/chat/completions"
             payload = {
@@ -500,9 +621,9 @@ class LLMClient:
         started = time.monotonic()
         data = self._request_json("POST", path, payload)
         duration_ms = int((time.monotonic() - started) * 1000)
-        # №49/№50 (§13.8): причина завершения и счётчики читаются ДО разбора
-        # content — при пустом обрезанном ответе метаданные вызова уже есть и
-        # уходят с отказом (диагностика воркера без второй записи).
+        # No49/No50 (§13.8): the finish reason and the counters are read BEFORE
+        # parsing the content - with an empty cut answer the call metadata already
+        # exists and leaves with the refusal (worker diagnostics without a second write).
         finish_reason, truncated = self._read_finish_reason(data, self.spec.provider)
         (
             prompt_count,
@@ -518,7 +639,7 @@ class LLMClient:
             operation=operation,
             model_type=self.spec.model_type,
             budget=budget,
-            budget_source=budget_source,
+            budget_source=budgets.answer_source,
             prompt_tokens=prompt_count,
             completion_tokens=completion_count,
             reasoning_tokens=reasoning_count,
@@ -529,11 +650,19 @@ class LLMClient:
             duration_ms=duration_ms,
             base_url=self.spec.base_url,
             config_source=self.spec.model_source,
+            answer_budget=budgets.answer_budget,
+            reasoning_budget=budgets.reasoning_budget,
+            sent_budget=sent_budget,
+            answer_source=budgets.answer_source,
+            reasoning_source=budgets.reasoning_source,
+            escalated_from=escalated_from,
         )
         try:
-            content = self._parse_chat_content(data, path, truncated=truncated)
+            content = self._parse_chat_content(
+                data, path, truncated=truncated, had_thinking=had_thinking
+            )
         except LLMError as exc:
-            exc.meta = meta  # отказ после ответа модели — метаданные вызова
+            exc.meta = meta  # a failure after the model answered - the call metadata
             raise
         return ChatResult(content=content, meta=meta)
 
@@ -546,10 +675,11 @@ class LLMClient:
         think: bool | None = None,
         operation: str | None = None,
     ) -> str:
-        """Обёртка над `chat_result(...)` — совместимость: возвращает content.
+        """A wrapper over `chat_result(...)` - compatibility: returns content.
 
-        Юнит-тесты и фейки продолжают работать с прежним строковым результатом;
-        `num_predict` теперь необязателен (None — политика «сколько влезет»).
+                Unit tests and fakes keep working with the plain string result;
+                `num_predict` is optional now (None - the "as much as fits" policy).
+
         """
         return self.chat_result(
             system_prompt,
@@ -561,16 +691,17 @@ class LLMClient:
 
     @staticmethod
     def slot_config_warnings(spec: SlotSpec) -> list[tuple[str, str]]:
-        """Предупреждения конфигурации слота (№49, arch §13.5) — чистая функция.
+        """The slot configuration warnings (No49, arch SS13.5) - a pure function.
 
-        Возвращает список `(code, EN-текст)` и ничего не логирует (логирует
-        `main.py` при старте, событие `slot_config_warning`); ни сети, ни
-        Settings не требует. Эффективный бюджет берётся тем же источником
-        истины, что и в вызове (`slot_budget.resolve_output_budget`): явный
-        операторский бюджет слота, иначе «сколько влезет» из заявленного
-        контекста, иначе прежний потолок операции. Пять кодов:
-        `reasoning_tight_budget`, `reasoning_think_off`, `budget_gt_context`,
-        `context_unknown`, `timeout_short`.
+                Returns a list of `(code, EN text)` and logs nothing (main.py logs at
+                startup, the `slot_config_warning` event); needs neither the network nor
+                Settings. The effective budget comes from the same source of truth as in
+                the call (`slot_budget.resolve_output_budget`): the operator's explicit
+                slot budget, else "as much as fits" from the declared context, else the
+                operation's previous cap. Five codes: `reasoning_tight_budget`,
+                `reasoning_think_off`, `budget_gt_context`, `context_unknown`,
+                `timeout_short`.
+
         """
         warnings: list[tuple[str, str]] = []
         prefix = f"slot {spec.name}"
@@ -640,13 +771,14 @@ class LLMClient:
         return warnings
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        """Закодировать batch текстов; порядок результата = порядку входа.
+        """Encode a batch of texts; the result order = the input order.
 
-        ollama — POST /api/embed (input: [...]), openai — POST /v1/embeddings
-        (+Bearer; элементы ответа упорядочиваются по `index`). Проверки
-        контракта ответа (число векторов, размерность = EMBEDDING_DIM) —
-        на вызывающей стороне (EmbeddingService, пул 4): клиент возвращает
-        только то, что прислал сервер.
+                ollama - POST /api/embed (input: [...]); openai - POST /v1/embeddings
+                (+Bearer; the response items are ordered by `index`). The response-contract
+                checks (the vector count, the dimension = EMBEDDING_DIM) belong to the
+                caller (EmbeddingService, pool 4): the client returns exactly what the
+                server sent.
+
         """
         if not texts:
             raise ValueError("embed: пустой список текстов")
@@ -656,13 +788,14 @@ class LLMClient:
         return self._parse_embeddings(data, path)
 
     def check(self) -> CheckResult:
-        """Стартовая проверка слота (решение №5): исход, не исключение.
+        """The startup slot check: an outcome, not an exception.
 
-        Одна попытка, ~5 с, без слота очереди (не генерация). ollama —
-        GET /api/tags + сверка модели слота в списке; openai —
-        GET /v1/models (+Bearer при заданном ключе). Фатальность исхода
-        решает вызывающий (main.py, пул 4): auth_failed — фатально,
-        unreachable/model_missing — WARN + деградация.
+                One attempt, about 5 s, no queue slot (not generation). ollama - GET
+                /api/tags + the slot model checked against the list; openai - GET
+                /v1/models (+Bearer with a key set). The fatality of the outcome is the
+                caller's (main.py, pool 4): auth_failed is fatal; unreachable/
+                model_missing - WARN + degradation.
+
         """
         try:
             response = self._client.get(
@@ -671,7 +804,7 @@ class LLMClient:
                 timeout=CHECK_TIMEOUT_SEC,
             )
         except _RETRIABLE:
-            # Сеть/таймаут: WARN + деградация, не фатально (решение №5).
+            # Network/timeout: WARN + degradation, not fatal.
             return CHECK_UNREACHABLE
         if response.status_code in STATUS_UNAUTHORIZED:
             return CHECK_AUTH_FAILED
@@ -686,19 +819,19 @@ class LLMClient:
         return CHECK_OK
 
     def close(self) -> None:
-        """Закрыть HTTP-пул (чистое завершение процесса)."""
+        """Close the HTTP pool (a clean process shutdown)."""
         self._client.close()
 
     def decide(self, state: str, questions: list[dict]) -> dict:
-        """Один `POST /v1/systemone`: state + ВСЕ вопросы в одном теле (FR-2.3).
+        """One `POST /v1/systemone`: state + ALL questions in one body (FR-2.3).
 
-        Возвращает разобранный блок `answers` (фактическая форма сервера,
-        сверено 2026-10-10); `questions` — канонические dict'ы (`name`/`kind`/
-        `text`/`labels`/`criteria`), имена полей сервера знает только
-        `_systemone_payload`.
-        Отказ (сеть/не-200/мусор) — `LLMError` с прежними признаками
-        (`transient`/`status`); признак `empty` не ставится никогда —
-        генерации нет, «пустого ответа» быть не может.
+                Returns the parsed `answers` block (the server's actual shape, verified
+                live); `questions` - the canonical dicts (`name`/`kind`/`text`/`labels`/
+                `criteria`); only `_systemone_payload` knows the server's field names. A
+                failure (network/non-200/garbage) - `LLMError` with the usual flags
+                (`transient`/`status`); the `empty` flag is never set - there is no
+                generation, so there can be no "empty answer".
+
         """
         payload = {
             "model": self.spec.model,
@@ -708,14 +841,15 @@ class LLMClient:
         return self._parse_systemone(data)
 
     def check_decision(self) -> DecisionCheck:
-        """Стартовая проверка «модель умеет decision» (FR-1.3/FR-6.2).
+        """The startup "can the model do decision" check (FR-1.3/FR-6.2).
 
-        Одна попытка, таймаут слота, без слота очереди (не генерация):
-        минимальный `/v1/systemone` с одним тривиальным `noul`-вопросом.
-        Исходы: `ok` — корректный блок `answers`; `unsupported` — сервер не
-        знает маршрут или не принимает тип вопроса (400–404/200 с чужим
-        форматом); `auth_failed` — 401/403; `unreachable` — сеть/таймаут/5xx/
-        не-JSON. Фатальность исхода решает вызывающий (main.py).
+                One attempt, the slot timeout, no queue slot (not generation): a minimal
+                `/v1/systemone` with one trivial `noul` question. Outcomes: `ok` - a
+                correct `answers` block; `unsupported` - the server does not know the
+                route or rejects the question kind (400-404/200 with a foreign shape);
+                `auth_failed` - 401/403; `unreachable` - network/timeout/5xx/non-JSON.
+                The fatality of the outcome is the caller's (main.py).
+
         """
         questions = [
             {
@@ -752,26 +886,27 @@ class LLMClient:
         try:
             self._parse_systemone(data)
         except LLMError:
-            # Сервер ответил, но контракта не знает — исход «не умеет decision».
+            # The server answered but does not know the contract - the "cannot do decision" outcome.
             return DECISION_CHECK_UNSUPPORTED
         return DECISION_CHECK_OK
 
     @staticmethod
     def _systemone_payload(state: str, questions: list[dict]) -> dict:
-        """Тело `/v1/systemone` — ОДНА точка адаптации формата (arch §6.2/§13.6).
+        """The `/v1/systemone` body - THE single adaptation point of the format (arch SS6.2/SS13.6).
 
-        Фактический контракт сервера (ollama ≥ 0.35.1; сверено живым запросом
-        2026-10-10): `questions` — ОБЪЕКТ «имя вопроса → вопрос» (1..64),
-        у вопроса `type` (choice|noul|score) и `instructions` (формулировка,
-        НЕ `name`/`text`), а `criteria` — варианты `choice` (ключ — метка,
-        значение — описание либо null для голой метки; сервер требует не
-        меньше двух), массив описаний для `score` (от низшего балла к высшему)
-        либо `{"true": …, "false": …}` для `noul` (необязательно). `state` —
-        непустая строка (объект/массив сервер тоже принимает). `model`
-        добавляет вызывающий (`decide`/`check_decision`): функция чистая и
-        тестируется без клиента. Если сервер разойдётся с этим форматом —
-        правится ровно эта пара (`_systemone_payload`/`_parse_systemone`) и её
-        контрактный тест, потребители не меняются.
+                The server's actual contract (ollama >= 0.35.1; verified by a live
+                request): `questions` is an OBJECT "question name -> question" (1..64); a
+                question carries `type` (choice|noul|score) and `instructions` (the
+                wording, NOT `name`/`text`); `criteria` - the `choice` options (the key is
+                the label, the value - a description or null for a bare label; the server
+                requires at least two), an array of descriptions for `score` (from the
+                lowest score up), or `{"true": ..., "false": ...}` for `noul` (optional).
+                `state` - a non-empty string (an object/array is accepted too). `model` is
+                added by the caller (`decide`/`check_decision`): the function is pure and
+                testable without a client. If the server diverges from this format - only
+                this pair (`_systemone_payload`/`_parse_systemone`) and its contract test
+                change; consumers do not.
+
         """
         items: dict[str, dict[str, Any]] = {}
         for question in questions:
@@ -782,8 +917,8 @@ class LLMClient:
             }
             criteria = question.get("criteria")
             if kind == "choice":
-                # Варианты choice задаёт сам объект criteria: метки — его ключи.
-                # Метки без описания доезжают как null (голая метка).
+                # The choice options come from the criteria object itself: the labels are its keys.
+                # Labels without a description arrive as null (a bare label).
                 options: dict[str, str | None] = {
                     str(label): None for label in (question.get("labels") or ())
                 }
@@ -794,14 +929,14 @@ class LLMClient:
                         )
                 item["criteria"] = options
             elif kind == "score":
-                # score: описания уровней от низшего балла к высшему (0..N-1).
+                # score: the level descriptions from the lowest score up (0..N-1).
                 levels = (
                     criteria.values() if isinstance(criteria, Mapping) else criteria
                 )
                 item["criteria"] = [str(level) for level in (levels or ())]
             elif criteria:
-                # noul: необязательные описания двух исходов; сервер знает
-                # только ключи 'true'/'false' (лишние отвергает).
+                # noul: the optional descriptions of the two outcomes; the server knows
+                # only the 'true'/'false' keys (it rejects the rest).
                 item["criteria"] = {
                     str(key): str(value)
                     for key, value in criteria.items()
@@ -812,13 +947,14 @@ class LLMClient:
 
     @staticmethod
     def _parse_systemone(data: Any) -> dict:
-        """Разобрать ответ `/v1/systemone` — ОДНА точка адаптации (arch §6.2).
+        """Parse the `/v1/systemone` response - THE single adaptation point (arch SS6.2).
 
-        Возвращает `{имя вопроса: канонический ответ}`; три формы ответа
-        сервера (`noul`/`choice`/`score`) нормализуются в канонические ключи
-        `kind`/`label`/`probability`/`confidence`/`probabilities`/`score`/`raw`.
-        Ответ без блока `answers` или с незнакомой формой вопроса — `LLMError`
-        (это НЕ «пустой ответ»: генерации нет).
+                Returns `{question name: canonical answer}`; the three server shapes
+                (`noul`/`choice`/`score`) normalize into the canonical keys
+                `kind`/`label`/`probability`/`confidence`/`probabilities`/`score`/`raw`.
+                A response without the `answers` block or with an unknown question shape -
+                `LLMError` (this is NOT an "empty answer": there is no generation).
+
         """
         if not isinstance(data, dict):
             raise LLMError(f"{DECISION_PATH}: ответ не объект JSON")
@@ -832,7 +968,7 @@ class LLMClient:
 
     @staticmethod
     def _normalize_decision_answer(name: str, value: Any) -> dict:
-        """Один ответ вопроса → канонический dict (формы сервера)."""
+        """One question's answer -> a canonical dict (the server shapes)."""
         if not isinstance(value, dict):
             raise LLMError(
                 f"{DECISION_PATH}: ответ вопроса «{name}» — не объект JSON"
@@ -888,14 +1024,15 @@ class LLMClient:
             f"{DECISION_PATH}: незнакомая форма ответа вопроса «{name}»"
         )
 
-    # --- внутреннее ----------------------------------------------------------
+    #--- internal ----------------------------------------------------------
 
     def _headers(self) -> dict[str, str]:
-        """Bearer — при заданном ключе: openai-провайдеру и decision-слоту.
+        """Bearer - with a key set: the openai provider and the decision slot.
 
-        Нативный ollama-маршрут `/v1/systemone` (decision) ходит с Bearer,
-        когда оператор задал `DECISION_API_KEY` (arch §8); генеративные
-        ollama-слоты ключ не отправляют (решение №4).
+                The native ollama route `/v1/systemone` (decision) goes with Bearer when
+                the operator set `DECISION_API_KEY` (arch SS8); generative ollama slots
+                never send a key.
+
         """
         if not self.spec.api_key.strip():
             return {}
@@ -913,11 +1050,12 @@ class LLMClient:
         num_predict: int,
         think_flag: bool | None,
     ) -> dict[str, Any]:
-        """Тело /api/chat: model, messages system+user, stream:false,
-        num_predict, temperature; think по флагу (False — явный запрет).
+        """The /api/chat body: model, messages system+user, stream:false,
+                    num_predict, temperature; think per the flag (False - an explicit ban).
 
-        keep_alive НЕ отправляется (решение №6): моделью управляет сервер
-        (OLLAMA_KEEP_ALIVE); в v2.0 клиент слал «15m» — снято.
+                    keep_alive is NOT sent: the server manages the model
+                    (OLLAMA_KEEP_ALIVE); in v2.0 the client sent "15m" - removed.
+
         """
         payload: dict[str, Any] = {
             "model": self.spec.model,
@@ -930,16 +1068,17 @@ class LLMClient:
             "temperature": TEMPERATURE,
         }
         if think_flag is False:
-            # Явный запрет рассуждений (как в v2.0: think:false экономит
-            # секунды на бездумных задачах).
+            # An explicit thinking ban (as in v2.0: think:false saves seconds on
+            # thoughtless tasks).
             payload["think"] = False
         return payload
 
     def _request_json(self, method: str, path: str, payload: dict[str, Any]) -> Any:
-        """Один HTTP-вызов (ollama — через слот очереди) + разбор JSON.
+        """One HTTP call (ollama - through the queue slot) + a JSON parse.
 
-        Ретраев нет: транзиентность помечается флагом `LLMError.transient`,
-        решение о повторе — за вызывающим (эмбеддер — ретраит, чат — нет).
+                No retries: transience is marked by `LLMError.transient`; the repeat
+                decision belongs to the caller (the embedder retries, chat does not).
+
         """
         try:
             if self.spec.provider == PROVIDER_OLLAMA:
@@ -952,8 +1091,8 @@ class LLMClient:
                     method, path, json=payload, headers=self._headers()
                 )
         except _RETRIABLE as exc:
-            # №39 §6.3: таймаут и транспорт больше не неотличимы — таймаут
-            # несёт отдельный признак `timeout` (исход TIMEOUT, не UNAVAILABLE).
+            # No39 §6.3: timeout and transport are no longer indistinguishable - the timeout
+            # carries its own `timeout` flag (the TIMEOUT outcome, not UNAVAILABLE).
             raise LLMError(
                 f"сервер слота {self.spec.name} недоступен "
                 f"({self.spec.base_url}): {exc}",
@@ -964,18 +1103,19 @@ class LLMClient:
             self._raise_for_status(response, path)
         try:
             return response.json()
-        except ValueError as exc:  # json.JSONDecodeError — подкласс ValueError
+        except ValueError as exc:  # json.JSONDecodeError is a subclass of ValueError
             raise LLMError(f"не-JSON ответ от {path}: {exc}") from exc
 
     def _raise_for_status(self, response: httpx.Response, path: str) -> None:
-        """Не-200 → типизированная ошибка.
+        """Non-200 -> a typed error.
 
-        401/403 — отказ доступа у ЛЮБОГО провайдера (arch §6.1: `AUTH` =
-        «401/403 — ждать бессмысленно»): у openai-слота это `LLMAuthError` с
-        hint про `{SLOT}_API_KEY`, у ollama-слота (Bearer не ходит) — обычный
-        `LLMError` с признаком `auth`. Исход вызова в обоих случаях `AUTH`
-        (FR-4.3) — разница только в тексте: hint про ключ остаётся там, где
-        ключ действительно есть (решение №4), и не вводит в заблуждение.
+                401/403 - an access refusal from ANY provider (arch SS6.1: `AUTH` =
+                "401/403 - waiting is pointless"): at an openai slot it is `LLMAuthError`
+                with the `{SLOT}_API_KEY` hint; at an ollama slot (no Bearer) - a plain
+                `LLMError` with the `auth` flag. The outcome is `AUTH` in both cases
+                (FR-4.3) - only the text differs: the key hint stays where a key actually
+                exists, and does not mislead.
+
         """
         status = response.status_code
         body = " ".join(response.text[:_ERROR_BODY_CHARS].split())
@@ -995,7 +1135,7 @@ class LLMClient:
         )
 
     def _auth_message(self, status: int) -> str:
-        """Hint 401/403 (решение №4): пустой ключ — задать, заданный — неверен."""
+        """The 401/403 hint: an empty key - set one; a set one - wrong."""
         slot_env = f"{self.spec.name.upper()}_API_KEY"
         prefix = f"провайдер openai слота {self.spec.name}: API отклонил запрос ({status}) — "
         if not self.spec.api_key.strip():
@@ -1004,12 +1144,13 @@ class LLMClient:
 
     @staticmethod
     def _read_finish_reason(data: Any, provider: str) -> tuple[str | None, bool]:
-        """Причина завершения и признак обрезки (§13.3).
+        """The finish reason and the truncation flag (SS13.3).
 
-        ollama — `done_reason` (поля `finish_reason` у ollama НЕТ); openai —
-        `choices[0].finish_reason`. `"length"` — обрезка по лимиту вывода
-        (`truncated=True`); иначе/отсутствие поля — `(None, False)` — обрезка
-        невыяснена, старый/незнакомый сервер вызов не роняет.
+                ollama - `done_reason` (there is NO `finish_reason` field at ollama);
+                openai - `choices[0].finish_reason`. `"length"` - cut by the output limit
+                (`truncated=True`); otherwise/an absent field - `(None, False)` - the
+                truncation unknown, an old/unfamiliar server does not fail the call.
+
         """
         reason: str | None = None
         if isinstance(data, dict):
@@ -1031,17 +1172,18 @@ class LLMClient:
     def _read_usage(
         data: Any, provider: str
     ) -> tuple[int | None, int | None, int | None, bool, int]:
-        """Счётчики и факт размышления ответа (§13.3).
+        """The counters and the thinking fact of the response (SS13.3).
 
-        → `(prompt_tokens, completion_tokens, reasoning_tokens,
-        had_thinking, thinking_chars)`. ollama: `prompt_eval_count`,
-        `eval_count`, `reasoning_tokens=None` (счётчика токенов размышления
-        у ollama НЕТ), `message.thinking` → факт/длина текста. openai:
-        `usage.prompt_tokens`, `usage.completion_tokens`,
-        `usage.completion_tokens_details.reasoning_tokens` (если сервер отдаёт),
-        текст размышления — `message.reasoning_content` и `message.reasoning`
-        (у Selectel — `reasoning`). Все чтения — с защитой: отсутствующее поле
-        не роняет вызов, остаётся `None`.
+                -> `(prompt_tokens, completion_tokens, reasoning_tokens, had_thinking,
+                thinking_chars)`. ollama: `prompt_eval_count`, `eval_count`,
+                `reasoning_tokens=None` (ollama has NO reasoning-token counter),
+                `message.thinking` -> the fact/length of the text. openai:
+                `usage.prompt_tokens`, `usage.completion_tokens`,
+                `usage.completion_tokens_details.reasoning_tokens` (when the server sends
+                it); the thinking text - `message.reasoning_content` and
+                `message.reasoning` (at Selectel - `reasoning`). Every read is guarded: an
+                absent field does not fail the call and stays `None`.
+
         """
         prompt: int | None = None
         completion: int | None = None
@@ -1081,16 +1223,22 @@ class LLMClient:
         had_thinking = bool(thinking)
         return prompt, completion, reasoning, had_thinking, len(thinking or "")
 
-    def _parse_chat_content(self, data: Any, path: str, *, truncated: bool) -> str:
-        """Извлечь content ответа чата; малформация/пустота — отказ (§5.5).
+    def _parse_chat_content(
+        self, data: Any, path: str, *, truncated: bool, had_thinking: bool = False
+    ) -> str:
+        """Extract the chat response content; malformation/emptiness - a refusal (SS5.5).
 
-        ollama — `message.content` (поле `thinking` отбрасывается в
-        принципе); openai — `choices[0].message.content` (поля
-        `reasoning_content`/`reasoning` игнорируются: ответ из одних
-        рассуждений без content — не ответ).
-        Правило первенства (№50 §13.8): если `truncated` (причина завершения
-        `length`), пустой content — это ОБРЕЗКА бюджета, признак `truncated`
-        (признак `empty` не ставится); иначе — прежний `empty`.
+                ollama - `message.content` (the `thinking` field is discarded in
+                principle); openai - `choices[0].message.content` (the
+                `reasoning_content`/`reasoning` fields are ignored: an answer made of
+                pure reasoning without content is not an answer).
+                The precedence rule (No50 SS13.8): when `truncated` (the finish reason
+                `length`), an empty content is a BUDGET cut, the `truncated` flag (the
+                `empty` flag is not set); otherwise - the old `empty`.
+                LSBN-T-33: an empty content with NON-EMPTY reasoning - the separate
+                "budget eaten by reasoning" outcome (`LLMReasoningBudgetError`),
+                recognizable by the type, not by parsing the error text.
+
         """
         content = None
         if isinstance(data, dict):
@@ -1108,17 +1256,31 @@ class LLMClient:
                 message = data.get("message")
                 content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str) or not content.strip():
+            if had_thinking:
+                # No answer while thinking happened: the reasoning ate the output budget
+                # (lsbdef-0008 in its explicit form). The distinct type lets the caller
+                # tell "eaten by reasoning" from "the slot refused".
+                detail = (
+                    "done_reason='length' — обрезано по суммарному лимиту вывода"
+                    if truncated
+                    else "модель завершилась без content"
+                )
+                raise LLMReasoningBudgetError(
+                    f"бюджет ответа съеден рассуждением: content пуст, "
+                    f"thinking был ({detail}; провайдер {self.spec.provider}, "
+                    f"слот {self.spec.name}, {path})"
+                )
             if truncated:
-                # reasoning-модель могла съесть бюджет вывода целиком —
-                # вызов обрезан, а не «пуст» (№50 §13.8, дефект lsbdef-0008).
+                # A reasoning model may have eaten the whole output budget -
+                # the call is cut, not "empty" (No50 §13.8, the lsbdef-0008 defect).
                 raise LLMError(
                     f"пустой content при причине завершения 'length' "
                     f"(обрезано по лимиту вывода; провайдер {self.spec.provider}, "
                     f"слот {self.spec.name}, {path})",
                     truncated=True,
                 )
-            # №39 §6.3: пустой ответ помечается отдельным признаком `empty` —
-            # исход EMPTY не смешивается с недоступностью (FR-3.3). Текст прежний.
+            # No39 §6.3: an empty answer gets its own `empty` flag -
+            # the EMPTY outcome is not mixed with unavailability (FR-3.3). The text unchanged.
             raise LLMError(
                 f"пустой content в ответе модели "
                 f"(провайдер {self.spec.provider}, слот {self.spec.name}, {path})",
@@ -1128,14 +1290,15 @@ class LLMClient:
 
     @staticmethod
     def _parse_embeddings(data: Any, path: str) -> list[list[float]]:
-        """Вектора ответа embed: ollama — `embeddings`, openai — `data`.
+        """The embed response vectors: ollama - `embeddings`; openai - `data`.
 
-        openai-элементы сортируются по `index` (порядок результата =
-        порядку входа). Форма ответа (число векторов, размерность) не
-        проверяется — контракт ответа остаётся на EmbeddingService.
+                The openai items are sorted by `index` (the result order = the input
+                order). The response shape (the vector count, the dimension) is not
+                checked - the response contract stays with EmbeddingService.
+
         """
         if isinstance(data, dict) and isinstance(data.get("embeddings"), list):
-            return list(data["embeddings"])  # ollama: уже в порядке входа
+            return list(data["embeddings"])  # ollama: already in the input order
         if isinstance(data, dict) and isinstance(data.get("data"), list):
             items = sorted(
                 (item for item in data["data"] if isinstance(item, dict)),
@@ -1153,8 +1316,9 @@ class LLMClient:
 
     @staticmethod
     def _model_names(data: Any) -> set[str]:
-        """Имена моделей из ответа check(): ollama `models[].name`,
-        openai `data[].id` — сверка модели слота идёт по точному имени."""
+        """The model names of a check() response: ollama `models[].name`,
+                    openai `data[].id` - the slot model is matched by the exact name.
+        """
         names: set[str] = set()
         if not isinstance(data, dict):
             return names

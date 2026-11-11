@@ -1,10 +1,11 @@
-"""Колонка `notes.comment` (no24-01, релиз 3.2.0): схема и идемпотентная миграция.
+"""The `notes.comment` column (no24-01, release 3.2.0): the schema and the idempotent migration.
 
-Унаследованная БД предыдущей версии (колонки `comment` нет) → `init_db`
-добавляет её PRAGMA-guarded `ALTER` (по образцу `title`), данные целы; повторный
-старт — no-op. Свежие БД получают колонку из `_NOTES_DDL`. Лимит 250 в схеме
-НЕ CHECK — валидация доменная (как у `title`), поэтому проверяем только
-наличие колонки и `NULL` по умолчанию («комментария нет»).
+    An inherited DB of the previous version (no `comment` column) → `init_db`
+    adds it with a PRAGMA-guarded `ALTER` (modeled on `title`); the data intact;
+    a repeated start — a no-op. Fresh DBs get the column from `_NOTES_DDL`. The
+    250 limit in the schema is NOT a CHECK — the validation is domain-level
+    (like `title`), so we only check the column's presence and the `NULL` default
+    ("no comment").
 """
 
 from __future__ import annotations
@@ -29,12 +30,12 @@ def _comments() -> dict[int, str | None]:
 
 
 def _downgrade_to_prev(settings: Settings) -> None:
-    """Свежая БД → состояние до постановки 24: снять колонку `comment`.
+    """A fresh DB → the pre-brief-24 state: remove the `comment` column.
 
-    Схема строится текущим `init_db` (все прочие таблицы и колонки — как у
-    живой БД), после чего снимается ровно объект этой постановки (SQLite
-    3.35+ поддерживает `DROP COLUMN`): апгрейд проверяется на живой БД с
-    данными, а не на пустом файле.
+                The schema is built by the current `init_db` (all other tables and
+                columns — as in a live DB), after which exactly this brief's object
+                is removed (SQLite 3.35+ supports `DROP COLUMN`): the upgrade is
+                checked on a live DB with data, not on an empty file.
     """
     with session(settings) as conn:
         conn.execute(
@@ -45,8 +46,8 @@ def _downgrade_to_prev(settings: Settings) -> None:
             "INSERT INTO notes (id, text, title) "
             "VALUES (2, 'текст второй заметки', 'Вторая заметка')"
         )
-        # no24-02: снимаем и объекты FTS пометок (признак версии «до №24») —
-        # иначе DROP COLUMN comment падает: триггер ссылается на new.comment.
+        # no24-02: we also drop the comments' FTS objects (the mark of a "pre-24" version) —
+        # otherwise DROP COLUMN comment fails: the trigger references new.comment.
         conn.execute("DROP TRIGGER IF EXISTS notes_comment_fts_ai")
         conn.execute("DROP TRIGGER IF EXISTS notes_comment_fts_au")
         conn.execute("DROP TABLE IF EXISTS notes_comment_fts")
@@ -55,34 +56,34 @@ def _downgrade_to_prev(settings: Settings) -> None:
 
 @pytest.fixture
 def legacy(test_env: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> Settings:
-    """Живая БД предыдущей версии (до постановки 24) с двумя заметками."""
+    """A live DB of the previous version (before brief 24) with two notes."""
     monkeypatch.setenv("EMBEDDING_DIM", "8")
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
     _downgrade_to_prev(settings)
-    assert "comment" not in _notes_columns()  # предусловие: БД «до №24»
+    assert "comment" not in _notes_columns()  # the precondition: a "pre-24" DB
     return settings
 
 
 def test_migrate_adds_comment_column(legacy: Settings) -> None:
-    """БД без `comment` → init_db добавляет колонку; повторный старт — no-op."""
+    """A DB without `comment` → init_db adds the column; a repeated start — a no-op."""
     init_db(get_settings())
     assert "comment" in _notes_columns()
-    assert _comments() == {1: None, 2: None}  # данные целы, комментариев нет
+    assert _comments() == {1: None, 2: None}  # the data intact; no comments
 
-    init_db(get_settings())  # идемпотентность: второй прогон ничего не меняет
+    init_db(get_settings())  # idempotency: a second run changes nothing
     assert "comment" in _notes_columns()
     assert _comments() == {1: None, 2: None}
 
 
 def test_fresh_db_gets_comment_from_ddl() -> None:
-    """Свежая БД получает колонку сразу из `_NOTES_DDL` (миграция — no-op)."""
+    """A fresh DB gets the column straight from `_NOTES_DDL` (the migration — a no-op)."""
     init_db(get_settings())
     with session(get_settings()) as conn:
         columns = {
             row["name"]: row for row in conn.execute("PRAGMA table_info(notes)")
         }
     assert "comment" in columns
-    assert columns["comment"]["notnull"] == 0  # NULL = комментария нет
-    assert columns["comment"]["dflt_value"] is None  # лимит — доменный, не CHECK
+    assert columns["comment"]["notnull"] == 0  # NULL = no comment
+    assert columns["comment"]["dflt_value"] is None  # the limit — domain-level, not a CHECK

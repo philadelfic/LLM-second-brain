@@ -1,11 +1,12 @@
-"""Причина дефекта lsbdef-0008 видна в журнале (релиз 3.2.0; arch §6.3/§7.2).
+"""The lsbdef-0008 defect's cause is visible in the journal (release 3.2.0; arch §6.3/§7.2).
 
-Юнит без сети: слот отдаёт пустой `content` при `done_reason=length` и поле
-`thinking` (reasoning-модель съела бюджет вывода). Событие отказа называет
-причину `outcome=truncated` и несёт диагностику последнего вызова
-(`had_thinking`, `finish_reason`, бюджет); работа остаётся `pending` — повтор
-по back-off, очередь не зацикливается на «пустом ответе». Ответ без маркера
-вердикта — `off_contract` с фрагментом `detail` (≤160 симв.).
+    A unit without the network: the slot serves an empty `content` at
+    `done_reason=length` plus a `thinking` field (a reasoning model ate the output
+    budget). The failure event names the cause `outcome=truncated` and carries the
+    last call's diagnostics (`had_thinking`, `finish_reason`, the budget); the work
+    stays `pending` — a retry on back-off, the queue does not loop on an "empty
+    answer". An answer without the verdict marker — `off_contract` with a `detail`
+    fragment (≤160 chars).
 """
 
 from __future__ import annotations
@@ -84,14 +85,14 @@ def pending_judge_jobs(settings) -> int:
 
 
 def test_reasoning_budget_eaten_is_truncated(settings, caplog) -> None:
-    """Пустой content + length + thinking → truncated с диагностикой, работа pending."""
+    """Empty content + length + thinking → truncated with diagnostics; the work stays pending."""
     notes = NoteService(settings, FailingEmbedder())
     notes.save("первая заметка обрезки бюджета")
     notes.save("вторая заметка обрезки бюджета")
     body = judge_body("", done_reason="length")
     body["message"]["thinking"] = "длинные рассуждения съели бюджет вывода"
     worker = build_worker(settings, judge_service(settings, body))
-    assert worker.process_pending() == 2  # создаёт dedup-работы (очередь judge)
+    assert worker.process_pending() == 2  # creates dedup jobs (the judge queue)
     with caplog.at_level(logging.INFO, logger="app"):
         worker.process_judge_pending()
     failures = records(caplog, "dedup_judge_failed")
@@ -101,12 +102,12 @@ def test_reasoning_budget_eaten_is_truncated(settings, caplog) -> None:
     assert record.had_thinking is True
     assert record.finish_reason == "length"
     assert isinstance(record.budget, int) and record.budget > 0
-    # Причина названа, очередь не зациклится: работа ждёт back-off, не «done».
+    # The cause is named and the queue will not loop: the work waits on back-off, not "done".
     assert pending_judge_jobs(settings) == 1
 
 
 def test_off_contract_detail_present(settings, caplog) -> None:
-    """Ответ без маркера вердикта → off_contract с фрагментом detail (≤160)."""
+    """An answer without the verdict marker → off_contract with a detail fragment (≤160)."""
     notes = NoteService(settings, FailingEmbedder())
     notes.save("первая заметка без вердикта")
     notes.save("вторая заметка без вердикта")

@@ -1,8 +1,9 @@
-"""№12 (3.2.0): правка заметки инвалидирует её предупреждение (FR-4.4).
+"""#12 (3.2.0): a note edit invalidates its warning (FR-4.4).
 
-`NoteService.set_warnings_resolver` — узкая инъекция (`WarningsService.
-resolve_for_subject`), без циклических импортов. Правка `text`/`title`/`namespace`
-и сшивание пары снимают открытые предупреждения заметки В ТОЙ ЖЕ транзакции.
+    `NoteService.set_warnings_resolver` — a narrow injection (`WarningsService.
+    resolve_for_subject`), without import cycles. An edit of
+    `text`/`title`/`namespace` and a pair merge clear the note's open warnings in
+    THE SAME transaction.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ def _open_count(settings: Settings, note_id: int) -> int:
 
 
 def test_update_resolves_warning(settings: Settings) -> None:
-    """Правка снимает предупреждение заметки; `merge_pair` — у обеих."""
+    """An edit clears the note's warning; `merge_pair` — for both."""
     notes = NoteService(settings, embedding=HashEmbedder(DIM))
     warnings = WarningsService(settings, classifier=None, namespaces=None)
     notes.set_warnings_resolver(warnings.resolve_for_subject)
@@ -54,10 +55,10 @@ def test_update_resolves_warning(settings: Settings) -> None:
     warnings.open(KIND_NOTE_NO_NODE, "note", newer, "m", {})
 
     notes.update(older, text="исправленный текст ранней заметки")
-    assert _open_count(settings, older) == 0  # правка инвалидировала
-    assert _open_count(settings, newer) == 1  # чужая заметка не тронута
+    assert _open_count(settings, older) == 0  # the edit invalidated it
+    assert _open_count(settings, newer) == 1  # a foreign note is untouched
 
-    # Сшивание пары снимает предупреждения ОБЕИХ заметок (в той же транзакции).
+    # Merging a pair clears BOTH notes' warnings (in the same transaction).
     warnings.open(KIND_NOTE_MISPLACED, "note", older, "m2", {})
     notes.merge_pair(older, "слитый текст заметки", newer)
     assert _open_count(settings, older) == 0

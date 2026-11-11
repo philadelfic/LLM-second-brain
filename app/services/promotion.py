@@ -1,48 +1,53 @@
-"""PromotionService — триггер домена и авто-создание листа (Фаза 10, Шаг 5).
+"""PromotionService — the domain trigger and automatic leaf creation (Phase 10, Step 5).
 
-«Модель для моделей» (§5.7): структура растёт системой. Конвейер одного
-прогона `run()`:
+    "A model for models" (§5.7): the structure grows by the system. The pipeline of
+    one `run()`:
 
-1. **Триггер — SQL-агрегация, не LLM**: `GROUP BY hint_path` (единый
-   полный путь разметки lsb-0005-02) среди default-заметок; группа с счётчиком ≥ NAMESPACE_PROMOTION_THRESHOLD
-   (15) при confidence каждой заметки ≥ NAMESPACE_PROMOTION_MIN_CONFIDENCE
-   (0.60) — кандидат на авто-создание листа. `candidates()` — та же агрегация
-   для `memory_namespaces.promotion_candidates` (актуальная карта для моделей).
-2. **Генерация описания**: LLM по 2–3 суммари группы (Describer — модель
-   суммаризации, маленький num_predict, think:false — паттерн классификатора
-   Шага 4); контракт описаний ≤2 предложений держит обрезка до 2 предложений.
-3. **Косинус-предфильтр антисинонимии**: эмбеддинг описания кандидата против
-   описаний всех узлов реестра; косинус ≥ NAMESPACE_SYNONYM_SIMILARITY (0.85)
-   → слияние БЕЗ LLM (паттерн Фазы 8: косинус — предфильтр, LLM — пограничную
-   зону).
-4. **Судья структуры — LLM-гейт перед созданием** (StructureJudge — модель
-   судьи дедупа, отдельный промпт): (1) пограничная антисинонимия —
-   вердикт «СЛИТЬ <path>»; (2) осмысленность слага/описания — «ОТКЛОНИТЬ»;
-   иначе «СОЗДАТЬ». Вердиктует модель, не человек.
-5. **Действие**: create → provisional-лист (только листья внутри
-   существующих корней — `NamespaceService.create` корни не создаёт);
-   merge → ретро-перекладка в канонический узел одним UPDATE с канонизацией
-   hint; reject → запись вердикта, заметки остаются в default (честно-общие).
-   Ретро-перекладка — один UPDATE (+vector_status='pending' — пере-кодировка
-   векторов в партицию нового узла штатной очередью).
+    1. **The trigger — SQL aggregation, not an LLM**: `GROUP BY hint_path` (the
+       single full path of the lsb-0005-02 markup) among default notes; a group
+       with a counter ≥ NAMESPACE_PROMOTION_THRESHOLD
+       (15) at each note's confidence ≥ NAMESPACE_PROMOTION_MIN_CONFIDENCE
+       (0.60) — a candidate for automatic leaf creation. `candidates()` — the same
+       aggregation for `memory_namespaces.promotion_candidates` (an up-to-date map
+       for models).
+    2. **Description generation**: an LLM over 2–3 of the group's summaries (the
+       Describer — the summarization model, a small num_predict, think:false — the
+       Step-4 classifier pattern); the ≤2-sentences descriptions contract is held
+       by a truncation to 2 sentences.
+    3. **The cosine anti-synonymy prefilter**: the candidate description's
+       embedding against the descriptions of all registry nodes; cosine ≥
+       NAMESPACE_SYNONYM_SIMILARITY (0.85) → a merge WITHOUT an LLM (the Phase 8
+       pattern: cosine is the prefilter, the LLM — the borderline zone).
+    4. **The structure judge — an LLM gate before creation** (a StructureJudge —
+       the dedup judge's model, a separate prompt): (1) borderline anti-synonymy —
+       the "MERGE <path>" verdict; (2) the slug/description meaningfulness —
+       "REJECT"; otherwise "CREATE". The model verdicts, not a human.
+    5. **The action**: create → a provisional leaf (only leaves inside existing
+       roots — `NamespaceService.create` never creates roots);
+       merge → a retro-move into the canonical node by one UPDATE with hint
+       canonization; reject → the verdict is recorded, the notes stay in default
+       (honestly generic). The retro-move is one UPDATE (+vector_status='pending'
+       — re-encoding the vectors into the new node's partition by the regular
+       queue).
 
-**Cooldown** (бриф «лимиты/cooldown»): три механизма — (а) запись вердикта
-в `promotions` (merged/rejected): группа больше не дёргает describer/судью
-(иначе отклонённый кандидат зациклил бы LLM-вызовы при каждом прогоне);
-(б) существование узла: группа с уже зарегистрированным путём — не кандидат;
-(в) лимиты защиты от шторма: NAMESPACE_AUTO_MAX_PER_DAY (provisional-узлы,
-созданные за сегодня по UTC) и NAMESPACE_MAX_LEAVES_PER_DOMAIN (потолок
-листов в корне) — кандидаты с превышением пропускаются с логом до вызова
-LLM. Созданный узел записи в `promotions` не требует: ретро-перекладка
-уводит группу из default, а новые высокоуверенные default-заметки с тем же
-hint переезжают в узел штатной причёской Шага 4 (узел уже существует).
+    **Cooldown** (the brief "limits/cooldown"): three mechanisms — (a) recording
+    the verdict in `promotions` (merged/rejected): the group no longer pokes the
+    describer/judge (otherwise a rejected candidate would loop LLM calls on every
+    run); (b) the node's existence: a group with an already-registered path is not
+    a candidate; (c) storm-protection limits: NAMESPACE_AUTO_MAX_PER_DAY
+    (provisional nodes created today by UTC) and NAMESPACE_MAX_LEAVES_PER_DOMAIN
+    (the leaves ceiling in a root) — candidates over the limit are skipped with a
+    log before any LLM call. A created node needs no `promotions` record: the
+    retro-move takes the group out of default, and new high-confidence default
+    notes with the same hint move into the node by the regular Step-4 grooming
+    (the node already exists).
 
-Границы автономии (§5.7): домен hint'а обязан быть зарегистрированным корнем
-(новые корни — только оператор; незарегистрированный hint — сигнал в логах
-«в default копится контент вне известных корней»); авто — только листья.
-Отказ любого шага (DescriberError/StructureJudgeError/EmbeddingError) данные
-не портит: кандидат остаётся, повтор — при следующем прогоне (NFR-3), группу
-будит следующая классификация default-заметки в воркере.
+    Autonomy bounds (§5.7): the hint's domain must be a registered root (new roots
+    — only by the operator; an unregistered hint — a log signal "default
+    accumulates content outside known roots"); automatic — leaves only. A failure
+    of any step (DescriberError/StructureJudgeError/EmbeddingError) does not spoil
+    the data: the candidate stays, a retry — at the next run (NFR-3); the next
+    default-note classification in the worker wakes the group.
 """
 
 from __future__ import annotations
@@ -64,32 +69,32 @@ from app.services.namespaces import (
 from app.services.prompts import PromptRegistry
 from app.storage.db import DEFAULT_NAMESPACE, session, transaction
 
-# Описания кандидата строятся по суммари: топ по confidence, детерминированно.
+# The candidate's descriptions are built from summaries: top by confidence, deterministically.
 SUMMARIES_PER_CANDIDATE = 3
 
-# Параметры вызова описания (бюджет 512, think:false) с LSBN-F-34 живут в
-# реестре операций (app/services/operations.OPERATION_FIELD_DEFAULTS —
-# кодовые дефолты операции `describe`) и переопределяются плоским env
-# DESCRIBE_NUM_PREDICT / DESCRIBE_THINK. Таймауты/температура — уровень
-# клиента слота (LLMClient): read-таймаут — цепочка операции; keep_alive
-# не отправляется никому (решение №6 — моделью управляет сервер).
+# The description call parameters (budget 512, think:false) with LSBN-F-34 live in the
+# operations registry (app/services/operations.OPERATION_FIELD_DEFAULTS —
+# the `describe` operation's code defaults) and are overridden by the flat env
+# DESCRIBE_NUM_PREDICT / DESCRIBE_THINK. Timeouts/temperature — the level
+# of the slot client (LLMClient): the read timeout — the operation chain; keep_alive
+# is not sent to anyone (decision #6 — the server governs the model).
 
 
 def _l2_norm(vec: list[float]) -> float:
-    """Евклидова норма вектора (L2)."""
+    """The vector's Euclidean norm (L2)."""
     return math.sqrt(sum(v * v for v in vec))
 
 
 class DescriberError(RuntimeError):
-    """Генератор описания не дал текста: сервер недоступен или ответ пуст."""
+    """The description generator gave no text: the server is unavailable or the answer is empty."""
 
 
 class StructureJudgeError(RuntimeError):
-    """Судья структуры не дал вердикта: сервер недоступен или ответ некорректен."""
+    """The structure judge gave no verdict: the server is unavailable or the answer is invalid."""
 
 
 class Verdict:
-    """Вердикт судьи структуры: action create|merge|reject + цель слияния."""
+    """The structure judge's verdict: the action create|merge|reject + the merge target."""
 
     __slots__ = ("action", "target")
 
@@ -99,21 +104,21 @@ class Verdict:
 
 
 class Describer(Protocol):
-    """Контракт генератора описаний узлов: природы реализации он не знает."""
+    """The node description generator contract: it knows nothing about the implementation nature."""
 
     def describe(
         self, summaries: list[str], slug: str, domain: str
     ) -> str:
-        """Описание нового узла по суммари группы (≤2 предложений)."""
+        """The new node's description from the group's summaries (≤2 sentences)."""
         ...
 
     def close(self) -> None:
-        """Закрыть ресурсы (интерфейс-совместимость с остальными клиентами)."""
+        """Close resources (interface-compatible with the other clients)."""
         ...
 
 
 class StructureJudge(Protocol):
-    """Контракт судьи структуры (гейт перед созданием, §5.7)."""
+    """The structure judge contract (the gate before creation, §5.7)."""
 
     def review(
         self,
@@ -124,25 +129,24 @@ class StructureJudge(Protocol):
         nearest_path: str | None,
         nearest_cosine: float | None,
     ) -> Verdict:
-        """Вердикт по кандидату: СОЗДАТЬ / СЛИТЬ <path> / ОТКЛОНИТЬ."""
+        """A verdict on a candidate: CREATE / MERGE <path> / REJECT."""
         ...
 
     def close(self) -> None:
-        """Закрыть ресурсы (интерфейс-совместимость с остальными клиентами)."""
+        """Close resources (interface-compatible with the other clients)."""
         ...
 
 
-    # --- генератор описания (модель суммаризации, паттерн классификатора) ------
+    # --- description generator (the summarization model, the classifier pattern) ---
 
 class DescriptionService:
-    """Описание узла через chat слота summary (модель суммаризации).
+    """A node description via the summary slot's chat (the summarization model).
 
-    Отдельный маленький вызов (think:false, num_predict 128) — паттерн
-    классификатора Шага 4: та же модель, что суммаризация, один клиент
-    слота (Фаза 11: LLMClient слота summary, оллама-вызвы сериализует
-    ollama_slot). Слишком длинный ответ обрезается до 2 предложений —
-    контракт описаний (решение О.) соблюдается механикой, а не надеждой
-    на модель.
+            A separate small call (think:false, num_predict 128) — the Step-4
+            classifier pattern: the same model as summarization, one slot client
+            (Phase 11: the summary slot's LLMClient; ollama calls are serialized by
+            ollama_slot). An overly long answer is trimmed to 2 sentences — the
+            descriptions contract is held by mechanics, not by hoping in the model.
     """
 
     def __init__(
@@ -157,10 +161,10 @@ class DescriptionService:
     ) -> None:
         self._settings = settings
         self._prompts = registry if registry is not None else PromptRegistry()
-        # DI сборки или свой клиент с transport-инъекцией для юнит-тестов.
-        # Операция `describe` (LSBN-F-34): плоский env DESCRIBE_* поверх слота
-        # summary; кодовые дефолты операции — бюджет 128 и think=False
-        # (operations.OPERATION_FIELD_DEFAULTS, бывшие DESCRIBE_NUM_PREDICT).
+        # DI builds or a dedicated client with a transport injection for unit tests.
+        # The `describe` operation (LSBN-F-34): the flat env DESCRIBE_* on top of the summary
+        # slot; the operation's code defaults — the budget 128 and think=False
+        # (operations.OPERATION_FIELD_DEFAULTS, the former DESCRIBE_NUM_PREDICT).
         self._llm = (
             llm
             if llm is not None
@@ -168,11 +172,11 @@ class DescriptionService:
                 SlotSpec.for_operation("describe", settings)[0], transport=transport
             )
         )
-        # None — попыток не было (health не врёт до первых данных).
+        # None — no attempts yet (health does not lie before the first data).
         self.last_attempt_ok: bool | None = None
 
     def describe(self, summaries: list[str], slug: str, domain: str) -> str:
-        """Описание нового узла по суммари группы; отказ — DescriberError."""
+        """The new node's description from the group's summaries (≤2 sentences)."""
         if not summaries:
             raise ValueError("describe: ожидается непустой список суммари")
         try:
@@ -183,29 +187,29 @@ class DescriptionService:
                     slug=slug,
                     summaries="\n".join(f"- {s}" for s in summaries),
                 ),
-                operation="describe",  # LSBN-F-34: бюджет/think — цепочка операции
+                operation="describe",  # LSBN-F-34: the budget/think — the operation chain
             )
         except LLMError as exc:
-            # Текст клиента сохраняется: HTTP-статус, адрес слота, hint
-            # про {SLOT}_API_KEY у auth-отказа (решение №4).
+            # The client text is preserved: HTTP status, the slot address, the
+            # {SLOT}_API_KEY hint on an auth failure (decision #4).
             self.last_attempt_ok = False
             raise DescriberError(str(exc)) from exc
         self.last_attempt_ok = True
         return self._trim(content)
 
     def close(self) -> None:
-        """Закрыть HTTP-пул (чистое завершение процесса)."""
+        """Close resources (interface-compatible with the other clients)."""
         self._llm.close()
 
-    # --- внутреннее ---------------------------------------------------------
+    # --- internal -------------------------------------------------------------
 
     @staticmethod
     def _trim(content: str) -> str:
-        """Нормализовать и обрезать до 2 предложений (контракт описаний).
+        """Normalize and trim to 2 sentences (the descriptions contract).
 
-        Модель может проигнорировать «1–2 предложения» — контракт держим
-        обрезкой: первые два предложения, остальное отбрасывается. Пустой
-        результат — DescriberError (узла без описания не бывает).
+                    The model may ignore "1–2 sentences" — we hold the contract by
+                    trimming: the first two sentences, the rest is dropped. An empty
+                    result — DescriberError (a node without a description never exists).
         """
         text = " ".join(content.split())
         if not text:
@@ -219,15 +223,15 @@ class DescriptionService:
         trimmed = ". ".join(sentences)
         if not trimmed.endswith((".", "!", "?")):
             trimmed += "."
-        if count_sentences(trimmed) > 2:  # страховка: контракт ≤2 предложений
+        if count_sentences(trimmed) > 2:  # a safety net: the ≤2-sentences contract
             raise DescriberError(f"описание не обрезается до 2 предложений: {trimmed[:120]}")
         return trimmed
 
 
-# --- судья структуры (модель судьи дедупа, паттерн Фазы 8) -----------------
+# --- structure judge (the dedup judge's model, the Phase 8 pattern) --------
 
-# Путь-цель вердикта СЛИТЬ: слаги латиница/цифры/дефис, путь 1..3 уровней
-# (lsb-0005-03: вложенность узлов до глубины 3).
+# The MERGE verdict's target path: slugs of latin/digits/hyphen, a path of 1..3 levels
+# (lsb-0005-03: node nesting up to depth 3).
 VERDICT_PATH_RE = re.compile(
     r"[a-z0-9]+(?:-[a-z0-9]+)*"
     r"(?:/[a-z0-9]+(?:-[a-z0-9]+)*){0,2}"
@@ -235,17 +239,17 @@ VERDICT_PATH_RE = re.compile(
 
 
 class StructureJudgeService:
-    """Вердикт судьи структуры через chat слота judge (non-stream).
+    """The structure judge's verdict via the judge slot's chat (non-stream).
 
-    Модель судьи дедупа (JUDGE_MODEL, REQUIREMENTS §5.7 «та же модель
-    судьи дедупа, отдельный промпт»); Фаза 11: транспорт — общий клиент
-    слота judge (LLMClient), параметры вызова — как у JudgeService
-    (Фаза 8): think из NAMESPACE_JUDGE_THINK (None — наследует
-    JUDGE_THINK), бюджет JUDGE_NUM_PREDICT; keep_alive не отправляется
-    (решение №6). Отказ судьи (транспорт) — StructureJudgeError: кандидат
-    остаётся без вердикта и повторяется при следующем прогоне (NFR-3).
-    Плохой вердикт (СЛИТЬ без узла) — тоже StructureJudgeError:
-    недоопределённое решение не превращаем в создание.
+            The dedup judge's model (JUDGE_MODEL, REQUIREMENTS §5.7 "the same dedup
+            judge model, a separate prompt"); Phase 11: the transport — the shared
+            judge slot client (LLMClient), the call parameters — like JudgeService
+            (Phase 8): think from NAMESPACE_JUDGE_THINK (None — inherits JUDGE_THINK),
+            the JUDGE_NUM_PREDICT budget; keep_alive is not sent (decision #6). A judge
+            failure (transport) — StructureJudgeError: the candidate stays without a
+            verdict and retries at the next run (NFR-3). A bad verdict (MERGE without
+            a node) — also StructureJudgeError: an underdefined decision is never
+            turned into a creation.
     """
 
     def __init__(
@@ -260,11 +264,11 @@ class StructureJudgeService:
     ) -> None:
         self._settings = settings
         self._prompts = registry if registry is not None else PromptRegistry()
-        # DI сборки (общий клиент слота judge) или свой клиент с
-        # transport-инъекцией для юнит-тестов (MockTransport). Операция
-        # `structure_judge` (LSBN-F-34): плоский env STRUCTURE_JUDGE_* поверх
-        # слота judge; NAMESPACE_JUDGE_THINK остаётся старшим каналом think
-        # (None — цепочка операции: STRUCTURE_JUDGE_THINK → JUDGE_THINK).
+        # DI builds (the shared judge slot client) or a dedicated client with
+        # a transport injection for unit tests (MockTransport). The
+        # `structure_judge` operation (LSBN-F-34): the flat env STRUCTURE_JUDGE_* on top of
+        # the judge slot; NAMESPACE_JUDGE_THINK stays the senior think channel
+        # (None — the operation chain: STRUCTURE_JUDGE_THINK → JUDGE_THINK).
         self._llm = (
             llm
             if llm is not None
@@ -284,7 +288,7 @@ class StructureJudgeService:
         nearest_path: str | None,
         nearest_cosine: float | None,
     ) -> Verdict:
-        """Вердикт по кандидату; любой отказ — StructureJudgeError."""
+        """A verdict on a candidate: CREATE / MERGE <path> / REJECT."""
         try:
             content = self._llm.chat(
                 self._prompts.structure_judge_system,
@@ -303,51 +307,52 @@ class StructureJudgeService:
                         else "нет близких узлов"
                     ),
                 ),
-                # Бюджет/think — цепочка операции (LSBN-F-34):
-                # STRUCTURE_JUDGE_NUM_PREDICT → JUDGE_NUM_PREDICT → авто;
+                # The budget/think — the operation chain (LSBN-F-34):
+                # STRUCTURE_JUDGE_NUM_PREDICT → JUDGE_NUM_PREDICT → auto;
                 # think: NAMESPACE_JUDGE_THINK → STRUCTURE_JUDGE_THINK →
-                # JUDGE_THINK (None — флаг spec клиента).
+                # JUDGE_THINK (None — the client's spec flag).
                 num_predict=None,
                 think=self._think(),
                 operation="structure_judge",
             )
         except LLMError as exc:
-            # Текст клиента сохраняется: HTTP-статус, адрес слота, hint
-            # про {SLOT}_API_KEY у auth-отказа (решение №4).
+            # The client text is preserved: HTTP status, the slot address, the
+            # {SLOT}_API_KEY hint on an auth failure (decision #4).
             self.last_attempt_ok = False
             raise StructureJudgeError(str(exc)) from exc
         try:
             verdict = self._parse(content)
         except StructureJudgeError:
-            self.last_attempt_ok = False  # нераспознанный вердикт — тоже отказ
+            self.last_attempt_ok = False  # an unrecognized verdict is also a failure
             raise
         self.last_attempt_ok = True
         return verdict
 
     def close(self) -> None:
-        """Закрыть HTTP-пул (чистое завершение процесса)."""
+        """Close resources (interface-compatible with the other clients)."""
         self._llm.close()
 
-    # --- внутреннее ---------------------------------------------------------
+    # --- internal -------------------------------------------------------------
 
     def _think(self) -> bool | None:
-        """Флаг think судьи структуры: NAMESPACE_JUDGE_THINK — старший канал
-        (None — цепочка операции LSBN-F-34: STRUCTURE_JUDGE_THINK →
-        JUDGE_THINK через spec клиента). Флаг отделён от дедуп-судьи
-        (E2E Шага 7 — думающий судья структуры «залипал» на парах-
-        близнецах при 20 ток/с, голодая суммаризацию на общем слоте;
-        бездумный вердикт — 10–50 токенов).
+        """The structure judge's think flag: NAMESPACE_JUDGE_THINK — the senior channel
+                    (None — the LSBN-F-34 operation chain: STRUCTURE_JUDGE_THINK →
+                    JUDGE_THINK through the client's spec). The flag is separated from the
+                    dedup judge (the Step-7 E2E — a thinking structure judge "stuck" on
+                    twin pairs at 20 tok/s, starving summarization on the shared slot;
+                    a thoughtless verdict — 10–50 tokens).
         """
         return self._settings.namespace_judge_think
 
     @staticmethod
     def _parse(content: str) -> Verdict:
-        """Разбор отметки CREATE / MERGE <path> / REJECT.
+        """Parse the CREATE / MERGE <path> / REJECT mark.
 
-        Markdown-жирный стрипается, регистр не учитывается. «MERGE» требует
-        узла-цели в ответе: путь извлекается из исходного content (не из
-        upper) регэкспом слагов; без пути — отказ (недоопределённый вердикт
-        не превращаем в создание). Ответ без отметки — StructureJudgeError.
+                    Markdown-bold is stripped, case does not matter. "MERGE" requires a
+                    target node in the answer: the path is extracted from the original
+                    content (not from the upper-cased) by the slug regexp; without a path —
+                    a failure (an underdefined verdict is never turned into a creation).
+                    An answer without a mark — StructureJudgeError.
         """
         upper = " ".join(content.replace("*", " ").upper().split())
         if "REJECT" in upper:
@@ -366,17 +371,17 @@ class StructureJudgeService:
         )
 
 
-# --- триггер домена ----------------------------------------------------------
+# --- the domain trigger -----------------------------------------------------
 
 
 class PromotionService:
-    """Триггер + авто-создание листа: агрегация hint-групп → гейт → действие.
+    """The trigger + automatic leaf creation: hint-group aggregation → gate → action.
 
-    Зависимости инъектируются (DI): embedding — косинус-предфильтр,
-    describer — генерация описания, judge — гейт перед созданием,
-    namespaces — реестр (общий экземпляр с воркером/NoteService).
-    describer/judge None — триггер не запускается (тестовый режим, как
-    classifier=None у воркера).
+            Dependencies are injected (DI): embedding — the cosine prefilter, the
+            describer — description generation, the judge — the gate before creation,
+            namespaces — the registry (the shared instance with the worker/
+            NoteService). describer/judge None — the trigger does not start (a test
+            mode, like the worker's classifier=None).
     """
 
     def __init__(
@@ -393,20 +398,20 @@ class PromotionService:
         self._judge = judge
         self._namespaces = namespaces if namespaces is not None else NamespaceService(settings)
 
-    # --- чтение: кандидаты (SQL-агрегация, §5.7 «триггер — не LLM») ----------
+    # --- reads: candidates (SQL aggregation, §5.7 "the trigger is not an LLM") ---
 
     def candidates(self) -> list[dict[str, Any]]:
-        """Группы default-заметок, доросшие до порога и без вердикта.
+        """Default-note groups that reached the threshold and have no verdict.
 
-        SQL-агрегация: счётчик ≥ NAMESPACE_PROMOTION_THRESHOLD при confidence
-        каждой заметки ≥ NAMESPACE_PROMOTION_MIN_CONFIDENCE; далее фильтры
-        cooldown: домен hint'а зарегистрирован (корни — оператор), узел ещё
-        не создан, вердикта merged/rejected нет. Группировка — по единому
-        полному пути hint_path глубины 2 или 3 (lsb-0005-03): глубина-1
-        (домен-общая) не промоутится; родитель обязан существовать
-        (иерархия без дыр — глубина-3 ждёт создания родителя depth 2).
-        Сортировка по убыванию счётчика — большие группы первыми,
-        детерминированно.
+                    SQL aggregation: a counter ≥ NAMESPACE_PROMOTION_THRESHOLD at every
+                    note's confidence ≥ NAMESPACE_PROMOTION_MIN_CONFIDENCE; then the
+                    cooldown filters: the hint's domain is registered (roots — the
+                    operator), the node is not created yet, there is no merged/rejected
+                    verdict. Grouping — by the single full hint_path of depth 2 or 3
+                    (lsb-0005-03): depth-1 (domain-generic) is not promoted; the parent must
+                    exist (a hierarchy without holes — depth-3 waits for its depth-2 parent
+                    to be created). Sorted by the counter descending — bigger groups first,
+                    deterministically.
         """
         with session(self._settings) as conn:
             rows = conn.execute(
@@ -430,16 +435,16 @@ class PromotionService:
             hint = row["hint_path"]
             depth = len(hint.split("/"))
             if depth not in (2, 3):
-                continue  # глубина-1 (домен-общая) не промоутится; >3 не бывает
+                continue  # depth-1 (domain-generic) is not promoted; >3 never happens
             domain = hint.split("/", 1)[0]
             slug = "/".join(hint.split("/")[1:])
             parent = "/".join(hint.split("/")[:-1])
             if not self._namespaces.exists(parent):
-                continue  # родитель обязан существовать (иерархия без дыр)
+                continue  # the parent must exist (a hierarchy without holes)
             if hint in decided:
-                continue  # cooldown: вердикт судьи уже вынесен
+                continue  # cooldown: the judge's verdict is already issued
             if self._namespaces.exists(hint):
-                continue  # узел уже есть — группа разберётся причёской
+                continue  # the node already exists — grooming will sort the group out
             result.append(
                 {
                     "domain": domain,
@@ -450,20 +455,20 @@ class PromotionService:
             )
         return result
 
-    # --- прогон конвейера ----------------------------------------------------
+    # --- the pipeline run ----------------------------------------------------
 
     def run(self) -> dict[str, Any]:
-        """Прогнать всех готовых кандидатов; сводка {created, merged, rejected}.
+        """Run all ready candidates; a summary {created, merged, rejected}.
 
-        Вызывается воркером после классификации default-заметки (разметка
-        могла докинуть группу до порога). Отказ на одном кандидате не
-        отменяет остальных (NFR-3): кандидат пропускается до следующего
-        прогона (в сводку не попадает). Лимиты дня/листов проверяются до
-        LLM-вызовов.
+                    Called by the worker after classifying a default note (the markup could
+                    have pushed a group over the threshold). A failure on one candidate
+                    does not cancel the others (NFR-3): the candidate is skipped until the
+                    next run (it does not enter the summary). The day/leaves limits are
+                    checked before the LLM calls.
         """
         report: dict[str, Any] = {"created": [], "merged": [], "rejected": []}
         if self._describer is None or self._judge is None:
-            return report  # триггер отключён (тестовый режим)
+            return report  # the trigger is off (a test mode)
         logger = logging.getLogger("app")
         self._signal_root_orphans()
         day_limit = self._day_limit_reached()
@@ -492,14 +497,15 @@ class PromotionService:
         return report
 
     def _signal_root_orphans(self) -> None:
-        """Сигнал оператору: в default копится контент вне известных корней (§5.7).
+        """A signal to the operator: default accumulates content outside known roots (§5.7).
 
-        Новые корни система сама не создаёт (границы автономии): если
-        разметка причёски стабильно указывает на незарегистрированный домен
-        и группа доросла до порога — оператор решает, быть ли такому корню
-        (REST Шаг 6). Сигнал — по порогу триггера (шум отсечён), в логах
-        (event=root_orphans); в memory_namespaces не выносим — структурная
-        сигнализация остаётся операторской.
+                    The system does not create new roots itself (the autonomy bounds): if
+                    the grooming markup consistently points at an unregistered domain and
+                    the group reached the threshold — the operator decides whether such a
+                    root should exist (the Step-6 REST). The signal — by the trigger
+                    threshold (noise is cut off), in the logs (event=root_orphans); it is
+                    not carried into memory_namespaces — structural signaling stays with
+                    the operator.
         """
         with session(self._settings) as conn:
             rows = conn.execute(
@@ -525,12 +531,12 @@ class PromotionService:
             )
 
     def _promote_one(self, domain: str, slug: str) -> str | None:
-        """Полный цикл одного кандидата: created|merged|rejected|None.
+        """The full cycle of one candidate: created|merged|rejected|None.
 
-        None — отказ describer/судьи (транспорт): кандидат остаётся БЕЗ
-        вердикта, повтор при следующем прогоне (NFR-3); в сводке не
-        считается. Вернувшийся вердикт всегда записывается (cooldown):
-        merged/rejected — в promotions, created — узлом реестра.
+                    None — a describer/judge failure (transport): the candidate stays
+                    WITHOUT a verdict, a retry at the next run (NFR-3); it does not count
+                    in the summary. A returned verdict is always recorded (cooldown):
+                    merged/rejected — into promotions, created — by a registry node.
         """
         logger = logging.getLogger("app")
         path = f"{domain}/{slug}"
@@ -543,12 +549,12 @@ class PromotionService:
                 extra={"event": "promotion_failed", "domain": domain, "slug": slug,
                        "reason": "describer"},
             )
-            return None  # без описания кандидата нет: повтор — следующий прогон
+            return None  # no candidate description: a retry — the next run
         nearest_path, nearest_cosine = self._nearest_node(description)
         if nearest_cosine is not None and (
             nearest_cosine >= self._settings.namespace_synonym_similarity
         ):
-            # Косинус-предфильтр: слияние без LLM (паттерн Фазы 8).
+            # The cosine prefilter: a merge without an LLM (the Phase 8 pattern).
             self._merge(path, nearest_path)  # type: ignore[arg-type]
             return "merged"
         try:
@@ -570,10 +576,10 @@ class PromotionService:
         if verdict.action == "merge":
             target = self._namespaces.validate_path(verdict.target or "")
             if target == path:
-                # Судья «слил» кандидата с ним самим — вердикт некорректен:
-                # кандидата не создаём и не запрещаем навсегда (записи нет),
-                # повтор — следующий прогон; стабильно мусорные ответы видны
-                # в логах (promotion_failed, reason=judge_self_merge).
+                # The judge "merged" the candidate with itself — the verdict is incorrect:
+                # we neither create the candidate nor forbid it forever (no record),
+                # a retry — the next run; consistently garbage answers are visible
+                # in the logs (promotion_failed, reason=judge_self_merge).
                 logger.warning(
                     "promotion: judge merged candidate into itself — bad verdict",
                     extra={"event": "promotion_failed", "domain": domain,
@@ -581,9 +587,9 @@ class PromotionService:
                 )
                 return None
             if target == DEFAULT_NAMESPACE:
-                # Слияние с default бессмысленно: кандидат в нём и лежит.
-                # Вердикт не записываем (путаница, а не решение); повтор —
-                # следующий прогон, мусор виден в логах.
+                # A merge with default is meaningless: the candidate lies in it already.
+                # We do not record the verdict (a confusion, not a decision); a retry —
+                # the next run; the garbage is visible in the logs.
                 logger.warning(
                     "promotion: judge merged candidate into default — bad verdict",
                     extra={"event": "promotion_failed", "domain": domain,
@@ -591,9 +597,9 @@ class PromotionService:
                 )
                 return None
             if not self._namespaces.exists(target):
-                # Судья назвал незарегистрированный узел: вердикт ненадёжен,
-                # но это его РЕШЕНИЕ (не отказ транспорта) — фиксируем как
-                # reject, чтобы группа не дёргала судью повторно.
+                # The judge named an unregistered node: the verdict is unreliable,
+                # but it is its DECISION (not a transport failure) — we record it as
+                # a reject so the group does not poke the judge again.
                 logger.warning(
                     "promotion: judge merge target unknown — recorded as rejected",
                     extra={"event": "promotion_rejected", "domain": domain,
@@ -615,7 +621,7 @@ class PromotionService:
         return "created"
 
     def _create(self, path: str, description: str) -> None:
-        """Создать provisional-лист и переложить группу (один UPDATE)."""
+        """Create a provisional leaf and move the group (one UPDATE)."""
         self._namespaces.create(path, description, status="provisional")
         moved = self._retro_move(path, path)
         logging.getLogger("app").info(
@@ -625,10 +631,10 @@ class PromotionService:
         )
 
     def _merge(self, path: str, canonical: str) -> None:
-        """Слияние кандидата с каноническим узлом (один UPDATE + вердикт).
+        """Merge the candidate into the canonical node (one UPDATE + the verdict).
 
-        Заметки группы переехали — hint канонизируется (hint_path =
-        канонический путь узла).
+                    The group's notes have moved — the hint is canonized
+                    (hint_path = the node's canonical path).
         """
         moved = self._retro_move(path, canonical)
         self._record(path, "merged", canonical)
@@ -638,14 +644,15 @@ class PromotionService:
                    "hint": path, "moved": moved},
         )
 
-    # --- SQL-механика --------------------------------------------------------
+    # --- SQL mechanics ---------------------------------------------------------
 
     def _thematic_nodes(self) -> list[dict[str, Any]]:
-        """Тематические узлы реестра (без системного свопа default).
+        """The registry's thematic nodes (without the system default swap).
 
-        Косинус-предфильтр и судья сравнивают кандидата только с ними:
-        слияние с default бессмысленно (кандидат в нём и лежит), а своп в
-        списке кандидатов-на-слияние только путает вердикт.
+                    The cosine prefilter and the judge compare the candidate only with
+                    them: a merge with default is meaningless (the candidate lies in it
+                    already), and the swap in the merge-candidate list would only confuse
+                    the verdict.
         """
         return [
             node
@@ -654,12 +661,12 @@ class PromotionService:
         ]
 
     def _retro_move(self, path: str, canonical: str) -> int:
-        """Ретро-перекладка группы в канонический узел ОДНИМ UPDATE (§5.7).
+        """A retro-move of the group into the canonical node by ONE UPDATE (§5.7).
 
-        Канонизация hint_path: hint_path = канонический путь узла — в лист
-        полный путь листа, в корень — корень («общая» для домена).
-        vector_status='pending' — штатная пере-кодировка векторов в партию
-        нового узла (воркер). Возврат — число переложенных заметок.
+                    hint_path canonization: hint_path = the node's canonical path — into a
+                    leaf, the leaf's full path; into a root, the root ("generic" for the
+                    domain). vector_status='pending' — the regular re-encoding of vectors
+                    into the new node's batch (the worker). Returns the moved note count.
         """
         with session(self._settings) as conn, transaction(conn):
             cursor = conn.execute(
@@ -674,7 +681,7 @@ class PromotionService:
     def _record(
         self, path: str, status: str, canonical: str | None = None
     ) -> None:
-        """Записать вердикт судьи (cooldown: группа больше не кандидат)."""
+        """Record the judge's verdict (cooldown: the group is no longer a candidate)."""
         with session(self._settings) as conn, transaction(conn):
             conn.execute(
                 "INSERT INTO promotions (hint_path, status, canonical_path) "
@@ -686,13 +693,13 @@ class PromotionService:
             )
 
     def _decided_hints(self) -> set[str]:
-        """Группы с вынесенным вердиктом (cooldown: не дёргаем судью)."""
+        """Groups with an issued verdict (cooldown: we do not poke the judge)."""
         with session(self._settings) as conn:
             rows = conn.execute("SELECT hint_path FROM promotions").fetchall()
         return {row["hint_path"] for row in rows}
 
     def _group_summaries(self, path: str) -> list[str]:
-        """Топ-3 суммари группы (по confidence, затем id) — вход описания."""
+        """The group's top-3 summaries (by confidence, then id) — the description input."""
         with session(self._settings) as conn:
             rows = conn.execute(
                 "SELECT summary FROM notes "
@@ -705,21 +712,23 @@ class PromotionService:
         return [row["summary"] for row in rows]
 
     def _nearest_node(self, description: str) -> tuple[str | None, float | None]:
-        """Косинус-предфильтр: ближайший узел по описанию (эмбеддинги).
+        """The cosine prefilter: the nearest node by description (embeddings).
 
-        Описание кандидата + описания тематических узлов реестра — одним
-        батчем embed_texts (описаний мало — узлов 3–7). default исключён:
-        слияние кандидата со свопом бессмысленно, он в нём и лежит. Возврат
-        (path, cosine) ближайшего или (None, None), если реестр пуст/
-        эмбеддинг отказал. Отказ кодирования (EmbeddingError) — предфильтр
-        просто не находит ближайшего: гейт остаётся судье (деградация, не
-        отказ конвейера).
+                    The candidate's description + the thematic nodes' descriptions of the
+                    registry — in one embed_texts batch (few descriptions — 3–7 nodes).
+                    default is excluded: merging the candidate into the swap is
+                    meaningless, it already lies there. Returns (path, cosine) of the
+                    nearest or (None, None) when the registry is empty / the embedding
+                    failed. An encoding failure (EmbeddingError) — the prefilter simply
+                    finds no nearest: the gate stays with the judge (a degradation, not a
+                    pipeline failure).
 
-        Косинус считается по L2-нормированным векторам: dot product по
-        нормированным = честный cosine, нечувствительный к масштабу
-        провайдера (симметрично `vectors.py`, где косинус не зависит от
-        нормы). Если норма вектора 0 — пара даёт cosine 0.0 (слияния не
-        будет — безопасное направление)."""
+                    The cosine is computed over L2-normalized vectors: a dot product over
+                    normalized ones = an honest cosine, insensitive to the provider's
+                    scale (symmetric to `vectors.py`, where the cosine does not depend on
+                    the norm). A zero vector norm — the pair gives cosine 0.0 (no merge —
+                    the safe direction).
+        """
         nodes = self._thematic_nodes()
         if not nodes:
             return None, None
@@ -734,8 +743,8 @@ class PromotionService:
             )
             return None, None
         candidate_vec, node_vecs = vectors[0], vectors[1:]
-        # L2-нормализация: dot product по нормированным = честный cosine,
-        # не зависит от масштаба провайдера.
+        # L2 normalization: a dot product over normalized ones = an honest cosine,
+        # independent of the provider's scale.
         candidate_norm = _l2_norm(candidate_vec)
         if candidate_norm == 0.0:
             return None, None
@@ -754,12 +763,12 @@ class PromotionService:
                 best_cosine = cos
                 best_index = i
         if best_cosine == -1.0:
-            # Все узлы нулевые — гейт остаётся судье.
+            # All nodes are zero — the gate stays with the judge.
             return None, None
         return nodes[best_index]["path"], best_cosine
 
     def _day_limit_reached(self) -> bool:
-        """NAMESPACE_AUTO_MAX_PER_DAY: provisional-узлы, созданные сегодня (UTC)."""
+        """NAMESPACE_AUTO_MAX_PER_DAY: provisional nodes created today (UTC)."""
         with session(self._settings) as conn:
             count = conn.execute(
                 "SELECT COUNT(*) FROM namespaces "
@@ -769,7 +778,7 @@ class PromotionService:
         return int(count) >= self._settings.namespace_auto_max_per_day
 
     def _leaves_limit_reached(self, domain: str) -> bool:
-        """NAMESPACE_MAX_LEAVES_PER_DOMAIN: потолок листов в корне."""
+        """NAMESPACE_MAX_LEAVES_PER_DOMAIN: the leaves ceiling in a root."""
         with session(self._settings) as conn:
             count = conn.execute(
                 "SELECT COUNT(*) FROM namespaces WHERE path LIKE ? || '/%'",

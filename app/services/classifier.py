@@ -1,43 +1,46 @@
-"""ClassificationService — фоновая причёска (Фаза 10, Шаг 4; REQUIREMENTS §5.7).
+"""ClassificationService — background grooming (Phase 10, Step 4; REQUIREMENTS §5.7).
 
-Классификатор default-заметок: слот summary — та же модель, что
-суммаризация (SUMMARY_MODEL / SUMMARY_BASE_URL), отдельный промпт,
-JSON-вывод, маленький `num_predict`. Выход — два поля разметки:
-`hint_path` (полный путь 1..3 слага или null = общая), `confidence` (0–1).
-Параметры разметки — внутренние данные,
-НЕ в MCP-контрактах (не теги-2.0): клиент-модель видит только узлы реестра.
+    The default-note classifier: the summary slot — the same model as
+    summarization (SUMMARY_MODEL / SUMMARY_BASE_URL), a separate prompt,
+    JSON output, a small `num_predict`. The output is two tagging fields:
+    `hint_path` (a full path of 1..3 slugs or null = generic), `confidence` (0–1).
+    Tagging parameters are internal data,
+    NOT part of the MCP contracts (not tags-2.0): the client model sees only
+    registry nodes.
 
-Фаза 11: HTTP-транспорт вынесен в `LLMClient` (app/services/llm_client.py)
-— классификатор делит клиент слота summary (провайдер `ollama` | `openai`,
-решение №1: классификация живёт в одном слоте с суммаризацией). Сервис
-больше не держит httpx и не собирает пейлоады сам: system+user, non-stream,
-маленький `num_predict` и явный `think: false` уходят через
-`LLMClient.chat`; очередь F1 (ollama_slot — только ollama-провайдер),
-Bearer при заданном ключе и разбор ответа (`message.content`, reasoning-
-поля отбрасываются) — внутри клиента. keep_alive не отправляется никому
-(решение №6: моделью управляет сервер, OLLAMA_KEEP_ALIVE). Read-таймаут —
-таймаут слота summary (SUMMARY_TIMEOUT_SEC): с v2.1 клиент один на слот,
-отдельный CLASSIFIER_TIMEOUT_SEC больше не задаётся.
+    Phase 11: the HTTP transport is factored out into `LLMClient`
+    (app/services/llm_client.py) — the classifier shares the summary slot client
+    (provider `ollama` | `openai`, decision #1: classification lives in one slot
+    with summarization). The service no longer keeps httpx or builds payloads
+    itself: system+user, non-stream, a small `num_predict` and an explicit
+    `think: false` go through `LLMClient.chat`; the F1 queue (ollama_slot —
+    ollama provider only), Bearer when a key is set, and response parsing
+    (`message.content`, reasoning fields discarded) live inside the client.
+    keep_alive is not sent to anyone (decision #6: the server governs the model,
+    OLLAMA_KEEP_ALIVE). The read timeout — the summary slot timeout
+    (SUMMARY_TIMEOUT_SEC): since v2.1 the client is one per slot, a separate
+    CLASSIFIER_TIMEOUT_SEC is no longer set.
 
-Вызывается только фоновым воркером после суммаризации default-заметки
-(последовательно, не параллельно — ollama_slot сериализует вызовы к одному
-base_url). Отказ — `ClassificationError`: заметка остаётся в default,
-`classified_at` не ставится, повтор — после `memory_update` (анти-зацикливание
-§5.7). `last_attempt_ok` — как у суммаризатора (NFR-4, /health).
+    Invoked only by the background worker after summarizing a default note
+    (sequentially, not in parallel — ollama_slot serializes calls to one
+    base_url). Failure — `ClassificationError`: the note stays in default,
+    `classified_at` is not set, a retry comes after `memory_update` (anti-looping
+    §5.7). `last_attempt_ok` — like the summarizer (NFR-4, /health).
 
-Единственный hint-путь (`hint_path`) валидируется через `validate_path`
-реестра (слаги латиница-цифры-дефис, 1..3 сегмента, вложенность под
-`default/...` запрещена); нарушение — некорректная разметка →
-`ClassificationError`, заметка остаётся в default (повтор после update).
+    The single hint path (`hint_path`) is validated via the registry's
+    `validate_path` (slugs of latin-digits-hyphen, 1..3 segments, nesting under
+    `default/...` forbidden); a violation — invalid tagging →
+    `ClassificationError`, the note stays in default (a retry after update).
 
-Промпт: в user-сообщение передаются известные узлы (path: description) —
-«подходит существующий — используй; специфична и не подходит — новый слаг
-(латиница-цифры-дефис); общая — null». Консистентность слагов растёт вместе
-со списком известных узлов. Текст — из реестра промптов (Фаза 11, решение
-№7): `classifier_system` — зашитая константа, файлами не создаётся никогда.
+    Prompt: the user message carries the known nodes (path: description) —
+    "if an existing one fits, use it; if specific and nothing fits — a new slug
+    (latin-digits-hyphen); generic — null". Slug consistency grows together with
+    the list of known nodes. The text comes from the prompt registry (Phase 11,
+    decision #7): `classifier_system` is a baked-in constant, never created by
+    files.
 
-Юнит-тестам — транспорт без сети: `transport` принимает httpx.MockTransport
-или handler (пробрасывается в LLMClient слота).
+    Unit tests — transport without the network: `transport` accepts
+    httpx.MockTransport or a handler (passed into the slot's LLMClient).
 """
 
 from __future__ import annotations
@@ -57,29 +60,30 @@ from app.services.namespaces import NamespaceService, NamespaceValidationError
 from app.services.prompts import PromptRegistry
 from app.services.slot_outcome import SlotOutcome, classify_llm_error
 
-# Параметры вызова, не настраиваемые env (ARCH §4.7): маленький бюджет
-# JSON-разметки; think:false — явный запрет рассуждений (быстрее). №49: это
-# legacy-потолок классификатора ("classify" в slot_budget.LEGACY_OUTPUT_BUDGET),
-# действующий при неизвестном контексте; при заявленном — авто-бюджет.
+# Call parameters not configurable via env (ARCH §4.7): a small JSON-tagging
+# budget; think:false — an explicit no-reasoning switch (faster). #49: this is
+# the classifier's legacy ceiling ("classify" in slot_budget.LEGACY_OUTPUT_BUDGET),
+# applied when the context is unknown; with a declared one — the auto-budget.
 CLASSIFIER_NUM_PREDICT = 768
 
-# Резервная метка decision-вопроса разметки (реестр, arch §6.4): «общая»
-# заметка, не привязанная к узлу, → `hint_path is None`.
+# The fallback label of the tagging decision question (registry, arch §6.4): a
+# note not bound to a node → `hint_path is None`.
 GENERIC_LABEL = "generic"
 
-# Минимум кандидатов у `choice`-вопроса decision-модели (живой контракт
-# `/v1/systemone`, сверено 2026-10-10): сервер требует 2–26 вариантов в
-# `criteria`, иначе 400. Один кандидат — выбирать не из чего: решение НЕ
-# применимо, вызова нет (arch §13.6).
+# The minimum candidates of the decision model's `choice` question (live contract
+# of `/v1/systemone`, verified 2026-10-10): the server requires 2–26 options in
+# `criteria`, otherwise 400. One candidate — nothing to choose from: the decision
+# is NOT applicable, no call (arch §13.6).
 DECISION_MIN_CANDIDATES = 2
 
 
 class ClassificationError(RuntimeError):
-    """Классификация не выполнена: сервер недоступен или ответ некорректен.
+    """Classification failed: the server is unavailable or the response is invalid.
 
-    `outcome` — единый тип исхода вызова слота (№39, arch §6.4): отказ
-    клиента — `classify_llm_error`, «не найден маркер/структура/JSON» —
-    явно `OFF_CONTRACT` (дефолт). Воркер пишет исход в журнал.
+            `outcome` — the single call-outcome type of a slot (#39, arch §6.4): a
+            client failure — `classify_llm_error`; "marker/structure/JSON not found" —
+            explicitly `OFF_CONTRACT` (the default). The worker writes the outcome
+            to the journal.
     """
 
     def __init__(
@@ -91,38 +95,38 @@ class ClassificationError(RuntimeError):
     ) -> None:
         super().__init__(message)
         self.outcome = outcome
-        # Метаданные состоявшегося вызова (№49): отказ после ответа модели
-        # (разметка не разобрана) несёт их воркеру.
+        # Metadata of a completed call (#49): a failure after the model's response
+        # (tagging not parsed) carries them to the worker.
         self.meta = meta
 
 
 @dataclass(frozen=True)
 class Classification:
-    """Разметка default-заметки (внутренние данные, §5.7)."""
+    """Tagging of a default note (internal data, §5.7)."""
 
-    hint_path: str | None  # полный путь 1..3 слага или null (общая)
+    hint_path: str | None  # full path of 1..3 slugs or null (generic)
     confidence: float  # 0..1
-    meta: ChatMeta | None = None  # №49: метаданные вызова (заполняет сервис)
+    meta: ChatMeta | None = None  # #49: call metadata (filled by the service)
 
 
 class Classifier(Protocol):
-    """Контракт классификатора: природы реализации он не знает.
+    """The classifier contract: it knows nothing about the implementation nature.
 
-    Реализации: ClassificationService (живой слот summary) и тестовый
-    фейк (tests/fakes.py) — воркер зависит от протокола, а не от класса.
+            Implementations: ClassificationService (the live summary slot) and a test
+            fake (tests/fakes.py) — the worker depends on the protocol, not the class.
     """
 
     def classify(self, text: str, known_nodes: list[dict[str, Any]]) -> Classification:
-        """Разметить default-заметку по известным узлам реестра."""
+        """Tag a default note against the known registry nodes."""
         ...
 
     def close(self) -> None:
-        """Закрыть ресурсы (интерфейс-совместимость с EmbeddingService)."""
+        """Close resources (interface-compatible with EmbeddingService)."""
         ...
 
 
 class ClassificationService:
-    """Разметка default-заметки через chat слота summary (non-stream)."""
+    """Tag a default note via the summary slot's chat (non-stream)."""
 
     def __init__(
         self,
@@ -137,13 +141,13 @@ class ClassificationService:
     ) -> None:
         self._settings = settings
         self._prompts = registry if registry is not None else PromptRegistry()
-        # LSBN-F-12: decision-слот (None — выключен, поведение v3.1.0).
+        # LSBN-F-12: the decision slot (None — disabled, v3.1.0 behavior).
         self._decider = decider
-        # DI сборки (общий клиент слота summary) или свой клиент с
-        # transport-инъекцией для юнит-тестов (MockTransport). Операция
-        # `classify` (LSBN-F-34): плоский env CLASSIFY_* переопределяет
-        # конфигурацию разметки поверх слота summary; decision-резерв
-        # (LSBN-F-12) остаётся на своих DECISION_*.
+        # DI builds (the shared summary slot client) or a dedicated client with
+        # a transport injection for unit tests (MockTransport). The `classify`
+        # operation (LSBN-F-34): flat env CLASSIFY_* overrides the tagging
+        # configuration on top of the summary slot; the decision fallback
+        # (LSBN-F-12) stays on its own DECISION_*.
         self._llm = (
             llm
             if llm is not None
@@ -151,33 +155,27 @@ class ClassificationService:
                 SlotSpec.for_operation("classify", settings)[0], transport=transport
             )
         )
-        # None — попыток не было (health не врёт до первых данных).
+        # None — no attempts yet (health does not lie before the first data).
         self.last_attempt_ok: bool | None = None
-        # Метаданные последнего вызова (№49/№50): диагностика в /health.slots
-        # без чтения журнала (None — вызова ещё не было). У `Classification`
-        # метаданные уже есть (№49) — сервис дополнительно кладёт их сюда.
+        # Metadata of the last call (#49/#50): diagnostics in /health.slots
+        # without reading the journal (None — no call yet). `Classification`
+        # already carries the metadata (#49) — the service additionally stores it here.
         self.last_meta: ChatMeta | None = None
 
     def classify(
         self, text: str, known_nodes: list[dict[str, Any]]
     ) -> Classification:
-        """Разметить текст: decision-слот, иначе генеративный путь (§6.4/§13.6).
-
-        Внешний контракт (`hint_path` 1..3 слага или null, `confidence` 0..1)
-        не меняется (FR-5.3): три причины переключения
-        (`unavailable`/`unsupported`/`low_confidence`) и невалидная метка
-        уводят на прежний генеративный путь, а при `DECISION_FALLBACK=false`
-        отказ `UNAVAILABLE` ждёт по контракту №39 (вердикт не выдумывается).
+        """Tag a default note against the known registry nodes.
         """
         if not text or not text.strip():
             raise ValueError("classify: пустой текст заметки")
         if self._decider is not None:
             labels = self._decision_labels(known_nodes)
             if len(labels) < DECISION_MIN_CANDIDATES:
-                # Выбирать не из чего: решение НЕ применимо — это не одно из
-                # трёх переключений (§13.6). Вызова нет, счётчики
-                # переключений и разрыв decision-слота не трогаются, сразу
-                # идём прежним генеративным путём.
+                # Nothing to choose from: the decision is NOT applicable — this is not one of
+                # the three switch reasons (§13.6). No call, the switch
+                # counters and the decision-slot breaker are untouched; go straight
+                # down the old generative path.
                 self._log_decision_skipped(len(labels))
             else:
                 try:
@@ -192,21 +190,22 @@ class ClassificationService:
 
     @staticmethod
     def _decision_labels(known_nodes: list[dict[str, Any]]) -> list[str]:
-        """Метки `choice`-вопроса разметки: пути узлов карты + резервная `generic`."""
+        """Labels of the tagging `choice` question: node paths of the map + the fallback `generic`."""
         return [node["path"] for node in known_nodes] + [GENERIC_LABEL]
 
     def _classify_decision(
         self, text: str, known_nodes: list[dict[str, Any]], labels: list[str]
     ) -> Classification:
-        """Решение decision-слота: метка → `hint_path`, вероятность → `confidence`.
+        """The decision slot's verdict: label → `hint_path`, probability → `confidence`.
 
-        Вопрос — из реестра (`decider.questions_for("classify")`); метки
-        приходят от `classify` (пути известных узлов + резервная `generic` →
-        `hint_path is None`), состояние — заметка + узлы (`path: description`,
-        как сегодня). Вызов — только при `len(labels) >= DECISION_MIN_CANDIDATES`:
-        иначе решение не применимо и сюда не заходят. Этот же вопрос
-        обслуживает джобу `warnings` («заметка не на своём месте»): она ходит
-        через тот же `classify` (arch §13.6, FR-8.4).
+                    The question comes from the registry (`decider.questions_for("classify")`);
+                    labels come from `classify` (paths of known nodes + the fallback
+                    `generic` → `hint_path is None`), state — the note + nodes
+                    (`path: description`, as today). The call happens only at
+                    `len(labels) >= DECISION_MIN_CANDIDATES`: otherwise the decision is
+                    not applicable and this code is not reached. The same question serves
+                    the `warnings` job ("a note is not in its place"): it walks through
+                    the same `classify` (arch §13.6, FR-8.4).
         """
         assert self._decider is not None
         questions = self._decider.questions_for("classify")
@@ -226,8 +225,8 @@ class ClassificationService:
             )
         hint_path: str | None = None
         if answer.label != GENERIC_LABEL:
-            # Путь валидируется тем же `validate_path`, что и в `_parse`
-            # (слаги латиница-цифры-дефис, 1..3 сегмента, не под default/...).
+            # The path is validated by the same `validate_path` as in `_parse`
+            # (slugs of latin-digits-hyphen, 1..3 segments, not under default/...).
             try:
                 hint_path = NamespaceService(self._settings).validate_path(
                     answer.label
@@ -250,32 +249,32 @@ class ClassificationService:
     def _classify_generative(
         self, text: str, known_nodes: list[dict[str, Any]]
     ) -> Classification:
-        """Прежний генеративный путь (JSON-разметка слота summary)."""
+        """The old generative path (JSON tagging of the summary slot)."""
         try:
             chat = self._llm.chat_result(
                 self._prompts.classifier_system,
                 self._user_message(text, known_nodes),
-                # №49: num_predict=None — авто-бюджет «сколько влезет»; при
-                # неизвестном контексте действует legacy-потолок
+                # #49: num_predict=None — the auto-budget "as much as fits"; with an
+                # unknown context the legacy ceiling applies
                 # CLASSIFIER_NUM_PREDICT ("classify" = 768).
                 num_predict=None,
-                think=False,  # JSON-разметка без рассуждений (быстрее)
+                think=False,  # JSON tagging without reasoning (faster)
                 operation="classify",
             )
         except LLMError as exc:
-            # Текст клиента сохраняется (HTTP-статус/hint ключа, решение №4).
-            # Исход вызова (№39, arch §6.4) — единый тип на границе сервиса.
-            self.last_attempt_ok = False  # деградация станет видна в /health
-            self.last_meta = exc.meta  # метаданные вызова для диагностики
+            # The client text is preserved (HTTP status/key hint, decision #4).
+            # The call outcome (#39, arch §6.4) — a single type at the service boundary.
+            self.last_attempt_ok = False  # the degradation becomes visible in /health
+            self.last_meta = exc.meta  # call metadata for diagnostics
             raise ClassificationError(
                 str(exc), outcome=classify_llm_error(exc), meta=exc.meta
             ) from exc
         try:
             result = self._parse(chat.content)
         except ClassificationError as exc:
-            self.last_attempt_ok = False  # некорректная разметка — тоже отказ
+            self.last_attempt_ok = False  # invalid tagging is also a failure
             self.last_meta = chat.meta
-            # Вызов состоялся — метаданные уходят воркеру вместе с отказом.
+            # The call happened — the metadata goes to the worker along with the failure.
             raise ClassificationError(
                 str(exc), outcome=exc.outcome, meta=chat.meta
             ) from exc
@@ -288,17 +287,18 @@ class ClassificationService:
         )
 
     def close(self) -> None:
-        """Закрыть HTTP-пул (чистое завершение процесса)."""
+        """Close the HTTP pool (clean process shutdown)."""
         self._llm.close()
 
     @staticmethod
     def _log_decision_skipped(candidates: int) -> None:
-        """Событие `decision_skipped`: решение не применимо, вызова НЕ было (§13.6).
+        """The `decision_skipped` event: the decision is not applicable, NO call happened (§13.6).
 
-        Пишется, когда кандидатов у `choice`-вопроса меньше
-        `DECISION_MIN_CANDIDATES` (выбирать не из чего). Это не переключение:
-        счётчики `/health.decision` (`fallbacks`/`by_reason`) и разрыв слота не
-        двигаются, вероятностей в событии нет (FR-3.3).
+                    Written when the `choice` question has fewer candidates than
+                    `DECISION_MIN_CANDIDATES` (nothing to choose from). This is not a
+                    switch: the `/health.decision` counters (`fallbacks`/`by_reason`) and
+                    the slot breaker do not move, and the event carries no probabilities
+                    (FR-3.3).
         """
         logging.getLogger("app").info(
             "decision_skipped",
@@ -311,11 +311,11 @@ class ClassificationService:
             },
         )
 
-    # --- внутреннее ---------------------------------------------------------
+    # --- internal -------------------------------------------------------------
 
     @staticmethod
     def _user_message(text: str, known_nodes: list[dict[str, Any]]) -> str:
-        """Заметка + известные узлы (path: description) — контекст выбора."""
+        """The note + known nodes (path: description) — the choice context."""
         nodes = "\n".join(
             f"- {node['path']}: {node['description']}" for node in known_nodes
         )
@@ -324,7 +324,7 @@ class ClassificationService:
         return f"Заметка:\n{text}\n\nИзвестные узлы:\n{nodes}"
 
     def _parse(self, content: str) -> Classification:
-        """Извлечь и провалидировать JSON-разметку; нарушения — ClassificationError."""
+        """Extract and validate the JSON tagging; violations — ClassificationError."""
         data = self._extract_json(content)
         if not isinstance(data, dict):
             raise ClassificationError("не-JSON объект в ответе классификатора")
@@ -335,9 +335,9 @@ class ClassificationService:
         if not isinstance(confidence, (int, float)) or not 0.0 <= float(confidence) <= 1.0:
             raise ClassificationError("confidence: ожидается число 0..1")
         if hint_path is not None:
-            # Полный путь валидируется как путь узла реестра: слаги
-            # (латиница-цифры-дефис), 1..3 сегмента, вложенность под
-            # `default/...` запрещена (default — системный узел).
+            # The full path is validated as a registry node path: slugs
+            # (latin-digits-hyphen), 1..3 segments, nesting under
+            # `default/...` is forbidden (default is a system node).
             try:
                 hint_path = NamespaceService(self._settings).validate_path(hint_path)
             except NamespaceValidationError as exc:
@@ -346,11 +346,11 @@ class ClassificationService:
 
     @staticmethod
     def _extract_json(content: str) -> Any:
-        """Вынуть JSON-объект из ответа (устойчиво к код-фенсам и обвязке).
+        """Extract the JSON object from the response (robust to code fences and wrappers).
 
-        Срезается обвязка thinking/response (модель ornith:35b оборачивает
-        JSON в теги thinking/response, где рассуждения могут содержать
-        фигурные скобки) — до попытки json.loads.
+                    The thinking/response wrapper is cut off (the ornith:35b model wraps
+                    JSON in thinking/response tags, where reasoning may contain curly
+                    braces) — before the json.loads attempt.
         """
         text = content.strip()
         if text.startswith("```"):
@@ -376,13 +376,13 @@ class ClassificationService:
 
     @staticmethod
     def _strip_reasoning_wrapper(text: str) -> str:
-        """Срезать обвязку thinking/response, если модель её добавила.
+        """Cut the thinking/response wrapper if the model added one.
 
-        Идём с конца: если есть строка-маркер `response` (последняя из
-        {response, <response>, </response>}) — возвращаем всё, что после неё.
-        Иначе убираем строки-маркеры {thinking, <thinking>, </thinking>,
-        response, <response>, </response>}. Если ничего не срезалось —
-        возвращаем исходный текст.
+                    Walk from the end: if there is a `response` marker line (the last of
+                    {response, <response>, </response>}) — return everything after it.
+                    Otherwise remove the marker lines {thinking, <thinking>, </thinking>,
+                    response, <response>, </response>}. If nothing was cut — return the
+                    original text.
         """
         lines = text.splitlines()
         response_markers = {"response", "<response>", "</response>"}

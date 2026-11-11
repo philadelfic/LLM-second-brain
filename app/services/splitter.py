@@ -1,28 +1,28 @@
-"""Токен-сплиттер длинных заметок (Фаза 7, brief PHASE7 §4/§6).
+"""The token splitter of long notes (Phase 7, brief PHASE7 SS4/SS6).
 
-Заметка хранится и отдаётся ЦЕЛИКОМ (никто её не режет) — сплиттер нужен
-только для ПОСТРОЕНИЯ векторов: единый вектор длинной заметки «размазывает»
-семантику, а вектора по чанкам держат локальную семантику, поэтому поиск
-факта внутри длинной заметки её находит (шаг 3: NoteService раскладывает
-заметку на чанки; шаг 4: SearchService агрегирует чанк-хиты).
+    A note is stored and served WHOLE (nobody cuts it) - the splitter exists only
+    to BUILD vectors: a single vector of a long note "smears" the semantics,
+    while per-chunk vectors keep the local semantics, so a search for a fact
+    inside a long note finds it (step 3: NoteService splits a note into chunks;
+    step 4: SearchService aggregates the chunk hits).
 
-Решения (brief §4/§5, зафиксированы с О. 2026-08-29):
-- Разбиение — фиксированное скользящее окно по токенам tiktoken
-  `cl100k_base`. Markdown Header Splitter НЕ делаем: заметки моделей — не
-  markdown-документы, заголовков в них может не быть вовсе.
-- Окно `CHUNK_SIZE` токенов, перекрытие `CHUNK_OVERLAP` (стык окон не режет
-  факт, пересёкший границу), хвостовой чанк короче `CHUNK_MIN_TARGET`
-  сливается с предыдущим (бессмысленный «обрезок» не индексируем). Слитый
-  хвост может превышать CHUNK_SIZE максимум до chunk_size + chunk_min_target
-  - 1 токенов (~1223 при дефолтах) — принято: это цена отсутствия мусорного
-  хвостика: на качество поиска не влияет.
-- Encoding зафиксирован (без вариантов в env): BPE-словарь пресобирается в
-  образ при сборке (Dockerfile), иначе холодный контейнер без сети падает на
-  первом же сплите.
-- Токен-срез может разрезать multi-byte символ UTF-8 (byte-fallback токены) —
-  на границе чанка возможен U+FFFD; для прозы это редкий и приемлемый дефект,
-  декодирование по токенам — стандартная практика (полный текст заметки при
-  этом не искажается: он нигде не пересобирается из чанков).
+    Decisions (brief SS4/SS5, fixed with the owner):
+    - Splitting - a fixed sliding window over tiktoken `cl100k_base` tokens. No
+      Markdown Header Splitter: model notes are not markdown documents and may
+      have no headers at all.
+    - The window is `CHUNK_SIZE` tokens with `CHUNK_OVERLAP` overlap (a window
+      seam does not cut a fact crossing the border); a tail chunk shorter than
+      `CHUNK_MIN_TARGET` merges into the previous one (a meaningless "scrap" is
+      not indexed). The merged tail may exceed CHUNK_SIZE by up to
+      chunk_size + chunk_min_target - 1 tokens (~1223 at the defaults) - accepted:
+      it is the price of having no junk tail; it does not affect search quality.
+    - The encoding is pinned (no env variants): the BPE vocabulary is pre-built
+      into the image at build time (Dockerfile) - otherwise a cold container
+      without a network fails on the very first split.
+    - A token cut may split a multi-byte UTF-8 symbol (byte-fallback tokens) - a
+      U+FFFD is possible at a chunk border; for prose this is a rare, acceptable
+      defect; decoding by tokens is standard practice (the full note text is not
+      distorted: it is never reassembled from chunks).
 """
 
 from __future__ import annotations
@@ -32,18 +32,20 @@ from functools import lru_cache
 
 import tiktoken
 
-# Фиксированный encoding (brief §4: «фикс. encoding cl100k_base, env не
-# обязателен»): размерность словаря на качество поиска заметок не влияет,
-# а единый encoding упрощает пресборку кэша в образе.
+# A pinned encoding (brief §4: "a fixed encoding cl100k_base; env is
+# not required"): the vocabulary size does not affect note search quality,
+# and one encoding simplifies pre-building the cache into the image.
 ENCODING_NAME = "cl100k_base"
 
 
 @dataclass(frozen=True)
 class Chunk:
-    """Чанк заметки: декодированный текст и размер в токенах.
+    """A note chunk: the decoded text and the size in tokens.
 
-    `tokens` идёт в `notes_chunks.tokens` (шаг 2) — диагностика и метрики;
-    текст — для векторизации чанка (воркер, шаги 3/5) и snippet'а (шаг 4).
+            `tokens` goes into `notes_chunks.tokens` (step 2) - diagnostics and
+            metrics; the text - for the chunk's vectorization (the worker, steps 3/5)
+            and the snippet (step 4).
+
     """
 
     text: str
@@ -52,12 +54,15 @@ class Chunk:
 
 @lru_cache(maxsize=1)
 def encoding() -> tiktoken.Encoding:
-    """Загрузить encoding единожды на процесс (BPE-парс ~0.1–0.5 c)."""
+    """Load the encoding once per process (the BPE parse takes ~0.1-0.5 s)."""
     return tiktoken.get_encoding(ENCODING_NAME)
 
 
 def count_tokens(text: str) -> int:
-    """Число токенов текста (валидации/диагностика, Фаза 7)."""
+    """The `cl100k_base` token count; an empty string -> 0 (no encoder call).
+
+    The encoder cache lives in `splitter.encoding()` (`lru_cache`): the BPE
+    vocabulary is parsed once per process; the counter only counts."""
     return len(encoding().encode(text))
 
 
@@ -68,19 +73,20 @@ def token_windows(
     chunk_overlap: int,
     chunk_min_target: int,
 ) -> list[tuple[int, int]]:
-    """Скользящие окна по токенам [0, total) (чистая арифметика — unit-тесты).
+    """Sliding windows over tokens [0, total) (pure arithmetic - unit-testable).
 
-    Правила (brief §4/§6):
-    - окно = `chunk_size` токенов, сдвиг = chunk_size - chunk_overlap;
-    - последний старт — там, где остаток уже влезает в одно окно;
-    - хвостовое окно короче `chunk_min_target` (и это не единственное окно) —
-      сливается с предыдущим: конец предыдущего удлиняется до общего конца;
-      такой слитый чанк длиннее chunk_size максимум на
-      chunk_min_target - chunk_overlap - 1 токенов.
+            The rules (brief SS4/SS6):
+            - a window = `chunk_size` tokens, the shift = chunk_size - chunk_overlap;
+            - the last start is where the remainder already fits one window;
+            - a tail window shorter than `chunk_min_target` (and not the only window)
+              merges into the previous one: the previous end extends to the shared
+              end; such a merged chunk is longer than chunk_size by at most
+              chunk_min_target - chunk_overlap - 1 tokens.
 
-    Raises:
-        ValueError: недопустимые параметры — overlap ≥ size (окна не
-            сдвигаются), min_target > size или < 1.
+            Raises:
+                ValueError: invalid parameters - overlap >= size (the windows never
+                    shift), min_target > size or < 1.
+
     """
     if chunk_overlap >= chunk_size:
         raise ValueError(
@@ -97,7 +103,7 @@ def token_windows(
     if total <= 0:
         return []
     if total <= chunk_size:
-        return [(0, total)]  # типичный случай: ≤3 000 симв. = 1 чанк (brief §4)
+        return [(0, total)]  # the typical case: <= 3000 chars = 1 chunk (brief §4)
 
     starts: list[int] = []
     start = 0
@@ -111,7 +117,7 @@ def token_windows(
     tail_merged = len(starts) > 1 and tail_len < chunk_min_target
     if tail_merged:
         starts.pop()
-        # Слитый хвост: предыдущее окно удлиняем до конца текста (ниже).
+        # A merged tail: the previous window extends to the end of the text (below).
     ends = [min(s + chunk_size, total) for s in starts]
     if tail_merged:
         ends[-1] = total
@@ -125,11 +131,13 @@ def split_text(
     chunk_overlap: int,
     chunk_min_target: int,
 ) -> list[Chunk]:
-    """Разбить текст на чанки по токенам: окно/overlap/минимальный хвост.
+    """Split a text into chunks by tokens: window/overlap/minimum tail.
 
-    Пустой текст → пустой список (заметка валидируется выше по стеку, но
-    чистая функция отдаёт честный результат). Соседние чанки перекрываются
-    на chunk_overlap токенов — стыки окон не режут факт, пересёкший границу.
+            An empty text -> an empty list (the note is validated higher up the stack,
+            but the pure function returns an honest result). Neighboring chunks
+            overlap by chunk_overlap tokens - the seams never cut a fact crossing the
+            border.
+
     """
     tokens = encoding().encode(text)
     windows = token_windows(

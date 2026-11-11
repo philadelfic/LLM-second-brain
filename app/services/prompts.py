@@ -1,34 +1,35 @@
-"""PromptRegistry — реестр промптов (Фаза 11, решение №7).
+"""PromptRegistry - the prompt registry (Phase 11).
 
-Все тексты промптов собираются в одном месте. Двенадцать промптов делятся
-на две группы (решение О. 2026-09-04: «часть промптов — наша задача довести
-до ума, их не правит никто»):
+    All prompt texts are assembled in one place. The twelve prompts split into two
+    groups (the owner's ruling: "some prompts are ours to polish; nobody edits
+    them"):
 
-- **4 редактируемых** (`summary_system`, `summary_merge_system`,
-  `summary_split_system`, `judge_system`): при заданном `prompts_dir`
-  выносятся в файлы (seed-if-missing — создаются с встроенным дефолтом
-  как стартовым текстом) и правятся оператором без пересборки образа;
-  существующие operator-edited files are NEVER overwritten; an empty file
-  = the built-in default; a non-empty file wins. Auto-migration
-  (lsbdef-0006): a file byte-identical to a previously seeded text
-  (seed_meta.json) or to a known legacy seed (LEGACY_SEEDS) is rewritten
-  with the current canon when the seed version changes;
-- **8 зашитых** (`merge_user`, `split_user`, `judge_user`,
-  `classifier_system`, `describe_system`, `describe_user`,
-  `structure_judge_system`, `structure_judge_user`): только константы
-  в коде, файлами не создаются никогда.
+    - **4 editable** (`summary_system`, `summary_merge_system`,
+      `summary_split_system`, `judge_system`): with `prompts_dir` set they are
+      written out to files (seed-if-missing - created with the built-in default as
+      the starting text) and edited by the operator without an image rebuild;
+      existing operator-edited files are NEVER overwritten; an empty file = the
+      built-in default; a non-empty file wins. Auto-migration (lsbdef-0006): a
+      file byte-identical to a previously seeded text (seed_meta.json) or to a
+      known legacy seed (LEGACY_SEEDS) is rewritten with the current canon when
+      the seed version changes;
+    - **8 hardwired** (`merge_user`, `split_user`, `judge_user`,
+      `classifier_system`, `describe_system`, `describe_user`,
+      `structure_judge_system`, `structure_judge_user`): code constants only,
+      never created as files.
 
-Контрактная защита: финальный `judge_system` (встроенный или из файла)
-обязан содержать маркеры «ДУБЛЬ» и «НЕ ДУБЛЬ» — вердикты дедупа парсятся
-по ним (app/services/judge.py::_verdict), и файл без маркеров молча уронил
-бы дедуп на отказах парсера. Нарушение — фатальный `ConfigError` при
-конструировании реестра (старт сервиса падает с понятным сообщением).
+    The contract guard: the final `judge_system` (built-in or from a file) MUST
+    contain the "DUPLICATE" and "NOT DUPLICATE" markers - the dedup verdicts are
+    parsed by them (app/services/judge.py::_verdict), and a file without the
+    markers would silently kill dedup with parser failures. A violation - a fatal
+    `ConfigError` at registry construction (the service start aborts with a
+    readable message).
 
-`prompts_dir` не задан (None) — файловая механика не активна вовсе:
-работают только встроенные константы.
+    `prompts_dir` unset (None) - the file mechanics are entirely off: only the
+    built-in constants work.
 
-Потребитель — пул 4 (клиенты слотов summary/judge берут системные промпты
-из реестра, user-шаблоны — зашитые константы реестра).
+    The consumer - pool 4 (the summary/judge slot clients take the system prompts
+    from the registry; the user templates are the registry's hardwired constants).
 """
 
 from __future__ import annotations
@@ -45,12 +46,14 @@ from app.services.decision import DECISION_KINDS, DecisionQuestion
 def _build_decision_questions(
     groups: dict, max_questions: int
 ) -> dict[str, tuple[DecisionQuestion, ...]]:
-    """Собрать и провалидировать группы decision-вопросов (arch §6.4).
+    """Assemble and validate the decision-question groups (arch §6.4).
 
-    Валидация фатальна (`ConfigError`, прецедент маркеров `judge_system`):
-    неизвестный `kind`, пустое имя/текст, `choice` без меток или без критериев,
-    дубль имени в группе, число вопросов в группе больше `DECISION_MAX_QUESTIONS`,
-    `threshold` вне 0..1. Возвращает `group -> tuple[DecisionQuestion]`.
+            The validation is fatal (`ConfigError`, the `judge_system` markers
+            precedent): an unknown `kind`, an empty name/text, a `choice` without
+            labels or criteria, a name duplicate in a group, more questions in a group
+            than `DECISION_MAX_QUESTIONS`, a `threshold` outside 0..1. Returns
+            `group -> tuple[DecisionQuestion]`.
+
     """
     result: dict[str, tuple[DecisionQuestion, ...]] = {}
     for group, items in groups.items():
@@ -122,19 +125,19 @@ def _build_decision_questions(
     return result
 
 
-# --- Встроенные тексты -------------------------------------------------------
-# Перенесены 1-в-1 из app/services/summary.py, judge.py, classifier.py,
-# promotion.py (константы-источники остаются на месте до перевода клиентов
-# на реестр — пул 4; см. test_builtin_texts_match_current_constants).
+#--- Built-in texts -------------------------------------------------------
+# Moved 1:1 from app/services/summary.py, judge.py, classifier.py,
+# promotion.py (the source constants stay in place until the clients move
+# to the registry - pool 4; see test_builtin_texts_match_current_constants).
 
-# Редактируемые 3 (seed-if-missing при заданном prompts_dir).
+# The 3 editable ones (seed-if-missing with prompts_dir set).
 
-# summary.py::SYSTEM_PROMPT — пересказ заметки.
-# Лимит длины — 150 СИМВОЛОВ (решение гейта 3.1.0, 2026-09-19): прежнее
-# «не более 30 слов» снято, двойного ограничения в промпте нет. Промпт —
-# просьба к модели, страховка от недисциплинированной модели — в коде:
-# усечение по границе слова в точке сохранения (worker.process_summary_pending,
-# summary.cap_summary, лимит settings.max_summary_chars).
+# summary.py::SYSTEM_PROMPT - the note summary.
+# The length limit - 150 CHARACTERS (the 3.1.0 gate decision): the former
+#"no more than 30 words" is gone; the prompt carries no double cap. The prompt
+# is a request to the model; the guard against an undisciplined model is in
+# code: the word-boundary cut at the save point (worker.process_summary_pending,
+# summary.cap_summary, the settings.max_summary_chars limit).
 SUMMARY_SYSTEM_PROMPT = (
     "Summarize the note in 1–2 short, dense sentences — no more than 150 "
     "characters in total. Convey the main idea so that this condensed version "
@@ -142,15 +145,15 @@ SUMMARY_SYSTEM_PROMPT = (
     "explanations. Respond in the language of the note."
 )
 
-# summary.py::MERGE_SYSTEM_PROMPT — слияние дубликатов (системный).
-# Канон LSBN-F-23: слияние отдаёт СПИСОК самодостаточных частей (JSON) —
-# «лучше несколько самодостаточных заметок, чем одна обрезанная». Лимит
-# части — мягкий лимит заметки (settings.max_note_chars; 3.4.1 — из
-# конфига, LSBN-T-26); контракт структурированный, чтобы полноту проверял
-# код, а не «на глаз». Число подставляется сборщиком ниже — литерала в
-# каноне нет (одно число — одно место: env MAX_NOTE_CHARS).
+# summary.py::MERGE_SYSTEM_PROMPT - merging duplicates (system).
+# The LSBN-F-23 canon: a merge returns a LIST of self-contained parts (JSON) -
+#"several self-contained notes are better than one cut short". The part
+# limit - the note soft limit (settings.max_note_chars; since 3.4.1 - from
+# the config, LSBN-T-26); the contract is structured so the CODE checks
+# completeness, not an eyeball. The number is substituted by the builder below -
+# the canon has no literal (one number - one place: the MAX_NOTE_CHARS env).
 def summary_merge_system_prompt(limit: int) -> str:
-    """Системный промпт слияния; `limit` — мягкий лимит заметки из настроек."""
+    """The merge system prompt; `limit` - the note soft limit from settings."""
     return (
         "You have two versions of the same note. Merge them into one or several "
         "SELF-CONTAINED notes (parts): combine all information from both — facts, "
@@ -167,13 +170,13 @@ def summary_merge_system_prompt(limit: int) -> str:
     )
 
 
-# summary.py::SPLIT_SYSTEM_PROMPT — нарезка длинной заметки (системный).
-# Канон LSBN-F-22 (M2): тот же контракт списка частей, что у слияния, но
-# источник — ОДНА длинная заметка; требование самодостаточности части
-# усилено постановкой (шаг «Нарезка идёт через F-23»): каждая часть несёт
-# СВОИ имена, числа, даты — читается без исходника и остальных частей.
+# summary.py::SPLIT_SYSTEM_PROMPT - splitting a long note (system).
+# The LSBN-F-22 canon (M2): the same part-list contract as the merge, but
+# the source is ONE long note; the part self-sufficiency requirement is
+# strengthened by the design (the step "splitting goes through F-23"): each
+# part carries ITS OWN names, numbers, dates - readable without the source
 def summary_split_system_prompt(limit: int) -> str:
-    """Системный промпт нарезки; `limit` — мягкий лимит заметки из настроек."""
+    """The split system prompt; `limit` - the note soft limit from settings."""
     return (
         "You are given ONE long note that exceeds the note limit. Split it into "
         "one or several SELF-CONTAINED notes (parts): preserve every fact — "
@@ -188,8 +191,8 @@ def summary_split_system_prompt(limit: int) -> str:
         '{"parts": [{"title": "...", "text": "..."}, ...]}'
     )
 
-# judge.py::JUDGE_SYSTEM_PROMPT — определение одинаковости заметок
-# (ДУБЛЬ/НЕ ДУБЛЬ).
+# and the other parts.
+# judge.py::JUDGE_SYSTEM_PROMPT - deciding note sameness (DUPLICATE/NOT DUPLICATE).
 JUDGE_SYSTEM_PROMPT = (
     "You check long-term memory for duplicates. Determine whether two texts "
     "are duplicates: the same thought restated in other words (matching "
@@ -197,18 +200,18 @@ JUDGE_SYSTEM_PROMPT = (
     "DUPLICATE or NOT DUPLICATE. No explanations."
 )
 
-# Зашитые 7 (только константы, файлами не создаются).
+# The 7 hardwired ones (constants only, never created as files).
 
 # summary.py::MERGE_USER_TEMPLATE ({text_a}, {text_b}).
 SUMMARY_MERGE_USER_TEMPLATE = "TEXT 1:\n{text_a}\n\nTEXT 2:\n{text_b}"
 
-# summary.py::SPLIT_USER_TEMPLATE ({text}) — нарезка длинной заметки (F-22 M2).
+# summary.py::SPLIT_USER_TEMPLATE ({text}) - splitting a long note (F-22 M2).
 SUMMARY_SPLIT_USER_TEMPLATE = "TEXT:\n{text}"
 
 # judge.py::JUDGE_USER_TEMPLATE ({text_new}, {text_candidate}).
 JUDGE_USER_TEMPLATE = "TEXT 1:\n{text_new}\n\nTEXT 2:\n{text_candidate}"
 
-# classifier.py::CLASSIFY_SYSTEM_PROMPT — JSON-контракт разметки (§5.7).
+# classifier.py::CLASSIFY_SYSTEM_PROMPT - the placement JSON contract (§5.7).
 CLASSIFIER_SYSTEM_PROMPT = (
     "You are a note classifier for hierarchical memory. Determine which "
     "section the note belongs to. Known nodes are listed in the request. "
@@ -220,7 +223,7 @@ CLASSIFIER_SYSTEM_PROMPT = (
     "how confident you are."
 )
 
-# promotion.py::DESCRIBE_SYSTEM_PROMPT — описание узла по примерам заметок.
+# promotion.py::DESCRIBE_SYSTEM_PROMPT - a node description from note examples.
 DESCRIBE_SYSTEM_PROMPT = (
     "You generate descriptions of sections in hierarchical memory. From the "
     "example notes, write a description of the section: what kind of notes "
@@ -234,8 +237,8 @@ DESCRIBE_USER_TEMPLATE = (
     "Example notes of the section (brief summaries):\n{summaries}"
 )
 
-# promotion.py::JUDGE_SYSTEM_PROMPT — судья структуры
-# (протокол СОЗДАТЬ/СЛИТЬ <path>/ОТКЛОНИТЬ).
+# promotion.py::JUDGE_SYSTEM_PROMPT - the structure judge
+# (the CREATE/MERGE <path>/REJECT protocol).
 STRUCTURE_JUDGE_SYSTEM_PROMPT = (
     "You are the structure judge of hierarchical memory. Evaluate the "
     "candidate for a new sub-section. Rules: (1) if the meaning of the "
@@ -258,10 +261,10 @@ STRUCTURE_JUDGE_USER_TEMPLATE = (
     "Nearest by vector similarity: {nearest}"
 )
 
-# Имя → встроенный текст (единый словарь: и свойства реестра, и seed-файлы).
-# Тексты с числом (merge/split) собраны сборщиками от ДЕФОЛТА конфига;
-# PromptRegistry при конструировании пересобирает их от переданного
-# settings.max_note_chars (3.4.1, LSBN-T-26: одно число — одно место).
+# Name -> built-in text (one dictionary: both the registry properties and the seed files).
+# The texts with a number (merge/split) are assembled by the builders from the
+# config DEFAULT; PromptRegistry at construction re-assembles them from the
+# passed settings.max_note_chars (3.4.1, LSBN-T-26: one number - one place).
 BUILTIN_PROMPTS: dict[str, str] = {
     "summary_system": SUMMARY_SYSTEM_PROMPT,
     "summary_merge_system": summary_merge_system_prompt(MAX_NOTE_CHARS_DEFAULT),
@@ -277,7 +280,7 @@ BUILTIN_PROMPTS: dict[str, str] = {
     "structure_judge_user": STRUCTURE_JUDGE_USER_TEMPLATE,
 }
 
-# Редактируемые: только эти имена выносятся в файлы (зашитые — никогда).
+# Editable: only these names are written to files (the hardwired - never).
 EDITABLE_PROMPTS: tuple[str, ...] = (
     "summary_system",
     "summary_merge_system",
@@ -289,14 +292,14 @@ _PROMPT_FILE_SUFFIX = ".txt"
 
 # Version of the current prompt canon (seed stamp). Bumped on every canon
 # change of the editable prompts; used for auto-migration of untouched
-# legacy seeds (lsbdef-0006). Текущий канон — 3.4.1 (LSBN-F-22 M2: добавлен
-# редактируемый `summary_split_system` — нарезка длинной заметки списком
-# самодостаточных частей; 3.4.0 — слияние списком частей, LSBN-F-23; ранее
-# 3.1.0 — саммари ≤ 150 символов, решение гейта 2026-09-19). Штамп уже
-# выставлен релизом 3.4.0 и при 3.4.1 не меняется: перезапись нетронутых
-# сидов поднимает сравнение с текущим каноном (_should_migrate) — число
-# лимита в тексте теперь приходит из настроек, и смена MAX_NOTE_CHARS
-# переписывает сид без смены штампа (LSBN-T-26).
+# legacy seeds (lsbdef-0006). The current canon is 3.4.1 (LSBN-F-22 M2: added
+# the editable `summary_split_system` - splitting a long note into a list of
+# self-contained parts; 3.4.0 - merging into a list of parts, LSBN-F-23; earlier
+# 3.1.0 - summaries <= 150 characters, the gate decision). The stamp was set
+# by the 3.4.0 release and does not change at 3.4.1: rewriting untouched
+# seeds goes through the current-canon comparison (_should_migrate) - the
+# in-text limit number now comes from settings, and a MAX_NOTE_CHARS change
+# rewrites the seed without a stamp bump (LSBN-T-26).
 SEED_VERSION = "3.4.1"
 
 # Name of the seed-stamp sidecar file in prompts_dir: version + SHA-256 of
@@ -351,11 +354,11 @@ LEGACY_SEEDS: dict[str, tuple[str, ...]] = {
 }
 
 
-# --- встроенные decision-вопросы (LSBN-F-12, arch §6.4) -----------------------
-# Не промпты, а данные вопросов: имя, формулировка (EN, обезличенная), тип и
-# критерии. Критерии choice приходят в `state` (описания узлов); здесь —
-# резервная метка generic. Группа переопределяется файлом
-# `decision_questions.json` в prompts_dir ЦЕЛИКОМ (§6.4).
+#--- built-in decision questions (LSBN-F-12, arch §6.4) -----------------------
+# Not prompts but question data: a name, a wording (EN, depersonalized), a type
+# and criteria. The choice criteria come in `state` (the node descriptions);
+# here - the generic fallback label. A group is overridden by the file
+# `decision_questions.json` in prompts_dir WHOLE (§6.4).
 BUILTIN_DECISION_QUESTIONS: dict[str, tuple[dict, ...]] = {
     "judge": (
         {
@@ -388,24 +391,25 @@ BUILTIN_DECISION_QUESTIONS: dict[str, tuple[dict, ...]] = {
     ),
 }
 
-# Имя файла-переопределения групп decision-вопросов (не создаётся нами).
+# The override file name of the decision-question groups (we never create it).
 _DECISION_QUESTIONS_FILENAME = "decision_questions.json"
 
 
 class PromptRegistry:
-    """Встроенные константы всех 12 промптов + файловые переопределения.
+    """The built-in constants of all 12 prompts + the file overrides.
 
-    Конструирование = полная подготовка к работе: seed-if-missing (при
-    заданном `prompts_dir`), чтение переопределений и контрактная проверка
-    `judge_system`. Валидация падает фатальным `ConfigError` — старт сервиса
-    обязан прерваться (см. docstring модуля).
+            Construction = the full readiness preparation: seed-if-missing (with
+            `prompts_dir` set), reading the overrides and the contract check of
+            `judge_system`. The validation fails with a fatal `ConfigError` - the
+            service start must abort (see the module docstring).
 
-    Доступ — по именам промптов (свойства, как в задании пула 3):
-    редактируемые `summary_system`, `summary_merge_system`,
-    `summary_split_system`, `judge_system` и зашитые `merge_user`,
-    `split_user`, `judge_user`, `classifier_system`, `describe_system`,
-    `describe_user`, `structure_judge_system`, `structure_judge_user`;
-    универсальный `get(name)` — для обхода по списку `BUILTIN_PROMPTS`.
+            Access - by the prompt names (properties, as pool 3 specified): the
+            editable `summary_system`, `summary_merge_system`, `summary_split_system`,
+            `judge_system` and the hardwired `merge_user`, `split_user`, `judge_user`,
+            `classifier_system`, `describe_system`, `describe_user`,
+            `structure_judge_system`, `structure_judge_user`; the universal
+            `get(name)` - for iterating over the `BUILTIN_PROMPTS` list.
+
     """
 
     def __init__(
@@ -415,22 +419,22 @@ class PromptRegistry:
         decision_max_questions: int = 64,
         max_note_chars: int = MAX_NOTE_CHARS_DEFAULT,
     ) -> None:
-        # Копия встроенных: файловые переопределения ложатся поверх. Тексты
-        # с мягким лимитом заметки (merge/split) пересобираются от
-        # переданного значения — settings.max_note_chars сборки (3.4.1,
-        # LSBN-T-26: смена env меняет и промпты, и валидацию одним числом).
+        # A copy of the built-ins: the file overrides layer on top. The texts
+        # with the note soft limit (merge/split) are re-assembled from the
+        # passed value - the build's settings.max_note_chars (3.4.1,
+        # LSBN-T-26: one env change updates both the prompts and the validation).
         self._texts: dict[str, str] = {
             **BUILTIN_PROMPTS,
             "summary_merge_system": summary_merge_system_prompt(max_note_chars),
             "summary_split_system": summary_split_system_prompt(max_note_chars),
         }
-        # Имена, чей финальный текст пришёл из непустого файла (диагностика
-        # источника в ошибках валидации).
+        # The names whose final text came from a non-empty file (the source
+        # diagnostics in the validation errors).
         self._file_overrides: set[str] = set()
         self.prompts_dir: Path | None = (
             Path(prompts_dir) if prompts_dir is not None else None
         )
-        # LSBN-F-12: реестр decision-вопросов (валидация фатальна, §6.4).
+        # LSBN-F-12: the decision-question registry (the validation is fatal, §6.4).
         self._decision_questions: dict[str, tuple[DecisionQuestion, ...]] = (
             _build_decision_questions(BUILTIN_DECISION_QUESTIONS, decision_max_questions)
         )
@@ -439,70 +443,70 @@ class PromptRegistry:
             self._load_decision_file(decision_max_questions)
         self._validate_judge_markers()
 
-    # --- API (имена — контракт пула 3/4) -------------------------------------
+    #--- API (the names are the pool 3/4 contract) -------------------------------------
 
     @property
     def summary_system(self) -> str:
-        """Системный промпт пересказа заметки (редактируемый)."""
+        """The note-summary system prompt (editable)."""
         return self._texts["summary_system"]
 
     @property
     def summary_merge_system(self) -> str:
-        """Системный промпт слияния дубликатов (редактируемый)."""
+        """The duplicate-merge system prompt (editable)."""
         return self._texts["summary_merge_system"]
 
     @property
     def summary_split_system(self) -> str:
-        """Системный промпт нарезки длинной заметки (редактируемый, F-22 M2)."""
+        """The long-note split system prompt (editable, F-22 M2)."""
         return self._texts["summary_split_system"]
 
     @property
     def judge_system(self) -> str:
-        """Системный промпт судьи дедупа ДУБЛЬ/НЕ ДУБЛЬ (редактируемый)."""
+        """The dedup judge DUPLICATE/NOT DUPLICATE system prompt (editable)."""
         return self._texts["judge_system"]
 
     @property
     def merge_user(self) -> str:
-        """User-шаблон слияния: {text_a}, {text_b} (зашитый)."""
+        """The merge user template: {text_a}, {text_b} (hardwired)."""
         return self._texts["merge_user"]
 
     @property
     def split_user(self) -> str:
-        """User-шаблон нарезки: {text} (зашитый, F-22 M2)."""
+        """The split user template: {text} (hardwired, F-22 M2)."""
         return self._texts["split_user"]
 
     @property
     def judge_user(self) -> str:
-        """User-шаблон судьи дедупа: {text_new}, {text_candidate} (зашитый)."""
+        """The dedup judge user template: {text_new}, {text_candidate} (hardwired)."""
         return self._texts["judge_user"]
 
     @property
     def classifier_system(self) -> str:
-        """Системный промпт классификатора, JSON-контракт (зашитый)."""
+        """The classifier system prompt, a JSON contract (hardwired)."""
         return self._texts["classifier_system"]
 
     @property
     def describe_system(self) -> str:
-        """Системный промпт описания узла (зашитый)."""
+        """The node description system prompt (hardwired)."""
         return self._texts["describe_system"]
 
     @property
     def describe_user(self) -> str:
-        """User-шаблон описания узла: {domain}/{slug}, {summaries} (зашитый)."""
+        """The node description user template: {domain}/{slug}, {summaries} (hardwired)."""
         return self._texts["describe_user"]
 
     @property
     def structure_judge_system(self) -> str:
-        """Системный промпт судьи структуры СОЗДАТЬ/СЛИТЬ/ОТКЛОНИТЬ (зашитый)."""
+        """The structure judge CREATE/MERGE/REJECT system prompt (hardwired)."""
         return self._texts["structure_judge_system"]
 
     @property
     def structure_judge_user(self) -> str:
-        """User-шаблон судьи структуры (зашитый)."""
+        """The structure judge user template (hardwired)."""
         return self._texts["structure_judge_user"]
 
     def get(self, name: str) -> str:
-        """Текст промпта по имени (см. BUILTIN_PROMPTS); KeyError — незнакомое."""
+        """The prompt text by name (see BUILTIN_PROMPTS); KeyError - unknown."""
         try:
             return self._texts[name]
         except KeyError:
@@ -513,17 +517,18 @@ class PromptRegistry:
 
     @property
     def decision_questions(self) -> dict[str, tuple[DecisionQuestion, ...]]:
-        """Группы decision-вопросов (LSBN-F-12): mapping `group -> tuple` (§6.4)."""
+        """The decision-question groups (LSBN-F-12): a mapping `group -> tuple` (§6.4)."""
         return self._decision_questions
 
-    # --- decision-вопросы (LSBN-F-12, arch §6.4) -----------------------------
+    #--- decision questions (LSBN-F-12, arch §6.4) -----------------------------
 
     def _load_decision_file(self, max_questions: int) -> None:
-        """Необязательный `decision_questions.json` переопределяет группу целиком.
+        """An optional `decision_questions.json` overrides a group whole.
 
-        Файл не создаётся и не перезаписывается (прецедент `_load_files`:
-        правки оператора неприкосновенны); ошибка чтения/формата — фатальный
-        `ConfigError`. Группа из файла заменяет встроенную целиком.
+                    The file is neither created nor rewritten (the `_load_files`
+                    precedent: the operator's edits are untouchable); a read/format error
+                    - a fatal `ConfigError`. A file group replaces the built-in one whole.
+
         """
         assert self.prompts_dir is not None
         path = self.prompts_dir / _DECISION_QUESTIONS_FILENAME
@@ -544,7 +549,7 @@ class PromptRegistry:
         groups.update(data)
         self._decision_questions = _build_decision_questions(groups, max_questions)
 
-    # --- файловая механика ---------------------------------------------------
+    #--- the file mechanics ---------------------------------------------------
 
     def _file_path(self, name: str) -> Path:
         assert self.prompts_dir is not None
@@ -620,13 +625,14 @@ class PromptRegistry:
     def _should_migrate(self, name: str, content: str, meta: dict) -> bool:
         """Whether the file needs auto-migration to the current canon.
 
-        True if the file is an untouched seed: either seeded by us and
-        unchanged since (hash matches seed_meta.json) while the built-in
-        canon moved on — a bumped stamp version OR the built-in text itself
-        differs (с 3.4.1/LSBN-T-26 число в тексте приходит из настроек:
-        смена MAX_NOTE_CHARS меняет встроенный текст, нетронутый сид
-        переписывается без смены штампа версии) — or byte-identical to a
-        known legacy seed.
+                    True if the file is an untouched seed: either seeded by us and
+                    unchanged since (the hash matches seed_meta.json) while the built-in
+                    canon moved on - a bumped stamp version OR the built-in text itself
+                    differs (since 3.4.1/LSBN-T-26 the in-text number comes from settings:
+                    a MAX_NOTE_CHARS change alters the built-in text, and an untouched
+                    seed is rewritten without a stamp-version bump) - or byte-identical to
+                    a known legacy seed.
+
         """
         recorded = meta["files"].get(name)
         if recorded is not None and self._hash(content) == recorded:
@@ -640,21 +646,22 @@ class PromptRegistry:
         # File not seeded by us (legacy) — checking known legacy seeds.
         return content in LEGACY_SEEDS.get(name, ())
 
-    # --- валидация -----------------------------------------------------------
+    #--- validation -----------------------------------------------------------
 
     def _validate_judge_markers(self) -> None:
-        """Финальный judge_system обязан содержать маркеры «DUPLICATE» и «NOT DUPLICATE».
+        """The final judge_system must contain the "DUPLICATE" and "NOT DUPLICATE" markers.
 
-        Вердикты дедупа парсятся по этим маркерам (judge._verdict: сначала
-        «NOT DUPLICATE», затем «DUPLICATE»). Промпт без маркеров не дал бы
-        парсеру ни одного вердикта — дедуп молча встал бы на отказах.
-        Фатально.
+                    The dedup verdicts are parsed by these markers (judge._verdict: first
+                    "NOT DUPLICATE", then "DUPLICATE"). A prompt without the markers would
+                    give the parser no verdict at all - dedup would silently stall on
+                    refusals. Fatal.
 
-        «DUPLICATE» требуется самостоятельной отметкой (вхождение вне связки
-        «NOT DUPLICATE»): промпт, разрешающий только «NOT DUPLICATE», тихо
-        сломал бы сведение дубликатов в другую сторону — судья не смог бы
-        вынести вердикт «дубль» (тот же класс отказа, что и потеря маркера
-        вовсе).
+                    "DUPLICATE" must appear as a standalone occurrence (outside the "NOT
+                    DUPLICATE" bundle): a prompt allowing only "NOT DUPLICATE" would
+                    silently break merging in the other direction - the judge could not
+                    produce a "duplicate" verdict (the same failure class as losing the
+                    marker entirely).
+
         """
         judge = self._texts["judge_system"]
         missing = self._missing_judge_markers(judge)
@@ -676,11 +683,12 @@ class PromptRegistry:
 
     @staticmethod
     def _missing_judge_markers(text: str) -> list[str]:
-        """Маркеры вердикта, отсутствующие в тексте промпта.
+        """The verdict markers missing from the prompt text.
 
-        «DUPLICATE» засчитывается только самостоятельным вхождением:
-        вхождения внутри «NOT DUPLICATE» вычёркиваются. «NOT DUPLICATE» —
-        как связка целиком.
+                    "DUPLICATE" counts only as a standalone occurrence: the occurrences
+                    inside "NOT DUPLICATE" are struck out. "NOT DUPLICATE" - as a whole
+                    bundle.
+
         """
         missing: list[str] = []
         if "NOT DUPLICATE" not in text:

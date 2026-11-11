@@ -1,4 +1,4 @@
-"""№32 (3.2.0): идемпотентность джобы — состояние в самих данных (§13.11)."""
+"""#32 (3.2.0): the job's idempotency — the state lives in the data itself (§13.11)."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def _warnings_total(settings) -> int:
 
 
 def test_second_run_noop(parts) -> None:
-    """Второй прогон не меняет terms, не плодит warnings и не пишет событий."""
+    """A second run changes no terms, multiplies no warnings and writes no events."""
     settings, _terms, _warnings, service = parts
     seed(
         settings,
@@ -43,7 +43,7 @@ def test_second_run_noop(parts) -> None:
     warnings_after = _warnings_total(settings)
     versions_after = sum(len(versions(settings, term_id)) for term_id in (1, 2, 3))
 
-    assert service.run() == 0  # после нормализации группа не берётся отбором
+    assert service.run() == 0  # after the normalization the group is no longer selected
     assert active_rows(settings, "идемп") == terms_after
     assert _warnings_total(settings) == warnings_after
     assert (

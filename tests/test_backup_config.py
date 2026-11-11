@@ -1,12 +1,12 @@
-"""Конфигурация проверки бэкапов (№14, 3.2.0, arch §8).
+"""The backups verification configuration (#14, 3.2.0, arch §8).
 
-`BACKUP_VERIFY_EVERY` — int ≥ 0, дефолт 1: проверяем каждый свежий снапшот;
-0 — авто-проверка выключена (только ручная `POST /backups/verify`).
-Отрицательное значение — фатальная ошибка конфигурации со ВСЕМИ нарушениями.
+    `BACKUP_VERIFY_EVERY` — int ≥ 0, default 1: every fresh snapshot is verified;
+    0 — the auto-verification off (only the manual `POST /backups/verify`).
+    A negative value — a fatal configuration error with ALL violations.
 
-`BACKUP_SHIP_CMD` — команда выноса проверенной копии (дефолт пуст — вынос
-выключен; назначение/учётки живут вне репозитория), `BACKUP_SHIP_TIMEOUT_SEC` —
-её таймаут (int ≥ 1, дефолт 300).
+    `BACKUP_SHIP_CMD` — the verified copy's ship command (the default empty —
+    shipping off; the destination/credentials live outside the repository);
+    `BACKUP_SHIP_TIMEOUT_SEC` — its timeout (int ≥ 1, default 300).
 """
 
 from __future__ import annotations
@@ -35,14 +35,14 @@ def load_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> Settings:
 
 @pytest.fixture(autouse=True)
 def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("DB_PATH", raising=False)  # дефолт §8, как в test_config
+    monkeypatch.delenv("DB_PATH", raising=False)  # the §8 default, as in test_config
     monkeypatch.delenv("BACKUP_VERIFY_EVERY", raising=False)
     monkeypatch.delenv("BACKUP_SHIP_CMD", raising=False)
     monkeypatch.delenv("BACKUP_SHIP_TIMEOUT_SEC", raising=False)
 
 
 def test_verify_every_defaults_and_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Дефолт 1; отрицательное значение — ConfigError со всеми нарушениями."""
+    """The default 1; a negative value — a ConfigError with all violations."""
     assert load_env(monkeypatch).backup_verify_every == 1
     with pytest.raises(ConfigError) as exc_info:
         load_env(monkeypatch, BACKUP_VERIFY_EVERY="-1", BACKUP_KEEP="0")
@@ -52,21 +52,21 @@ def test_verify_every_defaults_and_invalid(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_verify_every_zero_is_manual_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    """0 — валидное значение: авто-проверка выключена (вручную)."""
+    """0 — a valid value: the auto-verification off (manual)."""
     assert load_env(monkeypatch, BACKUP_VERIFY_EVERY="0").backup_verify_every == 0
 
 
 def test_ship_defaults_and_invalid_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Дефолты выноса: команда пуста (вынос выключен), таймаут 300 с."""
+    """The ship defaults: an empty command (shipping off); the timeout 300 s."""
     settings = load_env(monkeypatch)
     assert settings.backup_ship_cmd == ""
     assert settings.backup_ship_timeout_sec == 300
-    # Команда — не секрет и читается как есть (назначение/учётки — вне репо).
+    # The command is not a secret and is read as is (the destination/credentials — outside the repo).
     assert load_env(monkeypatch, BACKUP_SHIP_CMD="true").backup_ship_cmd == "true"
 
 
 def test_ship_timeout_invalid_fatal(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`BACKUP_SHIP_TIMEOUT_SEC=0` — фатальная ошибка конфигурации."""
+    """`BACKUP_SHIP_TIMEOUT_SEC=0` — a fatal configuration error."""
     with pytest.raises(ConfigError) as exc_info:
         load_env(monkeypatch, BACKUP_SHIP_TIMEOUT_SEC="0")
     assert 'backup_ship_timeout_sec' in str(exc_info.value)

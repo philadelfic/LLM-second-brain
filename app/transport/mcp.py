@@ -1,152 +1,163 @@
-"""MCP-поверхность (ARCHITECTURE §3.1, §5): 23 инструмента (8 `memory_*`
-заметок/узлов + 5 `skills_*` области навыков + 5 `user_*` области «user»
-+ 3 `terms_*` области «terms» + 2 `history_*` чтения истории) + инструкции.
+"""The MCP surface (ARCHITECTURE §3.1, §5): 23 tools (8 `memory_*` of notes/nodes
+    + 5 `skills_*` of the skills area + 5 `user_*` of the "user" area
+    + 3 `terms_*` of the "terms" area + 2 `history_*` of history reading) +
+    instructions.
 
-`MCPServer` — официальный высокоуровневый API mcp SDK 2.x (ex-`FastMCP`).
-Фаза 2: инструменты вызывают тот же service-слой, что и REST (ARCH §1);
-внешних LLM-вызовов нет — summary/vector pending, поиск FTS-only (Фазы 3–4
-добавят семантику и суммаризацию в фоновом воркере).
+    `MCPServer` — the official high-level API of the mcp SDK 2.x (ex-`FastMCP`).
+    Phase 2: the tools call the same service layer as REST (ARCH §1);
+    no external LLM calls — summary/vector pending, FTS-only search (Phases 3–4
+    add semantics and summarization in the background worker).
 
-ВАЖНО: не добавлять `from __future__ import annotations` — SDK вычисляет
-аннотации инструментов (eval/logging.get_type_hints на реальных объектах);
-со строковыми аннотациями from_function не видит замыкание settings и падает
-InvalidSignature (см. журнал Фазы 1, подтверждено ещё раз в Фазе 2).
+    IMPORTANT: do not add `from __future__ import annotations` — the SDK evaluates
+    tool annotations (eval/logging.get_type_hints on real objects); with string
+    annotations from_function does not see the settings closure and fails with
+    InvalidSignature (see the Phase 1 journal, confirmed again in Phase 2).
 
-Блокирующие вызовы SQLite — короткие (мс), но event loop не занимаем:
-каждый вызов сервиса уходит в `asyncio.to_thread`, а соединение с БД целиком
-живёт внутри рабочего потока.
+    Blocking SQLite calls — short (ms), but the event loop is not occupied:
+    every service call goes into `asyncio.to_thread`, and the DB connection lives
+    entirely inside the worker thread.
 
-Фаза 9: MCP-выдачи — компактные проекции полных ответов сервисов по белым
-спискам полей (полный контракт остаётся в REST/логах; см.
-briefs/PHASE9_BRIEF.md). hint — только при fail; warning из MCP-ответов
-срезан (наблюдаемость деградации — REST /search, лог tool_call с fts_only,
-/health.embedding_ok).
+    Phase 9: MCP outputs — compact projections of full service answers by field
+    whitelists (the full contract stays in REST/the logs; see
+    briefs/PHASE9_BRIEF.md). hint — only on fail; warning is trimmed from MCP
+    answers (degradation observability — REST /search, the tool_call log with
+    fts_only, /health.embedding_ok).
 
-Фаза 10 (Шаг 3): namespace-параметры в save/update/search/list (+namespace_exact
-для поиска/обзора); 7-й инструмент `memory_namespaces` — реестр узлов с
-счётчиками и promotion_candidates; карта неймспейсов и правило «уверен — узел,
-не уверен — глобально» вшиты в SERVER_INSTRUCTIONS (бюджет §2 ≤ ~1300 токенов).
-Незарегистрированный узел в save/update/search/list → NamespaceError/
-NamespaceValidationError, транспорт обернёт в fail + hint (мягкий маркер,
-как hint Фазы 9). Метка `namespace` добавлена в белые списки search/list/get
-(слой ориентирования 3, §5.7).
+    Phase 10 (Step 3): namespace parameters in save/update/search/list
+    (+namespace_exact for search/list); the 7th tool `memory_namespaces` — the
+    node registry with counters and promotion_candidates; the namespace map and
+    the rule "confident — a node, not confident — global" are baked into
+    SERVER_INSTRUCTIONS (the §2 budget ≤ ~1300 tokens). An unregistered node in
+    save/update/search/list → NamespaceError/NamespaceValidationError; the
+    transport wraps it into fail + hint (a soft marker, like Phase 9's hint). The
+    `namespace` label added to the search/list/get whitelists (orientation
+    layer 3, §5.7).
 
-Фаза 11 (решение №9): параметр `title` в memory_save (обязателен — без него
-или длиннее 5 слов сервис отклоняет запись, транспорт даёт fail+hint «задай
-title ≤5 слов») и memory_update (опционален — передан и валиден → перезапись,
-не передан → прежний). `title` добавлен в белые списки выдач search/list;
-в get названия НЕТ (экономия контекста — там полный текст). SearchService
-отдаёт title в выдаче поиска (follow-up пула 5b, Фаза 11).
+    Phase 11 (decision #9): the `title` parameter in memory_save (mandatory —
+    without it, or longer than 5 words, the service rejects the write; the
+    transport gives fail+hint "set a title ≤5 words") and memory_update (optional
+    — passed and valid → overwrite; not passed → the old one). `title` added to
+    the search/list output whitelists; get has NO title (context economy — the
+    full text is there). SearchService serves title in the search output (the
+    pool-5b follow-up, Phase 11).
 
-lsb-0005-05 (FR-6/FR-8): 8-й инструмент `memory_namespace_create` — модель
-создаёт узел ЛЮБОГО уровня (включая корни 1..3) с обязательным описанием.
-Отдельный процесс от save: save только кладёт заметки в существующий узел,
-создание узлов — через эту ручку (confirmed, прямое создание). Судья не
-вызывается. Отказы (узел уже есть / несуществующий родитель / невалидный
-путь, в т.ч. default/... / пустое описание) — fail + hint.
+    lsb-0005-05 (FR-6/FR-8): the 8th tool `memory_namespace_create` — the model
+    creates a node of ANY level (including roots 1..3) with a mandatory
+    description. A separate process from save: save only places notes into an
+    existing node; node creation — through this handle (confirmed, direct
+    creation). The judge is not called. Failures (the node exists / a nonexistent
+    parent / an invalid path, incl. default/... / an empty description) —
+    fail + hint.
 
-lsb-0005-06 (FR-6): антисинонимия при создании — перед созданием косинус
-описания нового узла против описаний тематических узлов реестра (default
-исключён); `> NAMESPACE_CREATE_SYNONYM_SIMILARITY` (0.90) → мягкий отказ
-с хинтом «есть похожий: <ближайший>» (1 ближайший), создание не происходит.
-Для корня (depth 1) сравнение — против корней; для листа — против всех
-тематических узлов (тот же предфильтр, что `_nearest_node` промоушна, но
-порог 0.90 и без записи вердикта). Отказ эмбеддинга предфильтр пропускает
-(деградация: создание происходит).
+    lsb-0005-06 (FR-6): the creation anti-synonymy — before creation, the cosine
+    of the new node's description against the thematic nodes' descriptions
+    (default excluded); `> NAMESPACE_CREATE_SYNONYM_SIMILARITY` (0.90) → a soft
+    failure with the "there is a similar one: <nearest>" hint (1 nearest), no
+    creation. For a root (depth 1) the comparison — against roots; for a leaf —
+    against all thematic nodes (the same prefilter as promotion's `_nearest_node`,
+    but the 0.90 threshold and no verdict record). An embedding failure — the
+    prefilter is skipped (a degradation: creation happens).
 
-lsb-0007-03 (релиз 3.0.0): 5 инструментов области навыков — `skills_search`,
-`skills_list`, `skills_get`, `skills_save`, `skills_delete` — тонкие обёртки
-над `SkillsService` (один код с REST-зеркалами §3.7). Описания — дословно
-канон arch lsb-0007 §3.8 (правило «перед рутинной задачей —
-`skills_search`/`skills_list`, тело — только `skills_get` вшито в тексты:
-инструкции MCP на OWUI не доходят, гарантированный канал — tools). Выдачи
-компактны (белые списки), `hint` — только при мягком отказе. Антисинонимия
-создания (FR-5.2) живёт в сервисном слое (`SkillsService.save`): её обязан
-звать и REST POST /skills, у сервиса уже есть DI-эмбеддер; транспорт лишь
-отдаёт мягкий отказ `{created: False, hint}`.
+    lsb-0007-03 (release 3.0.0): 5 tools of the skills area — `skills_search`,
+    `skills_list`, `skills_get`, `skills_save`, `skills_delete` — thin wrappers
+    over `SkillsService` (one codebase with the §3.7 REST mirrors). The
+    descriptions — verbatim of the arch lsb-0007 §3.8 canon (the rule "before a
+    routine task — `skills_search`/`skills_list`; the body — only `skills_get`"
+    is baked into the texts: MCP instructions do not reach OWUI; the guaranteed
+    channel is tools). The outputs are compact (whitelists); `hint` — only on a
+    soft failure. The creation anti-synonymy (FR-5.2) lives in the service layer
+    (`SkillsService.save`): REST POST /skills must call it too; the service
+    already has a DI embedder; the transport only serves the soft failure
+    `{created: False, hint}`.
 
-lsb-0009-02 (релиз 3.0.0): 5 инструментов области «user» — `user_search`,
-`user_save`, `user_update`, `user_delete`, `user_get` — тонкие обёртки над
-`UserFactsService` (один код с REST-зеркалами lsb-0009-03). Описания — дословно
-канон arch lsb-0009 §3.7 (правило «один факт = одна запись; несколько фактов —
-отдельные вызовы» + запрет секретов); выдачи компактны (белые списки), тело
-факта в контекст попадает только через `user_get` (поиск — `excerpt`). Хинты —
-четыре канала FR-7: описание инструмента (1), ПОСТОЯННЫЙ hint в каждом успешном
-`user_save` (2), дедуп-hint с id/name (3), мягкий отказ при `body` > 1200 (4).
-Инъекции при init НЕТ (arch §2): блока «user» в `instructions` не появляется —
-текст инструкций относительно предыдущего состояния не меняется (анонс навыков
-существовал и раньше, lsb-0007-04).
+    lsb-0009-02 (release 3.0.0): 5 tools of the "user" area — `user_search`,
+    `user_save`, `user_update`, `user_delete`, `user_get` — thin wrappers over
+    `UserFactsService` (one codebase with the lsb-0009-03 REST mirrors). The
+    descriptions — verbatim of the arch lsb-0009 §3.7 canon (the rule "one fact =
+    one record; several facts — separate calls" + the secrets prohibition); the
+    outputs are compact (whitelists); a fact body reaches the context only via
+    `user_get` (the search — an `excerpt`). The hints — the four FR-7 channels:
+    the tool description (1), the PERMANENT hint in every successful `user_save`
+    (2), the dedup hint with id/name (3), the soft failure at `body` > 1200 (4).
+    NO init injections (arch §2): no "user" section appears in `instructions` —
+    the instructions text does not change relative to the previous state (the
+    skills announce existed before, lsb-0007-04).
 
-lsb-0008-02 (релиз 3.0.0): 3 инструмента области terms — `terms_search`,
-`terms_save`, `terms_get` — тонкие обёртки над `TermsService` (один код с
-REST-зеркалами lsb-0008-03). Описания — дословно канон arch lsb-0008 §3.7
-(правило «все смыслы термина; выбор смысла — по контексту разговора, из
-разговора неясно — уточнить у пользователя, не додумывать» и «контекст
-обязателен всегда» вшиты в тексты: инструкции MCP на OWUI не доходят,
-гарантированный канал — tools). Листинга нет: поиск — единственный путь к
-определению. Выдачи компактны (белые списки), внутренние нормализованные
-колонки в MCP не просачиваются, `warning` сервиса срезается; hint — маркер
-мягкого отказа (нет точного термина / термина нет / близкий контекст /
-лимиты / пустой контекст). Инъекции при init НЕТ (arch §2): блока «terms» в
-`instructions` не появляется — анонса области terms нет.
+    lsb-0008-02 (release 3.0.0): 3 tools of the terms area — `terms_search`,
+    `terms_save`, `terms_get` — thin wrappers over `TermsService` (one codebase
+    with the lsb-0008-03 REST mirrors). The descriptions — verbatim of the arch
+    lsb-0008 §3.7 canon (the rules "all senses of the term; the sense choice — by
+    the conversation context; unclear from the conversation — ask the user, do
+    not guess" and "the context is always mandatory" are baked into the texts:
+    MCP instructions do not reach OWUI; the guaranteed channel is tools). No
+    listing: the search is the only road to a definition. The outputs are compact
+    (whitelists); the internal normalized columns do not leak into MCP; the
+    service's `warning` is trimmed; `hint` — the soft-failure marker (no exact
+    term / no term / a close context / limits / an empty context). NO init
+    injections (arch §2): no "terms" section appears in `instructions` — no
+    terms area announce.
 
-lsb-0013-02 (релиз 3.1.0): листинги — транспортная часть контракта lsb-0013
-(arch §3.3–3.4). Оба листинга (`memory_list`, `skills_list`) несут поля
-страницы `total`/`has_more`/`next_offset`/`next_cursor` (их считает сервисный
-`page_fields`) и ровно одну подсказку «есть ещё»: `+N more — offset=K` при
-`has_more` и отсутствии другой подсказки. Существующие `memory is empty` /
-`page beyond the memory` сохраняются дословно и «+N more» не дополняются.
-Потолок лимита проверяет СЕРВИС, а не схема (у `limit` остаётся только
-`ge=1`): `limit=50` на MCP — мягкий отказ с единым текстом
-`limit: expected 1..20, got 50`, а не schema-error транспорта. `skills_list`
-получает `limit`/`offset` (дефолт и потолок те же, поведение как у
-`memory_list`). `memory_search` и `memory_namespaces` не меняются; состав
-поверхности — 21 инструмент.
+    lsb-0013-02 (release 3.1.0): the listings — the transport part of the
+    lsb-0013 contract (arch §3.3–3.4). Both listings (`memory_list`,
+    `skills_list`) carry the page fields `total`/`has_more`/`next_offset`/
+    `next_cursor` (the service `page_fields` computes them) and exactly one
+    "there is more" hint: `+N more — offset=K` when `has_more` and no other hint
+    exists. The existing `memory is empty` / `page beyond the memory` are
+    preserved verbatim and are not extended with "+N more". The limit ceiling is
+    checked by the SERVICE, not the schema (`limit` keeps only `ge=1`):
+    `limit=50` on MCP — a soft failure with the single text
+    `limit: expected 1..20, got 50`, not a transport schema-error. `skills_list`
+    receives `limit`/`offset` (the same default and ceiling; the behavior like
+    `memory_list`). `memory_search` and `memory_namespaces` unchanged; the
+    surface — 21 tools.
 
-lsb-0010-04 (релиз 3.1.0, задача №44): в компактные выдачи добавлено поле
-`chars` — объём ПОЛНОГО текста заметки в символах. Модель видит объём и сама
-решает, хватит ли `memory_get` или нужен чанк. В chunk-режиме `memory_get`
-белый список не применяется: верхний `chars` там — сумма символов ОТДАННЫХ
-чанков (контракт lsb-0003, не переопределяется).
+    lsb-0010-04 (release 3.1.0, task #44): the compact outputs gained the `chars`
+    field — the note's FULL text volume in characters. The model sees the volume
+    and decides itself whether `memory_get` suffices or a chunk is needed. In
+    memory_get's chunk mode the whitelist is not applied: the top-level `chars`
+    there is the sum of the SERVED chunks' characters (the lsb-0003 contract, not
+    overridden).
 
-LSBN-F-13 (релиз 3.4.0, решение О. 21.10.2026): сокращение выдачи —
-ПОВЕДЕНИЕ ПО УМОЛЧАНИЮ. Дефолт `memory_search` — шапки `_SEARCH_HEADER_ITEM`
-(id, title, namespace, chars, score), дефолт `memory_list` — деталь titles,
-batch-`memory_get` — шапки `_GET_HEADER_ITEM` (title в шапке get теперь
-есть: без названия шапка не ориентирует); прежняя семантическая форма с
-саммари (`_SEARCH_ITEM`/`_search_hit`) и полные тексты batch-чтения из MCP
-убраны (REST сохраняет полный контракт — нетленность операторской
-поверхности). Все три ручки несут `budget_chars` (символы, 100..100000);
-не влезающий элемент деградирует до шапки с `"truncated": true`, в ответе —
-единственная hint усечения с id для точечного чтения. Одиночный id и
-chunk-режим — полный текст без бюджета (уровень 2 двухуровневого чтения).
+    LSBN-F-13 (release 3.4.0): output reduction — the DEFAULT BEHAVIOR. The
+    `memory_search` default — the `_SEARCH_HEADER_ITEM` headers (id, title,
+    namespace, chars, score); the `memory_list` default — the titles detail; a
+    batch `memory_get` — the `_GET_HEADER_ITEM` headers (get's header now HAS the
+    title: a header without a title does not orient); the former semantic shape
+    with summaries (`_SEARCH_ITEM`/`_search_hit`) and the full texts of batch
+    reads are gone from MCP (REST keeps the full contract — the operator surface
+    is untouchable). All three handles carry `budget_chars` (characters,
+    100..100000); an element that does not fit degrades to a header with
+    `"truncated": true`, and the answer carries a single truncation hint with the
+    id for pointwise reading. A single id and chunk mode — the full text without
+    a budget (level 2 of the two-level reading).
 
-lsb-0010-05 (релиз 3.1.0, задача №44): при одиночном чтении `memory_get` — в
-том числе в chunk-режиме — ответ несёт `links` — компактный перечень связанных
-заметок из ДРУГИХ неймспейсов (уровень 1 с фолбэком на уровень 0, arch §3.5).
-В batch-чтении (`ids` длиной > 1), `memory_search` и `memory_list` связей нет.
-Элемент связи — собственный белый список `{id, title, namespace, chars}`, где
-`chars` — объём ПОЛНОГО текста связанной заметки; это НЕ верхнеуровневый
-`chars` chunk-режима (сумма отданных чанков) — два разных уровня ответа
-(FR-3.5). Подсказок про связи нет: пустой список — нормальный ответ.
+    lsb-0010-05 (release 3.1.0, task #44): on a single `memory_get` read —
+    including chunk mode — the answer carries `links`, a compact list of linked
+    notes from OTHER namespaces (level 1 with a fallback to level 0, arch §3.5).
+    A batch read (`ids` longer than 1), `memory_search` and `memory_list` have no
+    links. A link item — its own whitelist `{id, title, namespace, chars}`, where
+    `chars` is the linked note's FULL text volume; it is NOT the chunk mode's
+    top-level `chars` (the sum of served chunks) — two different answer levels
+    (FR-3.5). No hints about links: an empty list is a normal answer.
 
-№41 (релиз 3.2.0, §7.1/§13.14): поверхность 21 → 23 — добавлены ровно ДВА
-ОБЩИХ инструмента чтения истории (`history_list`/`history_get` с параметром
-`entity`) вместо ручек по каждой области (бюджет F-11). История читается
-только по явному запросу и НЕ подмешивается в `memory_get`/`skills_get`/
-`terms_get`/`user_get` (FR-5.5/FR-9.2); существующие ручки не меняются
-(FR-9.1). Компактный список версий — без тел (FR-5.1), `session` в MCP не
-выводится (§13.4); `history_get` мягко отвечает `{…, hint}` на неизвестную
-сущность/версию, без исключения. Откат из MCP недоступен (решение О.,
-§13.6). При `HISTORY_ENABLED=false` оба инструмента отдают пусто + hint
-«history is off» (§8) — ошибкой это не считается.
+    #41 (release 3.2.0, §7.1/§13.14): the surface 21 → 23 — exactly TWO SHARED
+    history reading tools added (`history_list`/`history_get` with an `entity`
+    parameter) instead of handles per area (the F-11 budget). History is read
+    only on an explicit request and is NOT mixed into `memory_get`/`skills_get`/
+    `terms_get`/`user_get` (FR-5.5/FR-9.2); the existing handles do not change
+    (FR-9.1). A compact version list — without bodies (FR-5.1); `session` is not
+    output to MCP (§13.4); `history_get` softly answers `{…, hint}` on an unknown
+    entity/version, without an exception. Rollback from MCP is unavailable.
+    With `HISTORY_ENABLED=false` both tools serve empty + the "history is off"
+    hint (§8) — this is not an error.
 
-№40, no40-02 (релиз 3.2.0, §7.1/§13.10): допустимый словарь `entity` ручек
-истории выводится из флагов областей (`history_entities_mcp`) — сущность
-выключенной области для агента НЕИЗВЕСТНА: мягкий hint без раскрытия, что
-область существует, и без её имени в подсказке/схеме параметра; ядровая `note`
-доступна всегда. Операторский REST при выключенной области остаётся полным
-(§13.10) — флаги областей гейтят только агентскую поверхность и фон.
+    #40, no40-02 (release 3.2.0, §7.1/§13.10): the `entity` dictionary valid for
+    the history handles is derived from the area flags (`history_entities_mcp`) —
+    a disabled area's entity is UNKNOWN to the agent: a soft hint without
+    revealing that the area exists, and without its name in the hint/parameter
+    schema; the core `note` is always available. The operator REST with a
+    disabled area stays full (§13.10) — the area flags gate only the agent
+    surface and the background.
 """
 
 import asyncio
@@ -199,26 +210,26 @@ from app.services.user_facts import (
 )
 from app.storage.db import DEFAULT_NAMESPACE
 
-if TYPE_CHECKING:  # только аннотация: рантайм-зависимости от воркера нет
+if TYPE_CHECKING:  # an annotation only: no runtime dependency on the worker
     from app.services.worker import BackgroundWorker
 
 SERVER_NAME = "LLM Second Brain"
 
-#: Потолок массива `notes` в memory_save (LSBN-F-23, п. 3): одна операция
-#: агента пишет до SAVE_NOTES_MAX самодостаточных заметок (слияние даёт
-#: 2–3 части; потолок — тот же порядок, что у ids в memory_get: 20).
+#: The ceiling of the `notes` array in memory_save (LSBN-F-23, p. 3): one agent
+#: operation writes up to SAVE_NOTES_MAX self-sufficient notes (a merge yields
+#: 2–3 parts; the ceiling is the same order as memory_get's ids: 20).
 SAVE_NOTES_MAX = 20
 
-# Серверные инструкции при MCP-handshake (ARCHITECTURE §5.1) — КОРОТКОЕ ЯДРО
-# (LSBN-F-11, f11-02): роль, обязательные правила и запреты, указатели действием.
-# Бюджет — `TOKENS_CORE_MAX` (arch §13.17, канон §6); полные формулировки правил
-# и справочные перечни живут в каноне §3.3.5 и в ответах ручек, поэтому в ядре
-# их нет. Фаза 10: это БАЗА — `build_instructions`/`InstructionsRefresher`
-# дописывают к ней карту узлов и хвосты областей (динамика — из реестра).
-# 3.4.1 (LSBN-T-26): число лимита заметки в тексте — из настроек (одно число —
-# одно место), поэтому ядро собирает функция `server_instructions`.
+# The server instructions at MCP handshake (ARCHITECTURE §5.1) — a SHORT CORE
+# (LSBN-F-11, f11-02): the role, mandatory rules and prohibitions, pointers phrased as actions.
+# The budget — `TOKENS_CORE_MAX` (arch §13.17, canon §6); the full rule wordings
+# and reference lists live in canon §3.3.5 and in handle answers, so the core
+# does not carry them. Phase 10: this is the BASE — `build_instructions`/`InstructionsRefresher`
+# append the node map and the area tails to it (the dynamics — from the registry).
+# 3.4.1 (LSBN-T-26): the note limit number in the text — from settings (one number —
+# one place), so the core is assembled by the `server_instructions` function.
 def server_instructions(note_limit: int) -> str:
-    """База инструкций; `note_limit` — settings.max_note_chars сборки."""
+    """The instructions base; `note_limit` — the build's settings.max_note_chars."""
     return (
         "You have persistent long-term memory (LLM Second Brain) — a shared bank of "
         "short notes available to all models. **Before answering on any topic that "
@@ -243,11 +254,11 @@ def server_instructions(note_limit: int) -> str:
         "`history_list`/`history_get`."
     )
 
-# Динамический хвост инструкций (Фаза 10, §5.7): правило «уверен — узел,
-# не уверен — глобально» + карта неймспейсов из реестра (по строке на узел).
-# Про саму карту ядро уже сказало (`memory_namespaces`) — здесь только то, чему
-# в ядре не место: выбор узла и правило записи. Статичный текст здесь, строки
-# реестра — в `_namespace_map`.
+# The dynamic instructions tail (Phase 10, §5.7): the rule "confident — a node,
+# not confident — global" + the namespace map from the registry (one line per node).
+# The core already mentioned the map itself (`memory_namespaces`) — here only what
+# does not belong in the core: the node choice and the write rule. The static text lives here; the registry
+# rows — in `_namespace_map`.
 _NS_RULES = (
     "\n\nHierarchical namespaces are large sections of the memory (few of them, "
     "unambiguous choice). Rule: confident about the area — search with "
@@ -256,31 +267,31 @@ _NS_RULES = (
     "only with `memory_namespace_create`. Node map (path: description):\n"
 )
 
-# Ограничение карты узлов (FR-2.4): рост числа узлов НЕ должен растить
-# инструкции линейно. Описание обрезается под бюджет строки; не вместившиеся
-# узлы заменяются строкой-указателем `_NS_MAP_MORE` (прецедент
-# `_SKILLS_ANNOUNCE_MORE`), место под неё резервируется заранее. Токены —
-# единой метрикой релиза (`injection_budget.count_tokens`).
+# The node map limit (FR-2.4): a growing node count must NOT grow the
+# instructions linearly. A description is trimmed to the line's budget; nodes that
+# do not fit are replaced by the `_NS_MAP_MORE` pointer line (the
+# `_SKILLS_ANNOUNCE_MORE` precedent); space for it is reserved in advance. Tokens —
+# by the release's single metric (`injection_budget.count_tokens`).
 _NS_MAP_DESCRIPTION_CHARS = 60
 _NS_MAP_MAX_TOKENS = 400
 _NS_MAP_MORE = "  (+{n} more — memory_namespaces)"
 
 
 def _namespace_map(services: Services) -> str:
-    """Строки карты реестра (одна на узел) в бюджете `_NS_MAP_MAX_TOKENS`.
+    """The registry map's lines (one per node) within the `_NS_MAP_MAX_TOKENS` budget.
 
-    MCP собирается раньше, чем lifespan инициализирует хранилище (init_db),
-    поэтому на самом первом старте / при импорте приложения для тестов БД
-    может быть ещё не открыта. Карта — слой 1 ориентирования (§5.7), не
-    контракт: при недоступности реестра инструкции остаются валидными
-    (слой 2 — `memory_namespaces` всегда отдаст реестр по запросу), а при
-    переполнении карта обрывается строкой-указателем на ту же ручку.
+            MCP is assembled before lifespan initializes the storage (init_db), so at
+            the very first start / at application import for tests the DB may not be
+            open yet. The map is orientation layer 1 (§5.7), not a contract: when the
+            registry is unavailable the instructions stay valid (layer 2 —
+            `memory_namespaces` always serves the registry on request), and on
+            overflow the map is cut off with a pointer line to the same handle.
     """
     try:
         namespaces = services.namespaces.list_all()["namespaces"]
     except Exception:
-        # БД ещё не инициализирована (init_db в lifespan) либо реестр временно
-        # недоступен — деградируем карту, а не падаем при сборке приложения.
+        # The DB is not initialized yet (init_db in lifespan) or the registry is temporarily
+        # unavailable — we degrade the map instead of crashing at application assembly.
         logger = logging.getLogger("app")
         logger.info("namespace map unavailable at build — degraded instructions",
                     extra={"event": "startup"})
@@ -311,23 +322,24 @@ def _namespace_map(services: Services) -> str:
 def build_instructions(
     services: Services, settings: Settings | None = None
 ) -> str:
-    """Полный текст инструкций: база + правило неймспейсов + карта + анонс.
+    """The full instructions text: the base + the namespace rule + the map + the announce.
 
-    Порядок слагаемых: база (`SERVER_INSTRUCTIONS`), правила неймспейсов
-    (`_NS_RULES`), карта узлов, анонс навыков, раздел логов, строка про
-    lifetime заметки.
+            The terms' order: the base (`SERVER_INSTRUCTIONS`), the namespace rules
+            (`_NS_RULES`), the node map, the skills announce, the logs section, the
+            note-lifetime line.
 
-    Блок анонса навыков — ХВОСТ (lsb-0007 §3.5): манифест, правила и карта
-    не меняются, блок лишь дописывается и не добавляется вовсе, если
-    активных навыков нет (или БД ещё недоступна).
+            The skills announce block — the TAIL (lsb-0007 §3.5): the manifest, the
+            rules and the map do not change; the block is only appended, and is not
+            appended at all when there are no active skills (or the DB is not yet
+            available).
 
-    LSBN-F-10 (f10-04, arch §10): хвостом ПОСЛЕ анонса навыков добавляется
-    короткий раздел области логов — и только при `AREA_LOGS_ENABLED`; в карту
-    узлов логи не входят (карта — про неймспейсы заметок, §13.13).
+            LSBN-F-10 (f10-04, arch §10): a short logs-area section is appended after
+            the skills announce as a tail — and only at `AREA_LOGS_ENABLED`; logs do
+            not enter the node map (the map is about note namespaces, §13.13).
 
-    №46 (no46-02): САМЫМ последним хвостом — строка про lifetime заметки;
-    флагами областей НЕ гейтится (TTL — ядровая механика заметок, как
-    `note`/`memory_*`), остаётся и при выключенных областях.
+            #46 (no46-02): the very LAST tail — the note-lifetime line; NOT gated by
+            area flags (the TTL is the core mechanics of notes, like
+            `note`/`memory_*`), it stays even with areas disabled.
     """
     settings = get_settings() if settings is None else settings
     return (
@@ -340,11 +352,11 @@ def build_instructions(
     )
 
 
-# Раздел области логов в инструкциях (f10-04, arch §10) — статический EN-текст.
-# Обезличенный: ни имён, ни «оператора»; реестра записей в разделе нет (§13.13).
-# LSBN-F-11 (f11-02): раздел сокращён и не повторяет правил ядра — он входит
-# в `TOKENS_INSTRUCTIONS_MAX` вместе с ядром и картой. Добавляется только при
-# включённой области; выключенная — раздела нет вовсе (§10).
+# The logs area's section in the instructions (f10-04, arch §10) — static EN text.
+# Impersonal: no names, no "operator"; the section carries no record registry (§13.13).
+# LSBN-F-11 (f11-02): the section is shortened and does not repeat the core's rules — it is part
+# of `TOKENS_INSTRUCTIONS_MAX` together with the core and the map. Added only when
+# the area is enabled; a disabled one — no section at all (§10).
 _LOGS_SECTION = (
     "\n\nAssistant logs are a separate area for «what I did and why» (a decision, "
     "a measurement, an instruction, a defect, a release requirement) — NOT notes "
@@ -356,23 +368,24 @@ _LOGS_SECTION = (
 
 
 def _logs_section(services: Services, settings: Settings) -> str:
-    """Хвост инструкций — короткий раздел области логов (arch §10, f10-04).
+    """The instructions tail — a short logs-area section (arch §10, f10-04).
 
-    Статический текст, без имён и без реестра записей; карта узлов (`_namespace_map`)
-    логов не содержит — карта про неймспейсы заметок (§13.13). При выключенной
-    области (`AREA_LOGS_ENABLED=false`) — пустая строка: раздела нет.
+            Static text, no names and no record registry; the node map
+            (`_namespace_map`) does not contain logs — the map is about note
+            namespaces (§13.13). With the area disabled (`AREA_LOGS_ENABLED=false`) —
+            an empty string: no section.
     """
     if not settings.area_logs_enabled:
         return ""
     return _LOGS_SECTION
 
 
-# Строка про lifetime заметки в инструкциях (№46, no46-02) — статический EN-текст
-# канона постановки, дословно. Обезличенный: ни имён, ни «оператора». Даёт модели
-# знать про TTL: `expires_at` превращается в абсолютный ISO-8601, просроченную
-# заметку удаляет сам LSB джобой `expiration`. Флагами областей НЕ гейтится —
-# TTL это ядровая механика заметок, а не область. Бюджет F-11 держим: короткая
-# строка, перечень форматов TTL — минимально необходимый.
+# The note-lifetime line in the instructions (#46, no46-02) — the static EN text
+# of the brief's canon, verbatim. Impersonal: no names, no "operator". It tells the model
+# about the TTL: `expires_at` becomes an absolute ISO-8601; an expired
+# note is deleted by LSB itself with the `expiration` job. NOT gated by area flags —
+# the TTL is the core mechanics of notes, not an area. We keep the F-11 budget: a short
+# line; the TTL formats list — the bare minimum.
 _NOTE_LIFETIME_SECTION = (
     "\n\nNotes can carry a lifetime: pass `expires_at` (a TTL like «1d», «2h», "
     "«30m», «45s», «2w») to `memory_save` — LSB deletes the note when it "
@@ -381,65 +394,67 @@ _NOTE_LIFETIME_SECTION = (
 
 
 def _note_lifetime_section(services: Services, settings: Settings) -> str:
-    """Хвост инструкций — строка про lifetime заметки (№46, no46-02).
+    """The instructions tail — the note-lifetime line (#46, no46-02).
 
-    Статический EN-текст канона; от флагов областей не зависит (TTL — ядровая
-    механика заметок), поэтому возвращается всегда. `services`/`settings` —
-    ради единой подписи слагаемых `build_instructions`.
+            The canon's static EN text; it does not depend on the area flags (the TTL
+            is the core mechanics of notes), so it is returned always.
+            `services`/`settings` — for the unified signature of the
+            `build_instructions` terms.
     """
     return _NOTE_LIFETIME_SECTION
 
 
-# Блок анонса навыков (arch lsb-0007 §3.5/§3.8): манифест и заголовок канона
-# §3.8 (в доке разбит на строки — это вёрстка, строки склеены пробелами).
-# LSBN-F-11 (f11-02): правило про навыки живёт в ЯДРЕ (`skills_search`/
-# `skills_list`, тело — `skills_get`) — здесь его больше нет, чтобы не
-# дублировать ядро. Строки реестра — ДАННЫЕ, а не канон:
+# The skills announce block (arch lsb-0007 §3.5/§3.8): the manifest and the canon's heading
+# §3.8 (split into lines in the doc — that is layout; the lines are joined with spaces).
+# LSBN-F-11 (f11-02): the skills rule lives in the CORE (`skills_search`/
+# `skills_list`; the body — `skills_get`) — it is no longer here, to avoid
+# duplicating the core. The registry rows are DATA, not canon:
 # `  - {id} — {name}: {description}`.
 _SKILLS_ANNOUNCE_RULES = (
     "\n\nSkills are stored procedures (how-to), kept separately from notes. "
     "Available skills (id — name: description):\n"
 )
 
-# Строка переполнения бюджета (канон §3.8); хвостовые пробелы арх-доки —
-# вёрстка (плейсхолдер {n} заменяется числом не вместившихся навыков).
+# The budget overflow line (canon §3.8); the arch doc's trailing spaces are
+# layout (the {n} placeholder is replaced by the count of skills that did not fit).
 _SKILLS_ANNOUNCE_MORE = "  (+{n} more — skills_list)"
 
-# Деградация сборки до init_db / недоступности БД — паттерн карты неймспейсов
-# (§3.5): блок анонса не собирается, инструкции остаются валидными, модель
-# идёт в листинг. Пустой реестр — тоже без блока (но без этой подсказки:
-# реестр известен и он пуст).
+# Degrading the assembly before init_db / DB unavailability — the namespace-map pattern
+# (§3.5): the announce block is not assembled, the instructions stay valid, the model
+# goes to the listing. An empty registry — also without the block (but without that hint:
+# the registry is known and empty).
 _SKILLS_ANNOUNCE_DEGRADED = (
     "\n\n(skills announce loads at startup; up-to-date — skills_list)"
 )
 
 
 def _skills_announce(services: Services) -> str:
-    """Хвост инструкций — блок анонса навыков (arch lsb-0007 §3.5).
+    """The instructions tail — the skills announce block (arch lsb-0007 §3.5).
 
-    Правило поведения + строки реестра `  - {id} — {name}: {description}`;
-    `description` обрезается до `skill_announce_description_chars` (120),
-    весь блок — не длиннее `skill_announce_max_chars` (2000); не вместившиеся
-    навыки заменяются последней строкой `  (+{n} more — skills_list)`.
-    Бюджет считается по всему блоку (правило + строки) — иначе блок вылезал
-    бы за заявленный предел; место под строку переполнения резервируется
-    заранее, чтобы она влезла. Активных навыков нет — блок НЕ добавляется;
-    БД недоступна — деградация по паттерну карты неймспейсов.
+            The behavior rule + the registry rows `  - {id} — {name}: {description}`;
+            `description` is trimmed to `skill_announce_description_chars` (120);
+            the whole block is no longer than `skill_announce_max_chars` (2000);
+            skills that did not fit are replaced by the last line
+            `  (+{n} more — skills_list)`. The budget is counted over the whole block
+            (the rule + the rows) — otherwise the block would exceed the declared
+            limit; space for the overflow line is reserved in advance so it fits. No
+            active skills — the block is NOT added; the DB unavailable — the
+            degradation follows the namespace-map pattern.
     """
     skills = services.skills
     if skills is None:
-        # DI-сборки тестов без области навыков (Services.skills опционален).
+        # Test DI builds without the skills area (Services.skills is optional).
         return ""
     settings = skills.settings
     if not settings.area_skills_enabled:
-        # №40 (FR-2.4): анонс гасится ПО ФЛАГУ области (а не по None-сервису) —
-        # выключенная область не упоминается в текстах, которые видит агент.
+        # #40 (FR-2.4): the announce is muted BY THE AREA FLAG (not by a None service) —
+        # a disabled area is never mentioned in the texts the agent sees.
         return ""
     try:
         items = skills.announce_items()
     except Exception:
-        # БД ещё не инициализирована (init_db в lifespan) либо реестр временно
-        # недоступен — деградируем, а не падаем при сборке приложения.
+        # The DB is not initialized yet (init_db in lifespan) or the registry is temporarily
+        # unavailable — we degrade instead of crashing at application assembly.
         logging.getLogger("app").info(
             "skills announce unavailable at build — degraded instructions",
             extra={"event": "startup"},
@@ -470,11 +485,12 @@ def _skills_announce(services: Services) -> str:
 
 
 def _mcp_session(ctx: ServerRequestContext[Any, Any]) -> str | None:
-    """Сессия версии для MCP-запроса (§13.4): идентификатор агента/вызова.
+    """The version session for an MCP request (§13.4): the agent/call identifier.
 
-    Имя клиента из `initialize` (`clientInfo.name`) или, иначе, `str(request_id)`
-    — имя человека никогда не придумываем. `params` приходят с провода
-    (`clientInfo` в camelCase), поэтому берём их как есть, без типизации.
+            The client name from `initialize` (`clientInfo.name`) or, failing that,
+            `str(request_id)` — a human's name is never invented. `params` arrive from
+            the wire (`clientInfo` in camelCase), so we take them as is, without
+            typing.
     """
     params = getattr(ctx, "params", None) or {}
     client = params.get("clientInfo") if isinstance(params, Mapping) else None
@@ -485,19 +501,20 @@ def _mcp_session(ctx: ServerRequestContext[Any, Any]) -> str | None:
 
 
 class InstructionsRefresher:
-    """ServerMiddleware SDK mcp 2.x — пересборка instructions на каждый initialize.
+    """A ServerMiddleware of the mcp 2.x SDK — reassembling instructions at every initialize.
 
-    Механизм откатанного 2.2 (lsb-0002), но БЕЗ данных пользователя: перед
-    обработкой `initialize` middleware пересобирает инструкции (манифест +
-    правила + карта + анонс навыков) в рабочем потоке (`asyncio.to_thread` —
-    блокирующие вызовы SQLite не занимают event loop) и присваивает атрибут
-    low-level сервера: ответ на initialize собирается в момент handshake,
-    поэтому обновления атрибута достаточно — транспорт не меняется, а новый
-    чат видит актуальный реестр навыков.
+            The mechanism of the rolled-back 2.2 (lsb-0002), but WITHOUT user data:
+            before handling `initialize` the middleware reassembles the instructions
+            (the manifest + the rules + the map + the skills announce) in a worker
+            thread (`asyncio.to_thread` — blocking SQLite calls do not occupy the
+            event loop) and assigns the low-level server's attribute: the initialize
+            answer is assembled at handshake time, so updating the attribute is
+            enough — the transport does not change, and a new chat sees the up-to-date
+            skills registry.
 
-    SDK 2.x: `MCPServer.instructions` — read-only свойство поверх
-    `_lowlevel_server.instructions` (provisional API — обновляем атрибут
-    напрямую, см. middleware guide).
+            SDK 2.x: `MCPServer.instructions` is a read-only property over
+            `_lowlevel_server.instructions` (a provisional API — we update the
+            attribute directly, see the middleware guide).
     """
 
     def __init__(self, services: Services, server: MCPServer) -> None:
@@ -509,17 +526,17 @@ class InstructionsRefresher:
         ctx: ServerRequestContext[Any, Any],
         call_next: Callable[[ServerRequestContext[Any, Any]], Awaitable[Any]],
     ) -> Any:
-        # №41 (§13.4): каждый MCP-запрос обёрнут источником версий «mcp» —
-        # правки через любую ручку несут версию с этим источником и сессией
-        # агента/вызова. Contextvar переживает `asyncio.to_thread` сервисов.
+        # #41 (§13.4): every MCP request is wrapped with the "mcp" versions source —
+        # edits through any handle carry a version with this source and the
+        # agent/call session. The contextvar survives the services' `asyncio.to_thread`.
         with history.bind_origin("mcp", session=_mcp_session(ctx)):
             if ctx.method == "initialize":
                 try:
                     text = await asyncio.to_thread(build_instructions, self._services)
                 except Exception:
-                    # Пересборка не должна ломать handshake: прежние инструкции
-                    # остаются (недоступность БД уже деградирована внутри
-                    # build_instructions — сюда доходит только дефект кода).
+                    # The rebuild must not break the handshake: the previous instructions
+                    # stay (DB unavailability is already degraded inside
+                    # build_instructions — only a code defect reaches here).
                     logging.getLogger("app").warning(
                         "instructions rebuild failed — keeping previous",
                         extra={"event": "instructions_refresh_failed"},
@@ -530,24 +547,25 @@ class InstructionsRefresher:
             return await call_next(ctx)
 
 
-# №39 FR-4.4 (arch §7.3): короткий ОБЕЗЛИЧЕННЫЙ хинт о сломанном слоте —
-# примешивается к ответу инструмента; имён людей и слова «оператор» нет.
+# #39 FR-4.4 (arch §7.3): a short IMPERSONAL hint about a broken slot —
+# mixed into the tool's answer; no people's names and no word "operator".
 SLOT_HINT_DOWN = (
     "slot {slot} is down ({outcome}): its jobs are waiting — tell your human."
 )
 
 
 class SlotHintMiddleware:
-    """ServerMiddleware (архетип InstructionsRefresher): хинт о сломанном слоте.
+    """A ServerMiddleware (the InstructionsRefresher archetype): the broken-slot hint.
 
-    №39 FR-4.4/FR-4.5 (arch §7.3): перед ответом инструмента middleware
-    проверяет снимок разрывов воркера (`worker.slot_states()`); если есть слот
-    в паузе и с последнего хинта по нему прошло ≥ `SLOT_HINT_EVERY_SEC` —
-    дописывает в ответ короткий обезличенный хинт (в `structured_content.hint`
-    и текстовым блоком в `content`). Троттлинг — в памяти процесса
-    (`dict[str, float]`): хинт не ест контекст (F-11), основное место
-    диагностики — `/health` и журнал. Своего канала наружу у LSB нет —
-    «предупредить» можно только хинтом (FR-4.6); имена людей не придумываем.
+            #39 FR-4.4/FR-4.5 (arch §7.3): before a tool's answer the middleware
+            checks the worker's breaker snapshot (`worker.slot_states()`); if a slot
+            is paused and ≥ `SLOT_HINT_EVERY_SEC` passed since the last hint for it —
+            it appends a short impersonal hint to the answer (into
+            `structured_content.hint` and as a text block in `content`). The
+            throttling — in process memory (`dict[str, float]`): the hint does not eat
+            context (F-11); the main diagnostics place — `/health` and the journal.
+            LSB has no outbound channel of its own — the only way to "warn" is a hint
+            (FR-4.6); human names are never invented.
     """
 
     def __init__(
@@ -564,7 +582,7 @@ class SlotHintMiddleware:
     ) -> Any:
         result = await call_next(ctx)
         if getattr(ctx, "method", None) != "tools/call":
-            return result  # только ответы инструментов (не initialize/list)
+            return result  # tool answers only (not initialize/list)
         hint = self._hint_text()
         if hint is None or not isinstance(result, CallToolResult):
             return result
@@ -579,7 +597,7 @@ class SlotHintMiddleware:
         return result
 
     def _hint_text(self) -> str | None:
-        """Хинт по первому слоту в паузе, которому не мешает троттлинг (№39)."""
+        """The hint for the first paused slot not blocked by the throttling (#39)."""
         if self._worker is None:
             return None
         states = self._worker.slot_states()
@@ -599,13 +617,13 @@ class SlotHintMiddleware:
 
 
 class UpdateHintMiddleware:
-    """ServerMiddleware: хинт о свежем релизе (№45, arch §7.1/§7.3).
+    """A ServerMiddleware: the fresh-release hint (#45, arch §7.1/§7.3).
 
-    Перед ответом инструмента читает кеш `UpdateChecker` (только память —
-    никаких файловых/сетевых обращений в пути ручки) и, если вернулся текст,
-    добавляет поле верхнего уровня `update_hint`. `hint`/`fail` не подменяются
-    и не дублируются. Дефолт выключен: `hint()` возвращает None — выдача
-    инструмента не меняется ни на байт (FR-45.8/FR-45.9).
+            Before a tool's answer it reads the `UpdateChecker` cache (memory only —
+            no file/network access on the handle path) and, if a text came back, adds
+            the top-level `update_hint` field. `hint`/`fail` are not replaced or
+            duplicated. The default is off: `hint()` returns None — the tool output
+            does not change by a byte (FR-45.8/FR-45.9).
     """
 
     def __init__(self, checker: UpdateChecker | None = None) -> None:
@@ -618,7 +636,7 @@ class UpdateHintMiddleware:
     ) -> Any:
         result = await call_next(ctx)
         if getattr(ctx, "method", None) != "tools/call":
-            return result  # только ответы инструментов (не initialize/list)
+            return result  # tool answers only (not initialize/list)
         if self._checker is None or not isinstance(result, CallToolResult):
             return result
         hint = self._checker.hint()
@@ -632,12 +650,12 @@ class UpdateHintMiddleware:
         return result
 
 
-# Обучающие описания инструментов (ARCHITECTURE §5.2) — гарантированный канал
-# «обучения» моделей: спецификации всегда попадают в контекст.
-# 3.4.1 (LSBN-T-26): число лимита заметки в memory_save/memory_update — из
-# настроек (одно число — одно место), поэтому описания собирает функция.
+# The tools' teaching descriptions (ARCHITECTURE §5.2) — the guaranteed channel
+# of "teaching" models: the specifications always reach the context.
+# 3.4.1 (LSBN-T-26): the note limit number in memory_save/memory_update — from
+# settings (one number — one place), so a function assembles the descriptions.
 def tool_descriptions(note_limit: int) -> dict[str, str]:
-    """Описания инструментов; `note_limit` — settings.max_note_chars сборки."""
+    """The tool descriptions; `note_limit` — the build's settings.max_note_chars."""
     return {
         "memory_search": (
             "Search long-term memory by meaning (`mode=semantic`, default) or by "
@@ -713,10 +731,10 @@ def tool_descriptions(note_limit: int) -> dict[str, str]:
             "too-similar description is refused with a hint pointing at the similar "
             "node — choose another wording or node."
         ),
-        # lsb-0007-03: описания области навыков — канон arch lsb-0007 §3.8 (английский).
-        # lsb-0007-04: правило-страховка «перед рутинной задачей — search/list, тело —
-        # только skills_get» остаётся в описаниях: инструкции MCP на OWUI не доходят,
-        # гарантированный канал — tools (§3.5).
+        # lsb-0007-03: the skills area's descriptions — the arch lsb-0007 §3.8 canon (English).
+        # lsb-0007-04: the safety-net rule "before a routine task — search/list; the body —
+        # only skills_get" stays in the descriptions: MCP instructions do not reach OWUI;
+        # the guaranteed channel is tools (§3.5).
         "skills_search": (
             "Search the skills area BEFORE doing a routine or repeatable task: skills "
             "are stored procedures (how-to), kept separately from notes. Empty result "
@@ -752,9 +770,9 @@ def tool_descriptions(note_limit: int) -> dict[str, str]:
             "is factually wrong, fully duplicates another one or was created by "
             "mistake."
         ),
-        # lsb-0009-02: описания области «user» — канон arch lsb-0009 §3.7 (английский).
-        # Правило «один факт — одна запись» и запрет секретов остаются в описаниях:
-        # они — гарантированный канал (FR-7.1), блока «user» в инструкциях нет (§2).
+        # lsb-0009-02: the "user" area's descriptions — the arch lsb-0009 §3.7 canon (English).
+        # The "one fact — one record" rule and the secrets prohibition stay in the descriptions:
+        # they are the guaranteed channel (FR-7.1); there is no "user" section in the instructions (§2).
         "user_search": (
             "Search the user area: atomic facts about the user (tastes and "
             "preferences, hobbies, monthly spending and subscriptions with amounts, "
@@ -784,9 +802,9 @@ def tool_descriptions(note_limit: int) -> dict[str, str]:
         "user_get": (
             "Read one fact by id: name + body."
         ),
-        # lsb-0008-02: описания области terms — канон arch lsb-0008 §3.7 (английский).
-        # Правило «все смыслы термина; выбор — по контексту разговора» и «контекст
-        # обязателен всегда» остаются в описаниях: блока «terms» в инструкциях нет §2.
+        # lsb-0008-02: the terms area's descriptions — the arch lsb-0008 §3.7 canon (English).
+        # The rules "all senses of the term; the choice — by the conversation context" and "the context
+        # is always mandatory" stay in the descriptions: there is no "terms" section in the instructions (§2).
         "terms_search": (
             "Look up a term or an abbreviation in the terms area. Returns ALL senses "
             "of the term together with their contexts: one term means different "
@@ -808,7 +826,7 @@ def tool_descriptions(note_limit: int) -> dict[str, str]:
         "terms_get": (
             "Read one term record by id: term, context, definition."
         ),
-        # №12 (no12-02, §7.1/§13.4): ОДНА точка чтения предупреждений на систему.
+        # #12 (no12-02, §7.1/§13.4): ONE warnings reading point per system.
         "warnings_list": (
             "Read the warnings of the memory (notes placed in the wrong node, "
             "suggested nodes that do not exist yet, term contexts). Compact and "
@@ -816,7 +834,7 @@ def tool_descriptions(note_limit: int) -> dict[str, str]:
             "Read them when a note or a term looks out of place; reading never calls "
             "a model."
         ),
-        # №41 (FR-5.3, §7.1, §13.14): два ОБЩИХ инструмента чтения истории.
+        # #41 (FR-5.3, §7.1, §13.14): two SHARED history reading tools.
         "history_list": (
             "Read the version history of a record on demand: pass entity (note | "
             "skill | term | user_fact) and id. Returns compact version metadata "
@@ -832,7 +850,7 @@ def tool_descriptions(note_limit: int) -> dict[str, str]:
             "back as a soft {…, hint} without an exception; history off — empty with "
             "a hint."
         ),
-        # LSBN-F-10 (f10-02/f10-03, arch §7.1): шесть ручек области логов.
+        # LSBN-F-10 (f10-02/f10-03, arch §7.1): six handles of the logs area.
         "logs_save": (
             "Save ONE entry to the assistant-logs area: action (what was done) and "
             "reason (why) are required; entity names the object of the change — "
@@ -878,46 +896,55 @@ def tool_descriptions(note_limit: int) -> dict[str, str]:
             "entity_version). Returns {items, total, has_more, next_offset, hint?}; "
             "the body is cut to an excerpt — the full text via `logs_get`."
         ),
+        # LSBN-F-26 (release 3.5.0): a period journal export as a file.
+        "logs_export": (
+            "Export the assistant-logs area for a period as a digest FILE "
+            "(`logs-<from>_<to>.md` next to the database, visible on the host "
+            "volume) plus a short summary. Slices as in `logs_search`; at least "
+            "one of date_from/date_to (YYYY-MM-DD, UTC) is required. Entries run "
+            "oldest first, grouped by day, with FULL field text — built for "
+            "release gates. Read-only."
+        ),
     }
 
 
 TOOL_NAMES = frozenset(tool_descriptions(MAX_NOTE_CHARS_DEFAULT))
 
 
-# Белые списки и мапперы компактных MCP-выдач (Фаза 9, бриф §1):
-# из полного ответа сервиса берём ТОЛЬКО разрешённые поля; рост сервисных
-# ответов в MCP не просачивается. hint — маркер мягкого отказа (только fail).
-# Фаза 10: +namespace в search/list/get (слой ориентирования 3, §5.7).
-# Фаза 11 (решение №9): +title в list (сервис notes отдаёт) и в search
-# (SearchService отдаёт — follow-up пула 5b, см. _search_hit);
-# в get названия НЕТ — там полный текст (экономия контекста).
-# lsb-0010-04 (FR-4.1/FR-4.3): +chars (объём полного текста в символах) в
-# search/list(summaries)/get — модель решает, хватит ли memory_get или нужен
-# чанк. Деталь titles (_TITLE_LIST_ITEM) остаётся {id, title, namespace}:
-# режим сканирования реестра, объём там не нужен (обратная совместимость).
-# В chunk-режиме memory_get белый список не применяется — сервисный контракт
-# отдаётся как есть, верхний `chars` там = сумма символов отданных чанков
-# (контракт lsb-0003, не переопределяем, FR-3.5/FR-4.2).
-# lsb-0010-05 (FR-3.1/FR-3.5): элемент связи — СВОЙ белый список: `chars`
-# внутри него — объём ПОЛНОГО текста связанной заметки, а не верхнеуровневый
-# `chars` chunk-режима (сумма отданных чанков) — поля разных уровней ответа.
+# The whitelists and mappers of compact MCP outputs (Phase 9, brief §1):
+# from the service's full answer we take ONLY the allowed fields; the growth of service
+# answers does not leak into MCP. hint — a soft-failure marker (fail only).
+# Phase 10: +namespace in search/list/get (orientation layer 3, §5.7).
+# Phase 11 (decision #9): +title in list (the notes service provides it) and in search
+# (SearchService provides it — the pool-5b follow-up, see _search_hit);
+# get has NO title — it carries the full text (context economy).
+# lsb-0010-04 (FR-4.1/FR-4.3): +chars (the full text's volume in characters) in
+# search/list(summaries)/get — the model decides whether memory_get suffices or a
+# chunk is needed. The titles detail (_TITLE_LIST_ITEM) stays {id, title, namespace}:
+# a registry-scanning mode; the volume is not needed there (backward compatibility).
+# In memory_get's chunk mode the whitelist is not applied — the service contract
+# is returned as is; the top-level `chars` there = the sum of the served chunks' characters
+# (the lsb-0003 contract, not overridden; FR-3.5/FR-4.2).
+# lsb-0010-05 (FR-3.1/FR-3.5): a link item — its OWN whitelist: `chars`
+# inside it — the linked note's FULL text volume, not the top-level
+# `chars` of chunk mode (the sum of served chunks) — fields of different answer levels.
 _LIST_ITEM = ("id", "title", "summary", "chars", "created_at", "updated_at", "namespace", "expires_at")
 _GET_NOTE = ("id", "text", "chars", "created_at", "updated_at", "namespace", "expires_at", "comment")
 _LINK_ITEM = ("id", "title", "namespace", "chars")
-# LSBN-F-16: строка карты окружения — свой белый список. `direction` (только
-# mention) и `truncated` (деградация бюджета, F-13) — опциональные ключи, их
-# добирает `_map_row` при наличии (в базовом белом списке их нет).
+# LSBN-F-16: an environment map row — its own whitelist. `direction` (mention
+# only) and `truncated` (a budget degradation, F-13) — optional keys;
+# `_map_row` picks them up when present (the base whitelist does not have them).
 _MAP_ITEM = ("id", "title", "namespace", "kind")
 _NS_ITEM = ("path", "description", "status", "notes_count", "subtree_count", "updated_at")
 
-# Диапазоны и дефолты параметров карты окружения (LSBN-F-16): константы кода,
-# не env (по прецеденту бюджетов F-13). map_limit 1..20 — свой потолок карты,
-# не LIMIT_TOP: карта — обзор, страница точечного чтения больше не нужна.
+# The environment map parameters' ranges and defaults (LSBN-F-16): code constants,
+# not env (following the F-13 budgets precedent). map_limit 1..20 — the map's own ceiling,
+# not LIMIT_TOP: the map is an overview; a pointwise-reading page is no longer needed.
 MAP_LIMIT_MIN = 1
 MAP_LIMIT_MAX = 20
 MAP_LIMIT_DEFAULT = 8
 
-# Мягкие отказы параметров карты (как mode/detail: fail + hint, не ошибки).
+# Soft failures of the map parameters (like mode/detail: fail + hint, not errors).
 HINT_MAP_SINGLE_ID = "map works on a single id — pass a single id (not a list)"
 HINT_INVALID_MAP_LEVEL = "map_level must be one of: auto, 1, 0"
 HINT_INVALID_MAP_LIMIT = (
@@ -925,28 +952,29 @@ HINT_INVALID_MAP_LIMIT = (
 )
 HINT_INVALID_MAP_OFFSET = "map_offset must be >= 0"
 
-# LSBN-F-13 (3.4.0, решение О. 21.10): сокращение выдачи — ПОВЕДЕНИЕ ПО
-# УМОЛЧАНИЮ. Дефолтные выдачи чтения — ШАПКИ в бюджете символов; полный
-# текст — только точечным чтением одного id (`memory_get` уровень 2).
-# Шапка search — идентичность + объём + релевантность (score); шапка get —
-# идентичность + объём (title в get теперь ЕСТЬ: шапка без названия не
-# ориентирует, прежнее «в get названия нет» относилось к полному тексту).
+# LSBN-F-13 (3.4.0): output reduction — the DEFAULT
+# BEHAVIOR. Default read outputs — HEADERS within the character budget; the full
+# text — only by pointwise reading of one id (`memory_get` level 2).
+# A search header — identity + volume + relevance (score); a get header —
+# identity + volume (get now HAS the title: a header without a title does not
+# orient; the old "get has no title" referred to the full text).
 _SEARCH_HEADER_ITEM = ("id", "title", "namespace", "chars")
 _GET_HEADER_ITEM = ("id", "title", "namespace", "chars")
 
-# no24-02 (3.2.0): элемент отдельного поиска ПОМЕТОК — {id, title, namespace,
-# comment, updated_at}; пометки ищутся своей ручкой, не смешиваясь с search.
+# no24-02 (3.2.0): an item of the separate COMMENT search — {id, title, namespace,
+# comment, updated_at}; comments are searched by their own handle, not mixed with search.
 _COMMENT_ITEM = ("id", "title", "namespace", "comment", "updated_at")
 
 
 async def _links_of(services: Services, note_id: int) -> list[dict[str, Any]]:
-    """Компактный перечень связей заметки для MCP-выдачи (FR-3.1/FR-3.2).
+    """A compact list of the note's links for the MCP output (FR-3.1/FR-3.2).
 
-    Сборка — на уровне транспорта (arch §3.5): `NoteService` о связях не знает.
-    Синхронный SQL уводим в поток (как остальные вызовы сервисов) и применяем
-    белый список элемента; пустой список — нормальный ответ, без `hint`.
-    `Services.links` в DI-сборках тестов может быть None (без связей) —
-    деградируем до пустого списка, как анонс навыков без области (lsb-0007).
+            The assembly — at the transport level (arch §3.5): `NoteService` knows
+            nothing about links. The synchronous SQL goes into a thread (like the
+            other service calls) and the item whitelist is applied; an empty list — a
+            normal answer, without a `hint`. `Services.links` can be None in test DI
+            builds (no links) — we degrade to an empty list, like the skills announce
+            without the area (lsb-0007).
     """
     if services.links is None:
         return []
@@ -955,11 +983,12 @@ async def _links_of(services: Services, note_id: int) -> list[dict[str, Any]]:
 
 
 def _map_row(item: dict[str, Any]) -> dict[str, Any]:
-    """Строка карты окружения: белый список + опциональные ключи (LSBN-F-16).
+    """An environment map row: the whitelist + optional keys (LSBN-F-16).
 
-    Базовые поля — `_MAP_ITEM`; `direction` (только у `mention`) и
-    `truncated` (деградация бюджета, F-13) копируются при наличии — ключи
-    необязательны, поэтому мимо `_pick` (тот падает громко на пропаже).
+            The base fields — `_MAP_ITEM`; `direction` (for `mention` only) and
+            `truncated` (a budget degradation, F-13) are copied when present — the
+            keys are optional, so they bypass `_pick` (which fails loudly on a
+            missing key).
     """
     row = _pick(item, _MAP_ITEM)
     for extra in ("direction", "truncated"):
@@ -971,17 +1000,18 @@ def _map_row(item: dict[str, Any]) -> dict[str, Any]:
 async def _map_of(
     services: Services, note_id: int, level: str, limit: int, offset: int
 ) -> dict[str, Any]:
-    """Карта окружения заметки для MCP-выдачи (LSBN-F-16).
+    """The note's environment map for the MCP output (LSBN-F-16).
 
-    Замена перечня `links` при `map=true` одиночного чтения: сосед построчно,
-    источник и страница — в `LinksService.neighborhood` (NoteService о связях
-    не знает, arch §3.5), форма — на транспорте. Синхронный SQL уводим в
-    поток. Строки влезают в свой потолок символов `MAP_BUDGET_CHARS_DEFAULT`
-    (`budget_chars` к одиночному чтению не применяется — F-13): не влезающая
-    строка деградирует до шапки с `"truncated": true`, одна hint «read
-    point-wise» — как в F-13. Пустая карта (нет связей) — `neighbors: []`
-    без ошибки и без `hint` (FR-3.3). `Services.links` в DI-сборках тестов
-    может быть None — деградируем до пустой карты (как `_links_of`).
+            The replacement of the `links` list at `map=true` of a single read: a
+            neighbor per line; the source and the page — in `LinksService.neighborhood`
+            (NoteService knows nothing about links, arch §3.5); the shape — on the
+            transport. The synchronous SQL goes into a thread. The rows fit their own
+            character ceiling `MAP_BUDGET_CHARS_DEFAULT` (`budget_chars` does not
+            apply to a single read — F-13): a row that does not fit degrades to a
+            header with `"truncated": true`, one "read point-wise" hint — as in F-13.
+            An empty map (no links) — `neighbors: []` without an error and without a
+            `hint` (FR-3.3). `Services.links` can be None in test DI builds — we
+            degrade to an empty map (like `_links_of`).
     """
     if services.links is None:
         return {"neighbors": [], "map_level_used": 0, "total": 0}
@@ -1002,18 +1032,19 @@ async def _map_of(
 
 
 def _pick(source: dict, fields: tuple[str, ...]) -> dict[str, Any]:
-    """Взять ТОЛЬКО разрешённые поля (белый список): KeyError при
-    отсутствии поля — контракт изменился, пусть падает громко."""
+    """Take ONLY the allowed fields (a whitelist): a KeyError on a missing
+            field — the contract changed; let it fail loudly.
+    """
     return {name: source[name] for name in fields}
 
 
 def _search_header(row: dict[str, Any]) -> dict[str, Any]:
-    """Шапка хита memory_search — ДЕФОЛТ 3.4.0 (LSBN-F-13).
+    """A memory_search hit header — the 3.4.0 DEFAULT (LSBN-F-13).
 
-    Идентичность (id/title/namespace) + объём (`chars`) + релевантность
-    (`score` = rrf_score, 4 знака): агент выбирает 1–2 заметки для точечного
-    чтения, не таща саммари всех кандидатов. `title` — soft-ключ (контракт
-    №9): старые заметки без названия получают null.
+            Identity (id/title/namespace) + volume (`chars`) + relevance
+            (`score` = rrf_score, 4 digits): the agent picks 1–2 notes for pointwise
+            reading without dragging all candidates' summaries. `title` — a soft key
+            (the #9 contract): old titleless notes get null.
     """
     header: dict[str, Any] = {name: row[name] for name in _SEARCH_HEADER_ITEM
                               if name != "title"}
@@ -1030,10 +1061,11 @@ def _budgeted(
     budget_chars: int,
     source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Элементы под бюджетом символов + ЕДИНСТВЕННАЯ hint усечения (F-13).
+    """Items within the character budget + the SINGLE truncation hint (F-13).
 
-    Приоритет hint: усечение (как дочитать) > мягкий отказ сервиса (пустой
-    результат). Обе сразу не бывают: пустой результат резать нечем.
+            The hint priority: truncation (how to read on) > the service's soft
+            failure (an empty result). Both never happen at once: an empty result has
+            nothing to trim.
     """
     fitted, cut, _ = fit_within_budget(items, budget_chars)
     out: dict[str, Any] = {field: fitted}
@@ -1047,7 +1079,7 @@ def _budgeted(
 def _compact_search_headers(
     result: dict[str, Any], budget_chars: int
 ) -> dict[str, Any]:
-    """Дефолт semantic-поиска 3.4.0: шапки в бюджете (LSBN-F-13)."""
+    """The 3.4.0 semantic-search default: headers within the budget (LSBN-F-13)."""
     return _budgeted(
         "results",
         [_search_header(r) for r in result["results"]],
@@ -1057,33 +1089,35 @@ def _compact_search_headers(
 
 
 def _with_hint(out: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
-    """hint — маркер fail в сервисных контрактах: копируем только если есть."""
+    """hint — the fail marker in service contracts: copied only when present."""
     if "hint" in source:
         out["hint"] = source["hint"]
     return out
 
 
 def _compact_comment_search(result: dict[str, Any]) -> dict[str, Any]:
-    """Компактный хит memory_comment_search: {id, title, namespace, comment,
-    updated_at}; hint мягкого отказа копируется, если есть."""
+    """A compact memory_comment_search hit: {id, title, namespace, comment,
+            updated_at}; a soft-failure hint is copied when present.
+    """
     out = {"results": [_pick(r, _COMMENT_ITEM) for r in result["results"]]}
     return _with_hint(out, result)
 
 
-# lsb-0013-02 (FR-2.1, arch §3.3): подсказка «есть ещё» — ОДНА на выдачу
-# листинга (ослабление правила «hint — только в мягком отказе»). `n` — остаток
-# записей, `offset` — готовое смещение следующей страницы (`next_offset`).
+# lsb-0013-02 (FR-2.1, arch §3.3): the "there is more" hint — ONE per listing output
+# (a relaxation of the "hint — only on a soft failure" rule). `n` — the remaining
+# record count; `offset` — the ready offset of the next page (`next_offset`).
 HINT_MORE = "+{n} more — offset={offset}"
 
 
 def _listing_page(result: dict[str, Any]) -> dict[str, Any]:
-    """Поля страницы листинга + единственная подсказка «есть ещё» (lsb-0013-02).
+    """The listing's page fields + the single "there is more" hint (lsb-0013-02).
 
-    Поля страницы считает сервисный `page_fields` (arch §3.1–3.2) — транспорт
-    лишь переносит их в компактную выдачу: `total`/`has_more`/`next_offset`/
-    `next_cursor`. Подсказка `+N more — offset=K` добавляется РОВНО ОДНА и
-    только при `has_more`, если сервис не отдал своей: `memory is empty` и
-    `page beyond the memory` сохраняются дословно и не дополняются.
+            The service `page_fields` computes the page fields (arch §3.1–3.2) — the
+            transport only carries them into the compact output: `total`/`has_more`/
+            `next_offset`/`next_cursor`. The `+N more — offset=K` hint is added
+            EXACTLY ONCE and only at `has_more`, when the service gave none of its
+            own: `memory is empty` and `page beyond the memory` are preserved verbatim
+            and not extended.
     """
     out = {
         "total": result["total"],
@@ -1094,7 +1128,7 @@ def _listing_page(result: dict[str, Any]) -> dict[str, Any]:
     if "hint" in result:
         out["hint"] = result["hint"]
     elif result["has_more"]:
-        # next_offset = offset + len(items) — из него и остаток записей (FR-2.1).
+        # next_offset = offset + len(items) — the remaining record count comes from it too (FR-2.1).
         out["hint"] = HINT_MORE.format(
             n=result["total"] - result["next_offset"],
             offset=result["next_offset"],
@@ -1103,12 +1137,13 @@ def _listing_page(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_list(result: dict[str, Any], budget_chars: int) -> dict[str, Any]:
-    """Листинг summaries (явная деталь с 3.4.0) — в бюджете символов.
+    """The summaries listing (an explicit detail since 3.4.0) — within the character budget.
 
-    Не влезающий целиком элемент деградирует до шапки с `"truncated": true`
-    (п.4 брифа F-13): id виден, агент дочитывает точечно. Усечение —
-    единственная hint успешного ответа (важнее «+N more»: поля пагинации и
-    так в выдаче).
+            An element that does not fit whole degrades to a header with
+            `"truncated": true` (p.4 of the F-13 brief): the id is visible, the agent
+            reads on pointwise. The truncation — the successful answer's only hint
+            (more important than "+N more": the pagination fields are in the output
+            anyway).
     """
     items = [_pick(i, _LIST_ITEM) for i in result["items"]]
     fitted, cut, _ = fit_within_budget(items, budget_chars)
@@ -1118,30 +1153,30 @@ def _compact_list(result: dict[str, Any], budget_chars: int) -> dict[str, Any]:
     return out
 
 
-# lsb-0001-02 (FR-3.4/FR-4.1): title-режим поиска и titles-деталь листинга —
-# отдельные компактные контракты. Белые списки semantic-поиска и summaries-
-# листинга (_SEARCH_ITEM/_LIST_ITEM) НЕ меняются — обратная совместимость
-# v2.1.1 (FR-3.3, FR-4.2). title-выдача поиска несёт score вместо
-# created_at/updated_at (контракт FR-2.2 постановки 01); titles-листинг —
-# только id/title/namespace.
+# lsb-0001-02 (FR-3.4/FR-4.1): the search's title mode and the listing's titles detail —
+# separate compact contracts. The whitelists of semantic search and the summaries
+# listing (_SEARCH_ITEM/_LIST_ITEM) do NOT change — backward compatibility
+# v2.1.1 (FR-3.3, FR-4.2). The search's title output carries score instead of
+# created_at/updated_at (the FR-2.2 contract of brief 01); the titles listing —
+# id/title/namespace only.
 _TITLE_SEARCH_ITEM = ("id", "title", "namespace", "summary", "score")
 _TITLE_LIST_ITEM = ("id", "title", "namespace")
 
-# Допустимые значения новых опциональных параметров (FR-3.1, FR-4.1).
+# Valid values of the new optional parameters (FR-3.1, FR-4.1).
 SEARCH_MODES = ("semantic", "title")
 LIST_DETAILS = ("summaries", "titles")
 
-# Мягкие отказы (FR-3.4, §5.3 fail + hint): хинт перечисляет доступные
-# значения — модель сама выбирает корректное.
+# Soft failures (FR-3.4, §5.3 fail + hint): the hint lists the available
+# values — the model picks the correct one itself.
 HINT_INVALID_MODE = (
     "unknown search mode; available: semantic (default), title"
 )
 HINT_INVALID_DETAIL = (
     "unknown list form; available: summaries (default), titles"
 )
-# no29-01: невалидное значение свежести — мягкий отказ (fail + hint); текст
-# совпадает с FreshnessValidationError (один и тот же для сервисов и обоих
-# транспортов). Принимается только абсолютная ISO-8601 UTC.
+# no29-01: an invalid freshness value — a soft failure (fail + hint); the text
+# matches FreshnessValidationError (the same one for the services and both
+# transports). Only an absolute ISO-8601 UTC is accepted.
 HINT_INVALID_UPDATED_AFTER = (
     "unknown updated_after; expected ISO-8601 UTC: "
     "YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ"
@@ -1151,7 +1186,7 @@ HINT_INVALID_UPDATED_AFTER = (
 def _compact_title_search(
     result: dict[str, Any], budget_chars: int
 ) -> dict[str, Any]:
-    """title-режим поиска — шапки с summary в бюджете (F-13)."""
+    """The search's title mode — headers with summary within the budget (F-13)."""
     return _budgeted(
         "results",
         [_pick(r, _TITLE_SEARCH_ITEM) for r in result["results"]],
@@ -1163,8 +1198,8 @@ def _compact_title_search(
 def _compact_list_titles(
     result: dict[str, Any], budget_chars: int
 ) -> dict[str, Any]:
-    # Деталь titles — ДЕФОЛТ листинга с 3.4.0 (F-13); тот же контракт
-    # страницы, плюс бюджет символов (lsb-0013-02 → F-13).
+    # The titles detail — the listing DEFAULT since 3.4.0 (F-13); the same page
+    # contract, plus the character budget (lsb-0013-02 → F-13).
     items = [_pick(i, _TITLE_LIST_ITEM) for i in result["items"]]
     fitted, cut, _ = fit_within_budget(items, budget_chars)
     out: dict[str, Any] = {"items": fitted, **_listing_page(result)}
@@ -1174,11 +1209,11 @@ def _compact_list_titles(
 
 
 def _compact_get(result: dict[str, Any]) -> dict[str, Any]:
-    """Одиночное чтение (уровень 2, F-13): полный текст, БЕЗ бюджета.
+    """A single read (level 2, F-13): the full text, WITHOUT a budget.
 
-    п.5 брифа: `memory_get` по конкретному id отдаёт полный текст — иначе
-    двухуровневое чтение бессмысленно. Budget к одиночному чтению и к
-    chunk-режиму не применяется (точечное чтение уже есть).
+            p.5 of the brief: `memory_get` by a concrete id serves the full text —
+            otherwise the two-level reading is meaningless. The budget does not apply
+            to a single read or chunk mode (pointwise reading already exists).
     """
     out = {"notes": [_pick(n, _GET_NOTE) for n in result["notes"]]}
     return _with_hint(out, result)
@@ -1187,11 +1222,11 @@ def _compact_get(result: dict[str, Any]) -> dict[str, Any]:
 def _compact_get_headers(
     result: dict[str, Any], budget_chars: int
 ) -> dict[str, Any]:
-    """Batch-чтение (ids > 1) с 3.4.0 — шапки в бюджете (LSBN-F-13).
+    """A batch read (ids > 1) since 3.4.0 — headers within the budget (LSBN-F-13).
 
-    Полных текстов в batch больше нет: `{id, title, namespace, chars}` +
-    hint усечения с id для точечного чтения. title в шапке get теперь есть
-    (без названия шапка не ориентирует).
+            No full texts in batch anymore: `{id, title, namespace, chars}` + a
+            truncation hint with the id for pointwise reading. get's header now has
+            the title (a header without a title does not orient).
     """
     headers = [
         {name: note[name] for name in _GET_HEADER_ITEM if name in note}
@@ -1201,13 +1236,13 @@ def _compact_get_headers(
 
 
 def _save_one(notes_service: Any, item: Any) -> dict[str, Any]:
-    """Сохранить ОДНУ заметку массива `notes` (LSBN-F-23, п. 3).
+    """Save ONE note of the `notes` array (LSBN-F-23, p. 3).
 
-    Каждый элемент валидируется и пишется отдельно: ошибка одного элемента
-    (нет/длинный текст, нет title, незарегистрированный узел, дословный
-    дедуп) даёт `{stored: false, hint}` у ЭТОГО элемента — остальные
-    сохраняются (постановка: «валидирует каждую заметку, возвращает список
-    id и заголовков»). Успех — `{id, title, stored: true, summary_pending}`.
+            Each item is validated and written separately: one item's error (no/too
+            long text, no title, an unregistered node, a verbatim duplicate) gives
+            `{stored: false, hint}` for THAT item — the others are saved (the brief:
+            "validates each note, returns the list of ids and titles"). Success —
+            `{id, title, stored: true, summary_pending}`.
     """
     if not isinstance(item, dict):
         return {"stored": False, "hint": "every `notes` item must be an object"}
@@ -1246,17 +1281,17 @@ def _save_one(notes_service: Any, item: Any) -> dict[str, Any]:
 def _compact_save(result: dict[str, Any]) -> dict[str, Any]:
     if result.get("duplicated"):
         return {"id": result["id"], "stored": False, "hint": result["hint"]}
-    # Фаза 10 (Шаг 5, US-8): hint «похожее есть в <ns>» при записи в узел,
-    # где уже лежит дословный дубль (запись не блокирует — меж-узловые
-    # дубли легитимны). Копируется только если есть — белый список не
-    # растёт для обычного ответа.
+    # Phase 10 (Step 5, US-8): the "similar exists in <ns>" hint when writing into a node
+    # that already holds a verbatim duplicate (the write is not blocked — cross-node
+    # duplicates are legitimate). Copied only when present — the whitelist does not
+    # grow for a regular answer.
     out = _pick(result, ("id", "stored", "summary_pending"))
-    # №28 (3.2.0): подсказка узла при записи без `namespace` — рядом с `hint`
-    # (дедуп чужого узла), тоже только если есть.
+    # #28 (3.2.0): the node hint when writing without `namespace` — next to `hint`
+    # (the foreign-node dedup), also only when present.
     if "namespace_hint" in result:
         out["namespace_hint"] = result["namespace_hint"]
-    # №30 (3.2.0): подсказка «похожее» — 1–2 ближайших заметки
-    # (id/title/namespace) рядом с id/stored; копируется только если есть.
+    # #30 (3.2.0): the "similar" hint — the 1–2 nearest notes
+    # (id/title/namespace) next to id/stored; copied only when present.
     if result.get("similar"):
         out["similar"] = result["similar"]
     return _with_hint(out, result)
@@ -1273,9 +1308,9 @@ def _compact_delete(result: dict[str, Any]) -> dict[str, Any]:
 def _compact_namespaces(result: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[str, Any]:
     out = {
         "namespaces": [_pick(node, _NS_ITEM) for node in result["namespaces"]],
-        # Кандидаты на авто-создание узла (триггер Шага 5): растущие группы
-        # default-заметок с общим hint, ещё не прогнанные через судью
-        # структуры. Компактная проекция (domain, subdomain, count).
+        # Node auto-creation candidates (the Step-5 trigger): growing groups of
+        # default notes with a shared hint, not yet run through the structure
+        # judge. A compact projection (domain, subdomain, count).
         "promotion_candidates": [
             {
                 "domain": candidate["domain"],
@@ -1288,39 +1323,40 @@ def _compact_namespaces(result: dict[str, Any], candidates: list[dict[str, Any]]
     return out
 
 
-# lsb-0005-06 (FR-6): антисинонимия при создании — порог косинуса описаний
-# нового узла и существующих (с учётом склонений/окончаний, решение О.
-# 2026-09-09); > порога → мягкий отказ с хинтом «есть похожий: <ближайший>».
-# Отличается от промоушна (namespace_synonym_similarity 0.85, merge): создание
-# мягко отклоняется, вердикт не записывается, судья не вызывается.
+# lsb-0005-06 (FR-6): the creation anti-synonymy — the cosine threshold of the new node's
+# description against the existing ones (inflections/endings accounted);
+# over the threshold → a soft failure with the "there is a similar one: <nearest>" hint.
+# It differs from promotion (namespace_synonym_similarity 0.85, merge): creation
+# is softly rejected, no verdict is recorded, the judge is not called.
 NAMESPACE_CREATE_SYNONYM_SIMILARITY = 0.90
 
 
 def _ns_l2_norm(vec: list[float]) -> float:
-    """Евклидова норма вектора (L2) — как `_l2_norm` промоушна."""
+    """The vector's Euclidean norm (L2) — like promotion's `_l2_norm`."""
     return math.sqrt(sum(v * v for v in vec))
 
 
 def _antiseonymy_nearest(
     services: Services, path: str, description: str
 ) -> tuple[str | None, float | None]:
-    """Ближайший тематический узел по описанию (косинус-предфильтр создания).
+    """The nearest thematic node by description (the creation cosine prefilter).
 
-    Тот же подход, что `_nearest_node` промоушна: описание кандидата +
-    описания узлов одним батчем embed_texts, L2-нормализация, dot product =
-    cosine (нечувствителен к масштабу провайдера). default исключён: слияние/
-    сходство со свопом бессмысленно. Для корня (depth 1) сравнение — только
-    против корней (depth 1); для листа (depth ≥ 2) — против всех тематических
-    узлов. Возврат (path, cosine) ближайшего или (None, None): реестр пуст /
-    норма кандидата 0 / отказ эмбеддинга (деградация — предфильтр пропущен,
-    создание происходит).
+            The same approach as promotion's `_nearest_node`: the candidate's
+            description + the nodes' descriptions in one embed_texts batch, L2
+            normalization, dot product = cosine (insensitive to the provider's scale).
+            default is excluded: merging/similarity with the swap is meaningless. For
+            a root (depth 1) the comparison — against roots (depth 1) only; for a
+            leaf (depth ≥ 2) — against all thematic nodes. Returns (path, cosine) of
+            the nearest or (None, None): the registry empty / the candidate's norm 0 /
+            an embedding failure (a degradation — the prefilter is skipped, creation
+            happens).
     """
     nodes = [
         node
         for node in services.namespaces.list_all()["namespaces"]
         if node["path"] != DEFAULT_NAMESPACE
     ]
-    if len(path.split("/")) == 1:  # корень — против корней
+    if len(path.split("/")) == 1:  # a root — against roots
         nodes = [node for node in nodes if "/" not in node["path"]]
     if not nodes:
         return None, None
@@ -1354,8 +1390,8 @@ def _antiseonymy_nearest(
     return nodes[best_index]["path"], best_cosine
 
 
-# lsb-0005-05: компактная проекция созданного узла (confirmed) + hint при отказе.
-# Белый список минимален: path/description/status — то, что нужно модели.
+# lsb-0005-05: a compact projection of the created node (confirmed) + a hint on failure.
+# The whitelist is minimal: path/description/status — what the model needs.
 _NS_CREATE = ("path", "description", "status")
 
 
@@ -1363,19 +1399,19 @@ def _compact_namespace_create(result: dict[str, Any]) -> dict[str, Any]:
     return {"created": True, **_pick(result, _NS_CREATE)}
 
 
-# lsb-0007-03: компактные выдачи области навыков — белые списки полей (§3.3).
-# Тело навыка в контекст попадает только через `skills_get` (экономия
-# контекста, §3.5): search/list несут лишь опознавательные поля. `score` в
-# search и `example` в get — soft-ключи: показываются только когда сервис их
-# отдал (гибрид области / необязательное поле формы). hint — только при
-# мягком отказе; warning сервиса срезается всегда.
+# lsb-0007-03: the skills area's compact outputs — field whitelists (§3.3).
+# A skill body reaches the context only via `skills_get` (context
+# economy, §3.5): search/list carry only identifying fields. `score` in
+# search and `example` in get — soft keys: shown only when the service
+# provided them (the area hybrid / an optional shape field). hint — only on
+# a soft failure; the service's warning is always trimmed.
 _SKILL_SEARCH_ITEM = ("id", "name", "description")
 _SKILL_LIST_ITEM = ("id", "name", "description")
 _SKILL_GET_ITEM = ("name", "description", "steps", "text", "instruction_template")
 
 
 def _skill_hit(row: dict[str, Any]) -> dict[str, Any]:
-    """Компактный хит skills_search: id/name/description (+score, если есть)."""
+    """A compact skills_search hit: id/name/description (+score, when present)."""
     hit: dict[str, Any] = _pick(row, _SKILL_SEARCH_ITEM)
     if row.get("score") is not None:
         hit["score"] = row["score"]
@@ -1385,34 +1421,34 @@ def _skill_hit(row: dict[str, Any]) -> dict[str, Any]:
 def _compact_skill_search(result: dict[str, Any]) -> dict[str, Any]:
     """skills_search: {results: [{id, name, description, score?}], hint}.
 
-    №38: подсказка берётся с ВЕРХНЕГО уровня ответа — ровно одна на весь поиск
-    (`HINT_SKILLS_BODY` при хитах, `HINT_SEARCH_EMPTY` при пустом результате);
-    в белом списке элемента (`_SKILL_SEARCH_ITEM`) поля `hint` нет. Пустой
-    поиск — не fail сервиса, а мягкий ответ с дословным hint канона §3.8
-    (проба: навыка нет — валидный исход). Мягкий отказ `fail + hint`
-    (невалидный `top_k`/запрос) обрабатывается в ручке ДО поиска и сюда не
-    доходит.
+            #38: the hint is taken from the answer's TOP level — exactly one for the
+            whole search (`HINT_SKILLS_BODY` on hits, `HINT_SEARCH_EMPTY` on an empty
+            result); the item whitelist (`_SKILL_SEARCH_ITEM`) has no `hint` field. An
+            empty search — not the service's fail but a soft answer with the verbatim
+            §3.8 canon hint (a probe: no skill — a valid outcome). A soft
+            `fail + hint` failure (an invalid `top_k`/query) is handled in the handle
+            BEFORE the search and never reaches here.
     """
     out = {"results": [_skill_hit(row) for row in result["results"]]}
-    return _with_hint(out, result)  # warning не копируется никогда
+    return _with_hint(out, result)  # warning is never copied
 
 
 def _compact_skill_list(result: dict[str, Any]) -> dict[str, Any]:
-    """skills_list: {items: [{id, name, description}], total, …} — без тел.
+    """skills_list: {items: [{id, name, description}], total, …} — no bodies.
 
-    Поля страницы и подсказка «есть ещё» — как у листинга заметок
-    (lsb-0013-02: один контракт листинга на обе ручки).
+            The page fields and the "there is more" hint — like the notes listing
+            (lsb-0013-02: one listing contract for both handles).
     """
     return {"items": [_pick(item, _SKILL_LIST_ITEM) for item in result["items"]],
             **_listing_page(result)}
 
 
 def _compact_skill_get(result: dict[str, Any]) -> dict[str, Any]:
-    """skills_get: композит §3.1 — name/description/example?/steps/text/шаблон.
+    """skills_get: the §3.1 composite — name/description/example?/steps/text/the template.
 
-    Не найден → `{hint}` канона §3.8 (композита нет: строки нет); `id` в
-    успешную выдачу не входит (модель уже знает id — экономия контекста),
-    `extra` тоже (полная запись — REST).
+            Not found → the §3.8 canon `{hint}` (no composite: no row); `id` does not
+            enter the successful output (the model already knows the id — context
+            economy), `extra` too (the full record — REST).
     """
     if "name" not in result:
         return _with_hint({}, result)
@@ -1423,11 +1459,11 @@ def _compact_skill_get(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_skill_save(result: dict[str, Any]) -> dict[str, Any]:
-    """skills_save: (id, version, created|updated); отказ — fail + hint.
+    """skills_save: (id, version, created|updated); a failure — fail + hint.
 
-    Создание слишком похожего навыка (антисинонимия, §3.4) → `{created:
-    False, hint}` с hint канона; правка несуществующего id → `{id, updated:
-    False, hint}`.
+            Creating a too-similar skill (the anti-synonymy, §3.4) →
+            `{created: False, hint}` with the canon hint; an edit of a nonexistent id
+            → `{id, updated: False, hint}`.
     """
     if result.get("created"):
         return _pick(result, ("id", "version", "created"))
@@ -1439,23 +1475,23 @@ def _compact_skill_save(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_skill_delete(result: dict[str, Any]) -> dict[str, Any]:
-    """skills_delete: (id, deleted); повторный/чужой id → hint канона."""
+    """skills_delete: (id, deleted); a repeated/foreign id → the canon hint."""
     return _with_hint(_pick(result, ("id", "deleted")), result)
 
 
-# lsb-0009-02: компактные выдачи области «user» — белые списки полей
-# (arch lsb-0009 §3.3, §3.7). Тело факта в контекст попадает только через
-# `user_get` (поиск отдаёт `excerpt`); `score` — soft-ключ (гибрид области —
-# показывается, если сервис его отдал). hint — маркер мягкого отказа, но в
-# УСПЕШНОМ `user_save` он ПОСТОЯННЫЙ (FR-7.2, hint атомарности) — поэтому
-# он не срезается, а средняя зона дедупа несёт ещё и справочный `related`.
+# lsb-0009-02: the "user" area's compact outputs — field whitelists
+# (arch lsb-0009 §3.3, §3.7). A fact body reaches the context only via
+# `user_get` (the search serves an `excerpt`); `score` — a soft key (the area hybrid —
+# shown when the service provided it). hint — a soft-failure marker, but in a
+# SUCCESSFUL `user_save` it is PERMANENT (FR-7.2, the atomicity hint) — so
+# it is not trimmed, and the dedup's middle zone also carries the reference `related`.
 _USER_SEARCH_ITEM = ("id", "name", "excerpt")
 _USER_GET_ITEM = ("id", "name", "body")
 _USER_RELATED_ITEM = ("id", "name")
 
 
 def _user_hit(row: dict[str, Any]) -> dict[str, Any]:
-    """Компактный хит user_search: id/name/excerpt (+score, если есть)."""
+    """A compact user_search hit: id/name/excerpt (+score, when present)."""
     hit: dict[str, Any] = _pick(row, _USER_SEARCH_ITEM)
     if row.get("score") is not None:
         hit["score"] = row["score"]
@@ -1465,27 +1501,28 @@ def _user_hit(row: dict[str, Any]) -> dict[str, Any]:
 def _compact_user_search(result: dict[str, Any]) -> dict[str, Any]:
     """user_search: {results: [{id, name, excerpt, score?}], hint?}.
 
-    Пустой поиск — не fail сервиса, а мягкий ответ с дословным hint канона
-    §3.7 (проба: факта нет — валидный исход). warning всегда срезается.
+            An empty search — not the service's fail but a soft answer with the
+            verbatim §3.7 canon hint (a probe: no fact — a valid outcome). warning is
+            always trimmed.
     """
     out = {"results": [_user_hit(row) for row in result["results"]]}
-    return _with_hint(out, result)  # warning не копируется никогда
+    return _with_hint(out, result)  # warning is never copied
 
 
 def _compact_user_get(result: dict[str, Any]) -> dict[str, Any]:
-    """user_get: (id, name, body); не найден → {id} + hint канона §3.7."""
+    """user_get: (id, name, body); not found → {id} + the §3.7 canon hint."""
     if "name" not in result:
         return _with_hint({"id": result["id"]}, result)
     return _pick(result, _USER_GET_ITEM)
 
 
 def _compact_user_save(result: dict[str, Any]) -> dict[str, Any]:
-    """user_save: (id, stored, hint?, related?); отказ дедупа — fail + hint.
+    """user_save: (id, stored, hint?, related?); a dedup failure — fail + hint.
 
-    Успех всегда несёт постоянный hint атомарности (FR-7.2); средняя зона
-    дедупа — справочный `related` (id/name похожих). Мягкий отказ сильного
-    совпадения (`stored: False`) записи не имеет — `id` в выдачу не входит,
-    hint канона ведёт к `user_update` существующего факта.
+            Success always carries the permanent atomicity hint (FR-7.2); the dedup's
+            middle zone — the reference `related` (similar facts' id/name). A strong
+            match's soft failure (`stored: False`) has no record — `id` does not enter
+            the output; the canon hint leads to `user_update` of the existing fact.
     """
     if not result.get("stored"):
         return _with_hint({"stored": False}, result)
@@ -1493,36 +1530,37 @@ def _compact_user_save(result: dict[str, Any]) -> dict[str, Any]:
     related = result.get("related")
     if related:
         out["related"] = [_pick(item, _USER_RELATED_ITEM) for item in related]
-    return _with_hint(out, result)  # hint — ВСЕГДА (постоянный, FR-7.2)
+    return _with_hint(out, result)  # hint — ALWAYS (permanent, FR-7.2)
 
 
 def _compact_user_update(result: dict[str, Any]) -> dict[str, Any]:
-    """user_update: (id, changed); нет записи → hint канона §3.7."""
+    """user_update: (id, changed); no record → the §3.7 canon hint."""
     return _with_hint(_pick(result, ("id", "changed")), result)
 
 
 def _compact_user_delete(result: dict[str, Any]) -> dict[str, Any]:
-    """user_delete: (id, deleted); повторный/чужой id → hint канона §3.7."""
+    """user_delete: (id, deleted); a repeated/foreign id → the §3.7 canon hint."""
     return _with_hint(_pick(result, ("id", "deleted")), result)
 
 
-# lsb-0008-02: компактные выдачи области «terms» — белые списки полей
-# (arch lsb-0008 §3.4–3.5). Внутренние нормализованные колонки области
+# lsb-0008-02: the "terms" area's compact outputs — field whitelists
+# (arch lsb-0008 §3.4–3.5). The area's internal normalized columns
 # (`term_norm`, `context_norm`, `vector_status`, `created_at`/`updated_at`,
-# `deleted_at`) в MCP не выводятся. `term`/`score` в выдаче смысла —
-# soft-ключи: в точной ветке сервис их не отдаёт (смыслы уже опознаны по
-# термину), в неточной — отдаёт (ближайшие по смыслу, не точное совпадение);
-# `warning` сервиса срезается всегда, `hint` — маркер мягкого отказа.
+# `deleted_at`) are not output to MCP. `term`/`score` in a sense's output —
+# soft keys: the exact branch does not serve them (the senses are already identified by
+# the term); the inexact one does (the closest by meaning, not an exact match);
+# the service's `warning` is always trimmed; `hint` — a soft-failure marker.
 _TERM_SENSE_ITEM = ("id", "context", "definition")
 _TERM_SENSE_HINT_ITEM = ("id", "context")
 _TERM_GET_ITEM = ("id", "term", "context", "definition")
 
 
 def _term_sense(row: dict[str, Any]) -> dict[str, Any]:
-    """Компактный смысл terms_search: id/context/definition (+term/score).
+    """A compact terms_search sense: id/context/definition (+term/score).
 
-    `term`/`score` — soft-ключи неточной ветки: показываются только когда
-    сервис их отдал (гибрид области) — точная ветка идёт без них.
+            `term`/`score` — the inexact branch's soft keys: shown only when the
+            service provided them (the area hybrid) — the exact branch goes without
+            them.
     """
     sense: dict[str, Any] = _pick(row, _TERM_SENSE_ITEM)
     if "term" in row:
@@ -1534,12 +1572,13 @@ def _term_sense(row: dict[str, Any]) -> dict[str, Any]:
 
 def _compact_term_search(result: dict[str, Any]) -> dict[str, Any]:
     """terms_search: {senses: [{id, context, definition, term?, score?}],
-    exact, hint?}.
+            exact, hint?}.
 
-    Точная ветка (`exact: true`) — ВСЕ смыслы термина, без `term`/`score`
-    (один смысл не выбирается за модель, §3.4); неточная — ближайшие по
-    смыслу + дословный hint «не точное совпадение». Пусто — мягкий ответ
-    с hint «термина нет вовсе» (не fail). warning не копируется никогда.
+            The exact branch (`exact: true`) — ALL the term's senses, without
+            `term`/`score` (one sense is not picked for the model, §3.4); the inexact
+            one — the closest by meaning + the verbatim "not an exact match" hint.
+            Empty — a soft answer with the "no term at all" hint (not a fail). warning
+            is never copied.
     """
     out: dict[str, Any] = {
         "senses": [_term_sense(row) for row in result["senses"]],
@@ -1551,12 +1590,12 @@ def _compact_term_search(result: dict[str, Any]) -> dict[str, Any]:
 def _compact_term_save(result: dict[str, Any]) -> dict[str, Any]:
     """terms_save: {created|updated, id, senses, contexts, hint?}.
 
-    Оба успешных исхода (§3.5) несут справочно `senses` этого термина
-    `[{id, context}]` и `contexts` области — чтобы модель переиспользовала
-    формулировку контекста (FR-3.2). Мягкий отказ близкого контекста
-    (`created: False`) записи не имеет: `id` в выдачу не входит, hint ведёт
-    к существующему контексту. Дословный hint лимитов/пустого контекста — из
-    мягкого отказа сервиса (§3.7).
+            Both successful outcomes (§3.5) carry for reference this term's `senses`
+            `[{id, context}]` and the area's `contexts` — so the model reuses the
+            context wording (FR-3.2). A close-context soft failure
+            (`created: False`) has no record: `id` does not enter the output; the hint
+            leads to the existing context. The verbatim limits/empty-context hint —
+            from the service's soft failure (§3.7).
     """
     if not (result.get("created") or result.get("updated")):
         return _with_hint({"created": False}, result)
@@ -1572,17 +1611,17 @@ def _compact_term_save(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_term_get(result: dict[str, Any]) -> dict[str, Any]:
-    """terms_get: (id, term, context, definition); нет — hint канона §3.7."""
+    """terms_get: (id, term, context, definition); none — the §3.7 canon hint."""
     if "term" not in result:
         return _with_hint({}, result)
     return _pick(result, _TERM_GET_ITEM)
 
 
-# LSBN-F-10 (f10-02, arch §7.1/§6.1): компактные выдачи области логов — белые
-# списки полей. Тела записи режет только поиск/листинг (f10-03: `excerpt`
-# `logs_search_excerpt_chars`); `logs_get` отдаёт запись целиком — агент обязан
-# видеть, к какому объекту и с какой версией относится запись. `hint` — только
-# при мягком отказе; `warning` (деградация FTS-only) приходит в `logs_search`
+# LSBN-F-10 (f10-02, arch §7.1/§6.1): the logs area's compact outputs — field
+# whitelists. Only search/listing trim the record body (f10-03: the `excerpt`
+# `logs_search_excerpt_chars`); `logs_get` serves the record whole — the agent must
+# see which object and version the record refers to. `hint` — only
+# on a soft failure; the `warning` (the FTS-only degradation) arrives in `logs_search`
 # (f10-03: `_compact_log_search`).
 _LOG_GET_ITEM = (
     "id",
@@ -1598,57 +1637,58 @@ _LOG_GET_ITEM = (
     "session",
     "created_at",
     "updated_at",
-    # f10-04 (§11): состояние объекта ссылки — только когда `entity` задан.
+    # f10-04 (§11): the referenced object's state — only when `entity` is set.
     "entity_state",
 )
 
 
 def _log_field(value: Any) -> Any:
-    """Поле `logs_update`: не переданное (None) — значит «оставить как есть».
+    """A `logs_update` field: not passed (None) means "keep as is".
 
-    Мост между схемой инструмента (у опциональных полей default None) и
-    сервисом, где «не передано» — сентинел `_LOG_UNSET` (прецедент
-    `memory_update`/`user_update`): так пустая строка остаётся осмысленной.
+            The bridge between the tool schema (optional fields default to None) and
+            the service, where "not passed" is the `_LOG_UNSET` sentinel (the
+            `memory_update`/`user_update` precedent): this way an empty string stays
+            meaningful.
     """
     return _LOG_UNSET if value is None else value
 
 
 def _compact_log_save(result: dict[str, Any]) -> dict[str, Any]:
-    """logs_save: (id, created, version); мягкий отказ — (created: false, hint)."""
+    """logs_save: (id, created, version); a soft failure — (created: false, hint)."""
     if not result.get("created"):
         return _with_hint({"created": False}, result)
     return _pick(result, ("id", "created", "version"))
 
 
 def _compact_log_get(result: dict[str, Any]) -> dict[str, Any]:
-    """logs_get: белый список полей записи; нет/удалена → (id) + hint §7.3."""
+    """logs_get: the record's field whitelist; none/deleted → (id) + a §7.3 hint."""
     if "action" not in result:
         return _with_hint({"id": result["id"]}, result)
     return _pick(result, _LOG_GET_ITEM)
 
 
 def _compact_log_update(result: dict[str, Any]) -> dict[str, Any]:
-    """logs_update: (id, updated); «ничего не передано»/нет записи → hint §7.3."""
+    """logs_update: (id, updated); "nothing passed"/no record → a §7.3 hint."""
     return _with_hint(_pick(result, ("id", "updated")), result)
 
 
 def _compact_log_delete(result: dict[str, Any]) -> dict[str, Any]:
-    """logs_delete: (id, deleted); повторный/чужой id → hint канона §7.3."""
+    """logs_delete: (id, deleted); a repeated/foreign id → the §7.3 canon hint."""
     return _with_hint(_pick(result, ("id", "deleted")), result)
 
 
-# f10-03 (arch §7.1): компактный хит поиска/листинга — {id, action, created_at}
-# плюс присутствующие `entity`/`entity_id`/`score`; `action` режется до
-# `logs_search_excerpt_chars`, чтобы тело лога не вываливалось в контекст
-# (FR-2.3/FR-5.3; REST оператора, наоборот, отдаёт текст целиком).
+# f10-03 (arch §7.1): a compact search/listing hit — {id, action, created_at}
+# plus the present `entity`/`entity_id`/`score`; `action` is trimmed to
+# `logs_search_excerpt_chars` so the log body does not spill into the context
+# (FR-2.3/FR-5.3; the operator's REST, on the contrary, serves the text whole).
 _LOG_HIT_REQUIRED = ("id", "action", "created_at")
-# `entity_state` (f10-04, §11) — состояние объекта ссылки; у элемента поиска/
-# листинга оно есть, пока слой истории доступен.
+# `entity_state` (f10-04, §11) — the referenced object's state; a search/listing item
+# has it while the history layer is available.
 _LOG_HIT_OPTIONAL = ("entity", "entity_id", "entity_state", "score")
 
 
 def _compact_log_hit(hit: dict[str, Any], excerpt_chars: int) -> dict[str, Any]:
-    """Один элемент выдачи поиска/листинга: белый список + обрезка `action`."""
+    """One search/listing output item: the whitelist + an `action` trim."""
     compact = {name: hit[name] for name in _LOG_HIT_REQUIRED}
     for name in _LOG_HIT_OPTIONAL:
         if hit.get(name) is not None:
@@ -1662,8 +1702,8 @@ def _compact_log_hit(hit: dict[str, Any], excerpt_chars: int) -> dict[str, Any]:
 def _compact_log_search(
     result: dict[str, Any], excerpt_chars: int
 ) -> dict[str, Any]:
-    """logs_search: {results, warning?, hint?} — warning FTS-only виден агенту."""
-    if "results" not in result:  # мягкий отказ до БД (например, лимит top_k)
+    """logs_search: {results, warning?, hint?} — the FTS-only warning is visible to the agent."""
+    if "results" not in result:  # a soft failure before the DB (e.g. a top_k limit)
         return _with_hint({"results": []}, result)
     out: dict[str, Any] = {
         "results": [
@@ -1678,8 +1718,8 @@ def _compact_log_search(
 def _compact_log_list(
     result: dict[str, Any], excerpt_chars: int
 ) -> dict[str, Any]:
-    """logs_list: {items, total, has_more, next_offset, hint?} без next_cursor."""
-    if "items" not in result:  # мягкий отказ (лимит/offset) — пустая страница
+    """logs_list: {items, total, has_more, next_offset, hint?} without next_cursor."""
+    if "items" not in result:  # a soft failure (limit/offset) — an empty page
         return _with_hint({"items": []}, result)
     out: dict[str, Any] = {
         "items": [
@@ -1692,20 +1732,20 @@ def _compact_log_list(
     return _with_hint(out, result)
 
 
-# №41 (FR-5.3, §7.1, §13.14): история из MCP — одна общая пара инструментов
-# (`history_list`/`history_get`) с параметром `entity` вместо ручек на каждую
-# область: поверхность растёт на 2, а не на 8. `session` версии —
-# идентификатор вызова/агента, в выдачу не идёт (§13.4); тела версий отдаёт
-# только `history_get` (FR-5.1). Неизвестная сущность — мягкий hint, без
-# исключения.
+# #41 (FR-5.3, §7.1, §13.14): history from MCP — one shared pair of tools
+# (`history_list`/`history_get`) with an `entity` parameter instead of handles per
+# area: the surface grows by 2, not 8. A version's `session` —
+# the call/agent identifier; it does not go into the output (§13.4); version bodies are served
+# only by `history_get` (FR-5.1). An unknown entity — a soft hint, without
+# an exception.
 #
-# №40, no40-02 (§7.1/§13.10): допустимый для АГЕНТА словарь сущностей выводится
-# из флагов областей — сущность выключенной области обрабатывается как
-# НЕИЗВЕСТНАЯ (мягкий hint без раскрытия, что область существует). `note` —
-# ядровая память, есть всегда; `skill`/`term`/`user_fact` — по флагу своей
-# области; `assistant_log` (f10-04, LSBN-F-10) — по флагу области логов.
-# Шаблон инструкции навыка (`skill_template`) агенту не отдаётся и при
-# включённой области.
+# #40, no40-02 (§7.1/§13.10): the entity dictionary valid for the AGENT is derived
+# from the area flags — a disabled area's entity is treated as
+# UNKNOWN (a soft hint without revealing that the area exists). `note` —
+# core memory, always present; `skill`/`term`/`user_fact` — by their area's
+# flag; `assistant_log` (f10-04, LSBN-F-10) — by the logs area's flag.
+# The skill instruction template (`skill_template`) is not served to the agent even when
+# the area is enabled.
 _HISTORY_ENTITIES_BY_AREA = (
     ("area_skills_enabled", history.ENTITY_SKILL),
     ("area_terms_enabled", history.ENTITY_TERM),
@@ -1715,7 +1755,7 @@ _HISTORY_ENTITIES_BY_AREA = (
 
 
 def history_entities_mcp(settings: Settings) -> tuple[str, ...]:
-    """Сущности истории, доступные агенту, — от флагов областей (№40, §13.10)."""
+    """The history entities available to the agent — from the area flags (#40, §13.10)."""
     return (history.ENTITY_NOTE,) + tuple(
         entity
         for flag, entity in _HISTORY_ENTITIES_BY_AREA
@@ -1724,10 +1764,10 @@ def history_entities_mcp(settings: Settings) -> tuple[str, ...]:
 
 
 def _unknown_history_entity_hint(entities: tuple[str, ...]) -> str:
-    """Hint «сущность неизвестна»: перечислены ТОЛЬКО допустимые агенту сущности.
+    """The "entity unknown" hint: ONLY the agent-valid entities are listed.
 
-    Выключенная область не упоминается (FR-2.1, §7.1): её сущность для агента
-    неотличима от опечатки.
+            A disabled area is not mentioned (FR-2.1, §7.1): its entity is
+            indistinguishable from a typo for the agent.
     """
     return (
         "unknown entity; available: "
@@ -1735,15 +1775,16 @@ def _unknown_history_entity_hint(entities: tuple[str, ...]) -> str:
         + " — history_list shows the available versions"
     )
 
-# Белые списки версий: метаданные + «что изменилось» (FR-5.1). Без `session`
-# (§13.4) и без тел.
+# The version whitelists: metadata + "what changed" (FR-5.1). Without `session`
+# (§13.4) and without bodies.
 _HISTORY_VERSION_ITEM = ("version", "created_at", "event", "source", "changed")
 _HISTORY_META_ITEM = ("created_at", "event", "source", "changed")
 
 
 def _compact_history_list(result: dict[str, Any]) -> dict[str, Any]:
     """history_list: {entity, id, versions: [{version, created_at, event,
-    source, changed}], has_more, total, hint?} — без полных тел версий."""
+            source, changed}], has_more, total, hint?} — without full version bodies.
+    """
     out = {
         "entity": result["entity"],
         "id": result["id"],
@@ -1756,22 +1797,23 @@ def _compact_history_list(result: dict[str, Any]) -> dict[str, Any]:
 
 def _compact_history_get(result: dict[str, Any]) -> dict[str, Any]:
     """history_get: {entity, id, version, created_at, event, source, changed,
-    <поля проекции>, hint?}; нет версии/сущности — мягкий ответ с hint."""
+            <projection fields>, hint?}; no version/entity — a soft answer with a hint.
+    """
     out: dict[str, Any] = {
         name: result[name] for name in ("entity", "id", "version") if name in result
     }
     if "fields" not in result:
-        # Мягкий ответ слоя (нет версии / история выключена) — как есть.
+        # The layer's soft answer (no version / history off) — as is.
         return _with_hint(out, result)
     out.update({name: result[name] for name in _HISTORY_META_ITEM})
     out.update(result["fields"])
     return out
 
 
-# №12 (no12-02, §7.1): элемент выдачи предупреждений — белый список; тел
-# заметок/терминов и служебных `status`/`resolved_at` нет (бюджет F-11).
+# #12 (no12-02, §7.1): a warnings output item — a whitelist; no note/term
+# bodies and no service `status`/`resolved_at` (the F-11 budget).
 def _compact_warning(row: dict[str, Any]) -> dict[str, Any]:
-    """Строка предупреждения → компактная форма: `subject` — объект {type, id}."""
+    """A warnings row → a compact shape: `subject` — the object {type, id}."""
     return {
         "id": row["id"],
         "kind": row["kind"],
@@ -1785,9 +1827,10 @@ def _compact_warning(row: dict[str, Any]) -> dict[str, Any]:
 def _compact_warnings(result: dict[str, Any]) -> dict[str, Any]:
     """warnings_list: {warnings: [...], total, has_more, next_offset, hint?}.
 
-    Поля страницы переносим из сервисного `page_fields` (arch §3.1–3.2), но
-    `next_cursor` (залог keyset) агенту не нужен — форма §7.1 его не несёт;
-    `hint` — только при мягком отказе.
+            The page fields are carried from the service `page_fields`
+            (arch §3.1–3.2), but `next_cursor` (keyset-reserved) is not needed by the
+            agent — the §7.1 shape does not carry it; `hint` — only on a soft
+            failure.
     """
     out: dict[str, Any] = {
         "warnings": [_compact_warning(row) for row in result["warnings"]],
@@ -1804,40 +1847,40 @@ def build_mcp(
     worker: "BackgroundWorker | None" = None,
     update_checker: UpdateChecker | None = None,
 ) -> MCPServer:
-    """Собрать MCP-сервер: инструкции (§5.1, база + карта неймспейсов) +
-    до 24 инструментов (8 `memory_*` + 1 `warnings_list` + 5 `skills_*` +
-    5 `user_*` + 3 `terms_*` + 2 `history_*`) над сервисами.
+    """Assemble the MCP server: instructions (§5.1, the base + the namespace map) +
+            up to 24 tools (8 `memory_*` + 1 `warnings_list` + 5 `skills_*` +
+            5 `user_*` + 3 `terms_*` + 2 `history_*`) over the services.
 
-    Блоки ручек области (skills/user/terms) регистрируются только при её
-    включённом флаге `AREA_*_ENABLED` (№40, FR-2.1): выключенная область в
-    поверхность не попадает вовсе, поэтому число инструментов зависит от env.
-    Общие `memory_*`/`history_*` и ядровая память гейту не подлежат.
+            The area handle blocks (skills/user/terms) register only when the area's
+            `AREA_*_ENABLED` flag is on (#40, FR-2.1): a disabled area never enters
+            the surface, so the tool count depends on env. The shared
+            `memory_*`/`history_*` and core memory are not gated.
 
-    Сигнатуры и ограничения параметров — контракты REQUIREMENTS §5.1/§5.7;
-    значения по умолчанию (DEFAULT_TOP_K, DEFAULT_LIST_LIMIT) — из env.
+            The signatures and parameter constraints — the REQUIREMENTS §5.1/§5.7
+            contracts; the defaults (DEFAULT_TOP_K, DEFAULT_LIST_LIMIT) — from env.
 
-    `worker` (№39, FR-4.4) — источник снимка разрывов слотов для хинта
-    «предупреди своего человека»; None (DI-сборки тестов без воркера) — хинт
-    выключен.
+            `worker` (#39, FR-4.4) — the source of the slot-breaker snapshot for the
+            "warn your human" hint; None (test DI builds without a worker) — the hint
+            is off.
 
-    `update_checker` (№45, FR-45.8) — источник хинта о свежем релизе; None
-    (DI-сборки без чекера) — поле `update_hint` не добавляется.
+            `update_checker` (#45, FR-45.8) — the fresh-release hint's source; None
+            (DI builds without the checker) — the `update_hint` field is not added.
     """
-    # 3.4.1 (LSBN-T-26): описания ручек собраны от настроек сборки — число
-    # лимита заметки в memory_save/memory_update то же, что в валидации.
+    # 3.4.1 (LSBN-T-26): the handle descriptions are assembled from the build settings — the note
+    # limit number in memory_save/memory_update is the same as in validation.
     descriptions = tool_descriptions(settings.max_note_chars)
     mcp = MCPServer(
         name=SERVER_NAME,
         instructions=build_instructions(services),
     )
-    # Свежесть анонса навыков (lsb-0007 §3.5): ServerMiddleware пересобирает
-    # инструкции перед каждым initialize — новый чат видит актуальный реестр
-    # (данных пользователя в пересборке нет, только реестр навыков).
+    # The skills announce's freshness (lsb-0007 §3.5): a ServerMiddleware reassembles
+    # the instructions before every initialize — a new chat sees the up-to-date registry
+    # (no user data in the rebuild, only the skills registry).
     mcp.middleware.append(InstructionsRefresher(services, mcp))
-    # №39 (FR-4.4/FR-4.5, arch §7.3): хинт о сломанном слоте с троттлингом.
+    # #39 (FR-4.4/FR-4.5, arch §7.3): a throttled hint about a broken slot.
     mcp.middleware.append(SlotHintMiddleware(settings, worker))
-    # №45 (FR-45.8, arch §7.1): хинт о свежем релизе отдельным полем
-    # `update_hint` с троттлингом; дефолт выключен — выдача не меняется.
+    # #45 (FR-45.8, arch §7.1): a fresh-release hint as a separate `update_hint` field
+    # with throttling; the default is off — the output does not change.
     mcp.middleware.append(UpdateHintMiddleware(update_checker))
 
     @mcp.tool(name="memory_search", description=descriptions["memory_search"])
@@ -1890,8 +1933,8 @@ def build_mcp(
     ) -> dict[str, Any]:
         started = time.perf_counter()
         if mode not in SEARCH_MODES:
-            # FR-3.4: неизвестный mode — мягкий отказ с хинтом доступных
-            # режимов (fail + hint), не жёсткая ошибка.
+            # FR-3.4: an unknown mode — a soft failure with a hint of the available
+            # modes (fail + hint), not a hard error.
             log_tool_call(
                 "memory_search",
                 started,
@@ -1901,8 +1944,8 @@ def build_mcp(
                 query=preview(query),
             )
             return {"results": [], "hint": HINT_INVALID_MODE}
-        # LSBN-F-13: бюджет символов ответа; невалидный — мягкий отказ (как
-        # mode), валидный/не переданный — дефолт поверхности из кода.
+        # LSBN-F-13: the answer's character budget; invalid — a soft failure (like
+        # mode); valid/not passed — the surface default from code.
         if budget_chars is not None and not (
             BUDGET_CHARS_MIN <= budget_chars <= BUDGET_CHARS_MAX
         ):
@@ -1919,8 +1962,8 @@ def build_mcp(
             budget_chars if budget_chars is not None
             else SEARCH_BUDGET_CHARS_DEFAULT
         )
-        # no29-01: невалидное значение свежести — мягкий отказ с хинтом (как
-        # mode/detail), сразу после проверки mode.
+        # no29-01: an invalid freshness value — a soft failure with a hint (like
+        # mode/detail), right after the mode check.
         try:
             fresh = (
                 parse_updated_after(updated_after)
@@ -1939,8 +1982,8 @@ def build_mcp(
             return {"results": [], "hint": HINT_INVALID_UPDATED_AFTER}
         try:
             if mode == "title":
-                # lsb-0001-02: title-режим поверх SearchService.search_title
-                # (постановка 01) — строгий поиск по подстроке названия.
+                # lsb-0001-02: the title mode over SearchService.search_title
+                # (brief 01) — a strict search over the title substring.
                 result = await asyncio.to_thread(
                     services.search.search_title,
                     query,
@@ -1959,8 +2002,8 @@ def build_mcp(
                     fresh,
                 )
         except (NamespaceError, NamespaceValidationError) as exc:
-            # NFR-4: отказ инструмента наблюдаем — failed + латентность;
-            # текст исключения безопасен (имя узла, не содержимое заметок).
+            # NFR-4: a tool failure is observable — failed + latency;
+            # the exception text is safe (a node name, not note content).
             log_tool_call(
                 "memory_search",
                 started,
@@ -1970,8 +2013,8 @@ def build_mcp(
                 query=preview(query),
             )
             return {"results": [], "hint": str(exc)}
-        # NFR-4: вызов инструмента с латентностью и числом результатов;
-        # текст запроса — превью (первые 80 симв.); заметки не логируются.
+        # NFR-4: a tool call with latency and the result count;
+        # the query text — a preview (the first 80 chars); notes are not logged.
         log_tool_call(
             "memory_search",
             started,
@@ -1983,7 +2026,7 @@ def build_mcp(
         )
         if mode == "title":
             return _compact_title_search(result, budget)
-        # Дефолт 3.4.0 (F-13): шапки в бюджете; саммари — точечным чтением.
+        # The 3.4.0 default (F-13): headers within the budget; summaries — pointwise reading.
         return _compact_search_headers(result, budget)
 
     @mcp.tool(
@@ -2023,11 +2066,11 @@ def build_mcp(
             ),
         ] = None,
     ) -> dict[str, Any]:
-        """Отдельный поиск ПОМЕТОК (no24-02, §13.6): только по comment.
+        """A separate COMMENT search (no24-02, §13.6): over comment only.
 
-        Отдельная ручка, а не режим memory_search: результаты не смешиваются
-        со смысловым поиском. Невалидный `updated_after` — мягкий отказ
-        (fail + hint); неизвестный узел — hint от NamespaceError.
+                    A separate handle, not a memory_search mode: the results are not mixed
+                    with the semantic search. An invalid `updated_after` — a soft failure
+                    (fail + hint); an unknown node — a hint from NamespaceError.
         """
         started = time.perf_counter()
         try:
@@ -2079,8 +2122,8 @@ def build_mcp(
     async def memory_list(
         limit: Annotated[
             int,
-            # lsb-0013-02: верхнюю границу проверяет СЕРВИС (у схемы — только
-            # ge=1), иначе limit=50 давал бы schema-error вместо мягкого отказа.
+            # lsb-0013-02: the upper bound is checked by the SERVICE (the schema has only
+            # ge=1), otherwise limit=50 would give a schema-error instead of a soft failure.
             Field(description="Page size (1..20)", ge=1),
         ] = settings.default_list_limit,
         offset: Annotated[
@@ -2123,8 +2166,8 @@ def build_mcp(
     ) -> dict[str, Any]:
         started = time.perf_counter()
         if detail not in LIST_DETAILS:
-            # FR-4.1: неизвестный detail — мягкий отказ с хинтом доступных
-            # форм (fail + hint), симметрично mode.
+            # FR-4.1: an unknown detail — a soft failure with a hint of the available
+            # forms (fail + hint), symmetric to mode.
             log_tool_call(
                 "memory_list",
                 started,
@@ -2133,7 +2176,7 @@ def build_mcp(
                 namespace=namespace,
             )
             return {"items": [], "total": 0, "hint": HINT_INVALID_DETAIL}
-        # LSBN-F-13: бюджет символов ответа (мягкий отказ при невалидном).
+        # LSBN-F-13: the answer's character budget (a soft failure when invalid).
         if budget_chars is not None and not (
             BUDGET_CHARS_MIN <= budget_chars <= BUDGET_CHARS_MAX
         ):
@@ -2149,8 +2192,8 @@ def build_mcp(
             budget_chars if budget_chars is not None
             else LIST_BUDGET_CHARS_DEFAULT
         )
-        # no29-01: невалидное значение свежести — мягкий отказ с хинтом (как
-        # detail), сразу после проверки detail.
+        # no29-01: an invalid freshness value — a soft failure with a hint (like
+        # detail), right after the detail check.
         try:
             fresh = (
                 parse_updated_after(updated_after)
@@ -2173,7 +2216,7 @@ def build_mcp(
                 offset,
                 namespace,
                 namespace_exact,
-                # Потолок поверхности передаёт транспорт (arch §3.2).
+                # The surface ceiling is passed by the transport (arch §3.2).
                 max_limit=settings.list_max_limit_mcp,
                 updated_after=fresh,
             )
@@ -2187,8 +2230,8 @@ def build_mcp(
             )
             return {"items": [], "total": 0, "hint": str(exc)}
         except NoteValidationError as exc:
-            # lsb-0013-02 (FR-1.4): лимит вне потолка поверхности — мягкий отказ
-            # с единым текстом сервиса, а не schema-error транспорта.
+            # lsb-0013-02 (FR-1.4): a limit beyond the surface ceiling — a soft failure
+            # with the service's single text, not a transport schema-error.
             log_tool_call(
                 "memory_list",
                 started,
@@ -2207,7 +2250,7 @@ def build_mcp(
             offset=offset,
             namespace=namespace,
         )
-        # Дефолт 3.4.0 (F-13): titles; summaries — явная деталь; обе в бюджете.
+        # The 3.4.0 default (F-13): titles; summaries — an explicit detail; both within the budget.
         if detail == "titles":
             return _compact_list_titles(result, budget)
         return _compact_list(result, budget)
@@ -2275,9 +2318,9 @@ def build_mcp(
             Field(description="Map page start, 0-based (default 0)"),
         ] = 0,
     ) -> dict[str, Any]:
-        # FR-3: id (int) — алиас одного id (оборачивается в список).
-        # Неоднозначный ввод (оба параметра) отклоняется громко — модель
-        # учится по ошибкам (§5.3), а не молчаливому приоритету списка.
+        # FR-3: id (int) — an alias of a single id (wrapped into a list).
+        # Ambiguous input (both parameters) is rejected loudly — the model
+        # learns from errors (§5.3), not from a silent list priority.
         if ids is not None and id is not None:
             raise ValueError("pass either ids (list) or a single id — not both")
         if ids is None:
@@ -2285,8 +2328,8 @@ def build_mcp(
                 raise ValueError("pass ids (list) or a single id")
             ids = [id]
         started = time.perf_counter()
-        # LSBN-F-13: бюджет — только batch-чтение; одиночный id и chunk-режим
-        # (уровень 2) всегда полные. Невалидное значение — мягкий отказ.
+        # LSBN-F-13: the budget — batch reading only; a single id and chunk mode
+        # (level 2) are always full. An invalid value — a soft failure.
         if budget_chars is not None and not (
             BUDGET_CHARS_MIN <= budget_chars <= BUDGET_CHARS_MAX
         ):
@@ -2298,9 +2341,9 @@ def build_mcp(
             budget_chars if budget_chars is not None
             else GET_BUDGET_CHARS_DEFAULT
         )
-        # LSBN-F-16: карта окружения — ТОЛЬКО при одиночном чтении (там же,
-        # где `links`); batch карту не носит. Диапазоны параметров — мягкие
-        # отказы (как budget_chars/mode/detail), не исключения.
+        # LSBN-F-16: the environment map — ONLY on a single read (the same place
+        # as `links`); batch does not carry a map. Parameter ranges — soft
+        # failures (like budget_chars/mode/detail), not exceptions.
         if map:
             if len(ids) > 1:
                 log_tool_call(
@@ -2324,9 +2367,9 @@ def build_mcp(
                 return {"notes": [], "hint": HINT_INVALID_MAP_OFFSET}
         chunk_mode = query is not None or chunk is not None
         if not chunk_mode:
-            # Без query/chunk — чтение списком id. Одиночный id (или список
-            # из одного) — ПОЛНЫЙ текст + связи (уровень 2, F-13 п.5);
-            # batch — шапки в бюджете (уровень 1).
+            # Without query/chunk — reading by an id list. A single id (or a list
+            # of one) — the FULL text + links (level 2, F-13 p.5);
+            # batch — headers within the budget (level 1).
             if limit is not None:
                 log_tool_call(
                     "memory_get", started, failed=True, reason="limit without query/chunk"
@@ -2343,21 +2386,21 @@ def build_mcp(
             if len(ids) == 1 and result["notes"]:
                 out = _compact_get(result)
                 if map:
-                    # LSBN-F-16: карта вместо перечня `links` — сосед построчно
-                    # с типом связи (и направлением у mention); свой потолок
-                    # символов (`budget_chars` тут не действует — F-13).
+                    # LSBN-F-16: a map instead of the `links` list — a neighbor per line
+                    # with the link kind (and the direction for mention); its own character
+                    # ceiling (`budget_chars` does not apply here — F-13).
                     out.update(
                         await _map_of(
                             services, ids[0], map_level, map_limit, map_offset
                         )
                     )
                     return out
-                # Связи — только при одиночном чтении (FR-3.2): batch экономит
-                # контекст, поля `links` в нём нет вовсе.
+                # Links — on a single read only (FR-3.2): batch saves
+                # context; the `links` field is absent from it entirely.
                 out["links"] = await _links_of(services, ids[0])
                 return out
             return _compact_get_headers(result, budget)
-        # chunk-режим (lsb-0003, №16): чтение чанком — по одному id.
+        # Chunk mode (lsb-0003, #16): chunk reading — one id at a time.
         if len(ids) != 1:
             log_tool_call(
                 "memory_get", started, failed=True, reason="chunk read multi id"
@@ -2377,7 +2420,7 @@ def build_mcp(
                 limit if limit is not None else 1,
             )
         except NoteValidationError as exc:
-            # Мягкий отказ (hint): недопустимый limit / query+chunk вместе.
+            # A soft failure (a hint): an invalid limit / query+chunk together.
             log_tool_call(
                 "memory_get", started, failed=True, reason=str(exc), requested=1
             )
@@ -2389,11 +2432,11 @@ def build_mcp(
             results=len(result.get("chunks", [])),
         )
         if not result.get("hint"):
-            # Связи относятся к ЗАМЕТКЕ, а не к чанку (arch §3.5): кладём их
-            # рядом с `chunks`/`total_chunks`/`chars`, верхнеуровневый `chars`
-            # (сумма символов отданных чанков) не переопределяем (FR-3.5).
-            # `hint` — маркер мягкого отказа чанк-режима: успешный ответ отдаёт
-            # пустую строку (контракт lsb-0003), в отказе связи не добавляем.
+            # The links belong to the NOTE, not the chunk (arch §3.5): we place them
+            # next to `chunks`/`total_chunks`/`chars`; the top-level `chars`
+            # (the sum of served chunks' characters) is not overridden (FR-3.5).
+            # `hint` — the chunk mode's soft-failure marker: a successful answer serves
+            # an empty string (the lsb-0003 contract); on a failure we add no links.
             result["links"] = await _links_of(services, note_id)
         return result
 
@@ -2452,13 +2495,13 @@ def build_mcp(
     ) -> dict[str, Any]:
         started = time.perf_counter()
         if notes is not None:
-            # LSBN-F-23 (п. 3): массив заметок поверх скалярного контракта —
-            # агент, чей текст не влезает в лимит, сохраняет 2–3 самодостаточные
-            # заметки одним действием (и слияние пишет свои части так же).
-            # Смешивать `notes` и `text` нельзя — это два взаимоисключающих
-            # формата одного вызова (мягкий отказ с hint).
+            # LSBN-F-23 (p. 3): a notes array on top of the scalar contract —
+            # an agent whose text does not fit the limit saves 2–3 self-sufficient
+            # notes in one action (and the merge writes its parts the same way).
+            # Mixing `notes` and `text` is not allowed — two mutually exclusive
+            # formats of one call (a soft failure with a hint).
             if text.strip():
-                # `notes` и `text` взаимоисключающи (два формата одного вызова).
+                # `notes` and `text` are mutually exclusive (two formats of one call).
                 log_tool_call(
                     "memory_save",
                     started,
@@ -2478,7 +2521,7 @@ def build_mcp(
 
             results = await asyncio.to_thread(save_array)
             stored_count = sum(1 for item in results if item.get("stored"))
-            # Приватность (NFR-4): только счётчики и суммарная длина.
+            # Privacy (NFR-4): counters and the total length only.
             log_tool_call(
                 "memory_save",
                 started,
@@ -2487,9 +2530,9 @@ def build_mcp(
             )
             return {"stored_count": stored_count, "notes": results}
         if not text.strip():
-            # Ни массива, ни текста: нечего сохранять — мягкий отказ (текст
-            # стал необязательным ради `notes`; пустой скаляр сюда не доходит
-            # из осмысленных клиентов, а защита в глубине бесплатна).
+            # Neither the array nor the text: nothing to save — a soft failure (the text
+            # became optional for `notes`; an empty scalar does not reach here
+            # from sensible clients, and defense in depth is free).
             log_tool_call(
                 "memory_save",
                 started,
@@ -2503,11 +2546,11 @@ def build_mcp(
                 expires_at=expires_at, comment=comment,
             )
         except (NoteValidationError, NamespaceError, NamespaceValidationError) as exc:
-            # Отказ записи: title отсутствует/невалиден (решение №9) или узел
-            # не зарегистрирован — fail + hint (клиент-модель учится по hint,
-            # §5.3; узлы клиент не создаёт — актуальная карта
-            # memory_namespaces). NFR-4: отказ наблюдаем — failed + латентность;
-            # текст исключения безопасен (фиксированный hint / имя узла).
+            # A write failure: the title is absent/invalid (decision #9) or the node
+            # is not registered — fail + hint (the client model learns from hints,
+            # §5.3; the client does not create nodes — the up-to-date map is
+            # memory_namespaces). NFR-4: a failure is observable — failed + latency;
+            # the exception text is safe (a fixed hint / a node name).
             log_tool_call(
                 "memory_save",
                 started,
@@ -2517,7 +2560,7 @@ def build_mcp(
                 note_chars=len(text),
             )
             return {"stored": False, "hint": str(exc)}
-        # Приватность (NFR-4): сам текст не пишется — только длина и флаги.
+        # Privacy (NFR-4): the text itself is not logged — only the length and flags.
         log_tool_call(
             "memory_save",
             started,
@@ -2579,7 +2622,7 @@ def build_mcp(
         ] = _UNSET_COMMENT,
     ) -> dict[str, Any]:
         started = time.perf_counter()
-        # text=None (не передан) → сентинел _UNSET_TEXT: текст не трогаем.
+        # text=None (not passed) → the _UNSET_TEXT sentinel: the text is untouched.
         note_chars = len(text) if text is not None else None
         try:
             result = await asyncio.to_thread(
@@ -2593,8 +2636,8 @@ def build_mcp(
                 comment=comment,
             )
         except (NoteValidationError, NamespaceError, NamespaceValidationError) as exc:
-            # title невалиден (решение №9) или узел не зарегистрирован —
-            # мягкий отказ + hint. NFR-4: отказ наблюдаем — failed + латентность.
+            # An invalid title (decision #9) or an unregistered node —
+            # a soft failure + hint. NFR-4: a failure is observable — failed + latency.
             log_tool_call(
                 "memory_update",
                 started,
@@ -2606,7 +2649,7 @@ def build_mcp(
             )
             return {"id": id, "updated": False, "hint": str(exc)}
         log_tool_call(
-            # Приватность (NFR-4): текст не пишется — только длина.
+            # Privacy (NFR-4): the text is not logged — only the length.
             "memory_update",
             started,
             id=id,
@@ -2635,8 +2678,8 @@ def build_mcp(
         try:
             candidates = await asyncio.to_thread(services.promotion.candidates)
         except Exception:
-            # Кандидаты — вспомогательное поле карты: сбой агрегации (БД
-            # ещё не инициализирована и т.п.) не ломает выдачу реестра.
+            # candidates — an auxiliary map field: an aggregation failure (the DB
+            # not initialized yet, etc.) does not break the registry output.
             candidates = []
         log_tool_call(
             "memory_namespaces",
@@ -2666,20 +2709,20 @@ def build_mcp(
             ),
         ],
     ) -> dict[str, Any]:
-        # lsb-0005-05 (FR-6/FR-8): модель создаёт узел любого уровня 1..3
-        # (включая корни), confirmed, прямое создание (судья не вызывается).
-        # Отдельная ручка от save: save узлы не создаёт.
-        # lsb-0005-06 (FR-6): перед созданием — антисинонимия описания нового
-        # узла против тематических узлов реестра; > 0.90 → мягкий отказ.
+        # lsb-0005-05 (FR-6/FR-8): the model creates a node of any level 1..3
+        # (including roots), confirmed, direct creation (the judge is not called).
+        # A separate handle from save: save never creates nodes.
+        # lsb-0005-06 (FR-6): before creation — the anti-synonymy of the new node's
+        # description against the registry's thematic nodes; > 0.90 → a soft failure.
         started = time.perf_counter()
         nearest, cosine = _antiseonymy_nearest(services, path, description)
         if nearest is not None and (
             cosine is not None and cosine > NAMESPACE_CREATE_SYNONYM_SIMILARITY
         ):
-            # Мягкий отказ (fail + hint): описание слишком похоже на
-            # существующий узел — создание не происходит, подсказываем
-            # ближайшего (1). Судья не вызывается (его гейт — для
-            # авто-промоушна, решение О.).
+            # A soft failure (fail + hint): the description is too similar to
+            # an existing node — creation does not happen; we point at
+            # the nearest one (1). The judge is not called (its gate is for
+            # auto-promotion).
             log_tool_call(
                 "memory_namespace_create",
                 started,
@@ -2694,9 +2737,9 @@ def build_mcp(
                 services.namespaces.create, path, description, status="confirmed"
             )
         except (NamespaceError, NamespaceValidationError) as exc:
-            # Мягкий отказ (fail + hint): узел уже есть / родитель не
-            # существует / невалидный путь (default/..., глубина>3) /
-            # пустое или длинное описание. Текст исключения безопасен.
+            # A soft failure (fail + hint): the node exists / the parent does
+            # not exist / an invalid path (default/..., depth>3) /
+            # an empty or long description. The exception text is safe.
             log_tool_call(
                 "memory_namespace_create",
                 started,
@@ -2713,9 +2756,9 @@ def build_mcp(
         )
         return _compact_namespace_create(result)
 
-    # --- предупреждения: единая точка чтения (№12, no12-02, §7.1) ----------
-    # Регистрация БЕЗУСЛОВНАЯ: предупреждения памяти — ядро; предупреждения
-    # терминов (№32) появятся в той же таблице сами. Чтение — только SQL.
+    # --- warnings: the single reading point (#12, no12-02, §7.1) --------------
+    # The registration is UNCONDITIONAL: memory warnings are core; term warnings
+    # (#32) will appear in the same table by themselves. Reads — SQL only.
     @mcp.tool(name="warnings_list", description=descriptions["warnings_list"])
     async def warnings_list(
         kind: Annotated[
@@ -2736,8 +2779,8 @@ def build_mcp(
         ] = "open",
         limit: Annotated[
             int,
-            # Верхнюю границу проверяет СЕРВИС (у схемы — только ge=1), иначе
-            # limit=50 давал бы schema-error вместо мягкого отказа (lsb-0013).
+            # The upper bound is checked by the SERVICE (the schema has only ge=1), otherwise
+            # limit=50 would give a schema-error instead of a soft failure (lsb-0013).
             Field(description="Page size (1..20)", ge=1),
         ] = settings.default_list_limit,
         offset: Annotated[
@@ -2768,7 +2811,7 @@ def build_mcp(
                 max_limit=settings.warnings_max_limit_mcp,
             )
         except WarningsValidationError as exc:
-            # Мягкий отказ (fail + hint): лимит вне потолка поверхности.
+            # A soft failure (fail + hint): a limit beyond the surface ceiling.
             log_tool_call(
                 "warnings_list",
                 started,
@@ -2789,13 +2832,13 @@ def build_mcp(
         )
         return _compact_warnings(result)
 
-    # --- история версий: чтение из MCP (№41, §7.1, §13.14) ------------------
-    # Два ОБЩИХ инструмента по явному запросу; сервисы не нужны — читает тот же
-    # слой истории, что пишут все пути правки. Обычные выдачи историю не несут
-    # (FR-5.5). `entity` вне допустимых (в т.ч. выключенная область, no40-02) —
-    # мягкий hint без раскрытия; при `HISTORY_ENABLED=false` — пусто + hint (§8).
-    # Словарь сущностей и схема `entity` собираются от флагов (№40, no40-02):
-    # выключенная область не видна агенту ни выдачей, ни подсказкой, ни схемой.
+    # --- version history: reading from MCP (#41, §7.1, §13.14) ----------------
+    # Two SHARED tools on an explicit request; the services are not needed — it reads the same
+    # history layer all edit paths write to. Regular outputs carry no history
+    # (FR-5.5). An `entity` outside the valid ones (including a disabled area, no40-02) —
+    # a soft hint without revelation; with `HISTORY_ENABLED=false` — empty + a hint (§8).
+    # The entity dictionary and the `entity` schema are assembled from the flags (#40, no40-02):
+    # a disabled area is invisible to the agent in outputs, hints and the schema alike.
     history_entities = history_entities_mcp(settings)
     history_hint = _unknown_history_entity_hint(history_entities)
     history_entity_help = " | ".join(history_entities)
@@ -2806,15 +2849,15 @@ def build_mcp(
         id: Annotated[int, Field(description="Record id")],
         limit: Annotated[
             int,
-            # Потолок проверяет сервисный слой истории (как у листингов).
+            # The ceiling is checked by the history service layer (like the listings).
             Field(description="Page size", ge=1),
         ] = settings.default_list_limit,
         offset: Annotated[int, Field(description="Page offset", ge=0)] = 0,
     ) -> dict[str, Any]:
         started = time.perf_counter()
         if entity not in history_entities:
-            # Мягкий отказ (fail + hint): сущность неизвестна (или её область
-            # выключена) — что область существует, не раскрываем.
+            # A soft failure (fail + hint): the entity is unknown (or its area
+            # is disabled) — we do not reveal that the area exists.
             log_tool_call(
                 "history_list", started, failed=True,
                 reason="unknown entity", entity=entity, id=id,
@@ -2858,7 +2901,7 @@ def build_mcp(
             history.read_version, entity, id, version, settings
         )
         if "fields" not in result:
-            # Мягкий отказ: версии нет / история выключена — hint, без исключения.
+            # A soft failure: no version / history off — a hint, without an exception.
             log_tool_call(
                 "history_get", started, failed=True,
                 reason=result.get("hint"), entity=entity, id=id,
@@ -2867,12 +2910,12 @@ def build_mcp(
             log_tool_call("history_get", started, results=1, entity=entity, id=id)
         return _compact_history_get(result)
 
-    # --- область навыков (lsb-0007-03, arch §3.3–3.4) ------------------------
-    # Тонкие обёртки над `SkillsService` (один код с REST-зеркалами §3.7):
-    # блокирующие вызовы — в `asyncio.to_thread`, выдачи — белые списки,
-    # hint — только при мягком отказе. Антисинонимия создания живёт в
-    # сервисе (её обязан звать и REST POST /skills), транспорт лишь отдаёт
-    # `{created: False, hint}` как есть: `_compact_skill_save`.
+    # --- the skills area (lsb-0007-03, arch §3.3–3.4) -------------------------
+    # Thin wrappers over `SkillsService` (one codebase with the §3.7 REST mirrors):
+    # blocking calls — into `asyncio.to_thread`; outputs — whitelists;
+    # hint — only on a soft failure. The creation anti-synonymy lives in the
+    # service (REST POST /skills must call it too); the transport only serves
+    # `{created: False, hint}` as is: `_compact_skill_save`.
 
     if settings.area_skills_enabled:
         @mcp.tool(name="skills_search", description=descriptions["skills_search"])
@@ -2894,7 +2937,7 @@ def build_mcp(
             try:
                 result = await asyncio.to_thread(services.skills.search, query, top_k)
             except SkillValidationError as exc:
-                # Мягкий отказ (fail + hint): запрос/top_k вне домена области.
+                # A soft failure (fail + hint): the query/top_k outside the area's domain.
                 log_tool_call(
                     "skills_search",
                     started,
@@ -2903,8 +2946,8 @@ def build_mcp(
                     query=preview(query),
                 )
                 return {"results": [], "hint": str(exc)}
-            # Пустой результат — валидный исход пробы (hint канона в выдаче),
-            # не fail: событие несёт число хитов и признак FTS-only деградации.
+            # An empty result — a valid probe outcome (the canon hint in the output),
+            # not a fail: the event carries the hit count and the FTS-only degradation flag.
             log_tool_call(
                 "skills_search",
                 started,
@@ -2919,7 +2962,7 @@ def build_mcp(
         async def skills_list(
             limit: Annotated[
                 int,
-                # Потолок проверяет СЕРВИС — как у memory_list (lsb-0013-02).
+                # The ceiling is checked by the SERVICE — like memory_list (lsb-0013-02).
                 Field(description="Page size (1..20)", ge=1),
             ] = settings.default_list_limit,
             offset: Annotated[
@@ -2927,8 +2970,8 @@ def build_mcp(
                 Field(description="Page offset", ge=0),
             ] = 0,
         ) -> dict[str, Any]:
-            # lsb-0013-02 (FR-1.3): параметры страницы — дефолт/потолок и поведение
-            # те же, что у memory_list (один сервисный контракт листинга).
+            # lsb-0013-02 (FR-1.3): the page parameters — the default/ceiling and behavior
+            # are the same as memory_list's (one service listing contract).
             started = time.perf_counter()
             try:
                 result = await asyncio.to_thread(
@@ -2938,7 +2981,7 @@ def build_mcp(
                     max_limit=settings.list_max_limit_mcp,
                 )
             except SkillValidationError as exc:
-                # Мягкий отказ: лимит вне потолка поверхности — единый текст сервиса.
+                # A soft failure: a limit beyond the surface ceiling — the service's single text.
                 log_tool_call(
                     "skills_list",
                     started,
@@ -2964,7 +3007,7 @@ def build_mcp(
             started = time.perf_counter()
             result = await asyncio.to_thread(services.skills.get, id)
             if "hint" in result:
-                # Мягкий отказ: навыка нет (мягко — возможно, удалён).
+                # A soft failure: no skill (softly — maybe deleted).
                 log_tool_call(
                     "skills_get", started, failed=True, reason=result["hint"], id=id
                 )
@@ -3008,9 +3051,9 @@ def build_mcp(
                 ),
             ] = None,
         ) -> dict[str, Any]:
-            # Лимиты формы валидирует СЕРВИС (не схема — как title у заметок):
-            # нарушение → SkillValidationError с дословным hint канона §3.8.
-            # Приватность (NFR-4): в лог идут длины, не содержимое.
+            # The shape limits are validated by the SERVICE (not the schema — like the notes' title):
+            # a violation → SkillValidationError with the verbatim §3.8 canon hint.
+            # Privacy (NFR-4): lengths go into the log, not content.
             started = time.perf_counter()
             sizes = {
                 "name_chars": len(name),
@@ -3046,8 +3089,8 @@ def build_mcp(
                     **sizes,
                 )
             else:
-                # Мягкий отказ сервиса: дубль (антисинонимия) или правка
-                # несуществующего id — навык не записан, hint ведёт к решению.
+                # A service soft failure: a duplicate (anti-synonymy) or an edit
+                # of a nonexistent id — the skill is not saved; the hint leads to the resolution.
                 log_tool_call(
                     "skills_save", started, failed=True, reason=result["hint"],
                     id=id, **sizes,
@@ -3063,20 +3106,20 @@ def build_mcp(
             if result.get("deleted"):
                 log_tool_call("skills_delete", started, id=id, deleted=True)
             else:
-                # Повторный/несуществующий id — мягкий отказ с hint канона.
+                # A repeated/nonexistent id — a soft failure with the canon hint.
                 log_tool_call(
                     "skills_delete", started, failed=True, reason=result["hint"], id=id
                 )
             return _compact_skill_delete(result)
 
-    # --- область «user» (lsb-0009-02, arch §3.3/§3.7) ----------------------
-    # Тонкие обёртки над `UserFactsService` (один код с REST-зеркалами
-    # lsb-0009-03): блокирующие вызовы — в `asyncio.to_thread`, выдачи — белые
-    # списки, hint пробрасывается при мягком отказе, НО в успешном `user_save`
-    # он постоянный (FR-7.2) и не срезается. Валидация формы (лимиты `name`/
-    # `body`) живёт в сервисе — нарушение даёт дословный hint канона (§3.7)
-    # вместо схемного отказа. Инъекции при init НЕТ: блока «user» в инструкциях
-    # не появляется (FR-6, arch §2) — гарантированный канал лишь описания.
+    # --- the "user" area (lsb-0009-02, arch §3.3/§3.7) ------------------------
+    # Thin wrappers over `UserFactsService` (one codebase with the lsb-0009-03
+    # REST mirrors): blocking calls — into `asyncio.to_thread`; outputs —
+    # whitelists; hint is propagated on a soft failure, BUT in a successful `user_save`
+    # it is permanent (FR-7.2) and not trimmed. The shape validation (the `name`/
+    # `body` limits) lives in the service — a violation gives the verbatim canon hint (§3.7)
+    # instead of a schema failure. NO init injections: no "user" section appears in the instructions
+    # (FR-6, arch §2) — the descriptions are the only guaranteed channel.
 
     if settings.area_user_facts_enabled:
         @mcp.tool(name="user_search", description=descriptions["user_search"])
@@ -3099,7 +3142,7 @@ def build_mcp(
             try:
                 result = await asyncio.to_thread(services.user_facts.search, query, top_k)
             except UserFactValidationError as exc:
-                # Мягкий отказ (fail + hint): запрос/top_k вне домена области.
+                # A soft failure (fail + hint): the query/top_k outside the area's domain.
                 log_tool_call(
                     "user_search",
                     started,
@@ -3108,8 +3151,8 @@ def build_mcp(
                     query=preview(query),
                 )
                 return {"results": [], "hint": str(exc)}
-            # Пустой результат — валидный исход пробы (hint канона в выдаче),
-            # не fail: событие несёт число хитов и признак FTS-only деградации.
+            # An empty result — a valid probe outcome (the canon hint in the output),
+            # not a fail: the event carries the hit count and the FTS-only degradation flag.
             log_tool_call(
                 "user_search",
                 started,
@@ -3131,9 +3174,9 @@ def build_mcp(
                 Field(description="Fact body: ≤1200 characters; one fact per record"),
             ],
         ) -> dict[str, Any]:
-            # Лимиты формы валидирует СЕРВИС (не схема — как title у заметок):
-            # нарушение → UserFactValidationError с дословным hint канона §3.7.
-            # Приватность (NFR-4): в лог идут длины, не содержимое.
+            # The shape limits are validated by the SERVICE (not the schema — like the notes' title):
+            # a violation → UserFactValidationError with the verbatim §3.7 canon hint.
+            # Privacy (NFR-4): lengths go into the log, not content.
             started = time.perf_counter()
             sizes = {"name_chars": len(name), "body_chars": len(body)}
             try:
@@ -3150,8 +3193,8 @@ def build_mcp(
                     "user_save", started, results=1, id=result["id"], **sizes
                 )
             else:
-                # Мягкий отказ дедупа (сильное совпадение): записи нет, hint ведёт
-                # к правке существующего факта либо к отдельной записи.
+                # A dedup soft failure (a strong match): no record; the hint leads
+                # to editing the existing fact or to a separate record.
                 log_tool_call(
                     "user_save", started, failed=True, reason=result["hint"], **sizes
                 )
@@ -3177,10 +3220,10 @@ def build_mcp(
                 ),
             ] = _UNSET_BODY,
         ) -> dict[str, Any]:
-            # Сентинелы «не передано» (прецедент lsb-0004/`memory_update`): дефолты
-            # параметров — JSON-серизуемые строки; схема показывает null, поэтому
-            # модель либо не передаёт поле, либо передаёт значение (null в
-            # обязательном поле — мягкий отказ сервиса).
+            # The "not passed" sentinels (the lsb-0004/`memory_update` precedent): the parameter
+            # defaults are JSON-serializable strings; the schema shows null, so
+            # the model either omits the field or passes a value (null in
+            # a mandatory field — a service soft failure).
             started = time.perf_counter()
             try:
                 result = await asyncio.to_thread(
@@ -3192,7 +3235,7 @@ def build_mcp(
                 )
                 return {"id": id, "changed": False, "hint": str(exc)}
             if "hint" in result:
-                # Не найден/удалён — мягкий отказ с hint канона §3.7.
+                # Not found/deleted — a soft failure with the §3.7 canon hint.
                 log_tool_call(
                     "user_update", started, failed=True, reason=result["hint"], id=id
                 )
@@ -3211,7 +3254,7 @@ def build_mcp(
             if result.get("deleted"):
                 log_tool_call("user_delete", started, id=id, deleted=True)
             else:
-                # Повторный/несуществующий id — мягкий отказ с hint канона §3.7.
+                # A repeated/nonexistent id — a soft failure with the §3.7 canon hint.
                 log_tool_call(
                     "user_delete", started, failed=True, reason=result["hint"], id=id
                 )
@@ -3224,7 +3267,7 @@ def build_mcp(
             started = time.perf_counter()
             result = await asyncio.to_thread(services.user_facts.get, id)
             if "hint" in result:
-                # Мягкий отказ: факта нет (мягко — возможно, удалён).
+                # A soft failure: no fact (softly — maybe deleted).
                 log_tool_call(
                     "user_get", started, failed=True, reason=result["hint"], id=id
                 )
@@ -3232,13 +3275,13 @@ def build_mcp(
                 log_tool_call("user_get", started, results=1, id=id)
             return _compact_user_get(result)
 
-    # --- область terms (lsb-0008-02, arch §3.4–3.5) -------------------------
-    # Тонкие обёртки над `TermsService` (один код с REST-зеркалами §3.6):
-    # блокирующие вызовы — в `asyncio.to_thread`, выдачи — белые списки,
-    # hint — только при мягком отказе. Листинга НЕТ (решение О.): поиск —
-    # единственный путь к определению; «все смыслы» и выбор смысла по
-    # контексту разговора живут в описаниях инструментов. Инъекции при init
-    # НЕТ: блока «terms» в инструкциях не появляется (arch §2).
+    # --- the terms area (lsb-0008-02, arch §3.4–3.5) --------------------------
+    # Thin wrappers over `TermsService` (one codebase with the §3.6 REST mirrors):
+    # blocking calls — into `asyncio.to_thread`; outputs — whitelists;
+    # hint — only on a soft failure. There is NO listing: the search is
+    # the only road to a definition; "all senses" and choosing a sense by
+    # the conversation context live in the tool descriptions. Init
+    # injections: NO — no "terms" section appears in the instructions (arch §2).
 
     if settings.area_terms_enabled:
         @mcp.tool(name="terms_search", description=descriptions["terms_search"])
@@ -3261,7 +3304,7 @@ def build_mcp(
             try:
                 result = await asyncio.to_thread(services.terms.search, query, top_k)
             except TermValidationError as exc:
-                # Мягкий отказ (fail + hint): запрос/top_k вне домена области.
+                # A soft failure (fail + hint): the query/top_k outside the area's domain.
                 log_tool_call(
                     "terms_search",
                     started,
@@ -3270,8 +3313,8 @@ def build_mcp(
                     query=preview(query),
                 )
                 return {"senses": [], "exact": False, "hint": str(exc)}
-            # Пустой результат — валидный исход пробы (hint канона в выдаче),
-            # не fail: событие несёт число смыслов и признак FTS-only деградации.
+            # An empty result — a valid probe outcome (the canon hint in the output),
+             #not a fail: the event carries the sense count and the FTS-only degradation flag.
             log_tool_call(
                 "terms_search",
                 started,
@@ -3300,9 +3343,9 @@ def build_mcp(
                 Field(description="Definition: ≤350 characters"),
             ],
         ) -> dict[str, Any]:
-            # Лимиты формы валидирует СЕРВИС (не схема — как title у заметок):
-            # нарушение → TermValidationError с дословным hint канона §3.7, запись
-            # при этом НЕ идёт. Приватность (NFR-4): в лог идут длины, не текст.
+            # The shape limits are validated by the SERVICE (not the schema — like the notes' title):
+            # a violation → TermValidationError with the verbatim §3.7 canon hint; NO
+            # record. Privacy (NFR-4): lengths go into the log, not the text.
             started = time.perf_counter()
             sizes = {
                 "term_chars": len(term),
@@ -3323,8 +3366,8 @@ def build_mcp(
                     "terms_save", started, results=1, id=result["id"], **sizes
                 )
             else:
-                # Мягкий отказ близкого контекста: записи нет, hint ведёт к
-                # существующему контексту (§3.5, «подсказка ДО записи»).
+                # A close-context soft failure: no record; the hint leads to
+                # the existing context (§3.5, "the hint BEFORE the write").
                 log_tool_call(
                     "terms_save", started, failed=True, reason=result["hint"], **sizes
                 )
@@ -3337,7 +3380,7 @@ def build_mcp(
             started = time.perf_counter()
             result = await asyncio.to_thread(services.terms.get, id)
             if "hint" in result:
-                # Мягкий отказ: записи нет (мягко — возможно, удалена).
+                # A soft failure: no record (softly — maybe deleted).
                 log_tool_call(
                     "terms_get", started, failed=True, reason=result["hint"], id=id
                 )
@@ -3345,16 +3388,16 @@ def build_mcp(
                 log_tool_call("terms_get", started, results=1, id=id)
             return _compact_term_get(result)
 
-    # --- область логов (LSBN-F-10, f10-02, arch §7.1) ----------------------
-    # Тонкие обёртки над `LogsService` (один код с REST-зеркалами — f10-03):
-    # блокирующие вызовы — в `asyncio.to_thread`, выдачи — белые списки, hint —
-    # только при мягком отказе, содержимое лога в журнал НЕ идёт (NFR-4: длины,
-    # id и признак отказа). Регистрация под флагом области: выключенная область
-    # не даёт агенту ни одной ручки (FR-4.1), но данные и REST оператора
-    # остаются (§13.11). `source`/`session` по умолчанию не передаются: их берёт
-    # миддлварь вызова (`bind_origin`) — модель источник не выдумывает. Поиск и
-    # листинг (`logs_search`/`logs_list`) — f10-03; раздел инструкции и
-    # `assistant_log` в словаре `history_*` — f10-04.
+    # --- the logs area (LSBN-F-10, f10-02, arch §7.1) -------------------------
+    # Thin wrappers over `LogsService` (one codebase with the REST mirrors — f10-03):
+    # blocking calls — into `asyncio.to_thread`; outputs — whitelists; hint —
+    # only on a soft failure; the log content does NOT go into the journal (NFR-4: lengths,
+    # ids and the failure flag). Registration under the area flag: a disabled area
+    # gives the agent no handle at all (FR-4.1), but the data and the operator's REST
+    # stay (§13.11). `source`/`session` are not passed by default: the call
+    # middleware (`bind_origin`) provides them — the model never invents the source. The search
+    # and listing (`logs_search`/`logs_list`) — f10-03; the instructions section and
+    # `assistant_log` in the `history_*` dictionary — f10-04.
 
     if settings.area_logs_enabled and services.logs is not None:
         @mcp.tool(name="logs_save", description=descriptions["logs_save"])
@@ -3431,9 +3474,9 @@ def build_mcp(
                 ),
             ] = None,
         ) -> dict[str, Any]:
-            # Лимиты формы валидирует СЕРВИС (не схема — как `terms_save`):
-            # нарушение → LogValidationError с дословным hint §7.3, записи НЕТ.
-            # NFR-4: в журнал идут длины и id, не содержимое.
+            # The shape limits are validated by the SERVICE (not the schema — like `terms_save`):
+            # a violation → LogValidationError with the verbatim §7.3 hint; NO record.
+            # NFR-4: lengths and ids go into the journal, not content.
             started = time.perf_counter()
             sizes = {"action_chars": len(action), "reason_chars": len(reason)}
             try:
@@ -3467,7 +3510,7 @@ def build_mcp(
             started = time.perf_counter()
             result = await asyncio.to_thread(services.logs.get, id)
             if "hint" in result:
-                # Мягкий отказ: записи нет (мягко — возможно, удалена).
+                # A soft failure: no record (softly — maybe deleted).
                 log_tool_call(
                     "logs_get", started, failed=True, reason=result["hint"], id=id
                 )
@@ -3561,8 +3604,8 @@ def build_mcp(
                 ),
             ] = None,
         ) -> dict[str, Any]:
-            # «Не передано = оставить»: None схемы → сентинел сервиса
-            # (`_log_field`). Лимиты и словари валидирует сервис (hint §7.3).
+            # "Not passed = keep": the schema's None → the service's sentinel
+            # (`_log_field`). The service validates the limits and dictionaries (the §7.3 hint).
             started = time.perf_counter()
             result = await asyncio.to_thread(
                 services.logs.update,
@@ -3581,7 +3624,7 @@ def build_mcp(
             if result.get("updated"):
                 log_tool_call("logs_update", started, results=1, id=id)
             else:
-                # Мягкий отказ: ничего не передано либо записи нет.
+                # A soft failure: nothing passed or no record.
                 log_tool_call(
                     "logs_update",
                     started,
@@ -3602,7 +3645,7 @@ def build_mcp(
             if result.get("deleted"):
                 log_tool_call("logs_delete", started, id=id, deleted=True)
             else:
-                # Повторный/несуществующий id — мягкий отказ с hint §7.3.
+                # A repeated/nonexistent id — a soft failure with a §7.3 hint.
                 log_tool_call(
                     "logs_delete",
                     started,
@@ -3612,11 +3655,11 @@ def build_mcp(
                 )
             return _compact_log_delete(result)
 
-        # f10-03 (arch §7.1/§8): вспоминание области — гибридный поиск со
-        # срезами и листинг. Потолок `top_k` — схемой (1..20, как у других
-        # ручек), а потолок `limit`/знак `offset` — СЕРВИСОМ (мягкий отказ
-        # hint'ом, а не схема-ошибка: предцедент `memory_list`). Срезы — те же,
-        # что у REST-зеркала: один код сервиса на обе поверхности (f10-03/REST).
+        # f10-03 (arch §7.1/§8): the area's recall — a hybrid search with
+        # slices, and the listing. The `top_k` ceiling — by the schema (1..20, like the other
+        # handles); the `limit` ceiling/`offset` sign — by the SERVICE (a soft failure
+        # with a hint, not a schema error: the `memory_list` precedent). The slices — the same
+        # as the REST mirror: one service codebase for both surfaces (f10-03/REST).
         _logs_excerpt = settings.logs_search_excerpt_chars
 
         @mcp.tool(name="logs_search", description=descriptions["logs_search"])
@@ -3704,8 +3747,8 @@ def build_mcp(
                     date_to=date_to,
                 )
             except LogValidationError as exc:
-                # Срез/лимит/дата нарушены — мягкий отказ (fail + hint), без
-                # схемы: форма проверяется сервисом.
+                # A slice/limit/date violated — a soft failure (fail + hint), without
+                # the schema: the service checks the shape.
                 log_tool_call("logs_search", started, failed=True, reason=str(exc))
                 return {"results": [], "hint": str(exc)}
             fts_only = result.get("warning") is not None
@@ -3784,13 +3827,13 @@ def build_mcp(
             ] = None,
             limit: Annotated[
                 int,
-                # Потолок (list_max_limit_mcp) проверяет СЕРВИС: сверх него —
-                # мягкий отказ hint'ом, а не schema-error (предцедент memory_list).
+                # The ceiling (list_max_limit_mcp) is checked by the SERVICE: beyond it —
+                # a soft failure with a hint, not a schema-error (the memory_list precedent).
                 Field(description="Page size (1..20)", ge=1),
             ] = settings.default_list_limit,
             offset: Annotated[
                 int,
-                # Знак offset тоже проверяет СЕРВИС (offset < 0 — мягкий отказ).
+                # The offset sign is also checked by the SERVICE (offset < 0 — a soft failure).
                 Field(description="Page offset"),
             ] = 0,
         ) -> dict[str, Any]:
@@ -3816,5 +3859,97 @@ def build_mcp(
                 "logs_list", started, results=len(result["items"])
             )
             return _compact_log_list(result, _logs_excerpt)
+
+        # f26-01 (LSBN-F-26, release 3.5.0): a period journal export as a file.
+        # The period bounds are checked by the SERVICE (a soft failure with a hint): at least
+        # one of date_from/date_to is mandatory — without a period a random call
+        # would spawn a file with the whole history. The other slices — the same as
+        # `logs_search`/`logs_list`. Read-only: a file + a short digest.
+        @mcp.tool(name="logs_export", description=descriptions["logs_export"])
+        async def logs_export(
+            entity: Annotated[
+                str | None,
+                Field(
+                    description="Slice by object of the change (see logs_search)",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            entity_id: Annotated[
+                int | None,
+                Field(
+                    description="Slice by id of the changed object",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            entity_version: Annotated[
+                int | None,
+                Field(
+                    description="Slice by version of the changed object "
+                    "(requires entity_id)",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            session: Annotated[
+                str | None,
+                Field(
+                    description="Slice by call/agent identifier",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            source: Annotated[
+                str | None,
+                Field(
+                    description="Slice by call channel: mcp | rest | merge "
+                    "| migration | job:<name>",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            date_from: Annotated[
+                str | None,
+                Field(
+                    description="Period start (YYYY-MM-DD, UTC, inclusive); "
+                    "at least one of date_from/date_to is required",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+            date_to: Annotated[
+                str | None,
+                Field(
+                    description="Period end (YYYY-MM-DD, UTC, inclusive); "
+                    "at least one of date_from/date_to is required",
+                    json_schema_extra={"default": None},
+                ),
+            ] = None,
+        ) -> dict[str, Any]:
+            started = time.perf_counter()
+            try:
+                result = await asyncio.to_thread(
+                    services.logs.export,
+                    entity=entity,
+                    entity_id=entity_id,
+                    entity_version=entity_version,
+                    session=session,
+                    source=source,
+                    date_from=date_from,
+                    date_to=date_to,
+                )
+            except LogValidationError as exc:
+                log_tool_call("logs_export", started, failed=True, reason=str(exc))
+                return {"hint": str(exc)}
+            log_tool_call(
+                "logs_export", started, results=result["records"]
+            )
+            return {
+                "file": result["file"],
+                "path": result["path"],
+                "records": result["records"],
+                "date_from": result["date_from"],
+                "date_to": result["date_to"],
+                "entity": result["entity"],
+                "entity_id": result["entity_id"],
+                "entity_version": result["entity_version"],
+                "session": result["session"],
+                "source": result["source"],
+            }
 
     return mcp

@@ -1,8 +1,9 @@
-"""Триггер домена в воркере (Фаза 10, Шаг 5): этап после классификации.
+"""The domain trigger in the worker (Phase 10, Step 5): the stage after classification.
 
-Классификация default-заметки докидывает hint-группу до порога — воркер
-прогоняет конвейер промоции: узел создаётся автоматом, группа перекладывается.
-Сбой триггера не ломает суммаризацию (этап обогащения, NFR-3).
+    Classifying a default note can push a hint group over the threshold — the
+    worker runs the promotion pipeline: the node is created automatically and the
+    group moves. A trigger failure does not break summarization (an enrichment
+    stage, NFR-3).
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ def _save_defaults(settings, count: int, text: str) -> list[int]:
 
 
 class ExplodingPromoter:
-    """Фейк-триггер: run() всегда бросает (непредвиденный сбой обогащения)."""
+    """A fake trigger: run() always raises (an unexpected enrichment failure)."""
 
     def run(self) -> dict:
         raise RuntimeError("boom")
@@ -72,11 +73,11 @@ def _worker(settings, classifier, promoter) -> BackgroundWorker:
 
 class TestWorkerPromotion:
     def test_classification_reaching_threshold_creates_leaf(self, settings) -> None:
-        """15 default-заметок с общим hint: после 15-й классификации — узел."""
+        """15 default notes with a shared hint: after the 15th classification — a node."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         _save_defaults(settings, THRESHOLD, "заметка про СУБО")
         # confidence 0.7 ≥ NAMESPACE_PROMOTION_MIN_CONFIDENCE (0.60):
-        # ниже порога триггер группу не видит.
+        # below the threshold the trigger does not see the group.
         classifier = FixedClassifier(Classification("work/subo", 0.7))
         worker = _worker(settings, classifier, "real")
         assert worker.process_summary_pending() == THRESHOLD
@@ -88,15 +89,15 @@ class TestWorkerPromotion:
                 "SELECT COUNT(*) FROM notes WHERE namespace = 'work/subo'"
             ).fetchone()[0]
         assert node is not None and node["status"] == "provisional"
-        assert moved == THRESHOLD  # ретро-перекладка всей группы
+        assert moved == THRESHOLD  # the whole group's retro-move
 
     def test_promotion_failure_keeps_summary_done(self, settings) -> None:
-        """Сбой триггера не роняет воркер: суммаризация уже выполнена."""
+        """A trigger failure does not crash the worker: the summarization is already done."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         _save_defaults(settings, 3, "обычная заметка")
         classifier = FixedClassifier(Classification("work", 0.9))
         worker = _worker(settings, classifier, ExplodingPromoter())
-        assert worker.process_summary_pending() == 3  # суммаризация прошла
+        assert worker.process_summary_pending() == 3  # the summarization done
         with session(settings) as conn:
             statuses = conn.execute(
                 "SELECT summary_status FROM notes WHERE namespace = 'default'"
@@ -104,7 +105,7 @@ class TestWorkerPromotion:
         assert all(row["summary_status"] == "ok" for row in statuses)
 
     def test_no_promoter_keeps_untriggered(self, settings) -> None:
-        """promoter=None (тестовый режим): классификация работает, узлов нет."""
+        """promoter=None (a test mode): classification works; no nodes."""
         NamespaceService(settings).create("work", "Рабочие заметки.")
         _save_defaults(settings, 2, "заметка без триггера")
         classifier = FixedClassifier(Classification("work/subo", 0.5))

@@ -1,11 +1,11 @@
-"""Миграция lsb-0010-02: таблица `links`, индекс и маркер `notes.links_at`.
+"""The lsb-0010-02 migration: the `links` table, the index and the `notes.links_at` marker.
 
-Апгрейд живой БД предыдущей версии (v3.0.0: колонки `links_at` нет, таблицы
-`links` нет) — схема создаётся при старте идемпотентно, данные не трогаются,
-у существующих заметок `links_at = NULL`: первый прогон джобы `links`
-естественно делает backfill (arch §3.4). Повторный `init_db` — no-op. Смена
-модели/размерности эмбеддинга (автореиндексация) дополнительно очищает связи
-и маркеры: вектора другой модели делают их невалидными.
+    Upgrading a live DB of the previous version (v3.0.0: no `links_at` column, no
+    `links` table) — the schema is created idempotently at startup, the data is
+    untouched; existing notes have `links_at = NULL`: the `links` job's first run
+    naturally does the backfill (arch §3.4). A repeated `init_db` — a no-op. An
+    embedding model/dimension change (auto-reindex) additionally clears the links
+    and markers: another model's vectors make them invalid.
 """
 
 from __future__ import annotations
@@ -54,13 +54,14 @@ def _links_at() -> dict[int, str | None]:
 
 
 def _downgrade_to_v300(settings: Settings) -> None:
-    """Привести свежую БД к состоянию v3.0.0: без таблицы `links` и маркера.
+    """Bring a fresh DB to the v3.0.0 state: without the `links` table and the marker.
 
-    Схема строится текущим `init_db` (все прочие таблицы, meta, FTS и вектора
-    — как у живой БД предыдущей версии с тем же окружением), после чего
-    снимаются ровно объекты этой постановки: таблица `links` и колонка
-    `notes.links_at` (SQLite 3.35+). Так апгрейд проверяется на живой БД,
-    а не на пустом файле.
+                The schema is built by the current `init_db` (all other tables, meta,
+                FTS and vectors — as in a live DB of the previous version with the
+                same environment), after which exactly this brief's objects are
+                removed: the `links` table and the `notes.links_at` column
+                (SQLite 3.35+). This way the upgrade is checked on a live DB, not on
+                an empty file.
     """
     with session(settings) as conn:
         conn.execute(
@@ -77,29 +78,29 @@ def _downgrade_to_v300(settings: Settings) -> None:
 
 @pytest.fixture
 def legacy(test_env: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> Settings:
-    """Живая БД предыдущей версии (v3.0.0) с двумя заметками."""
+    """A live DB of the previous version (v3.0.0) with two notes."""
     monkeypatch.setenv("EMBEDDING_DIM", "8")
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
     _downgrade_to_v300(settings)
-    # Предусловие: объектов этой постановки на «старой» БД ещё нет.
+    # The precondition: this brief's objects are not on the "old" DB yet.
     assert "links_at" not in _notes_columns()
     assert _links_ddl() is None
     return settings
 
 
 def test_upgrade_creates_schema_and_preserves_notes(legacy: Settings) -> None:
-    """init_db поверх v3.0.0: links + idx_links_b + links_at, данные целы."""
+    """init_db over v3.0.0: links + idx_links_b + links_at; the data intact."""
     init_db(get_settings())
 
     ddl = _links_ddl()
     assert ddl is not None
-    # Канонический порядок пары — первичный ключ, а не отдельная колонка.
+    # The pair's canonical order — the primary key, not a separate column.
     assert "PRIMARY KEY (note_a, note_b)" in " ".join(ddl.split())
     assert _has_index("idx_links_b")
     assert "links_at" in _notes_columns()
-    # Существующие заметки на месте, маркер пуст — backfill сделает джоба.
+    # Existing notes in place, the marker empty — the job will do the backfill.
     assert _links_at() == {1: None, 2: None}
     with session(get_settings()) as conn:
         assert [
@@ -112,7 +113,7 @@ def test_upgrade_creates_schema_and_preserves_notes(legacy: Settings) -> None:
 
 
 def test_migration_is_idempotent(legacy: Settings) -> None:
-    """Повторный init_db ничего не пересоздаёт и не затирает."""
+    """A repeated init_db recreates and overwrites nothing."""
     init_db(get_settings())
     with session(get_settings()) as conn:
         conn.execute(
@@ -123,7 +124,7 @@ def test_migration_is_idempotent(legacy: Settings) -> None:
             "UPDATE notes SET links_at = '2026-01-01T00:00:00Z' WHERE id = 1"
         )
 
-    init_db(get_settings())  # рестарт сервиса
+    init_db(get_settings())  # a service restart
 
     assert _links_rows() == [(1, 2, "cosine")]
     assert _links_at() == {1: "2026-01-01T00:00:00Z", 2: None}
@@ -134,7 +135,7 @@ def test_migration_is_idempotent(legacy: Settings) -> None:
 def test_model_change_clears_links_and_markers(
     legacy: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Смена размерности/модели (автореиндексация) чистит связи и маркеры."""
+    """A dimension/model change (auto-reindex) clears the links and markers."""
     init_db(get_settings())
     with session(get_settings()) as conn:
         conn.execute(
@@ -151,7 +152,7 @@ def test_model_change_clears_links_and_markers(
 
     assert _links_rows() == []
     assert _links_at() == {1: None, 2: None}
-    with session(get_settings()) as conn:  # вектора невалидны — все в очередь
+    with session(get_settings()) as conn:  # the vectors invalid — all into the queue
         statuses = [
             row[0]
             for row in conn.execute("SELECT vector_status FROM notes ORDER BY id")

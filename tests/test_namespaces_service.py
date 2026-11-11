@@ -1,5 +1,6 @@
-"""Тесты NamespaceService (Фаза 10, Шаг 1): валидация контрактов §5.7,
-CRUD реестра, счётчики узлов/поддеревьев."""
+"""NamespaceService tests (Phase 10, Step 1): the §5.7 contract validation,
+    registry CRUD, node/subtree counters.
+"""
 
 from __future__ import annotations
 
@@ -29,9 +30,9 @@ class TestSlug:
             ("work", "work"),
             ("Work", "work"),
             ("  work  ", "work"),
-            ("Work / SBOS 2020", "work-sbos-2020"),  # один слаг, не путь
+            ("Work / SBOS 2020", "work-sbos-2020"),  # one slug, not a path
             ("sbos2020", "sbos2020"),
-            ("подпроект-2024", "2024"),  # кириллица не транслитерируется
+            ("подпроект-2024", "2024"),  # Cyrillic is not transliterated
         ],
     )
     def test_normalize_slug(self, raw: str, expected: str) -> None:
@@ -56,7 +57,7 @@ class TestSlug:
     def test_validate_path_rejects_default_nesting(
         self, service: NamespaceService
     ) -> None:
-        """default — системный узел, без вложенности."""
+        """default — a system node, no nesting."""
         assert service.validate_path("default") == "default"
         with pytest.raises(NamespaceValidationError):
             service.validate_path("default/x")
@@ -81,7 +82,7 @@ class TestSlug:
 
 
 class TestDescriptionContract:
-    """Контракт описаний (решение О. 2026-09-03): ≤2 кратких предложений."""
+    """The descriptions contract: ≤2 brief sentences."""
 
     def test_one_and_two_sentences_are_valid(self, service: NamespaceService) -> None:
         assert service.validate_description("Рабочие заметки.") == "Рабочие заметки."
@@ -99,13 +100,13 @@ class TestDescriptionContract:
             service.validate_description("   ")
 
     def test_punctuation_only_is_invalid(self, service: NamespaceService) -> None:
-        """lsb-0005-08: «...»/«?!» — мусор без реальных предложений → отказ."""
+        """lsb-0005-08: "..."/"?!" — junk without real sentences → a refusal."""
         for garbage in ("...", "???", ".,..", "!!!", "?.!"):
             with pytest.raises(NamespaceValidationError):
                 service.validate_description(garbage)
 
     def test_single_clause_without_period_is_valid(self, service: NamespaceService) -> None:
-        """lsb-0005-08: осмысленное 1-предложение без точки — валидно."""
+        """lsb-0005-08: a meaningful single sentence without a period — valid."""
         assert service.validate_description("СУБО 2020") == "СУБО 2020"
 
 
@@ -142,8 +143,9 @@ class TestCreate:
     def test_provisional_create_uses_same_description_contract(
         self, service: NamespaceService
     ) -> None:
-        """lsb-0005-08: авто-путь судьи (create provisional) проходит ТУ ЖЕ
-        валидацию контракта описаний, что и путь модели (create confirmed)."""
+        """lsb-0005-08: the judge's automatic path (create provisional) passes THE SAME
+                    descriptions-contract validation as the model path (create confirmed).
+        """
         service.create("work", "Рабочие заметки.")
         with pytest.raises(NamespaceValidationError):
             service.create("work/bad1", "", status="provisional")
@@ -157,7 +159,7 @@ class TestCreate:
     def test_confirmed_create_rejects_punctuation_only(
         self, service: NamespaceService
     ) -> None:
-        """lsb-0005-08: мусорное описание отклоняется и в пути модели (confirmed)."""
+        """lsb-0005-08: a junk description is rejected on the model path (confirmed) too."""
         with pytest.raises(NamespaceValidationError):
             service.create("work", "....")
 
@@ -166,7 +168,7 @@ class TestCreate:
             service.create("work", "Рабочие заметки.", status="draft")
 
     def test_depth3_requires_full_parent_chain(self, service: NamespaceService) -> None:
-        """Создание глубины 3 без существующего родителя depth 2 — NamespaceError."""
+        """Creating depth 3 without an existing depth-2 parent — NamespaceError."""
         service.create("domain", "Домен.")
         with pytest.raises(NamespaceError):
             service.create("domain/a/b", "Лист без родителя depth 2.")
@@ -178,12 +180,12 @@ class TestCreate:
     def test_default_nesting_create_is_rejected(
         self, service: NamespaceService
     ) -> None:
-        """default/x — NamespaceValidationError на этапе валидации пути."""
+        """default/x — NamespaceValidationError at the path validation stage."""
         with pytest.raises(NamespaceValidationError):
             service.create("default/x", "Вложенность под default.")
 
     def test_long_depth3_path_within_max_len(self, service: NamespaceService) -> None:
-        """\u0414\u043b\u0438\u043d\u043d\u044b\u0439 3-\u0443\u0440\u043e\u0432\u043d\u0435\u0432\u044b\u0439 \u043f\u0443\u0442\u044c \u0432 \u043f\u0440\u0435\u0434\u0435\u043b\u0430\u0445 MAX_PATH_LEN."""
+        """A long 3-level path within MAX_PATH_LEN."""
         seg = "a" * 60  # \u0441\u043b\u0430\u0433 60 \u0441\u0438\u043c\u0432\u043e\u043b\u043e\u0432, \u0432\u043c\u0435\u0441\u0442\u0435 \u0441 2 \u0441\u043b\u0435\u0448\u0430\u043c\u0438 = 182 < 200
         path = f"{seg}/{seg}/{seg}"
         assert service.validate_path(path) == path
@@ -209,16 +211,16 @@ class TestListAndCounters:
                     "INSERT INTO notes (text, namespace) VALUES (?, ?)",
                     (text, namespace),
                 )
-            # trash: не считается ни notes_count, ни subtree_count
+            # trash: counted neither in notes_count nor in subtree_count
             conn.execute(
                 "UPDATE notes SET deleted_at = '2026-01-01T00:00:00Z' "
                 "WHERE text = 'trash-заметка'"
             )
         registry = {node["path"]: node for node in service.list_all()["namespaces"]}
         assert registry["work"]["notes_count"] == 2
-        assert registry["work"]["subtree_count"] == 4  # 2 своих + 2 листа
+        assert registry["work"]["subtree_count"] == 4  # 2 own + 2 leaves
         assert registry["work/sbos2020"]["notes_count"] == 2
-        assert registry["work/sbos2020"]["subtree_count"] == 2  # лист: только себя
+        assert registry["work/sbos2020"]["subtree_count"] == 2  # a leaf: itself only
         assert registry["projects"]["subtree_count"] == 1
         assert registry["default"]["notes_count"] == 0
 
@@ -252,17 +254,17 @@ class TestMutations:
     def test_rename_race_maps_pk_conflict_to_namespace_error(
         self, service: NamespaceService, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Гонка: цель жива в БД, но проверки видят её как свободную (§5.9 → 409)."""
+        """A race: the target is alive in the DB, but the checks see it as free (§5.9 → 409)."""
         service.create("work", "Рабочие заметки.")
         service.create("projects", "Личные проекты.")
         real_exists = service.exists
 
         def fake_exists(path: str) -> bool:
             if path == "projects":
-                return False  # устаревший read: цель «ещё не зарегистрирована»
+                return False  # a stale read: the target "not registered yet"
             return real_exists(path)
 
         monkeypatch.setattr(service, "exists", fake_exists)
-        # PK-конфликт внутри транзакции → NamespaceError, не голый IntegrityError.
+        # a PK conflict inside the transaction → NamespaceError, not a bare IntegrityError.
         with pytest.raises(NamespaceError):
             service.rename("work", "projects")

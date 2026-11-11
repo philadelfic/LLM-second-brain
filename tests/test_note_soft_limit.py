@@ -1,19 +1,21 @@
-"""Мягкий лимит текста заметки — из конфига (LSBN-S-1; 3.4.1, LSBN-T-26).
+"""The note text's soft limit — from the config (LSBN-S-1; 3.4.1, LSBN-T-26).
 
-Решение О. 28.10.2026: лимит перестаёт быть константой кода
-(`NOTE_TEXT_LIMIT` убрана) и живёт в Settings.max_note_chars
-(env MAX_NOTE_CHARS, дефолт 2000, диапазон 500..20000). Одно число кормит
-валидацию записи/правки, части merge/split, хинты, описания ручек,
-инструкции и промпты — и одновременно CHECK новых баз + цель самомиграции
-F-22 (env = живой CHECK активной базы держат сверка и самомиграция).
+    The decision: the limit stops being a code constant (`NOTE_TEXT_LIMIT`
+    removed) and lives in Settings.max_note_chars
+    (env MAX_NOTE_CHARS, default 2000, range 500..20000). One number feeds the
+    save/edit validation, the merge/split parts, the hints, the handle
+    descriptions, the instructions and the prompts — and at the same time the
+    CHECK of new databases + the F-22 self-migration target (env = the active
+    database's live CHECK, held by the reconciliation and the self-migration).
 
-Граница берётся ИЗ КОНФИГА (не литерал): значение — сохраняется,
-значение+1 — мягкий отказ с хинтом (лимит + фактическая длина + правило
-разбиения). Смена env меняет ОДНОВРЕМЕННО валидацию, тексты (инструкции,
-описания ручек, промпты), /health.note_chars_limit и цель миграции —
-тест `TestEnvChangePropagates`. Сиды промптов: нетронутые перезаписываются
-под новый канон, правленые оператором не трогаются
-(tests/test_prompts_registry.py::TestSeedValueRewrite).
+    The boundary is taken FROM THE CONFIG (not a literal): the value — saved;
+    the value+1 — a soft failure with a hint (the limit + the actual length + the
+    splitting rule). An env change simultaneously changes the validation, the
+    texts (the instructions, the handle descriptions, the prompts),
+    /health.note_chars_limit and the migration target — the
+    `TestEnvChangePropagates` test. The prompt seeds: untouched ones are
+    rewritten to the new canon; operator-edited ones are not touched
+    (tests/test_prompts_registry.py::TestSeedValueRewrite).
 """
 
 from __future__ import annotations
@@ -32,14 +34,14 @@ from app.storage.db import init_db, session
 from app.storage.migration import startup_plan
 from app.transport.mcp import server_instructions, tool_descriptions
 
-# Значения env для тестов конфиг-лимита: не литералы действующего лимита,
-# а произвольные точки диапазона — граница всегда читается из Settings.
+# The env values for the config-limit tests: not the active limit's literals
+# but arbitrary points of the range — the boundary is always read from Settings.
 LIMIT_A = "1700"
 LIMIT_B = "2300"
 
 
 def _note_service() -> NoteService:
-    """NoteService над текущими настройками с детерминированным кодировщиком."""
+    """A NoteService over the current settings with a deterministic encoder."""
     settings = get_settings()
     init_db(settings)
     return NoteService(settings, HashEmbedder(settings.embedding_dim))
@@ -59,7 +61,7 @@ def _text_of(note_id: int) -> str:
 
 
 class TestSaveBoundary:
-    """Граница мягкого лимита при сохранении — значение из конфига."""
+    """The soft limit's boundary at save — the value from the config."""
 
     def test_save_at_limit_is_stored(self, service: NoteService) -> None:
         limit = get_settings().max_note_chars
@@ -87,7 +89,7 @@ class TestSaveBoundary:
 
 
 class TestUpdateBoundary:
-    """Граница мягкого лимита при правке."""
+    """The soft limit's boundary at edit."""
 
     def test_update_over_limit_rejected_text_kept(
         self, service: NoteService
@@ -108,7 +110,7 @@ class TestUpdateBoundary:
 
 
 class TestEnvDrivesLimitAndSchema:
-    """env задаёт и валидацию, и CHECK новой базы — одно число (LSBN-T-26)."""
+    """env sets both the validation and the new database's CHECK — one number (LSBN-T-26)."""
 
     @pytest.mark.parametrize("env_limit", [LIMIT_A, LIMIT_B])
     def test_env_value_becomes_working_limit(
@@ -120,7 +122,7 @@ class TestEnvDrivesLimitAndSchema:
         try:
             settings = get_settings()
             assert settings.max_note_chars == int(env_limit)
-            init_db(settings)  # CHECK новой базы — то же число
+            init_db(settings)  # the new database's CHECK — the same number
             svc = _note_service()
             assert svc.save("е" * int(env_limit), title="Граница")["stored"] is True
             with pytest.raises(NoteValidationError):
@@ -130,12 +132,13 @@ class TestEnvDrivesLimitAndSchema:
 
 
 class TestEnvChangePropagates:
-    """Смена env меняет ОДНОВРЕМЕННО валидацию, тексты, /health и цель
-    миграции (LSBN-T-26, приёмка): одно число — везде новое."""
+    """An env change simultaneously changes the validation, the texts, /health and the
+            migration target (LSBN-T-26, acceptance): one number — new everywhere.
+    """
 
     @staticmethod
     def _snapshot(monkeypatch: pytest.MonkeyPatch, tmp_path, env_limit: str) -> dict:
-        """Собрать сервис и все тексты при заданном env; вернуть наблюдения."""
+        """Assemble the service and all texts at a given env; return the observations."""
         monkeypatch.setenv("DB_PATH", str(tmp_path / f"notes-{env_limit}.db"))
         monkeypatch.setenv("MAX_NOTE_CHARS", env_limit)
         get_settings.cache_clear()
@@ -168,13 +171,13 @@ class TestEnvChangePropagates:
         second = self._snapshot(monkeypatch, tmp_path, LIMIT_B)
         assert first["limit"] == int(LIMIT_A)
         assert second["limit"] == int(LIMIT_B)
-        # Валидация: граница каждого снимка — своё значение, хинт называет его.
+        # Validation: each snapshot's boundary is its own value; the hint names it.
         assert first["validation"]["stored"]["stored"] is True
         assert f"{second['limit']}-character note limit" in second["validation"]["hint"]
         assert f"{first['limit']}-character note limit" not in second["validation"][
             "hint"
         ]
-        # Тексты: инструкции, описания ручек и промпт несут НОВОЕ число.
+        # The texts: the instructions, the handle descriptions and the prompt carry the NEW number.
         for text in (
             second["instructions"],
             second["descriptions"]["memory_save"],
@@ -183,14 +186,14 @@ class TestEnvChangePropagates:
         ):
             assert str(second["limit"]) in text
             assert str(first["limit"]) not in text
-        # Цель миграции = то же env-значение (перелив/нарезка под него).
+        # The migration target = the same env value (the pour/split aims at it).
         assert first["migration_target"] == int(LIMIT_A)
         assert second["migration_target"] == int(LIMIT_B)
 
     def test_health_shows_env_value(
         self, tmp_path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Число в /health — из env (проверка на живом приложении)."""
+        """The number in /health — from env (checked on the live application)."""
         from fastapi.testclient import TestClient
 
         from app.main import create_app
@@ -209,7 +212,7 @@ class TestEnvChangePropagates:
 
 
 class TestVisibility:
-    """Лимит из настроек виден в текстах ручек/инструкций."""
+    """The settings' limit is visible in the handle/instruction texts."""
 
     def test_limit_named_in_tool_descriptions(self) -> None:
         limit = get_settings().max_note_chars
@@ -226,9 +229,10 @@ class TestVisibility:
         assert "several self-contained notes" in instructions
 
     def test_merge_truncation_marker_gone(self) -> None:
-        """F-23 заменил временный маркер усечения S-1 списком частей:
-        усечённого слияния больше не существует — неполное слияние не
-        сохраняется вовсе (дозапрос → откладывание пары, пп. 2/6 F-23)."""
+        """F-23 replaced S-1's temporary truncation marker with a list of parts:
+                    a truncated merge no longer exists — an incomplete merge is not saved
+                    at all (a follow-up call → deferring the pair, F-23 pp. 2/6).
+        """
         import app.services.summary as summary_module
 
         assert not hasattr(summary_module, "MERGE_TRUNCATION_MARKER")

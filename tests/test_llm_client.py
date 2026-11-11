@@ -27,8 +27,11 @@ from app.services.llm_client import (
     LLMClient,
     LLMError,
     LLMAuthError,
+    LLMReasoningBudgetError,
     SlotSpec,
 )
+from app.services.slot_outcome import SlotOutcome, classify_llm_error
+from app.services.splitter import count_tokens
 
 SYSTEM = "Системный промпт теста."
 USER = "Пользовательский текст теста."
@@ -437,8 +440,11 @@ class TestChatParsing:
         )
         assert client.chat(SYSTEM, USER, num_predict=10) == "Итоговый ответ"
 
-    def test_openai_content_none_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Ответ из одних рассуждений (content: null) — отказ (§5.5)."""
+    def test_openai_content_none_with_reasoning_is_budget_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ответ из одних рассуждений (content: null) — «съедено рассуждением»
+        (LSBN-T-33): отдельный тип, не общий пустой ответ."""
         settings = make_settings(monkeypatch, SUMMARY_PROVIDER="openai")
         body = {
             "choices": [
@@ -455,29 +461,55 @@ class TestChatParsing:
         client, _ = make_client(
             SlotSpec.for_summary(settings), [httpx.Response(200, json=body)]
         )
-        with pytest.raises(LLMError, match="пустой content"):
+        with pytest.raises(LLMReasoningBudgetError, match="съеден рассуждением"):
             client.chat(SYSTEM, USER, num_predict=10)
 
     @pytest.mark.parametrize("content", ["", "   "])
-    def test_empty_content_rejected(self, monkeypatch: pytest.MonkeyPatch, content: str) -> None:
-        """Пустой/пробельный content — отказ вызова (§5.5)."""
+    def test_empty_content_with_thinking_is_budget_error(
+        self, monkeypatch: pytest.MonkeyPatch, content: str
+    ) -> None:
+        """Пустой content при непустом thinking — LLMReasoningBudgetError
+        (LSBN-T-33, lsbdef-0008): рассуждение съело бюджет вывода."""
         settings = make_settings(monkeypatch)
         client, _ = make_client(
             SlotSpec.for_summary(settings), [ollama_chat_ok(content)]
         )
-        with pytest.raises(LLMError, match="пустой content"):
+        with pytest.raises(LLMReasoningBudgetError, match="съеден рассуждением"):
             client.chat(SYSTEM, USER, num_predict=10)
 
-    def test_empty_flag_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Пустой content помечен empty (№39 §6.3): «пусто» ≠ «недоступность»."""
+    def test_empty_content_without_thinking_is_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Пустой content БЕЗ рассуждения — прежний отказ empty (№39 §6.3):
+        «пусто» ≠ «недоступность», тип не смешивается с budget-error."""
         settings = make_settings(monkeypatch)
+        body = {
+            "model": "test-model",
+            "message": {"role": "assistant", "content": "   "},
+            "done": True,
+        }
         client, _ = make_client(
-            SlotSpec.for_summary(settings), [ollama_chat_ok("   ")]
+            SlotSpec.for_summary(settings), [httpx.Response(200, json=body)]
         )
         with pytest.raises(LLMError, match="пустой content") as exc_info:
             client.chat(SYSTEM, USER, num_predict=10)
         assert exc_info.value.empty is True
         assert exc_info.value.transient is False
+        assert not isinstance(exc_info.value, LLMReasoningBudgetError)
+
+    def test_budget_error_flags(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """LLMReasoningBudgetError: truncated=True, empty=False, transient=False
+        → исход TRUNCATED (задание ждёт внимания, не back-off)."""
+        settings = make_settings(monkeypatch)
+        client, _ = make_client(
+            SlotSpec.for_summary(settings), [ollama_chat_ok("   ")]
+        )
+        with pytest.raises(LLMReasoningBudgetError) as exc_info:
+            client.chat(SYSTEM, USER, num_predict=10)
+        assert exc_info.value.truncated is True
+        assert exc_info.value.empty is False
+        assert exc_info.value.transient is False
+        assert classify_llm_error(exc_info.value) is SlotOutcome.TRUNCATED
 
     def test_content_stripped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         settings = make_settings(monkeypatch)
@@ -501,6 +533,139 @@ class TestChatParsing:
         )
         with pytest.raises(LLMError, match="не-JSON"):
             client.chat(SYSTEM, USER, num_predict=10)
+
+
+# --- раздельные бюджеты ответа/рассуждения (LSBN-T-33) -------------------------
+
+
+def ollama_chat_thinking_empty() -> httpx.Response:
+    """Ответ «flint-класса»: done_reason=length, thinking непуст, content пуст."""
+    return httpx.Response(
+        200,
+        json={
+            "model": "test-model",
+            "message": {"role": "assistant", "content": "", "thinking": "x" * 500},
+            "done": True,
+            "done_reason": "length",
+        },
+    )
+
+
+class TestSplitBudgets:
+    """Бюджет ответа не делится с рассуждением: sent = answer + reasoning
+    (окно контекста), пустой content при thinking — один авто-ретрай ×2."""
+
+    def test_sent_covers_answer_plus_reasoning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Явный ответ 12000 при контексте 32768: в num_predict уходит всё окно
+        (ответ + резерв рассуждения), а не только ответ."""
+        settings = make_settings(
+            monkeypatch,
+            SUMMARY_CONTEXT_TOKENS="32768",
+            SUMMARY_THINK="true",
+            SUMMARY_NUM_PREDICT="12000",
+        )
+        client, recorder = make_client(
+            SlotSpec.for_summary(settings), [ollama_chat_ok()]
+        )
+        result = client.chat_result(SYSTEM, USER)
+        prompt = count_tokens(SYSTEM) + count_tokens(USER)
+        window = 32768 - prompt - 512
+        assert last_payload(recorder)["num_predict"] == window
+        meta = result.meta
+        assert meta.answer_budget == 12000
+        assert meta.reasoning_budget == window - 12000
+        assert meta.sent_budget == window
+        assert meta.budget == meta.sent_budget
+        assert meta.answer_source == "explicit"
+        assert meta.reasoning_source == "context"
+
+    def test_think_false_sends_answer_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """think=false: рассуждение не резервируется, sent = ответ."""
+        settings = make_settings(
+            monkeypatch,
+            SUMMARY_CONTEXT_TOKENS="32768",
+            SUMMARY_THINK="false",
+            SUMMARY_NUM_PREDICT="12000",
+        )
+        client, recorder = make_client(
+            SlotSpec.for_summary(settings), [ollama_chat_ok()]
+        )
+        client.chat_result(SYSTEM, USER)
+        assert last_payload(recorder)["num_predict"] == 12000
+
+    def test_unknown_context_degrades(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Контекст неизвестен: деградация — sent = ответ, reasoning = 0."""
+        settings = make_settings(
+            monkeypatch, SUMMARY_THINK="true", SUMMARY_NUM_PREDICT="12000"
+        )
+        client, recorder = make_client(
+            SlotSpec.for_summary(settings), [ollama_chat_ok()]
+        )
+        result = client.chat_result(SYSTEM, USER)
+        assert last_payload(recorder)["num_predict"] == 12000
+        assert result.meta.reasoning_budget == 0
+        assert result.meta.reasoning_source == "legacy"
+
+    def test_escalation_retries_with_doubled_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Первый вызов: content пуст, thinking был → авто-ретрай с удвоенным
+        sent (до окна); в meta — escalated_from и бюджеты ВТОРОГО вызова."""
+        settings = make_settings(
+            monkeypatch,
+            SUMMARY_CONTEXT_TOKENS="32768",
+            SUMMARY_THINK="true",
+            SUMMARY_NUM_PREDICT="12000",
+            SLOT_REASONING_NUM_PREDICT="4000",
+        )
+        client, recorder = make_client(
+            SlotSpec.for_summary(settings),
+            [ollama_chat_thinking_empty(), ollama_chat_ok("спасённый ответ")],
+        )
+        result = client.chat_result(SYSTEM, USER)
+        assert result.content == "спасённый ответ"
+        assert recorder.calls == 2
+        assert last_payload(recorder)["num_predict"] == 16000  # первый вызов: 12000+4000
+        second_payload = json.loads(recorder.requests[1].read().decode())
+        # Ретрай: ×2 = 32000 (потолок окна не достигнут — окно ещё шире).
+        assert second_payload["num_predict"] == 32000
+        assert result.meta.escalated_from == 16000
+        assert result.meta.sent_budget == 32000
+
+    def test_escalation_exhausted_raises_budget_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Окно исчерпано первым вызовом (sent = окно, рассуждение не
+        резервировалось) — ретрая нет, отказ LLMReasoningBudgetError уходит
+        наверх (задание ждёт внимания, не back-off)."""
+        settings = make_settings(
+            monkeypatch,
+            SUMMARY_CONTEXT_TOKENS="32768",
+            SUMMARY_THINK="true",
+        )
+        client, recorder = make_client(
+            SlotSpec.for_summary(settings), [ollama_chat_thinking_empty()]
+        )
+        with pytest.raises(LLMReasoningBudgetError, match="съеден рассуждением"):
+            client.chat_result(SYSTEM, USER)
+        assert recorder.calls == 1
+
+    def test_no_escalation_without_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Контекст неизвестен: деградация (reasoning=0) — ретрая нет, одна
+        попытка, отказ «съедено рассуждением»."""
+        settings = make_settings(monkeypatch, SUMMARY_THINK="true")
+        client, recorder = make_client(
+            SlotSpec.for_summary(settings), [ollama_chat_thinking_empty()]
+        )
+        with pytest.raises(LLMReasoningBudgetError, match="съеден рассуждением"):
+            client.chat_result(SYSTEM, USER)
+        assert recorder.calls == 1
 
 
 # --- embed: payload-контракты + разбор ответа ---------------------------------

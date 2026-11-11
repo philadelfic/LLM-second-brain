@@ -1,8 +1,8 @@
-"""Исходы выноса переживают рестарт (№14, 3.2.0, arch §5.1/§6.1).
+"""Ship outcomes survive a restart (#14, 3.2.0, arch §5.1/§6.1).
 
-Сайдкар-индекс `backups-index.json` — единственное хранилище исходов выноса:
-новый экземпляр сервиса читает `last_ship` с диска, а представление
-`GET /backups` (`list_snapshots`) помечает подтверждённую копию `shipped`.
+    The `backups-index.json` sidecar index is the only store of ship outcomes: a
+    new service instance reads `last_ship` from disk, and the `GET /backups` view
+    (`list_snapshots`) marks a confirmed copy `shipped`.
 """
 
 from __future__ import annotations
@@ -30,14 +30,14 @@ def _new_dir(tmp_path: Path) -> Path:
 
 
 def test_last_ship_persisted(tmp_path: Path) -> None:
-    """`last_ship` переживает новый экземпляр сервиса (сайдкар-индекс)."""
+    """`last_ship` survives a new service instance (the sidecar index)."""
     backup_dir = _new_dir(tmp_path)
     first = _service(backup_dir, backup_ship_cmd=SIZE_REPORT_CMD)
     target = first.snapshot()
     assert first.ship(target)["ok"] is True
     assert (backup_dir / STATE_FILE_NAME).is_file()
 
-    # Новый экземпляр поверх того же каталога: исход выноса читается с диска.
+    # A new instance over the same directory: the ship outcome is read from disk.
     second = _service(backup_dir, backup_ship_cmd=SIZE_REPORT_CMD)
     last_ship = second.status()["last_ship"]
     assert last_ship["file"] == target.name
@@ -47,12 +47,12 @@ def test_last_ship_persisted(tmp_path: Path) -> None:
 
     items = {item["file"]: item for item in second.list_snapshots()}
     assert items[target.name]["shipped"] is True
-    # Вынос отметку проверки не пишет: снапшот никто не проверял — unknown.
+    # Shipping writes no verify mark: nobody verified the snapshot — unknown.
     assert items[target.name]["verified"] == "unknown"
 
 
 def test_last_ship_failure_persisted(tmp_path: Path) -> None:
-    """Отказ выноса тоже переживает рестарт (`result=failed` и `reason`)."""
+    """A ship failure survives a restart too (`result=failed` and the `reason`)."""
     backup_dir = _new_dir(tmp_path)
     first = _service(backup_dir, backup_ship_cmd="exit 1")
     target = first.snapshot()

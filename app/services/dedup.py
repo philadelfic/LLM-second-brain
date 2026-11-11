@@ -1,31 +1,32 @@
-"""DeduplicationService (ARCHITECTURE §3.2, REQUIREMENTS FR-4; Фаза 8, Этап 2).
+"""DeduplicationService (ARCHITECTURE §3.2, REQUIREMENTS FR-4; Phase 8, step 2).
 
-Дедуп разложен на два пути:
+    Dedup is split into two paths:
 
-- **Синхронный, при записи (save/update)** — только дословный дубль по тексту
-  (`find_by_text`): точное совпадение (SQL) и «почти точное» по
-  нормализованному тексту (регистр/пробелы) через FTS5-слова. Мгновенно, без
-  Ollama; перефразы не ловит — с Фазы 8 (Этап 1) это штатно: вектор в момент
-  записи не строится, косинус-сравнение невозможно на синхронном пути.
-- **Фоновый, после довекторизации (Этапы 2–3)**: воркер ищет топ-N
-  косинус-кандидатов (`find_candidates`, нижний порог
-  DEDUP_CANDIDATE_SIMILARITY ~0.80 — специально шире «дубль»-порога, чтобы
-  ловить перефразы 0.80–0.85). Приговор «дубль» принимает LLM-судья
-  (Этап 3.2, JudgeService — модель DEDUP_JUDGE_MODEL `ornith-1.5:35b`,
-  think:false): каждый кандидат опрашивается по паре текстов, косинус —
-  лишь предфильтр; без судьи (DI None, тестовый режим) воркер сводит по
-  косинусу ≥ DEDUP_SIMILARITY (фоллбек Этапа 2.2).
+    - **Synchronous, at write time (save/update)** - only a verbatim text
+      duplicate (`find_by_text`): an exact match (SQL) and an "almost exact" one
+      over the normalized text (case/whitespace) through FTS5 words. Instant, no
+      Ollama; it does not catch paraphrases - since Phase 8 (step 1) that is by
+      design: the vector is not built at write time, so a cosine comparison is
+      impossible on the synchronous path.
+    - **Background, after re-vectorization (steps 2-3)**: the worker looks up the
+      top-N cosine candidates (`find_candidates`, the lower threshold
+      DEDUP_CANDIDATE_SIMILARITY ~0.80 - deliberately wider than the "duplicate"
+      threshold to catch the 0.80-0.85 paraphrases). The "duplicate" verdict
+      belongs to the LLM judge (step 3.2, JudgeService - the DEDUP_JUDGE_MODEL
+      model, think:false): every candidate is asked over the pair of texts; the
+      cosine is only a pre-filter; without a judge (DI None, the test mode) the
+      worker merges by cosine >= DEDUP_SIMILARITY (the step 2.2 fallback).
 
-Trash (soft delete) не участвует ни в одном пути: удалённая заметка — не
-кандидат в дубликаты (undo оператора вернёт её как отдельную заметку,
-REQUIREMENTS FR-6); вектора trash живы (ARCH §3.3), дедуп читает только
-активные.
+    Trash (a soft delete) takes part in neither path: a deleted note is not a
+    duplicate candidate (the operator's undo returns it as a separate note,
+    REQUIREMENTS FR-6); trash vectors are alive (ARCH §3.3) - dedup reads only
+    the active ones.
 
-Заметка с таймером (TTL, `expires_at IS NOT NULL`, no46-03, 3.2.0) — тоже не
-кандидат на слияние ни в одном пути: такую заметку нельзя сшить с другой
-(правило О. 2026-10-10). Отбор исключает её SQL-стороной (и KNN-ветка, и
-текстовый фоллбек), без пост-фильтра на Python; связи (`links`) при этом
-разрешены — TTL-заметка может быть связана с другими.
+    A note with a timer (a TTL, `expires_at IS NOT NULL`, no46-03, 3.2.0) is also
+    never a merge candidate in either path: such a note must not be merged with
+    another (the owner's rule). The selection excludes it on the SQL side (both
+    the KNN branch and the text fallback), with no Python post-filter; the
+    `links` are allowed - a TTL note may be linked to others.
 """
 
 from __future__ import annotations
@@ -36,18 +37,18 @@ from app.config import Settings
 from app.storage import vectors
 from app.storage.db import session
 
-# Подсказка-обучение (§5.3) — общий канал двух путей дедупа.
+# The teaching hint (§5.3) - the shared channel of the two dedup paths.
 DEDUP_HINT = (
     "a nearly identical note already exists; to refine it — call memory_update "
     "(run memory_get first so you don't lose details)"
 )
 
-# Кандидатов из FTS-фоллбека, среди которых ищем нормализованный дубль.
+# The FTS-fallback candidates among which we look for a normalized duplicate.
 FALLBACK_SCAN = 20
 
 
 def duplicate_response(row: sqlite3.Row) -> dict[str, object]:
-    """Контракт дедупа (FR-4): существующую заметку возвращаем целиком."""
+    """The dedup contract (FR-4): the existing note is returned whole."""
     return {
         "duplicated": True,
         "id": row["id"],
@@ -57,17 +58,17 @@ def duplicate_response(row: sqlite3.Row) -> dict[str, object]:
 
 
 def normalize_text(text: str) -> str:
-    """Нормализация «дословного» сравнения: регистр и пробельные колебания."""
+    """The normalization of the "verbatim" comparison: case and whitespace wobble."""
     return " ".join(text.split()).casefold()
 
 
 class DeduplicationService:
-    """Дословный дедуп по тексту + топ-N косинус-кандидатов (предфильтр Этапа 2)."""
+    """The verbatim text dedup + the top-N cosine candidates (the step 2 pre-filter)."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    # --- фоновый дедуп: кандидаты (Фаза 8, Этап 2.1) -------------------------
+    #--- background dedup: the candidates (Phase 8, step 2.1) -------------------------
 
     def find_candidates(
         self,
@@ -75,29 +76,33 @@ class DeduplicationService:
         exclude_id: int | None = None,
         namespace: str | None = None,
     ) -> list[tuple[int, float]]:
-        """Топ-N активных кандидатов по косинусу (кандидат-предфильтр Этапа 2).
+        """The top-N active candidates by cosine (the step 2 candidate pre-filter).
 
-        Нижний порог DEDUP_CANDIDATE_SIMILARITY (~0.80) нарочно шире
-        фоллбек-порога DEDUP_SIMILARITY: кандидат — «возможно, перефраз»
-        (типичные перефразы 0.80–0.85, которых порог 0.92 не видит).
-        Финальное решение — за судьёй (Этап 3.2): воркер опрашивает
-        JudgeService по каждому кандидату (think:false), сводит первый
-        «ДУБЛЬ» (_merge_duplicates: merge суммаризатором, ранний
-        обновляется, поздний — trash); без судьи (DI None, тестовый
-        режим) — косинус-фоллбек Этапа 2.2 по DEDUP_SIMILARITY.
+                    The lower threshold DEDUP_CANDIDATE_SIMILARITY (~0.80) is deliberately
+                    wider than the fallback threshold DEDUP_SIMILARITY: a candidate is a
+                    "possible paraphrase" (the typical 0.80-0.85 paraphrases the 0.92
+                    threshold never sees). The final word belongs to the judge (step 3.2):
+                    the worker asks JudgeService per candidate (think:false) and merges
+                    the first "DUPLICATE" (_merge_duplicates: merge by the summarizer,
+                    the earlier one is updated, the later one - trash); without a judge
+                    (DI None, the test mode) - the step 2.2 cosine fallback over
+                    DEDUP_SIMILARITY.
 
-        exclude_id — свежевекторизованная заметка: её вектор уже в notes_vec
-        и без исключения занял бы слот топ-N с cosine 1.0. Trash не кандидат:
-        окно KNN расширяется на число trash-векторов, пост-фильтр оставляет
-        только активные (как в SearchService — vec0 не знает о notes).
-        Заметка с TTL (`expires_at IS NOT NULL`, no46-03) — тоже не кандидат
-        на слияние: исключается в SQL (условие к `deleted_at IS NULL`); её
-        вектор так же занимает слот окна KNN — расширяем и на него.
-        Фаза 10 (§5.7): `namespace` — дедуп в пределах неймспейса (KNN
-        сканирует партицию узла); None — глобально (legacy-совместимость).
-        Меж-неймспейсовый близкий контент — не дубль: заметки в разных
-        узлах легитимны (хинт ориентирования — Шаг 5).
-        Возврат — [(note_id, cosine)] по убыванию близости, не более топ-N.
+                    exclude_id - the freshly vectorized note: its vector is already in
+                    notes_vec and would take a top-N slot with cosine 1.0 without the
+                    exclusion. Trash is not a candidate: the KNN window widens by the
+                    trash-vector count, and the post-filter keeps only active ones (as in
+                    SearchService - vec0 knows nothing of notes). A note with a TTL
+                    (`expires_at IS NOT NULL`, no46-03) is also never a merge candidate:
+                    excluded in SQL (a condition next to `deleted_at IS NULL`); its vector
+                    takes a KNN window slot too - we widen for it as well.
+                    Phase 10 (§5.7): `namespace` - dedup within a namespace (the KNN scans
+                    the node's partition); None - global (legacy compatibility).
+                    Cross-namespace close content is not a duplicate: notes in different
+                    nodes are legitimate (the orienting hint - Step 5).
+                    The return - [(note_id, cosine)] by descending closeness, at most the
+                    top-N.
+
         """
         top_n = self._settings.dedup_candidate_top_n
         threshold = self._settings.dedup_candidate_similarity
@@ -108,9 +113,9 @@ class DeduplicationService:
             else:
                 ns_clause = ""
                 ns_params = []
-            # Не-кандидаты (trash и заметки с TTL, no46-03) свои вектора в
-            # notes_vec всё равно держат — окно KNN расширяем на их число,
-            # иначе такой сосед вытеснил бы активного кандидата из топ-N.
+            # Non-candidates (trash and TTL notes, no46-03) keep their vectors in
+            # notes_vec anyway - we widen the KNN window by their count,
+            # otherwise such a neighbor would push an active candidate out of the top-N.
             skipped = conn.execute(
                 "SELECT COUNT(*) FROM notes_vec WHERE note_id IN "
                 "(SELECT id FROM notes WHERE "
@@ -140,15 +145,15 @@ class DeduplicationService:
             result: list[tuple[int, float]] = []
             for candidate_id, cosine_value in hits:
                 if cosine_value < threshold:
-                    break  # выдача KNN отсортирована — дальше только ниже
+                    break  # the KNN output is sorted - everything further is only lower
                 if candidate_id == exclude_id or candidate_id not in active:
-                    continue  # сама свежая заметка / trash / TTL — не кандидаты
+                    continue  # the fresh note itself / trash / TTL - not candidates
                 result.append((candidate_id, cosine_value))
                 if len(result) == top_n:
                     break
             return result
 
-    # --- фоллбек --------------------------------------------------------
+    #--- the fallback --------------------------------------------------------
 
     def find_by_text(
         self,
@@ -156,21 +161,24 @@ class DeduplicationService:
         namespace: str | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> sqlite3.Row | None:
-        """Дословный дубль без векторизации (ARCH §4.1 «дедуп по FTS»).
+        """A verbatim duplicate without vectorization (ARCH §4.1 "dedup by FTS").
 
-        Опциональный `conn` — работать на ПЕРЕДАННОМ соединении (без своего
-        `session()`): save выполняет проверку и INSERT одной BEGIN IMMEDIATE-
-        транзакцией, что исключает TOCTOU-гонку двух конкурентных save одного
-        текста (писатели сериализуются busy_timeout, второй видит уже
-        вставленную строку — дословный дубль невозможен). Без `conn` — как
-        раньше: собственный `session()` (обратная совместимость).
+                    The optional `conn` - work on the PASSED connection (without an own
+                    `session()`): save runs the check and the INSERT in one BEGIN
+                    IMMEDIATE transaction, which rules out the TOCTOU race of two
+                    concurrent saves of the same text (the writers serialize through
+                    busy_timeout; the second one sees the already-inserted row - a
+                    verbatim duplicate is impossible). Without `conn` - as before: an own
+                    `session()` (backward compatibility).
 
-        LSBN-F-22 (M3): во время миграции — вторая попытка по ПРЕЖНЕЙ базе
-        (union, design §4): заметки 'ожидает'/'карантин' существуют только
-        там, и дубль по ним блокирует запись («дублей при save нет» —
-        design §6.4). Гонки нет: прежняя база во время миграции только
-        читается (записи ждущих заметок уходят туда через NoteService, но
-        дословный INSERT новых туда не делает). Контекста нет — пути прежние.
+                    LSBN-F-22 (M3): during a migration - a second attempt over the
+                    PREVIOUS base (the union, design §4): the 'waiting'/'quarantine'
+                    notes exist only there, and a duplicate over them must block the save
+                    ("no duplicates at save" - design §6.4). There is no race: the
+                    previous base is read-only during the migration (the waiting notes'
+                    writes go there through NoteService, but a verbatim INSERT of new
+                    notes does not). No context - the old paths.
+
         """
         if namespace:
             ns_clause = " AND namespace = ?"
@@ -191,8 +199,8 @@ class DeduplicationService:
                 )
         if found is not None:
             return found
-        # Ленивый импорт: services.migration тянет summary → notes (цикл),
-        # прецедент — notes.py ↔ ttl.py.
+        # A lazy import: services.migration pulls summary -> notes (a cycle),
+        # the precedent - notes.py <-> ttl.py.
         from app.services.migration import migration_context
 
         context = migration_context()
@@ -214,21 +222,25 @@ class DeduplicationService:
         ns_fts_clause: str,
         ns_params: list[object],
     ) -> sqlite3.Row | None:
-        """Тело дословного дедупа на открытом соединении (SQL + FTS-фоллбек).
+        """The verbatim dedup body on an open connection (SQL + the FTS fallback).
 
-        Заметка с TTL (`expires_at IS NOT NULL`, no46-03) не кандидат и здесь:
-        условие `expires_at IS NULL` добавлено в оба SQL (exact-scan и
-        FTS-фоллбек) — такое слияние запрещено правилом О. 2026-10-10.
+                    A note with a TTL (`expires_at IS NOT NULL`, no46-03) is not a
+                    candidate here either: the `expires_at IS NULL` condition is added to
+                    both SQLs (the exact scan and the FTS fallback) - such a merge is
+                    forbidden by the owner's rule.
 
-        План-хинты (пул 13, бенч 50k: find_by_text с ns-фильтром — 132 с):
-        - `NOT INDEXED` на exact-scan: без него с `AND namespace = ?`
-          планировщик берёт idx_notes_namespace (низкоселективный — все строки
-          узла) как внешний цикл и fetch'ит текст построчно (случайные
-          страницы вместо 18-мс последовательного скана);
-        - `CROSS JOIN` в FTS-запросе: forcing notes_fts внешним циклом —
-          без него тот же индекс ставил notes первым и дёргал MATCH на
-          каждую строку узла. `CROSS JOIN` в SQLite запрещает
-          перестановку таблиц оптимизатором.
+                    Plan hints (pool 13; a 50k benchmark: find_by_text with an ns filter -
+                    132 s):
+                    - `NOT INDEXED` on the exact scan: without it, with
+                      `AND namespace = ?` the planner takes idx_notes_namespace (a
+                      low-selective one - all the node's rows) as the outer loop and
+                      fetches the text row by row (random pages instead of an 18-ms
+                      sequential scan);
+                    - `CROSS JOIN` in the FTS query: forcing notes_fts as the outer loop -
+                      without it the same index put notes first and ran MATCH on every
+                      row of the node. A `CROSS JOIN` in SQLite forbids the optimizer
+                      from reordering the tables.
+
         """
         exact = conn.execute(
             "SELECT id, text, namespace FROM notes NOT INDEXED "
@@ -240,7 +252,7 @@ class DeduplicationService:
             return exact
         norm = normalize_text(text)
         words = [word for word in norm.split() if len(word) >= 3]
-        if not words:  # только слова короче 3 символов — trigram слеп
+        if not words:  # only words shorter than 3 characters - the trigram is blind
             return None
         expression = " AND ".join(
             f'"{word.replace(chr(34), chr(34) * 2)}"'

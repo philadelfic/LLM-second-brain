@@ -1,66 +1,69 @@
-"""Хранилище (ARCHITECTURE §3.3): SQLite-схема notes + FTS5 (trigram) + vec0.
+"""The storage (ARCHITECTURE §3.3): the SQLite schema notes + FTS5 (trigram) + vec0.
 
-Слой без доменных правил: только схема, соединения и транзакции. Семантика
-CRUD (валидации, статусы, soft delete) — в `app.services.notes`; векторные
-операции (сериализация vec0, KNN) — в `app.storage.vectors` (Фаза 3).
+A layer without domain rules: only the schema, connections and transactions.
+CRUD semantics (validations, statuses, soft delete) live in
+`app.services.notes`; vector operations (vec0 serialization, KNN) — in
+`app.storage.vectors` (Phase 3).
 
-Ключевые решения:
-- Схема создаётся идемпотентно при старте (`init_db`, `IF NOT EXISTS`).
-- `notes_fts` — FTS5 внешнего контента (`content='notes'`,
-  `content_rowid='id'`, `tokenize='trigram'`), индексирует НАЗВАНИЕ и ТЕКСТ
-  заметки (колонки title и text — lsb-0001 FR-1.2/FR-1.3), синхронизируется
-  триггерами AFTER INSERT / AFTER UPDATE OF text, title. DELETE-триггер не
-  нужен: удаление — soft (`deleted_at`), строка и FTS-индекс физически
-  остаются в trash.
-- Title-миграция (lsb-0001-01, решение гейта R4 — миграция при старте, не
-  джоба): у живых БД, созданных до индексации названия, notes_fts
-  пересоздаётся с колонкой title и переливается из notes заново;
-  notes_vec дропается — полные вектора считались по тексту без названия
-  и невалидны (все заметки, включая trash, → vector_status='pending',
-  вектора в этом шаге не кодируются — догоняет фоновый воркер);
-  notes_chunks_vec НЕ трогается: вектора чанков строятся по текстам
-  чанков, название на них не влияет. Идемпотентность — meta-ключ
-  `title_index_version` (значение «2»).
-- `notes_vec` — vec0-таблица, размерность фиксируется при создании БД
-  (ARCH §3.3); при несовпадении конфигурации с зафиксированной в БД
-  (EMBEDDING_DIM или смена EMBEDDING_MODEL, записанная в таблице meta)
-  запускается ПОЛНАЯ автореиндексация при старте: индекс пересоздаётся,
-  все заметки (включая trash) становятся vector_status='pending',
-  догоняются фоновым воркером (решение 2026-08-29).
-- `notes_chunks` + `notes_chunks_vec` (Фаза 7): вектора строятся по чанкам
-  заметки; схема и операции — `app.storage.chunks`. FK note_id+CASCADE и
-  PRAGMA foreign_keys=ON в session(); сироты после прямых правок оператора
-  чинятся при старте. Смена чанк-параметров (meta) — пере-чанковка (шаг 6),
-  смена модели/размерности — дроп ОБОИХ векторных индексов.
-- WAL + busy_timeout (ARCH §3.3): чтения конкурентны, писатели сериализуются,
-  спор за блокировку разрешается ожиданием до BUSY_TIMEOUT_MS, а не
-  мгновенным «database is locked».
-- Соединение — на одну операцию (для SQLite дёшево), поэтому оно всегда
-  создаётся, используется и закрывается в одном потоке (совместимо с
-  `asyncio.to_thread`). Транзакции — явно (`transaction()`, autocommit):
-  BEGIN IMMEDIATE сериализует писателей через busy_timeout.
-- `synchronous=NORMAL` — штатная практика для WAL: переживает падение
-  процесса; сценарии питания — на периодический backup (Фаза 5).
-- На старте FTS-индекс сверяется с `notes` (оператор имеет прямой доступ к
-  файлу БД, REQUIREMENTS §4); рассинхрон лечится rebuild'ом, прочие ошибки
-  целостности — фатальны (StorageError).
-- Связи заметок (lsb-0010-02, релиз 3.1.0): таблица `links` (одна строка
-  на пару, канонический порядок `note_a < note_b`) + маркер расчёта
-  `notes.links_at` — идемпотентная миграция при старте; смена модели или
-  размерности эмбеддинга (автореиндексация ниже) очищает и связи.
-- Лимит длины саммари (гейт 3.1.0, 2026-09-19): активные заметки с готовым
-  саммари длиннее MAX_SUMMARY_CHARS помечаются на перегенерацию
-  (`summary_status='pending'`) — текст саммари НЕ портится усечением, его
-  заменяет фоновая джоба `summary`; идемпотентно (после перегенерации
-  повторный старт — no-op), заметки с `summary_status != 'ok'` уже в очереди.
-- Области 3.0.0 (субстрат, ARCH substrate §3.1–3.2): отдельные таблицы,
-  FTS5-индексы и vec0-индексы по областям skills/terms/user в той же БД.
-  Ни один объект заметок не пересоздаётся; старые записи не мигрируются
-  (данные областей — с нуля). FTS — внешнего контента с триггерами
-  AFTER INSERT / AFTER UPDATE; `terms` несёт ЧАСТИЧНЫЙ UNIQUE по активным
-  записям (`WHERE deleted_at IS NULL`). Area-vec дропаются вместе с
-  notes_vec в ветке смены модели/размерности — все записи областей →
-  pending, догоняет петля `areas` воркера.
+Key decisions:
+- The schema is created idempotently at startup (`init_db`, `IF NOT EXISTS`).
+- `notes_fts` — an external-content FTS5 (`content='notes'`,
+  `content_rowid='id'`, `tokenize='trigram'`) indexing the note's TITLE and
+  TEXT (the title and text columns — lsb-0001 FR-1.2/FR-1.3), kept in sync by
+  AFTER INSERT / AFTER UPDATE OF text, title triggers. A DELETE trigger is
+  unnecessary: deletion is soft (`deleted_at`), the row and the FTS index
+  physically stay in trash.
+- The title migration (lsb-0001-01, gate decision R4 — a startup migration,
+  not a job): for live databases created before the title was indexed,
+  notes_fts is rebuilt with the title column and re-poured from notes;
+  notes_vec is dropped — the full vectors were computed over the text without
+  the title and are invalid (every note, trash included, →
+  vector_status='pending'; no vectors are encoded in this step — the
+  background worker catches up); notes_chunks_vec is NOT touched: chunk
+  vectors are built over chunk texts, the title does not affect them.
+  Idempotency — the meta key `title_index_version` (the value "2").
+- `notes_vec` — a vec0 table whose dimension is pinned at database creation
+  (ARCH §3.3); when the configuration diverges from the one recorded in the
+  DB (EMBEDDING_DIM, or an EMBEDDING_MODEL change stored in the meta table), a
+  FULL auto-reindex runs at startup: the index is rebuilt, every note (trash
+  included) becomes vector_status='pending' and is caught up by the
+  background worker.
+- `notes_chunks` + `notes_chunks_vec` (Phase 7): vectors are built over note
+  chunks; the schema and operations — `app.storage.chunks`. The
+  note_id+CASCADE FK and PRAGMA foreign_keys=ON live in session(); orphans
+  left by the operator's direct edits are healed at startup. A chunk-parameter
+  change (meta) — re-chunking (step 6); a model/dimension change — dropping
+  BOTH vector indexes.
+- WAL + busy_timeout (ARCH §3.3): reads are concurrent, writers serialize,
+  lock contention resolves by waiting up to BUSY_TIMEOUT_MS rather than an
+  instant "database is locked".
+- One connection per operation (cheap for SQLite), so it is always created,
+  used and closed within one thread (compatible with `asyncio.to_thread`).
+  Transactions are explicit (`transaction()`, autocommit): BEGIN IMMEDIATE
+  serializes writers through busy_timeout.
+- `synchronous=NORMAL` — the standard WAL practice: survives a process crash;
+  power-loss scenarios are covered by the periodic backup (Phase 5).
+- At startup the FTS index is verified against `notes` (the operator has
+  direct access to the DB file, REQUIREMENTS §4); desync is healed by a
+  rebuild, other integrity errors are fatal (StorageError).
+- Note links (lsb-0010-02, 3.1.0): the `links` table (one row per pair, the
+  canonical order `note_a < note_b`) + the `notes.links_at` computed marker —
+  an idempotent startup migration; an embedding model/dimension change (the
+  auto-reindex below) clears the links too.
+- The summary length limit (the 3.1.0 gate): active notes with a ready summary
+  longer than MAX_SUMMARY_CHARS are marked for regeneration
+  (`summary_status='pending'`) — the summary text is NOT damaged by
+  truncation; the background `summary` job replaces it; idempotent (after
+  regeneration a repeated start is a no-op), notes with
+  `summary_status != 'ok'` are already in the queue.
+- The 3.0.0 areas (the substrate, ARCH substrate §3.1–3.2): separate tables,
+  FTS5 indexes and vec0 indexes for the skills/terms/user areas in the same
+  DB. No note object is recreated; old records are not migrated (area data
+  starts from zero). FTS — external content with AFTER INSERT / AFTER UPDATE
+  triggers; `terms` carries a PARTIAL UNIQUE over live records
+  (`WHERE deleted_at IS NULL`). Area vecs are dropped together with notes_vec
+  in the model/dimension branch — every area record → pending, the worker's
+  `areas` loop catches up.
 """
 
 from __future__ import annotations
@@ -78,34 +81,35 @@ import sqlite_vec
 from app.config import Settings
 from app.storage import area_vectors, chunks, expirations, vectors
 
-# Сколько ждать блокировку записи, прежде чем сдаться (как timeout sqlite3,
-# так и PRAGMA busy_timeout).
+# How long to wait for a write lock before giving up (both the sqlite3
+# timeout and PRAGMA busy_timeout).
 BUSY_TIMEOUT_MS = 5000
 
-# Как выцупоть лимит CHECK(length(text) BETWEEN 1 AND ?) из DDL живой таблицы
-# notes (сверка с MAX_NOTE_CHARS при старте — см. init_db).
+# How to pull the CHECK(length(text) BETWEEN 1 AND ?) limit out of the live
+# notes DDL (checked against MAX_NOTE_CHARS at startup — see init_db).
 _CHECK_LIMIT_RE = re.compile(r"length\(\s*text\s*\)\s+BETWEEN\s+1\s+AND\s+(\d+)")
 
-# Признак «notes_fts уже индексирует title» в DDL из sqlite_master: новая
-# схема начинается с колонки title, легаси (v2.1.1) — с text (миграция
-# lsb-0001-01 — см. _sync_fts_title_index; по образцу _PARTITION_RE в
-# app.storage.vectors).
+# The "notes_fts already indexes title" marker in the sqlite_master DDL: the
+# new schema starts with the title column, the legacy one (v2.1.1) — with
+# text (the lsb-0001-01 migration — see _sync_fts_title_index; modeled after
+# _PARTITION_RE in app.storage.vectors).
 _FTS_TITLE_RE = re.compile(r"fts5\(\s*title")
 
 
 class StorageError(RuntimeError):
-    """Ошибка хранилища: БД недоступна или схема повреждена.
+    """A storage error: the DB is unavailable or the schema is damaged.
 
-    Фатальна на старте; при обслуживании запросов доходит транспортным
-    слоям как обычное исключение (формат ответа — зона Фазы 5).
+    Fatal at startup; while serving requests it reaches the transport layers
+    as a regular exception (the response format belongs to Phase 5).
     """
 
 
-# --- схема --------------------------------------------------------------
+# --- schema --------------------------------------------------------------
 
-# DDL-черновик ARCHITECTURE §3.3 (без vec0-таблицы — это Фаза 3). Лимит
-# CHECK подставляется из env при первой инициализации БД (ARCH §3.3:
-# «лимиты подставляются из env»); подставляется целое число — безопасно.
+# The ARCHITECTURE §3.3 DDL draft (without the vec0 table — that is Phase 3).
+# The CHECK limit is substituted from env at the first DB initialization
+# (ARCH §3.3: "limits are substituted from env"); an integer is substituted —
+# safe.
 _NOTES_DDL = """
 CREATE TABLE IF NOT EXISTS notes (
   id             INTEGER PRIMARY KEY,
@@ -130,11 +134,11 @@ CREATE TABLE IF NOT EXISTS notes (
 )
 """
 
-# Реестр неймспейсов (Фаза 10, REQUIREMENTS §5.7): узлы иерархии (path —
-# слэш-путь, максимум 2 уровня), description — обязательное (контракт
-# ≤2 предложений валидируется сервисом), status — confirmed | provisional
-# (авто-созданные узлы судьи структуры). Существующие заметки при миграции
-# уходят в 'default' (дефолт колонки + INSERT узла ниже).
+# The namespace registry (Phase 10, REQUIREMENTS §5.7): hierarchy nodes (path
+# — a slash path, at most 2 levels), description — required (the <=2-sentence
+# contract is validated by the service), status — confirmed | provisional
+# (auto-created nodes of the structure judge). Existing notes on migration go
+# to 'default' (the column default + the node INSERT below).
 _NAMESPACES_DDL = """
 CREATE TABLE IF NOT EXISTS namespaces (
   path        TEXT PRIMARY KEY,
@@ -146,25 +150,25 @@ CREATE TABLE IF NOT EXISTS namespaces (
 )
 """
 
-# lsb-0001-01 (FR-1.2/FR-1.3): FTS индексирует и название (title), и текст.
+# lsb-0001-01 (FR-1.2/FR-1.3): FTS indexes both the title and the text.
 _FTS_DDL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
   title, text, content='notes', content_rowid='id', tokenize='trigram'
 )
 """
 
-# Вердикты судьи структуры (Фаза 10, Шаг 5): cooldown триггера. Группа
-# hint_path'ов, по которой судья вынес вердикт (слияние/отклонение), не
-# дёргает LLM повторно — иначе отклонённый кандидат зациклил бы вызовы
-# судьи при каждом прогоне (заметки с отклонённым hint'ом остаются в
-# default навсегда — честно-общие). Слияние хранит канонический узел;
-# сброс вердикта — оператор (REST, Шаг 6). Созданный узел записей не
-# требует: группа уходит из default ретро-перекладкой.
+# Structure-judge verdicts (Phase 10, Step 5): the trigger cooldown. A
+# hint_path group the judge has already ruled on (merge/reject) does not call
+# the LLM again — otherwise a rejected candidate would loop judge calls on
+# every run (notes with a rejected hint stay in default forever — honestly
+# shared). A merge stores the canonical node; a verdict reset belongs to the
+# operator (REST, Step 6). A created node needs no record:
+# requires: the group leaves default by retro-placement.
 #
-# lsb-0005-03: ключ — единый полный путь разметки hint_path (1..3 уровня),
-# заменяет пару (domain, subdomain). Старая схема (ПК (domain, subdomain))
-# мигрируется в _migrate_promotions_key — существующие вердикты получают
-# hint_path = domain/subdomain.
+# lsb-0005-03: the key is the single full placement path hint_path (1..3
+# levels), replacing the (domain, subdomain) pair. The old schema (the
+# (domain, subdomain) PK) is migrated in _migrate_promotions_key — existing
+# verdicts get hint_path = domain/subdomain.
 _PROMOTIONS_DDL = """
 CREATE TABLE IF NOT EXISTS promotions (
   hint_path      TEXT NOT NULL,
@@ -175,11 +179,11 @@ CREATE TABLE IF NOT EXISTS promotions (
 )
 """
 
-# lsb-0004-02 (FR-5…FR-8): очередь удаления просроченных заметок. note_id —
-# PK (одна запись на заметку), expires_at — абсолютный ISO-8601 (UTC) срок
-# жизни. Создаётся идемпотентно (IF NOT EXISTS); синхронизация с notes —
-# на уровне сервиса (вставка при TTL, обновление при смене, удаление при
-# снятии/удалении заметки).
+# lsb-0004-02 (FR-5…FR-8): the expired-note deletion queue. note_id is the PK
+# (one row per note), expires_at — the absolute ISO-8601 (UTC) lifetime.
+# Created idempotently (IF NOT EXISTS); synchronization with notes is at the
+# service level (insert on a TTL, update on a change, delete on clear/note
+# deletion).
 _NOTE_EXPIRATIONS_DDL = """
 CREATE TABLE IF NOT EXISTS note_expirations (
   note_id    INTEGER PRIMARY KEY,
@@ -187,33 +191,35 @@ CREATE TABLE IF NOT EXISTS note_expirations (
 )
 """
 
-# Связи заметок, уровень 1 (lsb-0010-02, arch §3.2): одна строка на пару
-# заметок; пара хранится в каноническом порядке `note_a < note_b` (связь
-# симметрична, чтение — в обе стороны), `kind` — вид связи с приоритетом
-# mention > entities > cosine, `score` — косинус/доля общих слов (NULL для
-# mention). Строки пишет только расчёт (`LinksService.compute_for_note`) —
-# одна транзакция на заметку: удалить пары → вставить заново.
+# Note links, level 1 (lsb-0010-02, arch §3.2): one row per note pair; a pair
+# is stored in the canonical order `note_a < note_b` (a link is symmetric and
+# is read both ways), `kind` is the link kind with the priority
+# mention > entities > cosine, `score` — the cosine/shared-word share (NULL
+# for mention). Rows are written only by the computation
+# (`LinksService.compute_for_note`) — one transaction per note: delete the
+# pairs → insert them again.
 _LINKS_DDL = """
 CREATE TABLE IF NOT EXISTS links (
-  note_a     INTEGER NOT NULL,          -- меньший id пары
-  note_b     INTEGER NOT NULL,          -- больший id пары
+  note_a     INTEGER NOT NULL,          -- the smaller id of the pair
+  note_b     INTEGER NOT NULL,          -- the larger id of the pair
   kind       TEXT    NOT NULL,          -- 'mention' | 'entities' | 'cosine'
-  score      REAL,                      -- косинус / доля общих слов / NULL
+  score      REAL,                      -- the cosine / shared-word share / NULL
   created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   PRIMARY KEY (note_a, note_b)
 )
 """
 
-# Индекс обратной стороны пары: выдача и пересчёт ищут связи заметки в обе
-# стороны (`note_a = ? OR note_b = ?`), PRIMARY KEY покрывает только note_a.
+# The index over the pair's other side: output and recomputation look up a
+# note's links both ways (`note_a = ? OR note_b = ?`), the PRIMARY KEY covers
+# only note_a.
 _LINKS_INDEX_DDL = "CREATE INDEX IF NOT EXISTS idx_links_b ON links(note_b)"
 
-# Таблица предупреждений (№12 + №32, arch §5.1): ОДНА общая поверхность
-# предупреждений памяти и терминов, читаемая без вызова модели. Субстрат
-# (прецедент общей `meta`): доступ по ключу `(subject_type, subject_id)`,
-# SQL изоляции областей её не адресует. Не более одного ОТКРЫТОГО
-# предупреждения на (субъект, вид) — повторный прогон джобы обновляет
-# `updated_at`/`payload`, а не плодит строки (§13.7).
+# The warnings table (No12 + No32, arch §5.1): ONE shared warnings surface
+# for memory and terms, readable without a model call. Substrate (the shared
+# `meta` precedent): access by the key `(subject_type, subject_id)`; the area
+# isolation SQL never addresses it. At most one OPEN warning per (subject,
+# kind) — a repeated job run updates `updated_at`/`payload` instead of
+# spawning rows (§13.7).
 _WARNINGS_DDL = """
 CREATE TABLE IF NOT EXISTS warnings (
   id           INTEGER PRIMARY KEY,
@@ -229,24 +235,25 @@ CREATE TABLE IF NOT EXISTS warnings (
 )
 """
 
-# Частичный уникальный индекс: не более одного ОТКРЫТОГО предупреждения на
-# (субъект, вид) — идемпотентность upsert'а (§5.1, §13.7).
+# A partial unique index: at most one OPEN warning per (subject, kind) — the
+# upsert idempotency (§5.1, §13.7).
 _WARNINGS_UNIQUE_INDEX_DDL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_warnings_open_unique "
     "ON warnings(subject_type, subject_id, kind) "
     "WHERE status = 'open' AND resolved_at IS NULL"
 )
 
-# Рабочий индекс листинга/агрегатов (/health.warnings, GET /warnings).
+# The working index of listing/aggregates (/health.warnings, GET /warnings).
 _WARNINGS_STATUS_INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS idx_warnings_status_kind "
     "ON warnings(status, kind, id)"
 )
 
-# Вектора (Фаза 3): физическая схема в `app.storage.vectors` (размерность и
-# cosine-метрика — там же); в init_db — создание/сверка при старте. Модель
-# эмбеддинга, на которой построен индекс, — в таблице meta (см. ниже):
-# смена модели/размерности поверх живой БД = автоматическая переиндексация.
+# Vectors (Phase 3): the physical schema lives in `app.storage.vectors` (the
+# dimension and the cosine metric — there); init_db — creation/verification at
+# startup. The embedding model the index was built with is stored in the meta
+# table (see below): a model/dimension change over a live DB = an automatic
+# reindex.
 _META_DDL = """
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
@@ -254,10 +261,10 @@ CREATE TABLE IF NOT EXISTS meta (
 )
 """
 
-# Синхронизация FTS с notes. Для внешнего контента удаление из индекса —
-# спец-команда 'delete' со СТАРЫМИ значениями индексируемых колонок.
-# UPDATE OF text, title (lsb-0001-01): изменения прочих колонок (summary,
-# статусы, deleted_at при soft delete) FTS не трогают.
+# FTS synchronization with notes. For external content, removing from the
+# index is the special 'delete' command with the OLD values of the indexed
+# columns. UPDATE OF text, title (lsb-0001-01): changes of other columns
+# (summary, statuses, deleted_at on soft delete) do not touch FTS.
 _TRIGGERS = (
     """
     CREATE TRIGGER IF NOT EXISTS notes_fts_ai AFTER INSERT ON notes BEGIN
@@ -272,22 +279,22 @@ _TRIGGERS = (
     """,
 )
 
-# №24 (no24-02, 3.2.0): ОТДЕЛЬНЫЙ FTS-индекс пометок (arch §5.2). Смысловой
-# `notes_fts` индексирует title/text и пометок НЕ видит: пометки ищутся
-# отдельным поиском (MCP `memory_comment_search` / REST `GET /notes/comments`)
-# — результаты не смешиваются (§13.6).
+# No24 (no24-02, 3.2.0): a SEPARATE FTS index of comments (arch §5.2). The
+# semantic `notes_fts` indexes title/text and does NOT see comments: comments
+# are searched separately (MCP `memory_comment_search` / REST
+# `GET /notes/comments`) — the results never mix (§13.6).
 _COMMENT_FTS_DDL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_comment_fts USING fts5(
   comment, content='notes', content_rowid='id', tokenize='trigram'
 )
 """
 
-# Синхронизация индекса пометок с notes (по образцу _TRIGGERS): INSERT всегда
-# (в т.ч. comment IS NULL — «пометки нет»), UPDATE OF comment — спец-команда
-# 'delete' со СТАРЫМ значением + вставка нового. DELETE-триггера нет (как у
-# notes_fts): заметки soft-delete; физическое удаление — джоба зачистки TTL
-# (lsb-0004-02), индекс пометок чистится там же спец-командой 'delete' в
-# `delete_note_physical` (LSBN-D-8, 3.4.0).
+# Comment-index synchronization with notes (modeled after _TRIGGERS): INSERT
+# always (including comment IS NULL — "no comment"), UPDATE OF comment — the
+# special 'delete' command with the OLD value + inserting the new one. No
+# DELETE trigger (like notes_fts): notes are soft-deleted; the hard deletion
+# is the TTL cleanup job (lsb-0004-02), and the comment index is cleaned there
+# by the special 'delete' command in `delete_note_physical` (LSBN-D-8, 3.4.0).
 _COMMENT_TRIGGERS = (
     """
     CREATE TRIGGER IF NOT EXISTS notes_comment_fts_ai AFTER INSERT ON notes BEGIN
@@ -303,10 +310,10 @@ _COMMENT_TRIGGERS = (
 )
 
 
-# --- области 3.0.0 (субстрат: skills / terms / user) ----------------------
+# --- the 3.0.0 areas (substrate: skills / terms / user) ----------------------
 
-# Один раз на релиз: изолированный слой областей в общей БД notes.db.
-# Ни один SQL области не адресует notes* (изоляция — тесты в обе стороны).
+# Once per release: an isolated area layer inside the shared notes.db.
+# No area SQL ever addresses notes* (isolation is tested both ways).
 SKILLS_TABLE = "skills"
 SKILLS_FTS_TABLE = "skills_fts"
 SKILLS_FTS_COLUMNS = ("name", "description", "steps", "text")
@@ -317,15 +324,15 @@ USER_FACTS_TABLE = "user_facts"
 USER_FACTS_FTS_TABLE = "user_facts_fts"
 USER_FACTS_FTS_COLUMNS = ("name", "body")
 
-# Область «Логи ассистента» (LSBN-F-10, релиз 3.2.0, arch §5.1/§5.2): одна
-# таблица записей + FTS5-индекс тех же смысловых текстовых полей. Структурные
-# фильтры (`entity*`, `source`, `session`, `created_at`) — обычные колонки и в
-# FTS не входят.
+# The "Assistant logs" area (LSBN-F-10, 3.2.0, arch §5.1/§5.2): one record
+# table + an FTS5 index over the same semantic text fields. The structural
+# filters (`entity*`, `source`, `session`, `created_at`) are plain columns and
+# stay out of FTS.
 ASSISTANT_LOGS_TABLE = "assistant_logs"
 ASSISTANT_LOGS_FTS_TABLE = "assistant_logs_fts"
 ASSISTANT_LOGS_FTS_COLUMNS = ("action", "reason", "entity_ref", "outcome", "verified")
 
-# Записи областей (без vec-таблиц): общие колонки + поля конкретной области.
+# Area records (without vec tables): the common columns + the area's own fields.
 AREA_RECORD_TABLES = (
     SKILLS_TABLE,
     TERMS_TABLE,
@@ -333,8 +340,8 @@ AREA_RECORD_TABLES = (
     ASSISTANT_LOGS_TABLE,
 )
 
-# (таблица записей, FTS-таблица, индексируемые колонки) — реестр FTS/триггеров:
-# один DDL и один набор триггеров на каждую область (без копипасты по областям).
+# (record table, FTS table, indexed columns) — the FTS/trigger registry: one
+# DDL and one trigger set per area (no per-area copy-paste).
 _AREA_FTS_SPECS = (
     (SKILLS_TABLE, SKILLS_FTS_TABLE, SKILLS_FTS_COLUMNS),
     (TERMS_TABLE, TERMS_FTS_TABLE, TERMS_FTS_COLUMNS),
@@ -342,13 +349,13 @@ _AREA_FTS_SPECS = (
     (ASSISTANT_LOGS_TABLE, ASSISTANT_LOGS_FTS_TABLE, ASSISTANT_LOGS_FTS_COLUMNS),
 )
 
-# Обязательные таблицы «ядра» для проверки снапшота (no14-01, релиз 3.2.0):
-# имена всех не-векторных таблиц, которые `init_db` создаёт в боевой БД (ядро
-# заметок + записи/FTS областей). Векторные (vec0) таблицы живут в своих
-# реестрах (`vectors.VEC_TABLE`, `chunks.CHUNKS_VEC_TABLE`, `area_vectors.VEC_TABLES`)
-# и здесь не перечисляются: `BackupService.verify` собирает обязательный
-# набор из всех реестров `app.storage`, а не хардкодит его. Единый источник
-# имён ядра — этот кортеж.
+# The mandatory "core" tables for the snapshot check (no14-01, 3.2.0): the
+# names of every non-vector table `init_db` creates in the production DB (the
+# notes core + the area records/FTS). The vector (vec0) tables live in their
+# own registries (`vectors.VEC_TABLE`, `chunks.CHUNKS_VEC_TABLE`,
+# `area_vectors.VEC_TABLES`) and are not listed here: `BackupService.verify`
+# assembles the mandatory set from all `app.storage` registries instead of
+# hardcoding it. The single source of core names — this tuple.
 CORE_TABLES: tuple[str, ...] = (
     "notes",
     "notes_fts",
@@ -373,10 +380,10 @@ CORE_TABLES: tuple[str, ...] = (
     ASSISTANT_LOGS_FTS_TABLE,
 )
 
-# Поля записей — по архитектурам фич lsb-0007/0008/0009; общее у всех —
-# id, vector_status (default pending), created_at, updated_at, deleted_at.
-# CHECK-констрейнты, как у заметок, не используем: лимиты формы — валидация
-# сервиса (мягкий отказ с hint), DDL — только структура.
+# Record fields — per the lsb-0007/0008/0009 feature architectures; common to
+# all — id, vector_status (default pending), created_at, updated_at,
+# deleted_at. No CHECK constraints, unlike notes: form limits are service
+# validation (a soft refusal with a hint), the DDL carries structure only.
 _AREA_DDL = (
     """
 CREATE TABLE IF NOT EXISTS skills (
@@ -442,16 +449,16 @@ CREATE TABLE IF NOT EXISTS user_facts (
     """
 CREATE TABLE IF NOT EXISTS assistant_logs (
   id             INTEGER PRIMARY KEY,
-  action         TEXT    NOT NULL DEFAULT '',   -- что сделано (обязательно, <= LOGS_ACTION_MAX_CHARS)
-  reason         TEXT    NOT NULL DEFAULT '',   -- почему (обязательно, <= LOGS_REASON_MAX_CHARS)
-  entity         TEXT    NULL,                  -- тип объекта изменения (закрытый словарь, §5.4)
-  entity_id      INTEGER NULL,                  -- id объекта в своей области (версионные сущности)
-  entity_version INTEGER NULL,                  -- версия объекта на момент записи (№41)
-  entity_ref     TEXT    NULL,                  -- текстовая ссылка/путь (объекты без id; <= LOGS_ENTITY_REF_MAX_CHARS)
-  outcome        TEXT    NULL,                  -- результат (что получилось; <= LOGS_OUTCOME_MAX_CHARS)
-  verified       TEXT    NULL,                  -- что проверено (<= LOGS_VERIFIED_MAX_CHARS)
-  source         TEXT    NOT NULL DEFAULT 'mcp',-- источник записи: mcp|rest|job:<name>|merge|migration
-  session        TEXT    NULL,                  -- идентификатор вызова/агента, не имя человека
+  action         TEXT    NOT NULL DEFAULT '',   -- what was done (required, <= LOGS_ACTION_MAX_CHARS)
+  reason         TEXT    NOT NULL DEFAULT '',   -- why (required, <= LOGS_REASON_MAX_CHARS)
+  entity         TEXT    NULL,                  -- the object-of-change kind (a closed dictionary, §5.4)
+  entity_id      INTEGER NULL,                  -- the object id within its area (versioned kinds)
+  entity_version INTEGER NULL,                  -- the object version at write time (No41)
+  entity_ref     TEXT    NULL,                  -- a text reference/path (id-less objects; <= LOGS_ENTITY_REF_MAX_CHARS)
+  outcome        TEXT    NULL,                  -- the result (what came out; <= LOGS_OUTCOME_MAX_CHARS)
+  verified       TEXT    NULL,                  -- what was checked (<= LOGS_VERIFIED_MAX_CHARS)
+  source         TEXT    NOT NULL DEFAULT 'mcp',-- the write channel: mcp|rest|job:<name>|merge|migration
+  session        TEXT    NULL,                  -- a call/agent identifier, not a person's name
   vector_status  TEXT    NOT NULL DEFAULT 'pending',
   created_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   updated_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
@@ -460,10 +467,10 @@ CREATE TABLE IF NOT EXISTS assistant_logs (
 """,
 )
 
-# Глобальный шаблон области навыков (lsb-0007 §3.1/§3.8): одна запись
-# skills_meta на область — «как исполнять шаги» (не дублируется у навыков).
-# Ключ и текст сида: значение создаётся только при отсутствии ключа (правка —
-# оператором через REST, lsb-0007-05; сид её не затирает).
+# The skills-area global template (lsb-0007 §3.1/§3.8): one skills_meta record
+# — "how to execute the steps" (never duplicated per skill). The seed key and
+# text: the value is created only when the key is absent (the edit belongs to
+# the operator via REST, lsb-0007-05; the seed never overwrites it).
 INSTRUCTION_TEMPLATE_KEY = "instruction_template"
 INSTRUCTION_TEMPLATE_SEED = (
     "Execute the steps in order: the content of each step in `text` says what "
@@ -472,14 +479,16 @@ INSTRUCTION_TEMPLATE_SEED = (
     "improvising."
 )
 
-# Сид skill-создателя (lsb-0007 §3.6/§3.8): запись `skills` — процедура «как
-# создавать навыки», тексты дословно канон арх-доки §3.8 (в доке разбиты на
-# строки по ~80 симв. — это вёрстка, строки склеены пробелами, как у
-# INSTRUCTION_TEMPLATE_SEED). `extra` пуст, `vector_status='pending'` — вектор
-# догоняет петля `areas` воркера (субстрат §3.3).
-# Маркер сида в `skills_meta` пишется при первой попытке сида: пока он есть,
-# init_db сид НЕ воскрешает — удаление навыка оператором или моделью остаётся
-# осмысленным (маркер живёт в БД дольше мягко удалённой строки).
+# The skill-creator seed (lsb-0007 §3.6/§3.8): a `skills` record — the "how to
+# create skills" procedure; the texts are the arch-doc §3.8 canon verbatim (in
+# the doc they are wrapped at ~80 chars — layout only; lines are joined with
+# spaces, like INSTRUCTION_TEMPLATE_SEED). `extra` is empty,
+# `vector_status='pending'` — the worker's `areas` loop catches the vector up
+# (substrate §3.3).
+# The seed marker in `skills_meta` is written at the first seed attempt: while
+# it exists, init_db does NOT resurrect the seed — deleting the skill (by the
+# operator or a model) stays meaningful (the marker outlives the soft-deleted
+# row in the DB).
 CREATOR_SKILL_SEED_KEY = "creator_skill_seed"
 CREATOR_SKILL_SEED_VALUE = "seeded"
 CREATOR_SKILL_NAME = "Create skills"
@@ -505,18 +514,19 @@ CREATOR_SKILL_TEXT = (
     "previous version as a copy automatically."
 )
 
-# Частичный UNIQUE (lsb-0008 §3.3): ключ термина (term_norm + context_norm)
-# уникален только среди АКТИВНЫХ записей — soft-deleted строку ключ не держит
-# (удалённый ключ освобождается, «undo — оператором»).
+# A partial UNIQUE (lsb-0008 §3.3): the term key (term_norm + context_norm) is
+# unique among LIVE records only — a soft-deleted row does not hold the key
+# (the deleted key is freed; "the undo belongs to the operator").
 _TERMS_ACTIVE_KEY_INDEX_DDL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_terms_key_active "
     "ON terms(term_norm, context_norm) WHERE deleted_at IS NULL"
 )
 
-# Индексы обратного запроса области логов (arch §5.1, FR-4.1/FR-5.2): оба
-# частичные — только по активным записям (прецедент idx_terms_key_active).
-# Первый — «почему изменился объект»; второй — срез по абсолютной дате.
-# Отдельных индексов по session/source нет: домен узкий, объём мал (§4).
+# The logs-area reverse-lookup indexes (arch §5.1, FR-4.1/FR-5.2): both
+# partial — over live records only (the idx_terms_key_active precedent).
+# The first — "why did the object change"; the second — the absolute-date
+# slice. No separate session/source indexes: a narrow domain, a small volume
+# (§4).
 _ASSISTANT_LOGS_INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS idx_assistant_logs_entity_active "
     "ON assistant_logs(entity, entity_id, created_at DESC) WHERE deleted_at IS NULL",
@@ -524,24 +534,24 @@ _ASSISTANT_LOGS_INDEX_DDL = (
     "ON assistant_logs(created_at DESC) WHERE deleted_at IS NULL",
 )
 
-# История версий (№41, релиз 3.2.0, substrate-versioning §5.1): одна общая
-# таблица на все сущности, PK `(entity, entity_id, version)` — покрывает
-# lookup по записи и обратный порядок (от новых к старым). Индексов сверх PK
-# НЕ заводится (решение §5.1). `version=1` — baseline (`snapshot` заполнен,
-# `delta` NULL); `version≥2` — дельта, кроме перебазированной после prune.
+# Version history (No41, 3.2.0, substrate-versioning §5.1): one shared table
+# for every entity, the PK `(entity, entity_id, version)` covers the per-record
+# lookup and the reverse order (newest first). No indexes beyond the PK (the
+# §5.1 decision). `version=1` is the baseline (`snapshot` filled, `delta`
+# NULL); `version>=2` is a delta, except a re-based one after prune.
 _RECORD_VERSIONS_DDL = """
 CREATE TABLE IF NOT EXISTS record_versions (
   entity       TEXT    NOT NULL,                     -- 'note'|'skill'|'skill_template'|'term'|'user_fact'
-  entity_id    INTEGER NOT NULL,                     -- id строки живой таблицы; для skill_template — 0
+  entity_id    INTEGER NOT NULL,                     -- the live-table row id; 0 for skill_template
   version      INTEGER NOT NULL,                     -- 1..N, baseline = 1
   event        TEXT    NOT NULL DEFAULT 'content'
                CHECK(event IN ('baseline','content','delete','restore','rollback')),
-  source       TEXT    NOT NULL,                     -- 'mcp'|'rest'|'job:<имя>'|'merge'|'migration'
-  session      TEXT    NULL,                         -- идентификатор вызова/агента, не имя человека
-  changed      TEXT    NOT NULL DEFAULT '[]',        -- JSON-массив имён изменившихся полей
-  snapshot     TEXT    NULL,                         -- JSON-объект: поля целиком (baseline / после prune)
-  delta        TEXT    NULL,                         -- JSON-объект: поле → значение/строки (§5.2)
-  restore_from INTEGER NULL,                         -- откат: номер восстановленной версии
+  source       TEXT    NOT NULL,                     -- 'mcp'|'rest'|'job:<name>'|'merge'|'migration'
+  session      TEXT    NULL,                         -- a call/agent identifier, not a person's name
+  changed      TEXT    NOT NULL DEFAULT '[]',        -- a JSON array of the changed field names
+  snapshot     TEXT    NULL,                         -- a JSON object: whole fields (baseline / after prune)
+  delta        TEXT    NULL,                         -- a JSON object: field → value/lines (§5.2)
+  restore_from INTEGER NULL,                         -- a rollback: the restored version number
   created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
   PRIMARY KEY (entity, entity_id, version)
 )
@@ -549,7 +559,7 @@ CREATE TABLE IF NOT EXISTS record_versions (
 
 
 def _area_fts_ddl(table: str, fts_table: str, columns: tuple[str, ...]) -> str:
-    """DDL FTS5-индекса области: внешний контент, trigram (как notes_fts)."""
+    """The area FTS5 index DDL: external content, trigram (like notes_fts)."""
     return (
         f"CREATE VIRTUAL TABLE IF NOT EXISTS {fts_table} USING fts5("
         f"  {', '.join(columns)}, content='{table}', content_rowid='id', "
@@ -560,12 +570,12 @@ def _area_fts_ddl(table: str, fts_table: str, columns: tuple[str, ...]) -> str:
 def _area_trigger_ddls(
     table: str, fts_table: str, columns: tuple[str, ...]
 ) -> tuple[str, ...]:
-    """Триггеры синхронизации FTS области: AFTER INSERT и AFTER UPDATE.
+    """The area FTS sync triggers: AFTER INSERT and AFTER UPDATE.
 
-    DELETE-триггер не нужен: удаление области — soft (`deleted_at`), строка и
-    FTS-индекс физически остаются в trash (прецедент заметок). Для внешнего
-    контента удаление из индекса — спец-команда 'delete' со СТАРЫМИ
-    значениями индексируемых колонок (только в UPDATE).
+    No DELETE trigger: an area deletion is soft (`deleted_at`), the row and
+    the FTS index physically stay in trash (the notes precedent). For external
+    content, removing from the index is the special 'delete' command with the
+    OLD values of the indexed columns (in UPDATE only).
     """
     joined = ", ".join(columns)
     new_values = ", ".join(f"new.{column}" for column in columns)
@@ -586,12 +596,12 @@ END
 
 
 def _create_area_schema(conn: sqlite3.Connection, settings: Settings) -> None:
-    """Создать схему областей при старте — идемпотентно (ARCH substrate §3.1).
+    """Create the area schema at startup — idempotently (ARCH substrate §3.1).
 
-    Таблицы записей + FTS5 внешнего контента + триггеры + частичный UNIQUE
-    ключа terms + vec0-таблицы текущей размерности. Живые БД апгрейдятся без
-    ручных миграций (всё `IF NOT EXISTS`); существующие объекты заметок не
-    трогаются вовсе.
+    Record tables + external-content FTS5 + triggers + the partial UNIQUE of
+    the terms key + the vec0 tables of the current dimension. Live databases
+    upgrade without manual migrations (everything is `IF NOT EXISTS`);
+    existing note objects are not touched at all.
     """
     for ddl in _AREA_DDL:
         conn.execute(ddl)
@@ -606,17 +616,18 @@ def _create_area_schema(conn: sqlite3.Connection, settings: Settings) -> None:
 
 
 def _create_area_vec_if_missing(conn: sqlite3.Connection, dim: int) -> None:
-    """Создать отсутствующие area-vec (наследники до 3.0.0, ручные правки)."""
+    """Create the missing area vecs (pre-3.0.0 inheritors, manual edits)."""
     if not area_vectors.vec_tables_exist(conn):
         area_vectors.create_vec_tables(conn, dim)
 
 
 def _reset_area_vectors(conn: sqlite3.Connection, settings: Settings) -> None:
-    """Смена модели/размерности: area-vec дропаются и пересоздаются.
+    """A model/dimension change: area vecs are dropped and recreated.
 
-    Вектора другой модели несовместимы: все записи областей (включая trash)
-    → `vector_status='pending'`, догоняет петля `areas` воркера — по образцу
-    notes_vec (NFR-3: данные не теряются, поиск деградирует к FTS).
+    Another model's vectors are incompatible: every area record (trash
+    included) → `vector_status='pending'`, the worker's `areas` loop catches
+    up — modeled after notes_vec (NFR-3: no data is lost, search degrades to
+    FTS).
     """
     area_vectors.drop_vec_tables(conn)
     area_vectors.create_vec_tables(conn, settings.embedding_dim)
@@ -625,21 +636,21 @@ def _reset_area_vectors(conn: sqlite3.Connection, settings: Settings) -> None:
 
 
 def _count_area_records(conn: sqlite3.Connection) -> int:
-    """Число записей областей (события автореиндексации, наблюдение)."""
+    """The number of area records (auto-reindex events, observation)."""
     return sum(
         int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
         for table in AREA_RECORD_TABLES
     )
 
 
-# --- соединения ---------------------------------------------------------
+# --- connections ---------------------------------------------------------
 
 @contextmanager
 def session(settings: Settings) -> Iterator[sqlite3.Connection]:
-    """Соединение на одну операцию + WAL-прагмы (ARCH §3.3).
+    """One connection per operation + the WAL pragmas (ARCH §3.3).
 
-    Autocommit (`isolation_level=None`): каждый оператор атомарен сам по
-    себе, а многооператорные изменения оборачиваются `transaction()`.
+    Autocommit (`isolation_level=None`): every statement is atomic on its
+    own, and multi-statement changes are wrapped in `transaction()`.
     """
     try:
         conn = sqlite3.connect(
@@ -647,15 +658,15 @@ def session(settings: Settings) -> Iterator[sqlite3.Connection]:
             timeout=BUSY_TIMEOUT_MS / 1000,
             isolation_level=None,
         )
-        conn.row_factory = sqlite3.Row  # доступ к ячейкам по имени колонки
-    except sqlite3.Error as exc:  # например, путь недоступен
+        conn.row_factory = sqlite3.Row  # name-based cell access
+    except sqlite3.Error as exc:  # for example, the path is unreachable
         raise StorageError(
             f"не удалось открыть БД {settings.db_path}: {exc}"
         ) from exc
     try:
         conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        # Фаза 7: FK ON — без него ON DELETE CASCADE у notes_chunks молча
-        # не срабатывает (в SQLite внешние ключи выключены по умолчанию).
+        # Phase 7: FK ON — without it the notes_chunks ON DELETE CASCADE
+        # silently does not fire (SQLite ships with foreign keys off).
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
@@ -669,10 +680,10 @@ def session(settings: Settings) -> Iterator[sqlite3.Connection]:
 
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """Многооператорная запись: BEGIN IMMEDIATE … COMMIT, при ошибке ROLLBACK.
+    """A multi-statement write: BEGIN IMMEDIATE … COMMIT, ROLLBACK on error.
 
-    BEGIN IMMEDIATE берёт блокировку записи сразу — два конкурентных
-    писателя сериализуются через busy_timeout без deadlock при upgrade.
+    BEGIN IMMEDIATE takes the write lock right away — two concurrent writers
+    serialize through busy_timeout without an upgrade deadlock.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -684,14 +695,14 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         conn.execute("COMMIT")
 
 
-# --- расширение sqlite-vec ------------------------------------------------
+# --- the sqlite-vec extension ------------------------------------------------
 
 def _load_vec_extension(conn: sqlite3.Connection) -> None:
-    """Загрузить sqlite-vec в соединение (нужно на каждом соединении).
+    """Load sqlite-vec into the connection (needed on every connection).
 
-    Загрузка расширения — свойство соединения, а не файла БД; стоимость —
-    микросекунды. Без расширения vec0-таблицы не открываются вовсе, поэтому
-    ошибка загрузки — StorageError (фатально на старте).
+    Extension loading is a property of the connection, not of the DB file; the
+    cost is microseconds. Without the extension the vec0 tables do not open at
+    all, so a load failure is a StorageError (fatal at startup).
     """
     try:
         conn.enable_load_extension(True)
@@ -703,39 +714,40 @@ def _load_vec_extension(conn: sqlite3.Connection) -> None:
         ) from exc
 
 
-# --- инициализация ------------------------------------------------------
+# --- initialization ------------------------------------------------------
 
 
 def note_chars_limit(conn: sqlite3.Connection) -> int | None:
-    """Лимит живого CHECK(length(text) BETWEEN 1 AND ?) таблицы notes.
+    """The live CHECK(length(text) BETWEEN 1 AND ?) limit of the notes table.
 
-    None — таблицы ещё нет (свежая БД) или CHECK нет (рукотворная схема):
-    сверять не с чем. Источник истины — DDL в sqlite_master, а не meta:
-    лимит «запечён» в схему при первом создании.
+    None — the table does not exist yet (a fresh DB) or there is no CHECK (a
+    hand-made schema): nothing to compare against. The source of truth is the
+    DDL in sqlite_master, not meta: the limit is baked into the schema at
+    first creation.
     """
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'notes'"
     ).fetchone()
     if row is None or row[0] is None:
-        return None  # таблица не создана — init_db упал выше по-своему
+        return None  # no table — init_db failed above with its own error
     match = _CHECK_LIMIT_RE.search(row[0])
     if match is None:
-        return None  # без CHECK (рукотворная схема) — сверки нет
+        return None  # no CHECK (a hand-made schema) — nothing to compare
     return int(match.group(1))
 
 
 def _assert_note_chars_limit(conn: sqlite3.Connection, expected: int) -> int | None:
-    """Сверить ожидаемый лимит с живым CHECK таблицы notes — БЕЗ фатала.
+    """Compare the expected limit with the live CHECK of notes — WITHOUT a fatal.
 
-    История: до LSBN-F-22 несовпадение env с живым CHECK валило старт
-    (лимит зафиксирован в схеме, CHECK не меняется на лету). Самомиграция
-    (LSBN-F-22, решение О. 15.10.2026) заменяет фатал: функция возвращает
-    лимит живого CHECK (None — сверять не с чем), а решение о переливе
-    принимает `app.storage.migration` рядом с `init_db` в lifespan. Здесь
-    только наблюдаемость: расхождение — warning в журнале старта.
+    History: before LSBN-F-22 an env/CHECK mismatch killed the start (the
+    limit is pinned in the schema, a CHECK cannot change on the fly).
+    Self-migration (LSBN-F-22) replaces the fatal: the function returns the
+    live CHECK limit (None — nothing to compare), and the pour decision is
+    made by `app.storage.migration` next to `init_db` in the lifespan. Here —
+    observability only: a divergence is a startup-log warning.
 
     Returns:
-        Лимит живого CHECK или None (таблицы/CHECK нет).
+        The live CHECK limit, or None (no table/CHECK).
     """
     stored = note_chars_limit(conn)
     if stored is not None and stored != expected:
@@ -752,31 +764,31 @@ def _assert_note_chars_limit(conn: sqlite3.Connection, expected: int) -> int | N
 
 
 def init_db(settings: Settings, *, note_chars: int | None = None) -> None:
-    """Создать схему при старте (критерий приёмки Фазы 2); идемпотентно.
+    """Create the schema at startup (the Phase 2 acceptance test); idempotent.
 
-    `note_chars` — лимит CHECK(length(text)) ДЛЯ НОВОЙ базы (LSBN-F-22,
-    M1): None — из env (`settings.max_note_chars`), как раньше. Самомиграция
-    создаёт базу под целевой лимит этим параметром (копия Settings с другим
-    db_path не нужна для лимита). Поверх существующей БД параметр роли не
-    играет (IF NOT EXISTS), а расхождение env с живым CHECK больше не фатал:
-    `_assert_note_chars_limit` возвращает живой лимит, решение о переливе —
-    в `app.storage.migration` (lifespan).
+    `note_chars` — the CHECK(length(text)) limit FOR A NEW database
+    (LSBN-F-22, M1): None — from env (`settings.max_note_chars`), as before.
+    Self-migration creates the target-limit base through this parameter (a
+    Settings copy with another db_path is not needed for the limit). Over an
+    existing DB the parameter plays no role (IF NOT EXISTS), and an env/CHECK
+    divergence is no longer fatal: `_assert_note_chars_limit` returns the live
+    limit, the pour decision lives in `app.storage.migration` (lifespan).
 
-    При смене EMBEDDING_MODEL или EMBEDDING_DIM поверх существующей БД
-    автоматически перестраиваются ОБА векторных индекса (полный текст и
-    чанки): вектора другой модели несовместимы, все заметки уходят в pending
-    и догоняются воркером (NFR-3 — данные не теряются, поиск деградирует
-    к FTS до готовности).
+    An EMBEDDING_MODEL or EMBEDDING_DIM change over an existing DB
+    automatically rebuilds BOTH vector indexes (the full text and the chunks):
+    another model's vectors are incompatible, every note goes to pending and
+    is caught up by the worker (NFR-3 — no data is lost, search degrades to
+    FTS until ready).
 
-    Миграция title-индекса (lsb-0001-01, решение гейта R4 — при старте,
-    не джоба): notes_fts живых БД перестраивается под индексацию названия
-    (title + text, FR-1.2/FR-1.3), notes_vec дропается — полные вектора
-    считались по тексту без названия и невалидны, все заметки (включая
-    trash) уходят в pending и догоняются воркером; вектора чанков
-    (notes_chunks_vec) остаются валидными — они построены по текстам чанков.
+    The title-index migration (lsb-0001-01, gate decision R4 — at startup,
+    not a job): the notes_fts of live databases is rebuilt to index the title
+    (title + text, FR-1.2/FR-1.3), notes_vec is dropped — the full vectors
+    were computed over the text without the title and are invalid, every note
+    (trash included) goes to pending and is caught up by the worker; chunk
+    vectors (notes_chunks_vec) stay valid — they are built over chunk texts.
 
     Raises:
-        StorageError: БД недоступна, нет FTS5/vec0, схема повреждена.
+        StorageError: the DB is unavailable, no FTS5/vec0, a damaged schema.
     """
     limit = settings.max_note_chars if note_chars is None else note_chars
     path = Path(settings.db_path)
@@ -784,104 +796,117 @@ def init_db(settings: Settings, *, note_chars: int | None = None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with session(settings) as conn:
             conn.execute(_NOTES_DDL.format(max_note_chars=limit))
-            # Лимит CHECK «запечён» в DDL при первом создании (ARCH §3.3:
-            # «лимиты подставляются из env»). До LSBN-F-22 расхождение с env
-            # валило старт; теперь возвращается живой лимит (наблюдаемость —
-            # warning), решение о переливе — app.storage.migration.
+            # The CHECK limit is baked into the DDL at first creation
+            # (ARCH §3.3: "limits are substituted from env"). Before LSBN-F-22
+            # an env divergence killed the start; now the live limit is
+            # returned (observability — a warning), the pour decision lives in
+            # app.storage.migration.
             _assert_note_chars_limit(conn, limit)
             conn.execute(_FTS_DDL)
             for trigger in _TRIGGERS:
                 conn.execute(trigger)
-            # Названия заметок (Фаза 11, решение №9): notes.title TEXT (nullable).
-            # ДО title-миграции FTS: к моменту _sync_fts_title_index колонка
-            # title уже существует — перелив индекса читает notes.title.
+            # Note titles (Phase 11): notes.title TEXT (nullable).
+            # BEFORE the FTS title migration: by the time _sync_fts_title_index
+            # runs, the title column already exists — the index pour reads
+            # notes.title.
             _migrate_title_column(conn)
-            # Пометка заметки (№24, 3.2.0): notes.comment TEXT (nullable).
-            # Колонка нужна до вставок/чтений сервиса; FTS пометок — no24-02.
+            # The note comment (No24, 3.2.0): notes.comment TEXT (nullable).
+            # The column is needed before the service inserts/reads; the
+            # comment FTS is no24-02.
             _migrate_comment_column(conn)
-            # FTS пометок (№24, no24-02): отдельная таблица notes_comment_fts
-            # + триггеры — сразу после колонки comment и ДО сверки эмбеддинга
-            # (таблицу не адресует). Rebuild не нужен: комментариев ещё нет.
+            # The comment FTS (No24, no24-02): the separate notes_comment_fts
+            # table + triggers — right after the comment column and BEFORE the
+            # embedding check (it never addresses the table). No rebuild
+            # needed: there are no comments yet.
             _migrate_comment_fts(conn)
-            # Неймспейсы (Фаза 10): колонки notes + реестр + дефолт-узел.
+            # Namespaces (Phase 10): the notes columns + the registry + the
+            # default node.
             _migrate_namespace_columns(conn)
             _migrate_classification_columns(conn)
-            # lsb-0005-02: единый полный путь разметки hint_path (замена
-            # паре domain_hint/subdomain_hint) — бэкфилл из старой подписи.
+            # lsb-0005-02: the single full placement path hint_path (replacing
+            # the domain_hint/subdomain_hint pair) — a backfill from the old
+            # signature.
             _migrate_hint_path_columns(conn)
             conn.execute(_NAMESPACES_DDL)
-            # Временное хранение (lsb-0004-02): колонка notes.expires_at +
-            # очередь удаления note_expirations (идемпотентно).
+            # Lifetimes (lsb-0004-02): the notes.expires_at column + the
+            # note_expirations deletion queue (idempotent).
             _migrate_expiration_columns(conn)
-            # Связи заметок (lsb-0010-02): таблица links + индекс + маркер
-            # notes.links_at — идемпотентно, до ветки автореиндексации
-            # (та очищает связи при смене модели/размерности).
+            # Note links (lsb-0010-02): the links table + index + the
+            # notes.links_at marker — idempotent, before the auto-reindex
+            # branch (it clears links on a model/dimension change).
             _migrate_link_columns(conn)
-            # Порядок в узлах (lsb-0011-01): служебный маркер notes.node_order_at
-            # — идемпотентно; у существующих заметок NULL (первый прогон джобы
-            # `nodes` разбирает накопленный default — ретро-прогон, arch §4).
+            # Order in nodes (lsb-0011-01): the notes.node_order_at service
+            # marker — idempotent; existing notes have NULL (the first `nodes`
+            # run sweeps the accumulated default — a retro sweep, arch §4).
             _migrate_node_order_columns(conn)
-            # Предупреждения (№12, 3.2.0): служебный маркер notes.warnings_at
-            # — идемпотентно; у существующих заметок NULL (первый прогон
-            # джобы `warnings` проверяет накопленное).
+            # Warnings (No12, 3.2.0): the notes.warnings_at service marker —
+            # idempotent; existing notes have NULL (the first `warnings` run
+            # checks the accumulated ones).
             _migrate_warnings_columns(conn)
-            # Лимит длины саммари (гейт 3.1.0, 2026-09-19): готовые саммари
-            # длиннее MAX_SUMMARY_CHARS → pending (перегенерация фоном).
+            # The summary length limit (the 3.1.0 gate): ready summaries longer
+            # than MAX_SUMMARY_CHARS → pending (a background regeneration).
             _migrate_summary_length(conn, settings)
-            # List-индексы (пул 15): старый idx_notes_namespace заменён
-            # (prefix namespace, deleted_at покрыт новым ns-индексом).
+            # List indexes (pool 15): the old idx_notes_namespace replaced
+            # (the namespace prefix; deleted_at is covered by the new ns
+            # index).
             conn.execute("DROP INDEX IF EXISTS idx_notes_namespace")
             conn.execute(_INDEX_DELETED_UPDATED_DDL)
             conn.execute(_INDEX_NS_DELETED_UPDATED_DDL)
             _ensure_default_namespace(conn)
-            # №34 (3.2.0): описание `default` — EN; существующие БД доводятся
-            # одноразово и только если текст точно равен прежнему RU-дефолту
-            # (правка оператора сохраняется). Штамп в `meta` — см. функцию.
+            # No34 (3.2.0): the `default` description is EN; existing databases
+            # are brought over one-off and only when the text exactly equals the
+            # former RU default (an operator edit is preserved). The stamp in
+            # `meta` — see the function.
             _migrate_default_namespace_description(conn)
             conn.execute(_PROMOTIONS_DDL)
-            # lsb-0005-03: ключ promotions (domain, subdomain) → единый
-            # hint_path; миграция старых вердиктов (идемпотентно).
+            # lsb-0005-03: the promotions key (domain, subdomain) → the single
+            # hint_path; the old-verdict migration (idempotent).
             _migrate_promotions_key(conn)
-            # Title-индекс (lsb-0001-01, Часть A): перестройка notes_fts под
-            # индексацию названия на живых БД — ДО integrity-check: перелив
-            # выше оставляет индекс консистентным.
+            # The title index (lsb-0001-01, Part A): rebuilding notes_fts for
+            # title indexing on live databases — BEFORE the integrity check:
+            # the pour above leaves the index consistent.
             fts_migrated = _sync_fts_title_index(conn)
             _check_fts_integrity(conn)
-            # Партиция namespace (Фаза 10): vec-таблицы живых БД без `+ns`
-            # пересоздаются с партицией, все заметки — в pending. ДО сверки
-            # модели/чанков: обе ветки создают таблицы уже с партицией.
+            # The namespace partition (Phase 10): the live databases' vec
+            # tables without `+ns` are recreated with the partition, every note
+            # — to pending. BEFORE the model/chunk checks: both branches create
+            # the tables already partitioned.
             _sync_namespace_partition(conn, settings)
-            # Чанки (Фаза 7): таблица текстов чанков — до векторной сверки,
-            # при несовпадении конфигурации дропается и notes_chunks_vec.
+            # Chunks (Phase 7): the chunk-text table — before the vector
+            # check; on a configuration mismatch notes_chunks_vec is dropped
+            # too.
             chunks.create_table(conn)
-            # Области 3.0.0 (субстрат): таблицы/FTS/индексы/vec0 областей —
-            # до сверки модели/размерности: её ветка дропает area-vec и
-            # пересоздаёт их под текущую размерность (_reset_area_vectors).
+            # The 3.0.0 areas (substrate): the area tables/FTS/indexes/vec0 —
+            # before the model/dimension check: its branch drops the area vecs
+            # and recreates them under the current dimension
+            # (_reset_area_vectors).
             _create_area_schema(conn, settings)
-            # Предупреждения (№12/№32): общая таблица `warnings` + индексы —
-            # субстрат, ни на что не влияет, моделей не трогает; ДО сверки
-            # эмбеддинга (arch §5.4).
+            # Warnings (No12/No32): the shared `warnings` table + indexes —
+            # substrate, affects nothing, touches no models; BEFORE the
+            # embedding check (arch §5.4).
             _migrate_warnings_schema(conn)
-            # Сид глобального шаблона навыков (lsb-0007 §3.8): сразу после
-            # создания skills_meta, идемпотентно, существующее не трогаем.
+            # The skills global template seed (lsb-0007 §3.8): right after
+            # skills_meta is created, idempotent, existing values untouched.
             _ensure_skills_meta(conn)
-            # Сид skill-создателя (lsb-0007 §3.6/§3.8): сразу после шаблона,
-            # идемпотентно, с маркером в skills_meta (удалённый — не воскреснет).
+            # The skill-creator seed (lsb-0007 §3.6/§3.8): right after the
+            # template, idempotent, with the skills_meta marker (a deleted one
+            # will not resurrect).
             _ensure_creator_skill(conn)
-            # История версий (№41, 3.2.0, substrate-versioning §5.1/§5.4): таблица
-            # record_versions, baseline существующих записей и перенос архива
-            # skill_versions в общую форму — идемпотентно, ПОСЛЕ сидов областей
-            # (сид навыка получает baseline) и ДО сверки эмбеддинга: история —
-            # про контент, векторных таблиц не адресует вовсе.
+            # Version history (No41, 3.2.0, substrate-versioning §5.1/§5.4):
+            # the record_versions table, baselining existing records and moving
+            # the skill_versions archive into the shared shape — idempotent,
+            # AFTER the area seeds (the skill seed gets a baseline) and BEFORE
+            # the embedding check: history is about content and never addresses
+            # vector tables.
             _migrate_history_schema(conn, settings)
-            # Вектора (Фаза 3 + решение 2026-08-29; Фаза 7: + вектора чанков):
-            # создание при первом старте; при несовпадении зафиксированной
-            # конфигурации (модель/размерность) с env — полная автореиндексация
-            # обоих индексов.
+            # Vectors (Phase 3 + the 2026-08-29 decision; Phase 7: + chunk
+            # vectors): created at the first start; on a mismatch between the
+            # recorded configuration (model/dimension) and env — a full
+            # auto-reindex of both indexes.
             _sync_embedding_meta(conn, settings)
-            # Title-индекс (lsb-0001-01, Часть B): полные вектора заметок
-            # невалидны (строились по тексту без названия) — notes_vec
-            # дропается, все заметки в pending; штамп meta-ключа — здесь.
+            # The title index (lsb-0001-01, Part B): the full note vectors are
+            # invalid (built over the text without the title) — notes_vec is
+            # dropped, every note to pending; the meta-key stamp — here.
             _sync_title_vectors(conn, settings, fts_migrated)
             selfheal_chunk_orphans(conn)
     except (sqlite3.Error, OSError) as exc:
@@ -890,26 +915,28 @@ def init_db(settings: Settings, *, note_chars: int | None = None) -> None:
         ) from exc
 
 
-# --- неймспейсы (Фаза 10) --------------------------------------------------
+# --- namespaces (Phase 10) --------------------------------------------------
 
 DEFAULT_NAMESPACE = "default"
-# Описание системного узла — модельный текст, значит EN (№34, 3.2.0). Прежний
-# RU-дефолт остаётся отдельной константой: по нему одноразовая миграция
-# отличает «сид» от правки оператора (см. _migrate_default_namespace_description).
+# The system node description is model-facing text, hence EN (No34, 3.2.0).
+# The former RU default stays a separate constant: the one-off migration uses
+# it to tell a "seed" from an operator edit (see
+# _migrate_default_namespace_description).
 DEFAULT_NAMESPACE_DESCRIPTION = "general notes not tied to any domain"
 DEFAULT_NAMESPACE_DESCRIPTION_LEGACY = "общие заметки, не привязанные к доменам"
 
-# Штамп одноразового доведения описания `default` (№34, 3.2.0): ключ в `meta`.
+# The one-off `default`-description migration stamp (No34, 3.2.0): the key in
+# `meta`.
 DEFAULT_DESCRIPTION_META_KEY = "default_description_version"
 DEFAULT_DESCRIPTION_VERSION = "en-v1"
 
 
 def _migrate_title_column(conn: sqlite3.Connection) -> None:
-    """Нулевая миграция Фазы 11 (решение №9): notes.title TEXT (nullable).
+    """The Phase 11 zero migration: notes.title TEXT (nullable).
 
-    Свежие БД получают колонку из _NOTES_DDL; унаследованные — ALTER TABLE
-    ADD COLUMN (старые заметки остаются без названия — только они могут им
-    быть; новые всегда с title, контракт валидируется сервисом).
+    Fresh databases get the column from _NOTES_DDL; inherited ones — ALTER
+    TABLE ADD COLUMN (old notes stay untitled — only they may be; new ones
+    always carry a title, the contract is validated by the service).
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
     if "title" not in columns:
@@ -917,12 +944,12 @@ def _migrate_title_column(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_comment_column(conn: sqlite3.Connection) -> None:
-    """Нулевая миграция №24 (3.2.0): notes.comment TEXT (nullable).
+    """The No24 zero migration (3.2.0): notes.comment TEXT (nullable).
 
-    Свежие БД получают колонку из _NOTES_DDL; унаследованные — ALTER TABLE
-    ADD COLUMN (идемпотентно, применимо с любой предыдущей версии; NULL =
-    комментария нет). Лимит 250 в схеме НЕ CHECK — валидация доменная
-    (CommentValidationError), как у `title`.
+    Fresh databases get the column from _NOTES_DDL; inherited ones — ALTER
+    TABLE ADD COLUMN (idempotent, applicable from any earlier version;
+    NULL = no comment). The 250 limit is NOT a schema CHECK — the validation
+    is domain-level (CommentValidationError), like `title`.
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
     if "comment" not in columns:
@@ -930,24 +957,24 @@ def _migrate_comment_column(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_comment_fts(conn: sqlite3.Connection) -> None:
-    """FTS-индекс пометок (no24-02, 3.2.0): таблица + оба триггера.
+    """The comment FTS index (no24-02, 3.2.0): the table + both triggers.
 
-    Идемпотентно (IF NOT EXISTS) — повторный старт no-op. Rebuild НЕ делается:
-    на момент миграции комментариев нет (колонка только что создана
-    _migrate_comment_column), а последующие установки пометки идут через
-    `AFTER UPDATE OF comment`. Смысловой `notes_fts` не трогается.
+    Idempotent (IF NOT EXISTS) — a repeated start is a no-op. No rebuild:
+    at migration time there are no comments (the column was just created by
+    _migrate_comment_column), and later comment writes go through
+    `AFTER UPDATE OF comment`. The semantic `notes_fts` is untouched.
     """
     conn.execute(_COMMENT_FTS_DDL)
     for trigger in _COMMENT_TRIGGERS:
         conn.execute(trigger)
 
 
-# Индексы list-выдач (фаза 2, пул 15; замер 50k: LIST p95 204 мс):
-# покрывают ORDER BY updated_at DESC, id DESC — SQLite идёт по индексу
-# (COVERING, уже отсортирован) и останавливается после LIMIT, без полного
-# скана и сортировки. idx_notes_ns_deleted_updated заменяет собой
-# idx_notes_namespace (prefix namespace, deleted_at — те же lookup'ы дедупа
-# и счётчиков), старый индекс сносится при старте.
+# The list-output indexes (phase 2, pool 15; a 50k benchmark: LIST p95 204 ms):
+# they cover ORDER BY updated_at DESC, id DESC — SQLite walks the index
+# (COVERING, already sorted) and stops after LIMIT, with no full scan and no
+# sort. idx_notes_ns_deleted_updated supersedes idx_notes_namespace (the
+# namespace prefix; deleted_at — the same dedup/counter lookups), the old
+# index is dropped at startup.
 _INDEX_DELETED_UPDATED_DDL = (
     "CREATE INDEX IF NOT EXISTS idx_notes_deleted_updated "
     "ON notes(deleted_at, updated_at DESC, id DESC)"
@@ -959,12 +986,12 @@ _INDEX_NS_DELETED_UPDATED_DDL = (
 
 
 def _migrate_namespace_columns(conn: sqlite3.Connection) -> None:
-    """Нулевая миграция Фазы 10 поверх живых БД: колонки notes.namespace и
-    notes.classified_at. Свежие БД получают их из _NOTES_DDL; унаследованные —
-    ALTER TABLE ADD COLUMN (все существующие заметки → 'default',
-    classified_at NULL — причёска разберёт их позже, бриф Фазы 10, US-12).
-    SQLite допускает ADD COLUMN NOT NULL только с константным DEFAULT —
-    'default' им и является.
+    """The Phase 10 zero migration over live databases: the notes.namespace and
+    notes.classified_at columns. Fresh databases get them from _NOTES_DDL;
+    inherited ones — ALTER TABLE ADD COLUMN (every existing note → 'default',
+    classified_at NULL — grooming will sort them out later, the Phase 10 brief,
+    US-12). SQLite allows ADD COLUMN NOT NULL only with a constant DEFAULT —
+    'default' is exactly that.
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
     if "namespace" not in columns:
@@ -976,40 +1003,41 @@ def _migrate_namespace_columns(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_classification_columns(conn: sqlite3.Connection) -> None:
-    """Нулевая миграция Фазы 10 (Шаг 4): колонки разметки причёски
-    confidence. Свежие БД получают её из _NOTES_DDL; унаследованные —
-    ALTER TABLE ADD COLUMN (NULL — причёска разберёт их позже). Параметры
-    разметки — внутренние данные, НЕ в MCP-контрактах (§5.7).
+    """The Phase 10 zero migration (Step 4): the grooming placement column
+    confidence. Fresh databases get it from _NOTES_DDL; inherited ones —
+    ALTER TABLE ADD COLUMN (NULL — grooming will sort them out later). The
+    placement details are internal data, NOT in the MCP contracts (§5.7).
 
-    lsb-0005-04: колонки domain_hint/subdomain_hint сняты со схемы (груминг
-    переведён на единый hint_path — пара больше нигде не читается/пишется),
-    поэтому здесь остаётся только confidence. Бэкфилл старой пары для
-    унаследованных БД живёт в _migrate_hint_path_columns."""
+    lsb-0005-04: the domain_hint/subdomain_hint columns left the schema
+    (grooming moved to the single hint_path — the pair is read/written
+    nowhere anymore), so only confidence remains here. The old-pair backfill
+    for inherited databases lives in _migrate_hint_path_columns."""
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
     if "confidence" not in columns:
         conn.execute("ALTER TABLE notes ADD COLUMN confidence REAL")
 
 
 def _migrate_hint_path_columns(conn: sqlite3.Connection) -> None:
-    """Нулевая миграция lsb-0005-02: единый полный путь разметки hint_path.
+    """The lsb-0005-02 zero migration: the single full placement path hint_path.
 
-    Заменяет пару domain_hint+subdomain_hint на один полный путь. Свежие БД
-    получают колонку из _NOTES_DDL; унаследованные — ALTER TABLE ADD COLUMN
-    + бэкфилл из старой пары (`X/Y` → `hint_path='X/Y'`, `X`+NULL →
-    `hint_path='X'`, оба NULL → NULL). Идемпотентно: бэкфилл пишется только
-    там, где `hint_path` ещё NULL, поэтому повторный запуск не перезаписывает
-    уже размеченные заметки.
+    Replaces the domain_hint+subdomain_hint pair with one full path. Fresh
+    databases get the column from _NOTES_DDL; inherited ones — ALTER TABLE
+    ADD COLUMN + a backfill from the old pair (`X/Y` → `hint_path='X/Y'`,
+    `X`+NULL → `hint_path='X'`, both NULL → NULL). Idempotent: the backfill
+    writes only where `hint_path` is still NULL, so a repeated run never
+    overwrites already-placed notes.
 
-    Колонки domain_hint/subdomain_hint сняты со схемы (lsb-0005-04: груминг
-    переведён на hint_path — пара нигде в app/ больше не читается/пишется,
-    чистая зачистка), поэтому бэкфилл запускается только для СТАРЫХ БД, где
-    пара ещё физически есть (проверка `domain_hint` в структуре таблицы);
-    свежие БД эти колонки не создают и бэкфилл пропускают.
+    The domain_hint/subdomain_hint columns left the schema (lsb-0005-04:
+    grooming moved to hint_path — the pair is no longer read/written anywhere
+    in app/, a clean removal), so the backfill runs only for OLD databases
+    where the pair still physically exists (the `domain_hint` presence check
+    in the table structure); fresh databases do not create those columns and
+    skip the backfill.
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
     if "hint_path" not in columns:
         conn.execute("ALTER TABLE notes ADD COLUMN hint_path TEXT")
-    if "domain_hint" in columns:  # старая БД с парой — бэкфилл
+    if "domain_hint" in columns:  # an old database with the pair — backfill
         conn.execute(
             """
             UPDATE notes SET hint_path = (
@@ -1027,21 +1055,22 @@ def _migrate_hint_path_columns(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_promotions_key(conn: sqlite3.Connection) -> None:
-    """Миграция lsb-0005-03: ключ promotions (domain, subdomain) → единый
-    hint_path (идемпотентно).
+    """The lsb-0005-03 migration: the promotions key (domain, subdomain) → the
+    single hint_path (idempotent).
 
-    Свежие БД получают схему с hint_path PRIMARY KEY прямо из _PROMOTIONS_DDL;
-    унаследованные (ключ (domain, subdomain)) пересоздаются: существующие
-    вердикты мигрируются `hint_path = domain || '/' || subdomain`. Колонки
-    domain/subdomain не переносятся — вердикт полностью описывается
-    полным путём. Идемпотентность — по признаку старой колонки domain:
-    после пересоздания её нет, повторный запуск — no-op.
+    Fresh databases get the hint_path PRIMARY KEY schema straight from
+    _PROMOTIONS_DDL; inherited ones (the (domain, subdomain) key) are
+    recreated: existing verdicts migrate as
+    `hint_path = domain || '/' || subdomain`. The domain/subdomain columns are
+    not carried over — the full path describes the verdict completely.
+    Idempotency — by the presence of the old domain column: after the
+    recreation it is gone, a repeated run is a no-op.
     """
     columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(promotions)")
     }
     if "domain" not in columns:
-        return  # свежая схема (ключ hint_path) или таблицы ещё нет — no-op
+        return  # a fresh schema (the hint_path key) or no table yet — no-op
     with transaction(conn):
         conn.execute("ALTER TABLE promotions RENAME TO promotions_legacy")
         conn.execute(_PROMOTIONS_DDL)
@@ -1054,12 +1083,13 @@ def _migrate_promotions_key(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_expiration_columns(conn: sqlite3.Connection) -> None:
-    """Нулевая миграция lsb-0004-02 поверх живых БД: колонка notes.expires_at
-    и таблица note_expirations. Свежие БД получают колонку из _NOTES_DDL и
-    таблицу из _NOTE_EXPIRATIONS_DDL; унаследованные — ALTER TABLE ADD
-    COLUMN (существующие заметки без TTL → NULL, постоянные) + CREATE TABLE
-    IF NOT EXISTS (очередь удаления). Идемпотентно: повторный запуск не
-    ломает (колонка уже есть — ALTER пропускается, таблица — IF NOT EXISTS)."""
+    """The lsb-0004-02 zero migration over live databases: the notes.expires_at
+    column and the note_expirations table. Fresh databases get the column from
+    _NOTES_DDL and the table from _NOTE_EXPIRATIONS_DDL; inherited ones —
+    ALTER TABLE ADD COLUMN (existing notes without a TTL → NULL, permanent) +
+    CREATE TABLE IF NOT EXISTS (the deletion queue). Idempotent: a repeated
+    run is harmless (the column exists — ALTER is skipped, the table —
+    IF NOT EXISTS)."""
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
     if "expires_at" not in columns:
         conn.execute("ALTER TABLE notes ADD COLUMN expires_at TEXT")
@@ -1067,13 +1097,14 @@ def _migrate_expiration_columns(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_node_order_columns(conn: sqlite3.Connection) -> None:
-    """Нулевая миграция lsb-0011-01 поверх живых БД: маркер notes.node_order_at.
+    """The lsb-0011-01 zero migration over live databases: the
+    notes.node_order_at marker.
 
-    Свежие БД получают колонку из _NOTES_DDL; унаследованные — ALTER TABLE
-    ADD COLUMN (node_order_at NULL у всех заметок: первый прогон джобы `nodes`
-    естественно разбирает накопленный `default` — ретро-прогон). Маркер
-    служебный: в выдачи MCP/REST не выходит, warning'ом не является.
-    Идемпотентно: повторный запуск (рестарт сервиса) — no-op.
+    Fresh databases get the column from _NOTES_DDL; inherited ones — ALTER
+    TABLE ADD COLUMN (node_order_at NULL on every note: the first `nodes` run
+    naturally sweeps the accumulated `default` — a retro sweep). The marker is
+    service-level: it never reaches MCP/REST outputs and is not a warning.
+    Idempotent: a repeated run (a service restart) is a no-op.
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
     if "node_order_at" not in columns:
@@ -1081,14 +1112,15 @@ def _migrate_node_order_columns(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_warnings_columns(conn: sqlite3.Connection) -> None:
-    """Нулевая миграция №12 (3.2.0) поверх живых БД: маркер notes.warnings_at.
+    """The No12 (3.2.0) zero migration over live databases: the
+    notes.warnings_at marker.
 
-    Свежие БД получают колонку из `_NOTES_DDL`; унаследованные — ALTER TABLE
-    ADD COLUMN (warnings_at NULL у всех заметок: первый прогон джобы `warnings`
-    естественно проверяет их). Маркер — служебный (планирование обхода):
-    версий не создаёт, в выдачи MCP/REST не выходит, предупреждение в заметке
-    НЕ хранится (только строка в `warnings`, arch §5.3). Идемпотентно:
-    повторный запуск (рестарт сервиса) — no-op.
+    Fresh databases get the column from `_NOTES_DDL`; inherited ones — ALTER
+    TABLE ADD COLUMN (warnings_at NULL on every note: the first `warnings` run
+    naturally checks them). The marker is service-level (sweep scheduling):
+    it creates no versions, never reaches MCP/REST outputs, and the warning is
+    NOT stored on the note (only the row in `warnings`, arch §5.3).
+    Idempotent: a repeated run (a service restart) is a no-op.
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
     if "warnings_at" not in columns:
@@ -1096,11 +1128,12 @@ def _migrate_warnings_columns(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_warnings_schema(conn: sqlite3.Connection) -> None:
-    """Нулевая миграция №12 (3.2.0): таблица `warnings` + оба индекса (§5.1).
+    """The No12 (3.2.0) zero migration: the `warnings` table + both indexes
+    (§5.1).
 
-    Общая поверхность предупреждений памяти и терминов (№12 + №32).
-    CREATE TABLE/INDEX IF NOT EXISTS — идемпотентно, повторный старт no-op;
-    моделей и прочих таблиц не касается (arch §5.4).
+    The shared warnings surface of memory and terms (No12 + No32).
+    CREATE TABLE/INDEX IF NOT EXISTS — idempotent, a repeated start is a
+    no-op; it touches no models and no other tables (arch §5.4).
     """
     conn.execute(_WARNINGS_DDL)
     conn.execute(_WARNINGS_UNIQUE_INDEX_DDL)
@@ -1108,13 +1141,13 @@ def _migrate_warnings_schema(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_link_columns(conn: sqlite3.Connection) -> None:
-    """Нулевая миграция lsb-0010-02 поверх живых БД: таблица links, индекс
-    idx_links_b и маркер расчёта notes.links_at.
+    """The lsb-0010-02 zero migration over live databases: the links table, the
+    idx_links_b index and the notes.links_at computed marker.
 
-    Свежие БД получают колонку из _NOTES_DDL и таблицу из _LINKS_DDL;
-    унаследованные — ALTER TABLE ADD COLUMN (links_at NULL у всех заметок:
-    первый прогон джобы `links` естественно делает backfill, arch §3.4) +
-    CREATE TABLE/INDEX IF NOT EXISTS. Идемпотентно: повторный запуск — no-op.
+    Fresh databases get the column from _NOTES_DDL and the table from
+    _LINKS_DDL; inherited ones — ALTER TABLE ADD COLUMN (links_at NULL on
+    every note: the first `links` run naturally backfills, arch §3.4) +
+    CREATE TABLE/INDEX IF NOT EXISTS. Idempotent: a repeated run is a no-op.
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
     if "links_at" not in columns:
@@ -1126,28 +1159,30 @@ def _migrate_link_columns(conn: sqlite3.Connection) -> None:
 def _migrate_summary_length(
     conn: sqlite3.Connection, settings: Settings
 ) -> None:
-    """Миграция гейта 3.1.0 (2026-09-19): саммари длиннее лимита — на перегенерацию.
+    """The 3.1.0 gate migration: summaries above the limit go to regeneration.
 
-    Лимит длины саммари снижен до MAX_SUMMARY_CHARS (150): у живой БД уже
-    сохранённые более длинные саммари надо переделать. Хранимый текст здесь
-    НЕ трогается (грубое `substr` запрещено: обрезанная посередине фразы
-    выжимка хуже отсутствия): заметка помечается `summary_status='pending'`,
-    а новую выжимку кладёт фоновая джоба `summary` (`worker.process_summary_pending`
-    — `cap_summary` держит лимит). Пока саммари перегенерируется, выдачи
-    отдают fallback-усечение текста заметки (§5.5) — оно уже ≤ лимита.
+    The summary length limit dropped to MAX_SUMMARY_CHARS (150): a live DB's
+    already-saved longer summaries must be redone. The stored text is NOT
+    touched here (a crude `substr` is forbidden: a summary cut mid-sentence is
+    worse than none): the note is marked `summary_status='pending'`, and the
+    background `summary` job places the new one
+    (`worker.process_summary_pending` — `cap_summary` enforces the limit).
+    While a summary regenerates, outputs serve the fallback truncation of the
+    note text (§5.5) — already within the limit.
 
-    Идемпотентность: после перегенерации саммари ≤ лимита — повторный старт
-    ничего не находит (no-op), штамп в meta не нужен.
+    Idempotency: after regeneration the summary is <= the limit — a repeated
+    start finds nothing (a no-op), no meta stamp needed.
 
-    Что не трогаем:
-    - заметки с `summary_status != 'ok'` — они и так в очереди суммаризации
-      (повторная пометка ничего не меняет, статус не переписывается);
-    - trash (`deleted_at IS NOT NULL`) — джоба `summary` его не обслуживает,
-      заметка осталась бы вечно pending; саммари мусорных строк не важно.
+    What is not touched:
+    - notes with `summary_status != 'ok'` — they are already in the
+      summarization queue (a repeated mark changes nothing, the status is not
+      rewritten);
+    - trash (`deleted_at IS NOT NULL`) — the `summary` job does not serve it,
+      the note would stay pending forever; trash summaries do not matter.
 
-    Признака происхождения саммари в схеме нет (модель или явная передача),
-    поэтому явно вписанные длинные саммари тоже уходят на перегенерацию —
-    лимит один на всё поле `summary`.
+    The schema carries no summary-origin marker (model or explicit), so
+    explicitly written long summaries also go to regeneration — the limit is
+    one for the whole `summary` field.
     """
     cursor = conn.execute(
         "UPDATE notes SET summary_status = 'pending' "
@@ -1168,12 +1203,12 @@ def _migrate_summary_length(
 
 
 def _ensure_skills_meta(conn: sqlite3.Connection) -> None:
-    """Сид глобального instruction_template области навыков (идемпотентно).
+    """Seed the skills-area global instruction_template (idempotent).
 
-    По образцу _ensure_default_namespace: запись создаётся только при
-    отсутствии ключа. Существующее значение НЕ перезаписывается — шаблон
-    правит оператор через REST (lsb-0007-05), повторный init_db (рестарт
-    сервиса) его правку не затирает.
+    Modeled after _ensure_default_namespace: the record is created only when
+    the key is absent. An existing value is NEVER overwritten — the operator
+    edits the template via REST (lsb-0007-05), a repeated init_db (a restart
+    of the service) never wipes that edit.
     """
     conn.execute(
         "INSERT INTO skills_meta (key, value) VALUES (?, ?) "
@@ -1183,14 +1218,15 @@ def _ensure_skills_meta(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_creator_skill(conn: sqlite3.Connection) -> None:
-    """Сид skill-создателя области навыков (lsb-0007 §3.6/§3.8), идемпотентно.
+    """Seed the skills-area skill-creator (lsb-0007 §3.6/§3.8), idempotent.
 
-    Сид — ОДНА попытка на жизнь БД (маркер `creator_skill_seed` в
-    `skills_meta`): пока маркера нет и активной записи с именем
-    `CREATOR_SKILL_NAME` нет — навык вставляется; маркер пишется в любом
-    случае, когда сид проходит гейт. Так повторный init_db (рестарт сервиса)
-    не плодит копий, а удалённый оператором или моделью сид НЕ воскресает
-    (мягко удалённая строка остаётся в trash, маркер — в skills_meta).
+    The seed is ONE attempt per database lifetime (the `creator_skill_seed`
+    marker in `skills_meta`): while the marker is absent and no live record
+    named `CREATOR_SKILL_NAME` exists — the skill is inserted; the marker is
+    written whenever the seed passes the gate. This way a repeated init_db (a
+    service restart) spawns no copies, and a seed deleted by the operator or a
+    model does NOT resurrect (the soft-deleted row stays in trash, the marker —
+    in skills_meta).
     """
     seeded = conn.execute(
         "SELECT 1 FROM skills_meta WHERE key = ?", (CREATOR_SKILL_SEED_KEY,)
@@ -1219,10 +1255,10 @@ def _ensure_creator_skill(conn: sqlite3.Connection) -> None:
     )
 
 
-# --- история версий (№41, релиз 3.2.0) --------------------------------------
+# --- version history (No41, 3.2.0) --------------------------------------
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
-    """Существует ли объект-таблица в БД (идемпотентность шагов по наличию)."""
+    """Whether the table object exists in the DB (step idempotency by presence)."""
     return (
         conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
@@ -1232,10 +1268,11 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
 
 
 def _history_projection(entity: str, row: sqlite3.Row, fields: tuple[str, ...]) -> dict:
-    """Проекция записи для истории (§5.3): поля как есть, `extra` — объектом.
+    """The record projection for history (§5.3): fields as is, `extra` as an object.
 
-    `extra` навыка в живой таблице — JSON-текст полей класса; в версии он живёт
-    распарсенным объектом (одна форма у baseline и дельт), пусто — `None`.
+    A skill's `extra` in the live table is the JSON text of the class fields;
+    in a version it lives as the parsed object (one shape for the baseline and
+    the deltas), empty — `None`.
     """
     projection: dict = {}
     for field in fields:
@@ -1249,10 +1286,10 @@ def _history_projection(entity: str, row: sqlite3.Row, fields: tuple[str, ...]) 
 def _insert_baseline(
     conn: sqlite3.Connection, entity: str, entity_id: int, projection: dict
 ) -> None:
-    """`INSERT … WHERE NOT EXISTS`: baseline только там, где истории ещё нет.
+    """`INSERT … WHERE NOT EXISTS`: a baseline only where history does not exist yet.
 
-    Само-лечаще: строка, появившаяся после baseline-миграции, добирает baseline
-    при следующем старте; повторный проход — no-op (§5.4).
+    Self-healing: a row that appeared after the baseline migration picks up its
+    baseline at the next start; a repeated pass is a no-op (§5.4).
     """
     conn.execute(
         "INSERT INTO record_versions (entity, entity_id, version, event, source, "
@@ -1264,12 +1301,12 @@ def _insert_baseline(
 
 
 def _backfill_history_baseline(conn: sqlite3.Connection) -> None:
-    """Baseline всех существующих записей: `version=1` = текущее содержимое.
+    """Baseline every existing record: `version=1` = the current content.
 
-    Проекция собирается в Python (`json.dumps`) — без зависимости от SQLite
-    json1; проход по каждой сущности отдельный, `WHERE NOT EXISTS` держит
-    идемпотентность (FR-8.1/FR-8.2, §5.4). Записи в trash тоже получают
-    baseline: история — операторская, мягкое удаление её не отменяет.
+    The projection is assembled in Python (`json.dumps`) — no SQLite json1
+    dependency; a separate pass per entity, `WHERE NOT EXISTS` keeps it
+    idempotent (FR-8.1/FR-8.2, §5.4). Trash records get a baseline too:
+    history is operator-facing, a soft delete does not undo it.
     """
     from app.services.history import (
         CONTENT_FIELDS,
@@ -1298,7 +1335,7 @@ def _backfill_history_baseline(conn: sqlite3.Connection) -> None:
                 int(row["id"]),
                 _history_projection(entity, row, fields),
             )
-    # Глобальный шаблон навыков — отдельная сущность истории (id 0, ключ
+    # The skills global template — a separate history entity (id 0, the key
     # skills_meta.instruction_template, §5.3).
     template = conn.execute(
         "SELECT value FROM skills_meta WHERE key = ?", (INSTRUCTION_TEMPLATE_KEY,)
@@ -1310,17 +1347,18 @@ def _backfill_history_baseline(conn: sqlite3.Connection) -> None:
 
 
 def _merge_skill_versions(conn: sqlite3.Connection, settings: Settings) -> None:
-    """Перенести архив `skill_versions` в общую форму истории (§5.4, §13.7).
+    """Move the `skill_versions` archive into the shared history shape (§5.4, §13.7).
 
-    Цепочка `1..N`: v1 — самая ранняя архивная копия целиком (`snapshot`,
-    `event='baseline'`, `source='migration'`), промежуточные — дельты,
-    посчитанные из архивных копий на месте переноса, vN — текущая строка
-    `skills` (дельта от предыдущей). Номера — из `skill_versions.version` и
-    `skills.version`; недостающие звенья не выдумываются — дельта считается
-    между соседними ИМЕЮЩИМИСЯ версиями. Перенос идёт одной транзакцией
-    вызывающего; таблица `skill_versions` остаётся legacy-слепком (§13.7) и
-    кодом больше не читается. Навык, у которого история уже есть, пропускается:
-    шаг идемпотентен; таблицы нет — no-op.
+    The chain `1..N`: v1 — the earliest archived copy whole (`snapshot`,
+    `event='baseline'`, `source='migration'`), the middle ones — deltas
+    computed from the archived copies during the move, vN — the current `skills`
+    row (a delta from the previous one). The numbers come from
+    `skill_versions.version` and `skills.version`; missing links are not
+    invented — the delta is computed
+    between the neighboring versions THAT EXIST. The move runs in the
+    caller's single transaction; the `skill_versions` table stays a legacy
+    imprint (§13.7) and is no longer read by code. A skill that already has
+    history is skipped: the step is idempotent; no table — a no-op.
     """
     from app.services.history import CONTENT_FIELDS, ENTITY_SKILL, encode_delta
 
@@ -1384,15 +1422,16 @@ def _merge_skill_versions(conn: sqlite3.Connection, settings: Settings) -> None:
 
 
 def _migrate_history_schema(conn: sqlite3.Connection, settings: Settings) -> None:
-    """Схема истории + baseline существующих записей + перенос skill_versions.
+    """The history schema + baselining existing records + the skill_versions move.
 
-    Шаги постановки no41-01: (а) `CREATE TABLE IF NOT EXISTS record_versions`
-    (§5.1 — точно как в архитектуре, без индексов сверх PK); (б) перенос архива
-    навыков в общую форму; (в) baseline всех существующих записей. Порядок
-    «перенос → бэкфилл» обязателен: у навыка с архивом baseline — самая ранняя
-    архивная копия, а не текущая строка (иначе v1 был бы перезаписан текущим
-    содержимым и цепочка архива стала бы недостижима). Всё одной транзакцией,
-    идемпотентно и применимо с любой предыдущей версии.
+    The no41-01 design steps: (a) `CREATE TABLE IF NOT EXISTS record_versions`
+    (§5.1 — exactly as in the architecture, no indexes beyond the PK);
+    (b) moving the skills archive into the shared shape; (c) baselining every
+    existing record. The "move → backfill" order is mandatory: for a skill
+    with an archive the baseline is the earliest archived copy, not the
+    current row (otherwise v1 would be overwritten by the current content and
+    the archive chain would become unreachable). All in one transaction,
+    idempotent and applicable from any earlier version.
     """
     with transaction(conn):
         conn.execute(_RECORD_VERSIONS_DDL)
@@ -1401,8 +1440,8 @@ def _migrate_history_schema(conn: sqlite3.Connection, settings: Settings) -> Non
 
 
 def _ensure_default_namespace(conn: sqlite3.Connection) -> None:
-    """Узел 'default' существует всегда (идемпотентно): описание — дефолт,
-    оператор может править его через REST (Шаг 6)."""
+    """The 'default' node always exists (idempotent): the description is the
+    default one; the operator may edit it via REST (Step 6)."""
     conn.execute(
         "INSERT INTO namespaces (path, description, status) VALUES (?, ?, 'confirmed') "
         "ON CONFLICT(path) DO NOTHING",
@@ -1411,14 +1450,15 @@ def _ensure_default_namespace(conn: sqlite3.Connection) -> None:
 
 
 def _sync_namespace_partition(conn: sqlite3.Connection, settings: Settings) -> None:
-    """Миграция vec-индексов под партицию namespace (Фаза 10).
+    """Migrate the vec indexes under the namespace partition (Phase 10).
 
-    У БД, созданных до Фазы 10, notes_vec/notes_chunks_vec без колонки `+ns`:
-    ОБЕ таблицы дропаются и пересоздаются с partition key, все заметки
-    (включая trash) уходят в vector_status='pending' — фоновый воркер
-    пере-кодирует (NFR-3: данные не теряются, поиск деградирует к FTS).
-    Свежие БД пропускаются: их таблицы создаются в _sync_embedding_meta уже
-    с партицией. Вызывается ДО _sync_embedding_meta (см. init_db).
+    Databases created before Phase 10 have notes_vec/notes_chunks_vec without
+    the `+ns` column: BOTH tables are dropped and recreated with the partition
+    key, every note (trash included) goes to vector_status='pending' — the
+    background worker re-encodes (NFR-3: no data is lost, search degrades to
+    FTS). Fresh databases are skipped: their tables are created in
+    _sync_embedding_meta already partitioned. Called BEFORE
+    _sync_embedding_meta (see init_db).
     """
     if vectors.has_partition(conn) and chunks.has_partition(conn):
         return
@@ -1427,7 +1467,7 @@ def _sync_namespace_partition(conn: sqlite3.Connection, settings: Settings) -> N
         or chunks.existing_vec_dim(conn) is not None
     )
     if not has_tables:
-        return  # свежая БД — таблицы создадутся ниже уже с партицией
+        return  # a fresh DB — the tables are created below already partitioned
     notes_count = int(conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0])
     logging.getLogger("app").warning(
         "namespace partition introduced: rebuilding vector indexes",
@@ -1466,24 +1506,25 @@ def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def _migrate_default_namespace_description(conn: sqlite3.Connection) -> None:
-    """Довести описание узла `default` до EN (№34, 3.2.0): одноразово.
+    """Bring the `default` node description to EN (No34, 3.2.0): one-off.
 
-    Свежая БД получает EN-текст из `_ensure_default_namespace` — для неё
-    миграция no-op (текст не равен прежнему RU-дефолту), но штамп всё равно
-    ставится. Унаследованная БД правится ТОЛЬКО если описание точно равно
-    прежнему русскому дефолту (DEFAULT_NAMESPACE_DESCRIPTION_LEGACY): любая
-    иная, в том числе русская, правка оператора сохраняется — «сид» и
-    «правка» различаются сравнением текста, новой колонки не заводится.
+    A fresh database gets the EN text from `_ensure_default_namespace` — for
+    it the migration is a no-op (the text does not equal the former RU
+    default), but the stamp is set anyway. An inherited database is edited
+    ONLY when the description exactly equals the former Russian default
+    (DEFAULT_NAMESPACE_DESCRIPTION_LEGACY): any other edit — including a
+    Russian one — by the operator is preserved; "seed" and "edit" are
+    distinguished by text comparison, no new column is introduced.
 
-    Одноразовость даёт штамп DEFAULT_DESCRIPTION_META_KEY в `meta`: он
-    ставится НЕЗАВИСИМО от исхода (обновлена строка или нет), поэтому
-    повторный `init_db` ничего не ищет и ничего не меняет. Вызывается в
-    `init_db` сразу после `_ensure_default_namespace`.
+    The one-off nature comes from the DEFAULT_DESCRIPTION_META_KEY stamp in
+    `meta`: it is set INDEPENDENTLY of the outcome (whether the row was
+    updated or not), so a repeated `init_db` searches nothing and changes
+    nothing. Called in `init_db` right after `_ensure_default_namespace`.
     """
-    conn.execute(_META_DDL)  # meta может ещё не существовать у древних БД —
-    # штатно таблица создаётся позже, в _sync_embedding_meta (см. init_db)
+    conn.execute(_META_DDL)  # meta may not exist in ancient databases yet —
+    # normally the table is created later, in _sync_embedding_meta (see init_db)
     if _get_meta(conn, DEFAULT_DESCRIPTION_META_KEY) is not None:
-        return  # доведено ранее — идемпотентно
+        return  # brought over earlier — idempotent
     with transaction(conn):
         cursor = conn.execute(
             "UPDATE namespaces SET description = ?, "
@@ -1508,45 +1549,46 @@ def _migrate_default_namespace_description(conn: sqlite3.Connection) -> None:
         _set_meta(conn, DEFAULT_DESCRIPTION_META_KEY, DEFAULT_DESCRIPTION_VERSION)
 
 
-# --- title-индекс (lsb-0001-01) ---------------------------------------------
+# --- the title index (lsb-0001-01) ---------------------------------------------
 
-# Штамп миграции в meta: «2» — notes_fts индексирует title и text (FR-1.2/
-# FR-1.3); отсутствие ключа = БД, не прошедшая title-миграцию (FTS только
-# по text). Общий для Части A (FTS) и Части B (вектора).
+# The migration stamp in meta: "2" — notes_fts indexes title and text (FR-1.2/
+# FR-1.3); an absent key = a database that has not passed the title migration
+# (FTS over text only). Shared by Part A (FTS) and Part B (vectors).
 _TITLE_INDEX_META_KEY = "title_index_version"
 _TITLE_INDEX_VERSION = "2"
 
 
 def _sync_fts_title_index(conn: sqlite3.Connection) -> bool:
-    """Часть A миграции title-индекса (lsb-0001-01): notes_fts под (title, text).
+    """Part A of the title-index migration (lsb-0001-01): notes_fts under (title, text).
 
-    Живые БД до lsb-0001-01 имеют notes_fts с одной колонкой text: таблица
-    дропается и пересоздаётся по _FTS_DDL, индекс переливается из notes
-    (rowid, title, text — title может быть NULL, FTS5 трактует его как
-    пустую строку), триггеры пересоздаются под новые колонки. Решение
-    гейта R4 — миграция при старте, не джоба; идемпотентность — общий
-    с Частью B meta-ключ _TITLE_INDEX_META_KEY (штамп ставит
-    _sync_title_vectors в конце init_db).
+    Live databases predating lsb-0001-01 have a notes_fts with a single text
+    column: the table is dropped and recreated per _FTS_DDL, the index is
+    re-poured from notes (rowid, title, text — the title may be NULL, FTS5
+    treats it as an empty string), the triggers are recreated for the new
+    columns. The gate decision R4 — a startup migration, not a job;
+    idempotency — the meta key _TITLE_INDEX_META_KEY shared with Part B (the
+    stamp is set by _sync_title_vectors at the end of init_db).
 
-    Условие запуска: ключа нет И DDL notes_fts в sqlite_master без title
-    (регексп _FTS_TITLE_RE). Ключа нет, но DDL уже с title (свежая БД) —
-    no-op. Вызывается после миграций колонок: к моменту вызова notes.title
-    уже существует (перелив читает её) и ДО _check_fts_integrity — перелив
-    оставляет индекс консистентным.
+    The launch condition: the key is absent AND the notes_fts DDL in
+    sqlite_master has no title (the _FTS_TITLE_RE regexp). The key absent but
+    the DDL already with title (a fresh DB) — a no-op. Called after the column
+    migrations: by the call time notes.title already exists (the pour reads
+    it) and BEFORE _check_fts_integrity — the pour leaves the index
+    consistent.
 
-    Возвращает True, если в этом запуске БД была легаси и перестроена, —
-    Часть B (_sync_title_vectors) инвалидирует полные вектора только вслед
-    за фактической перестройкой FTS.
+    Returns True when this run found a legacy database and rebuilt it — Part B
+    (_sync_title_vectors) invalidates the full vectors only following an
+    actual FTS rebuild.
     """
-    conn.execute(_META_DDL)  # meta может ещё не существовать у древних БД —
-    # штатно таблица создаётся позже, в _sync_embedding_meta (см. init_db)
+    conn.execute(_META_DDL)  # meta may not exist in ancient databases yet —
+    # normally the table is created later, in _sync_embedding_meta (see init_db)
     if _get_meta(conn, _TITLE_INDEX_META_KEY) is not None:
-        return False  # мигрировано ранее — штамп ставит _sync_title_vectors
+        return False  # migrated earlier — _sync_title_vectors sets the stamp
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'notes_fts'"
     ).fetchone()
     if row is None or row[0] is None or _FTS_TITLE_RE.search(row[0]):
-        return False  # свежая БД: notes_fts создана выше уже с колонкой title
+        return False  # a fresh DB: notes_fts was created above with the title column
     notes_count = int(conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0])
     logging.getLogger("app").warning(
         "note title added to FTS index: rebuilding notes_fts",
@@ -1579,26 +1621,28 @@ def _sync_fts_title_index(conn: sqlite3.Connection) -> bool:
 def _sync_title_vectors(
     conn: sqlite3.Connection, settings: Settings, fts_migrated: bool
 ) -> None:
-    """Часть B миграции title-индекса (lsb-0001-01): полные вектора.
+    """Part B of the title-index migration (lsb-0001-01): the full vectors.
 
-    Полные вектора (notes_vec) считались по тексту БЕЗ названия — после
-    ввода title в FTS (и в кодирование, шаг 2) они невалидны: notes_vec
-    дропается, все заметки (включая trash) уходят в vector_status='pending',
-    вектора в этом шаге не кодируются — догоняет фоновый воркер.
-    notes_chunks_vec НЕ трогается (решение гейта R4): вектора чанков
-    строятся по текстам чанков, название на них не влияет.
+    The full vectors (notes_vec) were computed over the text WITHOUT the
+    title — after the title entered FTS (and the encoding, step 2) they are
+    invalid: notes_vec is dropped, every note (trash included) goes to
+    vector_status='pending'; no vectors are encoded in this step — the
+    background worker catches up. notes_chunks_vec is NOT touched (the gate
+    decision R4): chunk vectors are built over chunk texts, the title does not
+    affect them.
 
-    Условие: ключа нет (общий с Частью A) И в этом же запуске была
-    перестроена FTS (`fts_migrated` от _sync_fts_title_index): обе части
-    миграции двигаются вместе — штамп в meta не спасает от ручной потери
-    meta целиком, а дропать валидные вектора из-за одной только потери
-    штампа не нужно (без истории в meta вектора считаются актуальными —
-    как в нулевой миграции _sync_embedding_meta). Штамп ключа — в конце,
-    всегда (в т.ч. свежей БД с нулём заметок — пере-кодировать нечего).
+    The condition: the key is absent (shared with Part A) AND the FTS was
+    rebuilt in this same run (`fts_migrated` from _sync_fts_title_index): the
+    two migration parts move together — a meta stamp does not protect against
+    losing the whole meta manually, and dropping valid vectors because of a
+    lost stamp alone is unnecessary (without meta history the vectors count as
+    fresh — as in the _sync_embedding_meta zero migration). The key stamp —
+    at the end, always (including a fresh DB with zero notes — nothing to
+    re-encode).
 
-    Вызывается после _sync_embedding_meta: её ветки (смена модели/чанков)
-    успевают пересоздать таблицы текущей конфигурации — дроп здесь их уже
-    не ломает; ДО selfheal_chunk_orphans.
+    Called after _sync_embedding_meta: its branches (a model/chunk change)
+    have already recreated the tables of the current configuration — the drop
+    here no longer breaks them; BEFORE selfheal_chunk_orphans.
     """
     if _get_meta(conn, _TITLE_INDEX_META_KEY) is not None:
         return
@@ -1614,7 +1658,7 @@ def _sync_title_vectors(
         )
         conn.execute("DROP TABLE IF EXISTS notes_vec")
         vectors.create_vec_table(conn, settings.embedding_dim)
-        # Полные вектора невалидны — все заметки (включая trash) в очередь.
+        # The full vectors are invalid — every note (trash included) to the queue.
         conn.execute("UPDATE notes SET vector_status = 'pending'")
         logging.getLogger("app").info(
             "notes_vec rebuilt; background worker will re-encode all notes",
@@ -1627,34 +1671,34 @@ def _sync_title_vectors(
     _set_meta(conn, _TITLE_INDEX_META_KEY, _TITLE_INDEX_VERSION)
 
 
-# Описания чанк-параметров (Фаза 7, brief §4): фиксируются в meta —
-# смена любого из них поверх живой БД означает пере-чанковку (шаг 6).
+# The chunk-parameter descriptions (Phase 7, brief §4): pinned in meta —
+# changing any of them over a live DB means re-chunking (step 6).
 _CHUNK_META_KEYS = ("chunk_size", "chunk_overlap", "chunk_min_target")
 
 
 def _set_chunk_meta_defaults(conn: sqlite3.Connection, settings: Settings) -> None:
-    """Зафиксировать чанк-параметры в meta (нулевая миграция: отсутствующий
-    ключ — из env, без пере-чанковки; сравнение с env и пере-чанковка при
-    смене значения — шаг 6 Фазы 7)."""
+    """Pin the chunk parameters in meta (the zero migration: an absent key —
+    from env, no re-chunking; the env comparison and re-chunking on a change —
+    step 6 of Phase 7)."""
     for key in _CHUNK_META_KEYS:
         if _get_meta(conn, key) is None:
             _set_meta(conn, key, str(getattr(settings, key)))
 
 
 def _create_chunk_vec_if_missing(conn: sqlite3.Connection, dim: int) -> None:
-    """notes_chunks_vec появилась в Фазе 7 поверх живых БД — создать, если
-    её ещё нет (не реиндексируя заметки — их вектора и так текущие)."""
+    """notes_chunks_vec arrived in Phase 7 over live databases — create it when
+    missing (without reindexing notes — their vectors are current anyway)."""
     if chunks.existing_vec_dim(conn) is None:
         chunks.create_vec_table(conn, dim)
 
 
 def selfheal_chunk_orphans(conn: sqlite3.Connection) -> None:
-    """Вычистить сироты чанков при старте (Фаза 7, как FTS-integrity).
+    """Clean chunk orphans at startup (Phase 7, like the FTS integrity check).
 
-    Операторский sqlite3-CLI без PRAGMA foreign_keys=ON не каскадирует
-    физическое удаление заметки в чанки, а vec0 FK не поддерживает вовсе:
-    чанки без заметки и вектора без чанка убираются самолечением, событие в
-    лог — только если чистить было что."""
+    An operator's sqlite3 CLI without PRAGMA foreign_keys=ON does not cascade
+    a hard note deletion into chunks, and vec0 has no FK support at all:
+    chunks without a note and vectors without a chunk are removed by
+    self-healing; the log event fires only when there was something to clean."""
     dead_chunks, dead_vectors = chunks.clean_orphans(conn)
     if dead_chunks or dead_vectors:
         logging.getLogger("app").warning(
@@ -1668,44 +1712,45 @@ def selfheal_chunk_orphans(conn: sqlite3.Connection) -> None:
 
 
 def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
-    """Сверить конфигурацию векторизации/чанков с записями в meta; разошлись —
-    автореиндексация при старте.
+    """Compare the vectorization/chunking configuration with the meta records;
+    on a divergence — an auto-reindex at startup.
 
-    Две разные причины, одна механика (b972386, решение О. 2026-08-29):
-    - смена модели/размерности/провайдера (env vs meta embedding_model/
-      embedding_dim/embedding_provider, Фаза 11 — провайдер): ОБА векторных
-      индекса пересоздаются под текущую размерность, все заметки (включая
-      trash — их вектора тоже невалидны) уходят в pending, воркер
-      пере-кодирует полные вектора;
-    - смена чанк-параметров (env vs meta chunk_*, Фаза 7, brief §6): вектора
-      полного текста остаются валидными (текст не менялся) — дропается только
-      notes_chunks_vec; тексты чанков ПЕРЕСЧИТЫВАЮТСЯ у всех заметок
-      (включая trash) по текущим параметрам сплиттера, воркер до-векторизует.
-    Оба изменения сразу — работает по совокупности: один reindex_started/done,
-    пересоздание обоих индексов, все заметки pending + пере-чанковка.
+    Two different causes, one mechanics:
+    - a model/dimension/provider change (env vs the meta embedding_model/
+      embedding_dim/embedding_provider; the provider — Phase 11): BOTH vector
+      indexes are recreated under the current dimension, every note (trash
+      included — its vectors are invalid too) goes to pending, and the worker
+      re-encodes the full vectors;
+    - a chunk-parameter change (env vs the meta chunk_*, Phase 7, brief §6):
+      the full-text vectors stay valid (the text did not change) — only
+      notes_chunks_vec is dropped; the chunk texts are RECOMPUTED for every
+      note (trash included) under the current splitter parameters, and the
+      worker finishes the vectors.
+    Both changes at once — the combined path: one reindex_started/done, the
+    recreation of both indexes, every note pending + re-chunking.
 
-    Reuse при пере-чанковке: у заметки с ровно одним чанком ≤ CHUNK_SIZE
-    вектор чанка = вектор полного текста из notes_vec без кодирования —
-    вектор не зависит от чанк-параметров, а при сменившейся модели notes_vec
-    уже пуст (дропнут до пере-чанковки) — reuse сам не сработает там, где
-    полный вектор невалиден.
+    Reuse during re-chunking: for a note with exactly one chunk <= CHUNK_SIZE
+    the chunk vector = the full-text vector from notes_vec without encoding —
+    a vector does not depend on the chunk parameters, and with a changed model
+    notes_vec is already empty (dropped before the re-chunking) — reuse itself
+    never fires where the full vector is invalid.
 
-    Наследие: у БД без meta (созданных до этой правки) запись создаётся из
-    текущего env без реиндексации — нулевая миграция; их вектора и так
-    были построены той же моделью (иначе оператор потратил бы reindex.py).
-    Чанк-параметры в meta пишутся аналогично — только отсутствующие ключи
-    (отсутствие = «не менялись», сравнение с env только по существующим).
-    Провайдер эмбеддинга (Фаза 11) — тот же паттерн: у БД без ключа
-    embedding_provider (до Фазы 11) запись из env без реиндексации; смена
-    провайдера при том же имени модели — тоже реиндекс (вектора другой
-    провайдерской модели несовместимы).
+    Legacy: a database without meta (created before this change) gets the
+    record from the current env without a reindex — the zero migration; its
+    vectors were built by the same model anyway (otherwise the operator would
+    have run reindex.py). The chunk parameters are written to meta the same
+    way — only absent keys (absence = "never changed"; the env comparison runs
+    over existing keys only). The embedding provider (Phase 11) — the same
+    pattern: a database without the embedding_provider key (pre-Phase 11) gets
+    the env record without a reindex; a provider change under the same model
+    name is a reindex too (another provider's model vectors are incompatible).
     """
     conn.execute(_META_DDL)
     stored = _get_meta(conn, "embedding_model")
     stored_dim_raw = _get_meta(conn, "embedding_dim")
     existing_dim = vectors.existing_vec_dim(conn)
     if stored is None or stored_dim_raw is None:
-        # Свежая БД (нет таблицы) или унаследованная (не трогаем, см. docstring).
+        # A fresh DB (no table) or an inherited one (untouched, see the docstring).
         if existing_dim is None:
             vectors.create_vec_table(conn, settings.embedding_dim)
         _create_chunk_vec_if_missing(conn, settings.embedding_dim)
@@ -1716,8 +1761,9 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
         _set_meta(conn, "embedding_provider", settings.embedding_provider)
         return
     stored_dim = int(stored_dim_raw)
-    # Провайдер эмбеддинга (Фаза 11): у БД без ключа (до Фазы 11) — нулевая
-    # миграция по паттерну chunk-ключей: запись из env БЕЗ реиндексации.
+    # The embedding provider (Phase 11): a database without the key (pre-Phase
+    # 11) — the zero migration by the chunk-key pattern: the env record WITHOUT
+    # a reindex.
     stored_provider = _get_meta(conn, "embedding_provider")
     if stored_provider is None:
         _set_meta(conn, "embedding_provider", settings.embedding_provider)
@@ -1727,8 +1773,8 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
         or stored_dim != settings.embedding_dim
         or stored_provider != settings.embedding_provider
     )
-    # Чанк-параметры: сравниваем ТОЛЬКО зафиксированные ранее ключи
-    # (отсутствующий ключ — нулевая миграция, «не менялись», пишется ниже).
+    # Chunk parameters: compare ONLY the previously pinned keys (an absent key
+    # is the zero migration — "never changed"; written below).
     chunk_changes = {
         key: (str(stored_value), str(getattr(settings, key)))
         for key in _CHUNK_META_KEYS
@@ -1736,9 +1782,9 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
         and stored_value != str(getattr(settings, key))
     }
     if not model_changed and not chunk_changes:
-        # Совпало: но notes_chunks_vec могла ещё не существовать на живой БД
-        # (Фаза 7 поверх Фазы 5) — создать при отсутствии. Area-vec — та же
-        # логика (наследники до 3.0.0: у них есть meta, но нет областей).
+        # A match: but notes_chunks_vec may not exist yet on a live DB
+        # (Phase 7 over Phase 5) — create when missing. Area vecs — the same
+        # logic (pre-3.0.0 inheritors: they have meta but no areas).
         _create_chunk_vec_if_missing(conn, settings.embedding_dim)
         _create_area_vec_if_missing(conn, settings.embedding_dim)
         _set_chunk_meta_defaults(conn, settings)
@@ -1768,25 +1814,28 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
     if model_changed:
         conn.execute("DROP TABLE IF EXISTS notes_vec")
         vectors.create_vec_table(conn, settings.embedding_dim)
-        # Вектора полных текстов невалидны — все заметки (вкл. trash) в очередь.
+        # The full-text vectors are invalid — every note (trash included) to
+        # the queue.
         conn.execute("UPDATE notes SET vector_status = 'pending'")
-        # Связи уровня 1 (lsb-0010-02, arch §3.4): косинус считается по этим
-        # векторам, «значимые слова»/упоминания — по тексту, но связи другой
-        # модели невалидны целиком — таблица очищается, маркеры сброшены
-        # (расчёт догонит воркер после до-векторизации).
+        # Level-1 links (lsb-0010-02, arch §3.4): the cosine is computed over
+        # these vectors and "significant words"/mentions over the text, but
+        # another model's links are invalid wholesale — the table is cleared,
+        # the markers reset (the computation catches up after the worker
+        # finishes re-encoding).
         conn.execute("UPDATE notes SET links_at = NULL")
         conn.execute("DELETE FROM links")
-        # Области 3.0.0: вектора другой модели несовместимы — area-vec
-        # дропаются и пересоздаются, все записи областей → pending.
+        # The 3.0.0 areas: another model's vectors are incompatible — the area
+        # vecs are dropped and recreated, every area record → pending.
         _reset_area_vectors(conn, settings)
-    # Вектора чанков невалидны при любой из причин (другая модель — другая
-    # векторизация; другие параметры — другие чанки, их вектора больше не
-    # соответствуют их же новым текстам). Дроп: все чанки → pending
-    # (анти-джойн), воркер пере-кодирует.
+    # Chunk vectors are invalid under either cause (another model — another
+    # vectorization; other parameters — other chunks whose vectors no longer
+    # match their own new texts). The drop: every chunk → pending (an
+    # anti-join), the worker re-encodes.
     conn.execute("DROP TABLE IF EXISTS notes_chunks_vec")
     chunks.create_vec_table(conn, settings.embedding_dim)
-    # Пере-чанковка + записи meta — одним атомарным блоком: rollback вернёт
-    # и чанки, и meta предыдущей конфигурации, если что-то пойдёт не так.
+    # Re-chunking + the meta writes — one atomic block: a rollback returns
+    # both the chunks and the previous configuration's meta if anything goes
+    # wrong.
     with transaction(conn):
         rechunked, reused = _rechunk_all_notes(conn, settings)
         if model_changed:
@@ -1816,22 +1865,22 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
 def _rechunk_all_notes(
     conn: sqlite3.Connection, settings: Settings
 ) -> tuple[int, int]:
-    """Пере-чанковать все заметки (включая trash) по текущим параметрам.
+    """Re-chunk every note (trash included) under the current parameters.
 
-    Миграционная операция (вызывается только из _sync_embedding_meta при
-    сменившихся модели/размерности или чанк-параметрах — brief §6): тексты
-    пересчитываются чистым сплиттером, чанки и их вектора заменяются
-    (replace_note_chunks чистит vec-строки явно). Импорт сплиттера —
-    локальный: storage не тянет домен на импорте, пере-чанковка здесь —
-    как некогда реиндекс в init_db (b972386), one-shot на старте сервиса.
+    A migration operation (called only from _sync_embedding_meta when the
+    model/dimension or chunk parameters changed — brief §6): the texts are
+    recomputed by the pure splitter, the chunks and their vectors are replaced
+    (replace_note_chunks clears the vec rows explicitly). The splitter import
+    is local: storage does not pull the domain at import time — re-chunking
+    here is like the old reindex in init_db, one-shot at service startup.
 
-    Reuse: заметка с ровно одним чанком ≤ CHUNK_SIZE получает вектор чанка
-    = вектор полного текста из notes_vec — без кодирования; при сменившейся
-    модели notes_vec к этому моменту пуст — reuse сам не срабатывает.
+    Reuse: a note with exactly one chunk <= CHUNK_SIZE gets the chunk vector =
+    the full-text vector from notes_vec — without encoding; with a changed
+    model notes_vec is empty by then — reuse itself does not fire.
 
-    Возвращает (пере-чанковано заметок, reuse-векторов записано).
+    Returns (notes re-chunked, reuse vectors written).
     """
-    from app.services.splitter import split_text  # локально, см. докстринг
+    from app.services.splitter import split_text  # local, see the docstring
 
     rows = conn.execute("SELECT id, text FROM notes ORDER BY id").fetchall()
     rechunked = reused = 0
@@ -1855,16 +1904,17 @@ def _rechunk_all_notes(
 
 
 def _check_fts_integrity(conn: sqlite3.Connection) -> None:
-    """Сверить FTS-индекс с notes; рассинхрон (оператор правил `notes.text`
-    напрямую, мимо триггеров) лечится rebuild'ом — индекс полностью
-    выводим из (title, text) заметок, данные не теряются."""
+    """Verify the FTS index against notes; a desync (the operator edited
+    `notes.text` directly, bypassing the triggers) is healed by a rebuild —
+    the index is fully derived from the notes' (title, text), no data is
+    lost."""
     try:
         conn.execute("INSERT INTO notes_fts(notes_fts) VALUES('integrity-check')")
         return
     except sqlite3.DatabaseError:
-        pass  # рассинхрон/повреждение — самолечение ниже
-    # rebuild: обнулить индекс (спец-команда 'delete' со всеми текущими
-    # значениями) и залить заново; нечувствительно к прошлому состоянию.
+        pass  # a desync/damage — self-healing below
+    # rebuild: zero the index (the special 'delete' command with all current
+    # values) and pour it again; insensitive to the previous state.
     conn.execute(
         "INSERT INTO notes_fts(notes_fts, rowid, title, text) "
         "SELECT 'delete', id, title, text FROM notes"
@@ -1875,42 +1925,42 @@ def _check_fts_integrity(conn: sqlite3.Connection) -> None:
 
 
 def delete_note_physical(conn: sqlite3.Connection, note_id: int) -> None:
-    """Физически удалить заметку из всех индексов (lsb-0004-02, джоба зачистки).
+    """Hard-delete a note from every index (lsb-0004-02, the cleanup job).
 
-    Полное физическое удаление (НЕ soft delete): просроченная заметка должна
-    исчезнуть из всех индексов — notes + notes_chunks + notes_chunks_vec +
+    A full physical deletion (NOT a soft delete): an expired note must
+    disappear from all indexes — notes + notes_chunks + notes_chunks_vec +
     notes_vec + notes_fts + notes_comment_fts + note_expirations + links.
-    Композиция существующих примитивов слоя (chunks.drop_note_chunks,
-    vectors.drop, expirations.delete) + явный DELETE из notes_fts (внешний
-    контент: DELETE-триггера нет, индекс не чистится каскадом) и notes.
+    A composition of the layer's existing primitives (chunks.drop_note_chunks,
+    vectors.drop, expirations.delete) + an explicit DELETE from notes_fts
+    (external content: no DELETE trigger, the index is not cleaned by a
+    cascade) and from notes.
 
-    Связи (3.2.0, no46-03): `links` заметки сносятся здесь же, в ТОЙ ЖЕ
-    транзакции вызывающего (`DELETE FROM links WHERE note_a = ? OR note_b = ?` —
-    обе стороны пары, идемпотентно). Фоновый свип `purge_orphans` (idle-ветка
-    джобы `links`) остаётся страховкой, а не единственной чисталкой. Soft
-    delete связи НЕ трогает: заметка восстанавливаема — её строки `links`
-    живут (arch §3.2).
+    Links (3.2.0, no46-03): the note's `links` rows are torn down here, in the
+    SAME caller transaction (`DELETE FROM links WHERE note_a = ? OR
+    note_b = ?` — both sides of the pair, idempotent). The background
+    `purge_orphans` sweep (the idle branch of the `links` job) stays a safety
+    net, not the only cleaner. A soft delete does NOT touch links: the note is
+    restorable — its `links` rows live on (arch §3.2).
 
-    История (lsbdef-0014): физическое удаление уносит и версии заметки из
-    `record_versions` — `notes.id` без AUTOINCREMENT переиспользуется, и
-    оставшийся baseline переиспользованного id ронял `record_initial` новой
-    заметки на UNIQUE `(entity, entity_id, version)` → падал `memory_save`.
-    Soft delete историю СОХРАНЯЕТ (заметка в trash восстановима, версии
-    остаются) — не путать.
+    History (lsbdef-0014): a hard deletion takes the note's versions out of
+    `record_versions` too — `notes.id` without AUTOINCREMENT is reused, and a
+    leftover baseline of the reused id used to kill `record_initial` of the
+    new note on the UNIQUE `(entity, entity_id, version)` → `memory_save`
+    failed. A soft delete KEEPS the history (a note in trash is restorable,
+    the versions remain) — do not confuse the two.
 
-    Идемпотентно и безопасно: отсутствующей заметки нет — каждый DELETE
-    просто не матчит ничего; повторный вызов не падает. Вызывается внутри
-    открытой транзакции вызывающего (transaction()).
+    Idempotent and safe: a missing note matches nothing — every DELETE is a
+    no-op; a repeated call does not fail. Called inside the caller's open
+    transaction (transaction()).
     """
-    # Чанки и их вектора (notes_chunks_vec + notes_chunks) — до notes:
-    # notes_chunks_vec без FK, каскад от notes его не тронет.
+    # The chunks and their vectors (notes_chunks_vec + notes_chunks) — before
+    # notes: notes_chunks_vec has no FK, the notes cascade would not touch it.
     chunks.drop_note_chunks(conn, note_id)
     vectors.drop(conn, note_id)  # notes_vec
-    # LSBN-D-8 (3.4.0): FTS пометок — внешний контент без DELETE-триггера;
-    # спец-команда 'delete' со СТАРЫМ значением comment (образец —
-    # _COMMENT_TRIGGERS), пока строка notes ещё не удалена. Отсутствующей
-    # заметки нет — пропускаем (идемпотентно), остальные DELETE ниже просто
-    # не матчат ничего.
+    # LSBN-D-8 (3.4.0): the comment FTS — external content without a DELETE
+    # trigger; the special 'delete' command with the OLD comment value (the
+    # _COMMENT_TRIGGERS pattern) while the notes row is still there. A missing
+    # note is skipped (idempotent); the DELETEs below simply match nothing.
     comment_row = conn.execute(
         "SELECT comment FROM notes WHERE id = ?", (note_id,)
     ).fetchone()
@@ -1923,16 +1973,16 @@ def delete_note_physical(conn: sqlite3.Connection, note_id: int) -> None:
     conn.execute("DELETE FROM notes_fts WHERE rowid = ?", (note_id,))
     conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
     expirations.delete(conn, note_id)  # note_expirations
-    # 3.2.0 (no46-03): связи заметки уходят вместе с ней — обе стороны пары,
-    # в той же транзакции (идемпотентно: повторный вызов просто не матчит).
+    # 3.2.0 (no46-03): the note's links go with it — both sides of the pair,
+    # in the same transaction (idempotent: a repeated call matches nothing).
     conn.execute(
         "DELETE FROM links WHERE note_a = ? OR note_b = ?", (note_id, note_id)
     )
-    # История заметки (lsbdef-0014): версии уходят вместе с заметкой, в той же
-    # транзакции — иначе освобождённый `notes.id` после переиспользования
-    # наследовал чужой baseline и `memory_save` падал на UNIQUE. Только
-    # ФИЗИЧЕСКОЕ удаление чистит историю; soft delete её сохраняет
-    # (заметка восстановима).
+    # The note's history (lsbdef-0014): the versions go with the note, in the
+    # same transaction — otherwise a freed `notes.id`, after reuse, inherited
+    # someone else's baseline and `memory_save` failed on the UNIQUE. Only a
+    # HARD deletion clears the history; a soft delete keeps it (the note is
+    # restorable).
     conn.execute(
         "DELETE FROM record_versions WHERE entity = 'note' AND entity_id = ?",
         (note_id,),

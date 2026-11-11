@@ -1,18 +1,21 @@
-"""Формирование выдач (бриф Фазы 2, п. 3): summary/snippet.
+"""The output shaping (the Phase 2 brief, p. 3): summary/snippet.
 
-- `summary` — fallback-усечение: при `summary_status=pending` (Фаза 2 — всегда;
-  далее — отказ суммаризатора, Фаза 4+) выдаются первые MAX_SUMMARY_CHARS
-  символов текста (REQUIREMENTS §5.5). Готовое суммари отдаётся как есть.
-- `snippet` — первые SNIPPET_CHARS символов текста, всегда (ARCH §4.2) —
-  чтобы модель оценила релевантность, не открывая полный текст.
+    - `summary` - the fallback truncation: with `summary_status=pending` (Phase 2
+      - always; later - a summarizer failure, Phase 4+) the first
+      MAX_SUMMARY_CHARS characters of the text are served (REQUIREMENTS §5.5). A
+      ready summary is served as is.
+    - `snippet` - the first SNIPPET_CHARS characters of the text, always
+      (ARCH §4.2) - so the model can judge relevance without opening the full
+      text.
 
-Усечение — по символам строки (не байтам): кириллица меряется честно.
+    The truncation counts CHARACTERS of the string (not bytes): Cyrillic is
+    measured honestly.
 
-Лимит summary — один на всю систему (решение гейта 3.1.0, 2026-09-19: 150
-символов): fallback режется по символам (это текст ЗАМЕТКИ, а не ответ
-модели — грубое усечение тут безопасно, многоточие не добавляется);
-модельное саммари держит та же константа в точке сохранения (worker,
-summary.cap_summary — усечение по границе слова).
+    The summary limit is system-wide (the 3.1.0 gate decision: 150 characters):
+    the fallback is cut by characters (this is the NOTE text, not a model answer -
+    a crude cut is safe here, no ellipsis is added); the model summary is held to
+    the same constant at the save point (worker, summary.cap_summary - a
+    word-boundary truncation).
 """
 
 from __future__ import annotations
@@ -23,12 +26,12 @@ from app.config import Settings
 
 
 def summary_of(row: sqlite3.Row, settings: Settings) -> str:
-    """Краткое содержание к выдаче: готовое или fallback-усечение (§5.5)."""
+    """The summary for the output: the ready one or the fallback truncation (§5.5)."""
     if row["summary_status"] == "ok" and row["summary"]:
         return row["summary"]
     return row["text"][: settings.max_summary_chars]
 
 
 def snippet(text: str, settings: Settings) -> str:
-    """Фрагмент текста для memory_search: первые SNIPPET_CHARS символов."""
+    """The text fragment for memory_search: the first SNIPPET_CHARS characters."""
     return text[: settings.snippet_chars]

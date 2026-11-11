@@ -294,6 +294,41 @@ def test_non_json_response_raises(monkeypatch) -> None:
         service.summarize(NOTE)
 
 
+def test_raw_quotes_in_values_are_repaired(monkeypatch) -> None:
+    """LSBN-T-33/T-23 (проба flint 30.10.2026): «сырые» кавычки внутри
+    строковых значений — json.loads падает, репар экранирует их внутри
+    значений, части восстанавливаются, текст не портится."""
+    flint_shaped = (
+        '{"parts": ['
+        '{"title": "Покупка по пути", '
+        '"text": "Купил "молоко" и "хлеб" по дороге домой"},'
+        '{"title": "Магазин", "text": "По пути домой зашёл в магазин — '
+        'взял "молоко" и "хлеб""}'
+        "]}"
+    )
+    service, _ = make_service(
+        make_settings(monkeypatch),
+        [httpx.Response(200, json={"message": {"content": flint_shaped}, "done": True})],
+    )
+    result = service.merge(TEXT_A, TEXT_B)
+    assert [part.text for part in result.parts] == [
+        "Купил \"молоко\" и \"хлеб\" по дороге домой",
+        "По пути домой зашёл в магазин — взял \"молоко\" и \"хлеб\"",
+    ]
+    assert [part.title for part in result.parts] == ["Покупка по пути", "Магазин"]
+
+
+def test_broken_json_still_refused_after_repair(monkeypatch) -> None:
+    """Репар консервативен: починка не состоялась — прежний отказ OFF_CONTRACT
+    (модели без дефекта проходят мимо репара по быстрому пути)."""
+    service, _ = make_service(
+        make_settings(monkeypatch),
+        [httpx.Response(200, json={"message": {"content": '{"parts": [обрыв'}, "done": True})],
+    )
+    with pytest.raises(SummaryError, match="не-JSON"):
+        service.merge(TEXT_A, TEXT_B)
+
+
 def test_non_object_json_raises(monkeypatch) -> None:
     """Малформация ответа (не объект) — отказ клиента слота (§5.5):
     content из такого ответа не извлечь — отказ, не суммари."""
@@ -310,16 +345,40 @@ def test_missing_message_raises(monkeypatch) -> None:
         service.summarize(NOTE)
 
 
+def _empty_body(content: str) -> dict:
+    """Ответ без поля thinking: честный «пустой ответ» (LSBN-T-33 —
+    пустой content при НЕПУСТОМ thinking классифицируется иначе)."""
+    body = ok_body(content)
+    body["message"] = {"role": "assistant", "content": content}
+    return body
+
+
 def test_empty_content_is_treated_as_failure(monkeypatch) -> None:
     """Страховка §5.5: пустой content = отказ, не суммари."""
     for content in ("", "   \n\t"):
         settings = make_settings(monkeypatch)
         service, _ = make_service(
-            settings, [httpx.Response(200, json=ok_body(content))]
+            settings, [httpx.Response(200, json=_empty_body(content))]
         )
         with pytest.raises(SummaryError, match="пустой content"):
             service.summarize(NOTE)
         assert service.last_attempt_ok is False
+
+
+def test_empty_content_with_thinking_is_truncated(monkeypatch) -> None:
+    """LSBN-T-33: content пуст, а thinking был — «бюджет съеден рассуждением»:
+    исход TRUNCATED (внимание человеку), не EMPTY; клиент уже сделал свой
+    авто-ретрай (здесь контекст неизвестен — ретрая нет)."""
+    from app.services.slot_outcome import SlotOutcome
+
+    settings = make_settings(monkeypatch)
+    service, _ = make_service(
+        settings, [httpx.Response(200, json=ok_body(""))]
+    )
+    with pytest.raises(SummaryError, match="съеден рассуждением") as exc_info:
+        service.summarize(NOTE)
+    assert exc_info.value.outcome is SlotOutcome.TRUNCATED
+    assert service.last_attempt_ok is False
 
 
 def test_non_string_content_raises(monkeypatch) -> None:
@@ -511,7 +570,7 @@ def test_merge_off_contract_structure_is_summary_error(monkeypatch) -> None:
     assert service.last_attempt_ok is False
 
     service, _ = make_service(
-        make_settings(monkeypatch), [httpx.Response(200, json=ok_body(""))]
+        make_settings(monkeypatch), [httpx.Response(200, json=_empty_body(""))]
     )
     with pytest.raises(SummaryError, match="пустой content"):
         service.merge(TEXT_A, TEXT_B)

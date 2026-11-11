@@ -1,4 +1,4 @@
-"""JudgeResult: вердикт вместе с метаданными вызова (№49, arch §6.3)."""
+"""JudgeResult: the verdict together with the call metadata (#49, arch §6.3)."""
 
 from __future__ import annotations
 

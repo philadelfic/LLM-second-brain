@@ -1,126 +1,132 @@
-"""Фоновый воркер (ARCHITECTURE §3.4): до-векторизация + до-суммаризация.
+"""Background worker (ARCHITECTURE §3.4): pre-vectorization + pre-summarization.
 
-Единственный воркер на процесс, **четыре независимые петли по СЛОТАМ**
-(Фаза 11, решение №10; релиз 3.0.0 — петля областей) — состояния
-pending-статусов в БД (переживают рестарт, догоняются при старте сервиса):
+    The only worker per process, **four independent loops per SLOTS**
+    (Phase 11, decision #10; release 3.0.0 — the areas loop) — the states are
+    pending statuses in the DB (they survive a restart and are caught up at service
+    start):
 
-- **embedding-джоба** (`build_embedding_job`): вектора заметок (`pending_vector` →
-  batch `embed_texts` → notes_vec, vector_status='ok'; полный вектор — по
-  конкатенации title+text, `_embed_input`, lsb-0001 FR-1.1) + чанковая очередь
-  (Фаза 7, анти-джоин «нет строки в notes_chunks_vec»). Объединены в одну
-  петлю; Semaphore EMBEDDING_CONCURRENT_REQUESTS остаётся. После готовности
-  вектора каждой заметки создаётся judge-работа (дедуп) — диспетчер
-  зависимостей (решение №10): судья опрашивается только по довекторизованной
-  заметке. Тем же моментом будится джоба `links` (`notify_links_pending`,
-  решение гейта 1c): уровень 1 связей считается сразу после довекторизации, а
-  не через интервал/back-off. Форма самой embedding-джобы — «по интервалу +
-  событие `embedding` + перепроверка очереди» (gate 2026-09-19; перепроверка
-  lost wakeup — LSBN-T-30): запись/правка заметки
-  (`memory_save`/`memory_update`), слияние дублей и догенерация названия
-  возвращают заметку в `vector_status='pending'` и будят петлю сигналом
-  `notify_embedding_pending` — свежая заметка векторизуется сразу, а не после
-  выросшего back-off (до 15 мин); перепроверка `_embedding_queue_empty`
-  страхует сигнал, стёртый `clear()` (пул 6). Событие только ускоряет:
-  задание живёт в статусе заметки; при недоступных моделях (`EmbeddingError`)
-  сигнала нет и петля честно уходит в ожидание с back-off (отказ — не
-  прогресс, arch §3.2: холостого шторма перепроверка не даёт).
-- **summary-джоба** (`build_summary_job`): title-догенерация (миграция, title IS
-  NULL) → summarize → merge (слияние дублей) → классификация → описание узла.
-  notify будит эту петлю (save/update). Готовая выжимка заметки будит и петлю
-  `nodes` (`notify_nodes_pending`, lsb-0012, по образцу `notify_links_pending`
-  после довекторизации): её задание `reclass` ставится в момент сшивания
-  дубликатов, когда суммари объединённой заметки ещё пересчитывается, — и ждёт
-  именно этого момента. Сигнал — только при фактической готовности
-  (`summary_status='ok'`): при отказе суммаризации его нет, задание честно
-  ждёт по back-off.
-- **judge-джоба** (`build_judge_job`): судья дедупа (по judge-работам, созданным
-  embedding-петлёй) + судья структуры (внутри PromotionService, триггер после
-  классификации).
-- **джоба areas** (`build_areas_job`, субстрат 3.0.0): вектора записей областей
-  skills/terms/user (`vector_status='pending'` → батч `embed_texts` → vec0
-  области, 'ok'). Без LLM в момент записи (архитектура субстрата §3.3):
-  тексты областей — `AreaSpec.embed_text` (skills `name + description`,
-  terms `term + context + definition`, user `name + body`); отказ — событие
-  `area_embed_failed`, записи остаются pending, повтор по своему back-off.
-  Смена модели/размерности дропает area-vec вместе с notes_vec
-  (`db._sync_embedding_meta`) — все записи областей возвращаются в pending.
+    - **the embedding job** (`build_embedding_job`): note vectors (`pending_vector` →
+      an `embed_texts` batch → notes_vec, vector_status='ok'; the full vector — over
+      the title+text concatenation, `_embed_input`, lsb-0001 FR-1.1) + the chunk
+      queue (Phase 7, the anti-join "no row in notes_chunks_vec"). Merged into one
+      loop; the EMBEDDING_CONCURRENT_REQUESTS Semaphore stays. After each note's
+      vector is ready a judge job (dedup) is created — the dependency dispatcher
+      (decision #10): the judge is asked only about a vectorized note. The same
+      moment wakes the `links` job (`notify_links_pending`,
+      the gate-1c decision): link level 1 is computed right after vectorization,
+      not after an interval/back-off. The embedding job's shape is "by interval +
+      the `embedding` event + a queue recheck" (gate 2026-09-19; the recheck of the
+      lost wakeup — LSBN-T-30): writing/editing a note
+      (`memory_save`/`memory_update`), merging duplicates and title generation
+      return the note to `vector_status='pending'` and wake the loop with the
+      `notify_embedding_pending` signal — a fresh note is vectorized at once, not
+      after the grown back-off (up to 15 min); the `_embedding_queue_empty` recheck
+      insures the signal erased by `clear()` (pool 6). The event only accelerates:
+      the task lives in the note's status; with unavailable models
+      (`EmbeddingError`) there is no signal and the loop honestly goes into a wait
+      with back-off (a failure is not progress, arch §3.2: the recheck gives no
+      idle storm).
+    - **the summary job** (`build_summary_job`): title generation (migration, title
+      IS NULL) → summarize → merge (duplicate merging) → classification → node
+      description. The notify wakes this loop (save/update). A note's ready summary
+      wakes the `nodes` loop too (`notify_nodes_pending`, lsb-0012, modeled on
+      `notify_links_pending` after vectorization): its `reclass` task is placed at
+      the moment of duplicate stitching, while the merged note's summary is still
+      being recomputed — and it waits exactly for that moment. The signal — only
+      on actual readiness (`summary_status='ok'`): on a summarization failure there
+      is none, and the task honestly waits on back-off.
+    - **the judge job** (`build_judge_job`): the dedup judge (over judge jobs
+      created by the embedding loop) + the structure judge (inside
+      PromotionService, the trigger after classification).
+    - **the areas job** (`build_areas_job`, substrate 3.0.0): area records' vectors
+      (skills/terms/user; `vector_status='pending'` → an `embed_texts` batch → the
+      area's vec0, 'ok'). No LLM at write time (substrate architecture §3.3):
+      area texts — `AreaSpec.embed_text` (skills `name + description`,
+      terms `term + context + definition`, user `name + body`); a failure — an
+      `area_embed_failed` event, the records stay pending, a retry on its own
+      back-off. A model/dimension change drops area-vecs together with notes_vec
+      (`db._sync_embedding_meta`) — all area records return to pending.
 
-Петли описаны `JobSpec`-ами и обслуживаются каркасом джоб (lsb-0014-02,
-`app/services/jobs.py`): тела цикла, back-off и супервизор итерации — общие,
-воркер держит работу (`process_*`), перепроверку очереди, сигналы и гигиену.
-Сборщики своих джоб — `build_*_job` в конце модуля (регистрация — строка в
-реестре каркаса). События работ несут обязательное поле `job` (FR-1.4).
-Снимки очередей для `/health.queues` собирает `queues_health` по реестру:
-каждая джоба описывает свою очередь сама (`queue_stat`), `/health` при
-добавлении джобы не правится (lsb-0014-03, FR-2.2).
+    The loops are described by `JobSpec`s and served by the job framework
+    (lsb-0014-02, `app/services/jobs.py`): loop bodies, back-off and the iteration
+    supervisor are shared; the worker keeps the work (`process_*`), the queue
+    recheck, the signals and hygiene. Own job builders — `build_*_job` at the end
+    of the module (registration — a line in the framework registry). Work events
+    carry the mandatory `job` field (FR-1.4).
+    Queue snapshots for `/health.queues` are assembled by `queues_health` over the
+    registry: each job describes its own queue itself (`queue_stat`); `/health` is
+    not edited when a job is added (lsb-0014-03, FR-2.2).
 
-Джоба `nodes` (lsb-0011) разбирает накопленный `default` и реклассифицирует
-объединённые заметки: (1) промоция, (2) задания `reclass` после сшивания
-(lsb-0012 — приоритетный источник), (3) быстрый пул обхода — переезд по
-готовой разметке (`hint_path` + `confidence`) без вызова моделей,
-(4) классификаторный пул обхода — вызов классификатора в жёстком бюджете
-(`JOB_NODES_CLASSIFIER_BUDGET`) по `title` + готовой суммари. Механика переезда
-одна на все источники и на причёску после суммаризации (`_apply_node_order`).
-Маркер `node_order_at` — анти-зацикливание (ставится при любом исходе разбора).
+    The `nodes` job (lsb-0011) parses the accumulated `default` and reclassifies
+    merged notes: (1) promotion, (2) `reclass` tasks after stitching
+    (lsb-0012 — the priority source), (3) the fast sweep pool — a move by the ready
+    markup (`hint_path` + `confidence`) without model calls,
+    (4) the classifier sweep pool — a classifier call within the hard budget
+    (`JOB_NODES_CLASSIFIER_BUDGET`) over `title` + a ready summary. The move
+    mechanics is one for all sources and for the grooming after summarization
+    (`_apply_node_order`). The `node_order_at` marker — anti-looping (set on any
+    parse outcome).
 
-Job-очереди в БД по слотам (`worker_jobs`): judge-работа (kind='dedup')
-создаётся ТОЛЬКО после готовности вектора заметки; merge-работа (kind='merge')
-создаётся после вердикта судьи и ходит в summary-слот. Порядок заметок в
-очереди — по id. Back-off раздельный по петлям (30 с → ×2 → 15 мин, как
-сейчас); notify будит summary-петлю; save/update не векторизуют синхронно —
-векторизация фоновая (embedding-петля).
+    DB job queues per slots (`worker_jobs`): a judge job (kind='dedup') is created
+    ONLY after the note's vector is ready; a merge job (kind='merge') is created
+    after the judge's verdict and walks into the summary slot. The note order in
+    the queue — by id. Back-off is separate per loop (30 s → ×2 → 15 min, as now);
+    notify wakes the summary loop; save/update do not vectorize synchronously —
+    vectorization is background (the embedding loop).
 
-Title-догенерация (решение №9): заметки с `title IS NULL` (только миграционные
-— новые всегда с title) → думающий вызов слота summary (think по флагу, как
-суммаризация), результат обрезается до TITLE_MAX_WORDS механикой, запись title;
-очередь наполняется только миграцией и после прогонки опустеет. Промпт
-догенерации — зашит в воркере (TITLE_PROMPT), файлом не создаётся.
+    Title generation (decision #9): notes with `title IS NULL` (only migration
+    ones — new notes always have a title) → a thinking call of the summary slot
+    (think per the flag, like summarization); the result is trimmed to
+    TITLE_MAX_WORDS words mechanically; the title is written; the queue is filled
+    only by migration and empties after processing. The generation prompt is baked
+    into the worker (TITLE_PROMPT), never created by a file.
 
-Garanties:
-- отказ любого внешнего сервера не портит данные: статус остаётся pending
-  (NFR-3); интервал опроса растёт по back-off: PENDING_RETRY_SEC (30 с) → ×2
-  → max 15 минут (REQUIREMENTS §5.3) — **независимо по каждой петле**
-  (ARCH §3.4): недоступный векторизатор не останавливает суммаризацию и
-  наоборот; успех в петле сбрасывает только её интервал и продолжает
-  выгребать её немедленно.
-- конкурентный доступ — через busy_timeout/WAL (§3.3); каждая партия —
-  короткие транзакции, параллель с запросами безопасна.
-- `process_*` синхронные (выполняются в `asyncio.to_thread` — event loop не
-  занимаем); чанковая очередь Фазы 7 — своя async-обработка: кодирование
-  подъёмок размножается Semaphore'ом прямо в петле, транзакции записи —
-  короткие в to_thread. `run` — asyncio-таска (все джобы реестра под
-  каркасным `run_loop`), старт/стоп — в lifespan.
+    Guarantees:
+    - a failure of any external server does not spoil the data: the status stays
+      pending (NFR-3); the polling interval grows by back-off: PENDING_RETRY_SEC
+      (30 s) → ×2 → max 15 minutes (REQUIREMENTS §5.3) — **independently per
+      loop** (ARCH §3.4): an unavailable vectorizer does not stop summarization and
+      vice versa; success in a loop resets only its interval and keeps draining it
+      immediately.
+    - concurrent access — via busy_timeout/WAL (§3.3); each batch — short
+      transactions, parallelism with queries is safe.
+    - `process_*` are synchronous (run in `asyncio.to_thread` — the event loop is
+      not occupied); the Phase-7 chunk queue has its own async handling: encoding
+      sub-batches is multiplied by a Semaphore right in the loop, write transactions
+      — short ones in to_thread. `run` — an asyncio task (all registry jobs under
+      the framework `run_loop`), start/stop — in lifespan.
 
-Запись суммари защищена от гонки с memory_update: между вычиткой текста и
-записью воркер мог получить обновлённый текст — UPDATE ограничен условием
-`AND text = ?` (тот же текст; иначе суммари протухшего текста затёрло бы
-свежий). Векторизация защищена так же (пул 1): notes-петля пишет вектор
-только при неизменных с вычитки (id, text, title, namespace, vector_status) —
-guard-UPDATE в той же транзакции; протухшая партия не пишется, повтор —
-следующей партией (аналог `AND text = ?` у суммари и
-`upsert_vector_if_exists` у чанков). Название входит в вектор (lsb-0001
-FR-1.1): запись названия (title-доген) в той же транзакции возвращает
-векторизацию в pending и сбрасывает notes_vec — старый вектор по чистому
-text не кормит ни поиск, ни дедуп до перекодирования.
+    The summary write is protected from the memory_update race: between reading
+    the text and writing, the worker could receive an updated text — the UPDATE is
+    constrained by `AND text = ?` (the same text; otherwise the summary of a stale
+    text would overwrite the fresh one). Vectorization is protected the same way
+    (pool 1): the notes loop writes the vector only when unchanged since the read
+    (id, text, title, namespace, vector_status) — a guard UPDATE in the same
+    transaction; a stale batch is not written, the retry — the next batch (the
+    analogue of `AND text = ?` at summarization and `upsert_vector_if_exists` at
+    chunks). The title is part of the vector (lsb-0001 FR-1.1): writing the title
+    (title generation) in the same transaction returns vectorization to pending
+    and resets notes_vec — the old vector over the bare text feeds neither search
+    nor dedup until re-encoding.
 
-Чанковая очередь (Фаза 7) закрывает обе проблемы:
-- reuse единичного чанка (brief §6): у заметки с ровно одним чанком
-  ≤ CHUNK_SIZE вектор чанка = вектор полного текста из notes_vec, без вызова
-  кодировщика. Это случай, когда reuse шага 3 не успел примениться при
-  save — в момент записи полного вектора ещё не было (отказ Ollama);
-  кодировать тот же текст второй раз незачем.
-- гонка с update (ARCH §4.5, аналог `AND text = ?`): вектор чанка пишется
-  только если (id, text, tokens) не менялись с вычитки — update мог
-  заменить чанки (DELETE+INSERT, id при повторной вставке переиспользуются,
-  что дало бы вектор чужого текста на новом id).
+    The chunk queue (Phase 7) closes both problems:
+    - the single-chunk reuse (brief §6): for a note with exactly one chunk
+      ≤ CHUNK_SIZE the chunk's vector = the full text's vector from notes_vec,
+      without calling the encoder. This is the case where the step-3 reuse did not
+      make it at save — at write time the full vector did not exist yet (an Ollama
+      failure); encoding the same text a second time is pointless.
+    - the update race (ARCH §4.5, the analogue of `AND text = ?`): a chunk's vector
+      is written only if (id, text, tokens) did not change since the read — update
+      could have replaced the chunks (DELETE+INSERT; ids are reused on re-insert,
+      which would give a foreign text's vector on a new id).
 
-Статусы внешних серверов (для `/health.*_ok`, NFR-4) ведут сами сервисы —
-воркер не агрегирует: все кодирования идут через EmbeddingService
-(`embedding_ok` обновляется в `embed_texts` — единой точке кодирования), все
-генерации — через Summarizer.
+    External server statuses (for `/health.*_ok`, NFR-4) are kept by the services
+    themselves — the worker does not aggregate: all encodings go through
+    EmbeddingService (`embedding_ok` is updated in `embed_texts` — the single
+    encoding point), all generations — through the Summarizer.
 
-Суммаризатор инъектируется DI (build_services): None — петля не запускается
-(тестовый режим Фазы 3); в проде всегда передан SummaryService.
+    The summarizer is injected by DI (build_services): None — the loop does not
+    start (the Phase-3 test mode); in prod a SummaryService is always passed.
 """
 
 from __future__ import annotations
@@ -141,10 +147,10 @@ from app.services.classifier import Classification, ClassificationError, Classif
 from app.services.decision import SLOT_DECISION, DecisionService
 from app.services.dedup import DeduplicationService
 from app.services.embedding import Embedder, EmbeddingError
-# Back-off и его потолок перенесены в каркас джоб (lsb-0014, arch §3.3):
-# каркас владеет контрактом надёжности, петли воркера переиспользуют имена.
-# `MAX_INTERVAL_SEC as MAX_INTERVAL_SEC` — явный ре-экспорт: на него по-прежнему
-# ссылаются существующие тесты (tests/test_worker.py).
+# The back-off and its ceiling moved into the job framework (lsb-0014, arch §3.3):
+# the framework owns the reliability contract; the worker's loops reuse the names.
+# `MAX_INTERVAL_SEC as MAX_INTERVAL_SEC` — an explicit re-export: existing tests
+# still reference it (tests/test_worker.py).
 from app.services.jobs import MAX_INTERVAL_SEC as MAX_INTERVAL_SEC
 from app.services.jobs import (
     BackoffState,
@@ -164,7 +170,7 @@ from app.services.slot_breaker import SlotBreaker
 from app.services.slot_budget import slot_config_fingerprint
 from app.services.slot_outcome import SlotOutcome, outcome_of
 
-if TYPE_CHECKING:  # только аннотация DI: warnings → worker круга нет
+if TYPE_CHECKING:  # a DI annotation only: warnings → worker, no cycle
     from app.services.warnings import WarningsService
 from app.services.summary import (
     MERGE_MAX_ROUNDS,
@@ -177,75 +183,75 @@ from app.services.terms import TermsService
 from app.storage import area_vectors, chunks, vectors
 from app.storage.db import delete_note_physical, session, transaction
 
-# Сколько хранить выполненные done-работы в worker_jobs (retention). Не env —
-# по паттерну TITLE_MAX_WORDS: после этого срока работы вычищаются idle-веткой
-# embedding-петли (_purge_done_jobs), очередь не растёт безгранично.
+# How long to keep done jobs in worker_jobs (retention). Not env —
+# following the TITLE_MAX_WORDS pattern: after this term the jobs are cleaned by the idle branch
+# of the embedding loop (_purge_done_jobs); the queue does not grow without bound.
 WORKER_JOBS_RETENTION_DAYS = 7
 
-# Интервал джобы зачистки просроченных заметок (lsb-0004-02, этап 4):
-# фиксированные 5 минут (решение О. 2026-09-09), без настройки в компоузе.
-# Джоба без очереди и без события: её состояние back-off помечено
-# `fixed=True` — каркас держит паузу 300 с, back-off не растёт (поведение
-# дословно как было, FR-1.5).
+# The expired-notes cleanup job interval (lsb-0004-02, stage 4):
+# a fixed 5 minutes, without a compose setting.
+# A job with no queue and no event: its back-off state is marked
+# `fixed=True` — the framework holds the 300 s pause, the back-off does not grow (the
+# behavior preserved verbatim, FR-1.5).
 EXPIRATION_CLEANUP_INTERVAL_SEC = 5 * 60
 
-# Имена джоб воркера (каркас lsb-0014): `JobSpec.name`, ключ состояния back-off
-# и обязательное поле `job` в журнале — одна строка на джобу.
+# The worker's job names (the lsb-0014 framework): `JobSpec.name`, the back-off state key
+# and the mandatory `job` field in the journal — one line per job.
 EMBEDDING_JOB = "embedding"
 SUMMARY_JOB = "summary"
 JUDGE_JOB = "judge"
 AREAS_JOB = "areas"
 EXPIRATION_JOB = "expiration"
-# Джоба «порядок в узлах» (lsb-0011-01): обход накопленного `default`.
+# The "node order" job (lsb-0011-01): sweeping the accumulated `default`.
 NODES_JOB = "nodes"
 
-# LLM-слоты джоб (№39, arch §6.2): разрыв живёт на СЛОТ, а не на джобу —
-# слот summary делят суммаризация/слияние/классификация/описания и обход
-# `nodes`; слот judge — dedup-судья и судья структуры.
+# The jobs' LLM slots (#39, arch §6.2): the breaker lives on the SLOT, not the job —
+# the summary slot is shared by summarization/merge/classification/descriptions and the
+# `nodes` sweep; the judge slot — the dedup judge and the structure judge.
 SLOT_EMBEDDING = "embedding"
 SLOT_SUMMARY = "summary"
 SLOT_JUDGE = "judge"
 SLOT_NAMES = (SLOT_EMBEDDING, SLOT_SUMMARY, SLOT_JUDGE)
 
-# Имя работы слота `nodes` после сшивания (lsb-0012, arch §3.5): объединённая
-# заметка может лежать в ЛЮБОМ узле — обход `default` её не найдёт, поэтому
-# реклассификация ставится заданием.
+# The `nodes` slot's job name after stitching (lsb-0012, arch §3.5): the merged
+# note may live in ANY node — the `default` sweep will not find it, so
+# reclassification is placed as a task.
 NODES_RECLASS_KIND = "reclass"
 
-#: Вид предупреждения отложенной пары слияния (LSBN-F-23, п. 6): за 2 раунда
-#: модель не дала полное покрытие — обе заметки живы, пара ждёт внимания.
+#: The deferred merge pair's warning kind (LSBN-F-23, p. 6): within 2 rounds
+#: the model gave no full coverage — both notes are alive; the pair awaits attention.
 MERGE_DEFERRED_WARNING = "merge_deferred"
 
-# Счётчик попыток пары и состояние «требует вмешательства» (№39, arch §6.8):
-# нетранзиентные исходы замораживают пару — задание перестаёт браться
-# (вызовы модели не жгутся), но остаётся `pending`. `unavailable`/`timeout`/
-# `auth` счётчик НЕ замораживают: ими занимаются back-off и разрыв слота.
+# The pair attempt counter and the "needs attention" state (#39, arch §6.8):
+# non-transient outcomes freeze the pair — the task stops being taken
+# (no model calls burn) but stays `pending`. `unavailable`/`timeout`/
+# `auth` do NOT freeze the counter: back-off and the slot breaker handle them.
 _NON_TRANSIENT_OUTCOMES = frozenset(
     {SlotOutcome.EMPTY, SlotOutcome.TRUNCATED, SlotOutcome.OFF_CONTRACT}
 )
 
-# Wait-класс исходов, при котором продолжать партию бессмысленно (LSBN-T-28):
-# `unavailable`/`timeout` — провайдер лежит или висит; каждая следующая позиция
-# партии — ещё один потенциальный read-таймаут (900 с: config.py
-# `summary_timeout_sec`/`judge_timeout_sec`), поэтому партия до
-# `embedding_batch_size` позиций могла держать петлю и поток до 8 часов,
-# не будучи в back-off и не пиша `queue_waiting` — деградация невидима в
-# журнале. `auth` — ждать бессмысленно в принципе: разрыв слота открывается
-# сразу (`slot_breaker.note_failure`), и до его снятия гейт каркаса (LSBN-T-29)
-# партию не пустит. EMPTY/TRUNCATED/OFF_CONTRACT остаются per-item (`continue`):
-# они не означают «провайдер лежит» (зовутся быстро), а их покрытие — разрыв
-# слота после трёх отказов одного исхода (`slot_breaker.py`). Прецедент
-# снятия партии — джоба миграции (`if outcome == "retry-later": break`).
-# Требование «работа не теряется»: снятие партии ему не
-# противоречит — отказавшая позиция остаётся pending (как и хвост партии),
-# её добирают back-off петли, пробный стук разрыва после паузы и будка
-# нотификатором при новом сохранении; возврат — число обработанных ДО отказа
-# (сделанное засчитывается, как у миграции).
+# The wait-class outcomes that make continuing the batch pointless (LSBN-T-28):
+# `unavailable`/`timeout` — the provider is down or hanging; each next position
+# of the batch is one more potential read timeout (900 s: config.py
+# `summary_timeout_sec`/`judge_timeout_sec`), so a batch of up to
+# `embedding_batch_size` positions could hold the loop and a thread for up to 8 hours,
+# neither in back-off nor writing `queue_waiting` — the degradation invisible in
+# the journal. `auth` — waiting is pointless in principle: the slot breaker opens
+# immediately (`slot_breaker.note_failure`), and until it is lifted the framework gate (LSBN-T-29)
+# will not let the batch through. EMPTY/TRUNCATED/OFF_CONTRACT stay per-item (`continue`):
+# they do not mean "the provider is down" (they return fast), and their coverage — the
+# slot breaker after three failures of one outcome (`slot_breaker.py`). The
+# batch-release precedent — the migration job (`if outcome == "retry-later": break`).
+# The "no work is lost" requirement: releasing the batch does not
+# contradict it — the failed position stays pending (as does the batch tail);
+# it is picked up by the loop's back-off, the breaker's probe knock after the pause and the
+# notifier's wake on a new save; the return — the count processed BEFORE the failure
+# (done work counts, as with migration).
 _BATCH_ABORT_OUTCOMES = frozenset(
     {SlotOutcome.UNAVAILABLE, SlotOutcome.TIMEOUT, SlotOutcome.AUTH}
 )
 
-# Слот → имя джобы-владельца очереди (для событий внимания и /jobs/attention).
+# Slot → the owning job's queue name (for attention events and /jobs/attention).
 _SLOT_JOB_NAMES = {
     SLOT_EMBEDDING: EMBEDDING_JOB,
     SLOT_SUMMARY: SUMMARY_JOB,
@@ -255,18 +261,26 @@ _SLOT_JOB_NAMES = {
 
 
 def _call_meta_fields(meta: ChatMeta) -> dict[str, object]:
-    """Поля вызова для события отказа (§7.2): цифры/признаки, без секретов.
+    """Call fields for a failure event (§7.2): numbers/flags, no secrets.
 
-    LSBN-F-34 (решение №4 брифа): адрес слота (`base_url`) и источник
-    конфигурации операции (`config_source`: op|slot|default) идут в журнал —
-    в успешный `slot_call` (через `_call_log_fields`) и в событие джобы при
-    ошибке. Наружные поверхности (/health) адреса не показывают.
+            LSBN-F-34 (the brief's decision #4): the slot address (`base_url`) and the
+            operation configuration source (`config_source`: op|slot|default) go into
+            the journal — into the successful `slot_call` (via `_call_log_fields`) and
+            into the job's event on error. The outward surfaces (/health) do not show
+            addresses.
     """
     return {
         "operation": meta.operation,
         "model_type": meta.model_type,
         "budget": meta.budget,
         "budget_source": meta.budget_source,
+        # LSBN-T-33: separate call budgets — the journal shows how much
+        # was allotted to the answer and how much to reasoning (and whether there was an auto-retry).
+        "answer_budget": meta.answer_budget,
+        "reasoning_budget": meta.reasoning_budget,
+        "sent_budget": meta.sent_budget,
+        "reasoning_source": meta.reasoning_source,
+        "escalated_from": meta.escalated_from,
         "base_url": meta.base_url,
         "config_source": meta.config_source,
         "prompt_tokens": meta.prompt_tokens,
@@ -279,7 +293,7 @@ def _call_meta_fields(meta: ChatMeta) -> dict[str, object]:
 
 
 def _call_log_fields(meta: ChatMeta) -> dict[str, object]:
-    """Полный набор полей успешного вызова `slot_call` (№49, §7.2)."""
+    """The full set of fields of a successful `slot_call` (#49, §7.2)."""
     fields = _call_meta_fields(meta)
     fields.update(
         {
@@ -291,17 +305,17 @@ def _call_log_fields(meta: ChatMeta) -> dict[str, object]:
     )
     return fields
 
-# meta-ключ отпечатка конфигурации слотов (№39, arch §6.8/§13.3): смена
-# конфигурации слота — часть «причины» внимания, поэтому старт со сменой
-# отпечатка снимает `attention_at` у всех заданий. Состав отпечатка живёт в
-# `slot_budget.slot_config_fingerprint` (lsbdef0008-02): модель, тип, бюджет,
-# контекст, запас, потолок и параметры decision — одной реализацией на систему.
+# The meta key of the slot configuration fingerprint (#39, arch §6.8/§13.3): a
+# slot configuration change is part of the attention "reason", so a start with a changed
+# fingerprint clears `attention_at` of all tasks. The fingerprint's composition lives in
+# `slot_budget.slot_config_fingerprint` (lsbdef0008-02): the model, kind, budget,
+# context, reserve, ceiling and decision parameters — one implementation system-wide.
 SLOT_CONFIG_META_KEY = "slot_config_fingerprint"
 
-# Единое правило выборки быстрого пула обхода `default` (lsb-0011-01, arch §3.2):
-# активные default-заметки с готовой разметкой (`hint_path` + `confidence` не
-# ниже порога авто-переезда), ещё не разобранные (`node_order_at IS NULL`),
-# свежие первыми — переезд без вызова модели.
+# The single selection rule of the fast `default` sweep pool (lsb-0011-01, arch §3.2):
+# active default notes with ready markup (`hint_path` + `confidence` not
+# below the auto-move threshold), not yet parsed (`node_order_at IS NULL`),
+# newest first — a move without a model call.
 _NODES_SWEEP_SELECT = (
     "SELECT id, hint_path, confidence FROM notes "
     "WHERE namespace = 'default' AND deleted_at IS NULL "
@@ -309,11 +323,11 @@ _NODES_SWEEP_SELECT = (
     "ORDER BY updated_at DESC, id DESC LIMIT ?"
 )
 
-# Классификаторный пул обхода `default` (lsb-0011-02, arch §3.2): активные
-# default-заметки БЕЗ разметки (`classified_at IS NULL`), но с готовой непустой
-# суммари, ещё не разобранные, свежие первыми — вызов классификатора по
-# `title` + `summary` (arch §3.4). Неготовая суммари в пул не попадает: заметка
-# ждёт, маркер не ставится (FR-2.4). Число вызовов ограничивает бюджет
+# The classifier sweep pool of `default` (lsb-0011-02, arch §3.2): active
+# default notes WITHOUT markup (`classified_at IS NULL`) but with a ready non-empty
+# summary, not yet parsed, newest first — a classifier call over
+# `title` + `summary` (arch §3.4). A not-ready summary does not enter the pool: the note
+# waits and gets no marker (FR-2.4). The call count is limited by the budget
 # `JOB_NODES_CLASSIFIER_BUDGET`.
 _NODES_CLASSIFY_SELECT = (
     "SELECT id, title, summary FROM notes "
@@ -323,14 +337,14 @@ _NODES_CLASSIFY_SELECT = (
     "ORDER BY updated_at DESC, id DESC LIMIT ?"
 )
 
-# Предикат «задание `reclass` берётся в ЭТОМ прогоне» (lsb-0012, arch §3.5):
-# `_process_reclass_job` снимает задание, если заметки нет или она в корзине
-# (решать нечего), и решает его по ГОТОВОЙ непустой суммари; задание, ждущее
-# суммари, остаётся pending и прогрессом не считается. Снимок очереди считает
-# только берущиеся задания: ждущее суммари — не работа прогона (сама заметка
-# видна в очереди `summary`), иначе счётчик показывает работу, которой у джобы
-# нет (FAIL приёмки 3.1.0, решение гейта 2026-09-19: `pending=1` держался 7
-# минут — столько объединённая заметка ждала суммари).
+# The predicate "a `reclass` task is takeable in THIS run" (lsb-0012, arch §3.5):
+# `_process_reclass_job` releases the task when the note is gone or in trash
+# (nothing to decide), and decides it over the READY non-empty summary; a task waiting
+# for the summary stays pending and does not count as progress. The queue snapshot counts
+# only takeable tasks: one waiting for the summary is not the run's work (the note itself
+# is visible in the `summary` queue), otherwise the counter would show work the job
+# does not have (a 3.1.0 acceptance FAIL, the 2026-09-19 gate decision: `pending=1` held for 7
+# minutes — how long the merged note waited for its summary).
 _NODES_RECLASS_TAKEABLE = (
     "(n.id IS NULL OR n.deleted_at IS NOT NULL "
     "OR (n.summary_status = 'ok' AND trim(coalesce(n.summary, '')) <> ''))"
@@ -338,21 +352,21 @@ _NODES_RECLASS_TAKEABLE = (
 
 
 def _nodes_queue_stat_sql() -> str:
-    """SQL снимка очереди `nodes` под ФАКТИЧЕСКИЕ пулы прогона (FR-2.2).
+    """The SQL of the `nodes` queue snapshot under the run's ACTUAL pools (FR-2.2).
 
-    `pending` — ровно та работа, которую `process_nodes` может взять в этом
-    прогоне, и ничего больше:
-    (1) задания `reclass` после сшивания (lsb-0012), которые решаются сейчас
-    (`_NODES_RECLASS_TAKEABLE`);
-    (2) кандидаты быстрого пула обхода `default` — предикат тот же, что у
-    `_NODES_SWEEP_SELECT` (переезд по готовой разметке, без модели);
-    (3) кандидаты классификаторного пула — предикат тот же, что у
-    `_NODES_CLASSIFY_SELECT` (готовая непустая суммари, разметки ещё нет).
-    `oldest_pending_sec` — возраст старейшего ИЗ ПОСЧИТАННЫХ источников
-    (задания — `created_at`, кандидаты — `updated_at`), `null` — очередь
-    пуста. Только SQL, без обращений к моделям; снимок работает и у
-    выключенной джобы. Параметр `:threshold` — порог авто-переезда
-    (`NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE`).
+            `pending` — exactly the work `process_nodes` can take in this run, and
+            nothing more:
+            (1) `reclass` tasks after stitching (lsb-0012) that are solvable now
+            (`_NODES_RECLASS_TAKEABLE`);
+            (2) candidates of the fast `default` sweep pool — the same predicate as
+            `_NODES_SWEEP_SELECT` (a move by the ready markup, no model);
+            (3) candidates of the classifier pool — the same predicate as
+            `_NODES_CLASSIFY_SELECT` (a ready non-empty summary, no markup yet).
+            `oldest_pending_sec` — the age of the oldest AMONG THE COUNTED sources
+            (tasks — `created_at`, candidates — `updated_at`); `null` — the queue is
+            empty. SQL only, no model calls; the snapshot works for a disabled job
+            too. The `:threshold` parameter — the auto-move threshold
+            (`NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE`).
     """
     reclass_jobs = (
         "SELECT COUNT(*) FROM worker_jobs j "
@@ -404,30 +418,32 @@ def _nodes_queue_stat_sql() -> str:
     )
 
 
-# Промпт догенерации названия (решение №9): ЗАШИТ в SummaryService.title
-# (follow-up 6b — протокол Summarizer получил метод title; здесь раньше был
-# мёртвый дубль константы, генерация шла с промптом суммаризации).
-# Думающий вызов слота summary, обрезка до TITLE_MAX_WORDS — механика воркера.
+# The title-generation prompt (decision #9): BAKED INTO SummaryService.title
+# (follow-up 6b — the Summarizer protocol gained the title method; there used to be a
+# dead duplicate of the constant here; generation ran with the summarization prompt).
+# A thinking call of the summary slot; trimming to TITLE_MAX_WORDS — the worker's mechanics.
 
 
 def _embed_input(title: str | None, text: str) -> str:
-    """Вход кодирования полного вектора заметки (lsb-0001 FR-1.1).
+    """The input for encoding a note's full vector (lsb-0001 FR-1.1).
 
-    Вектор заметки строится по конкатенации названия и текста:
-    f"{title}\n{text}". title is NULL (миграционная заметка до догенерации
-    названия) — кодируется чистый text без префикса. Чанковые вектора это
-    не касается (решение D1): там кодируется чистый текст чанка без title.
+            The note vector is built over the title and text concatenation:
+            f"{title}
+        {text}". title is NULL (a migration note before title generation) —
+            the bare text is encoded without a prefix. Chunk vectors are unaffected
+            (decision D1): there the chunk's bare text is encoded without the title.
     """
     return text if title is None else f"{title}\n{text}"
 
 
 class BackgroundWorker:
-    """Единственный фоновый воркер; очереди — pending-статусы в БД + worker_jobs.
+    """The only background worker; the queues — pending statuses in the DB + worker_jobs.
 
-    Цикл, back-off и супервизор итерации — каркасные (app/services/jobs.py,
-    lsb-0014-02): воркер описывает свои джобы `JobSpec`-ами (сборщики
-    `build_*_job` в конце модуля) и регистрирует их в реестре. События работ
-    несут обязательное поле `job` (имя джобы, которой принадлежит работа).
+            The loop, back-off and the iteration supervisor are framework-side
+            (app/services/jobs.py, lsb-0014-02): the worker describes its jobs with
+            `JobSpec`s (the `build_*_job` builders at the end of the module) and
+            registers them in the registry. Work events carry the mandatory `job`
+            field (the name of the job owning the work).
     """
 
     def __init__(
@@ -446,51 +462,51 @@ class BackgroundWorker:
         self._settings = settings
         self._embedding = embedding
         self._summarizer = summarizer
-        # LLM-судья дедупа (Фаза 8, Этап 3.1, DI из build_services — один
-        # экземпляр на процесс): вердикт «дубль/не дубль» по каждому
-        # косинус-кандидату (judge-петля, Этап 3.2). None — тестовый режим:
-        # воркер сводит по косинус-фоллбеку Этапа 2.2.
+        # The LLM dedup judge (Phase 8, Stage 3.1, DI from build_services — one
+        # instance per process): the "duplicate / not duplicate" verdict per each
+        # cosine candidate (the judge loop, Stage 3.2). None — a test mode:
+        # the worker merges by the Stage-2.2 cosine fallback.
         self._judge = judge
-        # LSBN-F-12: decision-слот (None — выключен, поведение v3.1.0). Разрыв
-        # decision живёт ВНУТРИ сервиса (§13.8), воркер его не ведёт — берём
-        # только снимок для `/health.slots.decision`.
+        # LSBN-F-12: the decision slot (None — disabled, v3.1.0 behavior). The decision
+        # breaker lives INSIDE the service (§13.8); the worker does not keep it — we only take
+        # its snapshot for `/health.slots.decision`.
         self._decision = decision
-        # Фоновый дедуп (Фаза 8, Этап 2): поиск косинус-кандидатов против
-        # ранних заметок. DI для тестов.
+        # Background dedup (Phase 8, Stage 2): searching cosine candidates against
+        # earlier notes. DI for tests.
         self._dedup = (
             dedup if dedup is not None else DeduplicationService(settings)
         )
-        # Поверхность предупреждений (№12): F-23 п. 6 пишет «слияние
-        # отложено» в warnings; None — DI-сборки тестов (только журнал).
+        # The warnings surface (#12): F-23 p. 6 writes "the merge
+        # is deferred" into warnings; None — test DI builds (journal only).
         self._warnings = warnings
-        # Сведение дублей (Этап 2.2 → F-23) идёт штатной NOTE-логикой:
-        # части-заметки создаются, обе исходные уходят в корзину
-        # (NoteService.merge_into_parts, одна транзакция). Сервис собирается
-        # из тех же deps, что и воркер (embedding — DI-фейк в юнит-тестах);
-        # notifier суммаризации ему не нужен — после слияния воркер будит
-        # свои петли (notify_summary_pending/notify_embedding_pending).
+        # Duplicate merging (Stage 2.2 → F-23) goes through the regular NOTE logic:
+        # part-notes are created and both originals go to trash
+        # (NoteService.merge_into_parts, one transaction). The service is assembled
+        # from the same deps as the worker (embedding — a DI fake in unit tests);
+        # it needs no summarization notifier — after the merge the worker wakes
+        # its own loops (notify_summary_pending/notify_embedding_pending).
         self._notes = NoteService(settings, embedding=embedding)
-        # Причёска (Фаза 10, Шаг 4): классификатор default-заметок после
-        # суммаризации; None — тестовый режим без классификации.
+        # Grooming (Phase 10, Step 4): the default-note classifier after
+        # summarization; None — a test mode without classification.
         self._classifier = classifier
-        # Реестр неймспейсов: известные узлы для классификатора и проверка
-        # целевого узла авто-переезда.
+        # The namespace registry: known nodes for the classifier and the check
+        # of the auto-move target node.
         self._namespaces = NamespaceService(settings)
-        # Область terms (3.0.0, lsb-0008; 3.2.0 — джоба `terms-normalize`):
-        # тот же экземпляр, что у транспорта/петли areas (DI из build_services).
-        # None — DI-сборка без области: сборщик джобы не регистрируется (§6.6).
+        # The terms area (3.0.0, lsb-0008; 3.2.0 — the `terms-normalize` job):
+        # the same instance as the transport/areas loop (DI from build_services).
+        # None — a DI build without the area: the job builder is not registered (§6.6).
         self._terms = terms
-        # Триггер домена (Фаза 10, Шаг 5): авто-создание листов из hint-групп
-        # после классификации; None — тестовый режим без триггера (в проде
-        # DI из build_services: describer + судья структуры).
+        # The domain trigger (Phase 10, Step 5): automatic leaf creation from hint groups
+        # after classification; None — a test mode without the trigger (in prod
+        # DI from build_services: describer + structure judge).
         self._promoter = promoter
-        # Состояние back-off по джобам (каркас lsb-0014): один объект на джобу,
-        # живёт в воркере — интервал переживает итерации цикла и виден в
-        # диагностике (свойства interval/summary_interval/judge_interval/
-        # areas_interval). Стартовые интервалы — как были: PENDING_RETRY_SEC у
-        # очередей, фиксированные 300 с у зачистки просроченных заметок.
-        # Зачистка — единственная джоба с ФИКСИРОВАННЫМ расписанием
-        # (`fixed=True`): пауза всегда 300 с, back-off не растёт (FR-1.5).
+        # The per-job back-off state (the lsb-0014 framework): one object per job,
+        # kept in the worker — the interval survives loop iterations and is visible in
+        # diagnostics (the interval/summary_interval/judge_interval/
+        # areas_interval properties). The starting intervals — as before: PENDING_RETRY_SEC for
+        # queues, a fixed 300 s for expired-notes cleanup.
+        # Cleanup — the only job with a FIXED schedule
+        # (`fixed=True`): the pause is always 300 s, the back-off does not grow (FR-1.5).
         self._backoff: dict[str, BackoffState] = {
             EMBEDDING_JOB: BackoffState(settings.pending_retry_sec),
             SUMMARY_JOB: BackoffState(settings.pending_retry_sec),
@@ -500,17 +516,17 @@ class BackgroundWorker:
                 EXPIRATION_CLEANUP_INTERVAL_SEC, fixed=True
             ),
         }
-        # Разрывы слотов (№39, arch §6.2): состояние СЛОТА, а не джобы —
-        # слот делят разные петли (summary: суммаризация/слияние/
-        # классификация/описания и обход `nodes`; judge: dedup и структура),
-        # поэтому разрыв живёт в одной точке на слот. Разрыв перед прогоном
-        # проверяют ворота каркаса (`JobSpec.gate` → `_slot_gate`, 3.4.1,
-        # LSBN-T-29: единая точка, без ручных `if` в телах джоб),
-        # `_log_slot_failure` фиксирует исход отказа.
-        # Пауза — SLOT_PAUSE_SEC (потолок back-off), порог открытия —
-        # SLOT_PAUSE_AFTER (auth открывает сразу). Состояние — в памяти
-        # процесса: переживания рестарта не требует (конфигурация слота
-        # переоценивается стартовой проверкой, arch §13.2).
+        # Slot breakers (#39, arch §6.2): the SLOT's state, not the job's —
+        # different loops share a slot (summary: summarization/merge/
+        # classification/descriptions and the `nodes` sweep; judge: dedup and structure),
+        # so the breaker lives in one point per slot. The breaker before a run is
+        # checked by the framework gate (`JobSpec.gate` → `_slot_gate`, 3.4.1,
+        # LSBN-T-29: a single point, no manual `if`s in job bodies),
+        # `_log_slot_failure` records the failure outcome.
+        # The pause — SLOT_PAUSE_SEC (the back-off ceiling); the opening threshold —
+        # SLOT_PAUSE_AFTER (auth opens immediately). The state is in process
+        # memory: no restart survival needed (the slot configuration
+        # is re-evaluated by the startup check, arch §13.2).
         self._breakers: dict[str, SlotBreaker] = {
             name: SlotBreaker(
                 name,
@@ -520,198 +536,201 @@ class BackgroundWorker:
             for name in SLOT_NAMES
         }
         self._stopping = False
-        # Сигнал «появилась заметка с pending-вектором» — будит embedding-петлю
-        # сразу после записи (save/update/merge/title-доген), минуя выросший
-        # back-off: свежая заметка кодируется немедленно, а не через 15 мин
-        # (gate 2026-09-19; прецедент summary-петли). Ставит его NoteService
-        # (DI-нотификатор из main.py) и сам воркер — на путях, где он пишет
-        # заметку (слияние, догенерация названия).
+        # The "a note with a pending vector appeared" signal — wakes the embedding loop
+        # right after the write (save/update/merge/title-gen), bypassing the grown
+        # back-off: a fresh note is encoded immediately, not in 15 min
+        # (gate 2026-09-19; the summary-loop precedent). It is set by NoteService
+        # (a DI notifier from main.py) and by the worker itself — on the paths where it writes
+        # a note (merging, title generation).
         self._embedding_event = asyncio.Event()
-        # Сигнал «появилась заметка с pending summary» — будит петлю
-        # суммаризации немедленно (save/update), минуя выросший back-off.
+        # The "a note with a pending summary appeared" signal — wakes the
+        # summarization loop immediately (save/update), bypassing the grown back-off.
         self._summary_event = asyncio.Event()
-        # Сигнал «появилась judge-работа» — будит judge-петлю (embedding-петля
-        # создала дедуп-работу после довекторизации).
+        # The "a judge job appeared" signal — wakes the judge loop (the embedding loop
+        # created a dedup job after vectorization).
         self._judge_event = asyncio.Event()
-        # Сигнал «появилась pending-запись области» — будит петлю areas
-        # (save/update сервисов областей зовут notify_areas_pending): текст
-        # записывается мгновенно, вектор догоняет фоном (архитектура
-        # субстрата §3.3 — без LLM в момент записи).
+        # The "a pending area record appeared" signal — wakes the areas loop
+        # (the areas' save/update services call notify_areas_pending): the text
+        # is written instantly, the vector is caught up in the background (substrate
+        # architecture §3.3 — no LLM at write time).
         self._areas_event = asyncio.Event()
-        # Сигнал «появилось задание после сшивания» (lsb-0012): будит петлю
-        # `nodes` сразу после merge — не ждём часового интервала. Сигнал ставит
-        # та же summary-петля (`process_merge_pending`), DI-нотификатор не нужен:
-        # джоба живёт внутри воркера (arch §3.5).
+        # The "an after-stitching task appeared" signal (lsb-0012): wakes the
+        # `nodes` loop right after the merge — no hourly wait. The signal is set by
+        # the same summary loop (`process_merge_pending`); no DI notifier needed:
+        # the job lives inside the worker (arch §3.5).
         self._nodes_event = asyncio.Event()
-        # Сигнал «заметка получила готовый вектор» (решение гейта 1c): будит
-        # петлю `links` сразу после довекторизации — уровень 1 связей
-        # появляется немедленно, а не ждёт интервала/back-off. Ставит его
-        # embedding-петля (`process_pending`); джоба `links` описана в своём
-        # модуле (`links.py`), но событие берёт у воркера (общий владелец
-        # embedding-очереди; DI-нотификатор не нужен).
+        # The "a note got a ready vector" signal (the gate-1c decision): wakes the
+        # `links` loop right after vectorization — link level 1
+        # appears immediately instead of waiting for the interval/back-off. It is set by
+        # the embedding loop (`process_pending`); the `links` job is described in its own
+        # module (`links.py`) but takes the event from the worker (the shared owner
+        # of the embedding queue; no DI notifier needed).
         self._links_event = asyncio.Event()
-        # Собственный сервис заметок воркера будит его же embedding-петлю на
-        # путях, где пишет заметку сам воркер (`merge_pair` возвращает раннюю
-        # заметку в очередь векторизации) — DI-нотификатор API-слоя здесь
-        # недоступен (сервис собирается раньше событий).
+        # The worker's own note service wakes the worker's embedding loop on
+        # the paths where the worker writes a note itself (`merge_pair` returns the earlier
+        # note to the vectorization queue) — the API layer's DI notifier is not
+        # available here (the service is assembled before the events).
         self._notes.set_vector_notifier(self.notify_embedding_pending)
-        # Мемоизация создания таблицы job-очередей (пул 5): DDL исполняется
-        # один раз на экземпляр воркера, а не при каждом обращении к очередям
-        # (_create_job/_pending_jobs/_mark_job_done звали _ensure_job_table
-        # на каждый вызов — 3 раза на работу).
+        # Memoizing the job-queue table creation (pool 5): the DDL runs
+        # once per worker instance, not on every queue access
+        # (_create_job/_pending_jobs/_mark_job_done called _ensure_job_table
+        # on every call — 3 times per job).
         self._jobs_table_ready = False
-        # Лок ленивой миграции (lsbdef-0013): check-then-act на голом флаге
-        # выше пропускал два потока в ALTER одновременно — петли джоб гоняют
-        # синхронный SQL через `asyncio.to_thread`, а стартовое снятие
-        # внимания (`run`) идёт параллельно им; второй ALTER падал на
-        # `duplicate column name` и ронял итерацию петли. Быстрый выход по
-        # флагу остаётся без лока; сам DDL — под локом.
+        # The lazy migration lock (lsbdef-0013): a check-then-act on a bare flag
+        # above let two threads into the ALTER at once — the job loops run
+        # synchronous SQL through `asyncio.to_thread`, and the startup attention
+        # release (`run`) runs in parallel with them; the second ALTER failed on
+        # `duplicate column name` and crashed the loop iteration. The fast exit by
+        # the flag stays lock-free; the DDL itself — under the lock.
         self._jobs_table_lock = threading.Lock()
-        # Тестовый крючок (no39-04): сколько раз слот снимал (пытался снять)
-        # работу с внимания, по причинам (`probe`/`edit`/`operator`/`startup`).
-        # Инвариант «пауза — на слот, счёт — на пару» проверяется тестом «стук
-        # не обнуляет»: успешный стук НЕ должен появляться тут с reason
-        # `probe` вовсе (`_reset_attention_for_slot(..., "probe")` из
-        # `_slot_gate` удалён, no39-04).
+        # A test hook (no39-04): how many times the slot released (tried to release)
+        # work from attention, by reason (`probe`/`edit`/`operator`/`startup`).
+        # The invariant "the pause is per slot, the count per pair" is checked by the "a knock
+        # does not reset" test: a successful knock must NOT appear here with the reason
+        # `probe` at all (`_reset_attention_for_slot(..., "probe")` was removed from
+        # `_slot_gate`, no39-04).
         self._attention_resets: dict[str, int] = {}
-        # Job-очереди по слотам (Фаза 11, решение №10): таблица создаётся
-        # воркером лениво при первом обращении к очередям (схема — зона
-        # воркера, не db.py). В __init__ не создаём: воркер собирается в
-        # create_app() на импорте, когда БД ещё не инициализирована.
+        # Job queues per slots (Phase 11, decision #10): the table is created
+        # by the worker lazily at the first queue access (the schema is the
+        # worker's zone, not db.py). Not created in __init__: the worker is assembled in
+        # create_app() at import time, when the DB is not initialized yet.
 
     @property
     def interval(self) -> float:
-        """Текущий интервал embedding-джобы (диагностика, тесты)."""
+        """The embedding job's current interval (diagnostics, tests)."""
         return self._backoff[EMBEDDING_JOB].interval
 
     @property
     def summary_interval(self) -> float:
-        """Текущий интервал summary-джобы (диагностика, тесты)."""
+        """The summary job's current interval (diagnostics, tests)."""
         return self._backoff[SUMMARY_JOB].interval
 
     @property
     def chunk_interval(self) -> float:
-        """Интервал чанковой очереди (диагностика, тесты, Фаза 7).
+        """The chunk queue's interval (diagnostics, tests, Phase 7).
 
-        Чанковая очередь объединена с векторной в одну джобу (решение №10) —
-        интервал общий с `interval`.
+                    The chunk queue is merged with the vector queue into one job
+                    (decision #10) — the interval is shared with `interval`.
         """
         return self._backoff[EMBEDDING_JOB].interval
 
     @property
     def judge_interval(self) -> float:
-        """Текущий интервал judge-джобы (диагностика, тесты, Фаза 11)."""
+        """The judge job's current interval (diagnostics, tests, Phase 11)."""
         return self._backoff[JUDGE_JOB].interval
 
     @property
     def areas_interval(self) -> float:
-        """Текущий интервал джобы areas (диагностика, тесты, субстрат 3.0.0)."""
+        """The areas job's current interval (diagnostics, tests, substrate 3.0.0)."""
         return self._backoff[AREAS_JOB].interval
 
     def stop(self) -> None:
-        """Мягкая остановка: петли завершатся после разборки текущей итерации."""
+        """Soft stop: the loops will finish after unwinding the current iteration."""
         self._stopping = True
 
     def notify_embedding_pending(self) -> None:
-        """Разбудить embedding-петлю: заметка вернулась в очередь векторизации.
+        """Wake the embedding loop: a note returned to the vectorization queue.
 
-        Вызывается из save/update/merge (NoteService, поток `asyncio.to_thread`)
-        и из самого воркера (слияние дублей, догенерация названия) —
-        `asyncio.Event.set()` потокобезопасен. Петля немедленно выходит из
-        ожидания и кодирует pending-заметки, не дожидаясь выросшего back-off
-        (до 15 мин). Событие только ускоряет: задание живёт в самом статусе
-        заметки (`vector_status='pending'`) и будет выбрано следующим прогоном.
-        Страховка сигнала — перепроверка очереди (`queue_empty` →
-        `_embedding_queue_empty`, LSBN-T-30): сигнал, сработавший между пустым
-        прогоном и `clear()` события, стёрся бы, — селект очереди его
-        восполняет немедленным прогоном (lost wakeup закрыт). Холостого шторма
-        при недоступных моделях (`EmbeddingError`) перепроверка не даёт:
-        отказ — не прогресс петли (arch §3.2, no39-05), после одного
-        немедленного прогона петля честно уходит в ожидание по back-off
-        (см. `build_embedding_job`).
+                    Called from save/update/merge (NoteService, an `asyncio.to_thread`
+                    thread) and from the worker itself (duplicate merging, title
+                    generation) — `asyncio.Event.set()` is thread-safe. The loop
+                    immediately leaves the wait and encodes pending notes without waiting
+                    out the grown back-off (up to 15 min). The event only accelerates: the
+                    task lives in the note's status itself (`vector_status='pending'`) and
+                    will be picked by the next run. The signal's safety net — the queue
+                    recheck (`queue_empty` → `_embedding_queue_empty`, LSBN-T-30): a
+                    signal fired between an empty run and the event's `clear()` would be
+                    erased — the queue select restores it with an immediate run (lost
+                    wakeup closed). The recheck gives no idle storm with unavailable models
+                    (`EmbeddingError`): a failure is not loop progress (arch §3.2,
+                    no39-05); after one immediate run the loop honestly goes into a
+                    back-off wait (see `build_embedding_job`).
         """
         self._embedding_event.set()
 
     def notify_summary_pending(self) -> None:
-        """Разбудить петлю суммаризации: появилась заметка с pending summary.
+        """Wake the summarization loop: a note with a pending summary appeared.
 
-        Вызывается из save/update (поток `asyncio.to_thread`) —
-        `asyncio.Event.set()` потокобезопасен. Петля немедленно выходит из
-        ожидания и догоняет очередь, не дожидаясь выросшего back-off.
+                    Called from save/update (an `asyncio.to_thread` thread) —
+                    `asyncio.Event.set()` is thread-safe. The loop immediately leaves the
+                    wait and catches up the queue without waiting out the grown back-off.
         """
         self._summary_event.set()
 
     def notify_judge_pending(self) -> None:
-        """Разбудить judge-петлю: появилась judge-работа (дедуп).
+        """Wake the judge loop: a judge job (dedup) appeared.
 
-        Вызывается из embedding-петли после создания дедуп-работы —
-        `asyncio.Event.set()` потокобезопасен.
+                    Called from the embedding loop after creating a dedup job —
+                    `asyncio.Event.set()` is thread-safe.
         """
         self._judge_event.set()
 
     def notify_areas_pending(self) -> None:
-        """Разбудить петлю areas: появилась pending-запись области.
+        """Wake the areas loop: a pending area record appeared.
 
-        Вызывается сервисами областей из save/update (поток
-        `asyncio.to_thread`) — `asyncio.Event.set()` потокобезопасен. Петля
-        немедленно выходит из ожидания и догоняет очередь векторов, не
-        дожидаясь выросшего back-off.
+                    Called by the area services from save/update (an `asyncio.to_thread`
+                    thread) — `asyncio.Event.set()` is thread-safe. The loop immediately
+                    leaves the wait and catches up the vector queue without waiting out the
+                    grown back-off.
         """
         self._areas_event.set()
 
     def notify_nodes_pending(self) -> None:
-        """Разбудить петлю `nodes`: работа появилась (lsb-0012, два повода).
+        """Wake the `nodes` loop: work appeared (lsb-0012, two occasions).
 
-        Зовётся из summary-петли в двух моментах, оба — синхронный код в
-        `asyncio.to_thread`, поэтому `asyncio.Event.set()` потокобезопасен:
+                    Called from the summary loop at two moments, both synchronous code in
+                    `asyncio.to_thread`, so `asyncio.Event.set()` is thread-safe:
 
-        * после успешного сшивания (`process_merge_pending`) — задание
-          `reclass` объединённой заметки поставлено, но её суммари ещё
-          пересчитывается: задание законно ждёт;
-        * после фактической готовности выжимки (`process_summary_pending`,
-          `summary_status='ok'`) — задание, ждавшее этой выжимки, стало
-          берущимся; при отказе суммаризации сигнала нет.
+                    * after a successful stitch (`process_merge_pending`) — the merged
+                      note's `reclass` task is placed, but its summary is still being
+                      recomputed: the task legitimately waits;
+                    * after the summary is actually ready (`process_summary_pending`,
+                      `summary_status='ok'`) — the task waiting for that summary became
+                      takeable; on a summarization failure there is no signal.
 
-        Петля немедленно выходит из ожидания и разбирает `reclass`, не
-        дожидаясь часового интервала `JOB_NODES_INTERVAL_SEC`/выросшего
-        back-off. Задание живёт строкой `worker_jobs` — событие только ускоряет
-        (контракт «задание не теряется» не меняется). DI-нотификатор не нужен:
-        джоба живёт внутри воркера (arch §3.5)."""
+                    The loop immediately leaves the wait and parses `reclass` without
+                    waiting for the hourly `JOB_NODES_INTERVAL_SEC`/grown back-off. The
+                    task lives in a `worker_jobs` row — the event only accelerates (the
+                    "a task is not lost" contract does not change). No DI notifier needed:
+                    the job lives inside the worker (arch §3.5).
+        """
         self._nodes_event.set()
 
     def notify_links_pending(self) -> None:
-        """Разбудить петлю `links`: заметка получила готовый вектор (гейт 1c).
+        """Wake the `links` loop: a note got a ready vector (gate 1c).
 
-        Вызывается из embedding-петли после фактической довекторизации
-        (`process_pending` — синхронный SQL/HTTP в `asyncio.to_thread`),
-        `asyncio.Event.set()` потокобезопасен. Петля немедленно выходит из
-        ожидания и разбирает очередь расчёта связей (`links_at IS NULL`), не
-        дожидаясь `JOB_LINKS_INTERVAL_SEC`/выросшего back-off. Задание живёт
-        маркером `links_at` в БД — событие только ускоряет (контракт
-        надёжности не меняется); при недоступных моделях (`EmbeddingError`)
-        сигнала нет, очередь `links` пуста и петля ждёт по back-off.
+                    Called from the embedding loop after actual vectorization
+                    (`process_pending` — synchronous SQL/HTTP in `asyncio.to_thread`);
+                    `asyncio.Event.set()` is thread-safe. The loop immediately leaves the
+                    wait and parses the links-computation queue (`links_at IS NULL`)
+                    without waiting for `JOB_LINKS_INTERVAL_SEC`/the grown back-off. The
+                    task lives in the `links_at` marker in the DB — the event only
+                    accelerates (the reliability contract does not change); with
+                    unavailable models (`EmbeddingError`) there is no signal, the `links`
+                    queue is empty and the loop waits on back-off.
         """
         self._links_event.set()
 
     def _is_stopping(self) -> bool:
-        """Предикат мягкой остановки для каркасного цикла (`run_loop`)."""
+        """The soft-stop predicate for the framework loop (`run_loop`)."""
         return self._stopping
 
     def _job_backoff(self, spec: JobSpec) -> BackoffState:
-        """Состояние back-off джобы (для незарегистрированной — её интервал)."""
+        """A job's back-off state (for an unregistered one — its interval)."""
         return self._backoff.setdefault(
             spec.name, BackoffState(spec.interval_sec)
         )
 
     async def run(self) -> None:
-        """Все джобы реестра — единым каркасным циклом (asyncio-таска).
+        """All registry jobs — one framework loop (an asyncio task).
 
-        Джобы собираются `build_job_specs` (реестр `JobSpec`-ов каркаса; свои
-        джобы воркер регистрирует в конце модуля) и обслуживаются `run_loop`.
-        Обработанные партии идут одна за другой (очередь выгребаем сразу);
-        пустой прогон — ожидание сигнала `notify_*` (форма «по требованию») или
-        пауза по back-off. Джобы независимы: интервал и выгребание —
-        раздельные (свой `BackoffState` на джобу).
+                    The jobs are assembled by `build_job_specs` (the framework's registry
+                    of `JobSpec`s; the worker registers its own jobs at the end of the
+                    module) and served by `run_loop`. Processed batches go one after
+                    another (we drain the queue at once); an empty run — waiting for a
+                    `notify_*` signal (the "on demand" form) or a back-off pause. Jobs are
+                    independent: the interval and draining are separate (a `BackoffState`
+                    per job).
         """
         specs = build_job_specs(self, self._settings)
         await asyncio.gather(
@@ -719,37 +738,37 @@ class BackgroundWorker:
                 run_loop(spec, self._is_stopping, self._job_backoff(spec))
                 for spec in specs
             ),
-            # Старт со сменой конфигурации слота — «причина ушла»: внимание
-            # снимается, отпечаток перезаписывается (№39 §6.8/§13.3). Стартовая
-            # сверка идёт ПАРАЛЛЕЛЬНО петлям (не задерживает первый прогон).
+            # A start with a changed slot configuration — "the reason is gone": attention
+            # is cleared, the fingerprint rewritten (#39 §6.8/§13.3). The startup
+            # check runs IN PARALLEL with the loops (it does not delay the first run).
             self._startup_attention_reset_async(),
         )
 
-    # --- разрывы слотов (№39, arch §6.2/§6.7) ----------------------------------
+    # --- slot breakers (#39, arch §6.2/§6.7) ----------------------------------
 
     def slot_states(self) -> dict[str, dict]:
-        """Снимок разрывов слотов (для журнала и хинта человеку; №39).
+        """A snapshot of slot breakers (for the journal and a human hint; #39).
 
-        Только чтение памяти процесса — без обращений к моделям. Потребитель —
-        MCP-миддлварь хинта «предупреди своего человека». Полная поверхность
-        `/health.slots` и наблюдаемость очередей — постановка no39-03.
+                    Reading process memory only — no model calls. The consumer — the MCP
+                    middleware of the "warn your human" hint. The full `/health.slots`
+                    surface and queue observability — the no39-03 brief.
         """
         return {name: breaker.snapshot() for name, breaker in self._breakers.items()}
 
     def slots_health(self) -> dict[str, dict]:
-        """Снимок слотов для `/health.slots` (№39, arch §7.2): только SQL/память.
+        """A slots snapshot for `/health.slots` (#39, arch §7.2): SQL/memory only.
 
-        По каждому слоту (`embedding`/`summary`/`judge`) — снимок разрыва
-        (`SlotBreaker.snapshot`: `last_outcome`, `paused_until` и др.), исход
-        последней попытки (`ok` — прецедент `embedding_ok`/`summarizer_ok`/
-        `judge_ok`) и число заданий слота в внимании (`attention`, no39-02).
-        №50 (lsbdef-0008, §7.3): плюс диагностика последнего вызова из
-        `services.*.last_meta` — `last_finish_reason`/`last_budget`/
-        `last_budget_source`/`last_had_thinking` (нет метаданных — None):
-        оператор читает причину (обрезано по бюджету / размышление съело
-        вывод) без журнала.
-        Модели НЕ вызываются: только состояние в памяти и SQL по `worker_jobs`
-        (сбор `/health` не должен будить слоты).
+                    Per slot (`embedding`/`summary`/`judge`) — the breaker snapshot
+                    (`SlotBreaker.snapshot`: `last_outcome`, `paused_until`, etc.), the
+                    last attempt's outcome (`ok` — the `embedding_ok`/`summarizer_ok`/
+                    `judge_ok` precedent) and the slot's tasks in attention (`attention`,
+                    no39-02). #50 (lsbdef-0008, §7.3): plus the last call's diagnostics from
+                    `services.*.last_meta` — `last_finish_reason`/`last_budget`/
+                    `last_budget_source`/`last_had_thinking` (no metadata — None):
+                    the operator reads the reason (trimmed by the budget / reasoning ate
+                    the output) without the journal.
+                    Models are NOT called: only in-memory state and SQL over `worker_jobs`
+                    (assembling `/health` must not wake slots).
         """
         attention: dict[str, int] = {}
         try:
@@ -760,7 +779,7 @@ class BackgroundWorker:
                     "WHERE attention_at IS NOT NULL GROUP BY slot"
                 ).fetchall()
             attention = {rows[i]["slot"]: int(rows[i]["c"]) for i in range(len(rows))}
-        except Exception:  # noqa: BLE001 — наблюдаемость не роняет /health
+        except Exception:  # noqa: BLE001 — observability does not crash /health
             attention = {}
         services = {
             SLOT_EMBEDDING: self._embedding,
@@ -778,18 +797,24 @@ class BackgroundWorker:
             snapshot["last_budget"] = meta.budget if meta else None
             snapshot["last_budget_source"] = meta.budget_source if meta else None
             snapshot["last_had_thinking"] = meta.had_thinking if meta else None
+            # LSBN-T-33: separate budgets of the last call — "eaten by
+            # reasoning" is visible via the pair `last_outcome=truncated` +
+            # `last_had_thinking=true` + the budget split.
+            snapshot["last_answer_budget"] = meta.answer_budget if meta else None
+            snapshot["last_reasoning_budget"] = meta.reasoning_budget if meta else None
+            snapshot["last_sent_budget"] = meta.sent_budget if meta else None
             health[name] = snapshot
         health[SLOT_DECISION] = self._decision_slot_health(attention)
         return health
 
     def _decision_slot_health(self, attention: dict[str, int]) -> dict:
-        """Слот `decision` для `/health.slots` (LSBN-F-12, §7.1): только память.
+        """The `decision` slot for `/health.slots` (LSBN-F-12, §7.1): memory only.
 
-        Состояние берётся из `services.decision.snapshot()` (разрыв живёт в
-        сервисе, §13.8): `ok`, `last_outcome`, `paused_until`; `attention` — по
-        таблице заданий (своей очереди у decision нет — 0); четыре поля
-        диагностики последнего вызова — `None` (у decision нет `last_meta`).
-        Слот выключен/не собран — форма «выключен» (§7.1).
+                    The state comes from `services.decision.snapshot()` (the breaker lives
+                    in the service, §13.8): `ok`, `last_outcome`, `paused_until`;
+                    `attention` — over the task table (decision has no own queue — 0); the
+                    four last-call diagnostic fields — `None` (decision has no
+                    `last_meta`). The slot off/not built — the "disabled" shape (§7.1).
         """
         service = self._decision
         if service is None:
@@ -812,7 +837,7 @@ class BackgroundWorker:
 
     @staticmethod
     def _decision_disabled_stat() -> dict:
-        """Форма выключенного decision-слота в `/health.slots` (§7.1)."""
+        """The shape of a disabled decision slot in `/health.slots` (§7.1)."""
         return {
             "ok": None,
             "last_outcome": None,
@@ -822,11 +847,11 @@ class BackgroundWorker:
         }
 
     def _probe_slot(self, slot: str) -> str:
-        """Один дешёвый пробный вызов слота (без генерации, №39 §6.2).
+        """One cheap probe call of a slot (no generation, #39 §6.2).
 
-        По имени слота — `probe()` соответствующего сервиса (тонкая обёртка
-        над `LLMClient.check()`). Отсутствующий сервис или фейк без `probe`
-        (тестовый режим) — заглушка `CHECK_OK` (прецедент стартовой проверки).
+                    By slot name — the corresponding service's `probe()` (a thin wrapper
+                    over `LLMClient.check()`). A missing service or a fake without `probe`
+                    (a test mode) — the `CHECK_OK` stub (the startup-check precedent).
         """
         service = {
             SLOT_EMBEDDING: self._embedding,
@@ -839,13 +864,14 @@ class BackgroundWorker:
         return probe()
 
     def _slot_gate(self, slot: str | None, job: str | None = None) -> bool:
-        """Ворота слота: можно ли брать партию (№39, arch §6.2/§6.7).
+        """The slot gate: may the batch be taken (#39, arch §6.2/§6.7).
 
-        `None`/неизвестный слот — True (разрыва нет). Разрыв закрыт — True.
-        Разрыв открыт и стук не наступил — False (партия не берётся, вызовы
-        модели не жгутся; прогон возвращает 0 → back-off петли). Стук наступил
-        — один `probe()`: `CHECK_OK` снимает разрыв (партия идёт в этом же
-        прогоне), `auth_failed`/иное — пауза переставляется, партии нет.
+                    `None`/unknown slot — True (no breaker). The breaker closed — True.
+                    The breaker open and no knock yet — False (the batch is not taken, no
+                    model calls burn; the run returns 0 → the loop's back-off). The knock
+                    is due — one `probe()`: `CHECK_OK` lifts the breaker (the batch goes in
+                    the same run), `auth_failed`/other — the pause is rescheduled, no
+                    batch.
         """
         if slot is None:
             return True
@@ -858,14 +884,14 @@ class BackgroundWorker:
             result = self._probe_slot(slot)
             self._log_slot_event("slot_probe", slot, effective_job, result=result)
             if result == CHECK_OK:
-                # Стук снимает разрыв СЛОТА, но НЕ снимает счёт ПАРЫ (no39-04,
-                # решение О. 2026-10-12): «слот ожил» ≠ «причина пары ушла».
-                # Здесь нет `_reset_attention_for_slot(slot, "probe")` — иначе
-                # успешный стук обнулял бы `attempts` и `attention_at` пары,
-                # порог `SLOT_MAX_ATTEMPTS` становился бы недостижим, и
-                # «требует вмешательства» не наступало бы никогда. Работу с
-                # внимания снимают только протоколы правки пары, оператора и
-                # смены отпечатка конфигурации (arch §6.8).
+                # A knock lifts the SLOT's breaker but does NOT reset the PAIR's count (no39-04,
+                # the 2026-10-12 decision): "the slot revived" ≠ "the pair's reason is gone".
+                # There is no `_reset_attention_for_slot(slot, "probe")` here — otherwise
+                # a successful knock would reset the pair's `attempts` and `attention_at`,
+                # the `SLOT_MAX_ATTEMPTS` threshold would become unreachable, and
+                # "needs attention" would never trigger. Work is removed from
+                # attention only by the pair-edit protocols, the operator's, and the
+                # configuration-fingerprint change (arch §6.8).
                 breaker.note_success()
                 self._log_slot_event(
                     "slot_resumed",
@@ -886,7 +912,7 @@ class BackgroundWorker:
         return True
 
     def _note_slot_outcome(self, job: str, slot: str, outcome: SlotOutcome) -> bool:
-        """Зафиксировать исход у разрыва слота; True — разрыв открылся сейчас."""
+        """Record the outcome at the slot breaker; True — the breaker opened now."""
         breaker = self._breakers.get(slot)
         if breaker is None:
             return False
@@ -919,19 +945,20 @@ class BackgroundWorker:
         meta: ChatMeta | None = None,
         **extra: object,
     ) -> None:
-        """Единая точка отказа слота (№39, arch §6.7): событие + исход в журнал.
+        """The single point of a slot failure (#39, arch §6.7): an event + the outcome into the journal.
 
-        Поля события: `event`, `job`, `slot`, `outcome` (значение строки),
-        `detail` (фрагмент ≤160 симв.; секреты маскируются 4 симв. + `***`),
-        `note_id`/`older_id`/`candidate_id` по факту. №49: если вызов модели
-        состоялся (отказ после ответа — `meta` у ошибки), событие дополняется
-        полями вызова (§7.2) — второй записи нет. Отказ фиксируется и у
-        разрыва слота: открылся — пишется `slot_paused`. Вызывающий сохраняет
-        прежнее поведение для исходов per-item (работа остаётся pending,
-        `continue`); исход wait-класса (unavailable/timeout/auth,
-        `_BATCH_ABORT_OUTCOMES` — LSBN-T-28, партии summary/title/judge)
-        вызывающий снимает партию (`break`, прецедент migration retry-later):
-        работа остаётся pending — её добирает back-off после возврата слота.
+                    Event fields: `event`, `job`, `slot`, `outcome` (the string value),
+                    `detail` (a fragment ≤160 chars; secrets masked to 4 chars + `***`),
+                    `note_id`/`older_id`/`candidate_id` as available. #49: when the model
+                    call happened (a failure after the answer — the error carries `meta`),
+                    the event is extended with the call fields (§7.2) — no second record.
+                    The failure is also recorded at the slot breaker: if it opened —
+                    `slot_paused` is written. The caller keeps the old behavior for
+                    per-item outcomes (the work stays pending, `continue`); a wait-class
+                    outcome (unavailable/timeout/auth, `_BATCH_ABORT_OUTCOMES` — LSBN-T-28,
+                    the summary/title/judge batches) makes the caller release the batch
+                    (`break`, the migration retry-later precedent): the work stays pending
+                    — the back-off picks it up after the slot returns.
         """
         fields: dict[str, object] = {
             "event": event,
@@ -964,7 +991,7 @@ class BackgroundWorker:
         level: int = logging.INFO,
         **fields: object,
     ) -> None:
-        """Событие разрыва/стука (№39 §7.4): `event`/`slot`/`job` + поля по факту."""
+        """A breaker/probe event (#39 §7.4): `event`/`slot`/`job` + fields as available."""
         payload: dict[str, object] = {"event": event, "slot": slot, "job": job}
         for key, value in fields.items():
             if value is not None:
@@ -981,12 +1008,13 @@ class BackgroundWorker:
         older_id: int | None = None,
         candidate_id: int | None = None,
     ) -> None:
-        """Успешный вызов чата слота — событие `slot_call` (№49, §7.2).
+        """A successful slot chat call — the `slot_call` event (#49, §7.2).
 
-        Одно событие на вызов: бюджет и его источник, счётчики, факт и объём
-        размышления, причина завершения, обрезка, длительность. Без метаданных
-        (тестовый двойник/слот без `chat_result`) событие не пишется — живой
-        сервис их всегда отдаёт (№49 FR-3.1).
+                    One event per call: the budget and its source, the counters, the fact
+                    and volume of reasoning, the finish reason, the truncation, the
+                    duration. Without metadata (a test double / a slot without
+                    `chat_result`) the event is not written — a live service always
+                    provides them (#49 FR-3.1).
         """
         if meta is None:
             return
@@ -1001,10 +1029,10 @@ class BackgroundWorker:
         self._log_slot_event("slot_call", slot, job, level=logging.INFO, **fields)
 
     def _mask_detail(self, detail: str | None) -> str | None:
-        """Фрагмент причины ≤160 симв. с маскировкой секретов (4 симв. + ***).
+        """A reason fragment ≤160 chars with secrets masked (4 chars + ***).
 
-        Секреты (API-ключи слотов, MCP-токен) могут попасть в текст отказа
-        (URL/эхо) — в журнал они не уходят ни в каком виде.
+                    Secrets (slot API keys, the MCP token) can end up in a failure text
+                    (URL/echo) — they never reach the journal in any form.
         """
         if detail is None:
             return None
@@ -1020,11 +1048,11 @@ class BackgroundWorker:
                 fragment = fragment.replace(secret.strip(), secret.strip()[:4] + "***")
         return fragment
 
-    # --- счётчик попыток пары и «требует вмешательства» (№39, arch §6.8) --------
+    # --- the pair attempt counter and "needs attention" (#39, arch §6.8) ------
 
     @staticmethod
     def _load_payload(raw: str | None) -> dict:
-        """Разобрать payload работы (терпимо к пустому/битому JSON)."""
+        """Parse a job's payload (tolerant to empty/broken JSON)."""
         try:
             loaded = json.loads(raw or "{}")
         except (TypeError, ValueError):
@@ -1032,7 +1060,7 @@ class BackgroundWorker:
         return loaded if isinstance(loaded, dict) else {}
 
     def _set_job_payload(self, job_id: int, payload: dict) -> None:
-        """Перезаписать payload работы (идентичность пары и её штамп)."""
+        """Overwrite a job's payload (the pair identity and its stamp)."""
         self._ensure_job_table()
         with session(self._settings) as conn, transaction(conn):
             conn.execute(
@@ -1041,11 +1069,11 @@ class BackgroundWorker:
             )
 
     def _job_for_slot(self, slot: str) -> str:
-        """Имя джобы-владельца очереди слота (для событий и /jobs/attention)."""
+        """The owning job's name of a slot's queue (for events and /jobs/attention)."""
         return _SLOT_JOB_NAMES.get(slot, slot)
 
     def _log_attention_event(self, event: str, **fields: object) -> None:
-        """Событие внимания задания (arch §7.4): `event` + поля по факту."""
+        """A task attention event (arch §7.4): `event` + fields as available."""
         payload: dict[str, object] = {"event": event}
         for key, value in fields.items():
             if value is not None:
@@ -1060,23 +1088,25 @@ class BackgroundWorker:
         detail: str | None = None,
         pair_stamp: str | None = None,
     ) -> dict:
-        """Зафиксировать исход попытки пары (№39, arch §6.8; no39-04).
+        """Record a pair attempt's outcome (#39, arch §6.8; no39-04).
 
-        ИНВАРИАНТ «пауза — на слот, счёт — на пару»: состояние разрыва слота
-        здесь НЕ читается вовсе. Пауза — недоступность/отказ доступа СЛОТА
-        (back-off и пробный стук); счётчик `attempts` — собственная
-        безнадёжность ПАРЫ (заметка/кандидат). Поэтому нетранзиентные отказы
-        считаются независимо от того, открыт ли сейчас разрыв слота: пара
-        доходит до `SLOT_MAX_ATTEMPTS` через циклы «пауза → стук → снова
-        отказ», а не замирает на `SLOT_PAUSE_AFTER`.
+                    The INVARIANT "the pause is per slot, the count per pair": the slot
+                    breaker's state is not read here at all. The pause is the SLOT's
+                    unavailability/access failure (back-off and the probe knock); the
+                    `attempts` counter is the PAIR's own hopelessness (note/candidate).
+                    Therefore non-transient failures count regardless of whether the slot
+                    breaker is open now: the pair reaches `SLOT_MAX_ATTEMPTS` through
+                    cycles of "pause → knock → failure again" instead of freezing at
+                    `SLOT_PAUSE_AFTER`.
 
-        Транзиентный исход (`unavailable`/`timeout`/`auth`) обновляет только
-        `last_outcome`/`last_error` — счётчик не растёт (ждать — нормальное
-        состояние, им занимаются back-off и разрыв). Нетранзиентный
-        (`empty`/`truncated`/`off_contract`) наращивает `attempts`, и по
-        достижении `SLOT_MAX_ATTEMPTS` ставит `attention_at` — работа замирает,
-        оставаясь `pending`. Всё — одной транзакцией (`UPDATE … WHERE id = ?`).
-        `pair_stamp` — отпечаток пары (заметка/кандидат), обновляется в payload.
+                    A transient outcome (`unavailable`/`timeout`/`auth`) updates only
+                    `last_outcome`/`last_error` — the counter does not grow (waiting is a
+                    normal state; back-off and the breaker handle it). A non-transient one
+                    (`empty`/`truncated`/`off_contract`) increments `attempts`, and on
+                    reaching `SLOT_MAX_ATTEMPTS` sets `attention_at` — the work freezes
+                    while staying `pending`. All — in one transaction
+                    (`UPDATE … WHERE id = ?`). `pair_stamp` — the pair's fingerprint
+                    (note/candidate), updated in the payload.
         """
         self._ensure_job_table()
         masked = self._mask_detail(detail)
@@ -1139,13 +1169,14 @@ class BackgroundWorker:
         return {"job_id": job_id, "attempts": attempts, "attention": attention}
 
     def _release_attention(self, job_id: int, reason: str) -> dict:
-        """Сбросить счётчик пары и снять внимание (№39, arch §6.8/§13.3).
+        """Reset the pair counter and clear attention (#39, arch §6.8/§13.3).
 
-        `attempts = 0, attention_at = NULL, last_error = NULL` — «причина
-        ушла»: работа идёт как новая. `released` — было ли задание во внимании
-        (операторская ручка отдаёт 404 на задание вне внимания); `found` —
-        есть ли строка вообще. Событие `job_attention_released` с причиной
-        (`edit`/`probe`/`operator`/`startup`) пишется на найденную строку.
+                    `attempts = 0, attention_at = NULL, last_error = NULL` — "the reason
+                    is gone": the work goes as new. `released` — was the task in attention
+                    (the operator handle returns 404 for a task outside attention);
+                    `found` — whether the row exists at all. A `job_attention_released`
+                    event with the reason (`edit`/`probe`/`operator`/`startup`) is written
+                    for a found row.
         """
         self._ensure_job_table()
         with session(self._settings) as conn, transaction(conn):
@@ -1182,10 +1213,10 @@ class BackgroundWorker:
         }
 
     def release_attention(self, job_id: int) -> dict:
-        """Операторская переоткрытие задания из внимания (arch §6.7/§7.4).
+        """The operator's reopening of a task from attention (arch §6.7/§7.4).
 
-        Только для задания во внимании: вне внимания (или без строки) —
-        `released: false` без правок (REST-ручка отдаёт 404).
+                    Only for a task in attention: outside attention (or without a row) —
+                    `released: false` without edits (the REST handle returns 404).
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
@@ -1198,15 +1229,16 @@ class BackgroundWorker:
         return {"job_id": job_id, "released": True, "attempts": 0}
 
     def _reset_attention_for_slot(self, slot: str, reason: str) -> int:
-        """Снять внимание у заданий слота (`*` — у всех); число снятых.
+        """Clear attention of a slot's tasks (`*` — all); the number cleared.
 
-        Единственный «оптовый» сброс «причина ушла» — старт со сменой отпечатка
-        конфигурации (`reason="startup"`, arch §6.8/§13.3). Успешный стук слота
-        (`reason="probe"`) сюда больше НЕ ведёт (no39-04): «слот ожил» — не
-        «причина пары ушла».
+                    The only "wholesale" "the reason is gone" reset — a start with a
+                    changed configuration fingerprint (`reason="startup"`, arch
+                    §6.8/§13.3). A successful slot knock (`reason="probe"`) leads here NO
+                    MORE (no39-04): "the slot revived" is not "the pair's reason is
+                    gone".
         """
         self._ensure_job_table()
-        # крючок наблюдаемости (тесты): попытки снятия по каждой причине
+        # an observability hook (tests): release attempts per reason
         self._attention_resets[reason] = self._attention_resets.get(reason, 0) + 1
         with session(self._settings) as conn:
             if slot == "*":
@@ -1226,11 +1258,12 @@ class BackgroundWorker:
         return released
 
     def attention_jobs(self) -> list[dict]:
-        """Задания, ждущие человека (arch §6.7/§7.4): только SQL.
+        """Tasks waiting for a human (arch §6.7/§7.4): SQL only.
 
-        Форма записи: `{job_id, job, slot, note_id, older_id, outcome,
-        attempts, since}` — `since` — момент `attention_at`. Потребители —
-        `/health` и операторская ручка `GET /jobs/attention` (моделей не зовём).
+                    The record shape: `{job_id, job, slot, note_id, older_id, outcome,
+                    attempts, since}` — `since` is the `attention_at` moment. Consumers —
+                    `/health` and the operator handle `GET /jobs/attention` (no models
+                    called).
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
@@ -1256,7 +1289,7 @@ class BackgroundWorker:
         return jobs
 
     def attention_count(self) -> int:
-        """Сколько заданий ждёт человека (агрегат по всем слотам, arch §6.7)."""
+        """How many tasks wait for a human (an aggregate over all slots, arch §6.7)."""
         self._ensure_job_table()
         with session(self._settings) as conn:
             return int(
@@ -1267,12 +1300,13 @@ class BackgroundWorker:
             )
 
     def _review_attention_jobs(self, slot: str, kind: str) -> int:
-        """Пере-проверить пару замороженных работ без вызова модели (arch §6.8).
+        """Re-check a pair of frozen jobs without a model call (arch §6.8).
 
-        Протокол «правка пары» без ручных правок: правка заметки/кандидата или
-        смена лучшего кандидата возвращает работу в очередь (`attempts=0`),
-        решение о вердикте/слиянии принимает следующий прогон. Только SQL и
-        чтение вектора — моделей не зовём. Возвращает число размороженных.
+                    The "pair edit" protocol without manual edits: an edit of the
+                    note/candidate or a new best candidate returns the job to the queue
+                    (`attempts=0`); the verdict/merge decision is made by the next run.
+                    SQL and vector reads only — no models called. Returns the unfrozen
+                    count.
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
@@ -1297,7 +1331,7 @@ class BackgroundWorker:
                 )
             if note is None or note["deleted_at"] is not None:
                 continue
-            # правка стороны пары (заметки/ранней) — причина ушла
+            # a pair side's edit (the note/the earlier one) — the reason is gone
             if (
                 payload.get("note_updated_at") is not None
                 and payload["note_updated_at"] != note["updated_at"]
@@ -1324,8 +1358,8 @@ class BackgroundWorker:
                     if self._release_attention(int(row["id"]), "edit")["released"]:
                         released += 1
                 continue
-            # дедуп: лучший кандидат пересчитывается по вектору; без вектора
-            # пару не проверить — ждём перевекторизации
+            # dedup: the best candidate is recomputed over the vector; without a vector
+            # the pair cannot be checked — we wait for re-vectorization
             if note["vector_status"] != "ok" or vector is None:
                 continue
             candidates = self._find_dedup_candidates(
@@ -1357,17 +1391,20 @@ class BackgroundWorker:
         return released
 
     def _startup_attention_reset(self) -> int:
-        """Стартовая сверка отпечатка конфигурации слотов (arch §6.8/§13.3).
+        """The startup check of the slot configuration fingerprint (arch §6.8/§13.3).
 
-        Сравниваем текущий отпечаток (`slot_budget.slot_config_fingerprint`,
-        lsbdef0008-02: модель/тип/бюджет/контекст/запас/потолок + параметры
-        decision) с записанным в `meta` (`SLOT_CONFIG_META_KEY`). Отпечатка нет
-        или он отличается — «причина ушла»: внимание снимается у заданий всех
-        слотов (событие блока 2 `job_attention_released`, `reason="startup"`),
-        отпечаток перезаписывается. Тот же отпечаток — ничего не снимаем.
+                    We compare the current fingerprint
+                    (`slot_budget.slot_config_fingerprint`, lsbdef0008-02: model/kind/
+                    budget/context/reserve/ceiling + decision parameters) with the one
+                    recorded in `meta` (`SLOT_CONFIG_META_KEY`). No fingerprint or a
+                    different one — "the reason is gone": attention is cleared for the
+                    tasks of all slots (the block-2 `job_attention_released` event,
+                    `reason="startup"`), the fingerprint is rewritten. The same
+                    fingerprint — nothing is cleared.
 
-        `SLOT_ATTENTION_RESET_ON_START=false` отключает шаг целиком: оператор
-        запретил снятие, читать и переписывать отпечаток не нужно.
+                    `SLOT_ATTENTION_RESET_ON_START=false` disables the step entirely: the
+                    operator forbade the reset; reading and rewriting the fingerprint is
+                    unnecessary.
         """
         if not self._settings.slot_attention_reset_on_start:
             return 0
@@ -1389,32 +1426,34 @@ class BackgroundWorker:
         return released
 
     async def _startup_attention_reset_async(self) -> None:
-        """Стартовая сверка внимания в рабочем потоке (не блокирует петли).
+        """The startup attention check in a worker thread (does not block the loops).
 
-        Отказ сверки не роняет воркер: внимание само снимется успешным стуком
-        слота или правкой пары, а сама сверка — оптимизация «причина ушла при
-        смене конфигурации» (arch §6.8).
+                    A check failure does not crash the worker: attention clears itself by
+                    a successful slot knock or a pair edit, and the check itself is the
+                    "the reason is gone on a configuration change" optimization
+                    (arch §6.8).
         """
         try:
             await asyncio.to_thread(self._startup_attention_reset)
-        except Exception:  # noqa: BLE001 — фоновая оптимизация не роняет старт
+        except Exception:  # noqa: BLE001 — a background optimization does not crash the start
             logging.getLogger("app").warning(
                 "slot attention startup reset failed",
                 extra={"event": "job_attention_reset_failed"},
             )
 
-    # --- работа джоб (цикл, back-off и супервизор — в каркасе) -----------------
+    # --- job work (the loop, back-off and supervisor — in the framework) ------
 
     async def _process_embedding(self) -> int:
-        """Прогон embedding-джобы: notes-очередь (в потоке) + чанковая очередь.
+        """The embedding job's run: the notes queue (in a thread) + the chunk queue.
 
-        Обе очереди — одна джоба (решение №10): полные вектора заметок
-        (`process_pending` — синхронный SQL/HTTP, уходит в `to_thread`) и
-        чанковая очередь (`process_pending_chunks` — своя async-обработка с
-        Semaphore внутри). Возвращает число фактически обработанных заданий:
-        0 уводит каркасную петлю в ожидание с back-off (arch §3.2). Разрыв
-        слота до тела прогона не доходит: ворота — в каркасе (`JobSpec.gate`,
-        3.4.1, LSBN-T-29) — ручной `if` убран, проверка одна на все джобы.
+                    Both queues — one job (decision #10): full note vectors
+                    (`process_pending` — synchronous SQL/HTTP, goes into `to_thread`) and
+                    the chunk queue (`process_pending_chunks` — its own async handling
+                    with a Semaphore inside). Returns the number of actually processed
+                    tasks: 0 sends the framework loop into a back-off wait (arch §3.2).
+                    A slot breaker never reaches the run body: the gate is in the
+                    framework (`JobSpec.gate`, 3.4.1, LSBN-T-29) — the manual `if` is
+                    gone, one check for all jobs.
         """
         with history.bind_origin(f"job:{EMBEDDING_JOB}"):
             processed = await asyncio.to_thread(self.process_pending)
@@ -1422,24 +1461,24 @@ class BackgroundWorker:
         return processed
 
     async def _run_embedding_single(self) -> None:
-        """Обслуживать embedding-джобу каркасным циклом (запуск одной джобы).
+        """Serve the embedding job with the framework loop (a single-job run).
 
-        См. `_run_summary`: изоляция одной джобы — для тестов пула 6
-        (lost wakeup) по очереди векторизации (LSBN-T-30: перепроверка
-        `_embedding_queue_empty` против стёртого `clear()` сигнала).
+                    See `_run_summary`: one job's isolation — for the pool-6 tests
+                    (lost wakeup) over the vectorization queue (LSBN-T-30: the
+                    `_embedding_queue_empty` recheck against an erased `clear()` signal).
         """
         spec = build_embedding_job(self, self._settings)
         await run_loop(spec, self._is_stopping, self._backoff[EMBEDDING_JOB])
 
     async def _process_summary(self) -> int:
-        """Прогон summary-джобы: title-доген → summarize → merge (три шага).
+        """The summary job's run: title-gen → summarize → merge (three steps).
 
-        Каждый шаг — синхронный SQL/LLM, уходит в `to_thread`; порядок шагов
-        сохранён (как в исходной петле). Возвращает число обработанных
-        заданий: 0 уводит каркасную петлю к ожиданию сигнала
-        `notify_summary_pending` (форма «по требованию», пул 6) или таймаута.
-        Разрыв слота summary проверяют ворота каркаса (`JobSpec.gate`,
-        3.4.1, LSBN-T-29) — ручной `if` убран.
+                    Each step — synchronous SQL/LLM, goes into `to_thread`; the step order
+                    is preserved (as in the original loop). Returns the number of
+                    processed tasks: 0 sends the framework loop to waiting for the
+                    `notify_summary_pending` signal (the "on demand" form, pool 6) or a
+                    timeout. The summary slot breaker is checked by the framework gate
+                    (`JobSpec.gate`, 3.4.1, LSBN-T-29) — the manual `if` is gone.
         """
         with history.bind_origin(f"job:{SUMMARY_JOB}"):
             processed = await asyncio.to_thread(self.process_title_pending)
@@ -1448,64 +1487,66 @@ class BackgroundWorker:
         return processed
 
     async def _run_summary(self) -> None:
-        """Обслуживать summary-джобу каркасным циклом (запуск одной джобы).
+        """Serve the summary job with the framework loop (a single-job run).
 
-        Тело петли живёт в каркасе; метод оставлен для изолированного запуска
-        одной джобы — так тесты пула 6 (lost wakeup) проверяют селект по
-        очереди и `clear()` сигнала без остальных петель.
+                    The loop body lives in the framework; the method is kept for an
+                    isolated run of one job — this is how the pool-6 tests (lost wakeup)
+                    check the queue select and the signal's `clear()` without the other
+                    loops.
         """
         spec = build_summary_job(self, self._settings)
         if spec is None:
-            return  # без суммаризатора джоба неприменима (тестовый режим)
+            return  # without a summarizer the job is not applicable (a test mode)
         await run_loop(spec, self._is_stopping, self._backoff[SUMMARY_JOB])
 
     async def _process_judge(self) -> int:
-        """Прогон judge-джобы: партия judge-работ (дедуп) в `to_thread`.
+        """The judge job's run: a batch of judge jobs (dedup) in `to_thread`.
 
-        0 уводит каркасную петлю к ожиданию сигнала `notify_judge_pending`
-        (форма «по требованию», пул 6) или таймаута интервала. Разрыв слота
-        judge проверяют ворота каркаса (`JobSpec.gate`, 3.4.1, LSBN-T-29) —
-        ручной `if` убран.
+                    0 sends the framework loop to waiting for the `notify_judge_pending`
+                    signal (the "on demand" form, pool 6) or an interval timeout. The
+                    judge slot breaker is checked by the framework gate (`JobSpec.gate`,
+                    3.4.1, LSBN-T-29) — the manual `if` is gone.
         """
         with history.bind_origin(f"job:{JUDGE_JOB}"):
             return await asyncio.to_thread(self.process_judge_pending)
 
     async def _run_judge(self) -> None:
-        """Обслуживать judge-джобу каркасным циклом (запуск одной джобы).
+        """Serve the judge job with the framework loop (a single-job run).
 
-        См. `_run_summary`: изоляция одной джобы — для тестов пула 6
-        (lost wakeup) по judge-очереди.
+                    See `_run_summary`: one job's isolation — for the pool-6 tests
+                    (lost wakeup) over the judge queue.
         """
         spec = build_judge_job(self, self._settings)
         await run_loop(spec, self._is_stopping, self._backoff[JUDGE_JOB])
 
-    # --- джоба areas: вектора записей областей (субстрат 3.0.0) ---------------
+    # --- the areas job: area records' vectors (substrate 3.0.0) ---------------
 
     async def _process_areas(self) -> int:
-        """Прогон джобы areas: партия pending-записей областей в `to_thread`.
+        """The areas job's run: a batch of pending area records in `to_thread`.
 
-        Своя очередь, свой back-off и свой сигнал: отказ векторизации областей
-        не мешает заметкам и наоборот (ARCH §3.4). 0 уводит каркасную петлю к
-        ожиданию `notify_areas_pending` (пул 6) или таймаута интервала.
+                    Its own queue, its own back-off and its own signal: an area
+                    vectorization failure does not hinder notes and vice versa
+                    (ARCH §3.4). 0 sends the framework loop to waiting for
+                    `notify_areas_pending` (pool 6) or an interval timeout.
         """
         with history.bind_origin(f"job:{AREAS_JOB}"):
             return await asyncio.to_thread(self.process_pending_areas)
 
-    # --- джоба зачистки просроченных заметок (lsb-0004-02, этап 4) -----------
+    # --- the expired-notes cleanup job (lsb-0004-02, stage 4) -----------------
 
     async def _process_expiration(self) -> int:
-        """Прогон джобы expiration: зачистка просроченных заметок.
+        """The expiration job's run: expired-notes cleanup.
 
-        Выгребает note_expirations: заметки с `expires_at <= now()` удаляются
-        ПОЛНОСТЬЮ (notes+chunks+вектора+fts) вместе со строкой из
-        note_expirations (`process_expired_notes` в `to_thread`); удалено > 0
-        — событие `expiration_cleanup` с обязательным полем `job`. Джоба
-        обслуживается по ФИКСИРОВАННОМУ расписанию (её состояние back-off —
-        `fixed=True`): пауза всегда EXPIRATION_CLEANUP_INTERVAL_SEC
-        (фиксированные 5 минут, решение О. 2026-09-09), back-off не растёт —
-        зачистка не зависит от внешних сервисов, расписание не
-        ускоряется/замедляется (FR-1.5). Возвращает число удалённых заметок
-        (расписание ведёт интервал, а не прогресс — см. `run_loop`).
+                    It drains note_expirations: notes with `expires_at <= now()` are
+                    deleted FULLY (notes+chunks+vectors+fts) together with their
+                    note_expirations row (`process_expired_notes` in `to_thread`);
+                    deleted > 0 — an `expiration_cleanup` event with the mandatory `job`
+                    field. The job runs on a FIXED schedule (its back-off state is
+                    `fixed=True`): the pause is always EXPIRATION_CLEANUP_INTERVAL_SEC
+                    (a fixed 5 minutes), the back-off does not grow — cleanup does not
+                    depend on external services and the schedule neither speeds up nor
+                    slows down (FR-1.5). Returns the deleted note count (the schedule is
+                    led by the interval, not progress — see `run_loop`).
         """
         with history.bind_origin(f"job:{EXPIRATION_JOB}"):
             deleted = await asyncio.to_thread(self.process_expired_notes)
@@ -1521,18 +1562,18 @@ class BackgroundWorker:
         return deleted
 
     def process_expired_notes(self) -> int:
-        """Удалить просроченные заметки; возвращает число удалённых.
+        """Delete expired notes; returns the deleted count.
 
-        SELECT note_id FROM note_expirations WHERE expires_at <= now() (now —
-        в том же ISO-8601 UTC формате, что expires_at: strftime
-        '%Y-%m-%dT%H:%M:%SZ','now'); для каждого id — полное физическое
-        удаление (notes+chunks+вектора+fts) + удаление строки из
-        note_expirations (delete_note_physical).
+                    SELECT note_id FROM note_expirations WHERE expires_at <= now() (now —
+                    in the same ISO-8601 UTC format as expires_at: strftime
+                    '%Y-%m-%dT%H:%M:%SZ','now'); per id — full physical deletion
+                    (notes+chunks+vectors+fts) + removing the row from note_expirations
+                    (delete_note_physical).
 
-        Идемпотентно и безопасно: если заметка уже удалена (например,
-        оператором) — delete_note_physical просто не матчит ничего, не падает;
-        строка из note_expirations при этом всё равно снимается. Каждая
-        заметка — короткая транзакция: сбой одной не откатывает остальных.
+                    Idempotent and safe: if the note is already deleted (e.g. by the
+                    operator) — delete_note_physical simply matches nothing, no crash;
+                    the note_expirations row is removed anyway. Each note — a short
+                    transaction: one failure does not roll back the others.
         """
         with session(self._settings) as conn:
             rows = conn.execute(
@@ -1549,37 +1590,39 @@ class BackgroundWorker:
                 deleted += 1
         return deleted
 
-    # --- job-очереди по слотам (Фаза 11, решение №10) -------------------------
+    # --- job queues per slots (Phase 11, decision #10) ------------------------
 
     def _ensure_job_table(self) -> None:
-        """Создать таблицу + индекс job-очередей (идемпотентно, один раз).
+        """Create the job-queues table + index (idempotently, once).
 
-        Схема — зона воркера (не db.py): job-очереди по слотам — внутренняя
-        механика фонового конвейера, диспетчер зависимостей между петлями.
+                    The schema is the worker's zone (not db.py): per-slot job queues are
+                    the background pipeline's internal mechanics, the loops' dependency
+                    dispatcher.
 
-        Пул 5, единократное создание: полный DDL исполняется только при
-        первом обращении на экземпляр воркера (мемоизация на флаге
-        `_jobs_table_ready`); повторные вызовы (3 штуки на каждую работу:
-        `_create_job`, `_pending_jobs`, `_mark_job_done`) возвращаются сразу.
-        Индекс `idx_worker_jobs_queue` на (slot, kind, status, id): выборка
-        pending-очереди слота — по индексу, а не полным сканом таблицы.
-        Колонки внимания (№39, arch §5.2/§6.8) — `attempts`/`last_outcome`/
-        `last_error`/`attention_at` — в свежем DDL и идемпотентным ALTER'ом по
-        `PRAGMA table_info(worker_jobs)` для живой базы предыдущей версии;
-        индекс `idx_worker_jobs_attention` обслуживает выборку «требует
-        вмешательства».
+                    Pool 5, one-time creation: the full DDL runs only at the first access
+                    per worker instance (memoized on the `_jobs_table_ready` flag);
+                    repeated calls (3 per job: `_create_job`, `_pending_jobs`,
+                    `_mark_job_done`) return immediately. The `idx_worker_jobs_queue`
+                    index on (slot, kind, status, id): a slot's pending queue is selected
+                    by the index, not a full table scan. The attention columns (#39, arch
+                    §5.2/§6.8) — `attempts`/`last_outcome`/`last_error`/`attention_at` —
+                    are in the fresh DDL and added by an idempotent ALTER over
+                    `PRAGMA table_info(worker_jobs)` for a live database of the previous
+                    version; the `idx_worker_jobs_attention` index serves the "needs
+                    attention" selection.
 
-        DDL — под локом (lsbdef-0013): два потока (петля через
-        `asyncio.to_thread` + стартовое снятие внимания в `run`) одновременно
-        видели флаг `False` и колонку отсутствующей — второй ALTER падал на
-        `duplicate column name`. Двойная проверка флага внутри лока; ALTER
-        вдобавок терпит `duplicate column name`: лок закрывает только потоки
-        одного процесса, конкурирующий процесс воркера — не он.
+                    The DDL — under a lock (lsbdef-0013): two threads (a loop via
+                    `asyncio.to_thread` + the startup attention release in `run`)
+                    simultaneously saw the flag `False` and the column missing — the
+                    second ALTER failed on `duplicate column name`. A double flag check
+                    inside the lock; the ALTER also tolerates `duplicate column name`:
+                    the lock only covers threads of one process — a competing worker
+                    process is not one of them.
         """
         if self._jobs_table_ready:
             return
         with self._jobs_table_lock:
-            if self._jobs_table_ready:  # другой поток уже отмигрировал
+            if self._jobs_table_ready:  # another thread already migrated it
                 return
             with session(self._settings) as conn:
                 conn.execute(
@@ -1618,8 +1661,8 @@ class BackgroundWorker:
                                 f"ALTER TABLE worker_jobs ADD COLUMN {name} {ddl}"
                             )
                         except sqlite3.OperationalError as exc:
-                            # Колонку успел добавить конкурирующий процесс
-                            # (lsbdef-0013): не падаем, миграция продолжается.
+                            # A competing process managed to add the column
+                            # (lsbdef-0013): we do not crash; the migration continues.
                             if "duplicate column name" not in str(exc):
                                 raise
                 conn.execute(
@@ -1633,14 +1676,15 @@ class BackgroundWorker:
             self._jobs_table_ready = True
 
     def _purge_done_jobs(self) -> None:
-        """Вычистить done-работы старше retention-окна (пул 5, гигиена).
+        """Purge done jobs older than the retention window (pool 5, hygiene).
 
-        worker_jobs копит ≥1 строку на каждую заметку (при пере-векторизациях
-        после update — больше); без чистки таблица и полные сканы очереди
-        росли бы безгранично. DELETE ограничен `status = 'done'` и
-        `updated_at` старше WORKER_JOBS_RETENTION_DAYS — pending-работы не
-        трогаются. Вызывается в idle-ветке embedding-петли (когда работ нет,
-        перед сном). Удалено > 0 → info-лог event `jobs_purged`.
+                    worker_jobs accumulates ≥1 row per note (more on re-vectorizations
+                    after update); without cleanup the table and the queue's full scans
+                    would grow without bound. The DELETE is constrained by
+                    `status = 'done'` and `updated_at` older than
+                    WORKER_JOBS_RETENTION_DAYS — pending jobs are untouched. Called in the
+                    embedding loop's idle branch (no jobs, before the sleep). Deleted > 0
+                    → an info `jobs_purged` event.
         """
         self._ensure_job_table()
         with session(self._settings) as conn, transaction(conn):
@@ -1663,7 +1707,7 @@ class BackgroundWorker:
     def _create_job(
         self, slot: str, kind: str, note_id: int, payload: str | None = None
     ) -> None:
-        """Поставить работу в очередь слота (диспетчер зависимостей)."""
+        """Place a job into a slot's queue (the dependency dispatcher)."""
         self._ensure_job_table()
         with session(self._settings) as conn, transaction(conn):
             conn.execute(
@@ -1675,13 +1719,14 @@ class BackgroundWorker:
     def _ensure_job(
         self, slot: str, kind: str, note_id: int, payload: str | None = None
     ) -> None:
-        """Идемпотентно поставить работу в очередь слота (arch §3.5, FR-2.5).
+        """Idempotently place a job into a slot's queue (arch §3.5, FR-2.5).
 
-        `INSERT ... WHERE NOT EXISTS (pending с теми же slot/kind/note_id)`:
-        частая правка одной заметки не плодит дубли заданий (нужно джобам,
-        которые ставят работу по событию). Существующий `_create_job`
-        (judge/merge) не трогается: там дедуп не требуется — пара
-        «поздняя ↔ ранняя» и вердикт судьи дают свои инварианты.
+                    `INSERT ... WHERE NOT EXISTS (a pending with the same
+                    slot/kind/note_id)`: frequent edits of one note do not multiply task
+                    duplicates (needed by the jobs that place work on an event). The
+                    existing `_create_job` (judge/merge) is untouched: no dedup is needed
+                    there — the "later ↔ earlier" pair and the judge's verdict give their
+                    own invariants.
         """
         self._ensure_job_table()
         with session(self._settings) as conn, transaction(conn):
@@ -1696,11 +1741,11 @@ class BackgroundWorker:
     def _pending_jobs(
         self, slot: str, kind: str, limit: int
     ) -> list:
-        """Вычитать pending-работы слота (порядок по id).
+        """Read a slot's pending jobs (the order by id).
 
-        Замороженные работы (`attention_at IS NOT NULL`, №39 §6.8) не берутся:
-        повторяющийся нетранзиентный отказ перестаёт жечь вызовы модели, пока
-        причина не ушла (работа при этом остаётся `pending`).
+                    Frozen jobs (`attention_at IS NOT NULL`, #39 §6.8) are not taken: a
+                    repeating non-transient failure stops burning model calls until the
+                    reason is gone (the job stays `pending`).
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
@@ -1713,7 +1758,7 @@ class BackgroundWorker:
             ).fetchall()
 
     def _mark_job_done(self, job_id: int) -> None:
-        """Пометить работу выполненной (снята с очереди)."""
+        """Mark a job done (removed from the queue)."""
         self._ensure_job_table()
         with session(self._settings) as conn, transaction(conn):
             conn.execute(
@@ -1723,17 +1768,18 @@ class BackgroundWorker:
                 (job_id,),
             )
 
-    # --- потерянный будильник: дешёвая перепроверка очереди перед сном (пул 6)
+    # --- lost wakeup: a cheap queue recheck before the sleep (pool 6)
 
     def _decision_blocks_work(self) -> bool:
-        """Может ли текущая работа быть взята: доступен ли decision (№39, §6.9).
+        """Can the current work be taken: is decision available (#39, §6.9).
 
-        Судья дедупа и классификатор `nodes` ходят в слот decision: если слот
-        недоступен (`can_decide()` ложно — погашен стартовой проверкой или
-        `disable()`) и переключение выключено (`DECISION_FALLBACK=false`),
-        решения не будет ни у одной пары/кандидата — такая работа петлёй не
-        берётся (она видна в `/health.queues[].waiting`). Проверка живёт в
-        памяти процесса: без SQL сверх существующего.
+                    The dedup judge and the `nodes` classifier walk into the decision
+                    slot: if the slot is unavailable (`can_decide()` false — suppressed by
+                    the startup check or `disable()`) and the fallback is off
+                    (`DECISION_FALLBACK=false`), no pair/candidate will get a decision —
+                    such work is not taken by the loop (it is visible in
+                    `/health.queues[].waiting`). The check lives in process memory: no SQL
+                    beyond the existing.
         """
         service = self._decision
         if service is None or self._settings.decision_fallback:
@@ -1741,18 +1787,19 @@ class BackgroundWorker:
         return not service.can_decide()
 
     def _summary_queue_empty(self) -> bool:
-        """Пуста ли summary-очередь (дешёвый SELECT, пул 6, lost wakeup).
+        """Is the summary queue empty (a cheap SELECT, pool 6, lost wakeup).
 
-        Петля перед `clear()+wait` перепроверяет саму очередь, а не только
-        event: notify мог прийти во время выгребания партии, и `clear()`
-        после него стёр бы сигнал (пауза до интервала на непустой очереди).
-        Очередь пуста — только если нет title-догена (title IS NULL),
-        pending суммаризации и pending merge-работ (все в summary-слоте).
+                    Before `clear()+wait` the loop rechecks the queue itself, not only the
+                    event: notify could arrive while the batch was being drained, and the
+                    `clear()` after it would erase the signal (a pause up to the interval
+                    on a non-empty queue). The queue is empty only when there is no
+                    title-gen (title IS NULL), no pending summarization and no pending
+                    merge jobs (all in the summary slot).
 
-        №39 (arch §6.9/§13.9): считаем только БЕРУЩЕЕСЯ сейчас — merge-работы
-        без внимания (`attention_at IS NULL`). Замороженное задание
-        (`attention_at`, no39-02) петлю брать не может, а если бы очередь
-        считала его непустой — петля крутилась бы вхолостую (busy-loop).
+                    #39 (arch §6.9/§13.9): we count only what is TAKEABLE now — merge jobs
+                    without attention (`attention_at IS NULL`). A frozen task
+                    (`attention_at`, no39-02) cannot be taken by the loop, and if the
+                    queue counted it non-empty the loop would spin idly (busy-loop).
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
@@ -1763,10 +1810,10 @@ class BackgroundWorker:
                 "  WHERE slot = 'summary' AND status = 'pending' "
                 "  AND attention_at IS NULL) AS c"
             ).fetchone()
-        # №39 (arch §6.9): при открытом разрыве слота петля партию не берёт —
-        # очередь для неё пуста (иначе отложенное задание гонит busy-loop).
-        # То же — при недоступном decision и выключенном переключении: решение
-        # взять негде, работа ждёт (no39-05, `_decision_blocks_work`).
+        # #39 (arch §6.9): with the slot breaker open the loop takes no batch —
+        # the queue is empty for it (otherwise a deferred task drives a busy-loop).
+        # The same — with decision unavailable and fallback off: there is
+        # nowhere to get a decision; the work waits (no39-05, `_decision_blocks_work`).
         return (
             int(row["c"]) == 0
             or self._breakers[SLOT_SUMMARY].is_paused()
@@ -1774,12 +1821,12 @@ class BackgroundWorker:
         )
 
     def _judge_queue_empty(self) -> bool:
-        """Пуста ли judge-очередь (дешёвый SELECT, пул 6, lost wakeup).
+        """Is the judge queue empty (a cheap SELECT, pool 6, lost wakeup).
 
-        Считает pending dedup-работы judge-слота — ту же очередь, что
-        выгребает process_judge_pending в этой петле. №39 (arch §6.9/§13.9):
-        замороженное задание (`attention_at`, no39-02) не считается — петля
-        его не берёт, и очередь для неё пуста (busy-loop'а нет).
+                    It counts pending dedup jobs of the judge slot — the same queue
+                    process_judge_pending drains in this loop. #39 (arch §6.9/§13.9): a
+                    frozen task (`attention_at`, no39-02) is not counted — the loop does
+                    not take it, and the queue is empty for it (no busy-loop).
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
@@ -1788,9 +1835,9 @@ class BackgroundWorker:
                 "WHERE slot = 'judge' AND kind = 'dedup' AND status = 'pending' "
                 "AND attention_at IS NULL"
             ).fetchone()
-        # №39 (arch §6.9): при открытом разрыве судьи партия не берётся —
-        # очередь для петли пуста (busy-loop'а нет); то же при недоступном
-        # decision с выключенным переключением (no39-05).
+        # #39 (arch §6.9): with the judge breaker open no batch is taken —
+        # the queue is empty for the loop (no busy-loop); the same with decision
+        # unavailable and fallback off (no39-05).
         return (
             int(row[0]) == 0
             or self._breakers[SLOT_JUDGE].is_paused()
@@ -1798,38 +1845,41 @@ class BackgroundWorker:
         )
 
     def _embedding_queue_empty(self) -> bool:
-        """Пуста ли embedding-очередь (дешёвая перепроверка, пул 6, LSBN-T-30).
+        """Is the embedding queue empty (a cheap recheck, pool 6, LSBN-T-30).
 
-        Петля перед `clear()+wait` перепроверяет саму очередь, а не только
-        event: сигнал `notify_embedding_pending`, сработавший МЕЖДУ пустым
-        `process()` и `clear()` (заметка закоммичена, нотификатор ударил,
-        `clear()` стёр сигнал), иначе стирал бы будильник — петля спала бы
-        текущий интервал, а на простаивающей системе back-off дорастает до
-        15 мин, и свежая заметка ждала бы вектор столько же при живых моделях
-        (прямой приоритет «свежая заметка кодируется немедленно», прецедент
-        gate 2026-09-19). Перепроверка это окно закрывает: берущаяся работа
-        видна селекту и получает ОДИН немедленный прогон.
+                    Before `clear()+wait` the loop rechecks the queue itself, not only the
+                    event: a `notify_embedding_pending` signal fired BETWEEN an empty
+                    `process()` and the `clear()` (the note committed, the notifier
+                    struck, `clear()` erased the signal) would otherwise erase the alarm —
+                    the loop would sleep the current interval, and on an idle system the
+                    back-off grows to 15 min, so a fresh note would wait for its vector
+                    just as long with live models (the direct priority "a fresh note is
+                    encoded immediately"; the gate 2026-09-19 precedent). The recheck
+                    closes that window: takeable work is visible to the select and gets
+                    ONE immediate run.
 
-        Берущаяся работа embedding-джобы (одна джоба — две очереди, решение
-        №10): pending-заметки векторизации (`vector_status='pending'`,
-        источник — тот же `NoteService.vector_queue_stat()`, что и у снимка
-        `/health.queues`, — переиспользование, не копия SQL) плюс pending-чанки
-        (тот же предикат, что у вычитки `_read_chunk_batch`: чанк без строки в
-        `notes_chunks_vec`, `chunks.count_pending`). Только SQL/память, без
-        моделей (FR-2.2: наблюдаемость и расписания не жгут вызовы).
+                    The embedding job's takeable work (one job — two queues, decision
+                    #10): pending vectorization notes (`vector_status='pending'`; the
+                    source — the same `NoteService.vector_queue_stat()` as the
+                    `/health.queues` snapshot's — reuse, not a SQL copy) plus pending
+                    chunks (the same predicate as the `_read_chunk_batch` read: a chunk
+                    without a row in `notes_chunks_vec`, `chunks.count_pending`). SQL/
+                    memory only, no models (FR-2.2: observability and schedules burn no
+                    calls).
 
-        Busy-loop при недоступных моделях невозможен: у каркаса работа,
-        которую петля взять не может, — не прогресс (arch §3.2, no39-05) —
-        после перепроверки один прогон при отказе вернёт 0, и петля уйдёт в
-        `queue_waiting` + сон по back-off. Разрыв embedding-слота
-        (`_slot_blocked`, единая точка условия гейта, 3.4.1, LSBN-T-29;
-        прецедент `_areas_queue_empty`/`_nodes_queue_empty`) делает очередь
-        пустой для петли: ворота партию не берут — крутиться нечему (no39-05).
+                    A busy-loop with unavailable models is impossible: in the framework,
+                    work the loop cannot take is not progress (arch §3.2, no39-05) — after
+                    the recheck one run on a failure returns 0, and the loop goes into
+                    `queue_waiting` + a back-off sleep. An embedding-slot breaker
+                    (`_slot_blocked`, the single point of the gate condition, 3.4.1,
+                    LSBN-T-29; the `_areas_queue_empty`/`_nodes_queue_empty` precedent)
+                    makes the queue empty for the loop: the gate takes no batch — nothing
+                    to spin (no39-05).
         """
-        # №39 (arch §6.9): при открытом разрыве слота embedding петля партию
-        # не берёт — очередь для неё пуста (иначе отложенное задание гонит
-        # busy-loop). Проверка памяти — до SQL: разрыв закрывает обе очереди
-        # джобы разом (заметки и чанки).
+        # #39 (arch §6.9): with the embedding slot breaker open the loop takes no
+        # batch — the queue is empty for it (otherwise a deferred task drives a
+        # busy-loop). The memory check — before SQL: the breaker closes both of the
+        # job's queues at once (notes and chunks).
         if self._slot_blocked(SLOT_EMBEDDING):
             return True
         pending = int(self._notes.vector_queue_stat()["pending"] or 0)
@@ -1837,20 +1887,21 @@ class BackgroundWorker:
             pending += chunks.count_pending(conn)
         return pending == 0
 
-    # --- наблюдаемость очередей (lsb-0014-03, FR-2.2) -------------------------
+    # --- queue observability (lsb-0014-03, FR-2.2) ----------------------------
 
     def _slot_blocked(self, slot: str) -> bool:
-        """Слот заблокирован прямо сейчас? (№39, arch §6.9; LSBN-T-29).
+        """Is the slot blocked right now? (#39, arch §6.9; LSBN-T-29).
 
-        Единая точка условия гейта для СНИМКОВ очередей (раньше жила в
-        `_gated_queue_stat`): разрыв слота открыт (`SlotBreaker.is_paused`)
-        ИЛИ работа слота не может быть взята (decision недоступен,
-        `DECISION_FALLBACK=false` — слоты `summary`/`judge`, no39-05).
-        БЕЗ побочных эффектов — только память, никогда не зовёт модели и не
-        переставляет паузу: `is_gated` джоб читают её из `/health.queues` и
-        события `queue_waiting` (наблюдаемость не жжёт вызовы, контракт
-        `/health.queues`; пробный стук по истечении паузы — забота `gate`,
-        то есть `worker._slot_gate`, в каркасном `run_loop`).
+                    The single point of the gate condition for queue SNAPSHOTS (it used to
+                    live in `_gated_queue_stat`): the slot breaker is open
+                    (`SlotBreaker.is_paused`) OR the slot's work cannot be taken (decision
+                    unavailable, `DECISION_FALLBACK=false` — the `summary`/`judge` slots,
+                    no39-05). WITHOUT side effects — memory only, never calls models and
+                    never moves a pause: the jobs' `is_gated` read it from `/health.queues`
+                    and `queue_waiting` events (observability burns no calls, the
+                    `/health.queues` contract; the probe knock after the pause expires is
+                    `gate`'s concern, i.e. `worker._slot_gate`, in the framework
+                    `run_loop`).
         """
         breaker = self._breakers.get(slot)
         return (
@@ -1860,17 +1911,17 @@ class BackgroundWorker:
         )
 
     def queues_health(self) -> dict[str, dict]:
-        """Собрать `/health.queues` по реестру джоб (FR-2.2): только SQL.
+        """Assemble `/health.queues` over the job registry (FR-2.2): SQL only.
 
-        У каждой зарегистрированной джобы с очередью берётся её собственный
-        снимок (`JobSpec.queue_stat`) — `/health` не правится при добавлении
-        джобы. Джоба без очереди (`expiration`) в объект не попадает.
-        Слоты единообразно (3.4.1, LSBN-T-29): при заблокированном слоте
-        (`spec.is_gated` → `_slot_blocked`) сырой снимок прогоняется через
-        каркасный `gated_queue_stat` — работа едет из `pending` в `waiting`
-        у ВСЕХ джоб (прежде внешние migration/warnings и areas этому не
-        подчинялись). Обращений к моделям нет (только чтение
-        pending-состояния; `is_gated` — память/SQL, см. `_slot_blocked`).
+                    For every registered job with a queue its own snapshot is taken
+                    (`JobSpec.queue_stat`) — `/health` is not edited when a job is added.
+                    A job without a queue (`expiration`) does not enter the object.
+                    Slots uniformly (3.4.1, LSBN-T-29): with a blocked slot
+                    (`spec.is_gated` → `_slot_blocked`) the raw snapshot goes through the
+                    framework `gated_queue_stat` — work moves from `pending` to `waiting`
+                    for ALL jobs (before, the external migration/warnings and areas did
+                    not obey this). No model calls (only reading the pending state;
+                    `is_gated` — memory/SQL, see `_slot_blocked`).
         """
         queues: dict[str, dict] = {}
         for spec in build_job_specs(self, self._settings):
@@ -1883,27 +1934,29 @@ class BackgroundWorker:
         return queues
 
     def _vector_queue_stat(self) -> dict:
-        """Сырой снимок очереди векторизации заметок: pending и возраст.
+        """The raw snapshot of the note-vectorization queue: pending and age.
 
-        Источник — `notes.vector_status='pending'` (тот же предикат, что у
-        легаси-счётчика `pending_vector`); SQL живёт рядом с `health_counts`
-        в NoteService. Перенос pending → waiting при разрыве embedding делает
-        каркас (`queues_health`/`queue_waiting` через `is_gated`,
-        3.4.1, LSBN-T-29) — метод отдаёт снимок как есть.
+                    The source — `notes.vector_status='pending'` (the same predicate as
+                    the legacy `pending_vector` counter); the SQL lives next to
+                    `health_counts` in NoteService. The pending → waiting move on an
+                    embedding breaker is done by the framework (`queues_health`/
+                    `queue_waiting` via `is_gated`, 3.4.1, LSBN-T-29) — the method returns
+                    the snapshot as is.
         """
         return self._notes.vector_queue_stat()
 
     def _summary_queue_stat(self) -> dict:
-        """Сырой снимок очереди суммаризации (№39, arch §6.9).
+        """The raw snapshot of the summarization queue (#39, arch §6.9).
 
-        `pending` — работа, которую петля может взять СЕЙЧАС: заметки
-        (title-доген + pending суммаризации) плюс pending merge-работы слота
-        summary БЕЗ внимания. `attention` — pending merge-работы с вниманием
-        (no39-02, ждут человека), `waiting = attention`: у слота summary
-        отложено именно замороженное. `oldest_pending_sec` — максимум возраста
-        по обоим источникам. Перенос pending → waiting при разрыве слота
-        делает каркас (`is_gated` → `gated_queue_stat`, 3.4.1, LSBN-T-29) —
-        собственные вычисления waiting/attention не тронуты.
+                    `pending` — work the loop can take NOW: notes (title-gen + pending
+                    summarization) plus the summary slot's pending merge jobs WITHOUT
+                    attention. `attention` — pending merge jobs with attention (no39-02,
+                    waiting for a human); `waiting = attention`: what the summary slot has
+                    deferred is exactly the frozen ones. `oldest_pending_sec` — the maximum
+                    age over both sources. The pending → waiting move on a slot breaker is
+                    done by the framework (`is_gated` → `gated_queue_stat`, 3.4.1,
+                    LSBN-T-29) — the method's own waiting/attention computation is
+                    untouched.
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
@@ -1935,17 +1988,18 @@ class BackgroundWorker:
         )
 
     def _judge_queue_stat(self) -> dict:
-        """Сырой снимок очереди judge (№39, arch §6.9).
+        """The raw snapshot of the judge queue (#39, arch §6.9).
 
-        `pending` — dedup-работы слота judge БЕЗ внимания (берущееся сейчас,
-        драйвер `_judge_queue_empty`); `attention` — с вниманием (no39-02),
-        `waiting = attention`: у судьи отложено именно замороженное. Возраст
-        (3.3.1, LSBN-S-3) — `now - MIN(created_at)` по ВСЕМ pending джобы
-        (attention-работа тоже ждёт исполнения; иначе attention-only состояние
-        `pending=0, waiting>0` давало бы `null` вопреки определению).
-        Перенос pending → waiting при разрыве judge делает каркас
-        (`is_gated` → `gated_queue_stat`, 3.4.1, LSBN-T-29). Таблица
-        создаётся лениво (`_ensure_job_table`), моделей не зовём.
+                    `pending` — the judge slot's dedup jobs WITHOUT attention (takeable
+                    now; the `_judge_queue_empty` driver); `attention` — with attention
+                    (no39-02); `waiting = attention`: what the judge has deferred is
+                    exactly the frozen ones. The age (3.3.1, LSBN-S-3) —
+                    `now - MIN(created_at)` over ALL of the job's pending (attention work
+                    also waits to be done; otherwise an attention-only state
+                    `pending=0, waiting>0` would give `null` contrary to the definition).
+                    The pending → waiting move on a judge breaker is done by the framework
+                    (`is_gated` → `gated_queue_stat`, 3.4.1, LSBN-T-29). The table is
+                    created lazily (`_ensure_job_table`); no models called.
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
@@ -1970,17 +2024,17 @@ class BackgroundWorker:
         )
 
     def _areas_queue_stat(self) -> dict:
-        """Сырой снимок очереди областей: сумма pending по ВКЛЮЧЁННЫМ (FR-2.5).
+        """The raw snapshot of the areas queue: the pending sum over ENABLED ones (FR-2.5).
 
-        Источник pending — тот же, что у `_areas_queue_empty`: pending-записи
-        активных строк включённых областей (`enabled_areas`, №40) — выключенная
-        область фоном не забирается и в общий счётчик не входит. Суммы
-        складываются, возраст старейшего — максимум `now - updated_at` по
-        областям; пусто — `null`. Накопление выключенной области видно
-        отдельно в `/health.areas` (`areas_health`). Перенос pending →
-        waiting при разрыве embedding (области кодируют тем же слотом, №39,
-        arch §6.9) делает каркас (`is_gated` → `gated_queue_stat`,
-        3.4.1, LSBN-T-29).
+                    The pending source — the same as `_areas_queue_empty`: pending records
+                    of active rows of the enabled areas (`enabled_areas`, #40) — a
+                    disabled area is not drained in the background and does not enter the
+                    shared counter. The sums add up; the oldest's age — the maximum
+                    `now - updated_at` over the areas; empty — `null`. A disabled area's
+                    accumulation is visible separately in `/health.areas` (`areas_health`).
+                    The pending → waiting move on an embedding breaker (areas are encoded
+                    by the same slot, #39, arch §6.9) is done by the framework (`is_gated`
+                    → `gated_queue_stat`, 3.4.1, LSBN-T-29).
         """
         pending = 0
         oldest: int | None = None
@@ -2001,13 +2055,13 @@ class BackgroundWorker:
         return queue_snapshot(pending, oldest)
 
     def areas_health(self) -> dict[str, dict]:
-        """`/health.areas` (FR-4.3, №40): по ВСЕМ областям `{enabled, pending}`.
+        """`/health.areas` (FR-4.3, #40): per ALL areas `{enabled, pending}`.
 
-        Отдаётся по `ALL_AREAS`, а не по `enabled_areas`: накопление у
-        выключенной области должно быть видно (прецедент `JOB_*_ENABLED`:
-        «очередь остаётся видна в /health»). `pending` — тот же SQL, что у
-        `_areas_queue_stat`, но БЕЗ суммирования (по области); обращений к
-        моделям нет — только чтение pending-состояния.
+                    Served over `ALL_AREAS`, not `enabled_areas`: a disabled area's
+                    accumulation must be visible (the `JOB_*_ENABLED` precedent: "the
+                    queue stays visible in /health"). `pending` — the same SQL as
+                    `_areas_queue_stat` but WITHOUT summing (per area); no model calls —
+                    only reading the pending state.
         """
         enabled = {spec.name for spec in enabled_areas(self._settings)}
         health: dict[str, dict] = {}
@@ -2024,36 +2078,37 @@ class BackgroundWorker:
                 }
         return health
 
-    # --- синхронная работа (выполняется в to_thread) --------------------------
+    # --- synchronous work (runs in to_thread) ---------------------------------
 
     def process_pending(self, limit: int | None = None) -> int:
-        """Векторизовать одну партию pending; возвращает число обработанных.
+        """Vectorize one pending batch; returns the processed count.
 
-        Размер партии по умолчанию — settings.embedding_batch_size (пул 5:
-        notes-петля режется по EMBEDDING_BATCH_SIZE, как и чанковая
-        process_pending_chunks); явный `limit` переопределяет.
+                    The default batch size — settings.embedding_batch_size (pool 5: the
+                    notes loop is cut by EMBEDDING_BATCH_SIZE, like the chunk
+                    process_pending_chunks); an explicit `limit` overrides.
 
-        Полный вектор строится по title+text (_embed_input, lsb-0001
-        FR-1.1); заметка без названия (title IS NULL — легаси-путь до
-        догенерации) кодируется чистым text.
+                    The full vector is built over title+text (_embed_input, lsb-0001
+                    FR-1.1); a titleless note (title IS NULL — the legacy path before
+                    title generation) is encoded over the bare text.
 
-        Отказ кодирования — 0: статусы не тронуты, воркер выждет back-off.
-        Guard (пул 1): вектор пишется только при неизменных с вычитки
-        (id, text, title, namespace, vector_status='pending') — иначе
-        memory_update/переезд/догенерация названия в полёте оставили бы
-        протухший вектор со статусом 'ok'. Промахнувшиеся остаются pending →
-        следующая партия перекодирует заново (новый текст или название).
-        После каждой фактической довекторизации
-        создаётся judge-работа (дедуп) в очередь слота judge (решение №10):
-        судья опрашивается только по готовому вектору — диспетчер
-        зависимостей. Само сведение дублей — в judge-петле
-        (process_judge_pending) и summary-петле (process_merge_pending).
-        Если хотя бы одна заметка батча реально получила вектор, будится и
-        петля `links` (`notify_links_pending`, решение гейта 1c): уровень 1
-        связей считается сразу, а не через интервал — но по тому же маркеру
-        `links_at`, поэтому задание не теряется по построению. Одно событие на
-        батч достаточно. Отказ кодирования (`EmbeddingError`) выходит раньше —
-        события нет, задания ждут готового вектора (back-off).
+                    An encoding failure — 0: statuses untouched, the worker will wait out
+                    the back-off. The guard (pool 1): the vector is written only when
+                    unchanged since the read (id, text, title, namespace,
+                    vector_status='pending') — otherwise a memory_update/a move/title
+                    generation in flight would leave a stale vector with the 'ok' status.
+                    The missed ones stay pending → the next batch re-encodes them (a new
+                    text or title).
+                    After each actual vectorization a judge job (dedup) is created in the
+                    judge slot's queue (decision #10): the judge is asked only over a
+                    ready vector — the dependency dispatcher. The merging itself is in the
+                    judge loop (process_judge_pending) and the summary loop
+                    (process_merge_pending).
+                    If at least one batch note actually got a vector, the `links` loop is
+                    woken too (`notify_links_pending`, the gate-1c decision): link level 1
+                    is computed at once, not after an interval — but by the same `links_at`
+                    marker, so the task is not lost by construction. One event per batch
+                    suffices. An encoding failure (`EmbeddingError`) exits earlier — no
+                    event; the tasks wait for a ready vector (back-off).
         """
         batch = (
             limit if limit is not None else self._settings.embedding_batch_size
@@ -2076,14 +2131,14 @@ class BackgroundWorker:
         processed = 0
         for row, vector in zip(rows, embeddings):
             with session(self._settings) as conn, transaction(conn):
-                # Guard (пул 1): вектор — только если заметка не менялась с
-                # вычитки (id, text, title, namespace, vector_status='pending')
-                # — иначе memory_update/переезд/догенерация названия в полёте
-                # оставили бы протухший вектор со статусом 'ok'. `title IS ?`
-                # сравнивает и NULL (SQLite): легаси-заметка без названия
-                # проходит guard только при прежнем NULL. Промахнувшиеся
-                # остаются pending → следующая партия перекодирует заново
-                # (новый текст или название).
+                # The guard (pool 1): the vector — only if the note did not change since
+                # the read (id, text, title, namespace, vector_status='pending')
+                # — otherwise a memory_update/a move/title generation in flight would leave
+                # a stale vector with the 'ok' status. `title IS ?`
+                # also compares NULL (SQLite): a legacy titleless note
+                # passes the guard only with the former NULL. The missed ones
+                # stay pending → the next batch re-encodes them
+                # (a new text or title).
                 cursor = conn.execute(
                     "UPDATE notes SET vector_status = 'ok' "
                     "WHERE id = ? AND text = ? AND title IS ? AND namespace = ? "
@@ -2092,34 +2147,35 @@ class BackgroundWorker:
                 )
                 if not cursor.rowcount:
                     continue
-                # Фаза 10: вектор пишется в партицию неймспейса заметки.
+                # Phase 10: the vector is written into the note namespace's partition.
                 vectors.upsert(conn, row["id"], vector, row["namespace"])
                 processed += 1
-            # Фаза 11 (решение №10): вектор готов — judge-работа (дедуп)
-            # в очередь слота judge; диспетчер зависимостей.
+            # Phase 11 (decision #10): the vector is ready — a judge job (dedup) goes
+            # into the judge slot's queue; the dependency dispatcher.
             self._create_job("judge", "dedup", int(row["id"]))
         if processed:
-            # Заметка батча реально получила вектор — будим `links` (гейт 1c).
-            # Одно событие на батч достаточно; отказ кодирования сюда не
-            # доходит (EmbeddingError выше) — «модели недоступны → задания
-            # ждут» сохраняется.
+            # A batch note actually got a vector — wake `links` (gate 1c).
+            # One event per batch suffices; an encoding failure does not
+            # reach here (EmbeddingError above) — "models unavailable → tasks
+            # wait" holds.
             self.notify_links_pending()
         self.notify_judge_pending()
         return processed
 
-    # --- петля areas: вектора записей областей (субстрат 3.0.0) ---------------
+    # --- the areas loop: area records' vectors (substrate 3.0.0) --------------
 
     def process_pending_areas(self, limit: int | None = None) -> int:
-        """Векторизовать партию pending записей областей; число обработанных.
+        """Vectorize a batch of pending area records; the processed count.
 
-        Каждая область (skills/terms/user) — своим батчем: pending записи
-        (`vector_status='pending'`, активные) → `embed_texts` по тексту
-        области (`AreaSpec.embed_text`) → upsert в её vec0 → `'ok'`. Размер
-        батча — `embedding_batch_size` (как у notes-очереди). Guard: вектор
-        пишется только если запись не менялась с вычиты (поля векторизации)
-        — иначе update в полёте оставил бы протухший вектор со статусом 'ok'.
-        Отказ кодировщика — записи остаются pending, событие
-        `area_embed_failed` (NFR-3), повтор по back-off петли areas.
+                    Each area (skills/terms/user) — by its own batch: pending records
+                    (`vector_status='pending'`, active) → `embed_texts` over the area's
+                    text (`AreaSpec.embed_text`) → an upsert into its vec0 → `'ok'`. The
+                    batch size — `embedding_batch_size` (as the notes queue's). Guard: the
+                    vector is written only if the record did not change since the read
+                    (the vectorization fields) — otherwise an update in flight would leave
+                    a stale vector with the 'ok' status. An encoder failure — the records
+                    stay pending, an `area_embed_failed` event (NFR-3), a retry on the
+                    areas loop's back-off.
         """
         batch = (
             limit if limit is not None else self._settings.embedding_batch_size
@@ -2130,7 +2186,7 @@ class BackgroundWorker:
         return processed
 
     def _process_area_batch(self, spec: AreaSpec, batch: int) -> int:
-        """Батч одной области: вычитка pending → кодирование → upsert + 'ok'."""
+        """One area's batch: read pending → encode → upsert + 'ok'."""
         columns = ", ".join(("id", *spec.embed_fields))
         with session(self._settings) as conn:
             rows = conn.execute(
@@ -2146,7 +2202,7 @@ class BackgroundWorker:
                 [spec.embed_text(row) for row in rows]
             )
         except EmbeddingError as exc:
-            # №39: отказ слота embedding несёт тип исхода (записи — pending).
+            # #39: an embedding slot failure carries the outcome type (the records — pending).
             self._log_slot_failure(
                 AREAS_JOB,
                 SLOT_EMBEDDING,
@@ -2162,7 +2218,7 @@ class BackgroundWorker:
         guard = " AND ".join(f"{column} IS ?" for column in spec.embed_fields)
         for row, vector in zip(rows, embeddings):
             with session(self._settings) as conn, transaction(conn):
-                # Guard по полям векторизации: `IS ?` сравнивает и NULL.
+                # The guard over vectorization fields: `IS ?` also compares NULL.
                 cursor = conn.execute(
                     f"UPDATE {spec.table} SET vector_status = 'ok' "
                     "WHERE id = ? AND vector_status = 'pending' "
@@ -2182,10 +2238,11 @@ class BackgroundWorker:
         return processed
 
     def _areas_queue_empty(self) -> bool:
-        """Пуста ли очередь областей (дешёвый SELECT, пул 6, lost wakeup).
+        """Is the areas queue empty (a cheap SELECT, pool 6, lost wakeup).
 
-        pending-записи считаются по включённым областям реестра (`enabled_areas`,
-        №40) — та же очередь, что выгребает process_pending_areas.
+                    Pending records are counted over the registry's enabled areas
+                    (`enabled_areas`, #40) — the same queue process_pending_areas
+                    drains.
         """
         pending = 0
         with session(self._settings) as conn:
@@ -2197,33 +2254,35 @@ class BackgroundWorker:
                         "AND deleted_at IS NULL"
                     ).fetchone()[0]
                 )
-        # №39 (arch §6.9): области кодируются слотом embedding — при его
-        # разрыве партия не берётся, очередь для петли пуста (busy-loop'а нет).
+        # #39 (arch §6.9): areas are encoded by the embedding slot — on its
+        # breaker no batch is taken; the queue is empty for the loop (no busy-loop).
         return pending == 0 or self._breakers[SLOT_EMBEDDING].is_paused()
 
-    # --- judge-петля: судья дедупа (Фаза 8, Этап 3.2; Фаза 11, решение №10) ---
+    # --- the judge loop: the dedup judge (Phase 8, Stage 3.2; Phase 11, #10) --
 
     def process_judge_pending(self, limit: int | None = None) -> int:
-        """Обработать партию judge-работ (дедуп); число обработанных.
+        """Process a batch of judge jobs (dedup); the processed count.
 
-        По каждой judge-работе (создана после довекторизации заметки):
-        косинус-кандидаты против ранних заметок (_find_dedup_candidates,
-        DEDUP_CANDIDATE_* — только предфильтр) и приговор «дубль» — LLM-судья
-        (Этап 3.2, JudgeService; без судьи — косинус-фоллбек Этапа 2.2).
-        Признанный дубль → merge-работа в очередь слота summary (решение
-        №10: merge ходит в summary-слот). Отказ судьи (JudgeError) — работа
-        остаётся pending, повтор по back-off judge-петли (NFR-3: обе заметки
-        целы); исход wait-класса (unavailable/timeout/auth,
-        `_BATCH_ABORT_OUTCOMES`, LSBN-T-28) вдобавок снимает партию — остальные
-        позиции остаются pending и добираются по back-off после возврата
-        слота (прецедент migration retry-later), иначе «висящий» провайдер
-        жёг бы до 32 × 900 с на партию. Протухшая заметка (удалена/вектор не
-        готов) — работа снимается.
-        Заметка с таймером (TTL, no46-03) — тоже снимается, но ДО судьи и без
-        вызова моделей (событие `dedup_skipped`, reason="note has a lifetime").
+                    Per judge job (created after a note's vectorization): cosine
+                    candidates against earlier notes (_find_dedup_candidates,
+                    DEDUP_CANDIDATE_* — a prefilter only) and a "duplicate" verdict — the
+                    LLM judge (Stage 3.2, JudgeService; without a judge — the Stage-2.2
+                    cosine fallback). A recognized duplicate → a merge job into the
+                    summary slot's queue (decision #10: merge walks into the summary
+                    slot). A judge failure (JudgeError) — the work stays pending, a retry
+                    on the judge loop's back-off (NFR-3: both notes intact); a wait-class
+                    outcome (unavailable/timeout/auth, `_BATCH_ABORT_OUTCOMES`, LSBN-T-28)
+                    also releases the batch — the other positions stay pending and are
+                    picked up on back-off after the slot returns (the migration
+                    retry-later precedent); otherwise a "hanging" provider would burn up
+                    to 32 × 900 s per batch. A stale note (deleted/the vector not ready) —
+                    the job is released.
+                    A note with a timer (TTL, no46-03) — also released, but BEFORE the
+                    judge and without model calls (a `dedup_skipped` event,
+                    reason="note has a lifetime").
         """
-        # Протокол «правка пары»: замороженные работы перепроверяются без
-        # вызова модели — ушедшая причина размораживает их (арх §6.8).
+        # The "pair edit" protocol: frozen jobs are rechecked without
+        # a model call — the gone reason unfreezes them (arch §6.8).
         self._review_attention_jobs("judge", "dedup")
         jobs = self._pending_jobs(
             "judge",
@@ -2253,11 +2312,11 @@ class BackgroundWorker:
                 done += 1
                 continue
             if row["expires_at"] is not None:
-                # no46-03 (3.2.0): заметка с таймером (TTL, `expires_at IS NOT
-                # NULL`) НИКОГДА не сливается — ранний выход ДО судьи и до
-                # поиска кандидатов: модели не дёргаем, работа снимается;
-                # наблюдаемое событие dedup_skipped с причиной. Правило О.
-                # 2026-10-10; связи у такой заметки разрешены (links не тут).
+                # no46-03 (3.2.0): a note with a timer (TTL, `expires_at IS NOT NULL`) is
+                # NEVER merged — an early exit BEFORE the judge and before
+                # candidate search: no models poked, the job is released;
+                # an observable dedup_skipped event with the reason.
+                # Links of such a note are allowed (links is not here).
                 logging.getLogger("app").info(
                     "dedup: skipped — note has a lifetime",
                     extra={
@@ -2274,9 +2333,9 @@ class BackgroundWorker:
                 note_id, vector, row["namespace"]
             )
             if older:
-                # Перечитать тексты свежей заметки и всех кандидатов (гонка с
-                # memory_update/delete: протухшие кандидаты срезаются заранее —
-                # о них не спрашивают ни судью, ни суммаризатор).
+                # Re-read the fresh note's and all candidates' texts (the race with
+                # memory_update/delete: stale candidates are cut off in advance —
+                # neither the judge nor the summarizer is asked about them).
                 ids = [note_id] + [candidate_id for candidate_id, _ in older]
                 placeholders = ",".join("?" * len(ids))
                 with session(self._settings) as conn:
@@ -2297,11 +2356,11 @@ class BackgroundWorker:
                     if (r := by_id.get(candidate_id)) is not None
                     and r["deleted_at"] is None
                 ]
-                # Идентичность пары (№39 §6.8/§13.3): лучший кандидат и штампы
-                # сторон («заметка», «кандидат»). Новый лучший кандидат или
-                # правка любой стороны — ДРУГАЯ пара: счётчик и внимание
-                # сбрасываются, работа идёт как новая; штампы сохраняются на
-                # следующую сверку (в т.ч. у замороженной работы,
+                # The pair identity (#39 §6.8/§13.3): the best candidate and the sides'
+                # stamps ("note", "candidate"). A new best candidate or
+                # an edit of either side — a DIFFERENT pair: the counter and attention
+                # are reset, the work goes as new; the stamps are kept for the
+                # next comparison (including for a frozen job,
                 # `_review_attention_jobs`).
                 best_id = int(alive[0][0]) if alive else None
                 stored = self._load_payload(job["payload"])
@@ -2326,7 +2385,7 @@ class BackgroundWorker:
                 try:
                     best = self._pick_duplicate(note_id, alive, by_id)
                 except JudgeError as exc:
-                    # №39 (§6.7): отказ слота несёт тип исхода и фрагмент причины.
+                    # #39 (§6.7): a slot failure carries the outcome type and a reason fragment.
                     self._log_slot_failure(
                         JUDGE_JOB,
                         SLOT_JUDGE,
@@ -2346,13 +2405,13 @@ class BackgroundWorker:
                         detail=str(exc),
                     )
                     if outcome_of(exc) in _BATCH_ABORT_OUTCOMES:
-                        # транзиент/auth: партию снимаем, остальное — повтор по
-                        # back-off (прецедент migration retry-later).
+                        # transient/auth: release the batch; the rest — a retry on
+                        # back-off (the migration retry-later precedent).
                         break
-                    continue  # работа остаётся pending — повтор по back-off
+                    continue  # the work stays pending — a retry on back-off
                 if best is not None:
                     older_id, cosine_value = best
-                    # Merge-работа в очередь слота summary (решение №10).
+                    # A merge job into the summary slot's queue (decision #10).
                     self._create_job(
                         "summary",
                         "merge",
@@ -2365,33 +2424,36 @@ class BackgroundWorker:
             done += 1
         return done
 
-    # --- summary-петля: merge-работа (слияние дублей, Этап 2.2) --------------
+    # --- the summary loop: merge jobs (duplicate merging, Stage 2.2) ----------
 
     def process_merge_pending(self, limit: int | None = None) -> int:
-        """Обработать партию merge-работ (слияние дублей); число обработанных.
+        """Process a batch of merge jobs (duplicate merging); the processed count.
 
-        Merge-работа создана judge-петлёй после вердикта судьи (решение №10:
-        merge ходит в summary-слот). Процедура (вариант B — решение Олега):
-        1) перечитать тексты ранней и поздней заметок (гонка с
-           memory_update/delete: протухшая пара срезается);
-        2) summarizer.merge(текст_ранней, текст_поздней) — объединить;
-        3) NoteService.merge_pair — ОДНОЙ транзакцией обновить раннюю заметку
-           (текст = объединённый; ре-векторизация и ре-суммаризация — штатно,
-           своими очередями; title ранней не трогается) и soft-delete поздней
-           (trash). Пул 6: единая транзакция исключает полусостояние
-           «обновлена ранняя, поздняя жива» при отказе между операциями.
+                    A merge job is created by the judge loop after the judge's verdict
+                    (decision #10: merge walks into the summary slot). The procedure
+                    (variant B): 1) re-read the texts of the earlier and later notes
+                    (the race with memory_update/delete: a stale pair is cut off);
+                    2) summarizer.merge(earlier_text, later_text) — merge;
+                    3) NoteService.merge_pair — update the earlier note in ONE transaction
+                    (text = merged; re-vectorization and re-summarization — regular, by
+                    their queues; the earlier note's title is untouched) and soft-delete
+                    the later one (trash). Pool 6: a single transaction excludes the
+                    half-state "the earlier updated, the later alive" on a failure between
+                    the operations.
 
-        no46-03 (3.2.0), второй барьер: если у любой заметки пары есть таймер
-        (`expires_at IS NOT NULL`) — слияния нет, работа снимается, событие
-        `dedup_skipped` (reason="note has a lifetime"). Это защита в глубине:
-        заметка с TTL не сливается и снаружи (нормальный путь сюда не доходит —
-        judge-петля такую заметку не обрабатывает).
+                    no46-03 (3.2.0), the second barrier: if any note of the pair has a
+                    timer (`expires_at IS NOT NULL`) — no merge, the job is released, a
+                    `dedup_skipped` event (reason="note has a lifetime"). This is defense
+                    in depth: a TTL note is not merged from the outside either (the normal
+                    path never reaches here — the judge loop does not process such a
+                    note).
 
-        Отказ слияния (SummaryError, NFR-3) данные не портит: обе заметки
-        остаются, работа остаётся pending — повтор по back-off summary-петли.
+                    A merge failure (SummaryError, NFR-3) does not spoil the data: both
+                    notes stay, the work stays pending — a retry on the summary loop's
+                    back-off.
         """
         if self._summarizer is None:
-            return 0  # тестовый режим без суммаризатора: слияние невозможно
+            return 0  # a test mode without a summarizer: merging is impossible
         self._review_attention_jobs("summary", "merge")
         jobs = self._pending_jobs(
             "summary",
@@ -2432,9 +2494,9 @@ class BackgroundWorker:
                 done += 1
                 continue
             if older["expires_at"] is not None or newer["expires_at"] is not None:
-                # no46-03 (3.2.0), второй барьер (защита в глубине): если у
-                # ЛЮБОЙ заметки пары есть таймер — слияния нет (судья/суммаризатор
-                # не вызываются), работа снимается, событие того же вида.
+                # no46-03 (3.2.0), the second barrier (defense in depth): if ANY note of the
+                # pair has a timer — no merge (the judge/summarizer are
+                # not called), the job is released, an event of the same kind.
                 logging.getLogger("app").info(
                     "dedup: merge skipped — a note has a lifetime",
                     extra={
@@ -2448,9 +2510,9 @@ class BackgroundWorker:
                 self._mark_job_done(job["id"])
                 done += 1
                 continue
-            # Пара merge-работы — заметка (`older_id`); штампы сторон для
-            # сверки правки пары (№39 §6.8/§13.3): изменились — счётчик и
-            # внимание сбрасываются, работа идёт как новая.
+            # The merge job's pair — the note (`older_id`); the sides' stamps for
+            # the pair-edit comparison (#39 §6.8/§13.3): changed — the counter and
+            # attention reset, the work goes as new.
             pair_changed = (
                 payload.get("older_updated_at") is not None
                 and payload["older_updated_at"] != older["updated_at"]
@@ -2469,8 +2531,8 @@ class BackgroundWorker:
                 self._set_job_payload(job["id"], payload)
             try:
                 merge_result = self._summarizer.merge(older["text"], newer["text"])
-                # Наблюдаемость (F-23 п. 7): slot_call на КАЖДЫЙ вызов —
-                # дозапрос (2-й раунд) виден в журнале отдельной строкой.
+                # Observability (F-23 p. 7): a slot_call for EVERY call —
+                # the follow-up call (the 2nd round) is visible in the journal as a separate line.
                 for meta in merge_result.metas or [merge_result.meta]:
                     self._log_slot_call(
                         SUMMARY_JOB,
@@ -2485,19 +2547,19 @@ class BackgroundWorker:
                     [(part.title, part.text) for part in merge_result.parts],
                 )
                 if not outcome["merged"]:
-                    # Ранняя исчезла (оператор удалил) между вычиткой и
-                    # сведением — слияние не состоялось, работа снимается;
-                    # поздняя при этом не трогается (merge_into_parts ничего
-                    # не пишет, если ранней активной заметки нет).
+                    # The earlier note vanished (the operator deleted it) between the read and
+                    # the merge — no merge happened, the job is released;
+                    # the later one is not touched (merge_into_parts writes
+                    # nothing when there is no active earlier note).
                     self._mark_job_done(job["id"])
                     done += 1
                     continue
             except MergeIncompleteError as exc:
-                # F-23 п. 6: за MERGE_MAX_ROUNDS слияние не сошлось (модель
-                # теряет содержание). Повтор даст те же два раунда — пара
-                # ОТКЛАДЫВАЕТСЯ: работа снимается, ОБЕ заметки живы, событие
-                # в журнал джоб и запись в warnings (subject — ранняя пары,
-                # payload несёт позднюю и причину).
+                # F-23 p. 6: the merge did not converge within MERGE_MAX_ROUNDS (the model
+                # loses content). A retry would give the same two rounds — the pair is
+                # DEFERRED: the job is released, BOTH notes are alive, an event
+                # into the jobs journal and a warnings record (the subject — the pair's earlier note,
+                # the payload carries the later one and the reason).
                 self._mark_job_done(job["id"])
                 done += 1
                 self._log_slot_failure(
@@ -2539,7 +2601,7 @@ class BackgroundWorker:
                     outcome_of(exc),
                     detail=str(exc),
                 )
-                continue  # работа остаётся pending — повтор по back-off
+                continue  # the work stays pending — a retry on back-off
             logging.getLogger("app").info(
                 "dedup: duplicate merged into self-contained parts",
                 extra={
@@ -2548,7 +2610,7 @@ class BackgroundWorker:
                     "older_id": older_id,
                     "note_id": note_id,
                     "cosine": payload.get("cosine"),
-                    # F-23 п. 7: раунды, модель, число частей — в журнале джоб.
+                    # F-23 p. 7: the rounds, the model, the parts count — in the jobs journal.
                     "rounds": merge_result.rounds,
                     "model": merge_result.meta.model,
                     "parts": len(merge_result.parts),
@@ -2557,16 +2619,16 @@ class BackgroundWorker:
             )
             self._mark_job_done(job["id"])
             done += 1
-            # Размещение частей (lsb-0012, arch §3.5): каждая часть — новая
-            # заметка — кандидат обхода узлов (classified_at NULL); задаём
-            # слоту `nodes` по заданию на часть и будим его петлю сразу, не
-            # дожидаясь часового интервала. Неудачная постановка/обработка
-            # данные не портит: часть остаётся в узле ранней.
+            # Placing the parts (lsb-0012, arch §3.5): each part — a new note — is a node-sweep
+            # candidate (classified_at NULL); we place one task per part into the
+            # `nodes` slot and wake its loop at once, without waiting
+            # for the hourly interval. A failed placement/parse
+            # does not spoil the data: the part stays in the earlier note's node.
             for part in outcome["parts"]:
                 self._ensure_job(NODES_JOB, NODES_RECLASS_KIND, int(part["id"]))
             self.notify_nodes_pending()
-            # Части ждут суммаризацию и векторизацию — будим свои петли,
-            # не дожидаясь back-off.
+            # The parts wait for summarization and vectorization — wake their own loops,
+            # without waiting for the back-off.
             self.notify_summary_pending()
             self.notify_embedding_pending()
         return done
@@ -2574,13 +2636,14 @@ class BackgroundWorker:
     def _defer_merge_pair(
         self, older_id: int, note_id: int, *, reason: str, rounds: int
     ) -> None:
-        """Отложить пару слияния (F-23 п. 6): запись в warnings.
+        """Defer a merge pair (F-23 p. 6): a warnings record.
 
-        Открытое предупреждение kind=`merge_deferred` на ранней пары (upsert:
-        повторное откладывание той же пары двигает updated_at, не плодит
-        строки); payload несёт позднюю, число раундов и причину. Сервис
-        warnings недоступен (DI-сборки тестов) — откладывание остаётся
-        только событием журнала, данные не портит.
+                    An open kind=`merge_deferred` warning on the pair's earlier note
+                    (upsert: re-deferring the same pair moves updated_at, does not
+                    multiply rows); the payload carries the later note, the rounds count
+                    and the reason. With the warnings service unavailable (test DI builds)
+                    the deferring remains a journal event only — it does not spoil the
+                    data.
         """
         if self._warnings is None:
             return
@@ -2595,7 +2658,7 @@ class BackgroundWorker:
                 ),
                 {"newer_id": note_id, "rounds": rounds, "reason": reason[:500]},
             )
-        except Exception:  # noqa: BLE001 — предупреждение не ломает петлю
+        except Exception:  # noqa: BLE001 — a warning does not break the loop
             logging.getLogger("app").warning(
                 "dedup: failed to record merge_deferred warning",
                 extra={
@@ -2606,25 +2669,25 @@ class BackgroundWorker:
                 },
             )
 
-    # --- фоновый дедуп (Фаза 8, Этапы 2–3) ------------------------------------
+    # --- background dedup (Phase 8, Stages 2–3) -------------------------------
 
     def _find_dedup_candidates(
         self, note_id: int, vector: list[float], namespace: str = "default"
     ) -> list[tuple[int, float]]:
-        """Косинус-кандидаты дедупа после довекторизации заметки.
+        """Dedup cosine candidates after a note's vectorization.
 
-        Кандидаты ищутся только против **ранних** заметок (id меньше
-        текущей): пара «поздняя ↔ ранняя» обрабатывается один раз, из
-        стороны поздней — сведение (Этап 2.2) обновляет ранний дубль и
-        soft-delete поздний, а встречный прогон той же пары из стороны
-        ранней заметки зациклил бы обработку. Фаза 10 (§5.7): только в
-        пределах неймспейса заметки. Кандидаты логируются
-        (наблюдаемость); приговор «дубль» принимает process_judge_pending:
-        каждый кандидат опрашивается судьёй (Этап 3.2, JudgeService —
-        косинус лишь предфильтр); без судьи — косинус-фоллбек
-        DEDUP_SIMILARITY (Этап 2.2).
+                    Candidates are searched only against **earlier** notes (a smaller id):
+                    a "later ↔ earlier" pair is processed once, from the later side — the
+                    merge (Stage 2.2) updates the earlier duplicate and soft-deletes the
+                    later one, and the reverse run of the same pair from the earlier
+                    note's side would loop the processing. Phase 10 (§5.7): only within
+                    the note's namespace. Candidates are logged (observability); the
+                    "duplicate" verdict is made by process_judge_pending: each candidate
+                    is asked of the judge (Stage 3.2, JudgeService — cosine is only a
+                    prefilter); without a judge — the DEDUP_SIMILARITY cosine fallback
+                    (Stage 2.2).
 
-        Возвращает список [(candidate_id, cosine)] — вход сведение.
+                    Returns a list [(candidate_id, cosine)] — the merge's input.
         """
         found = self._dedup.find_candidates(
             vector, exclude_id=note_id, namespace=namespace
@@ -2648,30 +2711,32 @@ class BackgroundWorker:
         candidates: list[tuple[int, float]],
         by_id: dict,
     ) -> tuple[int, float] | None:
-        """Выбрать кандидата для сведения: судья (Этап 3.2) или фоллбек.
+        """Pick a candidate for merging: the judge (Stage 3.2) or the fallback.
 
-        Судья (Judge): опрашивается по каждому живому кандидату в порядке
-        убывания близости (порядок выдачи find_candidates); первый вердикт
-        «ДУБЛЬ» — приговор (candidate_id, cosine). «НЕ ДУБЛЬ» по всем —
-        None: слияния нет, заметка считается обработанной (повторять
-        вопрос по неизменному тексту незачем: дедуп ждёт следующую
-        векторизацию, а та случится только после изменения текста).
-        Каждая пара логируется (event=dedup_judge) — наблюдаемость
-        вердиктов предфильтра.
+                    The judge (Judge): asked per each live candidate in closeness
+                    descending order (the find_candidates output order); the first
+                    "DUPLICATE" verdict — the sentence (candidate_id, cosine). "NOT
+                    DUPLICATE" for all — None: no merge, the note counts as processed
+                    (repeating the question over an unchanged text is pointless: dedup
+                    waits for the next vectorization, and that happens only after a text
+                    change). Each pair is logged (event=dedup_judge) — the prefilter
+                    verdicts' observability.
 
-        Фоллбек без судьи (DI None, тестовый режим Этапа 2.2): первый
-        кандидат с cosine ≥ DEDUP_SIMILARITY (выдача отсортирована).
+                    The fallback without a judge (DI None, the Stage-2.2 test mode): the
+                    first candidate with cosine ≥ DEDUP_SIMILARITY (the output is
+                    sorted).
 
-        JudgeError пробрасывается наружу — process_judge_pending трактует
-        отказ судьи как отказ слияния (работа остаётся pending, повтор по
-        back-off, NFR-3): неопределённость не превращаем в «не дубль».
+                    JudgeError is propagated — process_judge_pending treats a judge
+                    failure as a merge failure (the work stays pending, a retry on
+                    back-off, NFR-3): uncertainty is never turned into "not duplicate".
 
-        by_id — свежепрочитанные строки notes (id → row): судья сравнивает
-        тексты пары (свежая, кандидат) — порядок аргументов фиксирует
-        JUDGE_USER_TEMPLATE (ТЕКСТ 1 — новая, ТЕКСТ 2 — кандидат).
+                    by_id — freshly read notes rows (id → row): the judge compares the
+                    pair's texts (the fresh one, the candidate) — the argument order is
+                    fixed by JUDGE_USER_TEMPLATE (TEXT 1 — the new one, TEXT 2 — the
+                    candidate).
         """
         if self._judge is None:
-            # Фоллбек Этапа 2.2 (тестовый режим): выдача отсортирована.
+            # The Stage-2.2 fallback (a test mode): the output is sorted.
             return next(
                 (
                     pair
@@ -2706,28 +2771,29 @@ class BackgroundWorker:
                 return (candidate_id, cosine_value)
         return None
 
-    # --- summary-петля: title-догенерация (решение №9) -----------------------
+    # --- the summary loop: title generation (decision #9) ---------------------
 
     def process_title_pending(self, limit: int | None = None) -> int:
-        """Догенерировать названия миграционных заметок (title IS NULL).
+        """Generate titles for migration notes (title IS NULL).
 
-        Только миграционные заметки (новые всегда с title — контракт решения
-        №9); очередь наполняется только миграцией и после прогонки опустеет.
-        Думающий вызов слота summary (SummaryService.title — промпт зашит
-        TITLE_PROMPT, Фаза 11), результат обрезается до TITLE_MAX_WORDS слов
-        механикой, запись title. Отказ генерации
-        (SummaryError) — заметка остаётся без названия, повтор по back-off
-        (NFR-3); исход wait-класса (unavailable/timeout/auth,
-        `_BATCH_ABORT_OUTCOMES`, LSBN-T-28) вдобавок снимает партию — остальные
-        позиции остаются без названия и добираются по back-off после возврата
-        слота (прецедент migration retry-later). Возвращает число записанных
-        названий (до отказа, если партия снята).
+                    Only migration notes (new ones always have a title — the decision-#9
+                    contract); the queue is filled only by migration and empties after
+                    processing. A thinking call of the summary slot (SummaryService.title
+                    — the prompt baked in as TITLE_PROMPT, Phase 11); the result is
+                    trimmed to TITLE_MAX_WORDS words mechanically; the title is written.
+                    A generation failure (SummaryError) — the note stays titleless, a
+                    retry on back-off (NFR-3); a wait-class outcome
+                    (unavailable/timeout/auth, `_BATCH_ABORT_OUTCOMES`, LSBN-T-28) also
+                    releases the batch — the other positions stay titleless and are picked
+                    up on back-off after the slot returns (the migration retry-later
+                    precedent). Returns the number of written titles (up to the failure,
+                    if the batch was released).
 
-        Запись названия инвалидирует полный вектор (lsb-0001 FR-1.1: title
-        участвует в кодировании) — в той же транзакции векторизация
-        возвращается в 'pending' и notes_vec сброшен; воркер notes-очереди
-        перекодирует уже с названием (_embed_input). Чанковые вектора не
-        тронуты (решение D1: title на них не влияет).
+                    Writing the title invalidates the full vector (lsb-0001 FR-1.1: the
+                    title takes part in encoding) — in the same transaction vectorization
+                    returns to 'pending' and notes_vec is reset; the notes-queue worker
+                    re-encodes with the title (_embed_input). Chunk vectors are untouched
+                    (decision D1: the title does not affect them).
         """
         if self._summarizer is None:
             return 0
@@ -2757,10 +2823,10 @@ class BackgroundWorker:
                     meta=getattr(exc, "meta", None),
                 )
                 if outcome_of(exc) in _BATCH_ABORT_OUTCOMES:
-                    # транзиент/auth: партию снимаем, остальное — повтор по
-                    # back-off (прецедент migration retry-later).
+                    # transient/auth: release the batch; the rest — a retry on
+                    # back-off (the migration retry-later precedent).
                     break
-                continue  # отказ: title остаётся NULL, повтор по back-off
+                continue  # failure: the title stays NULL, a retry on back-off
             self._log_slot_call(
                 SUMMARY_JOB, SLOT_SUMMARY, generated.meta, note_id=row["id"]
             )
@@ -2774,14 +2840,14 @@ class BackgroundWorker:
                     (title, row["id"]),
                 )
                 if cursor.rowcount:
-                    # lsb-0001 FR-1.1: title участвует в полном векторе —
-                    # запись названия делает старый вектор (по чистому text)
-                    # протухшим: статус в 'pending', notes_vec сброшен (тот
-                    # же смысл, что vectors.drop в notes.update(): в окне
-                    # pending заметка участвует только в FTS-поиске, старый
-                    # вектор без названия не кормит ни поиск, ни дедуп).
-                    # Чанковые вектора не тронуты (решение D1: кодируются по
-                    # чистому тексту чанка).
+                    # lsb-0001 FR-1.1: the title is part of the full vector —
+                    # writing the title makes the old vector (over the bare text)
+                    # stale: the status to 'pending', notes_vec reset (the
+                    # same meaning as vectors.drop in notes.update(): in the
+                    # pending window the note takes part in FTS search only; the old
+                    # vector without the title feeds neither search nor dedup).
+                    # Chunk vectors are untouched (decision D1: they are encoded over the
+                    # chunk's bare text).
                     conn.execute(
                         "UPDATE notes SET vector_status = 'pending' WHERE id = ?",
                         (row["id"],),
@@ -2790,8 +2856,8 @@ class BackgroundWorker:
                     vectors.drop(conn, row["id"])
             if cursor.rowcount:
                 done += 1
-                # Заметка вернулась в очередь векторизации (название входит в
-                # полный вектор) — будим embedding-петлю сразу.
+                # The note returned to the vectorization queue (the title is part of the
+                # full vector) — wake the embedding loop at once.
                 self.notify_embedding_pending()
                 logging.getLogger("app").info(
                     "title: generated for migration note",
@@ -2806,44 +2872,49 @@ class BackgroundWorker:
 
     @staticmethod
     def _truncate_title(text: str) -> str:
-        """Обрезать сгенерированное название до TITLE_MAX_WORDS слов (решение №9).
+        """Trim a generated title to TITLE_MAX_WORDS words (decision #9).
 
-        Слова = len(title.split()) — как в контракте валидации (notes.py).
+                    Words = len(title.split()) — as in the validation contract
+                    (notes.py).
         """
         words = text.split()
         return " ".join(words[:TITLE_MAX_WORDS])
 
     def process_summary_pending(self, limit: int | None = None) -> int:
-        """Досуммировать одну партию pending; число до 'ok' доведённых.
+        """Summarize one pending batch; the count brought to 'ok'.
 
-        Режим «Б» (§5.5): генерация — только здесь, по заметкам из очереди.
-        Отказ генерации одной заметки не отменяет остальных (NFR-3): статус
-        остаётся pending, заметка догонится следующей партией. Исключение —
-        wait-класс исходов (unavailable/timeout/auth, `_BATCH_ABORT_OUTCOMES`,
-        LSBN-T-28): провайдер лежит или висит (read-таймаут до 900 с на
-        позицию) — партия снимается (прецедент migration retry-later),
-        обработанные до отказа позиции засчитаны, хвост остаётся pending и
-        добирается по back-off после возврата слота. Trash
-        (deleted_at IS NOT NULL) не обслуживается — как и в векторизации.
+                    Mode "B" (§5.5): generation — only here, over the queue's notes. One
+                    note's generation failure does not cancel the others (NFR-3): the
+                    status stays pending, the note is caught up by the next batch. The
+                    exception — wait-class outcomes (unavailable/timeout/auth,
+                    `_BATCH_ABORT_OUTCOMES`, LSBN-T-28): the provider is down or hanging
+                    (a read timeout up to 900 s per position) — the batch is released (the
+                    migration retry-later precedent), the positions processed before the
+                    failure count, the tail stays pending and is picked up on back-off
+                    after the slot returns. Trash (deleted_at IS NOT NULL) is not served —
+                    as in vectorization.
 
-        Гонка с memory_update (ARCH §4.5): суммари пишется только если текст
-        не менялся с момента вычитки (`AND text = ?`) — протухшая выжимка не
-        затирает свежую заметку.
+                    The memory_update race (ARCH §4.5): the summary is written only if the
+                    text did not change since the read (`AND text = ?`) — a stale summary
+                    does not overwrite a fresh note.
 
-        Лимит длины (решение гейта 3.1.0, 2026-09-19): ответ модели сохраняется
-        только после `cap_summary` — жёсткое усечение до MAX_SUMMARY_CHARS по
-        границе слова с многоточием. Это единственная точка записи модельного
-        саммари, поэтому лимит не зависит от дисциплины модели.
+                    The length limit (the 3.1.0 gate decision, 2026-09-19): the model's
+                    answer is saved only after `cap_summary` — a hard trim to
+                    MAX_SUMMARY_CHARS at a word boundary with an ellipsis. This is the
+                    only point where a model summary is written, so the limit does not
+                    depend on the model's discipline.
 
-        Фактическая готовность выжимки — сигнал соседней петле (по образцу
-        `notify_links_pending` после довекторизации, решение гейта 2026-09-20):
-        если хоть одна заметка батча реально доведена до `summary_status='ok'`,
-        будится петля `nodes` (`notify_nodes_pending`) — её задание `reclass`
-        после сшивания дубликатов могло ждать именно этой выжимки и «спать» по
-        back-off (в приёмочном контуре до 15 мин). Отказ генерации per-item
-        (`continue` выше — статус остаётся pending), позиция, снявшая партию
-        (wait-класс, `break` — её статус тоже остаётся pending), и пустой
-        прогон сигнала не дают: «модели недоступны → задание ждёт» сохраняется.
+                    The summary's actual readiness — a signal to the neighboring loop
+                    (modeled on `notify_links_pending` after vectorization, the
+                    2026-09-20 gate decision): if at least one batch note was actually
+                    brought to `summary_status='ok'`, the `nodes` loop is woken
+                    (`notify_nodes_pending`) — its `reclass` task after duplicate
+                    stitching may have waited exactly for that summary and "slept" on
+                    back-off (up to 15 min in the acceptance contour). A per-item
+                    generation failure (`continue` above — the status stays pending), the
+                    position that released the batch (a wait class, `break` — its status
+                    also stays pending), and an empty run give no signal: "models
+                    unavailable → the task waits" holds.
         """
         if self._summarizer is None:
             return 0
@@ -2873,16 +2944,16 @@ class BackgroundWorker:
                     meta=getattr(exc, "meta", None),
                 )
                 if outcome_of(exc) in _BATCH_ABORT_OUTCOMES:
-                    # транзиент/auth: партию снимаем, остальное — повтор по
-                    # back-off (прецедент migration retry-later).
+                    # transient/auth: release the batch; the rest — a retry on
+                    # back-off (the migration retry-later precedent).
                     break
-                continue  # отказ: status pending остаётся, повтор по back-off
+                continue  # failure: the pending status stays, a retry on back-off
             self._log_slot_call(
                 SUMMARY_JOB, SLOT_SUMMARY, summary_result.meta, note_id=row["id"]
             )
-            # Страховка длины (решение гейта 3.1.0, 2026-09-19): модель может
-            # не послушать промпт («no more than 150 characters») — в БД уходит
-            # усечённое по границе слова саммари, всегда ≤ MAX_SUMMARY_CHARS.
+            # The length safety net (the 3.1.0 gate decision, 2026-09-19): the model may
+            # ignore the prompt ("no more than 150 characters") — what reaches the DB is
+            # a summary truncated at a word boundary, always ≤ MAX_SUMMARY_CHARS.
             summary = cap_summary(
                 summary_result.text, self._settings.max_summary_chars
             )
@@ -2894,17 +2965,17 @@ class BackgroundWorker:
                 )
             if cursor.rowcount:
                 done += 1
-                # Причёска (Фаза 10, Шаг 4): после суммаризации default-заметки
-                # (ещё не классифицированной) — разметка и авто-переезд.
+                # Grooming (Phase 10, Step 4): after summarizing a default note
+                # (not yet classified) — the markup and the auto-move.
                 if row["namespace"] == "default" and row["classified_at"] is None:
                     try:
                         self._classify_default_note(int(row["id"]), row["text"])
                     except asyncio.CancelledError:
-                        raise  # отмена петли — не глотать
+                        raise  # loop cancellation — do not swallow
                     except Exception:
-                        # Непредвиденный сбой причёски (в т.ч. баг) не роняет
-                        # summary-петлю: остальные заметки партии обрабатываются
-                        # дальше, классификация этой — после следующего update.
+                        # An unexpected grooming failure (including a bug) does not crash the
+                        # summary loop: the batch's other notes keep being
+                        # processed; this one's classification — after the next update.
                         logging.getLogger("app").warning(
                             "classify: internal error — enrichment deferred",
                             extra={
@@ -2915,16 +2986,16 @@ class BackgroundWorker:
                             exc_info=True,
                         )
         if done:
-            # Хоть одна заметка партии реально получила готовую суммари — будим
-            # петлю `nodes` (lsb-0012, по образцу `notify_links_pending`).
-            # Одно событие на батч достаточно; отказавшая позиция сюда с
-            # готовой суммари не доходит (per-item `continue` или `break` при
-            # wait-классе — статус остаётся pending), но досчитанные до отказа
-            # позиции партию сняли честно — сигнал по ним оправдан.
+            # At least one batch note actually got a ready summary — wake the
+            # `nodes` loop (lsb-0012, modeled on `notify_links_pending`).
+            # One event per batch suffices; a failed position does not reach here with
+            # a ready summary (a per-item `continue`, or `break` on the
+            # wait class — the status stays pending), but the positions counted before the failure
+            # released the batch honestly — the signal for them is justified.
             self.notify_nodes_pending()
         return done
 
-    # --- причёска (Фаза 10, Шаг 4) -------------------------------------------
+    # --- grooming (Phase 10, Step 4) ------------------------------------------
 
     def _apply_node_order(
         self,
@@ -2935,34 +3006,38 @@ class BackgroundWorker:
         current_namespace: str | None = None,
         no_hint_reason: str = "low_confidence",
     ) -> tuple[str, str, str | None]:
-        """Единственная точка переезда заметки по разметке (lsb-0011-01, arch §3.3).
+        """The single point of a markup-driven note move (lsb-0011-01, arch §3.3).
 
-        Один UPDATE: разметка (`hint_path`, `confidence`, `classified_at`) +
-        маркер разбора `node_order_at` + (при переезде) `namespace` и
-        `vector_status='pending'` (пере-кодировка в партицию нового узла —
-        существующий механизм). Guard `namespace = :expected_namespace` и
-        `deleted_at IS NULL`: операторский/клиентский переезд в полёте фоном
-        не перебивается — `rowcount = 0` даёт `kept`/`node_changed`.
+                    One UPDATE: the markup (`hint_path`, `confidence`, `classified_at`) +
+                    the parse marker `node_order_at` + (on a move) `namespace` and
+                    `vector_status='pending'` (re-encoding into the new node's partition —
+                    the existing mechanism). The `namespace = :expected_namespace` guard
+                    and `deleted_at IS NULL`: an operator/client move in flight is not
+                    overridden by the background — `rowcount = 0` gives
+                    `kept`/`node_changed`.
 
-        Целевой узел считается ДО транзакции: отказ валидации разметки
-        (`NamespaceValidationError` из `_auto_move_target`, в т.ч. мусорный
-        `hint_path`) не пишет в БД вовсе — строгая семантика «отказ = не
-        размечено». Возврат `(outcome, reason, target)`: `moved` — переезд;
-        `kept` — оставлена (`hint_unknown` — узла нет в реестре,
-        `no_hint_reason` — модель узла не предложила, `low_confidence` —
-        уверенность ниже порога, `same_node` — узел тот же, `node_changed` —
-        узел сменён в полёте). Все reason — из словаря arch §3.7.
+                    The target node is computed BEFORE the transaction: a markup
+                    validation failure (`NamespaceValidationError` from `_auto_move_target`,
+                    including a garbage `hint_path`) writes nothing to the DB at all — the
+                    strict "a failure = not marked" semantics. Returns
+                    (outcome, reason, target): `moved` — a move; `kept` — kept
+                    (`hint_unknown` — the node is not in the registry, `no_hint_reason` —
+                    the model proposed no node, `low_confidence` — below the threshold,
+                    `same_node` — the same node, `node_changed` — the node changed in
+                    flight). All reasons — from the arch §3.7 dictionary.
 
-        Механика одна на все источники (arch §3.3): её переиспользует
-        причёска после суммаризации (вход по полному тексту), обход `default`
-        (быстрый путь и классификаторный пул) и задание после сшивания.
+                    One mechanic for all sources (arch §3.3): the grooming after
+                    summarization (input by the full text), the `default` sweep (the fast
+                    path and the classifier pool) and the after-stitching task all reuse
+                    it.
 
-        `current_namespace` — узел заметки, прочитанный В МОМЕНТ РЕШЕНИЯ
-        (только задание после сшивания, lsb-0012): тогда результат без узла
-        даёт `no_hint_reason` (`result_default` — заметка НЕ понижается,
-        FR-2.4), а уверенный выбор текущего узла — `kept`/`same_node` без
-        лишней пере-векторизации. Для обхода и причёски (`None`) поведение
-        прежнее: `expected_namespace` — `'default'`.
+                    `current_namespace` — the note's node read AT DECISION TIME (the
+                    after-stitching task only, lsb-0012): then a no-node result gives
+                    `no_hint_reason` (`result_default` — the note is NOT downgraded,
+                    FR-2.4), and a confident choice of the current node —
+                    `kept`/`same_node` without needless re-vectorization. For the sweep
+                    and grooming (`None`) the behavior is as before: `expected_namespace`
+                    — `'default'`.
         """
         target = self._auto_move_target(result)
         confident = (
@@ -2970,8 +3045,8 @@ class BackgroundWorker:
         )
         move = target is not None and confident
         if current_namespace is not None and not result.hint_path:
-            # Результат «общая»: движение «узел → свалка» запрещено (FR-2.4) —
-            # заметка остаётся в узле ранней.
+            # A "generic" result: a "node → dump" move is forbidden (FR-2.4) —
+            # the note stays in the earlier note's node.
             target = None
             move = False
         elif (
@@ -2979,9 +3054,9 @@ class BackgroundWorker:
             and confident
             and target == current_namespace
         ):
-            move = False  # узел тот же: переезда (и пере-векторизации) нет
-        # Маркер разбора ставится в ТОЙ ЖЕ транзакции, что и разметка
-        # (lsb-0011-01, §3.6): атомарно, анти-зацикливание не отстаёт от решения.
+            move = False  # the same node: no move (and no re-vectorization)
+        # The parse marker is set in THE SAME transaction as the markup
+        # (lsb-0011-01, §3.6): atomically; the anti-looping never lags the decision.
         columns = [
             "hint_path = ?",
             "confidence = ?",
@@ -3001,10 +3076,10 @@ class BackgroundWorker:
                 (*params, note_id, expected_namespace),
             )
             if cursor.rowcount and move:
-                # №41 (FR-3.1/FR-4.4, §13.5): фактический переезд `namespace` —
-                # контентное изменение, версия пишется ТОЙ ЖЕ транзакцией.
-                # Источник — из `bind_origin` тела джобы (`job:<name>`);
-                # служебные `hint_path`/`confidence` в проекцию не входят.
+                # #41 (FR-3.1/FR-4.4, §13.5): an actual `namespace` move —
+                # a content change; the version is written by THE SAME transaction.
+                # The source — from the job body's `bind_origin` (`job:<name>`);
+                # the service `hint_path`/`confidence` are not in the projection.
                 row = conn.execute(
                     "SELECT text, title, namespace, expires_at, comment FROM notes "
                     "WHERE id = ?",
@@ -3028,38 +3103,39 @@ class BackgroundWorker:
         return "kept", "low_confidence", target
 
     def _classify_default_note(self, note_id: int, text: str) -> None:
-        """Разметить default-заметку после суммаризации; авто-переезд.
+        """Mark a default note after summarization; the auto-move.
 
-        Только default-заметки (уложенные не перетряхиваются, §5.7) и только
-        один проход (classified_at — анти-зацикливание; повтор — после
-        memory_update, который сбрасывает summary в pending). Отказ
-        классификатора (ClassificationError) данные не портит: заметка
-        остаётся в default, classified_at не ставится — повтор при следующем
-        обновлении.
+                    Only default notes (placed ones are not shaken up, §5.7) and only one
+                    pass (classified_at — anti-looping; a retry — after memory_update,
+                    which resets the summary to pending). A classifier failure
+                    (ClassificationError) does not spoil the data: the note stays in
+                    default, classified_at is not set — a retry at the next update.
 
-        Авто-переезд в существующий узел — при confidence ≥
-        NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE: в существующий лист (если
-        subdomain_hint совпал с зарегистрированным), иначе в корень домена;
-        новый лист (subdomain_hint не зарегистрирован) остаётся в default —
-        его создаст триггер (Шаг 5) и переложит ретро-перекладкой. Переезд
-        ставит vector_status='pending' — воркер пере-кодирует вектор в
-        партицию нового неймспейса (старый вектор уходит DELETE+INSERT).
+                    The auto-move into an existing node — at confidence ≥
+                    NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE: into an existing leaf (if the
+                    subdomain_hint matched a registered one), else into the domain's root;
+                    a new leaf (the subdomain_hint not registered) stays in default — the
+                    trigger (Step 5) will create it and move the notes by a retro-move.
+                    The move sets vector_status='pending' — the worker re-encodes the
+                    vector into the new namespace's partition (the old vector goes
+                    DELETE+INSERT).
 
-        Пул 6: разметка и переезд — ОДНА транзакция (один UPDATE, guard
-        `namespace='default'`): гонка с клиентским memory_update больше не
-        оставляет полусостояния «разметка записана, переезд по старой оценке»;
-        операторский переезд в полёте фоном не перебивается (rowcount). Цель
-        авто-переезда считаем до транзакции — отказ _auto_move_target (в т.ч.
-        NamespaceValidationError на мусорном hint) ничего не пишет в БД
-        (строгая семантика «отказ классификации = не размечено»).
+                    Pool 6: the markup and the move — ONE transaction (one UPDATE, the
+                    `namespace='default'` guard): the race with a client memory_update no
+                    longer leaves the half-state "the markup written, the move by the old
+                    estimate"; an operator move in flight is not overridden by the
+                    background (rowcount). The auto-move target is computed before the
+                    transaction — a `_auto_move_target` failure (including
+                    NamespaceValidationError on a garbage hint) writes nothing to the DB
+                    (the strict "a classification failure = not marked" semantics).
 
-        lsb-0011-01: сама механика переезда вынесена в общую точку
-        `_apply_node_order` (её же переиспользует обход `default`) — здесь
-        остаётся только вход по полному тексту и триггер промоции; поведение
-        классификации после суммаризации не меняется.
+                    lsb-0011-01: the move mechanics itself is factored into the shared
+                    `_apply_node_order` (the `default` sweep reuses it too) — only the
+                    full-text input and the promotion trigger remain here; the
+                    classification-after-summarization behavior does not change.
         """
         if self._classifier is None:
-            return  # тестовый режим без классификатора
+            return  # a test mode without a classifier
         known = self._namespaces.list_all()["namespaces"]
         try:
             result = self._classifier.classify(text, known)
@@ -3078,12 +3154,12 @@ class BackgroundWorker:
         self._log_slot_call(
             SUMMARY_JOB, SLOT_SUMMARY, result.meta, note_id=note_id
         )
-        # Пул 6: переезд — ОДНА общая точка `_apply_node_order` (разметка +
-        # namespace/vector_status одним UPDATE, guard внутри); отказ
-        # вычисления цели (в т.ч. NamespaceValidationError на мусорном hint)
-        # ничего не пишет в БД.
+        # Pool 6: the move — ONE shared point `_apply_node_order` (the markup +
+        # namespace/vector_status in one UPDATE, the guard inside); a failure
+        # of computing the target (including NamespaceValidationError on a garbage hint)
+        # writes nothing to the DB.
         outcome, _reason, target = self._apply_node_order(note_id, "default", result)
-        # Лог — только при ФАКТИЧЕСКОМ переезде (rowcount+condition).
+        # The log — only on an ACTUAL move (rowcount+condition).
         if outcome == "moved":
             logging.getLogger("app").info(
                 "classify: default note auto-moved into existing node",
@@ -3095,30 +3171,31 @@ class BackgroundWorker:
                     "confidence": result.confidence,
                 },
             )
-        # Триггер домена (Фаза 10, Шаг 5): разметка могла докинуть hint-группу
-        # до порога — прогоняем конвейер промоции (авто-создание/слияние).
+        # The domain trigger (Phase 10, Step 5): the markup could push a hint group
+        # over the threshold — run the promotion pipeline (auto-create/merge).
         self._run_promotion()
 
     def _run_promotion(self, job: str = SUMMARY_JOB) -> None:
-        """Триггер домена (Шаг 5) после классификации default-заметки.
+        """The domain trigger (Step 5) after a default note's classification.
 
-        Вызывается причёской (слот summary, `job=summary`) и обходом `nodes`
-        перед подметанием `default` (`job=nodes`, lsb-0011-01): промоция идёт
-        первой, чтобы заметка не «переезжала» в узел, который появится в этом
-        же прогоне. Имя джобы в журнале — параметр (события не переименовываем,
-        меняется лишь значение обязательного поля `job`).
+                    Called by the grooming (the summary slot, `job=summary`) and the
+                    `nodes` sweep before sweeping `default` (`job=nodes`, lsb-0011-01):
+                    promotion goes first so a note does not "move" into a node that will
+                    appear in the same run. The job name in the journal — a parameter (the
+                    events are not renamed; only the value of the mandatory `job` field
+                    changes).
 
-        Сбои триггера не роняют воркер: это этап обогащения, а не конвейера
-        данных — суммаризация/векторизация важнее структурной автоматики.
-        Ожидаемые отказы describer/судьи обрабатываются внутри
-        PromotionService (кандидат остаётся без вердикта, NFR-3); здесь
-        ловится ВСЁ остальное (включая баги) — warning с traceback в логи,
-        петли очередей живут. Повтор — следующая классификация default-
-        заметки или следующий прогон обхода: группы не теряются, просто
-        дотягивают до порога позже.
+                    Trigger failures do not crash the worker: this is an enrichment stage,
+                    not the data pipeline — summarization/vectorization matter more than
+                    structural automation. The expected describer/judge failures are
+                    handled inside PromotionService (the candidate stays without a
+                    verdict, NFR-3); here EVERYTHING else is caught (including bugs) — a
+                    warning with traceback into the logs, the queue loops live. A retry —
+                    the next default-note classification or the next sweep run: groups are
+                    not lost, they just reach the threshold later.
         """
         if self._promoter is None:
-            return  # тестовый режим без триггера
+            return  # a test mode without the trigger
         try:
             report = self._promoter.run()
         except Exception:
@@ -3133,8 +3210,8 @@ class BackgroundWorker:
             )
             return
         if any(report.values()):
-            # Сводка — одним ключом: 'created' конфликтует с атрибутом
-            # LogRecord (время создания) — extra его не принимает.
+            # The summary — under one key: 'created' clashes with the LogRecord
+            # attribute (the creation time) — extra does not accept it.
             logging.getLogger("app").info(
                 "promotion: trigger run finished",
                 extra={
@@ -3145,13 +3222,13 @@ class BackgroundWorker:
             )
 
     def _auto_move_target(self, result) -> str | None:
-        """Целевой узел авто-переезда (только существующие узлы, §5.7).
+        """The auto-move target node (existing nodes only, §5.7).
 
-        hint_path — полный путь разметки (1..3 слага); если он не
-        зарегистрирован (модель предложила новый узел — его создаст/
-        переложит триггер Шага 5) — не двигаем. Null (общая) — не двигаем.
-        Не-путь (мусор классификатора) валидируется в `exists` внутри —
-        NamespaceValidationError, ничего в БД не пишется (§5.7).
+                    hint_path — the markup's full path (1..3 slugs); if it is not
+                    registered (the model proposed a new node — the Step-5 trigger will
+                    create it/move notes into it) — do not move. Null (generic) — do not
+                    move. A non-path (classifier garbage) is validated inside by `exists`
+                    — NamespaceValidationError, nothing is written to the DB (§5.7).
         """
         hint = result.hint_path
         if not hint:
@@ -3160,60 +3237,62 @@ class BackgroundWorker:
             return None
         return hint
 
-    # --- джоба «порядок в узлах» (lsb-0011) -----------------------------------
+    # --- the "node order" job (lsb-0011) --------------------------------------
 
     def process_nodes(self, budget: int | None = None) -> int:
-        """Прогон джобы `nodes`: промоция → задания → обход `default`.
+        """The `nodes` job's run: promotion → tasks → the `default` sweep.
 
-        Полный порядок прогона (FR-1.2/FR-2.3/FR-3.3, arch §3.2):
-        (1) промоция — `PromotionService.run()` (создание/слияние листов,
-        ретро-перекладка), отказ не роняет джобу;
-        (2) задания `reclass` после сшивания (lsb-0012) — приоритетный
-        источник: объединённая заметка может лежать в любом узле, обход
-        `default` её не найдёт;
-        (3) быстрый пул обхода — остатком бюджета, переезд БЕЗ вызова модели;
-        (4) классификаторный пул обхода — остатком бюджета, но не более
-        `JOB_NODES_CLASSIFIER_BUDGET` вызовов классификатора за прогон.
-        Бюджет `JOB_NODES_BATCH` (дефолт 20) — ОБЩИЙ на оба источника за
-        прогон: не более него обработок (`moved` + `kept`); повторные прогоны
-        продолжают backlog. Заметка, ждущая модель или суммари, не
-        обрабатывается и маркера не получает — она попадёт в следующий прогон.
+                    The full run order (FR-1.2/FR-2.3/FR-3.3, arch §3.2):
+                    (1) promotion — `PromotionService.run()` (leaf creation/merging, the
+                    retro-move); a failure does not crash the job;
+                    (2) `reclass` tasks after stitching (lsb-0012) — the priority source:
+                    the merged note may live in any node; the `default` sweep will not
+                    find it;
+                    (3) the fast sweep pool — with the budget remainder, a move WITHOUT a
+                    model call;
+                    (4) the classifier sweep pool — with the budget remainder, but no more
+                    than `JOB_NODES_CLASSIFIER_BUDGET` classifier calls per run.
+                    The `JOB_NODES_BATCH` budget (default 20) — SHARED over both sources
+                    per run: no more parses than that (`moved` + `kept`); repeated runs
+                    continue the backlog. A note waiting for a model or a summary is not
+                    parsed and gets no marker — it lands in the next run.
 
-        Быстрый пул (arch §3.2): default-заметки с готовой разметкой
-        (`hint_path` + `confidence` не ниже порога авто-переезда), ещё не
-        разобранные (`node_order_at IS NULL`), свежие первыми. Узел
-        зарегистрирован → переезд (`moved`/`hint_exists`, разметка не
-        меняется); узла нет в реестре → `kept`/`hint_unknown` (лист создаст
-        промоция — узел здесь не создаём).
+                    The fast pool (arch §3.2): default notes with ready markup
+                    (`hint_path` + `confidence` not below the auto-move threshold), not
+                    yet parsed (`node_order_at IS NULL`), newest first. The node is
+                    registered → a move (`moved`/`hint_exists`, the markup unchanged); the
+                    node is not in the registry → `kept`/`hint_unknown` (promotion will
+                    create the leaf — we do not create nodes here).
 
-        Каждая разобранная заметка — событие `node_order` (`job='nodes'`,
-        `source='sweep'`/`'after_merge'`, `outcome`, `reason`, `target`,
-        `note_id`). Возврат — число разобранных заметок (0 уводит каркасную
-        петлю к ожиданию интервала или сигнала `notify_nodes_pending`).
-        Разрыв слота summary (классификатор ходит в него, №39, §6.2)
-        проверяют ворота каркаса (`JobSpec.gate`, 3.4.1, LSBN-T-29) —
-        ручной `if` убран: при разрыве партия не берётся вовсе, петля уходит
-        в back-off; задание и очередь не теряются (разбудит сигнал/таймаут).
+                    Each parsed note — a `node_order` event (`job='nodes'`,
+                    `source='sweep'`/`'after_merge'`, `outcome`, `reason`, `target`,
+                    `note_id`). Returns the parsed note count (0 sends the framework loop
+                    to waiting for the interval or the `notify_nodes_pending` signal).
+                    The summary slot breaker (the classifier walks into it, #39, §6.2) is
+                    checked by the framework gate (`JobSpec.gate`, 3.4.1, LSBN-T-29) — the
+                    manual `if` is gone: on a breaker no batch is taken at all, the loop
+                    goes into back-off; the task and queue are not lost (a signal/timeout
+                    will wake them).
         """
         limit = self._settings.job_nodes_batch if budget is None else budget
-        # (1) Промоция первой: заметка не «переезжает» в узел, который
-        # появится в этом же прогоне (FR-3.1). Отказ не роняет джобу (FR-3.2).
+        # (1) Promotion first: a note does not "move" into a node that
+        # will appear in the same run (FR-3.1). A failure does not crash the job (FR-3.2).
         self._run_promotion(NODES_JOB)
-        # (2) Задания после сшивания — приоритетный источник (FR-3.3).
+        # (2) After-stitching tasks — the priority source (FR-3.3).
         done = self._process_reclass_jobs(limit)
-        # (3) Быстрый пул обхода, (4) классификаторный — остатком бюджета.
+        # (3) The fast sweep pool; (4) the classifier one — with the budget remainder.
         done += self._sweep_fast_marks(limit - done)
         done += self._sweep_classifier(limit - done)
         return done
 
     def _process_reclass_jobs(self, limit: int) -> int:
-        """Обработать партию заданий `reclass` (после сшивания); их число.
+        """Process a batch of `reclass` tasks (after stitching); their count.
 
-        Порядок — по `id` очереди (свежие события не ждут за старыми).
-        Задание, ждущее готовой суммари, остаётся pending и прогрессом не
-        считается: петля уходит в сон по back-off — а когда выжимка станет
-        готовой, петлю разбудит `notify_nodes_pending` из
-        `process_summary_pending`.
+                    The order — by the queue's `id` (fresh events do not wait behind old
+                    ones). A task waiting for a ready summary stays pending and does not
+                    count as progress: the loop goes to sleep on back-off — and when the
+                    summary becomes ready, `notify_nodes_pending` from
+                    `process_summary_pending` will wake the loop.
         """
         if limit <= 0:
             return 0
@@ -3225,26 +3304,28 @@ class BackgroundWorker:
         return done
 
     def _process_reclass_job(self, note_id: int) -> bool:
-        """Разобрать одно задание после сшивания; True — задание снято с очереди.
+        """Parse one after-stitching task; True — the task left the queue.
 
-        Читаем заметку и решаем (FR-2.2/FR-2.5 lsb-0012, arch §3.5):
+                    We read the note and decide (FR-2.2/FR-2.5 of lsb-0012, arch §3.5):
 
-        * заметки нет (удалена оператором) — задание снимаем: решать нечего;
-        * суммари ещё не готова (`summary_status != 'ok'` или пустая) —
-          задание ОСТАЁТСЯ pending и прогрессом не считается (ждёт по
-          back-off: выжимку доведёт summary-петля и разбудит эту сигналом
-          `notify_nodes_pending`), по fallback-усечению решение не
-          принимается, маркер разбора не ставится — событие
-          `node_order`/`summary_pending`;
-        * по готовой суммари — вызов классификатора на `title` + `summary`
-          (двухступенчатость с полным `text` не вводим — arch §3.4) и общая
-          точка переезда `_apply_node_order` с guard-ом по УЗЛУ, ПРОЧИТАННОМУ
-          при решении: операторский/клиентский переезд в полёте фоном не
-          перебивается (`node_changed`). Результат `default` заметку не
-          понижает (`result_default`), тот же узел — `same_node`.
+                    * no note (the operator deleted it) — release the task: nothing to
+                      decide;
+                    * the summary is not ready yet (`summary_status != 'ok'` or empty) —
+                      the task STAYS pending and does not count as progress (it waits on
+                      back-off: the summary loop will finish the summary and wake this
+                      loop with `notify_nodes_pending`); no decision over the fallback
+                      truncation, no parse marker — a `node_order`/`summary_pending`
+                      event;
+                    * over the ready summary — a classifier call on `title` + `summary`
+                      (no two-stage with the full `text` — arch §3.4) and the shared move
+                      point `_apply_node_order` with the guard over the node READ at
+                      decision time: an operator/client move in flight is not overridden
+                      by the background (`node_changed`). A `default` result does not
+                      downgrade the note (`result_default`); the same node —
+                      `same_node`.
 
-        Без классификатора (тестовый режим) решение не принимается: задание
-        остаётся pending, данные не портятся.
+                    Without a classifier (a test mode) no decision is made: the task stays
+                    pending, the data is not spoiled.
         """
         with session(self._settings) as conn:
             row = conn.execute(
@@ -3253,23 +3334,23 @@ class BackgroundWorker:
                 (note_id,),
             ).fetchone()
         if row is None:
-            return True  # заметки нет — задание снимаем
+            return True  # no note — release the task
         summary = row["summary"] or ""
         if row["summary_status"] != "ok" or not summary.strip():
             self._log_node_order(
                 note_id, "kept", "summary_pending", None, source="after_merge"
             )
-            return False  # ждём суммари: задание остаётся pending
+            return False  # waiting for the summary: the task stays pending
         if self._classifier is None:
-            return False  # тестовый режим без классификатора
+            return False  # a test mode without a classifier
         known = self._namespaces.list_all()["namespaces"]
         text = f"{row['title']}\n{summary}" if row["title"] else summary
         try:
             result = self._classifier.classify(text, known)
         except ClassificationError as exc:
-            # Отказ классификатора данные не портит (FR-3.1): заметка остаётся
-            # в текущем узле, разметка не пишется, задание — pending. №39:
-            # событие несёт тип исхода отказа слота summary.
+            # A classifier failure does not spoil the data (FR-3.1): the note stays
+            # in its current node, no markup is written, the task — pending. #39:
+            # the event carries the outcome type of the summary slot's failure.
             self._log_slot_failure(
                 NODES_JOB,
                 SLOT_SUMMARY,
@@ -3296,13 +3377,13 @@ class BackgroundWorker:
         return True
 
     def _sweep_fast_marks(self, budget: int) -> int:
-        """Быстрый пул обхода `default`: переезд по готовой разметке, без модели.
+        """The fast `default` sweep pool: a move by the ready markup, no model.
 
-        Заметки с `hint_path` + `confidence` не ниже порога авто-переезда,
-        ещё не разобранные (`node_order_at IS NULL`), свежие первыми. Маркер
-        `node_order_at` ставится при любом исходе (анти-зацикливание, §3.6):
-        оставленная заметка не выедает бюджет повторно до изменения
-        текста/названия (сброс маркера — NoteService.update/merge_pair).
+                    Notes with `hint_path` + `confidence` not below the auto-move
+                    threshold, not yet parsed (`node_order_at IS NULL`), newest first. The
+                    `node_order_at` marker is set on any outcome (anti-looping, §3.6): a
+                    kept note does not eat the budget again until its text/title changes
+                    (the marker reset — NoteService.update/merge_pair).
         """
         if budget <= 0:
             return 0
@@ -3321,14 +3402,14 @@ class BackgroundWorker:
         return done
 
     def _sweep_classifier(self, budget: int) -> int:
-        """Классификаторный пул обхода `default`: разметка через модель.
+        """The classifier sweep pool of `default`: markup through the model.
 
-        Заметки без разметки (`classified_at IS NULL`) с ГОТОВОЙ непустой
-        суммари, свежие первыми; вход классификатору — `title` + `summary`
-        (arch §3.4, полный `text` не отдаём). Число вызовов классификатора за
-        прогон ограничено бюджетом `JOB_NODES_CLASSIFIER_BUDGET` и остатком
-        общего бюджета. Отказ классификатора заметку не помечает — она
-        останется кандидатом следующего прогона (FR-3.2).
+                    Notes without markup (`classified_at IS NULL`) with a READY non-empty
+                    summary, newest first; the classifier's input — `title` + `summary`
+                    (arch §3.4; the full `text` is not given). The classifier call count
+                    per run is limited by the `JOB_NODES_CLASSIFIER_BUDGET` budget and the
+                    shared budget's remainder. A classifier failure does not mark the note
+                    — it stays a candidate of the next run (FR-3.2).
         """
         limit = min(budget, self._settings.job_nodes_classifier_budget)
         if limit <= 0 or self._classifier is None:
@@ -3354,7 +3435,7 @@ class BackgroundWorker:
                     detail=str(exc),
                     meta=getattr(exc, "meta", None),
                 )
-                continue  # маркер не ставим: заметка снова кандидат обхода
+                continue  # no marker: the note is a sweep candidate again
             self._log_slot_call(
                 NODES_JOB, SLOT_SUMMARY, result.meta, note_id=note_id
             )
@@ -3376,13 +3457,14 @@ class BackgroundWorker:
         target: str | None,
         source: str = "sweep",
     ) -> None:
-        """Событие `node_order` джобы `nodes` (FR-4.2): исход разбора заметки.
+        """The `nodes` job's `node_order` event (FR-4.2): a note parse outcome.
 
-        `reason` — из словаря arch §3.7 (`hint_exists`, `hint_unknown`,
-        `low_confidence`, `no_hint_classified`, `summary_pending`, `same_node`,
-        `result_default`, `node_changed`), `source` — источник решения
-        (`sweep` — обход `default`, `after_merge` — задание после сшивания).
-        Имена событий и полей существующие — наблюдаемость джобы не меняется.
+                    `reason` — from the arch §3.7 dictionary (`hint_exists`,
+                    `hint_unknown`, `low_confidence`, `no_hint_classified`,
+                    `summary_pending`, `same_node`, `result_default`, `node_changed`);
+                    `source` — the decision source (`sweep` — the `default` sweep,
+                    `after_merge` — the after-stitching task). The event and field names
+                    are the existing ones — the job's observability does not change.
         """
         logging.getLogger("app").info(
             "nodes: decided note order",
@@ -3398,24 +3480,24 @@ class BackgroundWorker:
         )
 
     def _nodes_queue_stat(self) -> dict:
-        """Снимок очереди `nodes` для `/health.queues` (FR-2.2).
+        """The `nodes` queue snapshot for `/health.queues` (FR-2.2).
 
-        Считает РОВНО работу, которую прогон `process_nodes` может взять в этом
-        прогоне: (1) решаемые задания `reclass` после сшивания — заметка с
-        готовой суммари либо её нет в живых (такое задание снимается сразу);
-        ждущее суммари задание НЕ считается — джоба его не берёт, а сама
-        заметка видна в очереди `summary`; (2) кандидаты быстрого пула обхода
-        `default`; (3) кандидаты классификаторного пула. Иначе счётчик
-        показывал бы работу, которой у джобы нет (FAIL приёмки 3.1.0, решение
-        гейта 2026-09-19).
+                    It counts EXACTLY the work the `process_nodes` run can take in this
+                    run: (1) solvable `reclass` tasks after stitching — a note with a ready
+                    summary, or the note is gone from the living (such a task is released
+                    at once); a task waiting for the summary is NOT counted — the job does
+                    not take it, and the note itself is visible in the `summary` queue;
+                    (2) candidates of the fast `default` sweep pool; (3) candidates of the
+                    classifier pool. Otherwise the counter would show work the job does not
+                    have (a 3.1.0 acceptance FAIL, the 2026-09-19 gate decision).
 
-        `oldest_pending_sec` — возраст старейшего ИЗ ПОСЧИТАННЫХ источников
-        (задания — `created_at`, кандидаты — `updated_at`), `null` — очередь
-        пуста. Только SQL, без обращений к моделям; снимок работает и у
-        выключенной джобы (`SQL` собирается в `_nodes_queue_stat_sql`).
-        Перенос pending → waiting при разрыве слота summary (классификатор
-        ходит в него, №39, arch §6.9) делает каркас (`is_gated` →
-        `gated_queue_stat`, 3.4.1, LSBN-T-29).
+                    `oldest_pending_sec` — the age of the oldest AMONG THE COUNTED sources
+                    (tasks — `created_at`, candidates — `updated_at`); `null` — the queue
+                    is empty. SQL only, no model calls; the snapshot works for a disabled
+                    job too (`SQL` is assembled in `_nodes_queue_stat_sql`).
+                    The pending → waiting move on a summary slot breaker (the classifier
+                    walks into it, #39, arch §6.9) is done by the framework (`is_gated` →
+                    `gated_queue_stat`, 3.4.1, LSBN-T-29).
         """
         self._ensure_job_table()
         with session(self._settings) as conn:
@@ -3429,51 +3511,54 @@ class BackgroundWorker:
         return queue_snapshot(row["pending"], row["oldest_pending_sec"])
 
     def _nodes_queue_empty(self) -> bool:
-        """Пуста ли очередь `nodes` (дешёвая перепроверка, пул 6, lost wakeup).
+        """Is the `nodes` queue empty (a cheap recheck, pool 6, lost wakeup).
 
-        Петля перед `clear()+wait` перепроверяет саму очередь, а не только
-        событие: сигнал `notify_nodes_pending` (задание после сшивания),
-        пришедший между пустым прогоном и `clear()`, иначе был бы стёрт —
-        берущееся задание ждало бы интервал/back-off (до 15 мин). Источник —
-        ровно тот же, что у `queue_stat` (arch §3.7): берущиеся задания
-        `reclass` + кандидаты обоих пулов обхода `default`. Заметка/задание,
-        ждущее суммари, очередь непустой НЕ делает: джоба его не возьмёт, а
-        сама заметка видна в очереди `summary` — иначе петля крутилась бы
-        вхолостую (busy-loop) вместо back-off. Слот — через единую точку
-        условия гейта (`_slot_blocked`, 3.4.1, LSBN-T-29; прежде гейт был
-        размазан по снимку): заблокированный слот для петли — пустая очередь
-        (no39-05). Только SQL, без обращений к моделям (FR-2.2).
+                    Before `clear()+wait` the loop rechecks the queue itself, not only the
+                    event: a `notify_nodes_pending` signal (an after-stitching task) that
+                    arrived between an empty run and `clear()` would otherwise be erased —
+                    a takeable task would wait out the interval/back-off (up to 15 min).
+                    The source — exactly the same as `queue_stat` (arch §3.7): takeable
+                    `reclass` tasks + candidates of both `default` sweep pools. A
+                    note/task waiting for a summary does NOT make the queue non-empty: the
+                    job will not take it, and the note itself is visible in the `summary`
+                    queue — otherwise the loop would spin idly (busy-loop) instead of
+                    back-off. The slot — via the single point of the gate condition
+                    (`_slot_blocked`, 3.4.1, LSBN-T-29; the gate used to be smeared over
+                    the snapshot): a blocked slot is an empty queue for the loop
+                    (no39-05). SQL only, no model calls (FR-2.2).
         """
         return (
             self._slot_blocked(SLOT_SUMMARY)
             or int(self._nodes_queue_stat()["pending"] or 0) == 0
         )
 
-    # --- чанковая очередь (Фаза 7) ---------------------------------------------
+    # --- the chunk queue (Phase 7) ---------------------------------------------
 
     async def process_pending_chunks(self, limit: int | None = None) -> int:
-        """Векторизовать одну вычитывающую партию pending-чанков (Фаза 7).
+        """Vectorize one read batch of pending chunks (Phase 7).
 
-        Вычитывающая партия — EMBEDDING_BATCH_SIZE ×
-        EMBEDDING_CONCURRENT_REQUESTS чанков (анти-джойн, старые первыми);
-        она режется на подъёмки по EMBEDDING_BATCH_SIZE, а кодирование
-        подъёмок идёт параллельно — не больше EMBEDDING_CONCURRENT_REQUESTS
-        одновременно (Semaphore + asyncio.to_thread: кодирование —
-        блокирующий HTTP, event loop не занимаем).
+                    A read batch — EMBEDDING_BATCH_SIZE × EMBEDDING_CONCURRENT_REQUESTS
+                    chunks (an anti-join, oldest first); it is cut into sub-batches of
+                    EMBEDDING_BATCH_SIZE, and the sub-batches are encoded in parallel —
+                    no more than EMBEDDING_CONCURRENT_REQUESTS at a time (Semaphore +
+                    asyncio.to_thread: encoding is blocking HTTP; the event loop is not
+                    occupied).
 
-        Отказ подъёмки (EmbeddingError) не портит остальных (NFR-3): вектора
-        успешных подъёмок записываются короткими транзакциями, отказавшие
-        чанки остаются pending — догонятся следующим прогоном.
-        Полный отказ — 0, воркер ждёт back-off; `embedding_ok` ведёт сам
-        EmbeddingService (единая точка кодирования — как и в других петлях).
+                    A sub-batch failure (EmbeddingError) does not spoil the others
+                    (NFR-3): successful sub-batches' vectors are written in short
+                    transactions; failed chunks stay pending — caught up by the next run.
+                    A full failure — 0, the worker waits back-off; `embedding_ok` is kept
+                    by EmbeddingService itself (the single encoding point — as in the
+                    other loops).
 
-        Reuse (brief §6): у заметки с ровно одним чанком ≤ CHUNK_SIZE вектор
-        чанка = вектор полного текста из notes_vec, без вызова кодировщика.
-        Гонка с memory_update (ARCH §4.5) — как у суммари: запись только при
-        неизменных (id, text, tokens) чанка; заменённые в полёте пропускаются.
+                    Reuse (brief §6): for a note with exactly one chunk ≤ CHUNK_SIZE the
+                    chunk's vector = the full text's vector from notes_vec, without
+                    calling the encoder. The memory_update race (ARCH §4.5) — like the
+                    summary's: a write only when the chunk's (id, text, tokens) are
+                    unchanged; chunks replaced in flight are skipped.
 
-        Возвращает число фактически записанных векторов (reuse + успешные
-        подъёмки; гонно заменённые чанки не считаются).
+                    Returns the number of actually written vectors (reuse + successful
+                    sub-batches; chunks replaced in flight are not counted).
         """
         batch = self._settings.embedding_batch_size
         drain = (
@@ -3492,20 +3577,21 @@ class BackgroundWorker:
         return len(reused) + written
 
     def _read_chunk_batch(self, limit: int) -> list:
-        """Вычитка партии pending-чанков (старые первыми), короткое чтение."""
+        """Read a batch of pending chunks (oldest first), a short read."""
         with session(self._settings) as conn:
             return chunks.pending_chunk_rows(conn, limit)
 
     def _reuse_single_chunk_vectors(self, rows: list) -> set[int]:
-        """Копировать полный вектор заметки в её единственный чанк ≤ CHUNK_SIZE.
+        """Copy the note's full vector into its single chunk ≤ CHUNK_SIZE.
 
-        Шаг 3 применяет reuse только при готовом notes_vec в момент save;
-        если полный вектор достроен позже (отказ при save — потом воркер
-        notes-очереди), чанк остаётся pending. Повторно кодировать тот же
-        текст незачем: у одного чанка текст = полный текст заметки, вектор
-        идентичен — копируем без вызова Ollama. Копия остаётся консистентной
-        с notes_vec, который теперь включает название (title+text — lsb-0001
-        FR-1.1); чанковая кодировка чистым текстом (решение D1) это не меняет.
+                    Step 3 applies the reuse only with notes_vec ready at save time; if
+                    the full vector was completed later (a failure at save — then the
+                    notes-queue worker), the chunk stays pending. Re-encoding the same
+                    text is pointless: with one chunk the text = the note's full text, the
+                    vector is identical — copy without calling Ollama. The copy stays
+                    consistent with notes_vec, which now includes the title (title+text —
+                    lsb-0001 FR-1.1); chunk encoding over the bare text (decision D1)
+                    does not change that.
         """
         by_note: dict[int, list] = {}
         for row in rows:
@@ -3514,7 +3600,7 @@ class BackgroundWorker:
         with session(self._settings) as conn:
             for note_id, note_rows in by_note.items():
                 if len(note_rows) != 1:
-                    continue  # у заметки в партии несколько pending-чанков
+                    continue  # the batch note has several pending chunks
                 count = int(
                     conn.execute(
                         "SELECT COUNT(*) FROM notes_chunks WHERE note_id = ?",
@@ -3525,7 +3611,7 @@ class BackgroundWorker:
                     continue
                 full = vectors.get_vector(conn, note_id)
                 if full is None:
-                    continue  # полного вектора нет — чанк кодируется наравне
+                    continue  # no full vector — the chunk is encoded on par
                 with transaction(conn):
                     if chunks.upsert_vector_if_exists(
                         conn,
@@ -3539,11 +3625,12 @@ class BackgroundWorker:
         return reused
 
     async def _encode_batches(self, batches: list[list]) -> list:
-        """Параллельное кодирование подъёмок; каждый вызов — embed_texts batch.
+        """Encode sub-batches in parallel; each call — an embed_texts batch.
 
-        Не более EMBEDDING_CONCURRENT_REQUESTS подъёмок одновременно.
-        Возврат выровнен по подъёмкам: список векторов или исключение
-        (EmbeddingError — штатный отказ; остальные — непредвиденный сбой).
+                    No more than EMBEDDING_CONCURRENT_REQUESTS sub-batches at a time.
+                    The return is aligned by sub-batches: a list of vectors or an
+                    exception (EmbeddingError — a regular failure; others — an unexpected
+                    crash).
         """
         semaphore = asyncio.Semaphore(self._settings.embedding_concurrent_requests)
 
@@ -3556,13 +3643,13 @@ class BackgroundWorker:
         return list(await asyncio.gather(*map(encode, batches), return_exceptions=True))
 
     def _store_chunk_vectors(self, batches: list[list], results: list) -> int:
-        """Записать вектора успешных подъёмок (партия — короткая транзакция)."""
+        """Write the successful sub-batches' vectors (a batch — a short transaction)."""
         written = 0
         for batch, result in zip(batches, results):
             if isinstance(result, EmbeddingError):
-                continue  # отказ кодирования: чанки остаются pending (NFR-3)
+                continue  # an encoding failure: the chunks stay pending (NFR-3)
             if isinstance(result, BaseException):
-                raise result  # непредвиденный сбой — громко, как в других петлях
+                raise result  # an unexpected failure — loud, as in the other loops
             with session(self._settings) as conn, transaction(conn):
                 for row, vector in zip(batch, result):
                     if chunks.upsert_vector_if_exists(
@@ -3577,58 +3664,61 @@ class BackgroundWorker:
         return written
 
 
-# --- сборщики джоб воркера (каркас lsb-0014-02) -------------------------------
+# --- the worker's job builders (the lsb-0014-02 framework) -----------------
 #
-# Регистрация вместо копии цикла (FR-1.1): каждая джоба описывается `JobSpec`
-# и добавляется в реестр каркаса; цикл, back-off и супервизор итерации — общие
-# (`app/services/jobs.py`). Формы: «по интервалу» (`expiration`) и «по
-# требованию» с событием и перепроверкой очереди (summary, judge, areas,
-# links, `nodes` — задание после сшивания; перепроверка `nodes` с 2026-09-20
-# и `embedding` с LSBN-T-30 — сигнал свежей заметки не теряется); формы
-# «интервал + событие» без перепроверки в реестре не осталось. Интервалы
-# существующих петель —
-# как были (FR-1.5):
-# PENDING_RETRY_SEC у очередей и фиксированные 300 с у зачистки (новых env эта
-# постановка не заводит). `queue_stat` — снимок своей очереди для
-# `/health.queues` (lsb-0014-03, FR-2.2): у `expiration` очереди нет (`None`).
-# Ворота слота (3.4.1, LSBN-T-29): `gate` (для `run_loop`, с пробным стуком)
-# и `is_gated` (для снимков, без моделей) передают `worker._slot_gate`/
-# `worker._slot_blocked` — проверка разрыва живёт в каркасе, ручных `if` в
-# телах джоб больше нет.
+# Registration instead of a loop copy (FR-1.1): each job is described by a `JobSpec`
+# and added to the framework registry; the loop, back-off and iteration supervisor are shared
+# (`app/services/jobs.py`). The shapes: "by interval" (`expiration`) and "on
+# demand" with an event and a queue recheck (summary, judge, areas,
+# links, `nodes` — the after-stitching task; the `nodes` recheck since 2026-09-20
+# and `embedding` since LSBN-T-30 — a fresh note's signal is not lost); the
+# "interval + event" shape without a recheck is gone from the registry. The intervals
+# of the existing loops —
+# as before (FR-1.5):
+# PENDING_RETRY_SEC for the queues and a fixed 300 s for cleanup (this brief introduces no
+# new env). `queue_stat` — the snapshot of one's own queue for
+# `/health.queues` (lsb-0014-03, FR-2.2): `expiration` has no queue (`None`).
+# The slot gate (3.4.1, LSBN-T-29): `gate` (for `run_loop`, with a probe knock)
+# and `is_gated` (for snapshots, no models) pass `worker._slot_gate`/
+# `worker._slot_blocked` — the breaker check lives in the framework; no manual `if`s in
+# job bodies anymore.
 
 
 def build_embedding_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
-    """Джоба `embedding`: notes-очередь + чанковая очередь (одна джоба).
+    """The `embedding` job: the notes queue + the chunk queue (one job).
 
-    Форма «по интервалу + событие `embedding` + перепроверка очереди» (gate
-    2026-09-19; перепроверка — LSBN-T-30): интервал `PENDING_RETRY_SEC`
-    с back-off остаётся страховкой, а сигнал `notify_embedding_pending`
-    (заметка записана/обновлена/слита — вернулась в `vector_status='pending'`)
-    будит петлю сразу: свежая заметка кодируется немедленно, а не после
-    выросшего back-off (до 15 мин). Пустой прогон — гигиена `worker_jobs`
-    (`idle_hook`, пул 5) и пауза PENDING_RETRY_SEC с back-off.
+                The shape "by interval + the `embedding` event + a queue recheck"
+                (gate 2026-09-19; the recheck — LSBN-T-30): the `PENDING_RETRY_SEC`
+                interval with back-off stays the safety net, and the
+                `notify_embedding_pending` signal (a note written/updated/merged — it
+                returned to `vector_status='pending'`) wakes the loop at once: a fresh
+                note is encoded immediately, not after the grown back-off (up to
+                15 min). An empty run — `worker_jobs` hygiene (the `idle_hook`,
+                pool 5) and a PENDING_RETRY_SEC pause with back-off.
 
-    Перепроверка очереди (`queue_empty` → `_embedding_queue_empty`) закрывает
-    гонку lost wakeup (пул 6): сигнал, сработавший МЕЖДУ пустым `process()`
-    и `clear()` события, стирался бы — петля спала бы текущий интервал, а на
-    простаивающей системе back-off дорастает до 15 мин, и свежая заметка
-    ждала бы вектор до 15 минут при живых моделях (прямой приоритет
-    «свежая заметка кодируется немедленно»; прецедент gate 2026-09-19).
-    Почему перепроверка теперь безопасна (это и есть дизайн): у каркаса
-    работа, которую петля взять не может, НЕ считается прогрессом
-    (arch §3.2, no39-05, живой случай 12.10.2026 ≈11 вызовов/с закрыт) —
-    после перепроверки один прогон при лежащем слоте вернёт 0, и петля уйдёт
-    в `queue_waiting` + сон по back-off; холостого шторма нет. После
-    LSBN-T-28 партия при wait-класс отказах снимается сразу — прогон не
-    висит. «Берущаяся работа» — только SQL/память (pending-заметки
-    векторизации + pending-чанки, без моделей); при разрыве embedding-слота
-    (`_slot_blocked`) перепроверка считает очередь пустой — петля спит,
-    модели не зовутся (no39-05). Задание и прежде не терялось: оно живёт
-    в статусе заметки, а события `queue_waiting` — уход в ожидание с непустой
-    очередью — видны в журнале (FR-2.3).
+                The queue recheck (`queue_empty` → `_embedding_queue_empty`) closes
+                the lost-wakeup race (pool 6): a signal fired BETWEEN an empty
+                `process()` and the event's `clear()` would be erased — the loop would
+                sleep the current interval, and on an idle system the back-off grows
+                to 15 min, so a fresh note would wait up to 15 minutes for its vector
+                with live models (the direct priority "a fresh note is encoded
+                immediately"; the gate 2026-09-19 precedent). Why the recheck is safe
+                now (that is the design): in the framework, work the loop cannot take
+                is NOT progress (arch §3.2, no39-05; the live case of 2026-10-12,
+                ≈11 calls/s, is closed) — after the recheck one run on a down slot
+                returns 0, and the loop goes into `queue_waiting` + a back-off sleep;
+                no idle storm. Since LSBN-T-28 a batch is released at once on
+                wait-class failures — the run does not hang. "Takeable work" — SQL/
+                memory only (pending vectorization notes + pending chunks, no models);
+                on an embedding-slot breaker (`_slot_blocked`) the recheck counts the
+                queue empty — the loop sleeps, no models called (no39-05). The task
+                was never lost even before: it lives in the note's status, and
+                `queue_waiting` events — going into a wait with a non-empty queue —
+                are visible in the journal (FR-2.3).
 
-    Ворота слота (3.4.1, LSBN-T-29): `gate` — `_slot_gate` (с пробным стуком
-    по истечении паузы), `is_gated` — `_slot_blocked` (снимки без моделей).
+                The slot gate (3.4.1, LSBN-T-29): `gate` — `_slot_gate` (with a probe
+                knock after the pause expires), `is_gated` — `_slot_blocked`
+                (snapshots without models).
     """
     return JobSpec(
         name=EMBEDDING_JOB,
@@ -3650,12 +3740,13 @@ def build_embedding_job(worker: BackgroundWorker, settings: Settings) -> JobSpec
 def build_summary_job(
     worker: BackgroundWorker, settings: Settings
 ) -> JobSpec | None:
-    """Джоба `summary`: title-доген → summarize → merge, сигнал `summary`.
+    """The `summary` job: title-gen → summarize → merge, the `summary` signal.
 
-    Ворота слота (3.4.1, LSBN-T-29): `gate` — `_slot_gate` (с пробным
-    стуком), `is_gated` — `_slot_blocked` (снимки без моделей).
-    Без суммаризатора (тестовый режим Фазы 3) джоба неприменима — сборщик
-    возвращает None, в реестр она не попадает (петли не было и раньше).
+                The slot gate (3.4.1, LSBN-T-29): `gate` — `_slot_gate` (with a probe
+                knock), `is_gated` — `_slot_blocked` (snapshots without models).
+                Without a summarizer (the Phase-3 test mode) the job is not
+                applicable — the builder returns None and it does not enter the
+                registry (the loop did not exist before either).
     """
     if worker._summarizer is None:
         return None
@@ -3677,10 +3768,10 @@ def build_summary_job(
 
 
 def build_judge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
-    """Джоба `judge`: партия judge-работ (дедуп), сигнал `judge`.
+    """The `judge` job: a batch of judge jobs (dedup), the `judge` signal.
 
-    Ворота слота (3.4.1, LSBN-T-29): `gate` — `_slot_gate` (с пробным
-    стуком), `is_gated` — `_slot_blocked` (снимки без моделей).
+                The slot gate (3.4.1, LSBN-T-29): `gate` — `_slot_gate` (with a probe
+                knock), `is_gated` — `_slot_blocked` (snapshots without models).
     """
     return JobSpec(
         name=JUDGE_JOB,
@@ -3700,14 +3791,14 @@ def build_judge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
 
 
 def build_areas_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
-    """Джоба `areas`: вектора записей областей (субстрат 3.0.0), сигнал `areas`.
+    """The `areas` job: area records' vectors (substrate 3.0.0), the `areas` signal.
 
-    Слот — `embedding` (№39, arch §6.9; LSBN-T-29): области кодируются тем же
-    слотом, что заметки (прецедент `_areas_queue_empty`), — теперь это
-    объявлено и в `JobSpec.slot`, и в воротах: `gate` — `_slot_gate`
-    embedding-слота (с пробным стуком), `is_gated` — `_slot_blocked`
-    (снимки без моделей). Прежде слот не заявлялся (None) — джоба при разрыве
-    продолжала дёргать мёртвый слот.
+                The slot — `embedding` (#39, arch §6.9; LSBN-T-29): areas are encoded
+                by the same slot as notes (the `_areas_queue_empty` precedent) — now
+                this is declared both in `JobSpec.slot` and in the gate: `gate` — the
+                embedding slot's `_slot_gate` (with a probe knock), `is_gated` —
+                `_slot_blocked` (snapshots without models). Before, no slot was
+                declared (None) — on a breaker the job kept poking the dead slot.
     """
     return JobSpec(
         name=AREAS_JOB,
@@ -3727,12 +3818,12 @@ def build_areas_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
 
 
 def build_expiration_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
-    """Джоба `expiration`: зачистка просроченных заметок (lsb-0004-02, этап 4).
+    """The `expiration` job: expired-notes cleanup (lsb-0004-02, stage 4).
 
-    Очереди нет (зачистка — не pending-состояние) и сигнала нет: джоба
-    описана формой «по интервалу», а её состояние back-off помечено
-    `fixed=True` (создаётся в `__init__`) — пауза всегда 300 с, без back-off
-    (решение О. 2026-09-09; поведение сохранено дословно, FR-1.5).
+                No queue (cleanup is not a pending state) and no signal: the job is
+                described by the "by interval" shape, and its back-off state is marked
+                `fixed=True` (created in `__init__`) — the pause is always 300 s,
+                without back-off (the behavior preserved verbatim, FR-1.5).
     """
     return JobSpec(
         name=EXPIRATION_JOB,
@@ -3750,34 +3841,38 @@ def build_expiration_job(worker: BackgroundWorker, settings: Settings) -> JobSpe
 
 
 def build_nodes_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
-    """Джоба `nodes`: обход `default` и реклассификация после сшивания (lsb-0011).
+    """The `nodes` job: the `default` sweep and reclassification after stitching (lsb-0011).
 
-    Форма «по интервалу + событие `nodes` + перепроверка очереди» (arch §3.1):
-    пустой прогон — сон на `JOB_NODES_INTERVAL_SEC`, сигнал `notify_nodes_pending`
-    (задание после сшивания и готовая выжимка объединённой заметки, lsb-0012)
-    будит петлю сразу, а `queue_empty`
-    закрывает гонку lost wakeup (пул 6): перед `clear()+wait` очередь
-    перепроверяется (см. `_nodes_queue_empty`). Прогон — промоция, задания
-    `reclass`, затем обход `default` (быстрый пул без модели + классификаторный
-    в бюджете `JOB_NODES_CLASSIFIER_BUDGET`). `JOB_NODES_ENABLED=false`
-    джобу не запускает, но очередь остаётся видна в `/health` (реестр её
-    сохраняет). Синхронный SQL/механика уходят в поток — event loop не занимаем.
+                The shape "by interval + the `nodes` event + a queue recheck"
+                (arch §3.1): an empty run — a sleep on `JOB_NODES_INTERVAL_SEC`; the
+                `notify_nodes_pending` signal (an after-stitching task and the merged
+                note's ready summary, lsb-0012) wakes the loop at once, and
+                `queue_empty` closes the lost-wakeup race (pool 6): before
+                `clear()+wait` the queue is rechecked (see `_nodes_queue_empty`). The
+                run — promotion, `reclass` tasks, then the `default` sweep (the fast
+                pool without a model + the classifier pool within
+                `JOB_NODES_CLASSIFIER_BUDGET`). `JOB_NODES_ENABLED=false` does not
+                start the job, but the queue stays visible in `/health` (the registry
+                keeps it). Synchronous SQL/mechanics go into a thread — the event loop
+                is not occupied.
 
-    Перепроверка (`queue_empty`) считает работой ровно то, что джоба может взять
-    сейчас (берущееся задание `reclass` либо кандидат пула) и заставляет петлю
-    продолжить прогон без сна; заметка/задание, ждущее модель или суммари, — не
-    работа, и петля уходит в сон по back-off (busy-loop'а нет, arch §3.2,
-    «отложенное задание — не прогресс»); заблокированный слот summary
-    (`_slot_blocked`) тоже делает очередь пустой для петли (no39-05).
+                The recheck (`queue_empty`) counts as work exactly what the job can
+                take now (a takeable `reclass` task or a pool candidate) and makes the
+                loop continue the run without sleep; a note/task waiting for a model
+                or a summary is not work, and the loop goes to sleep on back-off (no
+                busy-loop, arch §3.2, "a deferred task is not progress"); a blocked
+                summary slot (`_slot_blocked`) also makes the queue empty for the loop
+                (no39-05).
 
-    Ворота слота (3.4.1, LSBN-T-29): `gate` — `_slot_gate` summary-слота
-    (с пробным стуком), `is_gated` — `_slot_blocked` (снимки без моделей).
+                The slot gate (3.4.1, LSBN-T-29): `gate` — the summary slot's
+                `_slot_gate` (with a probe knock), `is_gated` — `_slot_blocked`
+                (snapshots without models).
     """
     batch = settings.job_nodes_batch
 
     async def process() -> int:
-        # №41 (§13.4): тело джобы несёт источник `job:nodes` — переезд
-        # `namespace` записывает версию с этой пометкой (FR-4.4).
+        # #41 (§13.4): the job body carries the `job:nodes` source — a `namespace` move
+        # writes a version with that mark (FR-4.4).
         with history.bind_origin(f"job:{NODES_JOB}"):
             return await asyncio.to_thread(worker.process_nodes, batch)
 
@@ -3798,10 +3893,10 @@ def build_nodes_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
     )
 
 
-# Регистрация петель воркера в реестре каркаса (FR-1.1): каркас собирает джобы
-# из `JOB_BUILDERS`; свой модуль дописывает свои сборщики после их определения
-# (импорт односторонний — worker → jobs, круга нет). Порядок — как у петель
-# раньше: embedding, summary, judge, areas, expiration, nodes.
+# Registering the worker's loops in the framework registry (FR-1.1): the framework assembles jobs
+# from `JOB_BUILDERS`; one's own module appends its builders after their definitions
+# (the import is one-way — worker → jobs, no cycle). The order — as the loops had:
+# embedding, summary, judge, areas, expiration, nodes.
 jobs.JOB_BUILDERS += (
     build_embedding_job,
     build_summary_job,

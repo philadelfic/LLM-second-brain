@@ -1,8 +1,9 @@
-"""Скрипт переиндексации (Фаза 3): сброс vec0, новая размерность, очередь.
+"""The reindexing script (Phase 3): a vec0 reset, a new dimension, the queue.
 
-Юнит-тесты без сети: живая векторизация в тестовой среде недоступна — скрипт
-останавливается на шаге «все в pending» (NFR-3-безопасный путь); догон живой
-векторизации — в integration (test_integration_live.py, если Ollama доступна).
+    Unit tests without the network: live vectorization is unavailable in the test
+    environment — the script stops at the "everything to pending" step (the
+    NFR-3-safe path); catching up with live vectorization — in integration
+    (test_integration_live.py, when Ollama is available).
 """
 
 from __future__ import annotations
@@ -19,8 +20,10 @@ from scripts.reindex import main
 
 @pytest.fixture
 def dim4(tmp_path, monkeypatch: pytest.MonkeyPatch):
-    """БД под старой размерностью 4, с двумя векторизованными заметками
-    (вектора догнала очередь воркера — Фаза 8 save пишет только pending)."""
+    """A DB under the old dimension 4, with two vectorized notes
+            (the worker queue caught the vectors up — the Phase-8 save writes only
+            pending).
+    """
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     monkeypatch.setenv("EMBEDDING_DIM", "4")
     get_settings.cache_clear()
@@ -29,67 +32,68 @@ def dim4(tmp_path, monkeypatch: pytest.MonkeyPatch):
     notes = NoteService(settings, HashEmbedder(4))
     notes.save("заметка при старой размерности")
     notes.save("вторая заметка при старой размерности")
-    # Фаза 8: вектора строит воркер — доводим очередь до «2 векторизованных»
+    # Phase 8: the worker builds the vectors — we bring the queue to "2 vectorized"
     assert vectorize_notes(settings, HashEmbedder(4)) == 2
     return settings
 
 
 def test_reindex_rebuilds_table_at_new_dim(dim4, monkeypatch) -> None:
-    """БД 4-мерных векторов + EMBEDDING_DIM=8: reindex чинит гейт старта.
+    """A DB of 4-dimensional vectors + EMBEDDING_DIM=8: reindex fixes the startup gate.
 
-    После скрипта: notes_vec float[8], все заметки pending (вектора сброшены),
-    init_db с новым dim проходит без отказа, заметки сохранены.
+                After the script: notes_vec float[8], all notes pending (the vectors
+                reset), init_db with the new dim passes without a failure, the notes
+                preserved.
     """
-    assert NoteService(dim4).get([1, 2])["notes"]  # данные до переиндексации
+    assert NoteService(dim4).get([1, 2])["notes"]  # the data before reindexing
 
     monkeypatch.setenv("EMBEDDING_DIM", "8")
     get_settings.cache_clear()
-    settings = get_settings()  # теперь 8
+    settings = get_settings()  # now 8
     assert main(["--yes"]) == 0
 
     with session(settings) as conn:
         ddl = conn.execute(
             "SELECT sql FROM sqlite_master WHERE name = 'notes_vec'"
         ).fetchone()[0]
-        assert "float[8]" in ddl  # таблица пересоздана под новую размерность
+        assert "float[8]" in ddl  # the table recreated under the new dimension
         statuses = conn.execute("SELECT vector_status FROM notes").fetchall()
         assert all(row[0] == "pending" for row in statuses)
-        assert vectors.count(conn) == 0  # старые вектора удалены
-    init_db(settings)  # гейт старта теперь проходит
-    assert NoteService(settings).get([1, 2])["notes"]  # данные не потеряны
+        assert vectors.count(conn) == 0  # the old vectors deleted
+    init_db(settings)  # the startup gate passes now
+    assert NoteService(settings).get([1, 2])["notes"]  # no data lost
 
 
 def test_reindex_same_dim_rebuilds_index(dim4) -> None:
-    """Повторный вызов при неизменной размерности — тоже безопасен."""
+    """A repeated call at an unchanged dimension — safe too."""
     assert main(["--yes"]) == 0
-    init_db(dim4)  # согласовано, отказов нет
+    init_db(dim4)  # consistent, no refusals
 
 
 def test_reindex_missing_db(tmp_path, monkeypatch) -> None:
-    """Нет файла БД — доходчивый отказ (код 2), а не traceback."""
+    """No DB file — a clear failure (code 2), not a traceback."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notexist.db"))
     get_settings.cache_clear()
     assert main(["--yes"]) == 2
 
 
 def test_reindex_confirmation_aborts(dim4) -> None:
-    """Без --yes и с отказным ответом в prompt — БД полностью нетронута."""
+    """Without --yes and with a declining prompt answer — the DB fully untouched."""
     import builtins
 
     builtins_input = builtins.input
     builtins.input = lambda _prompt: "n"
     try:
-        assert main([]) == 1  # отменено оператором
+        assert main([]) == 1  # cancelled by the operator
     finally:
         builtins.input = builtins_input
     with session(dim4) as conn:
-        # индекс цел: таблица на месте, вектора не сброшены
+        # the index intact: the table in place, the vectors not reset
         assert vectors.count(conn) == 2
         assert NoteService(dim4).get([1])["notes"]
 
 
 def test_reindex_offline_leaves_pending_queue(dim4, monkeypatch) -> None:
-    """Живая Ollama недоступна: заметки остаются pending, код 0 (NFR-3)."""
+    """Live Ollama unavailable: the notes stay pending, code 0 (NFR-3)."""
     monkeypatch.setenv("EMBEDDING_DIM", "8")
     get_settings.cache_clear()
     settings = get_settings()

@@ -57,23 +57,27 @@ process without touching the rest of the slot group:
 | `embed` (vectorization) | embedding | `EMBED_*` |
 
 Override fields (append to the prefix): `_MODEL`, `_PROVIDER`, `_BASE_URL`,
-`_API_KEY`, `_THINK`, `_NUM_PREDICT`, `_TIMEOUT_SEC`, `_CONTEXT_TOKENS`,
-`_MODEL_TYPE`. Resolution chain per field: **operation env → slot env →
-default**. Unset fields (`None`) inherit the slot, so a partial override
-(e.g. only `MERGE_MODEL`) is the normal case; operations without overrides
-behave exactly as before. `MERGE_NUM_PREDICT` is historical — it already was
-the merge operation's env (0 = auto).
+`_API_KEY`, `_THINK`, `_NUM_PREDICT`, `_REASONING_NUM_PREDICT`, `_TIMEOUT_SEC`,
+`_CONTEXT_TOKENS`, `_MODEL_TYPE`. Resolution chain per field: **operation env →
+slot env → default**. Unset fields (`None`) inherit the slot, so a partial
+override (e.g. only `MERGE_MODEL`) is the normal case; operations without
+overrides behave exactly as before. `MERGE_NUM_PREDICT` is historical — it
+already was the merge operation's env (0 = auto).
 
 - **Reserve first (F-12):** overrides apply to the primary (generative)
   path only. When the judge/classifier switch to the decision slot, the
   `DECISION_*` configuration (with its model) is used as-is.
 - **`/health.operations`** shows `{model, provider, source}` per operation,
   where `source` is where the model came from (`op` / `slot` / `default`).
+  Since v3.5 the same block carries the split budgets (`answer_budget`,
+  `reasoning_budget`, `sent_budget` + their sources) — the configured
+  ceiling of the operation with an empty prompt.
   Base URLs and keys are never exposed there — the address lives in the
   `slot_call` journal and in the job error event.
-- Changing an operation env (model/think/timeout/budget/context) releases
-  the «requires attention» state on restart, same as slot env changes
-  (config fingerprint); `*_API_KEY` is not part of the fingerprint.
+- Changing an operation env (model/think/timeout/budget/reasoning
+  budget/context) releases the «requires attention» state on restart, same
+  as slot env changes (config fingerprint); `*_API_KEY` is not part of the
+  fingerprint.
 - A typo in the prefix (e.g. `MERG_MODEL`) is ignored by the parser and
   produces an `unknown_operation_warning` at startup — the service starts.
 - Example (T-23): give the merge process its own cheap model on another
@@ -85,6 +89,47 @@ the merge operation's env (0 = auto).
   MERGE_NUM_PREDICT: "16384"
   MERGE_TIMEOUT_SEC: "600"
   ```
+
+### Answer vs reasoning budget (v3.5, LSBN-T-33)
+
+The transport (`num_predict` at ollama, `max_tokens` at openai) caps the
+**sum** of thinking + content: reasoning that never reaches the note eats
+the answer budget (defect class `lsbdef-0008`, the `flint` merge case).
+Since v3.5 a call carries two independent budgets and LSB enforces the split
+itself:
+
+- `answer_budget` — how many tokens the useful answer is guaranteed to get
+  (the note/operation limit; resolved exactly as `*_NUM_PREDICT` before);
+- `reasoning_budget` — how much the model may think; by default «as much as
+  fits» in the context window **without taking from the answer**;
+- what goes on the wire is `num_predict = answer_budget + reasoning_budget`,
+  clamped by the context window and the defensive cap. With `THINK=false`
+  only the answer budget is sent.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SLOT_REASONING_NUM_PREDICT` | `0` | slot-level reasoning budget (`0` = unset → «as much as fits» in the window) |
+| `<OP>_REASONING_NUM_PREDICT` | unset | per-operation reasoning budget; `0` = unset |
+
+A reasoning budget of `0` means «not set» — the window remainder after the
+answer, not «no thinking». Without a declared `*_CONTEXT_TOKENS` the split
+degrades to the v3.4.1 behavior (reasoning budget 0, only the answer cap is
+sent) — set the context to enable it.
+
+Failure handling: if the answer comes back **empty while thinking was
+present** (`message.thinking` / `reasoning_content`), the client raises a
+distinct error («бюджет ответа съеден рассуждением») and retries **once**
+with a doubled send budget, capped by the context window — this is a
+request-shaping retry, not a slot failure (back-off and the slot breaker are
+not involved). If the window is already exhausted or the context is unknown,
+the error goes up: the job waits for attention with a readable cause
+(`last_outcome=truncated` + `last_had_thinking=true` in `/health.slots`,
+plus the split budgets of the last call).
+
+Caveat: for an always-reasoning model without a thinking switch, a small
+reasoning budget on tight-budget operations (judge 256, classify 768) means
+those calls may still end empty — that is a model-choice limitation, not a
+code defect; give such operations a larger budget or a generation model.
 
 ## Full variable reference
 
@@ -148,11 +193,12 @@ the merge operation's env (0 = auto).
 Flat `<OPERATION>_<FIELD>` variables (see «Operations: per-process
 overrides» above). All default to unset (= inherit the slot); ranges match
 the slot rules: `_TIMEOUT_SEC` ≥ 1, `_NUM_PREDICT` ≥ 0 (0 = auto),
-`_CONTEXT_TOKENS` ≥ 0 (0 = unknown), `_PROVIDER` ∈ {`ollama`, `openai`},
-`_MODEL_TYPE` ∈ {`reasoning`, `generation`}. Code defaults: `describe`
-budget 512, `think=false` (override with `DESCRIBE_NUM_PREDICT` /
-`DESCRIBE_THINK`); `embed` read timeout 720 s (override with
-`EMBED_TIMEOUT_SEC`).
+`_REASONING_NUM_PREDICT` ≥ 0 (0/unset = «as much as fits», see the
+«Answer vs reasoning budget» section), `_CONTEXT_TOKENS` ≥ 0 (0 = unknown),
+`_PROVIDER` ∈ {`ollama`, `openai`}, `_MODEL_TYPE` ∈ {`reasoning`,
+`generation`}. Code defaults: `describe` budget 512, `think=false`
+(override with `DESCRIBE_NUM_PREDICT` / `DESCRIBE_THINK`); `embed` read
+timeout 720 s (override with `EMBED_TIMEOUT_SEC`).
 
 ### HTTP / MCP / storage
 

@@ -1,11 +1,13 @@
-"""Журнал decision-решений (LSBN-F-12, релиз 3.2.0; arch §6.4/§7.2/§13.6).
+"""The decision decisions journal (LSBN-F-12, release 3.2.0; arch §6.4/§7.2/§13.6).
 
-Вероятности и длительность решения видны в журнале (`decision_answer`), причина
-переключения — в `decision_fallback`; в БД вероятности НЕ пишутся (FR-3.3):
-ни таблиц решений, ни полей-истории, ни миграций. Журнал — JSON-события
-приложения (logging), а не таблица.
+    The decision's probabilities and duration are visible in the journal
+    (`decision_answer`); the switch reason — in `decision_fallback`; the
+    probabilities are NOT written to the DB (FR-3.3): no decisions table, no
+    history fields, no migrations. The journal — the application's JSON events
+    (logging), not a table.
 
-Юнит без сети: decision-клиент на httpx.MockTransport, БД — временная (conftest).
+    A unit without the network: a decision client on httpx.MockTransport; the DB
+    — temporary (conftest).
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ def events(caplog, name: str) -> list:
 
 
 def schema() -> dict[str, set[str]]:
-    """Таблицы БД и их колонки — снимок схемы до/после решений."""
+    """The DB tables and their columns — a schema snapshot before/after the decisions."""
     with session(get_settings()) as conn:
         tables = [
             row[0]
@@ -79,7 +81,7 @@ def run_classify_decision(settings, caplog) -> None:
 
 
 def test_decision_answer_probabilities_logged(monkeypatch, caplog) -> None:
-    """`decision_answer` несёт вероятность, порог, модель и `duration_ms`."""
+    """`decision_answer` carries the probability, the threshold, the model and `duration_ms`."""
     from test_judge_decision import decision_settings
 
     settings = decision_settings(monkeypatch)
@@ -107,7 +109,7 @@ def test_decision_answer_probabilities_logged(monkeypatch, caplog) -> None:
 
 
 def test_no_probabilities_in_db(monkeypatch, caplog) -> None:
-    """После решений схема БД не менялась: таблиц/полей решений нет."""
+    """After the decisions the DB schema did not change: no decisions tables/fields."""
     from test_judge_decision import decision_settings
 
     settings = decision_settings(monkeypatch)
@@ -123,11 +125,11 @@ def test_no_probabilities_in_db(monkeypatch, caplog) -> None:
     assert not [name for name in names if "probab" in name.lower()]
 
 
-# --- контракт событий (f12-03: наблюдаемость и тесты) -------------------------
+# --- the events contract (f12-03: observability and tests) ------------------
 
 
 def test_decision_check_fields(monkeypatch, caplog) -> None:
-    """Событие стартовой проверки `decision_check` несёт `model` и `result`."""
+    """The startup check's `decision_check` event carries `model` and `result`."""
     from app.main import create_app
     from app.services.llm_client import LLMClient
 
@@ -145,7 +147,7 @@ def test_decision_check_fields(monkeypatch, caplog) -> None:
 
 
 def test_decision_answer_fields(monkeypatch, caplog) -> None:
-    """`decision_answer`: operation/threshold/duration_ms/answers; вероятности — там."""
+    """`decision_answer`: operation/threshold/duration_ms/answers; the probabilities — there."""
     settings = decision_settings(monkeypatch)
     with caplog.at_level(logging.INFO, logger="app"):
         run_judge_decision(settings, caplog)
@@ -157,12 +159,13 @@ def test_decision_answer_fields(monkeypatch, caplog) -> None:
 
 
 def test_decision_fallback_reason_enum(monkeypatch, caplog) -> None:
-    """`reason` переключения — ровно три значения; иных нет (§13.6/FR-4.2).
+    """The switch's `reason` — exactly three values; no others (§13.6/FR-4.2).
 
-    Проверен весь словарь: зона неопределённости (`low_confidence`), разрыв и
-    сеть (`unavailable`), контракт с сервером (`unsupported`). Чужое имя
-    причина не принимает вовсе — в разработке это ошибка (`ValueError`),
-    а не четвёртый счётчик.
+                The whole dictionary is checked: the uncertainty zone
+                (`low_confidence`), the breaker and the network (`unavailable`), the
+                contract with the server (`unsupported`). A foreign name is never
+                accepted as a reason — in development that is an error
+                (`ValueError`), not a fourth counter.
     """
     settings = decision_settings(monkeypatch)
     allowed = {"unavailable", "unsupported", "low_confidence"}
@@ -180,7 +183,7 @@ def test_decision_fallback_reason_enum(monkeypatch, caplog) -> None:
         judge_contract, _, _, _ = make_judge(
             settings, [systemone({})], [chat_body()]
         )
-        judge_contract.judge(TEXT_NEW, TEXT_CANDIDATE)  # unsupported (нет решения)
+        judge_contract.judge(TEXT_NEW, TEXT_CANDIDATE)  # unsupported (no decision)
         reasons = {record.reason for record in events(caplog, "decision_fallback")}
         assert reasons == allowed
         assert set(decider.snapshot()["by_reason"]) == allowed
@@ -193,7 +196,7 @@ def test_decision_fallback_reason_enum(monkeypatch, caplog) -> None:
 
 
 def test_decision_paused_events(monkeypatch, caplog) -> None:
-    """Разрыв decision пишет `slot_paused`/`slot_probe`/`slot_resumed` (блок 2)."""
+    """The decision breaker writes `slot_paused`/`slot_probe`/`slot_resumed` (block 2)."""
     settings = decision_settings(monkeypatch)
     clock = {"t": 1000.0}
     monkeypatch.setattr("app.services.slot_breaker.time.time", lambda: clock["t"])
@@ -201,12 +204,12 @@ def test_decision_paused_events(monkeypatch, caplog) -> None:
         settings, [httpx.Response(401, text="nope"), noul(0.95)], [chat_body()]
     )
     with caplog.at_level(logging.INFO, logger="app"):
-        judge.judge(TEXT_NEW, TEXT_CANDIDATE)  # 401 → auth → разрыв открыт
+        judge.judge(TEXT_NEW, TEXT_CANDIDATE)  # 401 → auth → the breaker open
         paused = events(caplog, "slot_paused")
         assert paused and paused[0].slot == SLOT_DECISION
         assert paused[0].job == "judge"
         assert paused[0].outcome == "auth"
-        # Пауза истекла: стук проходит, разрыв снимается.
+        # The pause expired: the knock goes through; the breaker lifts.
         clock["t"] += settings.slot_pause_sec + 1
         judge.judge(TEXT_NEW, TEXT_CANDIDATE)
     probes = events(caplog, "slot_probe")

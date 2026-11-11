@@ -1,8 +1,8 @@
-"""№12 (no12-02, 3.2.0): агрегаты `/health.warnings` (arch §7.1/§7.2).
+"""#12 (no12-02, 3.2.0): the `/health.warnings` aggregates (arch §7.1/§7.2).
 
-`/health.warnings` = `{by_kind: {kind: N}, total: M}` — считает ОТКРЫТЫЕ
-предупреждения по видам (только SQL, без модели). Виды памяти и терминов
-видны в одном объекте: одна поверхность на систему (§13.4).
+    `/health.warnings` = `{by_kind: {kind: N}, total: M}` — counts OPEN warnings
+    by kind (SQL only, no model). The memory and terms kinds are visible in one
+    object: one surface per system (§13.4).
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from app.services.warnings import (
 
 
 def test_health_warnings_aggregate(client: TestClient) -> None:
-    """/health.warnings = {by_kind, total}, открытые по видам; снятые — нет."""
+    """/health.warnings = {by_kind, total}, open per kind; cleared ones — no."""
     service = client.app.state.services.warnings  # type: ignore[attr-defined]
     service.open(KIND_NOTE_MISPLACED, "note", 1, "m1", {})
     service.open(KIND_NOTE_MISPLACED, "note", 2, "m2", {})

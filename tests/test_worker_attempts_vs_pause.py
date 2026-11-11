@@ -1,13 +1,13 @@
-"""Счёт попыток пары независимо от паузы слота (№39, no39-04; arch §6.2/§6.8).
+"""The pair attempt count independently of the slot pause (#39, no39-04; arch §6.2/§6.8).
 
-Дефект приёмки 3.2.0 (lsbdef-0008, решение О. 2026-10-12): открытая пауза слота
-останавливала партию, а успешный стук обнулял счёт пары — порог
-`SLOT_MAX_ATTEMPTS` был недостижим, и состояние «требует вмешательства» не
-наступало никогда. Здесь закреплена разведённая граница: **пауза — состояние
-СЛОТА, счёт — свойство ПАРЫ**. Нетранзиентные отказы считаются и при открытом
-разрыве; успешный стук снимает разрыв, но не счёт; в фазе разрыва работа видна
-как `waiting`, а не `attention`; транзиентные отказы счёт по-прежнему не
-замораживают.
+    The 3.2.0 acceptance defect (lsbdef-0008): an open slot pause stopped the
+    batch, and a successful knock reset the pair's counter — the
+    `SLOT_MAX_ATTEMPTS` threshold was unreachable and the "needs attention" state
+    never came. This pins the separated boundary: **the pause is the SLOT's
+    state, the count is the PAIR's property**. Non-transient failures count even
+    with the breaker open; a successful knock lifts the breaker but not the
+    count; in the breaker phase the work shows as `waiting`, not `attention`;
+    transient failures still do not freeze the count.
 """
 
 from __future__ import annotations
@@ -76,14 +76,14 @@ def _events(caplog, event: str) -> list:
 
 
 def _freeze(monkeypatch, start: float = 1000.0) -> dict:
-    """Заморозить часы (общий модуль `time`) — детерминированные паузы."""
+    """Freeze the clock (the shared `time` module) — deterministic pauses."""
     clock = {"t": start}
     monkeypatch.setattr("app.services.slot_breaker.time.time", lambda: clock["t"])
     return clock
 
 
 class ProbeJudge:
-    """Судья-фейк с управляемым дешёвым `probe()` (стук слота)."""
+    """A fake judge with a controllable cheap `probe()` (a slot knock)."""
 
     def __init__(self, result: str = "ok") -> None:
         self._result = result
@@ -98,19 +98,19 @@ class ProbeJudge:
         return None
 
 
-# --- достижимость порога внимания -------------------------------------------
+# --- the attention threshold's reachability --------------------------------
 
 
 def test_counter_reaches_max_across_pause_cycles(
     tmp_path, monkeypatch, caplog
 ) -> None:
-    """8 отказов через циклы «пауза → стук → снова отказ» → attention.
+    """8 failures through "pause → knock → failure again" cycles → attention.
 
-    `slot_pause_after=3`, `slot_max_attempts=8`: разрыв слота открывается
-    после третьего отказа ОДНОГО исхода, но счёт ПАРЫ его не замечает — после
-    снятия паузы стуком отсчёт продолжается с прежнего значения (4, 5, … 8), а
-    не с нуля. Восьмой отказ ставит `attention_at` и событие `job_attention`
-    с `attempts=8`.
+                `slot_pause_after=3`, `slot_max_attempts=8`: the slot breaker opens
+                after the third failure of ONE outcome, but the PAIR's count does not
+                notice it — after the pause is lifted by a knock the count continues
+                from its former value (4, 5, … 8), not from zero. The eighth failure
+                sets `attention_at` and a `job_attention` event with `attempts=8`.
     """
     settings = _settings(
         tmp_path,
@@ -126,12 +126,12 @@ def test_counter_reaches_max_across_pause_cycles(
     breaker = worker._breakers["judge"]
 
     for _ in range(8):
-        # нетранзиентный отказ: он же отказ слота
+        # a non-transient failure: it is a slot failure too
         worker._note_slot_outcome("judge", "judge", SlotOutcome.EMPTY)
         worker._note_attempt(job_id, SlotOutcome.EMPTY, detail="empty answer")
         if breaker.is_paused():
-            # партия замерла до стука: пауза истекла, probe ok снимает разрыв,
-            # и следующий отказ копится ПОВЕРХ прежнего счёта пары
+            # the batch froze before the knock: the pause expired, a probe ok lifts the breaker,
+            # and the next failure counts ON TOP of the pair's former count
             clock["t"] += settings.slot_pause_sec + 1
             assert worker._slot_gate("judge", "judge") is True
             assert breaker.is_paused() is False
@@ -144,11 +144,12 @@ def test_counter_reaches_max_across_pause_cycles(
 
 
 def test_probe_success_does_not_reset_attempts(tmp_path, monkeypatch, caplog) -> None:
-    """Стук снимает разрыв слота, но НЕ обнуляет счёт пары.
+    """A knock lifts the slot breaker but does NOT reset the pair's count.
 
-    «Слот ожил» — не «причина пары ушла»: после трёх отказов и успешного стука
-    `attempts` остаётся 3, `attention_at` — NULL, событие `slot_resumed` есть,
-    а `job_attention_released` (и снятие внимания по причине `probe`) — нет.
+                "The slot revived" is not "the pair's reason is gone": after three
+                failures and a successful knock `attempts` stays 3, `attention_at` is
+                NULL, the `slot_resumed` event exists, and `job_attention_released`
+                (and the attention release by the `probe` reason) does not.
     """
     settings = _settings(tmp_path, monkeypatch, SLOT_PAUSE_AFTER="3")
     caplog.set_level(logging.INFO, logger="app")
@@ -161,9 +162,9 @@ def test_probe_success_does_not_reset_attempts(tmp_path, monkeypatch, caplog) ->
     assert _job_row(settings, job_id)["attempts"] == 3
 
     worker._breakers["judge"].note_failure(SlotOutcome.AUTH)
-    assert worker._slot_gate("judge", "judge") is False  # стук ещё не наступил
+    assert worker._slot_gate("judge", "judge") is False  # the knock is not due yet
     clock["t"] += settings.slot_pause_sec + 1
-    assert worker._slot_gate("judge", "judge") is True  # стук снял разрыв
+    assert worker._slot_gate("judge", "judge") is True  # the knock lifted the breaker
     assert judge.probe_calls == 1
 
     row = _job_row(settings, job_id)
@@ -171,20 +172,20 @@ def test_probe_success_does_not_reset_attempts(tmp_path, monkeypatch, caplog) ->
     assert row["attention_at"] is None
     assert _events(caplog, "slot_resumed")
     assert not _events(caplog, "job_attention_released")
-    # крючок: стук не снимал работу с внимания (и не пытался)
+    # the hook: the knock neither released the work from attention nor tried to
     assert worker._attention_resets.get("probe", 0) == 0
 
 
 def test_attention_set_while_gap_open(tmp_path, monkeypatch) -> None:
-    """Отказ пары при ОТКРЫТОМ разрыве слота всё равно ставит attention.
+    """A pair failure at an OPEN slot breaker still sets attention.
 
-    Счёт ведёт пара: её безнадёжность не зависит от того, что слот сейчас в
-    паузе. Разрыв здесь не читается вовсе.
+                The pair keeps the count: its hopelessness does not depend on the slot
+                being paused now. The breaker is not read here at all.
     """
     settings = _settings(tmp_path, monkeypatch, SLOT_MAX_ATTEMPTS="8")
     worker = _worker(settings)
     job_id = _seed_job(settings, slot="judge", kind="dedup", note_id=1)
-    # разрыв слота открыт (auth открывает сразу) — пара о нём не знает
+    # the slot breaker is open (auth opens it at once) — the pair does not know about it
     worker._breakers["judge"].note_failure(SlotOutcome.AUTH)
     assert worker._breakers["judge"].is_paused() is True
     for _ in range(8):
@@ -195,7 +196,7 @@ def test_attention_set_while_gap_open(tmp_path, monkeypatch) -> None:
 
 
 def test_transient_does_not_freeze(tmp_path, monkeypatch) -> None:
-    """unavailable/timeout/auth не растят счёт пары и не ставят attention_at."""
+    """unavailable/timeout/auth do not grow the pair's count and do not set attention_at."""
     settings = _settings(tmp_path, monkeypatch, SLOT_MAX_ATTEMPTS="1")
     worker = _worker(settings)
     job_id = _seed_job(settings, slot="judge", kind="dedup", note_id=1)
@@ -211,11 +212,11 @@ def test_transient_does_not_freeze(tmp_path, monkeypatch) -> None:
     assert row["last_outcome"] == "auth"
 
 
-# --- наблюдаемость: waiting ≠ attention --------------------------------------
+# --- observability: waiting ≠ attention -------------------------------------
 
 
 def test_gap_shows_waiting_not_attention(tmp_path, monkeypatch) -> None:
-    """При открытом разрыве работа видна в `waiting`, а не в `attention`."""
+    """With the breaker open the work shows in `waiting`, not in `attention`."""
     settings = _settings(tmp_path, monkeypatch)
     judge = ProbeJudge(result="ok")
     worker = _worker(settings, judge=judge)
@@ -226,20 +227,21 @@ def test_gap_shows_waiting_not_attention(tmp_path, monkeypatch) -> None:
     judge_queue = worker.queues_health()["judge"]
     assert judge_queue["waiting"] >= 1
     assert judge_queue["attention"] == 0
-    assert judge_queue["pending"] == 0  # петля партию не берёт
+    assert judge_queue["pending"] == 0  # the loop takes no batch
 
     assert worker.slots_health()["judge"]["paused_until"] is not None
 
 
-# --- конфигурация: софт-WARN -------------------------------------------------
+# --- configuration: a soft WARN ----------------------------------------------
 
 
 def test_config_warns_when_max_attempts_not_above_pause(
     tmp_path, monkeypatch, caplog
 ) -> None:
-    """SLOT_MAX_ATTEMPTS ≤ SLOT_PAUSE_AFTER → WARN с текстом действия.
+    """SLOT_MAX_ATTEMPTS ≤ SLOT_PAUSE_AFTER → a WARN with the action text.
 
-    Фатальным не делаем: оба значения — воля оператора, старт не падает.
+                Not fatal: both values are the operator's will; the startup does not
+                crash.
     """
     monkeypatch.setenv("SLOT_MAX_ATTEMPTS", "3")
     monkeypatch.setenv("SLOT_PAUSE_AFTER", "3")

@@ -1,7 +1,8 @@
-"""Общие помощники тестов джобы `terms-normalize` (№32, релиз 3.2.0).
+"""Shared helpers of the `terms-normalize` job's tests (#32, release 3.2.0).
 
-Юниты на хосте: строки области `terms` задаются прямым SQL (нужны точные id —
-на них проверяются канон и правило конфликта ключа), модель не зовётся нигде.
+    Units on the host: the `terms` area's rows are set by direct SQL (exact ids
+    are needed — the canon and the key-conflict rule are checked against them);
+    no model is called anywhere.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ DIM = 8
 
 
 class RecordingEmbedder:
-    """HashEmbedder с журналом вызовов: джоба `terms-normalize` — без моделей."""
+    """A HashEmbedder with a call log: the `terms-normalize` job — no models."""
 
     def __init__(self, dim: int = DIM) -> None:
         self.calls: list[Any] = []
@@ -47,7 +48,7 @@ class RecordingEmbedder:
 def make_settings(
     test_env: dict[str, str], monkeypatch: pytest.MonkeyPatch, **env: str
 ) -> Settings:
-    """Свежие настройки над инициализированной БД во временной папке."""
+    """Fresh settings over an initialized DB in a temp folder."""
     monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -58,9 +59,9 @@ def make_settings(
 
 
 def seed(settings: Settings, rows: list[dict[str, Any]]) -> None:
-    """Прямой INSERT строк области terms (ключи считаются нормализацией).
+    """A direct INSERT of terms area rows (the keys are computed by normalization).
 
-    `rows` — `{id, term, context, definition, deleted_at?, vector_status?}`.
+            `rows` — `{id, term, context, definition, deleted_at?, vector_status?}`.
     """
     with session(settings) as conn, transaction(conn):
         for row in rows:
@@ -85,7 +86,7 @@ def seed(settings: Settings, rows: list[dict[str, Any]]) -> None:
 def make_parts(
     settings: Settings, *, embedder: Any = None
 ) -> tuple[TermsService, WarningsService, TermsNormalizerService]:
-    """Собрать (terms, warnings, service) с DI-эмбеддером (без сети)."""
+    """Assemble (terms, warnings, service) with a DI embedder (no network)."""
     terms = TermsService(settings, embedder if embedder is not None else HashEmbedder(DIM))
     warnings = WarningsService(settings)
     service = TermsNormalizerService(settings, terms=terms, warnings=warnings)
@@ -93,7 +94,7 @@ def make_parts(
 
 
 def make_worker(settings: Settings, terms: TermsService | None) -> BackgroundWorker:
-    """Воркер с (или без) областью terms — точка сборки сборщика джобы."""
+    """A worker with (or without) the terms area — the job builder's assembly point."""
     return BackgroundWorker(settings, HashEmbedder(DIM), terms=terms)
 
 

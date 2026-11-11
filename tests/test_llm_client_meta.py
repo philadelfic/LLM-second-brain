@@ -1,8 +1,9 @@
-"""Признаки ответа слота в LLMClient (№49, релиз 3.2.0; arch §6.2, §13.3).
+"""The slot answer flags in LLMClient (#49, release 3.2.0; arch §6.2, §13.3).
 
-Юнит через httpx.MockTransport — без сети. Проверяется чтение ответа целиком:
-`done_reason`/`finish_reason`, счётчики токенов, факт размышления (ollama и
-openai), отсутствие полей не ломает вызов, источник бюджета в метаданных.
+    A unit via httpx.MockTransport — no network. Reading the whole answer is
+    checked: `done_reason`/`finish_reason`, the token counters, the reasoning fact
+    (ollama and openai); missing fields do not break the call; the budget source
+    in the metadata.
 """
 
 from __future__ import annotations
@@ -76,7 +77,7 @@ def test_ollama_thinking_flag() -> None:
     meta = make_client(make_spec(), body).chat_result("sys", "user").meta
     assert meta.had_thinking is True
     assert meta.thinking_chars == len(thinking)
-    assert meta.reasoning_tokens is None  # счётчика токенов размышления у ollama нет
+    assert meta.reasoning_tokens is None  # ollama has no reasoning token counter
 
 
 def test_openai_finish_reason_and_usage() -> None:
@@ -98,7 +99,7 @@ def test_openai_finish_reason_and_usage() -> None:
 
 @pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
 def test_openai_reasoning_field_variants(field: str) -> None:
-    """Selectel отдаёт `reasoning`, общее имя — `reasoning_content`; оба читаем."""
+    """Selectel serves `reasoning`; the generic name — `reasoning_content`; both are read."""
     body = openai_body()
     body["choices"][0]["message"][field] = "размышления провайдера"
     meta = make_client(make_spec("openai"), body).chat_result("sys", "user").meta
@@ -108,7 +109,7 @@ def test_openai_reasoning_field_variants(field: str) -> None:
 
 @pytest.mark.parametrize("provider", ["ollama", "openai"])
 def test_missing_fields_do_not_fail(provider: str) -> None:
-    """Ответ без причины и счётчиков — вызов успешен, поля None, не обрезано."""
+    """An answer without the reason and counters — the call succeeds; the fields None, not trimmed."""
     body = ollama_body() if provider == "ollama" else openai_body()
     meta = make_client(make_spec(provider), body).chat_result("sys", "user").meta
     assert meta.finish_reason is None
@@ -121,7 +122,7 @@ def test_missing_fields_do_not_fail(provider: str) -> None:
 
 
 def test_budget_source_in_meta() -> None:
-    """Без явного `num_predict`, но с заявленным контекстом — источник `context`."""
+    """No explicit `num_predict` but a declared context — the source `context`."""
     client = make_client(
         make_spec(context_tokens=8192, prompt_reserve_tokens=512, max_output_tokens=32768),
         ollama_body(),
@@ -132,7 +133,7 @@ def test_budget_source_in_meta() -> None:
 
 
 def test_legacy_budget_without_context() -> None:
-    """Неизвестный контекст и нет явного бюджета — прежний потолок операции."""
+    """An unknown context and no explicit budget — the operation's former ceiling."""
     meta = make_client(make_spec(), ollama_body()).chat_result(
         "sys", "user", operation="summary"
     ).meta

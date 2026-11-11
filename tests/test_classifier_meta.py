@@ -1,7 +1,7 @@
-"""Classification несёт метаданные вызова (№49, arch §6.3).
+"""Classification carries the call metadata (#49, arch §6.3).
 
-Контракт разметки (`hint_path` + `confidence`) не потерян; к результату
-добавлены метаданные вызова (`meta`) для журнала `slot_call`.
+    The tagging contract (`hint_path` + `confidence`) is not lost; the call
+    metadata (`meta`) is added to the result for the `slot_call` journal.
 """
 
 from __future__ import annotations

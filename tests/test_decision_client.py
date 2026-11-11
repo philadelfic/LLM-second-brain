@@ -1,12 +1,12 @@
-"""Decision-слот: клиент /v1/systemone (LSBN-F-12, релиз 3.2.0; arch §6.2/§13.6).
+"""The decision slot: the /v1/systemone client (LSBN-F-12, release 3.2.0; arch §6.2/§13.6).
 
-Юнит через httpx.MockTransport — без сети. Покрывается одна точка адаптации
-формата (`_systemone_payload` / `_parse_systemone`) в фактической форме
-сервера (ollama ≥ 0.35.1; сверено живым запросом 2026-10-10): запрос —
-`state` + `questions` ОБЪЕКТОМ «имя → вопрос» (`type` + `instructions` +
-`criteria`); три формы ответа разбираются в `DecisionAnswer`; незнакомый
-формат — `LLMError` (не «пустой ответ»: генерации нет); стартовая проверка
-`check_decision()` — все исходы.
+    A unit via httpx.MockTransport — no network. One format adaptation point is
+    covered (`_systemone_payload` / `_parse_systemone`) in the server's factual
+    shape (ollama ≥ 0.35.1; verified by a live request 2026-10-10): the request —
+    `state` + `questions` as an OBJECT "name → question" (`type` + `instructions`
+    + `criteria`); three answer shapes parse into `DecisionAnswer`; an unknown
+    shape — `LLMError` (not "an empty answer": there is no generation); the
+    startup check `check_decision()` — all outcomes.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from app.services.llm_client import (
 )
 
 
-# --- вспомогательное ---------------------------------------------------------
+# --- helpers ------------------------------------------------------------------
 
 
 def make_settings(monkeypatch: pytest.MonkeyPatch, **env: str):
@@ -42,7 +42,7 @@ def make_settings(monkeypatch: pytest.MonkeyPatch, **env: str):
 
 
 class Recorder:
-    """Транспорт-лог: считает запросы, раздаёт scripted-ответы по очереди."""
+    """A transport log: counts requests, deals out scripted answers in turn."""
 
     def __init__(self, actions: list) -> None:
         self.actions = actions
@@ -80,16 +80,16 @@ def ok_answers(payload: dict) -> httpx.Response:
     return httpx.Response(200, json={"answers": payload})
 
 
-# --- контракт клиента --------------------------------------------------------
+# --- the client contract ------------------------------------------------------
 
 
 def test_systemone_payload_shape(monkeypatch) -> None:
-    """Один state и все вопросы группы в одном теле (FR-2.3).
+    """One state and all the group's questions in one body (FR-2.3).
 
-    Тело — в фактической форме сервера: `questions` — ОБЪЕКТ «имя → вопрос»,
-    формулировка едет в `instructions` (не `text`), у `choice` варианты —
-    ключи `criteria` (метка без описания → null), у `noul` — необязательные
-    описания двух исходов.
+                The body — in the server's factual shape: `questions` — an OBJECT
+                "name → question"; the wording rides in `instructions` (not `text`);
+                `choice`'s options — the `criteria` keys (a label without a
+                description → null); `noul` — the two outcomes' optional descriptions.
     """
     state = "node descriptions"
     questions = [
@@ -125,7 +125,7 @@ def test_systemone_payload_shape(monkeypatch) -> None:
 
 
 def test_systemone_payload_choice_labels_and_score() -> None:
-    """Метка без описания → `null`; `score` — массив описаний уровней."""
+    """A label without a description → `null`; `score` — an array of level descriptions."""
     payload = LLMClient._systemone_payload(
         "node descriptions",
         [
@@ -142,10 +142,11 @@ def test_systemone_payload_choice_labels_and_score() -> None:
 
 
 def test_systemone_parse_noul(monkeypatch) -> None:
-    """Ответ `noul` сервера → DecisionAnswer(label=true, probability=noul).
+    """The server's `noul` answer → DecisionAnswer(label=true, probability=noul).
 
-    Тело — фактический ответ ollama (сверено 2026-10-10): `model`/`answers`/
-    `usage` верхнего уровня, у ответа вопроса — `type` и `noul`, уверенности нет.
+                The body — ollama's factual answer (verified 2026-10-10):
+                `model`/`answers`/`usage` at the top level; the question's answer has
+                `type` and `noul`; no confidence.
     """
     parsed = LLMClient._parse_systemone(
         {
@@ -163,7 +164,7 @@ def test_systemone_parse_noul(monkeypatch) -> None:
 
 
 def test_systemone_parse_choice(monkeypatch) -> None:
-    """Ответ `choice` сервера → DecisionAnswer(label, probabilities, confidence)."""
+    """The server's `choice` answer → DecisionAnswer(label, probabilities, confidence)."""
     parsed = LLMClient._parse_systemone(
         {
             "model": "clef-flash:latest",
@@ -187,7 +188,7 @@ def test_systemone_parse_choice(monkeypatch) -> None:
 
 
 def test_systemone_parse_score(monkeypatch) -> None:
-    """Ответ `score` сервера → DecisionAnswer(score, legend в raw)."""
+    """The server's `score` answer → DecisionAnswer(score, the legend in raw)."""
     parsed = LLMClient._parse_systemone(
         {
             "model": "clef-flash:latest",
@@ -210,7 +211,7 @@ def test_systemone_parse_score(monkeypatch) -> None:
 
 
 def test_systemone_unknown_shape_raises(monkeypatch) -> None:
-    """Ответ без answers/незнакомая форма → LLMError (не «пустой ответ»)."""
+    """An answer without answers/an unknown shape → LLMError (not "an empty answer")."""
     with pytest.raises(LLMError):
         LLMClient._parse_systemone({"nope": []})
     with pytest.raises(LLMError):
@@ -219,7 +220,7 @@ def test_systemone_unknown_shape_raises(monkeypatch) -> None:
         LLMClient._parse_systemone("not an object")
 
 
-# --- стартовая проверка «умеет decision» -------------------------------------
+# --- the startup check "can do decision" --------------------------------------
 
 
 def test_check_decision_unsupported(monkeypatch) -> None:

@@ -32,11 +32,11 @@ PASS = 0
 FAIL = 0
 FAILURES: list[str] = []
 
-# --- идемпотентность повторного прогона (techdebt-0036, item 2) ---------------
-# Узлы-зонды `e2e5*` переиспользуются: ручки удаления узла в MCP-поверхности
-# нет, поэтому повторный прогон получает от антисинонимии приложения мягкий
-# отказ с `nearest`, равным самому запрошенному пути, — это успех
-# (`node_creation`), а не FAIL.
+# --- a repeated run's idempotency (techdebt-0036, item 2) ------------------
+# # The `e2e5*` probe nodes are reused: the MCP surface has no node-deletion
+# # handle, so a repeated run gets from the application's anti-synonymy a soft
+# # failure with `nearest` equal to the very requested path — that is a success
+# # (`node_creation`), not a FAIL.
 _SYNONYM_HINT = re.compile(r"there is a similar one:\s*(\S+)")
 _ALREADY_REGISTERED = re.compile(r"already registered", re.IGNORECASE)
 
@@ -53,7 +53,7 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def refusal(result: dict) -> str:
-    """Текст мягкого отказа приложения (`hint`, иначе `reason`), иначе — пусто."""
+    """The application's soft-failure text (`hint`, else `reason`), else empty."""
     for field in ("hint", "reason"):
         value = result.get(field)
         if value not in (None, ""):
@@ -62,16 +62,17 @@ def refusal(result: dict) -> str:
 
 
 def node_creation(path: str, result: dict) -> tuple[bool, str]:
-    """Итог идемпотентной регистрации узла-зонда: `(успех, деталь для отчёта)`.
+    """The outcome of the idempotent probe-node registration: `(success, report detail)`.
 
-    Успех — узел создан ЭТИМ прогоном (`created=True`, статус `confirmed`) ЛИБО
-    уже зарегистрирован (повторный прогон). Имя и описание зонда фиксированы,
-    поэтому антисинонимия приложения (порог косинуса описаний 0.90) отдаёт
-    мягкий отказ `created=False` с подсказкой `hint='there is a similar one:
-    <nearest>'`, где `nearest` равен самому запрошенному пути (описание
-    сравнивается с самим собой) — это и есть «узел на месте». Любой другой
-    отказ (в том числе `nearest` на ЧУЖОЙ узел) — FAIL с причиной и `nearest`:
-    имя/описание зонда надо развести с существующим узлом.
+            Success — the node was created BY THIS RUN (`created=True`, the `confirmed`
+            status) OR is already registered (a repeated run). The probe's name and
+            description are fixed, so the application's anti-synonymy (the description
+            cosine threshold 0.90) serves a soft `created=False` failure with the hint
+            `hint='there is a similar one: <nearest>'`, where `nearest` equals the very
+            requested path (the description is compared with itself) — that is exactly
+            "the node is in place". Any other failure (including a `nearest` pointing
+            at a FOREIGN node) — a FAIL with the reason and `nearest`: the probe's
+            name/description must be moved apart from the existing node.
     """
     if result.get("created") is True:
         if result.get("status") != "confirmed":
@@ -92,7 +93,7 @@ def node_creation(path: str, result: dict) -> tuple[bool, str]:
 
 
 def check_node_creation(label: str, path: str, result: dict) -> None:
-    """Проверка регистрации узла-зонда по идемпотентным правилам `node_creation`."""
+    """Checking the probe-node registration by the idempotent `node_creation` rules."""
     ok, detail = node_creation(path, result)
     check(label, ok, detail)
 
@@ -120,11 +121,12 @@ class Client:
 
 
 async def node_confirmed(c: Client, path: str) -> tuple[bool, str]:
-    """Статус узла в реестре: `(подтверждён, деталь)` по карте `memory_namespaces`.
+    """The node's status in the registry: `(confirmed, detail)` by the `memory_namespaces` map.
 
-    Нужно потому, что `memory_namespace_create` на уже существующем узле отдаёт
-    мягкий отказ без поля `status` (см. `node_creation`), а проверка «root has
-    status confirmed» должна оставаться содержательной и на повторном прогоне.
+            Needed because `memory_namespace_create` on an already existing node serves
+            a soft failure without the `status` field (see `node_creation`), and the
+            "root has status confirmed" check must stay meaningful on a repeated run
+            too.
     """
     r = await c.call("memory_namespaces", {})
     for node in r.get("namespaces", []):

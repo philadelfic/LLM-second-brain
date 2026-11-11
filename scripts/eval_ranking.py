@@ -1,29 +1,30 @@
-"""Замер ранжирования поиска (LSBN-T-19, релиз 3.4.0).
+"""The search ranking measurement (LSBN-T-19, release 3.4.0).
 
-Прогоняет набор пар «запрос → релевантная заметка» через
-`SearchService.search(query, top_k=5)` на переданной копии БД и считает:
+    It runs the "query → relevant note" pair set through
+    `SearchService.search(query, top_k=5)` over the given DB copy and computes:
 
-- recall@5 — доля пар, где размеченная заметка в топ-5;
-- MRR — среднее 1/rank (промах — 0);
-- долю повторных поисков — пары тем с >1 запроса / все пары;
-- разбор промахов: заметка не в кандидатах (каналы: вектор/FTS) либо
-  в кандидатах, но ниже топ-5 (слияние/ранжирование). Кандидаты —
-  повторный поиск с `--candidate-window` (по умолчанию 20).
+    - recall@5 — the share of pairs where the labeled note is in the top-5;
+    - MRR — the mean 1/rank (a miss — 0);
+    - the share of repeated searches — pairs of topics with >1 query / all pairs;
+    - the miss breakdown: the note is not in the candidates (the channels:
+      vector/FTS) or is in the candidates but below the top-5 (merge/ranking).
+      Candidates — a repeated search with `--candidate-window` (default 20).
 
-Режим «до/после» задаётся ОПЕРАТОРОМ через env при запуске:
-`RANKING_BOOSTS_ENABLED=false|true` (скрипт не переключает сам —
-Settings снимок на процесс). Эмбеддер и остальные слоты — из env
-(конфигурация тест-контура); БД — только чтение (поиск не пишет).
+    The "before/after" mode is set by the OPERATOR via env at launch:
+    `RANKING_BOOSTS_ENABLED=false|true` (the script does not switch it itself —
+    Settings is a snapshot per process). The embedder and the other slots — from
+    env (the test contour's configuration); the DB — read-only (search does not
+    write).
 
-Запуск из корня проекта::
+    Run from the project root::
 
-    .venv/bin/python scripts/eval_ranking.py --db <копия> --label before|after
+        .venv/bin/python scripts/eval_ranking.py --db <copy> --label before|after
 
-Код возврата: 0 — прогон состоялся (даже с промахами), 2 — конфиг/БД/набор
-невалидны. Если эмбеддер недоступен, поиск тихо деградирует до FTS
-(WARNING_FTS_ONLY) — скрипт считает такие ответы и помечает прогон
-в итоговой сводке: числа с fts_only > 0 невалидны для замера векторного
-канала.
+    The return code: 0 — the run happened (even with misses); 2 — the
+    config/DB/set is invalid. If the embedder is unavailable, the search quietly
+    degrades to FTS (WARNING_FTS_ONLY) — the script counts such answers and marks
+    the run in the final digest: numbers with fts_only > 0 are invalid for
+    measuring the vector channel.
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))  # прямой запуск `python scripts/...`
+    sys.path.insert(0, str(ROOT))  # a direct run `python scripts/...`
 
 from app.config import Settings  # noqa: E402
 from app.services.embedding import EmbeddingService  # noqa: E402
@@ -131,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         rank = rank_of(results, note_id)
         bucket = "hit"
         if rank is None:
-            # Разбор промаха: заметка ниже окна кандидатов или вовсе вне их.
+            # A miss breakdown: the note below the candidate window or entirely outside them.
             deep = search.search(query, top_k=args.candidate_window)
             deep_rank = rank_of(deep["results"], note_id)
             bucket = "below5" if deep_rank is not None else "no-candidate"

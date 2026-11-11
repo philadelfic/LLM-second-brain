@@ -1,8 +1,8 @@
-"""Журнал вызовов слота в воркере (№49, релиз 3.2.0; arch §7.2).
+"""The slot call journal in the worker (#49, release 3.2.0; arch §7.2).
 
-Юнит без сети: успешный вызов пишет `slot_call` с бюджетом/источником/
-токенами/длительностью; отказ слота, у которого вызов состоялся, — ОДНО
-событие блока 2 (№39), расширенное полями вызова.
+    A unit without the network: a successful call writes a `slot_call` with the
+    budget/source/tokens/duration; a slot failure where the call did happen — ONE
+    block-2 event (#39) extended with the call fields.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ def test_slot_call_on_success(settings, caplog) -> None:
 
 
 class MetaFailingJudge:
-    """Судья-фейк: вызов состоялся, вердикт не распознан — отказ с метаданными."""
+    """A fake judge: the call happened, the verdict was not recognized — a failure with metadata."""
 
     def __init__(self) -> None:
         self.last_attempt_ok: bool | None = None
@@ -90,11 +90,11 @@ def test_failure_event_carries_call_meta(settings, caplog) -> None:
         RecordingDedup(candidates=[(1, 0.94)]),
         judge=MetaFailingJudge(),
     )
-    assert worker.process_pending() == 2  # создаёт dedup-работы (очередь judge)
+    assert worker.process_pending() == 2  # creates dedup jobs (the judge queue)
     with caplog.at_level(logging.INFO, logger="app"):
         worker.process_judge_pending()
     failures = records(caplog, "dedup_judge_failed")
-    assert len(failures) == 1  # второй записи нет
+    assert len(failures) == 1  # there is no second record
     record = failures[0]
     assert record.outcome == "off_contract"
     assert record.budget == 1000

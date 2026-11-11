@@ -1,9 +1,10 @@
-"""`/health.slots` — причина и пауза слота (№39, 3.2.0; arch §7.2).
+"""`/health.slots` — the slot's cause and pause (#39, 3.2.0; arch §7.2).
 
-По каждому слоту (`embedding`/`summary`/`judge`) `/health` отдаёт
-`{ok, last_outcome, paused_until, attention}`: исход последней попытки, исход
-последнего отказа, паузу разрыва и число заданий в внимании. Сбор — только
-SQL/память: `/health` не вызывает модели (иначе опрос здоровья будил бы слоты).
+    Per slot (`embedding`/`summary`/`judge`) `/health` serves
+    `{ok, last_outcome, paused_until, attention}`: the last attempt's outcome, the
+    last failure's outcome, the breaker's pause and the tasks in attention. The
+    assembly — SQL/memory only: `/health` calls no models (otherwise a health
+    poll would wake the slots).
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ SLOTS = ("embedding", "summary", "judge", "decision")
 
 
 def make_meta(**over: object) -> ChatMeta:
-    """Метаданные одного вызова чата для проверки диагностики /health.slots."""
+    """One chat call's metadata for checking the /health.slots diagnostics."""
     base: dict[str, object] = {
         "slot": "summary",
         "provider": "ollama",
@@ -40,7 +41,7 @@ def make_meta(**over: object) -> ChatMeta:
 
 
 def test_slots_block(client: TestClient) -> None:
-    """/health.slots несёт все слоты с полным набором полей (№39 + №49)."""
+    """/health.slots carries all slots with the full field set (#39 + #49)."""
     body = client.get("/health").json()
     assert set(body["slots"]) == set(SLOTS)
     for stat in body["slots"].values():
@@ -53,25 +54,29 @@ def test_slots_block(client: TestClient) -> None:
             "last_budget",
             "last_budget_source",
             "last_had_thinking",
+            # LSBN-T-33: the last call's separate budgets.
+            "last_answer_budget",
+            "last_reasoning_budget",
+            "last_sent_budget",
         }
-        assert stat["paused_until"] is None  # разрыва нет
+        assert stat["paused_until"] is None  # no breaker
         assert stat["attention"] == 0
 
 
 def test_slots_block_paused_until_when_break_open(client: TestClient) -> None:
-    """Открытый разрыв слота: last_outcome и paused_until заполнены."""
+    """An open slot breaker: last_outcome and paused_until filled."""
     worker = client.app.state.worker  # type: ignore[attr-defined]
     worker._breakers["embedding"].note_failure(SlotOutcome.AUTH)
 
     stat = client.get("/health").json()["slots"]["embedding"]
     assert stat["last_outcome"] == "auth"
     assert stat["paused_until"] is not None
-    # Остальные слоты не затронуты — недоступность одного слота не залипает.
+    # The other slots untouched — one slot's unavailability does not stick.
     assert client.get("/health").json()["slots"]["judge"]["paused_until"] is None
 
 
 def test_last_call_diagnostics(client: TestClient, monkeypatch) -> None:
-    """/health.slots несёт диагностику последнего вызова слота (lsbdef-0008)."""
+    """/health.slots carries the slot's last-call diagnostics (lsbdef-0008)."""
     services = client.app.state.services  # type: ignore[attr-defined]
     meta = make_meta()
     monkeypatch.setattr(
@@ -97,7 +102,7 @@ def test_last_call_diagnostics(client: TestClient, monkeypatch) -> None:
 
 
 def test_diagnostics_none_before_first_call(client: TestClient) -> None:
-    """До первого вызова слотов поля диагностики None — health не врёт."""
+    """Before a slot's first call the diagnostic fields are None — health does not lie."""
     for stat in client.get("/health").json()["slots"].values():
         assert stat["last_finish_reason"] is None
         assert stat["last_budget"] is None
@@ -106,7 +111,7 @@ def test_diagnostics_none_before_first_call(client: TestClient) -> None:
 
 
 def test_health_no_model_calls(client: TestClient, monkeypatch) -> None:
-    """Сбор /health не вызывает модели: счётчик заглушек остаётся нулевым."""
+    """Assembling /health calls no models: the stubs' counter stays zero."""
     services = client.app.state.services  # type: ignore[attr-defined]
     calls = {"n": 0}
 
@@ -144,14 +149,24 @@ OPERATIONS = (
 
 
 def test_operations_block(client: TestClient) -> None:
-    """/health.operations (LSBN-F-34): модель/провайдер/источник по операции."""
+    """/health.operations (LSBN-F-34): the model/provider/source per operation."""
     body = client.get("/health").json()
     assert set(body["operations"]) == set(OPERATIONS)
     for snapshot in body["operations"].values():
-        assert set(snapshot) == {"model", "provider", "source"}
+        assert set(snapshot) == {
+            "model",
+            "provider",
+            "source",
+            # LSBN-T-33: the operation's separate budgets.
+            "answer_budget",
+            "reasoning_budget",
+            "sent_budget",
+            "answer_source",
+            "reasoning_source",
+        }
         assert snapshot["source"] in ("op", "slot", "default")
-        assert snapshot["model"]  # модель есть у каждой операции
-    # Без переопределений summarize/title/merge наследуют слот summary.
+        assert snapshot["model"]  # every operation has a model
+    # Without overrides summarize/title/merge inherit the summary slot.
     assert body["operations"]["summarize"]["model"] == "test-summary-model"
     assert body["operations"]["summarize"]["source"] == "slot"
     assert body["operations"]["judge"]["model"] == "test-judge-model"
@@ -160,8 +175,10 @@ def test_operations_block(client: TestClient) -> None:
 def test_operations_block_has_no_addresses(
     client: TestClient, monkeypatch, tmp_path
 ) -> None:
-    """Решение №4 брифа: /health не печатает адреса слотов и ключей —
-    даже при переопределении операции (base_url известен только журналу)."""
+    """The brief's decision #4: /health prints no slot or key addresses —
+            even with an operation override (the base_url is known to the journal
+            only).
+    """
     from app.config import get_settings
     from app.main import create_app
 
