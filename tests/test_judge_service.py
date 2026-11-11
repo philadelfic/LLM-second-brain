@@ -187,8 +187,8 @@ def test_stream_disabled_and_generation_params(monkeypatch) -> None:
     service.judge(TEXT_NEW, TEXT_CANDIDATE)
     payload = last_payload(recorder)
     assert payload["stream"] is False
-    assert payload["num_predict"] == 256  # №49: legacy-потолок (контекст неизвестен)
-    assert payload["temperature"] == 0.1
+    assert payload["options"]["num_predict"] == 256  # №49: legacy-потолок (контекст неизвестен)
+    assert payload["options"]["temperature"] == 0.1
     assert "keep_alive" not in payload  # решение №6: моделью управляет сервер
 
 
@@ -211,8 +211,7 @@ def test_ollama_payload_bytes_minus_keep_alive(monkeypatch) -> None:
             },
         ],
         "stream": False,
-        "num_predict": 256,  # №49: legacy-потолок (контекст неизвестен)
-        "temperature": 0.1,
+        "options": {"num_predict": 256, "temperature": 0.1},
         "think": False,
     }
     assert recorder.requests[0].read() == json.dumps(
@@ -224,7 +223,7 @@ def test_num_predict_from_env(monkeypatch) -> None:
     settings = make_settings(monkeypatch, JUDGE_NUM_PREDICT="16")
     service, recorder = make_service(settings, [httpx.Response(200, json=ok_body())])
     service.judge(TEXT_NEW, TEXT_CANDIDATE)
-    assert last_payload(recorder)["num_predict"] == 16
+    assert last_payload(recorder)["options"]["num_predict"] == 16
 
 
 def test_read_timeout_from_env(monkeypatch) -> None:

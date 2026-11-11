@@ -149,13 +149,7 @@ class TestOllamaChatPayload:
         assert request.method == "POST"
         assert request.url.path == "/api/chat"
         payload = last_payload(recorder)
-        assert set(payload.keys()) == {
-            "model",
-            "messages",
-            "stream",
-            "num_predict",
-            "temperature",
-        }
+        assert set(payload.keys()) == {"model", "messages", "stream", "options"}
         assert payload == {
             "model": "test-summary-model",
             "messages": [
@@ -163,8 +157,7 @@ class TestOllamaChatPayload:
                 {"role": "user", "content": USER},
             ],
             "stream": False,
-            "num_predict": 777,
-            "temperature": TEMPERATURE,
+            "options": {"num_predict": 777, "temperature": TEMPERATURE},
         }
 
     def test_think_false_sends_explicit_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -572,7 +565,7 @@ class TestSplitBudgets:
         result = client.chat_result(SYSTEM, USER)
         prompt = count_tokens(SYSTEM) + count_tokens(USER)
         window = 32768 - prompt - 512
-        assert last_payload(recorder)["num_predict"] == window
+        assert last_payload(recorder)["options"]["num_predict"] == window
         meta = result.meta
         assert meta.answer_budget == 12000
         assert meta.reasoning_budget == window - 12000
@@ -595,7 +588,7 @@ class TestSplitBudgets:
             SlotSpec.for_summary(settings), [ollama_chat_ok()]
         )
         client.chat_result(SYSTEM, USER)
-        assert last_payload(recorder)["num_predict"] == 12000
+        assert last_payload(recorder)["options"]["num_predict"] == 12000
 
     def test_unknown_context_degrades(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Контекст неизвестен: деградация — sent = ответ, reasoning = 0."""
@@ -606,7 +599,7 @@ class TestSplitBudgets:
             SlotSpec.for_summary(settings), [ollama_chat_ok()]
         )
         result = client.chat_result(SYSTEM, USER)
-        assert last_payload(recorder)["num_predict"] == 12000
+        assert last_payload(recorder)["options"]["num_predict"] == 12000
         assert result.meta.reasoning_budget == 0
         assert result.meta.reasoning_source == "legacy"
 
@@ -629,10 +622,10 @@ class TestSplitBudgets:
         result = client.chat_result(SYSTEM, USER)
         assert result.content == "спасённый ответ"
         assert recorder.calls == 2
-        assert last_payload(recorder)["num_predict"] == 16000  # первый вызов: 12000+4000
+        assert last_payload(recorder)["options"]["num_predict"] == 16000  # первый вызов: 12000+4000
         second_payload = json.loads(recorder.requests[1].read().decode())
         # Ретрай: ×2 = 32000 (потолок окна не достигнут — окно ещё шире).
-        assert second_payload["num_predict"] == 32000
+        assert second_payload["options"]["num_predict"] == 32000
         assert result.meta.escalated_from == 16000
         assert result.meta.sent_budget == 32000
 
@@ -895,3 +888,26 @@ class TestSlotsAndTimeouts:
         client, _ = make_client(SlotSpec.for_summary(make_settings(monkeypatch)), [])
         client.close()
         client.close()  # повторный close не падает
+
+
+def test_options_carry_num_ctx_from_declared_context(monkeypatch) -> None:
+    """LSBN-D-14: заявленный контекст уходит в запрос как num_ctx.
+
+    Без него сервер берёт свой дефолт (262 144 на ИИ-сервере), модель не влезает
+    в видеопамять и генерация проседает в разы — живой случай 11.11.2026.
+    """
+    settings = make_settings(monkeypatch, SUMMARY_CONTEXT_TOKENS="32768")
+    client, recorder = make_client(SlotSpec.for_summary(settings), [ollama_chat_ok()])
+    client.chat(SYSTEM, USER, num_predict=100)
+    options = last_payload(recorder)["options"]
+    assert options["num_ctx"] == 32768
+    # при заявленном контексте отправляемое = ответ + рассуждение (остаток окна)
+    assert options["num_predict"] > 100
+
+
+def test_no_num_ctx_when_context_unknown(monkeypatch) -> None:
+    """Контекст не заявлен (0) — num_ctx не выдумываем, сервер решает сам."""
+    settings = make_settings(monkeypatch, SUMMARY_CONTEXT_TOKENS="0")
+    client, recorder = make_client(SlotSpec.for_summary(settings), [ollama_chat_ok()])
+    client.chat(SYSTEM, USER, num_predict=100)
+    assert "num_ctx" not in last_payload(recorder)["options"]

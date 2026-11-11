@@ -123,12 +123,12 @@ def test_payload_small_num_predict_and_think_false(monkeypatch) -> None:
     service, recorder = make_service(settings, [httpx.Response(200, json=body)])
     service.classify(NOTE, KNOWN)
     payload = last_payload(recorder)
-    assert payload["num_predict"] == CLASSIFIER_NUM_PREDICT
+    assert payload["options"]["num_predict"] == CLASSIFIER_NUM_PREDICT
     assert payload["think"] is False
     assert payload["model"] == settings.summary_model  # та же модель, что суммаризация
     # Фаза 11: температура — уровень клиента слота (0.1, как у суммаризации;
     # отдельная нулевая у классификатора осталась в v2.0).
-    assert payload["temperature"] == 0.1
+    assert payload["options"]["temperature"] == 0.1
     assert "keep_alive" not in payload  # решение №6
     service.close()
 
