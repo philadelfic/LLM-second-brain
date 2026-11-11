@@ -67,3 +67,38 @@ def test_size_hint_counts_parts():
     assert "19329" in hint
     assert "at least 4 part" in hint  # ceil(19329 / 5000) = 4
     assert "5000" in hint
+
+
+# --- LSBN-D-13, решение О. 11.11.2026: одна заметка = один факт --------
+
+def _facts(text, parts):
+    from app.services.summary import facts_coverage
+
+    return facts_coverage(text, parts)
+
+
+def test_facts_coverage_keeps_numbers_and_paths():
+    source = "Слот на 192.168.3.112, лимит 5000, таймаут 3600 с, версия 3.5.1"
+    parts = ["Слот на 192.168.3.112", "Лимит 5000 символов", "Таймаут 3600 с, версия 3.5.1"]
+    assert _facts(source, parts) == 1.0
+
+
+def test_facts_coverage_allows_rephrasing_words():
+    source = "Заметку нарезает модель, лимит 5000 символов"
+    parts = ["Нарезка выполняется моделью. Предел — 5000 символов"]
+    assert _facts(source, parts) == 1.0
+
+
+def test_facts_coverage_catches_lost_number():
+    source = "Лимит 5000 символов, таймаут 3600 с"
+    parts = ["Лимит 5000 символов"]
+    assert _facts(source, parts) < 1.0
+
+
+def test_split_uses_fact_check_not_word_check():
+    from app.services.prompts import summary_split_system_prompt
+
+    prompt = summary_split_system_prompt(5000)
+    assert "ATOMIC FACTS" in prompt
+    assert "one fact per" in prompt
+    assert "5000" in prompt

@@ -190,6 +190,37 @@ class MergeIncompleteError(SummaryError):
 _ELLIPSIS = "…"
 
 
+#: The hard-token classes of the fact check: digits and ASCII identifiers
+#: (versions, paths, commands, configs) - the parts of a fact that must survive
+#: verbatim even when the connecting prose is tightened.
+_HARD_TOKEN_RE = re.compile(r"[0-9A-Za-z_./:=-]{2,}")
+
+
+def facts_coverage(source: str, parts: list[str]) -> float:
+    """The share of the source's HARD tokens (numbers, latin identifiers,
+            paths, versions) found in the parts' text (LSBN-D-13, split only).
+
+            Oleg's decision of 2026-11-11: split = one note per fact, so the model
+            legitimately rephrases the prose. Checking it with the strict word
+            coverage (merge_coverage) would quarantine every note (the live case:
+            0.86 on a clean split). What must not be lost is the skeleton of facts:
+            numbers, dates, versions, paths and commands. Cyrillic words are allowed
+            to change; a missing number or path is still a lost fact.
+    """
+    def hard(text: str) -> set[str]:
+        return {
+            token.casefold()
+            for token in _HARD_TOKEN_RE.findall(text)
+            if any(char.isdigit() for char in token)
+        }
+
+    source_tokens = hard(source)
+    if not source_tokens:
+        return 1.0
+    parts_tokens = hard(" ".join(parts))
+    return len(source_tokens & parts_tokens) / len(source_tokens)
+
+
 def merge_coverage(source: str, parts: list[str]) -> float:
     """The share of the sources' significant tokens found in the parts' text (F-23, p. 4).
 
@@ -531,11 +562,11 @@ class SummaryService:
             metas: list[ChatMeta] = []
             system = self._prompts.summary_split_system
             base_user = self._prompts.split_user.format(text=text)
-            base_user += self._size_hint(len(text))
+            base_user += self._facts_hint(len(text))
             parts, raw, meta = self._merge_round(system, base_user, operation="split")
             metas.append(meta)
             rounds = 1
-            issue = self._incomplete_reason(parts, text)
+            issue = self._incomplete_reason(parts, text, operation="split")
             if issue is not None:
                 followup_user = (
                     f"{base_user}\n\nYOUR ANSWER:\n{raw}\n\n{issue}\n"
@@ -546,7 +577,7 @@ class SummaryService:
                 )
                 metas.append(meta)
                 rounds = 2
-                issue = self._incomplete_reason(parts, text)
+                issue = self._incomplete_reason(parts, text, operation="split")
                 if issue is not None:
                     raise MergeIncompleteError(
                         f"split incomplete after {MERGE_MAX_ROUNDS} rounds: {issue}",
@@ -584,7 +615,7 @@ class SummaryService:
         )
 
     def _incomplete_reason(
-        self, parts: list[MergePart], *sources: str
+        self, parts: list[MergePart], *sources: str, operation: str = "merge"
     ) -> str | None:
         """The reason of an incomplete merge/split or None (the F-23/F-22 briefs).
 
@@ -605,7 +636,19 @@ class SummaryService:
                 f"part {listed} exceeds the {limit}-character note "
                 "limit — split it into several self-contained parts"
             )
-        coverage = merge_coverage("\n".join(sources), [p.text for p in parts])
+        merged_source = "\n".join(sources)
+        texts = [p.text for p in parts]
+        if operation == "split":
+            # one note = one fact: prose may be tightened, the fact skeleton may not
+            coverage = facts_coverage(merged_source, texts)
+            if coverage < 1.0:
+                return (
+                    "the parts lost hard facts of the source — numbers, dates, "
+                    f"versions or paths are missing (fact coverage {coverage:.2f}); "
+                    "keep every number, date, version and path verbatim"
+                )
+            return None
+        coverage = merge_coverage(merged_source, texts)
         if coverage < MERGE_COVERAGE_MIN:
             return (
                 "the parts do not cover the source texts — key content "
@@ -632,7 +675,17 @@ class SummaryService:
             "name, number and date must be present in the parts."
         )
 
-    @staticmethod
+    def _facts_hint(self, chars: int) -> str:
+        """The "one note = one fact" hint for splitting (Oleg's decision 11.11.2026)."""
+        limit = max(1, int(self._settings.max_note_chars))
+        return (
+            f"\n\nFACTS: the source is {chars} characters. Return ONE PART PER FACT — "
+            "as many parts as there are distinct facts in the source, each well "
+            f"under {limit} characters. Keep every number, date, version, path and "
+            "command verbatim; only the connecting prose may be tightened. "
+            "Losing a fact is a failure."
+        )
+
     @staticmethod
     def _balanced_objects(text: str) -> list[str]:
         """Every balanced JSON object/array in the answer, in order of appearance.
