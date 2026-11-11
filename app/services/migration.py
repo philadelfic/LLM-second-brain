@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, Any
 
 from app.config import Settings
 from app.services import jobs
+from app.services.judge import JudgeError
 from app.services.summary import (
     MERGE_MAX_ROUNDS,
     MergeIncompleteError,
@@ -205,6 +206,7 @@ class MigrationService:
         summarizer: "Summarizer",
         notes: "NoteService",
         warnings: "WarningsService | None" = None,
+        judge: "Judge | None" = None,
     ) -> None:
         self._settings = settings
         self._summarizer = summarizer
@@ -213,6 +215,10 @@ class MigrationService:
         # p. 4); None — test DI builds: only the journal event remains
         # (the _defer_merge_pair precedent).
         self._warnings = warnings
+        # The split verdict (Oleg's decision 11.11.2026): the source and ALL new
+        # fact-notes go to the judge; without a verdict the split is not accepted.
+        # None - test DI builds (the check is skipped, the unit tests cover it).
+        self._judge = judge
 
     # --- queue (for /health.queues and the loop) -------------------------------
 
@@ -401,6 +407,45 @@ class MigrationService:
             )
             return "retry-later"
         parts = [(part.title, part.text) for part in result.parts]
+        # The judge's verdict (Oleg's decision 11.11.2026): the source and all the
+        # new notes go to the judge - "was everything decomposed, nothing missed".
+        # A refusal is a quarantine (the note stays whole in the previous base and
+        # is retried later); an unavailable judge is a transient failure.
+        if self._judge is not None:
+            try:
+                verdict = self._judge.verify_split(text, [part_text for _t, part_text in parts])
+            except JudgeError as exc:
+                self._bump_attempt(active, old_id)
+                self._log(
+                    "migration: split verdict unavailable — note stays pending",
+                    "migration_split_verdict_failed",
+                    old_id=old_id,
+                    detail=str(exc)[:300],
+                )
+                return "retry-later"
+            if verdict is not None:
+                self._mark(
+                    active,
+                    old_id,
+                    "карантин",
+                    reason=f"судья: {verdict}"[:500],
+                    bump_attempts=True,
+                )
+                self._log(
+                    "migration: judge refused the split — note quarantined",
+                    "migration_split_rejected",
+                    old_id=old_id,
+                    detail=verdict[:300],
+                    parts=len(parts),
+                )
+                self._open_warning(old_id, f"судья: {verdict}")
+                return "quarantined"
+            self._log(
+                "migration: judge confirmed the split",
+                "migration_split_verified",
+                old_id=old_id,
+                parts=len(parts),
+            )
         # Observability (DEF-6): a slot_call for EVERY splitting call — like
         # merge/dedup (worker); the 2nd-round follow-up is visible as a separate line.
         self._log_slot_call(old_id, result)
@@ -874,6 +919,7 @@ def build_migration_job(
         summarizer=worker._summarizer,
         notes=worker._notes,
         warnings=worker._warnings,
+        judge=worker._judge,
     )
 
     async def process() -> int:
