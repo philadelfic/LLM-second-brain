@@ -115,7 +115,7 @@ MERGE_COVERAGE_MIN = 1.0
 #: (`JudgeService.verify_split`): the source and ALL parts go to it with the
 #: "nothing missed" question. Live 2026-11-11: two live splits stopped at 0.72 and
 #: 0.90 and never reached the judge — the gate was stricter than the reviewer.
-SPLIT_FACTS_MIN = 0.90
+SPLIT_FACTS_MIN = 0.85
 
 
 @dataclass(frozen=True)
