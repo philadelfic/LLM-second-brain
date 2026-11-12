@@ -122,6 +122,21 @@ MERGE_COVERAGE_MIN = 1.0
 #: 0.90 and never reached the judge — the gate was stricter than the reviewer.
 SPLIT_FACTS_MIN = 0.0
 
+#: The split's mechanical GARBAGE floor (2026-11-12): below this hard-fact
+#: coverage the parts are not "a retelling" but a loss — the migration refuses
+#: to burn the judge's call on them and quarantines the note right away. Above
+#: it (up to 1.0) the judge decides — a retelling legitimately rephrases prose
+#: (the live case of 2026-11-11: a clean split measured 0.86, the judge passed
+#: it; the blocking gate of 0.72/0.90 never let the judge speak).
+SPLIT_FACTS_FLOOR = 0.3
+
+#: The fragmentation ceiling's slack (2026-11-12): a split may return at most
+#: the arithmetic minimum (ceil(source chars / the note limit)) plus this many
+#: parts. The "one part per fact" era of 2026-11-11 fragmented one live note
+#: into 75 scraps — each part must be a self-sufficient NOTE, not a factlet;
+#: beyond the minimum + slack the model is padding, not decomposing.
+SPLIT_PARTS_SLACK = 2
+
 
 @dataclass(frozen=True)
 class MergePart:
@@ -584,7 +599,7 @@ class SummaryService:
             metas: list[ChatMeta] = []
             system = self._prompts.summary_split_system
             base_user = self._prompts.split_user.format(text=text)
-            base_user += self._facts_hint(len(text))
+            base_user += self._parts_hint(len(text))
             parts, raw, meta = self._merge_round(system, base_user, operation="split")
             metas.append(meta)
             rounds = 1
@@ -661,6 +676,20 @@ class SummaryService:
         merged_source = "\n".join(sources)
         texts = [p.text for p in parts]
         if operation == "split":
+            # The fragmentation ceiling (2026-11-12): the "one part per fact"
+            # hint fragmented a live note into 75 scraps — a part must be a
+            # self-sufficient note. Beyond the arithmetic minimum + the slack
+            # the model is padding, not decomposing.
+            limit_len = max(1, int(limit))
+            minimum = max(1, -(-len(merged_source) // limit_len))
+            if len(parts) > minimum + SPLIT_PARTS_SLACK:
+                return (
+                    f"too many parts - {len(parts)} parts for a "
+                    f"{len(merged_source)}-character source at the "
+                    f"{limit}-character limit; pack the facts DENSELY into "
+                    f"about {minimum} self-sufficient parts (a part well under "
+                    "the limit means wasted notes)"
+                )
             # one note = one fact: prose may be tightened, the fact skeleton may not
             coverage = facts_coverage(merged_source, texts)
             if coverage < SPLIT_FACTS_MIN:
@@ -697,15 +726,27 @@ class SummaryService:
             "name, number and date must be present in the parts."
         )
 
-    def _facts_hint(self, chars: int) -> str:
-        """The "one note = one fact" hint for splitting (Oleg's decision 11.11.2026)."""
+    def _parts_hint(self, chars: int) -> str:
+        """The dense-packing hint for splitting (2026-11-12).
+
+            Replaces the "ONE PART PER FACT" hint of 2026-11-11: it fragmented
+            one live note into 75 scraps of a few lines each — the parts stopped
+            being self-sufficient notes. The hint gives the exact size of the
+            source and the MINIMUM number of parts (the model is bad at
+            arithmetic under a limit) and asks for DENSE parts: a part well
+            under the limit means wasted notes, related facts belong in one
+            part unless a fact stands completely on its own.
+        """
         limit = max(1, int(self._settings.max_note_chars))
+        minimum = max(1, -(-chars // limit))
         return (
-            f"\n\nFACTS: the source is {chars} characters. Return ONE PART PER FACT — "
-            "as many parts as there are distinct facts in the source, each well "
-            f"under {limit} characters. Keep every number, date, version, path and "
+            f"\n\nSIZE: the source is {chars} characters; the note limit is {limit}. "
+            f"Return at least {minimum} part(s), each within {limit} characters. "
+            "Pack the facts DENSELY: a part well under the limit means wasted "
+            "notes — merge related facts into one part unless a fact stands "
+            "completely on its own. Keep every number, date, version, path and "
             "command verbatim; only the connecting prose may be tightened. "
-            "Losing a fact is a failure."
+            "Dropping, shortening or summarizing the content is a failure."
         )
 
     @staticmethod

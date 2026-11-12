@@ -1484,14 +1484,16 @@ class NoteService:
                 new_ids.append(part_id)
             # The source's status — in the same transaction (design §3): 'split' +
             # new_ids; an upsert — a direct call without a passed job is not lost.
+            # parts_json (the split cache) is cleared: the parts are saved, the
+            # cache has no consumer left.
             conn.execute(
                 f"INSERT INTO {MIGRATION_NOTES_TABLE} "
-                "(old_id, status, new_ids, reason, updated_at) "
-                "VALUES (?, 'нарезана', ?, NULL, "
+                "(old_id, status, new_ids, reason, parts_json, updated_at) "
+                "VALUES (?, 'нарезана', ?, NULL, NULL, "
                 "strftime('%Y-%m-%dT%H:%M:%SZ','now')) "
                 "ON CONFLICT(old_id) DO UPDATE SET "
                 "status = 'нарезана', new_ids = excluded.new_ids, "
-                "reason = NULL, updated_at = excluded.updated_at",
+                "reason = NULL, parts_json = NULL, updated_at = excluded.updated_at",
                 (old_id, json.dumps(new_ids)),
             )
         self._notify_summary_pending()

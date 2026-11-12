@@ -133,20 +133,93 @@ class Judge(Protocol):
         ...
 
 
-#: The split verdict (Oleg's decision of 2026-11-11): the source note and ALL
-#: fact-notes it was split into go to the judge with one question - was anything
-#: from the source lost. Not a prompt file: a hardwired constant like the other
-#: judge strings.
+#: The split verdict (Oleg's decision of 2026-11-11; batched 2026-11-12): the
+#: source note and the fact-notes it was split into go to the judge with one
+#: question - was anything from the source lost. Not a prompt file: a
+#: hardwired constant like the other judge strings. The wording covers BOTH
+#: verification shapes: the whole source (a short note — one batch) and a
+#: SEGMENT of a long note (the source is cut into overlapping segments, each
+#: verified with its parts separately — the whole source plus all parts in one
+#: prompt exploded on real notes: 75 fragments of one source, a giant prompt,
+#: timeouts instead of a verdict).
 SPLIT_VERDICT_SYSTEM = (
-    "You check how one long note was decomposed into notes. You are given the "
-    "SOURCE note and the NOTES it was split into. Check ONLY one thing: whether "
-    "every fact of the source - names, numbers, dates, statuses, configs, paths, "
-    "decisions - is present in the notes, and nothing is lost or distorted. "
-    "Rewording, splitting into pieces of different sizes and changing the shape of "
-    "the text are NOT losses; a missing or changed fact IS. "
-    "Answer with exactly one line, no explanations: COMPLETE - if nothing is lost; "
-    "MISSING: <what exactly is lost> - otherwise."
+    "You check how a long note was decomposed into notes. You are given a part "
+    "of the SOURCE (the whole source if it is short) and the NOTES made from "
+    "it. Check ONLY one thing: whether every fact of this source part - names, "
+    "numbers, dates, statuses, configs, paths, decisions - is present in the "
+    "notes, and nothing is lost or distorted. Rewording, splitting into pieces "
+    "of different sizes and changing the shape of the text are NOT losses; a "
+    "missing or changed fact IS. Answer with exactly one line, no explanations: "
+    "COMPLETE - if nothing is lost; MISSING: <what exactly is lost> - otherwise."
 )
+
+
+def plan_split_verification(
+    source: str,
+    parts: list[str],
+    *,
+    segment_chars: int,
+    overlap_chars: int,
+) -> list[tuple[str, list[str]]]:
+    """The (source segment, its parts) batches for the split verdict.
+
+            A source not longer than `segment_chars` — ONE batch (the former
+            behavior verbatim: the whole source + all parts). A longer source
+            is cut into segments of `segment_chars` with a border cushion (at
+            most a quarter of the segment, see the code — a border fact is
+            judged with its full sentence on one of the sides), and every part
+            is assigned to the segment holding its estimated position — the
+            cumulative share of the parts' length.
+
+            A segment may get NO parts (the model dropped that stretch of the
+            source): the batch still goes to the judge with an empty note list
+            — a MISSING verdict is how the loss surfaces.
+
+            Raises:
+                ValueError: an empty source/parts list or a non-positive
+                    `segment_chars` (the caller validates, the pure function
+                    stays honest).
+    """
+    if not source or not source.strip():
+        raise ValueError("plan_split_verification: пустой источник")
+    if not parts:
+        raise ValueError("plan_split_verification: пустой список частей")
+    if segment_chars < 1:
+        raise ValueError(
+            f"segment_chars должен быть ≥ 1, получено {segment_chars}"
+        )
+    if len(source) <= segment_chars:
+        return [(source, list(parts))]
+
+    # The border cushion: at most a quarter of the segment (and never the
+    # whole `overlap_chars` — a note limit close to the segment size would
+    # otherwise make the windows crawl: overlap → segment-1, no progress).
+    overlap = max(0, min(overlap_chars, segment_chars // 4))
+    segments: list[tuple[int, int]] = []
+    start = 0
+    total = len(source)
+    while True:
+        end = min(start + segment_chars, total)
+        segments.append((start, end))
+        if end >= total:
+            break
+        start = end - overlap
+
+    parts_chars = sum(len(part) for part in parts)
+    total_chars = max(parts_chars, 1)
+    batches: list[list[str]] = [[] for _ in segments]
+    seen = 0.0
+    for part in parts:
+        # The part's estimated midpoint in the source: the parts' cumulative
+        # length share mapped onto the source length.
+        midpoint = (seen + len(part) / 2.0) / total_chars * total
+        seen += len(part)
+        index = next(
+            (j for j, (_, end) in enumerate(segments) if midpoint < end),
+            len(segments) - 1,
+        )
+        batches[index].append(part)
+    return [(source[s:e], batches[k]) for k, (s, e) in enumerate(segments)]
 
 
 class JudgeService:
@@ -274,19 +347,45 @@ class JudgeService:
         """The split verdict: None — nothing is lost, else the judge's reason.
 
             Oleg's decision of 2026-11-11: the split is accepted only after the
-            judge looks at the source and ALL the new notes and confirms that
+            judge looks at the source and the new notes and confirms that
             everything was decomposed and nothing was missed. Always the
             generative path: the decision slot is schema-bounded (8k context,
             64 KiB input) and cannot take a long note plus its parts.
+
+            Batched (2026-11-12): the source plus ALL parts in ONE call exploded
+            on real notes — the "one part per fact" era fragmented one note into
+            75 scraps, the judge's prompt became a wall of text, the verdict did
+            not arrive. Now the source is verified segment by segment
+            (`plan_split_verification`, the segment size —
+            `settings.split_verify_segment_chars`): every batch answers
+            COMPLETE/MISSING, the FIRST MISS is the verdict. The batches are
+            sequential — one slot call at a time, the slot delimiter of the
+            migration job paces the load.
         """
         if not source or not source.strip():
             raise ValueError("verify_split: пустой источник")
         if not parts:
             raise ValueError("verify_split: пустой список частей")
+        batches = plan_split_verification(
+            source,
+            parts,
+            segment_chars=int(self._settings.split_verify_segment_chars),
+            overlap_chars=int(self._settings.max_note_chars),
+        )
+        for segment, batch_parts in batches:
+            verdict = self._verify_split_batch(segment, batch_parts)
+            if verdict is not None:
+                return verdict
+        return None
+
+    def _verify_split_batch(self, segment: str, parts: list[str]) -> str | None:
+        """One verification batch: a source segment + the parts made from it."""
         listing = "\n\n".join(
             f"NOTE {number}:\n{text}" for number, text in enumerate(parts, start=1)
         )
-        user_text = f"SOURCE:\n{source}\n\nNOTES:\n{listing}"
+        if not parts:
+            listing = "(no notes were provided for this part of the source)"
+        user_text = f"SOURCE:\n{segment}\n\nNOTES:\n{listing}"
         try:
             result = self._llm.chat_result(
                 SPLIT_VERDICT_SYSTEM, user_text, operation="judge"
