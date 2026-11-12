@@ -877,6 +877,23 @@ class Settings(BaseSettings):
         need_low("slot_prompt_reserve_tokens", self.slot_prompt_reserve_tokens, 1)
         need_low("slot_max_output_tokens", self.slot_max_output_tokens, 1)
         need_low("judge_timeout_sec", self.judge_timeout_sec, 1)
+        # Думающий судья без бюджета — фатально (живой сбой 12.11.2026): при
+        # JUDGE_CONTEXT_TOKENS=0 авто-бюджет (JUDGE_NUM_PREDICT=0) деградирует к
+        # прошлой капе операции judge — 256 токенов (slot_budget.LEGACY_OUTPUT_BUDGET).
+        # Рассуждающая модель сжигает все 256 токенов на размышление, вердикт не
+        # выходит (content пустой, done_reason=length), каждый вызов — OFF_CONTRACT.
+        # NFR-6: отказываемся стартовать с читаемым сообщением вместо тихой деградации.
+        if (
+            self.judge_think
+            and self.judge_num_predict == 0
+            and self.judge_context_tokens == 0
+        ):
+            errors.append(
+                "  - judge: думающий судья (JUDGE_THINK=true) без явного бюджета и "
+                "объявленного контекста — авто-бюджет деградирует до 256 токенов и "
+                "рассуждение съедает ответ; задай JUDGE_NUM_PREDICT (например, 4096) "
+                "или JUDGE_CONTEXT_TOKENS"
+            )
         # LSBN-T-33: a reasoning budget of 0 = "as much as fits" (auto), hence
         # the minimum 0; operation-level None = "not set" — checked below.
         need_low("slot_reasoning_num_predict", self.slot_reasoning_num_predict, 0)

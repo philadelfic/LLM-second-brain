@@ -48,9 +48,14 @@ services:
       JUDGE_MODEL: "ornith:35b"                # dedup judge model
       JUDGE_MODEL_TYPE: "generation"   # reasoning | generation; declare reasoning to get the budget and thinking guards
       JUDGE_THINK: "true"              # thinking judge: think:false produced false positives on long notes (E2E); ollama provider only
-      JUDGE_NUM_PREDICT: "0"           # 0 = as much as fits (auto budget from JUDGE_CONTEXT_TOKENS); explicit values keep the old caps (1024)
+      # При думающем судье явный бюджет ОБЯЗАТЕЛЕН: с JUDGE_CONTEXT_TOKENS=0 авто-бюджет
+      # (0) деградирует к прошлой капе операции judge — 256 токенов, рассуждение съедает
+      # весь ответ и вердикт не выходит (живой сбой 12.11.2026: пустой content у каждого
+      # вызова, дедуп встал, нарезка миграции крутилась впустую). 4096 — с запасом на
+      # вердикт нарезки "MISSING: <что именно потеряно>"; дедуп-вердикт — одна строка.
+      JUDGE_NUM_PREDICT: "4096"
       JUDGE_TIMEOUT_SEC: "300"         # thinking judge: long pair 46 s, worst live call ~121 s (E2E) — 300 s with margin; 900 = the back-off/pause ceiling (15 min): a single call must not hold the slot longer than the job cycle is willing to wait
-      JUDGE_CONTEXT_TOKENS: "0"        # the model's context window; 0 = unknown → previous per-operation caps
+      JUDGE_CONTEXT_TOKENS: "0"        # the model's context window; 0 = unknown → previous per-operation caps (не используется при явном JUDGE_NUM_PREDICT)
       # --- decision slot (LSBN-F-12, 3.2.0): OFF by default; decisions go
       #     generative as today. decision needs Ollama ≥ 0.35.1: the route is
       #     native /v1/systemone, NOT OpenAI-compatible. When enabled, all
