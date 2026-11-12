@@ -56,6 +56,10 @@ def dim8(tmp_path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     monkeypatch.setenv("EMBEDDING_DIM", "8")
     monkeypatch.setenv("PENDING_RETRY_SEC", "0")
+    # LSBN-T-37 (3.6.3): этот набор проверяет модельный путь выжимки — правило
+    # короткого текста здесь выключено; его собственный набор —
+    # tests/test_summary_short.py.
+    monkeypatch.setenv("SUMMARY_SHORT_TEXT_CHARS", "0")
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
@@ -293,6 +297,8 @@ def test_merge_verdict_uses_dedup_similarity_env(tmp_path, monkeypatch) -> None:
         "DB_PATH": str(tmp_path / "notes.db"),
         "EMBEDDING_DIM": "8",
         "PENDING_RETRY_SEC": "0",
+        # LSBN-T-37: модельный путь выжимки, правило короткого текста выключено.
+        "SUMMARY_SHORT_TEXT_CHARS": "0",
         "DEDUP_SIMILARITY": "0.99",
     }.items():
         monkeypatch.setenv(name, value)

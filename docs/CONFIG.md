@@ -174,6 +174,7 @@ code defect; give such operations a larger budget or a generation model.
 | Variable | Default | Meaning |
 |---|---|---|
 | `MAX_SUMMARY_CHARS` | `150` | summary length limit: model summary is capped at a word boundary, the pending-note fallback is the first N characters (gate 3.1.0, 2026-09-19) |
+| `SUMMARY_SHORT_TEXT_CHARS` | `400` | a note not longer than N characters is summarized by its own text — the model is not called at all; the result is cut by the same `MAX_SUMMARY_CHARS` cap (`0` — the rule is off, every note takes the model path; LSBN-T-37, 3.6.3) |
 | `SUMMARY_THINK` | `true` | allow summarizer reasoning (ollama only) |
 | `SUMMARY_NUM_PREDICT` | `35000` | generation cap for the summary |
 | `MERGE_NUM_PREDICT` | `35000` | generation cap for dedup merge |

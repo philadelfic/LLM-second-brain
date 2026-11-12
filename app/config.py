@@ -105,6 +105,12 @@ class Settings(BaseSettings):
     # fallback truncation of the note text in outputs (emit.py, while
     # summary_status != 'ok'). The earlier 200 was a fallback-only limit.
     max_summary_chars: int = 150
+    # LSBN-T-37 (3.6.3): a note not longer than this many characters is
+    # summarized by its own text — the model is not called at all (a
+    # 100-character note summarized "in other words" only burns the slot).
+    # 0 — the rule is off: every note takes the model path as before.
+    # Deliberately NOT in `slot_config_fingerprint`: no slot changes.
+    summary_short_text_chars: int = 400
     summary_think: bool = True  # when false the call carries "think": false
     # No49 (arch §13.1): reasoning | generation — affects the budget, the
     # thinking-flag treatment and startup warnings (not the request body).
@@ -737,6 +743,8 @@ class Settings(BaseSettings):
         need_range("max_note_chars", self.max_note_chars, 500, 20000)
         need_low("max_query_chars", self.max_query_chars, 1)
         need_low("max_summary_chars", self.max_summary_chars, 1)
+        # LSBN-T-37: 0 — the short-note rule is off (a legitimate value).
+        need_range("summary_short_text_chars", self.summary_short_text_chars, 0, 5000)
         need_low("comment_max_chars", self.comment_max_chars, 1)
         need_low("snippet_chars", self.snippet_chars, 1)
         need_low("max_get_batch", self.max_get_batch, 1)

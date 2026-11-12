@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.6.3] - 2026-11-12
+
+Release 3.6.3 — "Short notes summarize themselves": a note that fits in
+`SUMMARY_SHORT_TEXT_CHARS` characters no longer waits for the summary model —
+its summary is its own text, so the summary queue stops being eternal on the
+parts of split notes.
+
+### Added
+
+* **`SUMMARY_SHORT_TEXT_CHARS` (`LSBN-T-37`)** — the short-note threshold
+  (default `400`, range `0..5000`; `0` — the rule is off, every note takes the
+  model path as before). The journal gets one `summary_shortcircuit` event per
+  note (`note_id`, `text_chars`, `summary_chars`). The parameter is not part of
+  the slot-configuration fingerprint — it changes no slot.
+
+### Changed
+
+* **Short notes do not spend the model** — the worker takes the summary of a
+  note not longer than the threshold from the text itself: the same
+  `cap_summary` cut (`MAX_SUMMARY_CHARS`, word boundary) and the same guarded
+  `UPDATE ... WHERE summary_status = 'pending' AND text = ?`, `summary_status`
+  goes to `ok` without a single slot call. On prod that is nearly all of it — 2855 short notes
+  (the parts of split notes, median ~102 characters).
+
+### Fixed
+
+* **The summary queue no longer grows eternal on the parts of split notes** —
+  a pass used to take ~32 notes and go to sleep on the back-off, leaving ~3000
+  pending tasks behind; the short ones now leave the queue in one pass without
+  touching the slot.
+
 ## [3.6.2] - 2026-11-12
 
 Release 3.6.2 — "Parts of one note are not duplicates": the background dedup no

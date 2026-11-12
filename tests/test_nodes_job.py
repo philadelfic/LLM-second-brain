@@ -845,7 +845,9 @@ def test_summary_ready_wakes_nodes_event(settings: Settings) -> None:
 def test_summary_failure_does_not_wake_nodes(settings: Settings) -> None:
     """Отказ суммаризации: сигнала нет, задание `reclass` ждёт по back-off (NFR-3)."""
     NamespaceService(settings).create("work", "Рабочие заметки.")
-    _seed_unmarked(settings, [(1, "объединённая заметка", "work", "pending")])
+    # LSBN-T-37: текст длиннее порога короткой выжимки — заметка идёт в модель.
+    long_text = "объединённая заметка: " + "детали слияния и решения по встрече. " * 12
+    _seed_unmarked(settings, [(1, long_text, "work", "pending")])
     worker = BackgroundWorker(settings, HashEmbedder(DIM), FailingSummarizer())
     _enqueue_reclass(worker, 1)
     spec = nodes_spec(worker, settings)
