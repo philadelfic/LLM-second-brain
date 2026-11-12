@@ -35,6 +35,10 @@ def settings(tmp_path, monkeypatch: pytest.MonkeyPatch):
     """БД без сид-записей: очереди наполняет только сам тест."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
+    # LSBN-T-37 (3.6.3): этот набор проверяет модельный путь выжимки — правило
+    # короткого текста здесь выключено; его собственный набор —
+    # tests/test_summary_short.py.
+    monkeypatch.setenv("SUMMARY_SHORT_TEXT_CHARS", "0")
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
@@ -285,7 +289,7 @@ def test_health_returns_queues_with_pending_work(client, token) -> None:
     """
     client.post(
         "/notes",
-        json={"text": "заметка для наблюдаемости очередей", "title": "Заметка очереди"},
+        json={"text": "заметка для наблюдаемости очередей: снимок очередей и старейшая заметка ждёт; снимок очередей и старейшая заметка ждёт; снимок очередей и старейшая заметка ждёт; снимок очередей и старейшая заметка ждёт; снимок очередей и старейшая заметка ждёт; снимок очередей и старейшая заметка ждёт; снимок очередей и старейшая заметка ждёт; снимок очередей и старейшая заметка ждёт; снимок очередей и старейшая заметка ждёт; снимок очередей и старейшая заметка ждёт; снимок очередей и старейшая заметка ждёт; снимок очередей и старейшая заметка ждёт; ", "title": "Заметка очереди"},
         headers={"Authorization": f"Bearer {token}"},
     )
     body = client.get("/health").json()

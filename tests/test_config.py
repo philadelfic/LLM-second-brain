@@ -44,6 +44,9 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "EMBEDDING_BATCH_SIZE": ("embedding_batch_size", 32),
     "EMBEDDING_CONCURRENT_REQUESTS": ("embedding_concurrent_requests", 3),
     "MAX_SUMMARY_CHARS": ("max_summary_chars", 150),
+    # LSBN-T-37 (3.6.3): короткая заметка — выжимка из своего текста, без модели
+    # (0 — правило выключено, все идут модельным путём).
+    "SUMMARY_SHORT_TEXT_CHARS": ("summary_short_text_chars", 400),
     "SNIPPET_CHARS": ("snippet_chars", 120),
     "MAX_GET_BATCH": ("max_get_batch", 20),
     "SUMMARY_THINK": ("summary_think", True),
@@ -296,7 +299,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 252 поля: 6 обязательных + 246 с умолчаниями
+        """В Settings — ровно 253 поля: 6 обязательных + 247 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
@@ -321,7 +324,9 @@ class TestCompleteness:
         SUMMARIZE_/TITLE_/MERGE_/SPLIT_/CLASSIFY_/DESCRIBE_/
         STRUCTURE_JUDGE_/EMBED_* (MERGE_NUM_PREDICT уже был)
         + 1 операторский тормоз фонового дедупа LSBN-D-14 релиза 3.6.2:
-        DEDUP_ENABLED)."""
+        DEDUP_ENABLED
+        + 1 порог короткой выжимки LSBN-T-37 релиза 3.6.3:
+        SUMMARY_SHORT_TEXT_CHARS)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

@@ -2973,6 +2973,12 @@ class BackgroundWorker:
                     only point where a model summary is written, so the limit does not
                     depend on the model's discipline.
 
+                    The short-note short-circuit (LSBN-T-37, 3.6.3): a note not longer
+                    than SUMMARY_SHORT_TEXT_CHARS (0 — the rule is off) needs no model —
+                    its summary is its own text, cut by the same `cap_summary` and saved
+                    by the same guarded UPDATE; the journal gets one `summary_shortcircuit`
+                    event per note (note_id, text_chars, summary_chars).
+
                     The summary's actual readiness — a signal to the neighboring loop
                     (modeled on `notify_links_pending` after vectorization, the
                     2026-09-20 gate decision): if at least one batch note was actually
@@ -2998,34 +3004,58 @@ class BackgroundWorker:
                 (batch,),
             ).fetchall()
         done = 0
+        short_chars = self._settings.summary_short_text_chars
         for row in rows:
-            try:
-                summary_result = self._summarizer.summarize(row["text"])
-            except SummaryError as exc:
-                self._log_slot_failure(
-                    SUMMARY_JOB,
-                    SLOT_SUMMARY,
-                    outcome_of(exc),
-                    event="summary_failed",
-                    message="summary: generation failed — kept pending, retry by back-off",
-                    note_id=row["id"],
-                    detail=str(exc),
-                    meta=getattr(exc, "meta", None),
+            text = row["text"]
+            if short_chars > 0 and len(text) <= short_chars:
+                # LSBN-T-37 (3.6.3): the summary of a short note is its own text —
+                # a model has nothing to add to 100 characters "in other words",
+                # it only burns the slot. The write path below is shared, so the
+                # cap, the race guard and the readiness signal stay one.
+                summary = cap_summary(text, self._settings.max_summary_chars)
+                logging.getLogger("app").info(
+                    "summary: short note — summarized without a model call",
+                    extra={
+                        "event": "summary_shortcircuit",
+                        "job": SUMMARY_JOB,
+                        "note_id": row["id"],
+                        "text_chars": len(text),
+                        "summary_chars": len(summary),
+                    },
                 )
-                if outcome_of(exc) in _BATCH_ABORT_OUTCOMES:
-                    # transient/auth: release the batch; the rest — a retry on
-                    # back-off (the migration retry-later precedent).
-                    break
-                continue  # failure: the pending status stays, a retry on back-off
-            self._log_slot_call(
-                SUMMARY_JOB, SLOT_SUMMARY, summary_result.meta, note_id=row["id"]
-            )
-            # The length safety net (the 3.1.0 gate decision, 2026-09-19): the model may
-            # ignore the prompt ("no more than 150 characters") — what reaches the DB is
-            # a summary truncated at a word boundary, always ≤ MAX_SUMMARY_CHARS.
-            summary = cap_summary(
-                summary_result.text, self._settings.max_summary_chars
-            )
+            else:
+                try:
+                    summary_result = self._summarizer.summarize(text)
+                except SummaryError as exc:
+                    self._log_slot_failure(
+                        SUMMARY_JOB,
+                        SLOT_SUMMARY,
+                        outcome_of(exc),
+                        event="summary_failed",
+                        message=(
+                            "summary: generation failed — kept pending, "
+                            "retry by back-off"
+                        ),
+                        note_id=row["id"],
+                        detail=str(exc),
+                        meta=getattr(exc, "meta", None),
+                    )
+                    if outcome_of(exc) in _BATCH_ABORT_OUTCOMES:
+                        # transient/auth: release the batch; the rest — a retry on
+                        # back-off (the migration retry-later precedent).
+                        break
+                    continue  # failure: the pending status stays, a retry on back-off
+                self._log_slot_call(
+                    SUMMARY_JOB, SLOT_SUMMARY, summary_result.meta, note_id=row["id"]
+                )
+                # The length safety net (the 3.1.0 gate decision, 2026-09-19): the
+                # model may ignore the prompt ("no more than 150 characters") — what
+                # reaches the DB is a summary truncated at a word boundary, always
+                # ≤ MAX_SUMMARY_CHARS. The short-note branch above goes through the
+                # same cap: one rule for both sources.
+                summary = cap_summary(
+                    summary_result.text, self._settings.max_summary_chars
+                )
             with session(self._settings) as conn, transaction(conn):
                 cursor = conn.execute(
                     "UPDATE notes SET summary = ?, summary_status = 'ok' "
