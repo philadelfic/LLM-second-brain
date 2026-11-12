@@ -74,6 +74,12 @@
     notify wakes the summary loop; save/update do not vectorize synchronously —
     vectorization is background (the embedding loop).
 
+    Dedup and ONE source (3.6.2, LSBN-D-14): the parts of a split are not
+    duplicates of each other - the own origin group is dropped by the candidate
+    prefilter (`find_candidates`), the merge path carries the same barrier, and a
+    frozen pair of one source is closed, not released (see process_merge_pending
+    and _review_attention_jobs).
+
     Title generation (decision #9): notes with `title IS NULL` (only migration
     ones — new notes always have a title) → a thinking call of the summary slot
     (think per the flag, like summarization); the result is trimmed to
@@ -1305,6 +1311,9 @@ class BackgroundWorker:
                     The "pair edit" protocol without manual edits: an edit of the
                     note/candidate or a new best candidate returns the job to the queue
                     (`attempts=0`); the verdict/merge decision is made by the next run.
+                    LSBN-D-14 (3.6.2): a frozen merge pair of ONE source is CLOSED here
+                    (`_mark_job_done` + `dedup_skipped`), not released - the reason is
+                    gone for good, and a release would freeze the pair again.
                     SQL and vector reads only — no models called. Returns the unfrozen
                     count.
         """
@@ -1322,7 +1331,7 @@ class BackgroundWorker:
             note_id = int(row["note_id"])
             with session(self._settings) as conn:
                 note = conn.execute(
-                    "SELECT id, namespace, vector_status, deleted_at, updated_at "
+                    "SELECT id, namespace, vector_status, deleted_at, updated_at, origin_note_id "
                     "FROM notes WHERE id = ?",
                     (note_id,),
                 ).fetchone()
@@ -1346,10 +1355,32 @@ class BackgroundWorker:
             if older_id is not None:
                 with session(self._settings) as conn:
                     other = conn.execute(
-                        "SELECT deleted_at, updated_at FROM notes WHERE id = ?",
+                        "SELECT deleted_at, updated_at, origin_note_id FROM notes WHERE id = ?",
                         (int(older_id),),
                     ).fetchone()
                 if other is None or other["deleted_at"] is not None:
+                    continue
+                if (
+                    note["origin_note_id"] is not None
+                    and note["origin_note_id"] == other["origin_note_id"]
+                ):
+                    # 3.6.2 (LSBN-D-14): the reason is gone for good - the pair is two
+                    # parts of ONE source (the verdict and the merge rule read the same
+                    # way). CLOSED, not released: a released pair returns to the queue,
+                    # is skipped there and freezes again - the frozen counter of
+                    # /health.queues would count it forever.
+                    logging.getLogger("app").info(
+                        "dedup: frozen pair closed — one source",
+                        extra={
+                            "event": "dedup_skipped",
+                            "job": self._job_for_slot(slot),
+                            "note_id": note_id,
+                            "older_id": int(older_id),
+                            "reason": "same origin",
+                            "detail": "the reason is gone: the pair is one source",
+                        },
+                    )
+                    self._mark_job_done(int(row["id"]))
                     continue
                 if (
                     payload.get("older_updated_at") is not None
@@ -1758,11 +1789,18 @@ class BackgroundWorker:
             ).fetchall()
 
     def _mark_job_done(self, job_id: int) -> None:
-        """Mark a job done (removed from the queue)."""
+        """Mark a job done (removed from the queue).
+
+                    A closed task is not waiting for a human (3.6.2, LSBN-D-14): the
+                    attention state is cleared together with the status - a frozen pair
+                    closed for good (`_review_attention_jobs`) must leave both
+                    `/health.queues.*.attention` and the operator handle
+                    `GET /jobs/attention` (both read `attention_at`).
+        """
         self._ensure_job_table()
         with session(self._settings) as conn, transaction(conn):
             conn.execute(
-                "UPDATE worker_jobs SET status = 'done', "
+                "UPDATE worker_jobs SET status = 'done', attention_at = NULL, "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
                 "WHERE id = ?",
                 (job_id,),
@@ -2280,6 +2318,10 @@ class BackgroundWorker:
                     A note with a timer (TTL, no46-03) — also released, but BEFORE the
                     judge and without model calls (a `dedup_skipped` event,
                     reason="note has a lifetime").
+                    A part of a split (3.6.2, LSBN-D-14): the candidates of the OWN
+                    origin group are dropped by the prefilter (find_candidates) - the
+                    parts of one source never reach the judge and never create a merge
+                    job.
         """
         # The "pair edit" protocol: frozen jobs are rechecked without
         # a model call — the gone reason unfreezes them (arch §6.8).
@@ -2448,6 +2490,11 @@ class BackgroundWorker:
                     path never reaches here — the judge loop does not process such a
                     note).
 
+                    LSBN-D-14 (3.6.2), the third barrier: a pair of ONE source (both
+                    notes carry the same non-NULL `origin_note_id` - the parts of one
+                    split) is never merged: the parts are legitimate neighbours by
+                    construction, merging them back loses content. The job is
+                    released, a `dedup_skipped` event (reason="same origin").
                     A merge failure (SummaryError, NFR-3) does not spoil the data: both
                     notes stay, the work stays pending — a retry on the summary loop's
                     back-off.
@@ -2476,7 +2523,7 @@ class BackgroundWorker:
                 continue
             with session(self._settings) as conn:
                 rows = conn.execute(
-                    "SELECT id, text, deleted_at, updated_at, expires_at "
+                    "SELECT id, text, deleted_at, updated_at, expires_at, origin_note_id "
                     "FROM notes "
                     "WHERE id IN (?, ?)",
                     (older_id, note_id),
@@ -2505,6 +2552,28 @@ class BackgroundWorker:
                         "older_id": older_id,
                         "note_id": note_id,
                         "reason": "note has a lifetime",
+                    },
+                )
+                self._mark_job_done(job["id"])
+                done += 1
+                continue
+            if (
+                older["origin_note_id"] is not None
+                and older["origin_note_id"] == newer["origin_note_id"]
+            ):
+                # 3.6.2 (LSBN-D-14), the barrier of the merge path: a pair of ONE source
+                # (both notes carry the same non-NULL `origin_note_id` - the parts of one
+                # split) is never merged - the parts are legitimate neighbours by
+                # construction, merging them back loses content. The job is released and
+                # an observable dedup_skipped follows, as for all non-candidate classes.
+                logging.getLogger("app").info(
+                    "dedup: merge skipped — one source",
+                    extra={
+                        "event": "dedup_skipped",
+                        "job": SUMMARY_JOB,
+                        "older_id": older_id,
+                        "note_id": note_id,
+                        "reason": "same origin",
                     },
                 )
                 self._mark_job_done(job["id"])

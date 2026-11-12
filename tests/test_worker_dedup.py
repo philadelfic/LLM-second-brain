@@ -28,6 +28,7 @@ judge-работа остаётся pending, повтор по back-off (NFR-3).
 
 from __future__ import annotations
 
+import json
 import logging
 
 import pytest
@@ -47,7 +48,7 @@ from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
 from app.services.warnings import WarningsService
 from app.services.worker import BackgroundWorker
-from app.storage.db import init_db, session
+from app.storage.db import init_db, session, transaction
 
 
 @pytest.fixture
@@ -613,3 +614,177 @@ def test_merge_incomplete_defers_pair_with_warning(dim8, caplog) -> None:
     assert '"newer_id": 2' in warning["payload"]
     # Повторный прогон не находит работы: пара отложена, не зацикливается.
     assert worker.process_merge_pending() == 0
+
+
+# --- пара одного исходника: барьер merge-пути (LSBN-D-14, 3.6.2) --------------
+
+
+def _origin_parts(notes: NoteService, count: int) -> list[int]:
+    """Части одной нарезки: у всех origin_note_id — id исходника (999)."""
+    saved = notes.save_migration_parts(
+        999,
+        "default",
+        [
+            (f"часть {index}", f"текст части {index} про бэкапы кластера")
+            for index in range(count)
+        ],
+    )
+    return [int(part["id"]) for part in saved["parts"]]
+
+
+def _merge_job(
+    worker: BackgroundWorker, settings, note_id: int, older_id: int
+) -> int:
+    """Merge-работа в очереди summary — как её ставит judge-петля."""
+    worker._create_job(
+        "summary", "merge", note_id, payload=json.dumps({"older_id": older_id})
+    )
+    with session(settings) as conn:
+        row = conn.execute(
+            "SELECT id FROM worker_jobs WHERE slot = 'summary' AND kind = 'merge' "
+            "AND note_id = ? ORDER BY id DESC",
+            (note_id,),
+        ).fetchone()
+    assert row is not None
+    return int(row["id"])
+
+
+def _freeze_job(settings, job_id: int, attempts: int = 5) -> None:
+    """Вморозить работу: attention_at IS NOT NULL (исчерпан счётчик попыток)."""
+    with session(settings) as conn, transaction(conn):
+        conn.execute(
+            "UPDATE worker_jobs SET attempts = ?, "
+            "attention_at = '2026-01-01T00:00:00Z' WHERE id = ?",
+            (attempts, job_id),
+        )
+
+
+def _job_state(settings, job_id: int) -> dict:
+    with session(settings) as conn:
+        row = conn.execute(
+            "SELECT status, attention_at, attempts FROM worker_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+    return dict(row) if row is not None else {}
+
+
+def _skipped_records(caplog) -> list:
+    """Лог-записи event=dedup_skipped (наблюдаемость барьеров слияния)."""
+    return [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "dedup_skipped"
+    ]
+
+
+def test_merge_job_of_one_source_is_skipped(dim8, caplog) -> None:
+    """Барьер merge-пути (3.6.2): пара одного исходника не сливается.
+
+    Обе заметки — части одной нарезки (общий non-NULL origin_note_id): работа
+    снимается без вызова модели (`merge_calls == []`), задача — `done`, в журнале
+    `dedup_skipped` с reason="same origin"; обе части живы.
+    """
+    notes = NoteService(dim8, FailingEmbedder())
+    older_id, note_id = _origin_parts(notes, 2)
+    summarizer = FixedSummarizer("Фикс-суммари.", merged="слитый текст")
+    worker = BackgroundWorker(dim8, HashEmbedder(8), summarizer)
+    job_id = _merge_job(worker, dim8, note_id, older_id)
+    with caplog.at_level(logging.INFO, logger="app"):
+        assert worker.process_merge_pending() == 1
+    assert summarizer.merge_calls == []  # модель не позвана
+    assert _job_state(dim8, job_id)["status"] == "done"
+    events = _skipped_records(caplog)
+    assert len(events) == 1
+    assert events[0].reason == "same origin"
+    assert events[0].job == "summary"
+    assert events[0].older_id == older_id and events[0].note_id == note_id
+    with session(dim8) as conn:
+        rows = conn.execute(
+            "SELECT id, deleted_at FROM notes ORDER BY id"
+        ).fetchall()
+    assert [row["id"] for row in rows] == [older_id, note_id]  # часть не родилась
+    assert all(row["deleted_at"] is None for row in rows)  # обе части живы
+
+
+def test_merge_job_without_origin_merges_as_before(dim8, caplog) -> None:
+    """Обратная совместимость: origin_note_id IS NULL — прежнее поведение."""
+    texts = ["первая отложенная заметка", "вторая отложенная заметка"]
+    notes = NoteService(dim8, FailingEmbedder())
+    for text in texts:
+        notes.save(text)
+    summarizer = FixedSummarizer("Фикс-суммари.", merged="слитый текст")
+    worker = BackgroundWorker(dim8, HashEmbedder(8), summarizer)
+    job_id = _merge_job(worker, dim8, 2, 1)
+    with caplog.at_level(logging.INFO, logger="app"):
+        assert worker.process_merge_pending() == 1
+    assert summarizer.merge_calls == [(texts[0], texts[1])]
+    assert _skipped_records(caplog) == []  # барьер не срабатывает
+    assert _job_state(dim8, job_id)["status"] == "done"
+    with session(dim8) as conn:
+        rows = conn.execute(
+            "SELECT id, text, origin_note_id, deleted_at FROM notes ORDER BY id"
+        ).fetchall()
+    assert len(rows) == 3  # две исходные + часть слияния
+    assert rows[0]["origin_note_id"] is None  # обычные заметки без группы
+    assert rows[1]["origin_note_id"] is None
+    assert rows[0]["deleted_at"] is not None
+    assert rows[1]["deleted_at"] is not None
+    assert rows[2]["text"] == "слитый текст"
+    assert rows[2]["deleted_at"] is None
+
+
+@pytest.mark.parametrize("part_first", [True, False])
+def test_merge_job_mixed_origins_not_blocked(dim8, part_first: bool) -> None:
+    """Правило про РАВНЫЕ группы: один NULL, другой non-NULL — не блокируем."""
+    notes = NoteService(dim8, FailingEmbedder())
+    texts: dict[int, str] = {}
+    if part_first:
+        part_id = _origin_parts(notes, 1)[0]
+        texts[part_id] = "текст части 0 про бэкапы кластера"
+        ordinary_id = int(notes.save("обычная заметка про бэкапы")["id"])
+        texts[ordinary_id] = "обычная заметка про бэкапы"
+    else:
+        ordinary_id = int(notes.save("обычная заметка про бэкапы")["id"])
+        texts[ordinary_id] = "обычная заметка про бэкапы"
+        part_id = _origin_parts(notes, 1)[0]
+        texts[part_id] = "текст части 0 про бэкапы кластера"
+    older_id, note_id = sorted((part_id, ordinary_id))
+    summarizer = FixedSummarizer("Фикс-суммари.", merged="слитый текст")
+    worker = BackgroundWorker(dim8, HashEmbedder(8), summarizer)
+    _merge_job(worker, dim8, note_id, older_id)
+    assert worker.process_merge_pending() == 1
+    assert summarizer.merge_calls == [(texts[older_id], texts[note_id])]
+
+
+def test_frozen_merge_job_of_one_source_is_closed(dim8, caplog) -> None:
+    """Вмороженная пара одного исходника закрывается при перепроверке.
+
+    `_review_attention_jobs` (без моделей) снимает merge-работу с общим
+    non-NULL origin: status='done', attention_at очищен — счётчик attention
+    слота summary (`/health.queues`) не считает её вечно, пара не
+    «освобождается» и не замерзает снова; обе части живы.
+    """
+    notes = NoteService(dim8, FailingEmbedder())
+    older_id, note_id = _origin_parts(notes, 2)
+    summarizer = FixedSummarizer("Фикс-суммари.", merged="слитый текст")
+    worker = BackgroundWorker(dim8, HashEmbedder(8), summarizer)
+    job_id = _merge_job(worker, dim8, note_id, older_id)
+    _freeze_job(dim8, job_id)
+    assert worker.attention_count() == 1
+    assert worker.slots_health()["summary"]["attention"] == 1
+    with caplog.at_level(logging.INFO, logger="app"):
+        assert worker.process_merge_pending() == 0  # закрыта перепроверкой
+    state = _job_state(dim8, job_id)
+    assert state["status"] == "done"
+    assert state["attention_at"] is None  # /health и GET /jobs/attention чисты
+    assert worker.attention_count() == 0
+    assert worker.slots_health()["summary"]["attention"] == 0
+    assert summarizer.merge_calls == []  # модель не позвана
+    events = _skipped_records(caplog)
+    assert len(events) == 1 and events[0].reason == "same origin"
+    with session(dim8) as conn:
+        rows = conn.execute(
+            "SELECT id, deleted_at FROM notes ORDER BY id"
+        ).fetchall()
+    assert [row["id"] for row in rows] == [older_id, note_id]
+    assert all(row["deleted_at"] is None for row in rows)
