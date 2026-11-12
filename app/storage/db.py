@@ -130,7 +130,8 @@ CREATE TABLE IF NOT EXISTS notes (
   expires_at     TEXT    NULL,
   links_at       TEXT    NULL,
   node_order_at  TEXT    NULL,
-  warnings_at    TEXT    NULL
+  warnings_at    TEXT    NULL,
+  origin_note_id INTEGER NULL  -- the origin group of a split/merge part, no FK
 )
 """
 
@@ -814,6 +815,10 @@ def init_db(settings: Settings, *, note_chars: int | None = None) -> None:
             # The column is needed before the service inserts/reads; the
             # comment FTS is no24-02.
             _migrate_comment_column(conn)
+            # The origin group of parts (3.6.2): notes.origin_note_id INTEGER
+            # (nullable, no FK) — right after the other zero ADD COLUMN
+            # migrations, before anything reads the notes row whole.
+            _migrate_origin_note_column(conn)
             # The comment FTS (No24, no24-02): the separate notes_comment_fts
             # table + triggers — right after the comment column and BEFORE the
             # embedding check (it never addresses the table). No rebuild
@@ -954,6 +959,20 @@ def _migrate_comment_column(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
     if "comment" not in columns:
         conn.execute("ALTER TABLE notes ADD COLUMN comment TEXT")
+
+
+def _migrate_origin_note_column(conn: sqlite3.Connection) -> None:
+    """The 3.6.2 zero migration: notes.origin_note_id INTEGER (nullable).
+
+    Fresh databases get the column from _NOTES_DDL; inherited ones — ALTER
+    TABLE ADD COLUMN (idempotent, applicable from any earlier version;
+    NULL = an ordinary note, not a part of a split/merge group). The value is
+    NOT a reference: no FK, no index — it only groups the parts of one origin
+    (the backfill of already split notes — app.storage.migration).
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
+    if "origin_note_id" not in columns:
+        conn.execute("ALTER TABLE notes ADD COLUMN origin_note_id INTEGER")
 
 
 def _migrate_comment_fts(conn: sqlite3.Connection) -> None:
@@ -1952,6 +1971,10 @@ def delete_note_physical(conn: sqlite3.Connection, note_id: int) -> None:
     Idempotent and safe: a missing note matches nothing — every DELETE is a
     no-op; a repeated call does not fail. Called inside the caller's open
     transaction (transaction()).
+
+    origin_note_id (3.6.2) is not a reference, nothing to clean: the parts of
+    a split/merge group keep pointing at the id of a note that may already be
+    gone (the id is reused) — the value is a group label, not an edge.
     """
     # The chunks and their vectors (notes_chunks_vec + notes_chunks) — before
     # notes: notes_chunks_vec has no FK, the notes cascade would not touch it.

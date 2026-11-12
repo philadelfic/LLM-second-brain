@@ -48,7 +48,9 @@ class TestSchemaCreated:
         CHECK схемы).
         lsb-0005-04: пара
         domain_hint/subdomain_hint снята со схемы — груминг переведён на
-        единый hint_path."""
+        единый hint_path.
+        3.6.2: + origin_note_id — группа исходника у частей нарезки/слияния
+        (не ссылка: без FK и без индекса; NULL = обычная заметка)."""
         init_db(get_settings())
         with session(get_settings()) as conn:
             columns = {
@@ -60,6 +62,7 @@ class TestSchemaCreated:
             "namespace", "classified_at", "hint_path", "confidence",
             "expires_at", "links_at", "node_order_at", "warnings_at",
             "comment",  # no24-01 (3.2.0): пометка заметки (NULL = нет)
+            "origin_note_id",  # 3.6.2: группа исходника части (NULL = обычная)
         }
         # DDL-умолчания: summary пуст, статусы pending, author unknown.
         assert columns["summary"]["dflt_value"] == "''"
@@ -73,6 +76,7 @@ class TestSchemaCreated:
         assert columns["links_at"]["notnull"] == 0  # lsb-0010-02: NULL = связи не считаны
         assert columns["node_order_at"]["notnull"] == 0  # lsb-0011-01: NULL = обход не разбирал
         assert columns["warnings_at"]["notnull"] == 0  # №12: NULL = предупреждения не проверены
+        assert columns["origin_note_id"]["notnull"] == 0  # 3.6.2: NULL = не часть группы
 
     def test_fts_external_content_trigram(self) -> None:
         """notes_fts — FTS5 внешний контент с trigram-токенизатором."""
