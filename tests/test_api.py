@@ -10,9 +10,11 @@ from fastapi.testclient import TestClient
 from app import __version__
 from app.config import get_settings
 from app.main import create_app
+from app.services.notes import NoteService
+from app.services.worker import BackgroundWorker, build_judge_job
 from app.storage.db import init_db, session, transaction
 from app.transport.auth import BearerAuthMiddleware
-from fakes import clear_seeded_skills
+from fakes import HashEmbedder, RecordingDedup, clear_seeded_skills
 
 
 class TestHealth:
@@ -74,6 +76,8 @@ class TestHealth:
             "notes_count": 0,
             # LSBN-S-1: мягкий лимит заметки — из настроек (LSBN-T-26).
             "note_chars_limit": 2000,
+            # LSBN-D-14 (3.6.2): операторский тормоз фонового дедупа — из настроек.
+            "dedup_enabled": True,
             "pending_vector": 0,
             "pending_summary": 0,
             "queues": {
@@ -137,6 +141,7 @@ class TestHealth:
             "decision_ok",
             "notes_count",
             "note_chars_limit",
+            "dedup_enabled",  # LSBN-D-14 (3.6.2): тормоз фонового дедупа
             "pending_vector",
             "pending_summary",
             "queues",
@@ -258,6 +263,49 @@ class TestHealth:
             body = area_client.get("/health").json()
         assert body["areas"]["terms"] == {"enabled": False, "pending": 1}
         assert body["areas"]["skills"] == {"enabled": True, "pending": 0}
+
+    def test_dedup_brake_keeps_judge_queue_visible(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """LSBN-D-14 (3.6.2): DEDUP_ENABLED=false — операторский тормоз дедупа.
+
+        Флаг виден в /health, джоба судьи не стартует (спека — enabled=False),
+        но её очередь остаётся в /health.queues: бэклог честно копится и
+        разберётся после включения (канон JOB_NODES_ENABLED).
+        """
+        monkeypatch.setenv("DEDUP_ENABLED", "false")
+        get_settings.cache_clear()
+        settings = get_settings()
+        assert settings.dedup_enabled is False
+        init_db(settings)
+        clear_seeded_skills(settings)
+        # Бэклог судьи по-настоящему: две заметки, вторая находит первую кандидатом.
+        notes = NoteService(settings, HashEmbedder(settings.embedding_dim))
+        notes.save("заметка для бэклога судьи — первая")
+        notes.save("заметка для бэклога судьи — вторая")
+        worker = BackgroundWorker(
+            settings,
+            HashEmbedder(settings.embedding_dim),
+            dedup=RecordingDedup(candidates=[(1, 0.94)]),
+        )
+        worker.process_pending()
+        # Работа первой заметки — её же кандидат (снимаем, как в тестах воркера).
+        with session(settings) as conn, transaction(conn):
+            conn.execute("DELETE FROM worker_jobs WHERE note_id = 1")
+        assert worker.queues_health()["judge"]["pending"] == 1
+        spec = build_judge_job(worker, settings)
+        assert spec.enabled is False
+        with TestClient(create_app(settings)) as brake_client:
+            body = brake_client.get("/health").json()
+        assert body["dedup_enabled"] is False
+        # Очередь видна и с выключенной джобой: реестр её сохраняет.
+        assert body["queues"]["judge"]["pending"] == 1
+        assert set(body["queues"]["judge"]) == {
+            "pending",
+            "oldest_pending_sec",
+            "waiting",
+            "attention",
+        }
 
     def test_startup_areas_event(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture

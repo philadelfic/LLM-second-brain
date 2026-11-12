@@ -447,6 +447,9 @@ class HealthResponse(BaseModel):
     # 3.4.1 (LSBN-T-26): from the build settings — the same number as the new databases' CHECK
     # and the self-migration target (one number — one place: MAX_NOTE_CHARS).
     note_chars_limit: int
+    # LSBN-D-14 (3.6.2): the operator brake of the background dedup — false: the
+    # `judge` job does not start (its pending backlog stays visible in `queues`).
+    dedup_enabled: bool
     pending_vector: int
     pending_summary: int
     queues: dict[str, QueueStat]  # lsb-0014-03: the wait per queue
@@ -721,6 +724,8 @@ def build_rest_router(settings: Settings) -> APIRouter:
             notes_count=counts["notes_count"],
             # LSBN-S-1: the note's soft limit is visible to the operator (from settings).
             note_chars_limit=settings.max_note_chars,
+            # LSBN-D-14: the dedup brake is visible to the operator (from settings).
+            dedup_enabled=settings.dedup_enabled,
             pending_vector=counts["pending_vector"],
             pending_summary=counts["pending_summary"],
             queues=queues,

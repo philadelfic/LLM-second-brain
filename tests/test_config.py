@@ -120,6 +120,8 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "JOB_TERMS_CLUSTER_SIMILARITY": ("job_terms_cluster_similarity", 0.75),
     "JOB_TERMS_CONTEXTS_EXCESS": ("job_terms_contexts_excess", 5),
     "DEDUP_SIMILARITY": ("dedup_similarity", 0.92),
+    # LSBN-D-14 (3.6.2): операторский тормоз фонового дедупа (false — джоба не стартует).
+    "DEDUP_ENABLED": ("dedup_enabled", True),
     # Фаза 8 (Этап 2.1): фоновый дедуп — косинус-кандидаты.
     "DEDUP_CANDIDATE_TOP_N": ("dedup_candidate_top_n", 3),
     "DEDUP_CANDIDATE_SIMILARITY": ("dedup_candidate_similarity", 0.80),
@@ -294,7 +296,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 233 поля: 6 обязательных + 227 с умолчаниями
+        """В Settings — ровно 252 поля: 6 обязательных + 246 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
@@ -317,7 +319,9 @@ class TestCompleteness:
         и BACKUP_SHIP_CMD/BACKUP_SHIP_TIMEOUT_SEC
         + 71 плоское поле операций LSBN-F-34 релиза 3.4.0:
         SUMMARIZE_/TITLE_/MERGE_/SPLIT_/CLASSIFY_/DESCRIBE_/
-        STRUCTURE_JUDGE_/EMBED_* (MERGE_NUM_PREDICT уже был))."""
+        STRUCTURE_JUDGE_/EMBED_* (MERGE_NUM_PREDICT уже был)
+        + 1 операторский тормоз фонового дедупа LSBN-D-14 релиза 3.6.2:
+        DEDUP_ENABLED)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

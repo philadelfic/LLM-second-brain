@@ -27,6 +27,17 @@
     another (the owner's rule). The selection excludes it on the SQL side (both
     the KNN branch and the text fallback), with no Python post-filter; the
     `links` are allowed - a TTL note may be linked to others.
+
+    Parts of one source are not duplicates of each other (LSBN-D-14, 3.6.2).
+    A split cuts one long note into N self-contained parts (`origin_note_id` -
+    their common source: NoteService.save_migration_parts stamps it); the parts
+    repeat the context of each other and their vectors are close by construction,
+    so the background path would merge them back and lose content. `find_candidates`
+    excludes the candidates of the OWN origin group of the current note, and the
+    vectors of the group keep their KNN-window slots - the window widens by their
+    count (the third non-candidate class next to trash and TTL). A NULL group is an
+    ordinary note: NULL against a known group is NOT an exclusion - the rule is
+    about EQUAL groups only.
 """
 
 from __future__ import annotations
@@ -96,6 +107,16 @@ class DeduplicationService:
                     (`expires_at IS NOT NULL`, no46-03) is also never a merge candidate:
                     excluded in SQL (a condition next to `deleted_at IS NULL`); its vector
                     takes a KNN window slot too - we widen for it as well.
+                    LSBN-D-14 (3.6.2): a candidate of the OWN origin group is not a
+                    duplicate. A split cuts one long text into N self-contained parts whose
+                    vectors are close by construction - without the rule the background path
+                    would merge the parts back and lose content. The group is read by
+                    `exclude_id` (`notes.origin_note_id`; NULL - an ordinary note, nothing to
+                    exclude; a NULL group of a candidate against a known one - an ordinary
+                    candidate, kept). The vectors of the group hold KNN-window slots, so the
+                    window widens by their count - the third non-candidate class next to
+                    trash and TTL (otherwise the own parts push a real candidate out of the
+                    top-N).
                     Phase 10 (§5.7): `namespace` - dedup within a namespace (the KNN scans
                     the node's partition); None - global (legacy compatibility).
                     Cross-namespace close content is not a duplicate: notes in different
@@ -113,15 +134,36 @@ class DeduplicationService:
             else:
                 ns_clause = ""
                 ns_params = []
-            # Non-candidates (trash and TTL notes, no46-03) keep their vectors in
-            # notes_vec anyway - we widen the KNN window by their count,
-            # otherwise such a neighbor would push an active candidate out of the top-N.
+            # 3.6.2 (LSBN-D-14): the origin group of the note being deduped. Parts of
+            # one source are not duplicates of each other - a split cuts one text into
+            # self-contained parts whose vectors are close by construction. Read by
+            # `exclude_id` (the freshly vectorized note); None - no exclude_id, hence no
+            # group to exclude.
+            origin: int | None = None
+            if exclude_id is not None:
+                origin_row = conn.execute(
+                    "SELECT origin_note_id FROM notes WHERE id = ?",
+                    (exclude_id,),
+                ).fetchone()
+                if origin_row is not None:
+                    origin = origin_row[0]
+            # Non-candidates (trash, TTL notes no46-03 and - 3.6.2 - the parts of the
+            # own origin group) keep their vectors in notes_vec anyway: we widen the
+            # KNN window by their count, otherwise such a neighbor would push an
+            # active candidate out of the top-N. For a split part that is the third
+            # class next to trash and TTL: a source cut into N parts gives N-1 own
+            # neighbors above every real candidate.
+            skip_clause = "deleted_at IS NOT NULL OR expires_at IS NOT NULL"
+            skip_params: list[object] = []
+            if origin is not None:
+                skip_clause += " OR origin_note_id = ?"
+                skip_params.append(origin)
             skipped = conn.execute(
                 "SELECT COUNT(*) FROM notes_vec WHERE note_id IN "
                 "(SELECT id FROM notes WHERE "
-                "(deleted_at IS NOT NULL OR expires_at IS NOT NULL)"
+                f"({skip_clause})"
                 f"{ns_clause})",
-                ns_params,
+                skip_params + ns_params,
             ).fetchone()[0]
             window = top_n + skipped + (1 if exclude_id is not None else 0)
             hits = vectors.knn(
@@ -133,10 +175,12 @@ class DeduplicationService:
             if not hits:
                 return []
             placeholders = ",".join("?" * len(hits))
+            # id -> origin group (3.6.2): the active notes among the hits; the group is
+            # compared in the loop below.
             active = {
-                row[0]
+                row[0]: row[1]
                 for row in conn.execute(
-                    f"SELECT id FROM notes WHERE deleted_at IS NULL "
+                    f"SELECT id, origin_note_id FROM notes WHERE deleted_at IS NULL "
                     f"AND expires_at IS NULL "
                     f"{ns_clause} AND id IN ({placeholders})",
                     ns_params + [note_id for note_id, _ in hits],
@@ -148,6 +192,8 @@ class DeduplicationService:
                     break  # the KNN output is sorted - everything further is only lower
                 if candidate_id == exclude_id or candidate_id not in active:
                     continue  # the fresh note itself / trash / TTL - not candidates
+                if origin is not None and active[candidate_id] == origin:
+                    continue  # a part of the same source (3.6.2) - not a duplicate
                 result.append((candidate_id, cosine_value))
                 if len(result) == top_n:
                     break

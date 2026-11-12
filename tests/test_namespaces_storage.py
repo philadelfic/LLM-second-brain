@@ -117,6 +117,7 @@ class TestFreshSchema:
             "namespace", "classified_at", "hint_path", "confidence",
             "expires_at", "links_at", "node_order_at", "warnings_at",
             "comment",  # no24-01 (3.2.0): the note's comment (NULL = none)
+            "origin_note_id",  # 3.6.2: the part's origin group (NULL = none)
         }
         assert columns["namespace"]["dflt_value"] == "'default'"
         assert columns["classified_at"]["notnull"] == 0

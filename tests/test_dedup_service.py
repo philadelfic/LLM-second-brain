@@ -383,3 +383,77 @@ def test_find_by_text_plan_hints(dim8, notes) -> None:
     assert found is not None  # нормализованный дубль найден фоллбеком
     assert "NOT INDEXED" in spy.executed[0]  # exact-scan: план-хинт
     assert "CROSS JOIN" in spy.executed[1]   # FTS-фоллбек: FTS-first
+
+
+# --- части одного исходника — не дубли (LSBN-D-14, 3.6.2) ----------------------
+
+
+def _origin_parts(notes: NoteService, count: int) -> list[int]:
+    """Части одной нарезки: origin_note_id у всех — id исходника (999)."""
+    saved = notes.save_migration_parts(
+        999,
+        'default',
+        [(f'часть {index}', f'текст части {index}') for index in range(count)],
+    )
+    return [int(part['id']) for part in saved['parts']]
+
+
+def _part_vector(settings, note_id: int, vector: list[float]) -> None:
+    """Вектор части: части рождаются 'pending' — тест кладёт контролируемый."""
+    with session(settings) as conn, transaction(conn):
+        vectors.upsert(conn, note_id, vector)
+
+
+def test_find_candidates_excludes_same_origin(dim8, notes) -> None:
+    """Кандидат того же исходника (соседняя часть нарезки) — не дубль."""
+    part_ids = _origin_parts(notes, 2)
+    _part_vector(dim8, part_ids[0], _vec_at_cos(0.95))  # своя часть — ближе всех
+    _part_vector(dim8, part_ids[1], E1)                # дедуплицируемая часть
+    duplicate = note_with_vector(dim8, notes, 'настоящий дубль рядом', _vec_at_cos(0.9))
+    found = DeduplicationService(dim8).find_candidates(E1, exclude_id=part_ids[1])
+    assert [note_id for note_id, _ in found] == [duplicate]
+
+
+def test_find_candidates_own_parts_do_not_eat_the_window(dim8, notes) -> None:
+    """ОКНО (3.6.2): три «своих» части сверху не вытесняют настоящего дубля.
+
+    Без расширения окна на части своей группы KNN отдаёт только их (топ-N
+    занят «своими»), и фильтр, не увидев настоящего кандидата, вернёт пусто:
+    тест краснеет ровно на расширении окна.
+    """
+    part_ids = _origin_parts(notes, 4)
+    for part_id, value in zip(part_ids[:3], (0.99, 0.98, 0.97)):
+        _part_vector(dim8, part_id, _vec_at_cos(value))
+    _part_vector(dim8, part_ids[3], E1)  # дедуплицируемая часть — сам запрос
+    duplicate = note_with_vector(
+        dim8, notes, 'настоящий дубль четвёртым по близости', _vec_at_cos(0.96)
+    )
+    found = DeduplicationService(dim8).find_candidates(E1, exclude_id=part_ids[3])
+    assert [note_id for note_id, _ in found] == [duplicate]
+
+
+def test_find_candidates_null_origins_behave_as_before(dim8, notes) -> None:
+    """Оба origin NULL (обычные заметки) — поведение как раньше."""
+    first = note_with_vector(dim8, notes, 'обычная заметка-эталон', E1)
+    second = note_with_vector(dim8, notes, 'обычная близкая заметка', _vec_at_cos(0.9))
+    with session(dim8) as conn:  # предпосылка: группа не задана ни у кого
+        origins = [
+            row['origin_note_id']
+            for row in conn.execute('SELECT origin_note_id FROM notes ORDER BY id')
+        ]
+    assert origins == [None, None]
+    found = DeduplicationService(dim8).find_candidates(E1, exclude_id=first)
+    assert [note_id for note_id, _ in found] == [second]
+
+
+def test_find_candidates_mixed_origins_not_excluded(dim8, notes) -> None:
+    """Один origin NULL, другой задан — не исключаем (правило про равные группы)."""
+    ordinary = note_with_vector(dim8, notes, 'обычная заметка рядом с частью', E1)
+    part_id = _origin_parts(notes, 1)[0]
+    _part_vector(dim8, part_id, _vec_at_cos(0.9))
+    dedup = DeduplicationService(dim8)
+    # дедуп обычной заметки: часть — настоящий кандидат (NULL ≠ 999)
+    assert [i for i, _ in dedup.find_candidates(E1, exclude_id=ordinary)] == [part_id]
+    # дедуп части: обычная заметка — тоже кандидат (999 ≠ NULL)
+    found = dedup.find_candidates(_vec_at_cos(0.9), exclude_id=part_id)
+    assert [i for i, _ in found] == [ordinary]

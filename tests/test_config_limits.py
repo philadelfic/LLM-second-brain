@@ -676,3 +676,19 @@ class TestMigrationSlotBreakerRanges:
     ) -> None:
         settings = load_env(monkeypatch, MIGRATION_PAUSE_SEC=good)
         assert settings.migration_pause_sec == int(good)
+
+
+# --- LSBN-D-14 (3.6.2): операторский тормоз фонового дедупа -----------------
+
+
+class TestDedupBrake:
+    """DEDUP_ENABLED: дефолт — включено; false — джоба судьи не стартует."""
+
+    def test_default_and_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Дефолт true; DEDUP_ENABLED=false читается как False."""
+        assert load_env(monkeypatch).dedup_enabled is True
+        custom = load_env(monkeypatch, DEDUP_ENABLED="false")
+        assert custom.dedup_enabled is False
+        # Тормоз не трогает пороги дедупа: 0.92/0.80 остаются как были.
+        assert custom.dedup_similarity == 0.92
+        assert custom.dedup_candidate_similarity == 0.80
