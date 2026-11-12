@@ -409,7 +409,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         raise SystemExit(2) from exc
     # JSON logs to stdout (NFR-4): enabled at application build (importing
     # app.main / tests / uvicorn — the same idempotent setup).
-    setup_logging(settings.log_level)
+    setup_logging(
+        settings.log_level, settings.log_file or None, settings.log_max_bytes, settings.log_backups
+    )
     # §3.4: two queues — vectors (Phase 3) and summary (Phase 4, mode "B");
     # the DI summarizer is the same instance /health.summarizer_ok reports.
     # The dedup judge (Phase 8, step 3.1) is DI from services too, one
