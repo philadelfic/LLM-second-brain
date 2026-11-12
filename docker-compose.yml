@@ -126,6 +126,7 @@ services:
       DEDUP_CANDIDATE_SIMILARITY: "0.80"     # lower paraphrase-candidate threshold (≤ DEDUP_SIMILARITY)
       # --- summarization (mode "B") ---
       MAX_SUMMARY_CHARS: "150"               # summary length limit: model summary + fallback (gate 2026-09-19)
+      SUMMARY_SHORT_TEXT_CHARS: "400"        # a note not longer than N chars is summarized by its own text, no model call (0 = rule off; 3.6.3)
       SUMMARY_THINK: "true"                  # keep model reasoning; ollama provider only
       SUMMARY_NUM_PREDICT: "0"               # 0 = as much as fits (auto budget from SUMMARY_CONTEXT_TOKENS); explicit 35000 keeps the old cap
       MERGE_NUM_PREDICT: "0"                 # 0 = as much as fits; explicit 35000 keeps the old merge cap

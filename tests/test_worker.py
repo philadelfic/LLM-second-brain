@@ -40,6 +40,10 @@ from app.storage.db import init_db, session, transaction
 def settings(tmp_path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     monkeypatch.setenv("EMBEDDING_DIM", "8")
+    # LSBN-T-37 (3.6.3): этот набор проверяет модельный путь выжимки — правило
+    # короткого текста здесь выключено; его собственный набор —
+    # tests/test_summary_short.py.
+    monkeypatch.setenv("SUMMARY_SHORT_TEXT_CHARS", "0")
     get_settings.cache_clear()
     settings = get_settings()
     init_db(settings)
@@ -51,6 +55,10 @@ def fast(tmp_path, monkeypatch: pytest.MonkeyPatch):
     """Как settings, но с PENDING_RETRY_SEC=0 — цикл без пауз."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     monkeypatch.setenv("EMBEDDING_DIM", "8")
+    # LSBN-T-37 (3.6.3): этот набор проверяет модельный путь выжимки — правило
+    # короткого текста здесь выключено; его собственный набор —
+    # tests/test_summary_short.py.
+    monkeypatch.setenv("SUMMARY_SHORT_TEXT_CHARS", "0")
     monkeypatch.setenv("PENDING_RETRY_SEC", "0")
     get_settings.cache_clear()
     settings = get_settings()
@@ -63,6 +71,10 @@ def slow(tmp_path, monkeypatch: pytest.MonkeyPatch):
     """Как settings, но с PENDING_RETRY_SEC=1 — интервалы различимы во времени."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     monkeypatch.setenv("EMBEDDING_DIM", "8")
+    # LSBN-T-37 (3.6.3): этот набор проверяет модельный путь выжимки — правило
+    # короткого текста здесь выключено; его собственный набор —
+    # tests/test_summary_short.py.
+    monkeypatch.setenv("SUMMARY_SHORT_TEXT_CHARS", "0")
     monkeypatch.setenv("PENDING_RETRY_SEC", "1")
     get_settings.cache_clear()
     settings = get_settings()

@@ -59,6 +59,10 @@ def settings(tmp_path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     monkeypatch.setenv("EMBEDDING_DIM", "8")
     monkeypatch.setenv("EMBEDDING_BATCH_SIZE", str(BATCH))
+    # LSBN-T-37 (3.6.3): этот набор проверяет модельный путь выжимки — правило
+    # короткого текста здесь выключено; его собственный набор —
+    # tests/test_summary_short.py.
+    monkeypatch.setenv("SUMMARY_SHORT_TEXT_CHARS", "0")
     get_settings.cache_clear()
     resolved = get_settings()
     init_db(resolved)

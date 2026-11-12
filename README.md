@@ -117,6 +117,10 @@ first-run walkthrough (compose, token, Open WebUI, `/health`).
 - **Comments only when they earn their place**: a constraint or a reason the
   code itself does not show. No restatements of the code, no dates or
   decision initials.
+- **Release gate**: a release that touches split, dedup, summary or merge must
+  pass the note-storm run on a snapshot of the live database
+  (`scripts/note_storm_run.py`, see [Installation](docs/INSTALL.md) → Release
+  gate) before it ships.
 - Documentation (`documents/`, `development-docs/`, release folders) stays in
   Russian and is maintained in Russian — the rule covers git commits and
   code comments/docstrings only.
