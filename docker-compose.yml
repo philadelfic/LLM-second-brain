@@ -120,6 +120,7 @@ services:
       MEMORY_SIMILAR_POOL: "5"             # FTS candidates fetched before scoring (≥ limit)
       MEMORY_SIMILAR_THRESHOLD: "0.74"     # Dice threshold over significant words (0..1); 0.30 шумел (№30, решение О. 12.10.2026)
       MEMORY_SIMILAR_TEXT_CHARS: "500"     # text characters scored alongside the title (≥1)
+      DEDUP_ENABLED: "true"                  # background dedup on/off (its queue stays visible in /health)
       DEDUP_SIMILARITY: "0.92"               # "duplicate" cosine threshold in background dedup (Phase 8)
       DEDUP_CANDIDATE_TOP_N: "3"             # top-N cosine candidates for the dedup judge
       DEDUP_CANDIDATE_SIMILARITY: "0.80"     # lower paraphrase-candidate threshold (≤ DEDUP_SIMILARITY)

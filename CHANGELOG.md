@@ -5,6 +5,49 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.6.2] - 2026-11-12
+
+Release 3.6.2 — "Parts of one note are not duplicates": the background dedup no
+longer sees the parts of one split note as duplicates of each other (the
+`LSBN-D-14` storm of merge attempts), and the operator gets a brake for the whole
+background dedup.
+
+### Added
+
+* **`notes.origin_note_id` — the origin group of the split parts (`LSBN-D-14`)** —
+  a part written by the splitter remembers its source note: the column is filled
+  for new splits and backfilled on start from `migration_notes` (the journal gets
+  the `origin_backfill` event with the `filled` counter).
+* **`DEDUP_ENABLED` — the operator brake of the background dedup** — `false`
+  does not start the judge job, while its queue stays visible in
+  `/health.queues` (`/health.dedup_enabled` reports the flag itself): the backlog
+  keeps accumulating honestly and is worked off after the flag is turned back on.
+  The flag is not part of the slot-configuration fingerprint — flipping it does
+  not clear the attention of the slots.
+
+### Fixed
+
+* **`LSBN-D-14`: the dedup merged the parts of one split note** — a split source
+  left its parts mutually similar, and the background dedup kept trying to merge
+  them: a storm of merge attempts, `off_contract` verdicts and pauses of the
+  summary slot. Parts of one origin are no longer candidates for each other, and
+  pairs of one source already frozen by the judge are closed instead of thawed.
+
+### Changed
+
+* **One rule on both ends of the dedup** — the merge path and the candidate
+  pre-filter now follow the same rule "parts of one source are not duplicates";
+  the KNN window is widened over the note's own origin group, so the rule sees
+  exactly the parts it must skip.
+
+### Upgrade notes
+
+* On prod drop the temporary thresholds `DEDUP_SIMILARITY=1.0` and
+  `DEDUP_CANDIDATE_SIMILARITY=1.0` (back to `0.92` / `0.80`): the `DEDUP_ENABLED`
+  brake replaces that workaround.
+* The origin backfill runs at every start; the journal gets the `origin_backfill`
+  event with the `filled` counter (expected 3083).
+
 ## [3.5.0] - 2026-11-01
 
 Release 3.5.0 — "Thinking models without losing the answer": a call now carries
