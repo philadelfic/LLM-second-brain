@@ -99,7 +99,12 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False)
 
 
-def setup_logging(level: str) -> None:
+def setup_logging(
+    level: str,
+    log_file: str | None = None,
+    max_bytes: int = 50_000_000,
+    backups: int = 5,
+) -> None:
     """Point the root logger at JSON stdout (idempotent).
 
     Repeated calls (pytest builds an application per test) do not duplicate
@@ -113,6 +118,20 @@ def setup_logging(level: str) -> None:
         handler.setFormatter(JsonFormatter())
         root.addHandler(handler)
         root._second_brain_json_handler = True  # type: ignore[attr-defined]
+    # 12.11.2026: the same JSON into a rotating file. `docker logs` lives only as
+    # long as the container, and every deploy recreates it — the analysis of the
+    # split (and of any failure) needs history that survives restarts.
+    if log_file and not getattr(root, "_second_brain_file_handler", False):
+        from logging.handlers import RotatingFileHandler
+        from pathlib import Path
+
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=max_bytes, backupCount=backups, encoding="utf-8"
+        )
+        file_handler.setFormatter(JsonFormatter())
+        root.addHandler(file_handler)
+        root._second_brain_file_handler = True  # type: ignore[attr-defined]
 
 
 def uvicorn_log_config(level: str) -> dict[str, object]:
