@@ -399,6 +399,12 @@ class Settings(BaseSettings):
     # release). No parallel workers: the splitting queue is single-threaded.
     migration_batch: int = 5  # notes per migration job run
     migration_pause_sec: int = 600  # the pause AFTER a run, before the next (10 min)
+    # The split-verification batch (2026-11-12): the judge verifies a split
+    # source SEGMENT BY SEGMENT — a source longer than this many characters is
+    # cut into overlapping segments, each verified with its parts in a separate
+    # call (the source + ALL parts in one prompt exploded on real notes). The
+    # overlap is max_note_chars — a border fact is judged with its full note.
+    split_verify_segment_chars: int = 6000
 
     # --- slot breaks (No39, 3.2.0) ----------------------------------
     # SLOT_PAUSE_SEC — the slot pause during a break (= the back-off ceiling),
@@ -981,6 +987,16 @@ class Settings(BaseSettings):
         # rollout-window ceiling).
         need_range("migration_batch", self.migration_batch, 1, 100)
         need_range("migration_pause_sec", self.migration_pause_sec, 0, 86400)
+        # The split-verification batch (2026-11-12): 1000..20000 — a segment
+        # must fit the judge's context WITH its parts (the source up to 20000
+        # chars splits into a handful of calls), below 1000 a long source
+        # fragments into dozens of calls.
+        need_range(
+            "split_verify_segment_chars",
+            self.split_verify_segment_chars,
+            1000,
+            20000,
+        )
 
         # --- slot breaks (No39): pause >= 30 (cheap, but not a busy loop),
         # open threshold >= 1, hint throttling >= 0 (0 — every call).

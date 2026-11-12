@@ -17,8 +17,10 @@ from fastapi.testclient import TestClient
 
 from app.config import get_settings
 from app.main import create_app
+from app.services.judge import JudgeError
 from app.services.migration import MIGRATION_JOB, MigrationService
 from app.services.notes import NoteService
+from app.services.slot_outcome import SlotOutcome
 from app.services.summary import SummaryService
 from app.storage.db import init_db, session, transaction
 from app.storage.migration import (
@@ -29,6 +31,33 @@ from app.storage.migration import (
 from fakes import FixedSummarizer
 
 _LONG = "длинная заметка про миграцию хранилища " * 150  # ~5100 знаков
+
+
+class _SplitJudge:
+    """Фейк-судья нарезки (12.11.2026): verify_split по сценарию.
+
+    `fail_times` — столько первых вызовов падают транзиентом (UNAVAILABLE);
+    дальше вердикты вычерпываются из `verdicts` (str — MISSING с причиной,
+    None — COMPLETE), пустая очередь = `default`.
+    """
+
+    def __init__(
+        self,
+        verdicts: list[str | None] | None = None,
+        default: str | None = None,
+        fail_times: int = 0,
+    ) -> None:
+        self.verdicts = list(verdicts or [])
+        self.default = default
+        self.fail_times = fail_times
+        self.calls: list[str] = []
+
+    def verify_split(self, source: str, parts: list[str]) -> str | None:
+        self.calls.append(source)
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise JudgeError("судья недоступен", outcome=SlotOutcome.UNAVAILABLE)
+        return self.verdicts.pop(0) if self.verdicts else self.default
 
 
 def _env(monkeypatch: pytest.MonkeyPatch, limit: int) -> None:
@@ -62,7 +91,7 @@ def _migrate_down(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _service(
-    summarizer, warnings=None
+    summarizer, warnings=None, judge=None
 ) -> MigrationService:
     """MigrationService на текущих настройках (notes — настоящий, без модели)."""
     settings = get_settings()
@@ -71,6 +100,7 @@ def _service(
         summarizer=summarizer,
         notes=NoteService(settings),
         warnings=warnings,
+        judge=judge,
     )
 
 
@@ -179,10 +209,11 @@ class TestSplitJob:
         assert _statuses()[4][0] == "нарезана"
         assert len(summarizer.split_calls) == 4  # 2 (снова), 4 — и 2+4 до этого
 
-    def test_transient_keeps_pending_and_counts_attempt(
+    def test_transient_keeps_pending_without_eating_attempts(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Транзиент: статус 'ожидает', attempts растёт, партия снимается."""
+        """Транзиент (#39, 12.11.2026): статус 'ожидает', попытка НЕ тратится
+        (ожидание — норма, бэк-офф джобы задаёт ритм), партия снимается."""
         _migrate_down(monkeypatch)
         summarizer = FixedSummarizer()
         summarizer.split_mode = "transient"
@@ -197,7 +228,103 @@ class TestSplitJob:
                     f"SELECT old_id, attempts FROM {MIGRATION_NOTES_TABLE}"
                 )
             }
-        assert attempts[2] == 1
+        assert attempts[2] == 0  # транзиент не ест бюджет попыток
+
+    def test_off_contract_quarantines_and_counts_attempt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Нетранзиент (off_contract): карантин + попытка съедается (#39);
+        на потолке SLOT_MAX_ATTEMPTS — attention, джоба заметку не берёт."""
+        _migrate_down(monkeypatch)
+        summarizer = FixedSummarizer()
+        summarizer.split_mode = "off_contract"
+        # 2/4 — карантин (модель молчит), 3 — expired (TTL, без модели).
+        assert _service(summarizer).process_batch() == 3
+        statuses = _statuses()
+        assert statuses[2][0] == "карантин"
+        assert statuses[3][0] == "карантин"
+        with session(get_settings()) as conn:
+            attempts = {
+                int(r["old_id"]): int(r["attempts"])
+                for r in conn.execute(
+                    f"SELECT old_id, attempts FROM {MIGRATION_NOTES_TABLE}"
+                )
+            }
+        assert attempts[2] == 1  # off_contract ест бюджет попыток
+        # Семь повторов: карантин берётся по back-off, каждый раз +1 попытка.
+        for _ in range(7):
+            assert _service(summarizer).process_batch() == 2
+        with session(get_settings()) as conn:
+            row = conn.execute(
+                f"SELECT attention, attempts FROM {MIGRATION_NOTES_TABLE} "
+                f"WHERE old_id = 2"
+            ).fetchone()
+        assert row["attention"] == 1  # потолок: заморожена
+        assert row["attempts"] == 8
+        # Attention не берётся: прогон пуст, вызовов модели нет.
+        calls_before = len(summarizer.split_calls)
+        assert _service(summarizer).process_batch() == 0
+        assert len(summarizer.split_calls) == calls_before
+        # Attention видна в очереди и НЕ даёт считать её пустой (фаза открыта).
+        stat = _service(summarizer).queue_stat()
+        assert stat["pending"] == 0
+        assert stat["attention"] == 1
+        assert _service(summarizer).queue_empty() is False
+
+    def test_judge_transient_reuses_cached_parts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Транзиент судьи: кэш parts_json — повтор верифицирует те же части,
+        модель нарезки второй раз не вызывается."""
+        _migrate_down(monkeypatch)
+        summarizer = FixedSummarizer()
+        judge = _SplitJudge(fail_times=1)
+        # Первый прогон: нарезка id 2 ок, судья отказал (транзиент) — партия
+        # снята до касания id 3/4, заметка 'ожидает', кэш частей сохранён.
+        assert _service(summarizer, judge=judge).process_batch() == 0
+        assert _statuses()[2][0] == "ожидает"
+        # Второй прогон: нарезки НЕТ (кэш), судья подтвердил — сохранено.
+        assert _service(summarizer, judge=judge).process_batch() == 3
+        assert len(summarizer.split_calls) == 2  # id 2 и id 4 по одному разу
+        assert len(judge.calls) == 3  # id 2 (отказ) + id 2 и id 4 (подтверждение)
+        assert _statuses()[2][0] == "нарезана"
+        assert _statuses()[4][0] == "нарезана"
+
+    def test_judge_refusal_quarantines_and_resplits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Вердикт MISSING — карантин, кэш сброшен: повтор нарезает заново."""
+        _migrate_down(monkeypatch)
+        summarizer = FixedSummarizer()
+        judge = _SplitJudge(verdicts=["MISSING: потерян таймаут 3600"])
+        assert _service(summarizer, judge=judge).process_batch() == 3
+        assert _statuses()[2][0] == "карантин"
+        assert "судья" in (_statuses()[2][2] or "")
+        # Повтор: карантин берётся по back-off, кэша нет — нарезка заново,
+        # судья подтверждает (default None).
+        assert _service(summarizer, judge=judge).process_batch() == 1
+        assert _statuses()[2][0] == "нарезана"
+        assert len(summarizer.split_calls) == 3  # id 2 дважды + id 4
+
+    def test_garbage_floor_quarantines_without_judge(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Покрытие фактов < SPLIT_FACTS_FLOOR — карантин БЕЗ вызова судьи."""
+        settings = get_settings()
+        facts = "таймаут 3600 секунд, релиз 3.6.3, хост db.internal:5432; "
+        long_facts = facts * 60  # > 1500 знаков
+        init_db(settings, note_chars=20000)
+        with session(settings) as conn, transaction(conn):
+            conn.execute("INSERT INTO notes(id, text) VALUES (2, ?)", (long_facts,))
+        _env(monkeypatch, 1500)
+        run_startup_migration(get_settings(), startup_plan(get_settings()))
+        summarizer = FixedSummarizer()  # части без единого факта источника
+        judge = _SplitJudge()
+        assert _service(summarizer, judge=judge).process_batch() == 1
+        assert judge.calls == []  # судью не жгли: мусор отсечён арифметикой
+        status = _statuses()[2]
+        assert status[0] == "карантин"
+        assert "покрытие фактов" in (status[2] or "")
 
     def test_restart_continues_from_migration_notes(
         self, monkeypatch: pytest.MonkeyPatch
@@ -364,6 +491,30 @@ class TestSummarySplit:
             f"exceeds the {settings.max_note_chars}-character"
             in str(followup["messages"][-1]["content"])
         )
+        service.close()
+
+    def test_split_fragment_ceiling_triggers_followup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Фрагментация сверх minimum+SPLIT_PARTS_SLACK — дозапрос, потом отказ.
+
+        Живой случай 11.11.2026: хинт «one part per fact» нарезал заметку
+        на 75 крошек; потолок требует уплотнить части.
+        """
+        settings = _split_settings(monkeypatch)
+        fragments = [{"title": f"Ф{i}", "text": "крошка"} for i in range(1, 5)]
+        service, recorder = _split_service(
+            settings,
+            [_parts_body(fragments), _parts_body(fragments)],
+        )
+        from app.services.summary import MergeIncompleteError
+
+        with pytest.raises(MergeIncompleteError):
+            service.split(SOURCE)
+        assert recorder.calls == 2
+        # Дозапрос просил уплотнить части.
+        followup = json.loads(recorder.requests[1].read().decode())
+        assert "too many parts" in str(followup["messages"][-1]["content"])
         service.close()
 
     def test_split_coverage_does_not_block_the_judge(

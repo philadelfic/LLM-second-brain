@@ -160,6 +160,11 @@ services:
       # смыслы); крутятся override'ом без релиза.
       MIGRATION_BATCH: "5"                   # notes per migration split run (1..100)
       MIGRATION_PAUSE_SEC: "600"             # pause AFTER a run before the next one, sec (0..86400)
+      # Верификация нарезки судьёй — сегментами (12.11.2026): источник длиннее
+      # N знаков режется на пересекающиеся сегменты (перекрытие = MAX_NOTE_CHARS),
+      # каждый сегмент с его частями — отдельный вызов судьи (источник + все
+      # части одним промптом взрывался на живых заметках).
+      SPLIT_VERIFY_SEGMENT_CHARS: "6000"     # source segment per judge call, chars (1000..20000)
       # --- slot breaks (No39, release 3.2.0): pause with a probe + human hint ---
       SLOT_PAUSE_SEC: "900"          # pause of a broken slot = back-off ceiling (≥30); one probe per pause
       SLOT_PAUSE_AFTER: "3"          # consecutive non-transient failures opening the break (≥1; auth opens at once)

@@ -75,9 +75,19 @@ CREATE TABLE IF NOT EXISTS {MIGRATION_NOTES_TABLE} (
   new_ids    TEXT    NULL,                  -- JSON-массив id частей (M2)
   attempts   INTEGER NOT NULL DEFAULT 0,
   reason     TEXT    NULL,
+  parts_json TEXT    NULL,                  -- кэш нарезки: {source_sha1, parts[[title,text]]} (12.11.2026)
+  attention  INTEGER NOT NULL DEFAULT 0,    -- потолок попыток (#39): 1 — не брать, ждёт оператора
   updated_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 )
 """
+
+#: The columns added to a pre-12.11.2026 migration_notes (the CHECK on `status`
+#: is NOT touched: a table rebuild mid-migration is a risk with no payoff —
+#: the attention state lives in its own flag column, outside the CHECK).
+_MIGRATION_NOTES_NEW_COLUMNS: dict[str, str] = {
+    "parts_json": "ALTER TABLE {table} ADD COLUMN parts_json TEXT NULL",
+    "attention": "ALTER TABLE {table} ADD COLUMN attention INTEGER NOT NULL DEFAULT 0",
+}
 
 logger = logging.getLogger("app")
 
@@ -163,8 +173,15 @@ def ensure_migration_schema(conn: sqlite3.Connection) -> None:
             Called for a new base after init_db and for the one returned by a rollback
             (it was created before LSBN-F-22 - the table/stamp may be missing).
 
+            The 12.11.2026 columns (`parts_json`, `attention`) are added to an
+            existing table by an idempotent ALTER (PRAGMA table_info check): a
+            base mid-migration keeps its rows, the new state simply appears.
     """
     conn.execute(_MIGRATION_NOTES_DDL)
+    columns = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({MIGRATION_NOTES_TABLE})")}
+    for name, ddl in _MIGRATION_NOTES_NEW_COLUMNS.items():
+        if name not in columns:
+            conn.execute(ddl.format(table=MIGRATION_NOTES_TABLE))
     limit = note_chars_limit(conn)
     if limit is not None:
         _set_meta(conn, META_SCHEMA_NOTE_CHARS, str(limit))

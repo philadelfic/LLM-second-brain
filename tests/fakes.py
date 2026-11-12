@@ -63,6 +63,7 @@ from app.services.summary import (
     SummaryError,
     SummaryResult,
 )
+from app.services.slot_outcome import SlotOutcome
 from app.services.worker import BackgroundWorker
 from app.storage.db import CREATOR_SKILL_NAME, session, transaction
 
@@ -234,7 +235,13 @@ class FixedSummarizer:
         self.last_attempt_ok = True
         meta = fake_meta("summary", "split")
         if self.split_mode == "transient":
-            raise SummaryError("нарезка недоступна")
+            # #39 (12.11.2026): транзиент — с исходом UNAVAILABLE (сеть/5xx/429);
+            # классификация в миграции читает `outcome`, а не текст.
+            raise SummaryError(
+                "нарезка недоступна", outcome=SlotOutcome.UNAVAILABLE
+            )
+        if self.split_mode == "off_contract":
+            raise SummaryError("модель вернула мусор")
         if self.split_mode == "incomplete":
             raise MergeIncompleteError(
                 "split incomplete after 2 rounds: coverage 0.40",
