@@ -140,6 +140,10 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "MAX_QUERY_CHARS": ("max_query_chars", 512),
     "COMMENT_MAX_CHARS": ("comment_max_chars", 250),  # no24-01 (3.2.0)
     "PENDING_RETRY_SEC": ("pending_retry_sec", 30),
+    # LSBN-D-16 (3.6.4): верхняя граница обработки SIGTERM, секунды (1..30) —
+    # задачи отменяются, ждутся в пределах бюджета, затем grace на потоки
+    # исполнителя, затем принудительный выход (shutdown_forced, код 0).
+    "SHUTDOWN_TIMEOUT_SEC": ("shutdown_timeout_sec", 30),
     # 3.4.1 (LSBN-T-27): разделитель слота нарезки — свои настройки джобы
     # миграции (не embedding_batch_size/pending_retry_sec).
     "MIGRATION_BATCH": ("migration_batch", 5),
@@ -331,7 +335,9 @@ class TestCompleteness:
         + 1 порог короткой выжимки LSBN-T-37 релиза 3.6.3:
         SUMMARY_SHORT_TEXT_CHARS
         + 1 сегмент верификации нарезки релиза 3.7.0:
-        SPLIT_VERIFY_SEGMENT_CHARS)."""
+        SPLIT_VERIFY_SEGMENT_CHARS
+        + 1 граница остановки LSBN-D-16 релиза 3.7.0:
+        SHUTDOWN_TIMEOUT_SEC)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected
