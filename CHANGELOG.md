@@ -26,6 +26,52 @@ stabilized (owner's decision: GitHub only on stabilization):
 * **3.6.2** (2026-11-12) — Parts of one note are not duplicates
 * **3.6.3** (2026-11-12) — Short notes summarize themselves
 
+## [3.7.0] - 2026-11-12
+
+Release 3.7.0 — "The retry economy of splitting": the live failure of
+2026-11-12 (a thinking judge with a degraded 256-token budget answered nothing,
+so the migration queue re-split the same notes every 10 minutes, burning the
+generation slot for days) is fixed at three levels — the judge's budget, the
+verification shape, and the retry policy.
+
+### Fixed
+
+* **A thinking judge without an explicit budget is a fatal config error** —
+  with `JUDGE_NUM_PREDICT=0` and `JUDGE_CONTEXT_TOKENS=0` the auto budget
+  degraded to the legacy 256-token cap of the `judge` operation, the reasoning
+  ate all of it (`done_reason=length`, empty `content`), and every judge call
+  failed (dedup froze after 8 attempts, split verification always fell). The
+  shipped compose sets `JUDGE_NUM_PREDICT=4096`; validation (NFR-6) refuses to
+  start on `JUDGE_THINK=true` + auto budget + unknown context.
+
+### Added
+
+* **`SPLIT_VERIFY_SEGMENT_CHARS`** (default `6000`, range `1000..20000`) — the
+  split verdict verifies the source segment by segment (overlap ≤ 1/4 of the
+  segment); the first `MISSING` batch is the verdict. One giant prompt
+  "source + all parts" exploded on real notes (75 fragments).
+* **The split parts cache** — `migration_notes.parts_json` (`{source_sha1,
+  parts}`): a transient judge failure verifies the same parts without calling
+  the split model again; saving the parts clears the cache.
+* **The split attention state** — the `SLOT_MAX_ATTEMPTS` ceiling of
+  non-transient failures freezes a note (`migration_notes.attention=1`): the
+  job stops taking it, the queue is not "empty" (phase stays open, the union
+  read keeps the source visible), a `warnings` record carries the reason.
+* **The mechanical garbage floor** — `SPLIT_FACTS_FLOOR=0.3` (`facts_coverage`
+  of hard tokens): below it the parts are a loss, not a retelling, and go to
+  quarantine without burning the judge's call.
+* **The fragmentation ceiling** — `SPLIT_PARTS_SLACK=2`: more parts than
+  `ceil(chars / limit) + 2` means the model is padding, not decomposing — one
+  follow-up, then defer (the "one part per fact" era fragmented a live note
+  into 75 scraps; the prompt now asks for dense parts).
+
+### Changed
+
+* **Transient failures no longer eat the attempt budget** (the #39 semantics,
+  mirrored from the dedup pairs): `unavailable`/`timeout`/`auth` wait on the
+  loop's back-off; only `empty`/`truncated`/`off_contract` count, and on the
+  ceiling the note moves to attention.
+
 ## [3.6.3] - 2026-11-12
 
 Release 3.6.3 — "Short notes summarize themselves": a note that fits in
