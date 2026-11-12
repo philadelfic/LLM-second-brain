@@ -242,7 +242,7 @@ class TestSplitJob:
         assert _service(summarizer).process_batch() == 3
         statuses = _statuses()
         assert statuses[2][0] == "карантин"
-        assert statuses[3][0] == "карантин"
+        assert statuses[3][0] == "expired"  # истёк TTL — дизайн §4, без модели
         with session(get_settings()) as conn:
             attempts = {
                 int(r["old_id"]): int(r["attempts"])
@@ -266,9 +266,10 @@ class TestSplitJob:
         assert _service(summarizer).process_batch() == 0
         assert len(summarizer.split_calls) == calls_before
         # Attention видна в очереди и НЕ даёт считать её пустой (фаза открыта).
+        # 2 и 4 шли симметрично: обе на потолке, обе видны оператору.
         stat = _service(summarizer).queue_stat()
         assert stat["pending"] == 0
-        assert stat["attention"] == 1
+        assert stat["attention"] == 2
         assert _service(summarizer).queue_empty() is False
 
     def test_judge_transient_reuses_cached_parts(

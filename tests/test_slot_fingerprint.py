@@ -214,7 +214,7 @@ def test_fingerprint_changes_with_think(tmp_path, monkeypatch) -> None:
         _settings(tmp_path, monkeypatch, SUMMARY_THINK="false")
     )
     judge_on = slot_config_fingerprint(
-        _settings(tmp_path, monkeypatch, JUDGE_THINK="true")
+        _settings(tmp_path, monkeypatch, JUDGE_THINK="true", JUDGE_NUM_PREDICT="4096")
     )
     assert len({base, summary_off, judge_on}) == 3
     # bool приводится к True/False (не 1/0) — отпечаток читает человек в журнале

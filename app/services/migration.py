@@ -269,12 +269,15 @@ class MigrationService:
             with session(self._settings) as conn:
                 ensure_migration_schema(conn)
                 row = conn.execute(
-                    f"SELECT COUNT(*) AS pending, "
+                    f"SELECT "
+                    f"COALESCE(SUM(CASE WHEN attention = 0 THEN 1 ELSE 0 END), 0) "
+                    f"AS pending, "
                     f"CAST(strftime('%s','now') AS INTEGER) - "
-                    f"CAST(strftime('%s', MIN(updated_at)) AS INTEGER) AS age, "
-                    f"COALESCE(SUM(attention), 0) AS attention "
-                    f"FROM {MIGRATION_NOTES_TABLE} WHERE status IN (?, ?) "
-                    f"AND attention = 0",
+                    f"CAST(strftime('%s', MIN(CASE WHEN attention = 0 THEN "
+                    f"updated_at END)) AS INTEGER) AS age, "
+                    f"COALESCE(SUM(CASE WHEN attention = 1 THEN 1 ELSE 0 END), 0) "
+                    f"AS attention "
+                    f"FROM {MIGRATION_NOTES_TABLE} WHERE status IN (?, ?)",
                     _TAKEN_STATUSES,
                 ).fetchone()
         except (sqlite3.Error, StorageError):

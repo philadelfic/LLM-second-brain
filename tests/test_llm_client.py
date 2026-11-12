@@ -181,7 +181,7 @@ class TestOllamaChatPayload:
     def test_think_override_for_structural_judge(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """think=bool в вызове переопределяет флаг слота (судья структуры:
         NAMESPACE_JUDGE_THINK поверх JUDGE_THINK)."""
-        settings = make_settings(monkeypatch, JUDGE_THINK="true")
+        settings = make_settings(monkeypatch, JUDGE_THINK="true", JUDGE_NUM_PREDICT="4096")
         client, recorder = make_client(SlotSpec.for_judge(settings), [ollama_chat_ok()])
         client.chat(SYSTEM, USER, num_predict=8, think=False)
         assert last_payload(recorder)["think"] is False
