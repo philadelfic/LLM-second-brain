@@ -131,6 +131,25 @@ matches the current canon (e.g. a `judge_system.txt` missing the
 clear message. To fix: delete the file to re-seed it from the built-in default,
 or edit it to add both markers (see [Configuration](CONFIG.md) → Prompts).
 
+## Release gate: the note storm
+
+A release that touches **split**, **dedup**, **summary** or **merge** must pass the
+note-storm run on a snapshot of the live database before it ships (LSBN-T-35,
+`scripts/note_storm_run.py`):
+
+```bash
+python scripts/note_storm_run.py --db data/backups/notes-<stamp>.db --dry-run
+```
+
+The run opens a **copy** of the snapshot (the original is never touched), calls no
+model in the dry run, reproduces the scenario that produced the merge storm — the
+parts of one split source against the background dedup — and prints a before/after
+table plus PASS/FAIL: 0 dedup candidates of one origin, 0 merge jobs and 0
+attention tasks for them, the summary and judge queues do not grow, every part
+stays alive with its text unchanged. `--live` additionally runs the real judge and
+merge loops on the copy within `--max-calls` (default 300) and stops when the
+budget is spent. A FAIL blocks the release.
+
 ## Operations
 
 - **Logs**: `docker compose logs -f second-brain` (one JSON line per event).
