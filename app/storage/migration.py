@@ -916,3 +916,66 @@ def ensure_startup_schema(settings: Settings) -> None:
     """
     with session(settings) as conn, transaction(conn):
         ensure_migration_schema(conn)
+
+
+def backfill_origin_note_ids(settings: Settings) -> dict:
+    """Fill notes.origin_note_id of the already split notes (3.6.2).
+
+    The source of truth is a `migration_notes` row of a split source
+    ('нарезана' + the new_ids JSON of its parts), not a meta stamp: `meta` is
+    poured between bases (_POUR_SPECS), and a stamp would claim the work done
+    in a base that never had the split. Idempotency lives in the data —
+    `WHERE origin_note_id IS NULL`: a repeated start changes nothing, and a
+    part that already knows its origin is never overwritten.
+
+    Runs at every start right after `ensure_startup_schema`, BEFORE the
+    startup plan: the values fill the active base first and a deferred
+    migration pours them into the new one. A base without the migration table
+    (never migrated into) is a zero answer, a broken new_ids JSON is skipped
+    with a warning — the parts are not lost, they just keep a NULL origin.
+
+    Returns the counters `{"sources", "parts", "filled"}`; the log line is
+    written only when something was actually filled.
+    """
+    counters = {"sources": 0, "parts": 0, "filled": 0}
+    with session(settings) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (MIGRATION_NOTES_TABLE,),
+        ).fetchone()
+        if exists is None:
+            return counters  # no migration in this base — nothing to backfill
+        with transaction(conn):
+            rows = conn.execute(
+                f"SELECT old_id, new_ids FROM {MIGRATION_NOTES_TABLE} "
+                "WHERE status = 'нарезана' AND new_ids IS NOT NULL"
+            ).fetchall()
+            for row in rows:
+                counters["sources"] += 1
+                old_id = int(row["old_id"])
+                try:
+                    part_ids = json.loads(row["new_ids"])
+                except (TypeError, ValueError):
+                    part_ids = None
+                if not isinstance(part_ids, list) or not all(
+                    isinstance(part_id, int) for part_id in part_ids
+                ):
+                    logger.warning(
+                        "new_ids источника не читается — источник пропущен",
+                        extra={"event": "origin_backfill_broken", "old_id": old_id},
+                    )
+                    continue
+                for part_id in part_ids:
+                    counters["parts"] += 1
+                    cursor = conn.execute(
+                        "UPDATE notes SET origin_note_id = ? "
+                        "WHERE id = ? AND origin_note_id IS NULL",
+                        (old_id, part_id),
+                    )
+                    counters["filled"] += cursor.rowcount
+    if counters["filled"]:
+        logger.info(
+            "origin_note_id частей заполнен из migration_notes",
+            extra={"event": "origin_backfill", **counters},
+        )
+    return counters

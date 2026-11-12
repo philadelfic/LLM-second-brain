@@ -48,6 +48,7 @@ from app.services.worker import BackgroundWorker
 from app.storage.db import StorageError, init_db
 from app.storage.migration import (
     MigrationError,
+    backfill_origin_note_ids,
     ensure_startup_schema,
     run_startup_migration,
     startup_plan,
@@ -497,6 +498,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # LSBN-F-22: the migration_notes table + the schema.note_chars
             # stamp on every start (idempotent; observability — design §3).
             ensure_startup_schema(settings)
+            # 3.6.2: the parts of the notes split before carry the id of their
+            # source note (origin_note_id from migration_notes, idempotent).
+            # BEFORE the startup plan — a deferred migration then pours the
+            # filled values into the new base together with the notes.
+            backfill_origin_note_ids(settings)
         except StorageError as exc:
             print(f"FATAL: {exc}", file=sys.stderr)
             raise SystemExit(2) from exc
