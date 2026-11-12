@@ -461,6 +461,9 @@ class Settings(BaseSettings):
 
     # --- misc ---
     log_level: str = "INFO"
+    log_file: str = ""  # JSON-лог в файл (ротация); пусто — только stdout
+    log_max_bytes: int = 50_000_000
+    log_backups: int = 5
     author_default: str = "unknown"
 
     # --- backup (NFR-3) ---
