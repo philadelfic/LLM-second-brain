@@ -53,3 +53,32 @@ def test_reserve_above_context_fatal(monkeypatch) -> None:
             SUMMARY_CONTEXT_TOKENS="4096",
             SLOT_PROMPT_RESERVE_TOKENS="8192",
         )
+
+
+def test_thinking_judge_without_budget_is_fatal(monkeypatch) -> None:
+    """Думающий судья с авто-бюджетом и неизвестным контекстом — фатальный старт.
+
+    Иначе авто-бюджет деградирует к прошлой капе операции judge (256 токенов),
+    рассуждение съедает ответ и вердикт не выходит (живой сбой 12.11.2026).
+    """
+    monkeypatch.delenv("DB_PATH", raising=False)
+    with pytest.raises(ConfigError, match="JUDGE_NUM_PREDICT"):
+        load(monkeypatch, JUDGE_THINK="true")
+
+
+def test_thinking_judge_with_explicit_budget_ok(monkeypatch) -> None:
+    """Явный бюджет или объявленный контекст думающего судьи — старт возможен."""
+    monkeypatch.delenv("DB_PATH", raising=False)
+    settings = load(monkeypatch, JUDGE_THINK="true", JUDGE_NUM_PREDICT="4096")
+    assert settings.judge_num_predict == 4096
+    settings = load(
+        monkeypatch, JUDGE_THINK="true", JUDGE_CONTEXT_TOKENS="131072"
+    )
+    assert settings.judge_context_tokens == 131072
+
+
+def test_thoughtless_judge_auto_budget_ok(monkeypatch) -> None:
+    """Недумающий судья с авто-бюджетом — прежнее поведение, старт возможен."""
+    monkeypatch.delenv("DB_PATH", raising=False)
+    settings = load(monkeypatch, JUDGE_THINK="false")
+    assert settings.judge_think is False

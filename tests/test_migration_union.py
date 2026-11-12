@@ -444,6 +444,7 @@ class TestAbort:
                 "quarantine": 0,
                 "expired": 0,
                 "waiting": 3,
+                "attention": 0,
             }
             assert health["migration"]["invariant_ok"] is True
             aborted = client.post("/migration/abort", headers=headers)
@@ -474,9 +475,11 @@ class TestHealthCounters:
             "quarantine": 0,
             "expired": 1,  # 50
             "waiting": 0,
+            "attention": 0,
         }
         assert block["invariant_ok"] is True
-        # Инвариант в лоб: old_total = poured + split + waiting + карантин + exp.
+        # Инвариант в лоб: old_total = poured + split + waiting + карантин
+        # + expired + attention.
         c = block["counters"]
         assert c["old_total"] == (
             c["poured"]
@@ -484,6 +487,7 @@ class TestHealthCounters:
             + c["waiting"]
             + c["quarantine"]
             + c["expired"]
+            + c["attention"]
         )
 
     def test_reverse_health_block_is_interpretable(

@@ -29,6 +29,24 @@
       model is unavailable for everyone else, a retry on the loop's back-off
       (NFR-3).
 
+    The retry economy of 2026-11-12 (the live failure: the judge's budget bug
+    sent every verification to OFF_CONTRACT and the queue re-split the same
+    notes every 10 minutes for days, burning the generation slot):
+    - the split result is CACHED in migration_notes.parts_json (keyed by the
+      source's sha1): a retry after a transient judge failure verifies the SAME
+      parts — the split model is not called again;
+    - the #39 semantics: a transient failure (unavailable/timeout/auth) does NOT
+      eat the attempt budget — waiting is normal, the job's back-off paces it; a
+      non-transient one (empty/truncated/off_contract) does;
+    - the attempt ceiling = SLOT_MAX_ATTEMPTS: exhausted, the note moves to the
+      ATTENTION state (migration_notes.attention=1, the status 'карантин') — the
+      job stops taking it (the queue stays open: phase=done does NOT fire while
+      attentioned notes remain), the operator decides in warnings; nothing is
+      lost — the source stays whole in the previous database;
+    - the mechanical garbage floor (SPLIT_FACTS_FLOOR): below it the parts are
+      a loss, not a retelling — the note is quarantined WITHOUT burning the
+      judge's call.
+
     The job registers on the lsb-0014 framework (a builder + a line in
     `jobs.JOB_BUILDERS`, the warnings/terms_normalize precedent): the "by
     interval" form, the summary slot — the splitting slot's breaker is visible in
@@ -42,6 +60,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -52,16 +72,20 @@ from typing import TYPE_CHECKING, Any
 from app.config import Settings
 from app.services import jobs
 from app.services.judge import JudgeError
+from app.services.slot_outcome import SlotOutcome, outcome_of
 from app.services.summary import (
     MERGE_MAX_ROUNDS,
     MergeIncompleteError,
+    SPLIT_FACTS_FLOOR,
     SummaryError,
+    facts_coverage,
 )
 from app.storage.db import StorageError, note_chars_limit, session, transaction
 from app.storage.migration import (
     MIGRATION_NOTES_TABLE,
     SOURCE_MIGRATION_SPLIT,
     MigrationError,
+    ensure_migration_schema,
     free_away_name,
     read_state,
     reverse_pour,
@@ -91,6 +115,15 @@ SPLIT_DEFERRED_WARNING = "split_deferred"
 #: Statuses the job takes into work: 'waiting' — primary, 'quarantine'
 #: — a retry on back-off (design §4: "quarantine … a retry on back-off").
 _TAKEN_STATUSES = ("ожидает", "карантин")
+
+#: The #39 outcome classes (mirrors worker._NON_TRANSIENT_OUTCOMES): a transient
+#: failure (unavailable/timeout/auth) means "wait" — it does NOT eat the attempt
+#: budget, the job's back-off paces the retries; a non-transient one
+#: (empty/truncated/off_contract) means "the note is hopeless as it is" — it
+#: counts, and on the SLOT_MAX_ATTEMPTS ceiling the note moves to attention.
+_NON_TRANSIENT_OUTCOMES = frozenset(
+    {SlotOutcome.EMPTY, SlotOutcome.TRUNCATED, SlotOutcome.OFF_CONTRACT}
+)
 
 logger = logging.getLogger("app")
 
@@ -228,24 +261,45 @@ class MigrationService:
                     The age — over `updated_at` of the taken status (the stamp is moved by
                     splitting and quarantine alike) — the same "age over pending+waiting"
                     semantics (3.3.1). No migration_notes table (no migration happened) —
-                    the queue is empty.
+                    the queue is empty. `attention` — the notes frozen after
+                    SLOT_MAX_ATTEMPTS non-transient attempts: not taken, not pending,
+                    visible (the #39 attention precedent).
         """
         try:
             with session(self._settings) as conn:
+                ensure_migration_schema(conn)
                 row = conn.execute(
-                    f"SELECT COUNT(*) AS pending, "
+                    f"SELECT "
+                    f"COALESCE(SUM(CASE WHEN attention = 0 THEN 1 ELSE 0 END), 0) "
+                    f"AS pending, "
                     f"CAST(strftime('%s','now') AS INTEGER) - "
-                    f"CAST(strftime('%s', MIN(updated_at)) AS INTEGER) AS age "
+                    f"CAST(strftime('%s', MIN(CASE WHEN attention = 0 THEN "
+                    f"updated_at END)) AS INTEGER) AS age, "
+                    f"COALESCE(SUM(CASE WHEN attention = 1 THEN 1 ELSE 0 END), 0) "
+                    f"AS attention "
                     f"FROM {MIGRATION_NOTES_TABLE} WHERE status IN (?, ?)",
                     _TAKEN_STATUSES,
                 ).fetchone()
         except (sqlite3.Error, StorageError):
-            return {"pending": 0, "oldest_pending_sec": None}
-        return {"pending": int(row["pending"]), "oldest_pending_sec": row["age"]}
+            return {"pending": 0, "oldest_pending_sec": None, "attention": 0}
+        return {
+            "pending": int(row["pending"]),
+            "oldest_pending_sec": row["age"],
+            "attention": int(row["attention"] or 0),
+        }
 
     def queue_empty(self) -> bool:
-        """Is the splitting queue empty (a cheap queue recheck, pool 6)."""
-        return int(self.queue_stat()["pending"] or 0) == 0
+        """Is the splitting queue empty (a cheap queue recheck, pool 6)?
+
+                    Attentioned notes COUNT as work: the queue is not "empty" while a
+                    frozen note waits for the operator — otherwise phase=done would
+                    fire and the union read would hide the note's source from the
+                    service (the note is not in the active base yet).
+        """
+        stat = self.queue_stat()
+        return (
+            int(stat["pending"] or 0) == 0 and int(stat["attention"] or 0) == 0
+        )
 
     # --- phase 4: the splitting batch -----------------------------------------
 
@@ -266,12 +320,29 @@ class MigrationService:
         legacy_path = self._legacy_path(state)
         if legacy_path is None:
             return 0
+        # The 12.11.2026 columns (parts_json/attention) appear on a base that
+        # started migrating before them — idempotent ALTER before the selects.
+        with session(self._settings) as conn:
+            ensure_migration_schema(conn)
         rows = self._taken_rows(limit)
         if not rows:
             # Phase 7 (M3): the splitting queue is empty — the reconciliation is zeroed,
             # phase=done (the union is disabled; the state stays — migration_notes
-            # is the rollback map). Idempotent: the next run is an idle one.
-            self._close_if_drained(state)
+            # is the rollback map). Attentioned notes are NOT "empty": the phase
+            # stays open while they wait for the operator. Idempotent: the next
+            # run is an idle one.
+            if self._attention_count() == 0:
+                self._close_if_drained(state)
+            else:
+                logger.info(
+                    "migration: split queue holds attentioned notes — "
+                    "phase stays open for the operator",
+                    extra={
+                        "event": "migration_attention_pending",
+                        "job": MIGRATION_JOB,
+                        "attention": self._attention_count(),
+                    },
+                )
             return 0
         # DEF-7a: splitting has started — the phase is visible in state and /health (design §3:
         # pour — the startup pour only, split — splitting; done/aborted — M3).
@@ -318,6 +389,7 @@ class MigrationService:
                     str(note["namespace"] or "default"),
                     str(note["text"]),
                     attempts=int(row["attempts"]),
+                    cached=row["parts_json"],
                 )
                 if outcome == "retry-later":
                     break  # transient: the model is down — release the batch
@@ -375,81 +447,83 @@ class MigrationService:
         text: str,
         *,
         attempts: int,
+        cached: str | None,
     ) -> str:
-        """Split one note: split → save_migration_parts → the status.
+        """Split one note → the judge's verdict → save; the status outcome.
 
-                    Returns: "done" (the status changed), "quarantined", "retry-later"
-                    (transient — the status unchanged, release the batch).
+                    Returns: "done" (the status changed), "quarantined" (deferred /
+                    attention — the note stays whole in the previous base),
+                    "retry-later" (transient — the status unchanged, release the
+                    batch).
+
+                    The retry economy (2026-11-12): a cached split (parts_json,
+                    keyed by the source's sha1) is verified as is — the split model
+                    is not called again after a transient judge failure; the
+                    garbage floor refuses to burn the judge on hopeless parts; the
+                    attempt ceiling (SLOT_MAX_ATTEMPTS, non-transient failures
+                    only — the #39 semantics) freezes the note in attention.
         """
-        try:
-            result: MergeResult = self._summarizer.split(text)
-        except MergeIncompleteError as exc:
-            # F-22 design §4: splitting did not converge within MERGE_MAX_ROUNDS —
-            # 'quarantine' + warnings; a retry on back-off (the lowest id
-            # of quarantine is taken together with 'waiting').
-            self._mark(
-                active,
-                old_id,
-                "карантин",
-                reason=str(exc)[:500],
-                bump_attempts=True,
-            )
-            self._log(
-                "migration: split incomplete — note quarantined",
-                "migration_split_deferred",
-                old_id=old_id,
-                rounds=int(getattr(exc, "rounds", 0)) or None,
-                detail=str(exc)[:300],
-                meta=getattr(exc, "meta", None),
-            )
-            self._open_warning(old_id, str(exc))
-            return "quarantined"
-        except SummaryError as exc:
-            # Transient (the model unavailable / an off-contract response): the status
-            # stays, the attempt is counted, the batch is released — the loop's back-off.
-            self._bump_attempt(active, old_id)
-            self._log(
-                "migration: split failed — note stays pending, retry by back-off",
-                "migration_split_failed",
-                old_id=old_id,
-                detail=str(exc)[:300],
-                meta=getattr(exc, "meta", None),
-            )
-            return "retry-later"
-        parts = [(part.title, part.text) for part in result.parts]
-        # The judge's verdict (Oleg's decision 11.11.2026): the source and all the
-        # new notes go to the judge - "was everything decomposed, nothing missed".
-        # A refusal is a quarantine (the note stays whole in the previous base and
-        # is retried later); an unavailable judge is a transient failure.
-        if self._judge is not None:
+        parts = self._cached_parts(cached, text)
+        result: "MergeResult | None" = None
+        if parts is None:
             try:
-                verdict = self._judge.verify_split(text, [part_text for _t, part_text in parts])
-            except JudgeError as exc:
-                self._bump_attempt(active, old_id)
-                self._log(
-                    "migration: split verdict unavailable — note stays pending",
-                    "migration_split_verdict_failed",
-                    old_id=old_id,
-                    detail=str(exc)[:300],
-                )
-                return "retry-later"
-            if verdict is not None:
-                self._mark(
+                result = self._summarizer.split(text)
+            except MergeIncompleteError as exc:
+                # F-22 design §4: splitting did not converge within MERGE_MAX_ROUNDS.
+                # The cached parts (if any) belong to the failed split — clear them,
+                # a retry re-splits from scratch.
+                self._clear_cached(active, old_id)
+                return self._defer(
                     active,
                     old_id,
-                    "карантин",
-                    reason=f"судья: {verdict}"[:500],
-                    bump_attempts=True,
+                    str(exc),
+                    attempts=attempts,
+                    detail=str(exc)[:300],
+                    rounds=int(getattr(exc, "rounds", 0)) or None,
+                    meta=getattr(exc, "meta", None),
+                    event="migration_split_deferred",
                 )
-                self._log(
-                    "migration: judge refused the split — note quarantined",
-                    "migration_split_rejected",
-                    old_id=old_id,
+            except SummaryError as exc:
+                return self._slot_failure(active, old_id, exc, attempts)
+            parts = [(part.title, part.text) for part in result.parts]
+            self._store_cached(active, old_id, text, parts)
+        # The mechanical garbage floor: below it the parts are a loss, not a
+        # retelling — quarantine WITHOUT burning the judge's call.
+        coverage = facts_coverage(text, [part_text for _title, part_text in parts])
+        if coverage < SPLIT_FACTS_FLOOR:
+            self._clear_cached(active, old_id)
+            return self._defer(
+                active,
+                old_id,
+                f"покрытие фактов {coverage:.2f} ниже порога {SPLIT_FACTS_FLOOR:.2f} "
+                "— части потеряли факты источника",
+                attempts=attempts,
+                detail=f"facts coverage {coverage:.2f} < {SPLIT_FACTS_FLOOR:.2f}",
+                event="migration_split_garbage",
+            )
+        # The judge's verdict (Oleg's decision 11.11.2026): the source and the new
+        # notes go to the judge - "was everything decomposed, nothing missed"
+        # (batched segment by segment since 12.11.2026). A refusal is a quarantine;
+        # an unavailable judge is a transient failure — the cached parts stay,
+        # the retry verifies them WITHOUT a new split.
+        if self._judge is not None:
+            try:
+                verdict = self._judge.verify_split(
+                    text, [part_text for _t, part_text in parts]
+                )
+            except JudgeError as exc:
+                return self._slot_failure(active, old_id, exc, attempts)
+            if verdict is not None:
+                self._clear_cached(active, old_id)
+                return self._defer(
+                    active,
+                    old_id,
+                    f"судья: {verdict}",
+                    attempts=attempts,
                     detail=verdict[:300],
                     parts=len(parts),
+                    event="migration_split_rejected",
                 )
-                self._open_warning(old_id, f"судья: {verdict}")
-                return "quarantined"
             self._log(
                 "migration: judge confirmed the split",
                 "migration_split_verified",
@@ -457,19 +531,206 @@ class MigrationService:
                 parts=len(parts),
             )
         # Observability (DEF-6): a slot_call for EVERY splitting call — like
-        # merge/dedup (worker); the 2nd-round follow-up is visible as a separate line.
-        self._log_slot_call(old_id, result)
+        # merge/dedup (worker); the 2nd-round follow-up is visible as a separate
+        # line. A cached split reuses the saved parts — the original call was
+        # journaled by the run that produced it.
+        if result is not None:
+            self._log_slot_call(old_id, result)
         outcome = self._notes.save_migration_parts(old_id, namespace, parts)
         self._log(
             "migration: note split into self-contained parts",
             "migration_split",
             old_id=old_id,
-            rounds=result.rounds,
-            model=result.meta.model,
+            rounds=result.rounds if result is not None else 1,
+            model=result.meta.model if result is not None and result.meta else None,
             parts=len(outcome["parts"]),
             part_ids=[int(part["id"]) for part in outcome["parts"]],
         )
         return "done"
+
+    # --- the retry economy (2026-11-12) ---------------------------------------
+
+    def _defer(
+        self,
+        active: sqlite3.Connection,
+        old_id: int,
+        reason: str,
+        *,
+        attempts: int,
+        event: str,
+        **log_fields: Any,
+    ) -> str:
+        """A non-transient failure: quarantine — or attention at the ceiling.
+
+                    `attempts` — the count BEFORE this failure (the row's value at
+                    the take). On the SLOT_MAX_ATTEMPTS ceiling the note moves to
+                    attention: the status stays 'карантин', the attention flag
+                    takes it out of the taken set, the warnings record tells the
+                    operator. Nothing is lost: the source is whole in the previous
+                    base.
+        """
+        if attempts + 1 >= self._settings.slot_max_attempts:
+            self._to_attention(active, old_id, reason)
+            return "quarantined"
+        self._mark(
+            active, old_id, "карантин", reason=reason[:500], bump_attempts=True
+        )
+        self._log(
+            "migration: split deferred — note quarantined",
+            event,
+            old_id=old_id,
+            **log_fields,
+        )
+        self._open_warning(old_id, reason)
+        return "quarantined"
+
+    def _slot_failure(
+        self,
+        active: sqlite3.Connection,
+        old_id: int,
+        exc: SummaryError,
+        attempts: int,
+    ) -> str:
+        """A split/verdict call failure, classified by the #39 outcome.
+
+                    Transient (unavailable/timeout/auth): the status and the
+                    attempt budget stay — waiting is normal, the loop's back-off
+                    paces the retry; only the queue's age stamp moves. Non-transient
+                    (empty/truncated/off_contract): the note eats the attempt —
+                    the `_defer` quarantine/attention mechanics.
+        """
+        outcome = outcome_of(exc)
+        if outcome in _NON_TRANSIENT_OUTCOMES:
+            return self._defer(
+                active,
+                old_id,
+                str(exc),
+                attempts=attempts,
+                detail=str(exc)[:300],
+                meta=getattr(exc, "meta", None),
+                event="migration_split_failed",
+            )
+        self._touch(active, old_id)
+        self._log(
+            "migration: split failed — note stays pending, retry by back-off",
+            "migration_split_failed",
+            old_id=old_id,
+            outcome=outcome.value,
+            detail=str(exc)[:300],
+            meta=getattr(exc, "meta", None),
+        )
+        return "retry-later"
+
+    def _to_attention(
+        self, active: sqlite3.Connection, old_id: int, reason: str
+    ) -> None:
+        """Freeze the note: the SLOT_MAX_ATTEMPTS ceiling is reached (#39).
+
+                    The attention flag takes the note out of the taken set (the job
+                    stops burning the slots on it), the status stays 'карантин',
+                    the cached parts are dropped (a human will re-decide), the
+                    warnings record carries the reason.
+        """
+        active.execute(
+            f"UPDATE {MIGRATION_NOTES_TABLE} "
+            f"SET attention = 1, status = 'карантин', reason = ?, "
+            f"attempts = attempts + 1, parts_json = NULL, "
+            f"updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            f"WHERE old_id = ?",
+            (reason[:500], old_id),
+        )
+        self._log(
+            "migration: split attempts exhausted — note moved to attention",
+            "migration_split_attention",
+            old_id=old_id,
+            attempts=self._settings.slot_max_attempts,
+            detail=reason[:300],
+        )
+        self._open_warning(old_id, f"требует внимания: {reason}")
+
+    @staticmethod
+    def _source_hash(text: str) -> str:
+        """The cache key: the source's sha1 (a source edit invalidates the cache)."""
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+    def _cached_parts(
+        self, cached: str | None, text: str
+    ) -> list[tuple[str, str]] | None:
+        """The cached split parts, None when absent/stale/malformed."""
+        if not cached:
+            return None
+        try:
+            data = json.loads(cached)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        if data.get("source_sha1") != self._source_hash(text):
+            return None
+        raw_parts = data.get("parts")
+        if not isinstance(raw_parts, list) or not raw_parts:
+            return None
+        parts: list[tuple[str, str]] = []
+        for item in raw_parts:
+            if (
+                not isinstance(item, list)
+                or len(item) != 2
+                or not all(isinstance(value, str) for value in item)
+            ):
+                return None
+            parts.append((item[0], item[1]))
+        return parts
+
+    @staticmethod
+    def _store_cached(
+        active: sqlite3.Connection,
+        old_id: int,
+        text: str,
+        parts: list[tuple[str, str]],
+    ) -> None:
+        """Remember the split result: a judge retry verifies THESE parts."""
+        payload = {
+            "source_sha1": MigrationService._source_hash(text),
+            "parts": [[title, part_text] for title, part_text in parts],
+        }
+        active.execute(
+            f"UPDATE {MIGRATION_NOTES_TABLE} "
+            f"SET parts_json = ?, "
+            f"updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            f"WHERE old_id = ?",
+            (json.dumps(payload, ensure_ascii=False), old_id),
+        )
+
+    @staticmethod
+    def _clear_cached(active: sqlite3.Connection, old_id: int) -> None:
+        """Drop the cached parts (a reject/attention: the next try re-splits)."""
+        active.execute(
+            f"UPDATE {MIGRATION_NOTES_TABLE} SET parts_json = NULL WHERE old_id = ?",
+            (old_id,),
+        )
+
+    @staticmethod
+    def _touch(active: sqlite3.Connection, old_id: int) -> None:
+        """Move the queue age stamp WITHOUT eating the attempt budget (#39)."""
+        active.execute(
+            f"UPDATE {MIGRATION_NOTES_TABLE} "
+            f"SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            f"WHERE old_id = ?",
+            (old_id,),
+        )
+
+    def _attention_count(self) -> int:
+        """The frozen notes (SQL only); no table — 0."""
+        try:
+            with session(self._settings) as conn:
+                ensure_migration_schema(conn)
+                row = conn.execute(
+                    f"SELECT COUNT(*) FROM {MIGRATION_NOTES_TABLE} "
+                    f"WHERE attention = 1"
+                ).fetchone()
+        except (sqlite3.Error, StorageError):
+            return 0
+        return int(row[0])
 
     def _read_state(self) -> dict | None:
         """The active database's migration state; None — nothing to split."""
@@ -503,10 +764,12 @@ class MigrationService:
         return str(candidate)
 
     def _taken_rows(self, limit: int | None) -> list[Any]:
-        """Minimal ids of the taken statuses ('waiting' + quarantine on back-off)."""
+        """Minimal ids of the takeable statuses ('waiting' + quarantine on
+                    back-off); the attentioned notes are NOT taken — the operator's."""
         query = (
-            f"SELECT old_id, status, attempts FROM {MIGRATION_NOTES_TABLE} "
-            f"WHERE status IN (?, ?) ORDER BY old_id"
+            f"SELECT old_id, status, attempts, parts_json "
+            f"FROM {MIGRATION_NOTES_TABLE} "
+            f"WHERE status IN (?, ?) AND attention = 0 ORDER BY old_id"
         )
         if limit is not None:
             query += f" LIMIT {int(limit)}"
@@ -532,16 +795,6 @@ class MigrationService:
             f"updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
             f"WHERE old_id = ?",
             (status, reason, 1 if bump_attempts else 0, old_id),
-        )
-
-    @staticmethod
-    def _bump_attempt(conn: sqlite3.Connection, old_id: int) -> None:
-        """Count a transient attempt (the status unchanged — design §4)."""
-        conn.execute(
-            f"UPDATE {MIGRATION_NOTES_TABLE} SET attempts = attempts + 1, "
-            f"updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
-            f"WHERE old_id = ?",
-            (old_id,),
         )
 
     def _open_warning(self, old_id: int, reason: str) -> None:
@@ -797,7 +1050,11 @@ def migration_health(settings: Settings) -> dict:
     counters = state.get("counters", {})
     waiting = statuses.get("ожидает", 0)
     split_notes = statuses.get("нарезана", 0)
-    quarantine = statuses.get("карантин", 0)
+    # The frozen notes are counted APART from the quarantine (the invariant
+    # closes over both): quarantine retries on back-off, attention waits for
+    # the operator.
+    attention = _attention_count_rows(conn)
+    quarantine = statuses.get("карантин", 0) - attention
     expired = statuses.get("expired", 0)
     old_total = _legacy_total(settings, state, phase)
     # reverse-pour is the only writer of `kept_parts`; the forward pour does not
@@ -810,7 +1067,10 @@ def migration_health(settings: Settings) -> dict:
         # After the abort everything came back whole: the previous database is full again,
         # state.counters from reverse_pour (poured rows) — not about notes.
         poured = old_total
-        invariant_ok = old_total == poured + split_notes + waiting + quarantine + expired
+        invariant_ok = (
+            old_total
+            == poured + split_notes + waiting + quarantine + expired + attention
+        )
     elif direction == "reverse":
         # A return upward (phase=done): the forward pour's poured was never written,
         # the forward invariant does not apply to these numbers (DEF-7b).
@@ -819,7 +1079,8 @@ def migration_health(settings: Settings) -> dict:
     else:
         poured = int(counters.get("poured", 0))
         invariant_ok = (
-            old_total == poured + split_notes + waiting + quarantine + expired
+            old_total
+            == poured + split_notes + waiting + quarantine + expired + attention
         )
     block: dict = {
         "phase": phase,
@@ -834,6 +1095,7 @@ def migration_health(settings: Settings) -> dict:
             "quarantine": quarantine,
             "expired": expired,
             "waiting": waiting,
+            "attention": attention,
         },
         "invariant_ok": invariant_ok,
     }
@@ -858,6 +1120,17 @@ def _status_counts(conn: sqlite3.Connection) -> dict[str, int]:
     except sqlite3.Error:
         return {}
     return {str(row["status"]): int(row["n"]) for row in rows}
+
+
+def _attention_count_rows(conn: sqlite3.Connection) -> int:
+    """The frozen notes (migration_notes.attention=1); no table/column — 0."""
+    try:
+        row = conn.execute(
+            f"SELECT COUNT(*) FROM {MIGRATION_NOTES_TABLE} WHERE attention = 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return 0
+    return int(row[0])
 
 
 def _part_count(conn: sqlite3.Connection) -> int:

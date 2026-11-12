@@ -174,7 +174,7 @@ def test_think_false_in_request_body_by_default(monkeypatch) -> None:
 
 def test_think_field_absent_when_enabled(monkeypatch) -> None:
     """JUDGE_THINK=true: поля think нет (thinking ограничиваем не)."""
-    settings = make_settings(monkeypatch, JUDGE_THINK="true")
+    settings = make_settings(monkeypatch, JUDGE_THINK="true", JUDGE_NUM_PREDICT="4096")
     service, recorder = make_service(settings, [httpx.Response(200, json=ok_body())])
     assert settings.judge_think is True
     service.judge(TEXT_NEW, TEXT_CANDIDATE)
@@ -355,3 +355,96 @@ def test_build_services_wires_judge(monkeypatch) -> None:
     assert services.judge is not None
     assert type(services.judge).__name__ == "JudgeService"
     services.judge.close()
+
+# --- верификация нарезки: батчи по сегментам (12.11.2026) -------------------
+
+def test_plan_verification_single_batch_short_source() -> None:
+    from app.services.judge import plan_split_verification
+
+    batches = plan_split_verification(
+        "исходник", ["часть 1", "часть 2"], segment_chars=6000, overlap_chars=2000
+    )
+    assert len(batches) == 1
+    assert batches[0][0] == "исходник"
+    assert batches[0][1] == ["часть 1", "часть 2"]
+
+
+def test_plan_verification_long_source_segments_and_assignment() -> None:
+    from app.services.judge import plan_split_verification
+
+    source = "x" * 15000
+    parts = ["первый блок текста", "середина заметки", "последний кусок"]
+    batches = plan_split_verification(
+        source, parts, segment_chars=6000, overlap_chars=2000
+    )
+    # 15000 знаков / 6000 → 3 сегмента; перекрытие ≤ 1/4 сегмента (1500).
+    assert len(batches) == 3
+    assert batches[0][0] == source[:6000]
+    assert batches[1][0] == source[4500:10500]
+    assert batches[2][0] == source[9000:15000]
+    # Части распределены по сегментам пропорционально позиции — по одной.
+    assert [len(batch[1]) for batch in batches] == [1, 1, 1]
+
+
+def test_plan_verification_empty_parts_segment_keeps_batch() -> None:
+    from app.services.judge import plan_split_verification
+
+    source = "a" * 15000
+    batches = plan_split_verification(
+        source, ["только начало"], segment_chars=6000, overlap_chars=2000
+    )
+    # Сегменты без частей НЕ пропадают: судья увидит пустоту и скажет MISSING.
+    assert len(batches) == 3
+    assert batches[2][1] == []
+
+
+def test_plan_verification_overlap_capped_for_progress() -> None:
+    from app.services.judge import plan_split_verification
+
+    # overlap_chars больше сегмента — перекрытие капится четвертью сегмента,
+    # окна ползут (а не зацикливаются при overlap → segment-1).
+    batches = plan_split_verification(
+        "z" * 5000, ["один"], segment_chars=2000, overlap_chars=2000
+    )
+    assert len(batches) == 3  # [0:2000], [1500:3500], [3000:5000]
+
+
+def test_verify_split_long_source_asks_each_batch(monkeypatch) -> None:
+    """Источник длиннее сегмента — верификация каждого сегмента; все COMPLETE."""
+    settings = make_settings(monkeypatch, SPLIT_VERIFY_SEGMENT_CHARS="2000")
+    source = "s" * 5000
+    service, recorder = make_service(
+        settings,
+        [httpx.Response(200, json=ok_body("COMPLETE")) for _ in range(3)],
+    )
+    assert service.verify_split(source, ["p1", "p2", "p3"]) is None
+    assert recorder.calls == 3  # 5000 / 2000 (с перекрытием 500) → 3 сегмента
+    service.close()
+
+
+def test_verify_split_first_missing_wins(monkeypatch) -> None:
+    """Первый MISSING — итоговый вердикт; дальнейшие батчи не спрашиваются."""
+    settings = make_settings(monkeypatch, SPLIT_VERIFY_SEGMENT_CHARS="2000")
+    source = "s" * 5000
+    service, recorder = make_service(
+        settings,
+        [
+            httpx.Response(200, json=ok_body("COMPLETE")),
+            httpx.Response(200, json=ok_body("MISSING: число 42")),
+        ],
+    )
+    verdict = service.verify_split(source, ["p1", "p2", "p3"])
+    assert verdict is not None and "42" in verdict
+    assert recorder.calls == 2  # третий сегмент не дозванивался
+    service.close()
+
+
+def test_verify_split_batch_garbage_raises(monkeypatch) -> None:
+    """Нераспознанный вердикт батча — JudgeError (как и раньше)."""
+    settings = make_settings(monkeypatch, SPLIT_VERIFY_SEGMENT_CHARS="2000")
+    service, _ = make_service(
+        settings, [httpx.Response(200, json=ok_body("не знаю"))]
+    )
+    with pytest.raises(JudgeError):
+        service.verify_split("s" * 5000, ["p1"])
+    service.close()

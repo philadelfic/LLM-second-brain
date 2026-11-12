@@ -45,12 +45,23 @@ services:
       JUDGE_PROVIDER: "ollama"                 # ollama (default) | openai
       JUDGE_BASE_URL: "http://localhost:11434"  # ollama: /api/chat; openai: /v1/chat/completions
       JUDGE_API_KEY: "CHANGE_ME"               # optional; required for the openai provider
+      # Судья — ornith:35b. Замер боевого flint 12.11.2026 (через /v1, 3.112):
+      # вердикт по нарезке после 8742 токенов думанья и 5м47с — и с галлюциной
+      # MISSING на заведомо полной нарезке; с капой 4096 думанье съедает ответ
+      # целиком. Для вердиктов-строк ornith объективно лучше; flint — слот merge.
       JUDGE_MODEL: "ornith:35b"                # dedup judge model
       JUDGE_MODEL_TYPE: "generation"   # reasoning | generation; declare reasoning to get the budget and thinking guards
       JUDGE_THINK: "true"              # thinking judge: think:false produced false positives on long notes (E2E); ollama provider only
-      JUDGE_NUM_PREDICT: "0"           # 0 = as much as fits (auto budget from JUDGE_CONTEXT_TOKENS); explicit values keep the old caps (1024)
-      JUDGE_TIMEOUT_SEC: "300"         # thinking judge: long pair 46 s, worst live call ~121 s (E2E) — 300 s with margin; 900 = the back-off/pause ceiling (15 min): a single call must not hold the slot longer than the job cycle is willing to wait
-      JUDGE_CONTEXT_TOKENS: "0"        # the model's context window; 0 = unknown → previous per-operation caps
+      # При думающем судье явный бюджет ОБЯЗАТЕЛЕН (живой сбой 12.11.2026: авто
+      # с неизвестным контекстом деградировал к 256 — рассуждение съедало ответ,
+      # вердиктов не было, контур стоял). 4096: дедуп-вердикт — строка, вердикт
+      # нарезки — "MISSING: <что именно>"; E2E-замер при 1024 — ~1200 токенов.
+      JUDGE_NUM_PREDICT: "4096"
+      # Думающий судья на длинных парах: худший живой вызов ~121 с (E2E), при
+      # бюджете 4096 запас до 900 с — потолка паузы слота (один вызов не должен
+      # держать слот дольше, чем цикл джобы готов ждать).
+      JUDGE_TIMEOUT_SEC: "900"
+      JUDGE_CONTEXT_TOKENS: "0"        # 0 = неизвестен; с явным JUDGE_NUM_PREDICT не используется
       # --- decision slot (LSBN-F-12, 3.2.0): OFF by default; decisions go
       #     generative as today. decision needs Ollama ≥ 0.35.1: the route is
       #     native /v1/systemone, NOT OpenAI-compatible. When enabled, all
@@ -136,6 +147,17 @@ services:
       SLOT_MAX_OUTPUT_TOKENS: "32768"        # defensive ceiling of the auto output budget (explicit budgets are never clamped)
       SLOT_REASONING_MIN_OUTPUT_TOKENS: "4096"  # below it a reasoning slot gets a startup WARN: too little room for thinking
       SLOT_MIN_TIMEOUT_SEC: "300"            # below it a reasoning slot gets a startup WARN: a long-thinking call looks like a timeout
+      # --- shutdown (LSBN-D-16): the SIGTERM bound, seconds (1..30).
+      #     docker stop → uvicorn drops the HTTP listener fast, but a worker
+      #     thread blocked on an LLM call (asyncio.to_thread, the read
+      #     timeout up to 900 s) used to keep the process alive — the
+      #     container stayed "Up" with a dead HTTP, restart=unless-stopped
+      #     never fired, no alert. Now: the background loops are cancelled,
+      #     SHUTDOWN_TIMEOUT_SEC waits them out, a short grace waits the
+      #     threads, then a forced exit (exit code 0, the shutdown_forced
+      #     journal event). SQLite is transactional — committed work
+      #     survives, pending statuses catch up after the restart.
+      SHUTDOWN_TIMEOUT_SEC: "30"
       # --- HTTP/MCP ---
       PORT: "8080"
       MCP_PATH: "/mcp"
@@ -155,6 +177,11 @@ services:
       # смыслы); крутятся override'ом без релиза.
       MIGRATION_BATCH: "5"                   # notes per migration split run (1..100)
       MIGRATION_PAUSE_SEC: "600"             # pause AFTER a run before the next one, sec (0..86400)
+      # Верификация нарезки судьёй — сегментами (12.11.2026): источник длиннее
+      # N знаков режется на пересекающиеся сегменты (перекрытие = MAX_NOTE_CHARS),
+      # каждый сегмент с его частями — отдельный вызов судьи (источник + все
+      # части одним промптом взрывался на живых заметках).
+      SPLIT_VERIFY_SEGMENT_CHARS: "6000"     # source segment per judge call, chars (1000..20000)
       # --- slot breaks (No39, release 3.2.0): pause with a probe + human hint ---
       SLOT_PAUSE_SEC: "900"          # pause of a broken slot = back-off ceiling (≥30); one probe per pause
       SLOT_PAUSE_AFTER: "3"          # consecutive non-transient failures opening the break (≥1; auth opens at once)

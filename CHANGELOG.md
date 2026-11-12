@@ -5,6 +5,95 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Publishing on GitHub next after 3.4.1
+
+The last published GitHub release is **3.4.1** (2026-10-29). Every release below
+is already in `dev` and is published as one wave — after the prod rollout is
+stabilized (owner's decision: GitHub only on stabilization):
+
+* **3.5.0** (2026-11-01) — Thinking models without losing the answer
+* **3.5.1** (2026-11-11) — Tolerant parts parser and a size hint
+* **3.5.2** (2026-11-11) — One note per fact
+* **3.5.3** (2026-11-11) — The split goes through the judge
+* **3.5.4** (2026-11-11) — Generation limits inside options
+* **3.5.5** (2026-11-11) — A number written with a space
+* **3.5.6** (2026-11-11) — A mechanical fact floor for the split
+* **3.5.7** (2026-11-11) — The floor lets the judge rule
+* **3.5.8** (2026-11-11) — The judge is the only gate
+* **3.5.9** (2026-11-12) — Self-contained facts
+* **3.6.0** (2026-11-12) — The judge judges facts, the answer is not capped
+* **3.6.1** (2026-11-12) — A log that outlives the container
+* **3.6.2** (2026-11-12) — Parts of one note are not duplicates
+* **3.6.3** (2026-11-12) — Short notes summarize themselves
+
+## [3.7.0] - 2026-11-12
+
+Release 3.7.0 — "The retry economy of splitting": the live failure of
+2026-11-12 (a thinking judge with a degraded 256-token budget answered nothing,
+so the migration queue re-split the same notes every 10 minutes, burning the
+generation slot for days) is fixed at three levels — the judge's budget, the
+verification shape, and the retry policy — plus a bounded SIGTERM stop
+(a container Up with a dead HTTP was a second live outage of the same day).
+
+### Fixed
+
+* **A half-dead container after SIGTERM (`LSBN-D-16`)** — 12.11 prod:
+  uvicorn dropped the HTTP listener at 18:56:32Z, but a worker thread
+  blocked on an LLM call (`asyncio.to_thread`, the read timeout up to
+  900 s) held the process for 20+ minutes: the container stayed `Up` with
+  a dead HTTP, the healthcheck went `unhealthy` 42 times,
+  `restart: unless-stopped` never fired (the process never exited) and
+  nothing alerted — a quiet memory outage for every agent. The stop is
+  bounded now: the background loops are cancelled before uvicorn logs
+  Application shutdown complete, anything still alive past the budget is
+  abandoned with a forced exit. SQLite is transactional (WAL): committed
+  work survives, an interrupted batch keeps its pending statuses and is
+  caught up after the restart.
+
+* **A thinking judge without an explicit budget is a fatal config error** —
+  with `JUDGE_NUM_PREDICT=0` and `JUDGE_CONTEXT_TOKENS=0` the auto budget
+  degraded to the legacy 256-token cap of the `judge` operation, the reasoning
+  ate all of it (`done_reason=length`, empty `content`), and every judge call
+  failed (dedup froze after 8 attempts, split verification always fell). The
+  shipped compose sets `JUDGE_NUM_PREDICT=4096`; validation (NFR-6) refuses to
+  start on `JUDGE_THINK=true` + auto budget + unknown context.
+
+### Added
+
+* **`SPLIT_VERIFY_SEGMENT_CHARS`** (default `6000`, range `1000..20000`) — the
+  split verdict verifies the source segment by segment (overlap ≤ 1/4 of the
+  segment); the first `MISSING` batch is the verdict. One giant prompt
+  "source + all parts" exploded on real notes (75 fragments).
+* **The split parts cache** — `migration_notes.parts_json` (`{source_sha1,
+  parts}`): a transient judge failure verifies the same parts without calling
+  the split model again; saving the parts clears the cache.
+* **The split attention state** — the `SLOT_MAX_ATTEMPTS` ceiling of
+  non-transient failures freezes a note (`migration_notes.attention=1`): the
+  job stops taking it, the queue is not "empty" (phase stays open, the union
+  read keeps the source visible), a `warnings` record carries the reason.
+* **The mechanical garbage floor** — `SPLIT_FACTS_FLOOR=0.3` (`facts_coverage`
+  of hard tokens): below it the parts are a loss, not a retelling, and go to
+  quarantine without burning the judge's call.
+* **`SHUTDOWN_TIMEOUT_SEC`** (default `30`, range `1..30`) — the upper bound
+  of SIGTERM handling (`LSBN-D-16`). The cancelled background tasks
+  (worker/backup/update-check) get this budget, then a short grace lets the
+  busy executor threads finish, then a forced exit (`os._exit(0)` — a docker
+  stop is a planned stop, so `restart: unless-stopped` keeps the container
+  stopped instead of looping). The journal gets one `shutdown_forced` event
+  (`timeout_sec`, `thread_grace_sec`, `pending_tasks`, `stuck_threads`).
+
+* **The fragmentation ceiling** — `SPLIT_PARTS_SLACK=2`: more parts than
+  `ceil(chars / limit) + 2` means the model is padding, not decomposing — one
+  follow-up, then defer (the "one part per fact" era fragmented a live note
+  into 75 scraps; the prompt now asks for dense parts).
+
+### Changed
+
+* **Transient failures no longer eat the attempt budget** (the #39 semantics,
+  mirrored from the dedup pairs): `unavailable`/`timeout`/`auth` wait on the
+  loop's back-off; only `empty`/`truncated`/`off_contract` count, and on the
+  ceiling the note moves to attention.
+
 ## [3.6.3] - 2026-11-12
 
 Release 3.6.3 — "Short notes summarize themselves": a note that fits in
@@ -78,6 +167,229 @@ background dedup.
   brake replaces that workaround.
 * The origin backfill runs at every start; the journal gets the `origin_backfill`
   event with the `filled` counter (expected 3083).
+
+## [3.6.1] - 2026-11-12
+
+Release 3.6.1 — "A log that outlives the container": the same JSON journal now
+also goes to a rotating file, so the analysis of a failure (the split of a long
+note, the merge storm) no longer dies together with the container.
+
+### Added
+
+* **A rotating JSON log file** — the settings `log_file` / `log_max_bytes` /
+  `log_backups` (env `LOG_FILE`, `LOG_MAX_BYTES`, `LOG_BACKUPS`): an empty
+  `LOG_FILE` keeps stdout only (as before), a set one adds a
+  `RotatingFileHandler` with the same `JsonFormatter`, rotation at
+  `LOG_MAX_BYTES` (default 50 000 000) keeping `LOG_BACKUPS` files (default 5);
+  the parent directory is created on start and the handler is built once, like
+  the stdout one.
+
+### Changed
+
+* **Post-mortem history survives a deploy** — `docker logs` lives as long as the
+  container and every deploy recreates it; the file keeps the journal across
+  restarts, which is exactly what the split/merge analysis of 11.11.2026 lacked.
+
+## [3.6.0] - 2026-11-12
+
+Release 3.6.0 — "The judge judges facts, the answer is not capped": the split
+verdict answers one question only — was a fact of the source lost (the shape of
+the parts is the splitter prompt's business), and a provider that rejects
+generation limits (the ollama.com cloud models) can be served without them.
+
+### Changed
+
+* **The split verdict checks facts only** — `SPLIT_VERDICT_SYSTEM` loses the
+  self-containment half: `COMPLETE` — nothing is lost, `MISSING: <what exactly is
+  lost>` — otherwise; `FRAGMENTS` is no longer read as a refusal, so a note is
+  quarantined only for a lost fact. Rewording, splitting into pieces of
+  different sizes and a changed shape of the text are explicitly not losses.
+
+### Added
+
+* **`SUMMARY_NO_OUTPUT_LIMITS` / `JUDGE_NO_OUTPUT_LIMITS` (default `false`)** —
+  with the flag the request carries no answer cap at all: no `options.num_predict`
+  (ollama) and no `max_tokens` (openai), the model stops when it is done.
+  `options.num_ctx` stays whenever the declared context is known — without it the
+  server allocates its own default (262 144 on the AI server), the model stops
+  fitting the GPU and generation degrades several times.
+
+## [3.5.9] - 2026-11-12
+
+Release 3.5.9 — "Self-contained facts": a part of a split is a statement, not a
+heading and not a phrase cut in the middle; the judge refuses fragments, and the
+split never spends the slot on a note from the trash.
+
+### Changed
+
+* **The split prompt asks for a self-contained STATEMENT** — one to three
+  sentences per part: never a bare heading, never a fragment, never a list of
+  items, never a phrase cut in the middle; a part shorter than 100 characters is a
+  fragment and is wrong.
+* **The judge refuses fragments (`FRAGMENTS: <how many>`)** —
+  `SPLIT_VERDICT_SYSTEM` gets the self-containment question next to the fact one
+  and `verify_split` reads `FRAGMENTS` as a refusal: the note is quarantined with
+  the judge's reason and a warning is opened, so "the words are present but the
+  note is a fragment" no longer passes.
+
+### Fixed
+
+* **A trashed note is not split** — the migration reads `deleted_at` together with
+  the note and marks a trashed one `expired` (`заметка в корзине`) instead of
+  splitting it (live case 2026-11-11: the queue carried five trashed notes, one of
+  them was split into 75 fragments).
+
+## [3.5.8] - 2026-11-11
+
+Release 3.5.8 — "The judge is the only gate": the mechanical fact coverage of
+a split stops blocking anything and only measures, so a note reaches the
+reviewer instead of dying on arithmetic.
+
+### Changed
+
+* **`SPLIT_FACTS_MIN = 0.0`** — the hard-token arithmetic no longer gates a split;
+  the only gate is the judge's verdict (`verify_split`: the source and ALL the new
+  parts with the "nothing missed" question). Live 2026-11-11: four attempts on one
+  note landed at 0.72 / 0.90 / 0.88 / 0.67 and never reached the judge — the gate
+  was stricter than the reviewer.
+* **Tests** — `tests/test_migration_split.py`: the coverage is diagnostic while the
+  note length limit stays hard.
+
+## [3.5.7] - 2026-11-11
+
+Release 3.5.7 — "The floor lets the judge rule": the mechanical fact floor drops
+so that a clean fact-split with rephrased prose reaches the reviewer at all.
+
+### Changed
+
+* **`SPLIT_FACTS_MIN` 0.90 → 0.85** — live splits of 2026-11-11 stopped exactly at
+  0.90 and never reached the judge; the floor is a gross-loss catcher, the verdict
+  belongs to the judge.
+
+## [3.5.6] - 2026-11-11
+
+Release 3.5.6 — "A mechanical fact floor for the split": the split stops being
+measured by the merge's strict word coverage (which quarantined every honest
+fact-split) and gets its own floor on hard facts.
+
+### Added
+
+* **`SPLIT_FACTS_MIN = 0.90` and a fact-coverage gate for the split** — before
+  this the split was checked with the merge's `MERGE_COVERAGE_MIN = 1.0` word
+  coverage; a fact-split legitimately rephrases the prose, so the split now uses
+  `facts_coverage` (numbers, latin identifiers, paths, versions) at a floor of
+  0.90. Below the floor the note is refused with "the parts lost hard facts of the
+  source — numbers, dates, versions or paths are missing (fact coverage 0.xx)";
+  the authoritative verdict stays the judge's.
+
+## [3.5.5] - 2026-11-11
+
+Release 3.5.5 — "A number written with a space": digit separators are folded
+before the fact comparison, and the split prompt forbids reformatting numbers.
+
+### Fixed
+
+* **Digit separators inside a number are folded (`_DIGIT_SEPARATOR_RE`)** —
+  `5 000` / `5_000` / `5.000` instead of `5000`, and non-breaking spaces, no
+  longer read as a lost fact (the live 0.72 coverage case: the facts were
+  present, only written with a space).
+
+### Changed
+
+* **The split prompt asks for exact numbers** — copy numbers, names, dates,
+  versions, paths and commands EXACTLY as written in the source: do not round,
+  do not reformat, do not split a number with a space, do not translate them;
+  only the connecting prose may be tightened.
+
+## [3.5.4] - 2026-11-11
+
+Release 3.5.4 — "Generation limits inside options (`LSBN-D-14`)": ollama ignores
+unknown top-level fields, so the whole answer/reasoning budget arithmetic of
+3.5.0 never reached the model.
+
+### Fixed
+
+* **`options.num_predict` instead of a top-level one (`LSBN-D-14`)** — ollama
+  silently dropped a top-level `num_predict` and the model generated with its own
+  default (unlimited); proven on the stand: a top-level `num_predict=4` returned
+  45 tokens, `options.num_predict=4` returned 4 (`done_reason=length`).
+* **`options.num_ctx` from the declared context** — without it the server
+  allocates its own default (262 144 on the AI server), the model stops fitting
+  the GPU and generation degrades several times over (the slow "thinking" of
+  2026-11-11).
+
+## [3.5.3] - 2026-11-11
+
+Release 3.5.3 — "The split goes through the judge": the source note and all the
+fact-notes it was split into are shown to the judge before the split is
+accepted.
+
+### Added
+
+* **`JudgeService.verify_split`** — the source plus ALL new parts with one
+  question ("was anything from the source lost"), always on the generative path:
+  the decision slot is schema-bounded (8k context, 64 KiB input) and cannot take a
+  long note plus its parts. `COMPLETE` → nothing lost, `MISSING: …` → the judge's
+  reason, anything else → `OFF_CONTRACT`.
+* **The verdict gates the split in the migration job** — a refusal is a
+  quarantine (`карантин`, reason `судья: …`, attempts bumped, a warning opened,
+  journal event `migration_split_rejected`); an unavailable judge keeps the note
+  pending (`migration_split_verdict_failed`); a pass is journaled as
+  `migration_split_verified`.
+
+## [3.5.2] - 2026-11-11
+
+Release 3.5.2 — "One note per fact (`LSBN-D-13`)": splitting stops being "copy
+the text in chunks" and becomes a decomposition into atomic facts, checked on
+the fact skeleton instead of the prose.
+
+### Changed
+
+* **The split prompt: one fact per part** — each part states exactly one
+  self-contained fact and carries its own names, numbers, dates, statuses,
+  configs and paths; no whole paragraphs copied, no several facts in one part;
+  the new `_facts_hint` gives the model the source size and "one part per fact,
+  each well under the limit".
+* **`facts_coverage` instead of the word coverage for the split** — the share of
+  the source's hard tokens (numbers, latin identifiers, paths, versions) found in
+  the parts; Cyrillic prose may be reworded, a missing number or path is a lost
+  fact. The merge keeps its strict 1.0 word coverage.
+
+### Fixed
+
+* **A clean fact-split is no longer quarantined by arithmetic** — the strict word
+  coverage read an honest decomposition as 0.86 and refused it.
+
+## [3.5.1] - 2026-11-11
+
+Release 3.5.1 — "Parts survive a broken answer": the parts are extracted
+tolerantly (the "not a JSON object" case of the live duplicate pair), the model
+is told the source size and the minimum number of parts, and the English-only
+remainder of `LSBN-T-32` lands here (moved out of 3.5.0 by the owner's decision of
+11.11.2026: mechanical hygiene must not hold the core).
+
+### Added
+
+* **A size hint for merge and split (`_size_hint`, `LSBN-D-13`)** — "SIZE: the
+  source is N characters; the note limit is M. Return at least K part(s), each
+  within M characters. Dropping, shortening or summarizing the content is a
+  failure": without the number the model returned one oversized part or silently
+  shortened the text (the live case of 2026-11-11: the model cut the merged text
+  in half, coverage 0.50).
+* **`_balanced_objects`: a string-aware scanner of every JSON object in the
+  answer** — the greedy "first `{` .. last `}`" slice broke on answers with prose
+  braces or two objects in a row; every balanced object is tried, raw and with
+  escaped quotes, and a bare array is read as `{"parts": [...]}`.
+* **The English-only remainder of `LSBN-T-32`** — comments and docstrings of
+  `app/`, `scripts/` and the remaining `tests/` translated; the language checker
+  reported 110 files with Cyrillic at the 3.5.0 gate, 109 of them under `tests/`.
+
+### Changed
+
+* **The merge/split prompts ask for one JSON object only** — no markdown fences,
+  no text before or after it, no trailing commas, every inner double quote
+  escaped in JSON style; merge additionally gets "a shortened retelling is a
+  failure, not a merge".
 
 ## [3.5.0] - 2026-11-01
 

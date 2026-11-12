@@ -387,6 +387,16 @@ class Settings(BaseSettings):
     # --- background operations ---
     pending_retry_sec: int = 30  # starting re-vectorization/re-summarization interval
 
+    # --- shutdown (LSBN-D-16) ---
+    # The upper bound of SIGTERM handling. 12.11.2026 prod: uvicorn stopped
+    # the HTTP listener on SIGTERM, but a worker thread blocked on an LLM call
+    # (asyncio.to_thread, the read timeout up to 900 s) kept the process alive
+    # for 20+ minutes — "container Up, HTTP dead", restart=unless-stopped never
+    # fired, no alert. The wait is bounded now: SHUTDOWN_TIMEOUT_SEC for the
+    # cancelled background tasks, a short grace for the executor threads, then
+    # a forced exit (the shutdown_forced journal event, exit code 0).
+    shutdown_timeout_sec: int = 30
+
     # --- migration slot cadence (3.4.1, LSBN-T-27) --
     # During a rollout, splitting must not monopolize the generation server:
     # the migration job takes a MIGRATION_BATCH batch of notes, processes it,
@@ -399,6 +409,12 @@ class Settings(BaseSettings):
     # release). No parallel workers: the splitting queue is single-threaded.
     migration_batch: int = 5  # notes per migration job run
     migration_pause_sec: int = 600  # the pause AFTER a run, before the next (10 min)
+    # The split-verification batch (2026-11-12): the judge verifies a split
+    # source SEGMENT BY SEGMENT — a source longer than this many characters is
+    # cut into overlapping segments, each verified with its parts in a separate
+    # call (the source + ALL parts in one prompt exploded on real notes). The
+    # overlap is max_note_chars — a border fact is judged with its full note.
+    split_verify_segment_chars: int = 6000
 
     # --- slot breaks (No39, 3.2.0) ----------------------------------
     # SLOT_PAUSE_SEC — the slot pause during a break (= the back-off ceiling),
@@ -877,6 +893,23 @@ class Settings(BaseSettings):
         need_low("slot_prompt_reserve_tokens", self.slot_prompt_reserve_tokens, 1)
         need_low("slot_max_output_tokens", self.slot_max_output_tokens, 1)
         need_low("judge_timeout_sec", self.judge_timeout_sec, 1)
+        # Думающий судья без бюджета — фатально (живой сбой 12.11.2026): при
+        # JUDGE_CONTEXT_TOKENS=0 авто-бюджет (JUDGE_NUM_PREDICT=0) деградирует к
+        # прошлой капе операции judge — 256 токенов (slot_budget.LEGACY_OUTPUT_BUDGET).
+        # Рассуждающая модель сжигает все 256 токенов на размышление, вердикт не
+        # выходит (content пустой, done_reason=length), каждый вызов — OFF_CONTRACT.
+        # NFR-6: отказываемся стартовать с читаемым сообщением вместо тихой деградации.
+        if (
+            self.judge_think
+            and self.judge_num_predict == 0
+            and self.judge_context_tokens == 0
+        ):
+            errors.append(
+                "  - judge: думающий судья (JUDGE_THINK=true) без явного бюджета и "
+                "объявленного контекста — авто-бюджет деградирует до 256 токенов и "
+                "рассуждение съедает ответ; задай JUDGE_NUM_PREDICT (например, 4096) "
+                "или JUDGE_CONTEXT_TOKENS"
+            )
         # LSBN-T-33: a reasoning budget of 0 = "as much as fits" (auto), hence
         # the minimum 0; operation-level None = "not set" — checked below.
         need_low("slot_reasoning_num_predict", self.slot_reasoning_num_predict, 0)
@@ -958,12 +991,26 @@ class Settings(BaseSettings):
         # --- background operations (0 is allowed: unit tests use a pause-free mode) ---
         need_low("pending_retry_sec", self.pending_retry_sec, 0)
 
+        # --- shutdown (LSBN-D-16): the SIGTERM bound, 1..30 s (the defect:
+        # an unbounded stop = a half-dead container) ---
+        need_range("shutdown_timeout_sec", self.shutdown_timeout_sec, 1, 30)
+
         # --- migration slot cadence (3.4.1, LSBN-T-27): a batch of 1..100
         # notes (more — the job monopolizes the slot for minutes), a pause of
         # 0..86400 s (0 — drain without yielding the slot; a day is the sane
         # rollout-window ceiling).
         need_range("migration_batch", self.migration_batch, 1, 100)
         need_range("migration_pause_sec", self.migration_pause_sec, 0, 86400)
+        # The split-verification batch (2026-11-12): 1000..20000 — a segment
+        # must fit the judge's context WITH its parts (the source up to 20000
+        # chars splits into a handful of calls), below 1000 a long source
+        # fragments into dozens of calls.
+        need_range(
+            "split_verify_segment_chars",
+            self.split_verify_segment_chars,
+            1000,
+            20000,
+        )
 
         # --- slot breaks (No39): pause >= 30 (cheap, but not a busy loop),
         # open threshold >= 1, hint throttling >= 0 (0 — every call).

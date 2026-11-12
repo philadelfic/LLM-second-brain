@@ -276,6 +276,7 @@ visible in `/health`.
 | Variable | Default | Meaning |
 |---|---|---|
 | `PENDING_RETRY_SEC` | `30` | initial worker poll interval (×2 → 15 min) |
+| `SHUTDOWN_TIMEOUT_SEC` | `30` | the SIGTERM bound, seconds (1..30): cancelled background tasks get this budget, then a short grace for the worker threads, then a forced exit (exit code 0, the `shutdown_forced` journal event) — a stuck LLM call must not leave a "container Up, HTTP dead" half-stop (LSBN-D-16) |
 | `LOG_LEVEL` | `INFO` | log level |
 | `AUTHOR_DEFAULT` | `unknown` | author if the harness sent none |
 | `BACKUP_DIR` | `/data/backups` | backup snapshot directory |

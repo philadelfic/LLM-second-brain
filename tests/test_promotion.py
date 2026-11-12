@@ -402,6 +402,7 @@ class TestJudgeThinkFlag:
         """Флаг не задан → наследует JUDGE_THINK (думающий дедум-конфиг:
         поле think в payload НЕ отправляется — модель думает по умолчанию)."""
         monkeypatch.setenv("JUDGE_THINK", "true")
+        monkeypatch.setenv("JUDGE_NUM_PREDICT", "4096")
         monkeypatch.delenv("NAMESPACE_JUDGE_THINK", raising=False)
         get_settings.cache_clear()
         payload = self._payload(get_settings())

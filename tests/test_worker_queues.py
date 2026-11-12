@@ -194,8 +194,9 @@ def test_queues_health_empty_queues_are_null(settings) -> None:
 
     В объект попадают все наблюдаемые очереди (vector/summary/judge/areas/
     links/nodes + migration, M2 3.4.0); `expiration` очереди не имеет и не
-    наблюдаема. Снимок миграции — её собственная форма (2 ключа, без
-    waiting/attention): миграции не было, таблицы migration_notes нет.
+    наблюдаема. Снимок миграции — её собственная форма (3 ключа, без
+    waiting: pending/oldest_pending_sec/attention): миграции не было, таблицы
+    migration_notes нет.
     """
     queues = make_worker(settings).queues_health()
     assert set(queues) == {
@@ -203,7 +204,7 @@ def test_queues_health_empty_queues_are_null(settings) -> None:
     }
     for name, stat in queues.items():
         assert stat == (
-            {"pending": 0, "oldest_pending_sec": None}
+            {"pending": 0, "oldest_pending_sec": None, "attention": 0}
             if name == "migration"
             else {
                 "pending": 0, "oldest_pending_sec": None,
@@ -237,8 +238,11 @@ def test_queues_health_matches_direct_sql(settings) -> None:
     _assert_stat(queues["areas"], _sql_areas_stat(settings))
     _assert_stat(queues["links"], _sql_links_stat(settings))
     # Очередь миграции (M2 3.4.0): в тестовой БД миграции не было — пусто,
-    # возраст null (собственная форма снимка — 2 ключа).
-    assert queues["migration"] == {"pending": 0, "oldest_pending_sec": None}
+    # возраст null (собственная форма снимка — 3 ключа: pending,
+    # oldest_pending_sec, attention).
+    assert queues["migration"] == {
+        "pending": 0, "oldest_pending_sec": None, "attention": 0,
+    }
     # Явные ожидания — снимок считает именно своё состояние.
     assert queues["vector"]["pending"] == 2
     assert queues["summary"]["pending"] == 2
