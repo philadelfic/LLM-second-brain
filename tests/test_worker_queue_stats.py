@@ -180,8 +180,8 @@ def test_queues_health_empty_db_age_is_null(settings) -> None:
     На чистой БД (сид-навык снят — он pending области areas) все очереди
     нулевые, `oldest_pending_sec is None`: null ⇔ нет работы ни в pending,
     ни в waiting (эталон — `test_queues_health_empty_queues_are_null`).
-    Очередь `migration` (M2 3.4.0) — своя форма снимка (2 ключа, без
-    waiting/attention), возраст тоже null.
+    Очередь `migration` (M2 3.4.0) — своя форма снимка (3 ключа, без
+    waiting: pending/oldest_pending_sec/attention), возраст тоже null.
     """
     clear_seeded_skills(settings)
     queues = make_worker(settings).queues_health()
@@ -190,7 +190,7 @@ def test_queues_health_empty_db_age_is_null(settings) -> None:
     }
     for name, stat in queues.items():
         assert stat == (
-            {"pending": 0, "oldest_pending_sec": None}
+            {"pending": 0, "oldest_pending_sec": None, "attention": 0}
             if name == "migration"
             else {
                 "pending": 0, "oldest_pending_sec": None,

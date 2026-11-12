@@ -422,7 +422,7 @@ class TestOverrides:
         for value in ("true", "1", "on"):
             assert load_env(monkeypatch, SUMMARY_THINK=value).summary_think is True
             assert load_env(
-                monkeypatch, JUDGE_THINK=value
+                monkeypatch, JUDGE_THINK=value, JUDGE_NUM_PREDICT="4096"
             ).judge_think is True
 
     def test_string_override(self, monkeypatch: pytest.MonkeyPatch) -> None:

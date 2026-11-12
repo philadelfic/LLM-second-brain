@@ -174,7 +174,7 @@ def test_think_false_in_request_body_by_default(monkeypatch) -> None:
 
 def test_think_field_absent_when_enabled(monkeypatch) -> None:
     """JUDGE_THINK=true: поля think нет (thinking ограничиваем не)."""
-    settings = make_settings(monkeypatch, JUDGE_THINK="true")
+    settings = make_settings(monkeypatch, JUDGE_THINK="true", JUDGE_NUM_PREDICT="4096")
     service, recorder = make_service(settings, [httpx.Response(200, json=ok_body())])
     assert settings.judge_think is True
     service.judge(TEXT_NEW, TEXT_CANDIDATE)

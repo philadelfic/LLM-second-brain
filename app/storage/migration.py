@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS {MIGRATION_NOTES_TABLE} (
   new_ids    TEXT    NULL,                  -- JSON-массив id частей (M2)
   attempts   INTEGER NOT NULL DEFAULT 0,
   reason     TEXT    NULL,
-  parts_json TEXT    NULL,                  -- кэш нарезки: {source_sha1, parts[[title,text]]} (12.11.2026)
+  parts_json TEXT    NULL,                  -- кэш нарезки: {{source_sha1, parts[[title,text]]}} (12.11.2026)
   attention  INTEGER NOT NULL DEFAULT 0,    -- потолок попыток (#39): 1 — не брать, ждёт оператора
   updated_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 )

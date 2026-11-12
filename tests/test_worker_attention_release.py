@@ -207,7 +207,8 @@ def test_think_change_releases_attention(tmp_path, monkeypatch, caplog) -> None:
 def test_same_think_keeps_attention(tmp_path, monkeypatch) -> None:
     """The same `THINK` → attention is not cleared (no false resets)."""
     settings = _settings(
-        tmp_path, monkeypatch, SUMMARY_THINK="true", JUDGE_THINK="true"
+        tmp_path, monkeypatch, SUMMARY_THINK="true", JUDGE_THINK="true",
+        JUDGE_NUM_PREDICT="4096",
     )
     worker = _worker(settings)
     job_id = _seed_job(settings, note_id=1)
