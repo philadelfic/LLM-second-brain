@@ -239,6 +239,10 @@ class SlotSpec:
     # the budget, the think treatment and the startup warnings
     # (`slot_config_warnings`), but NOT the request body (the wire stays the same).
     model_type: str = "generation"
+    # 12.11.2026: the slot's provider accepts no generation limits at all (the
+    # ollama.com cloud models): the request carries neither options.num_predict /
+    # options.num_ctx (ollama) nor max_tokens (openai).
+    no_output_limits: bool = False
     # No49 (arch §6.2): the declared model context (0 - unknown; then the budget
     # degrades to the previous cap), the auto-budget defensive cap and the
     # reserve for the chat template/service fields/tokenizer drift.
@@ -285,6 +289,7 @@ class SlotSpec:
             read_timeout=float(settings.summary_timeout_sec),
             think=settings.summary_think,
             model_type=settings.summary_model_type,
+            no_output_limits=settings.summary_no_output_limits,
             context_tokens=settings.summary_context_tokens,
             max_output_tokens=settings.slot_max_output_tokens,
             prompt_reserve_tokens=settings.slot_prompt_reserve_tokens,
@@ -306,6 +311,7 @@ class SlotSpec:
             read_timeout=float(settings.judge_timeout_sec),
             think=settings.judge_think,
             model_type=settings.judge_model_type,
+            no_output_limits=settings.judge_no_output_limits,
             context_tokens=settings.judge_context_tokens,
             max_output_tokens=settings.slot_max_output_tokens,
             prompt_reserve_tokens=settings.slot_prompt_reserve_tokens,
@@ -610,9 +616,10 @@ class LLMClient:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_text},
                 ],
-                "max_tokens": budget,
                 "temperature": TEMPERATURE,
             }
+            if not self.spec.no_output_limits:
+                payload["max_tokens"] = budget
         else:
             path = "/api/chat"
             payload = self._ollama_chat_payload(
@@ -1063,6 +1070,25 @@ class LLMClient:
         # default (unlimited) and the whole answer/reasoning budget arithmetic was
         # never applied. Proven on the stand: top-level num_predict=4 returned 45
         # tokens, options.num_predict=4 returned 4 (done_reason=length).
+        if self.spec.no_output_limits:
+            # No answer cap at all (12.11.2026, О.: «лимиты — только в промптах»):
+            # `num_predict` is not sent, the model stops when it is done. The WINDOW
+            # stays: without num_ctx the server allocates its own default (262 144
+            # on the AI server), the model no longer fits the GPU and generation
+            # degrades several times over.
+            body: dict[str, Any] = {
+                "model": self.spec.model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                "stream": False,
+            }
+            if self.spec.context_tokens and self.spec.context_tokens > 0:
+                body["options"] = {"num_ctx": int(self.spec.context_tokens)}
+            if think_flag is False:
+                body["think"] = False
+            return body
         options: dict[str, Any] = {
             "num_predict": int(num_predict),
             "temperature": TEMPERATURE,

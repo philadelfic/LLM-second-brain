@@ -53,6 +53,7 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "MERGE_NUM_PREDICT": ("merge_num_predict", 0),
     "SUMMARY_TIMEOUT_SEC": ("summary_timeout_sec", 900),
     "SUMMARY_CONTEXT_TOKENS": ("summary_context_tokens", 0),
+    "SUMMARY_NO_OUTPUT_LIMITS": ("summary_no_output_limits", False),
     "SLOT_PROMPT_RESERVE_TOKENS": ("slot_prompt_reserve_tokens", 512),
     "SLOT_MAX_OUTPUT_TOKENS": ("slot_max_output_tokens", 32768),
     "SLOT_REASONING_MIN_OUTPUT_TOKENS": ("slot_reasoning_min_output_tokens", 4096),
@@ -127,7 +128,8 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "JUDGE_MODEL_TYPE": ("judge_model_type", "generation"),  # №49
     "JUDGE_NUM_PREDICT": ("judge_num_predict", 0),  # №49: 0 = авто
     "JUDGE_TIMEOUT_SEC": ("judge_timeout_sec", 900),
-    "JUDGE_CONTEXT_TOKENS": ("judge_context_tokens", 0),  # №49: 0 — неизвестен
+    "JUDGE_CONTEXT_TOKENS": ("judge_context_tokens", 0),
+    "JUDGE_NO_OUTPUT_LIMITS": ("judge_no_output_limits", False),  # №49: 0 — неизвестен
     "RRF_K": ("rrf_k", 60),
     "MAX_NOTE_CHARS": ("max_note_chars", 2000),  # 3.4.1 (LSBN-T-26): 1500 → 2000, число в конфиге
     "MAX_QUERY_CHARS": ("max_query_chars", 512),
