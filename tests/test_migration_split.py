@@ -118,6 +118,17 @@ class TestSplitJob:
             for title, ns, status in parts.values():
                 assert title and status == "pending"
                 assert ns == "default"  # namespace исходника из прежней базы
+            # 3.6.2: у ВСЕХ частей нарезки origin_note_id — id своего исходника
+            for old_id, entry in statuses.items():
+                if entry[0] != 'нарезана':
+                    continue
+                part_ids = json.loads(entry[1])
+                markers = ', '.join('?' * len(part_ids))
+                rows = conn.execute(
+                    'SELECT origin_note_id FROM notes WHERE id IN (' + markers + ')',
+                    part_ids,
+                ).fetchall()
+                assert [row[0] for row in rows] == [old_id] * len(part_ids)
             # Модель звали ДВАЖДЫ (3 — expired, до модели дело не дошло).
             assert summarizer.split_calls == [_LONG, _LONG]
         # Журнал: событие нарезки с моделью, раундами и числом частей.

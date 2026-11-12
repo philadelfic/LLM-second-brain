@@ -537,6 +537,7 @@ class NoteService:
         title: str | None = None,
         expires_at: str | None = None,
         comment: str | None = None,
+        origin_note_id: int | None = None,
     ) -> int:
         """INSERT the note row (inside an open transaction).
 
@@ -547,6 +548,8 @@ class NoteService:
                     caller); None — a permanent note (no TTL).
                     comment (no24-01) — validated/normalized by the caller
                     (_checked_comment); None — no comment.
+                    origin_note_id (3.6.2) — the origin group of a split part (the
+                    id of the source note, no FK); None — an ordinary note.
         """
         from app.services.migration import migration_context
 
@@ -558,12 +561,16 @@ class NoteService:
             vector_status,
             namespace,
             expires_at,
+            origin_note_id,
         )
-        columns = "text, title, comment, author, vector_status, namespace, expires_at"
+        columns = (
+            "text, title, comment, author, vector_status, namespace, expires_at, "
+            "origin_note_id"
+        )
         ctx = migration_context()
         if ctx is None:  # no migration — the default rowid (max+1), no overhead
             cursor = conn.execute(
-                f"INSERT INTO notes ({columns}) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                f"INSERT INTO notes ({columns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 values,
             )
             return int(cursor.lastrowid or 0)
@@ -578,7 +585,7 @@ class NoteService:
             ).fetchone()[0]
         )
         cursor = conn.execute(
-            f"INSERT INTO notes (id, {columns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            f"INSERT INTO notes (id, {columns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (note_id, *values),
         )
         return int(cursor.lastrowid or 0)
@@ -1273,7 +1280,9 @@ class NoteService:
                     The DB schema does not change (that is F-22): parts are regular notes,
                     trash and history are regular mechanisms. The transaction rollback is
                     the goal: the half-state "a part created, the originals alive" is
-                    excluded.
+                    excluded. The migration_split parts (save_migration_parts) carry
+                    origin_note_id — the id of their source note; the parts of THIS
+                    merge get no origin group (out of F-23 scope).
 
                     Returns ``{"older_id", "newer_id", "merged", "parts":
                     [{"id", "title"}, ...], "deleted": {"older", "newer"}}``;
@@ -1456,6 +1465,7 @@ class NoteService:
                     vector_status="pending",
                     namespace=namespace,
                     title=title,
+                    origin_note_id=old_id,
                 )
                 self._store_chunks(conn, part_id, chunks_data, None)
                 part_row = conn.execute(
