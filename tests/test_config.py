@@ -144,6 +144,9 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     # миграции (не embedding_batch_size/pending_retry_sec).
     "MIGRATION_BATCH": ("migration_batch", 5),
     "MIGRATION_PAUSE_SEC": ("migration_pause_sec", 600),
+    # 3.7.0: верификация нарезки судьёй сегментами — сегмент источника на
+    # один вызов (перекрытие ≤ 1/4 сегмента).
+    "SPLIT_VERIFY_SEGMENT_CHARS": ("split_verify_segment_chars", 6000),
     "LOG_LEVEL": ("log_level", "INFO"),
     "LOG_FILE": ("log_file", ""),
     "LOG_MAX_BYTES": ("log_max_bytes", 50_000_000),
@@ -299,7 +302,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 253 поля: 6 обязательных + 247 с умолчаниями
+        """В Settings — ровно 254 поля: 6 обязательных + 248 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
@@ -326,7 +329,9 @@ class TestCompleteness:
         + 1 операторский тормоз фонового дедупа LSBN-D-14 релиза 3.6.2:
         DEDUP_ENABLED
         + 1 порог короткой выжимки LSBN-T-37 релиза 3.6.3:
-        SUMMARY_SHORT_TEXT_CHARS)."""
+        SUMMARY_SHORT_TEXT_CHARS
+        + 1 сегмент верификации нарезки релиза 3.7.0:
+        SPLIT_VERIFY_SEGMENT_CHARS)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected
