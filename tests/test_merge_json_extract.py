@@ -161,8 +161,15 @@ def test_split_prompt_forbids_fragments():
     assert "shorter than 100 characters is a fragment" in prompt
 
 
-def test_split_verdict_prompt_checks_self_containment():
+def test_split_verdict_prompt_judges_facts_only():
+    """Судья судит только потерю фактов, а не форму нарезки (живой замер 12.11).
+
+    Дословная нарезка (тот же текст, ничего не потеряно) получала FRAGMENTS —
+    придирка к форме блокировала любую нарезку длинной заметки.
+    """
     from app.services.judge import SPLIT_VERDICT_SYSTEM
 
-    assert "self-contained" in SPLIT_VERDICT_SYSTEM
-    assert "FRAGMENTS" in SPLIT_VERDICT_SYSTEM
+    assert "COMPLETE" in SPLIT_VERDICT_SYSTEM
+    assert "MISSING" in SPLIT_VERDICT_SYSTEM
+    assert "FRAGMENTS" not in SPLIT_VERDICT_SYSTEM
+    assert "NOT losses" in SPLIT_VERDICT_SYSTEM

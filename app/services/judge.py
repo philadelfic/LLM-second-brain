@@ -138,17 +138,14 @@ class Judge(Protocol):
 #: from the source lost. Not a prompt file: a hardwired constant like the other
 #: judge strings.
 SPLIT_VERDICT_SYSTEM = (
-    "You check how one long note was decomposed into atomic fact-notes. You are "
-    "given the SOURCE note and the NOTES it was split into. Check whether every "
-    "fact of the source - names, numbers, dates, statuses, configs, paths, "
+    "You check how one long note was decomposed into notes. You are given the "
+    "SOURCE note and the NOTES it was split into. Check ONLY one thing: whether "
+    "every fact of the source - names, numbers, dates, statuses, configs, paths, "
     "decisions - is present in the notes, and nothing is lost or distorted. "
-    "Rewording the connecting prose is NOT a loss; a missing or changed fact IS. "
-    "Also check that every note is a complete self-contained statement: a bare "
-    "heading, a fragment or a phrase cut in the middle is a defect even when "
-    "the words are present. Answer with exactly one line, no explanations: "
-    "COMPLETE - if nothing is lost and every note is self-contained; "
-    "FRAGMENTS: <how many are fragments> - if the content is there but the "
-    "notes are fragments; MISSING: <what exactly is lost> - otherwise."
+    "Rewording, splitting into pieces of different sizes and changing the shape of "
+    "the text are NOT losses; a missing or changed fact IS. "
+    "Answer with exactly one line, no explanations: COMPLETE - if nothing is lost; "
+    "MISSING: <what exactly is lost> - otherwise."
 )
 
 
@@ -303,7 +300,7 @@ class JudgeService:
         self.last_meta = result.meta
         text = (result.content or "").strip()
         upper = text.upper()
-        if "FRAGMENTS" in upper or "MISSING" in upper:
+        if "MISSING" in upper:
             self.last_attempt_ok = True
             return text[:500] or "MISSING"
         if "COMPLETE" in upper:

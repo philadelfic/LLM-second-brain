@@ -911,3 +911,16 @@ def test_no_num_ctx_when_context_unknown(monkeypatch) -> None:
     client, recorder = make_client(SlotSpec.for_summary(settings), [ollama_chat_ok()])
     client.chat(SYSTEM, USER, num_predict=100)
     assert "num_ctx" not in last_payload(recorder)["options"]
+
+
+def test_no_output_limits_omits_options(monkeypatch) -> None:
+    """12.11.2026: слот с no_output_limits не отправляет ни options, ни num_ctx."""
+    settings = make_settings(
+        monkeypatch, SUMMARY_NO_OUTPUT_LIMITS="true", SUMMARY_CONTEXT_TOKENS="65536"
+    )
+    client, recorder = make_client(SlotSpec.for_summary(settings), [ollama_chat_ok()])
+    client.chat(SYSTEM, USER, num_predict=100)
+    payload = last_payload(recorder)
+    assert "num_predict" not in payload  # лимита ответа нет
+    assert payload.get("options", {}).get("num_ctx") == 65536  # окно осталось
+    assert payload["stream"] is False
