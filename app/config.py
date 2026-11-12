@@ -387,6 +387,16 @@ class Settings(BaseSettings):
     # --- background operations ---
     pending_retry_sec: int = 30  # starting re-vectorization/re-summarization interval
 
+    # --- shutdown (LSBN-D-16) ---
+    # The upper bound of SIGTERM handling. 12.11.2026 prod: uvicorn stopped
+    # the HTTP listener on SIGTERM, but a worker thread blocked on an LLM call
+    # (asyncio.to_thread, the read timeout up to 900 s) kept the process alive
+    # for 20+ minutes — "container Up, HTTP dead", restart=unless-stopped never
+    # fired, no alert. The wait is bounded now: SHUTDOWN_TIMEOUT_SEC for the
+    # cancelled background tasks, a short grace for the executor threads, then
+    # a forced exit (the shutdown_forced journal event, exit code 0).
+    shutdown_timeout_sec: int = 30
+
     # --- migration slot cadence (3.4.1, LSBN-T-27) --
     # During a rollout, splitting must not monopolize the generation server:
     # the migration job takes a MIGRATION_BATCH batch of notes, processes it,
@@ -980,6 +990,10 @@ class Settings(BaseSettings):
 
         # --- background operations (0 is allowed: unit tests use a pause-free mode) ---
         need_low("pending_retry_sec", self.pending_retry_sec, 0)
+
+        # --- shutdown (LSBN-D-16): the SIGTERM bound, 1..30 s (the defect:
+        # an unbounded stop = a half-dead container) ---
+        need_range("shutdown_timeout_sec", self.shutdown_timeout_sec, 1, 30)
 
         # --- migration slot cadence (3.4.1, LSBN-T-27): a batch of 1..100
         # notes (more — the job monopolizes the slot for minutes), a pause of

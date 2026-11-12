@@ -24,7 +24,7 @@ import logging
 import sqlite3
 import sys
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
@@ -55,6 +55,7 @@ from app.storage.migration import (
 )
 # LSBN-F-22 (M3): the union read context (the holder lives in services.migration).
 from app.services.migration import refresh_migration_context
+from app.shutdown import bounded_shutdown
 from app.transport.auth import BearerAuthMiddleware
 from app.transport.mcp import build_mcp
 from app.transport.rest import build_rest_router
@@ -580,22 +581,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 update_task = asyncio.create_task(
                     update_checker.run(), name="update-check"
                 )
+            # LSBN-D-16: the background handles for diagnostics and tests
+            # (after a stop nothing must keep running — the shutdown test
+            # asserts every task here is done).
+            app.state.background_tasks = (worker_task, backup_task, update_task)
             try:
                 yield
             finally:
+                # LSBN-D-16: the loops are cancelled BEFORE uvicorn logs
+                # "Application shutdown complete", and the wait is bounded by
+                # SHUTDOWN_TIMEOUT_SEC: a worker thread blocked on an LLM
+                # call must not hold the container half-dead (see
+                # app/shutdown.py) — a soft flag, a cancel, a bounded wait.
                 worker.stop()  # soft flag: do not start a new batch
                 worker_task.cancel()  # and interrupt the wait if sleeping
-                with suppress(asyncio.CancelledError):
-                    await worker_task
                 services.backup.stop()
                 backup_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await backup_task
                 if update_task is not None:
                     update_checker.stop()
                     update_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await update_task
+                await bounded_shutdown(
+                    [
+                        task
+                        for task in (worker_task, backup_task, update_task)
+                        if task is not None
+                    ],
+                    timeout_sec=settings.shutdown_timeout_sec,
+                )
 
     app = FastAPI(
         title="LLM Second Brain",

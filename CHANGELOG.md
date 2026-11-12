@@ -32,9 +32,23 @@ Release 3.7.0 — "The retry economy of splitting": the live failure of
 2026-11-12 (a thinking judge with a degraded 256-token budget answered nothing,
 so the migration queue re-split the same notes every 10 minutes, burning the
 generation slot for days) is fixed at three levels — the judge's budget, the
-verification shape, and the retry policy.
+verification shape, and the retry policy — plus a bounded SIGTERM stop
+(a container Up with a dead HTTP was a second live outage of the same day).
 
 ### Fixed
+
+* **A half-dead container after SIGTERM (`LSBN-D-16`)** — 12.11 prod:
+  uvicorn dropped the HTTP listener at 18:56:32Z, but a worker thread
+  blocked on an LLM call (`asyncio.to_thread`, the read timeout up to
+  900 s) held the process for 20+ minutes: the container stayed `Up` with
+  a dead HTTP, the healthcheck went `unhealthy` 42 times,
+  `restart: unless-stopped` never fired (the process never exited) and
+  nothing alerted — a quiet memory outage for every agent. The stop is
+  bounded now: the background loops are cancelled before uvicorn logs
+  Application shutdown complete, anything still alive past the budget is
+  abandoned with a forced exit. SQLite is transactional (WAL): committed
+  work survives, an interrupted batch keeps its pending statuses and is
+  caught up after the restart.
 
 * **A thinking judge without an explicit budget is a fatal config error** —
   with `JUDGE_NUM_PREDICT=0` and `JUDGE_CONTEXT_TOKENS=0` the auto budget
@@ -60,6 +74,14 @@ verification shape, and the retry policy.
 * **The mechanical garbage floor** — `SPLIT_FACTS_FLOOR=0.3` (`facts_coverage`
   of hard tokens): below it the parts are a loss, not a retelling, and go to
   quarantine without burning the judge's call.
+* **`SHUTDOWN_TIMEOUT_SEC`** (default `30`, range `1..30`) — the upper bound
+  of SIGTERM handling (`LSBN-D-16`). The cancelled background tasks
+  (worker/backup/update-check) get this budget, then a short grace lets the
+  busy executor threads finish, then a forced exit (`os._exit(0)` — a docker
+  stop is a planned stop, so `restart: unless-stopped` keeps the container
+  stopped instead of looping). The journal gets one `shutdown_forced` event
+  (`timeout_sec`, `thread_grace_sec`, `pending_tasks`, `stuck_threads`).
+
 * **The fragmentation ceiling** — `SPLIT_PARTS_SLACK=2`: more parts than
   `ceil(chars / limit) + 2` means the model is padding, not decomposing — one
   follow-up, then defer (the "one part per fact" era fragmented a live note

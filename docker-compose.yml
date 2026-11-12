@@ -147,6 +147,17 @@ services:
       SLOT_MAX_OUTPUT_TOKENS: "32768"        # defensive ceiling of the auto output budget (explicit budgets are never clamped)
       SLOT_REASONING_MIN_OUTPUT_TOKENS: "4096"  # below it a reasoning slot gets a startup WARN: too little room for thinking
       SLOT_MIN_TIMEOUT_SEC: "300"            # below it a reasoning slot gets a startup WARN: a long-thinking call looks like a timeout
+      # --- shutdown (LSBN-D-16): the SIGTERM bound, seconds (1..30).
+      #     docker stop → uvicorn drops the HTTP listener fast, but a worker
+      #     thread blocked on an LLM call (asyncio.to_thread, the read
+      #     timeout up to 900 s) used to keep the process alive — the
+      #     container stayed "Up" with a dead HTTP, restart=unless-stopped
+      #     never fired, no alert. Now: the background loops are cancelled,
+      #     SHUTDOWN_TIMEOUT_SEC waits them out, a short grace waits the
+      #     threads, then a forced exit (exit code 0, the shutdown_forced
+      #     journal event). SQLite is transactional — committed work
+      #     survives, pending statuses catch up after the restart.
+      SHUTDOWN_TIMEOUT_SEC: "30"
       # --- HTTP/MCP ---
       PORT: "8080"
       MCP_PATH: "/mcp"
