@@ -217,6 +217,7 @@ timeout 720 s (override with `EMBED_TIMEOUT_SEC`).
 | `DEFAULT_TOP_K` | `5` | default `top_k` in `memory_search` |
 | `DEFAULT_LIST_LIMIT` | `20` | default `limit` in `memory_list` |
 | `SCORE_THRESHOLD` | `0.50` | cosine cutoff for search |
+| `DEDUP_ENABLED` | `true` | background dedup switch (false — the job does not start) |
 | `DEDUP_SIMILARITY` | `0.92` | "duplicate" cosine threshold |
 | `DEDUP_CANDIDATE_TOP_N` | `3` | cosine candidates for the judge |
 | `DEDUP_CANDIDATE_SIMILARITY` | `0.80` | candidate lower threshold |

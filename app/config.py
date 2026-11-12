@@ -265,6 +265,12 @@ class Settings(BaseSettings):
     # Calibrated on 82 real queries: 0.35 → 0.50.
     score_threshold: float = 0.50
     dedup_similarity: float = 0.92
+    # LSBN-D-14 (3.6.2): the operator brake of the background dedup — false: the
+    # dedup job does not start, its queue stays visible in /health (the
+    # `JOB_NODES_ENABLED` canon). Deliberately NOT in `slot_config_fingerprint`:
+    # flipping the brake is not a slot-configuration change (the attention of all
+    # slots is not cleared on it).
+    dedup_enabled: bool = True
     # --- background dedup (Phase 8, step 2.1): candidate pre-filter before the summary ---
     dedup_candidate_top_n: int = 3  # top-N candidates (the judge verifies, step 3)
     dedup_candidate_similarity: float = 0.80  # paraphrase-candidate lower threshold

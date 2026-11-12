@@ -3839,6 +3839,13 @@ def build_summary_job(
 def build_judge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
     """The `judge` job: a batch of judge jobs (dedup), the `judge` signal.
 
+                The operator brake (LSBN-D-14, 3.6.2): `DEDUP_ENABLED=false` does
+                not start the job — the registry keeps its queue, so the judge
+                backlog stays visible in `/health.queues` and is worked off after
+                the flag is back on (the `JOB_NODES_ENABLED` canon). The judge tasks
+                keep being created on vectorization — the backlog is honest, not
+                hidden.
+
                 The slot gate (3.4.1, LSBN-T-29): `gate` — `_slot_gate` (with a probe
                 knock), `is_gated` — `_slot_blocked` (snapshots without models).
     """
@@ -3847,7 +3854,11 @@ def build_judge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         queue="judge",
         interval_sec=settings.pending_retry_sec,
         batch=None,
-        enabled=True,
+        # LSBN-D-14 (3.6.2): the operator brake — false does not start the job, its
+        # queue stays visible in /health (the nodes canon). The judge tasks keep
+        # being created on vectorization: the backlog is honest and drains after
+        # the flag is turned back on.
+        enabled=settings.dedup_enabled,
         process=worker._process_judge,
         queue_empty=worker._judge_queue_empty,
         wait_event=worker._judge_event,
