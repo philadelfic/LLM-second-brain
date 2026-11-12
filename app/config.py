@@ -121,6 +121,9 @@ class Settings(BaseSettings):
     # The declared context of the summary slot model (0 — unknown → the
     # previous caps without failing); the chat-template/service-fields reserve
     # and the auto-budget defensive cap are shared across generative slots.
+    # 12.11.2026 (О.): облачные модели ollama.com лимиты не принимают —
+    # флаг снимает num_predицt/num_ctx/max_tokens из запроса целиком.
+    summary_no_output_limits: bool = False
     summary_context_tokens: int = 0
     slot_prompt_reserve_tokens: int = 512
     slot_max_output_tokens: int = 32768
@@ -278,6 +281,7 @@ class Settings(BaseSettings):
     judge_model_type: str = "generation"
     # No49 (arch §13.4): 900 = the back-off/slot pause ceiling; was 30.
     judge_timeout_sec: int = 900  # client read timeout of the judge call
+    judge_no_output_limits: bool = False
     judge_context_tokens: int = 0  # declared judge model context (0 — unknown)
     rrf_k: int = 60
     # Ranking boosts after RRF (LSBN-F-14, 3.4.0): the operator switch
