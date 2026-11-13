@@ -116,7 +116,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 
-RELEASE = "3.8.0"
+RELEASE = "3.8.1"
 
 # Repository root: the script runs from `scripts/`, while the LSBN-F-11
 # scenario needs `app.services.injection_budget` (the budget constants live in

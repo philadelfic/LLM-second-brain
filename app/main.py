@@ -192,7 +192,7 @@ def _operations_config_warnings(logger: logging.Logger, settings: Settings) -> N
     # An unknown operation name — a separate event WITHOUT a slot: the
     # `slot_config_warning` contract (always with a slot) stays intact (see
     # test_main_startup_warnings).
-    for _code, text in unknown_operation_warnings():
+    for _code, text in unknown_operation_warnings(settings):
         logger.warning(
             text,
             extra={
