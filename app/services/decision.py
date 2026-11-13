@@ -67,6 +67,16 @@ DECISION_KINDS = ("choice", "noul", "score")
 # the reason passes this whitelist in `_fallback`; a foreign name is an immediate ValueError.
 DECISION_REASONS = ("unavailable", "unsupported", "low_confidence")
 
+# LSBN-F-37: the scale a threshold is compared on. The journal names it next to the
+# threshold (`applied_threshold`/`applied_scale` in `decision_answer`), so a number in
+# the log is never read against a threshold of the OTHER scale (review defect of
+# 13.11.2026): `confidence` — the excess over chance (a `choice` answer carries it),
+# `probability` — the bare label probability (`noul`, `score`, and `choice` whose
+# answer came without a confidence).
+SCALE_CONFIDENCE = "confidence"
+SCALE_PROBABILITY = "probability"
+DECISION_SCALES = (SCALE_CONFIDENCE, SCALE_PROBABILITY)
+
 # Failure statuses meaning "waiting is pointless": the breaker opens immediately
 # (like AUTH of generative slots, block 2).
 _AUTH_STATUSES = frozenset({401, 403})
@@ -85,15 +95,26 @@ class DecisionQuestion:
             `name` — the question key (also the key in `answers`); `text` — the wording
             (EN, impersonal); `kind` — choice | noul | score; `labels` — the options
             of `choice`; `criteria` — a criterion per label (`choice`) or an array of
-            criteria (`score`); `threshold` — the question threshold (None →
-            `DECISION_THRESHOLD`).
+            criteria (`score`); `threshold` — the question threshold from the registry,
+            the STRONGEST of all (LSBN-F-37): it wins over the knob and lives on the
+            scale of the question's kind (for `choice` — confidence, for `noul`/`score`
+            — probability), so the author of a question writes it in that scale.
+            `threshold is None` → the knob decides, and not one number for everything:
+            `DECISION_CHOICE_THRESHOLD` for `choice` judged by confidence, otherwise
+            `DECISION_THRESHOLD` — that includes `choice` whose answer came WITHOUT
+            `confidence`: there is no confidence scale then, the bare probability is
+            compared and the general threshold applies (the two scales never meet in
+            one comparison).
     """
 
     name: str
     text: str
     kind: str
     labels: tuple[str, ...] = ()
-    criteria: Mapping[str, str] | None = None
+    # LSBN-F-37: a `choice` criterion may be null — a bare label without a
+    # description (the live server contract accepts it); the classifier sends
+    # node paths with their descriptions here.
+    criteria: Mapping[str, str | None] | None = None
     threshold: float | None = None
 
 
@@ -209,6 +230,10 @@ class DecisionService:
         self._answers = 0
         self._fallbacks = 0
         self._by_reason: dict[str, int] = {reason: 0 for reason in DECISION_REASONS}
+        # LSBN-F-37 (review): a `choice` answer without `confidence` is judged by the
+        # bare probability — legal, but reported ONCE per service (see
+        # `_warn_bare_probability`), so the fallback is visible in the log.
+        self._bare_probability_warned = False
 
     # --- state ----------------------------------------------------------------
 
@@ -434,28 +459,98 @@ class DecisionService:
         }
 
     def _accepted(self, answer: DecisionAnswer, question: DecisionQuestion) -> bool:
-        """Whether the chosen option's probability passed the threshold and zone (§6.4).
+        """Whether the chosen option's value passed the threshold and zone (§6.4).
 
-                    `|p − threshold| < zone` → low_confidence; `p ≥ threshold + zone` →
-                    accepted (the answer label); for `noul` the "opposite" decision
-                    (`p ≤ threshold − zone`) is accepted too; `choice`/`score` below the
-                    threshold — low_confidence (a multi-option question has no
-                    "opposite").
+                    `|value − threshold| < zone` → low_confidence; `value ≥ threshold +
+                    zone` → accepted (the answer label); for `noul` the "opposite"
+                    decision (`value ≤ threshold − zone`) is accepted too;
+                    `choice`/`score` below the threshold — low_confidence (a
+                    multi-option question has no "opposite").
+
+                    LSBN-F-37: for `choice` the compared quantity is the answer's
+                    CONFIDENCE, not the label probability — the live contract of
+                    13.11.2026 defines it as the excess over chance,
+                    `(p1 − 1/N) / (1 − 1/N)`, N — the number of labels. On a 20-label
+                    question a bare probability of 0.5 is "just above a coin toss", so
+                    choice has its own threshold; `noul`/`score` keep the probability
+                    and `DECISION_THRESHOLD`. The zone is shared.
+
+                    Which threshold it is and on which scale it lives — the single
+                    answer is `_applied_threshold` (the same pair goes to the journal).
         """
+        zone = self._settings.decision_uncertainty_zone
+        threshold, scale = self._applied_threshold(answer, question)
+        value = answer.confidence if scale == SCALE_CONFIDENCE else answer.probability
+        if value is None:
+            return False
+        if abs(value - threshold) < zone:
+            return False
+        if value >= threshold + zone:
+            return True
+        return answer.kind == "noul" and value <= threshold - zone
+
+    def _applied_threshold(
+        self, answer: DecisionAnswer, question: DecisionQuestion
+    ) -> tuple[float, str]:
+        """The threshold ACTUALLY applied to the answer and the scale it lives on.
+
+                    LSBN-F-37: the priority is question → knob. A question threshold
+                    from the registry (`decision_questions.json`) is the strongest —
+                    its author writes it on the scale of the question's kind; with no
+                    question threshold the knob answers: `DECISION_CHOICE_THRESHOLD`
+                    for `choice` judged by confidence, `DECISION_THRESHOLD` for all the
+                    rest (`noul`, `score`, and `choice` without confidence).
+
+                    Review defect of 13.11.2026: a `choice` answer WITHOUT `confidence`
+                    has no confidence scale at all — the bare label probability is
+                    compared (as it was before LSBN-F-37) and the default here is
+                    `DECISION_THRESHOLD`, NEVER the choice one: the two scales must not
+                    meet in one comparison. Such an answer is reported once per service
+                    (`_warn_bare_probability`): it means the server did not send
+                    `confidence` at all.
+
+                    The returned pair is what the journal writes next to the answer
+                    (`applied_threshold`/`applied_scale` in `decision_answer`): a reader
+                    of the log must never guess which number the threshold belongs to.
+        """
+        by_confidence = answer.kind == "choice" and answer.confidence is not None
+        if answer.kind == "choice" and answer.confidence is None:
+            self._warn_bare_probability()
+        scale = SCALE_CONFIDENCE if by_confidence else SCALE_PROBABILITY
+        default_threshold = (
+            self._settings.decision_choice_threshold
+            if by_confidence
+            else self._settings.decision_threshold
+        )
         threshold = (
             question.threshold
             if question.threshold is not None
-            else self._settings.decision_threshold
+            else default_threshold
         )
-        zone = self._settings.decision_uncertainty_zone
-        probability = answer.probability
-        if probability is None:
-            return False
-        if abs(probability - threshold) < zone:
-            return False
-        if probability >= threshold + zone:
-            return True
-        return answer.kind == "noul" and probability <= threshold - zone
+        return threshold, scale
+
+    def _warn_bare_probability(self) -> None:
+        """Warn ONCE per service: a `choice` answer came without `confidence`.
+
+                    LSBN-F-37 (review defect): the fallback to the bare probability is
+                    legal but must be visible — otherwise a `choice` judged by 0.5 looks
+                    exactly like a `choice` judged by the confidence threshold 0.6. One
+                    line per process is enough: the case belongs to the server's
+                    contract, not to a single answer.
+        """
+        if self._bare_probability_warned:
+            return
+        self._bare_probability_warned = True
+        logging.getLogger("app").warning(
+            "decision: choice-ответ без confidence — сравнение по голой probability "
+            "и DECISION_THRESHOLD (шкалы не смешиваются)",
+            extra={
+                "event": "decision_scale_fallback",
+                "slot": SLOT_DECISION,
+                "scale": SCALE_PROBABILITY,
+                "threshold": self._settings.decision_threshold,
+            },
+        )
 
     def _outcome_of_error(self, exc: LLMError) -> SlotOutcome:
         """A client error → the breaker outcome; 401/403 (native ollama) — AUTH."""
@@ -536,22 +631,36 @@ class DecisionService:
         """The `decision_answer` event (§7.2): probabilities — ONLY in the journal.
 
                     Fields: `slot`, `operation`, question names, answers (`kind`/`label`/
-                    `probability`/`confidence`), the threshold, the model and `duration_ms`.
-                    Probabilities are not written to the DB at all (FR-3.3).
+                    `probability`/`confidence`), per answer — `applied_threshold` and
+                    `applied_scale` (`confidence`|`probability`), the model and
+                    `duration_ms`. Probabilities are not written to the DB at all
+                    (FR-3.3).
+
+                    LSBN-F-37 (review defect): the event used to carry ONE `threshold` —
+                    always `DECISION_THRESHOLD`, whatever was really compared. Now the
+                    applied pair travels WITH the answer: one call may ask several
+                    questions of different kinds and each is judged on its own scale, so
+                    a single number at the top of the event would lie again.
         """
+        by_name = {question.name: question for question in questions}
+        logged: dict[str, dict[str, object]] = {}
+        for name, answer in answers.items():
+            entry: dict[str, object] = {
+                "kind": answer.kind,
+                "label": answer.label,
+                "probability": answer.probability,
+                "confidence": answer.confidence,
+            }
+            question = by_name.get(name)
+            if question is not None:
+                threshold, scale = self._applied_threshold(answer, question)
+                entry["applied_threshold"] = threshold
+                entry["applied_scale"] = scale
+            logged[name] = entry
         fields: dict[str, object] = {
             "operation": operation,
             "questions": [question.name for question in questions],
-            "answers": {
-                name: {
-                    "kind": answer.kind,
-                    "label": answer.label,
-                    "probability": answer.probability,
-                    "confidence": answer.confidence,
-                }
-                for name, answer in answers.items()
-            },
-            "threshold": self._settings.decision_threshold,
+            "answers": logged,
             "model": meta.model,
             "duration_ms": meta.duration_ms,
         }

@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
@@ -69,6 +69,12 @@ CLASSIFIER_NUM_PREDICT = 768
 # The fallback label of the tagging decision question (registry, arch §6.4): a
 # note not bound to a node → `hint_path is None`.
 GENERIC_LABEL = "generic"
+
+# The criterion of the fallback label in the tagging question (LSBN-F-37): node
+# descriptions travel in the question's `criteria` (path → description), so the
+# fallback label needs a wording of its own — it has no node behind it.
+# The text repeats the builtin classify wording: the registry stays tunable.
+GENERIC_CRITERION = "the note is generic and not bound to a known section"
 
 # The minimum candidates of the decision model's `choice` question (live contract
 # of `/v1/systemone`, verified 2026-10-10): the server requires 2–26 options in
@@ -200,8 +206,14 @@ class ClassificationService:
 
                     The question comes from the registry (`decider.questions_for("classify")`);
                     labels come from `classify` (paths of known nodes + the fallback
-                    `generic` → `hint_path is None`), state — the note + nodes
-                    (`path: description`, as today). The call happens only at
+                    `generic` → `hint_path is None`). LSBN-F-37: state is the note
+                    ONLY (cut to `DECISION_NOTE_CHARS`), while node descriptions
+                    travel in the question's `criteria` (path → description, null
+                    for a bare path; the wordings of `decision_questions.json` stay,
+                    the live node map wins on a hit; `generic` carries its own) — a growing
+                    node map does not inflate the state (measured 13.11.2026: 6.1–
+                    7.8 s against 8.3 s with the old layout, the same accuracy).
+                    The call happens only at
                     `len(labels) >= DECISION_MIN_CANDIDATES`: otherwise the decision is
                     not applicable and this code is not reached. The same question serves
                     the `warnings` job ("a note is not in its place"): it walks through
@@ -213,9 +225,13 @@ class ClassificationService:
             raise DecisionUnavailable(
                 "в реестре нет вопроса разметки узла", reason="unsupported"
             )
-        question = replace(questions[0], labels=tuple(labels))
+        question = replace(
+            questions[0],
+            labels=tuple(labels),
+            criteria=self._decision_criteria(questions[0].criteria, known_nodes),
+        )
         result = self._decider.decide(
-            self._user_message(text, known_nodes), [question], operation="classify"
+            self._decision_state(text), [question], operation="classify"
         )
         answer = result.answers.get(question.name)
         if answer is None or answer.label is None:
@@ -312,6 +328,42 @@ class ClassificationService:
         )
 
     # --- internal -------------------------------------------------------------
+
+    @staticmethod
+    def _decision_criteria(
+        registry: Mapping[str, str | None] | None,
+        known_nodes: list[dict[str, Any]],
+    ) -> dict[str, str | None]:
+        """Criteria of the tagging `choice` question: registry wordings + node map.
+
+                    LSBN-F-37: the node descriptions live HERE, not in the state — the
+                    label is the option key and its description is the option's wording
+                    (the server accepts null — a bare label; an empty description
+                    becomes null). The registry wording goes FIRST and the live node map
+                    second (review defect of 13.11.2026): the criteria of
+                    `decision_questions.json` used to be dropped whole, so a tuned
+                    wording died silently — now a node description overrides only the
+                    criterion of ITS path, every other registry wording survives (the
+                    `generic` one included; `GENERIC_CRITERION` fills in when the
+                    registry is silent).
+        """
+        criteria: dict[str, str | None] = dict(registry or {})
+        for node in known_nodes:
+            description = node.get("description")
+            criteria[node["path"]] = str(description) if description else None
+        criteria.setdefault(GENERIC_LABEL, GENERIC_CRITERION)
+        return criteria
+
+    def _decision_state(self, text: str) -> str:
+        """State of the tagging question: the note only, cut to `DECISION_NOTE_CHARS`.
+
+                    LSBN-F-37: the node map is not part of the state any more (it
+                    travels in `criteria`); a note longer than the limit is cut as is
+                    — a prefix is enough for choosing a section and the call stays
+                    cheap.
+        """
+        limit = self._settings.decision_note_chars
+        return text if len(text) <= limit else text[:limit]
 
     @staticmethod
     def _user_message(text: str, known_nodes: list[dict[str, Any]]) -> str:

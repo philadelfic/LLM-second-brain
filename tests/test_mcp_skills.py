@@ -166,6 +166,8 @@ TERMS_TOOL_NAMES = frozenset({"terms_search", "terms_save", "terms_get"})
 HISTORY_TOOL_NAMES = frozenset({"history_list", "history_get"})
 # №12 (no12-02): одна точка чтения предупреждений — ядро поверхности.
 WARNINGS_TOOL_NAMES = frozenset({"warnings_list"})
+# LSBN-F-37: ручки тюнинга — ядро (от флагов области не зависят).
+TUNING_TOOL_NAMES = frozenset({"tuning_list", "tuning_get"})
 
 
 def form(**overrides: object) -> dict[str, object]:
@@ -258,7 +260,7 @@ class TestToolRegistry:
         assert set(CANON_TOOL_DESCRIPTIONS) <= names
         assert names - set(CANON_TOOL_DESCRIPTIONS) == (
             MEMORY_TOOL_NAMES | USER_TOOL_NAMES | TERMS_TOOL_NAMES
-            | HISTORY_TOOL_NAMES | WARNINGS_TOOL_NAMES
+            | HISTORY_TOOL_NAMES | WARNINGS_TOOL_NAMES | TUNING_TOOL_NAMES
         )
         # Логи (f10-02/03) в этой DI-сборке не собраны (`services.logs is None`):
         # их ручек в поверхности нет, остальное совпадает со словарём TOOL_NAMES.
@@ -271,7 +273,7 @@ class TestToolRegistry:
             "logs_list",
             "logs_export",
         } == names
-        assert len(names) == 25
+        assert len(names) == 27
 
     @pytest.mark.asyncio
     async def test_tool_descriptions_are_canon_verbatim(self, mcp_skills) -> None:
