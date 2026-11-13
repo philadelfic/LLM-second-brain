@@ -26,6 +26,58 @@ stabilized (owner's decision: GitHub only on stabilization):
 * **3.6.2** (2026-11-12) — Parts of one note are not duplicates
 * **3.6.3** (2026-11-12) — Short notes summarize themselves
 
+## [3.8.0] - 2026-11-14
+
+Release 3.8.0 — a knob travels with its recipe: tuning became a mechanism
+rather than one-off knowledge of the owner (`LSBN-F-37`) — a value is read
+together with the way to calibrate it, so a consumer model does the calibration
+itself when the model or the data changes. The `choice` gate of the decision
+slot judges the normalized confidence of the server instead of a bare label
+probability (`LSBN-T-41`), and the journal names the scale it applied.
+
+### Added
+
+* **A tuning registry with the recipe (`LSBN-F-37`)** — `app/services/tuning.py`
+  holds `Tunable(key, env, slot, title, unit, affects, safe, metrics, hint,
+  calibrated)` and five records at once: `decision_threshold`,
+  `decision_choice_threshold`, `decision_note_chars`, `decision_model`,
+  `slot_pause_after`. The recipe is neither an injected memory block nor a note:
+  it arrives in the hint of the handle a consumer already reads. A new knob is a
+  new record with a recipe and observable metrics; an empty recipe means the
+  record is not ready.
+
+* **MCP `tuning_list` / `tuning_get`, REST `GET /v1/tuning` / `GET /v1/tuning/{key}`**
+  — one registry behind both transports and one card shape for a future front end
+  (a tooltip per handle, no separate reference list): the list answers key, value
+  and effect, the card adds `hint`, `metrics`, `calibrated`, `safe`, `slot` and
+  `env`; an unknown key answers a hint pointing at `tuning_list`.
+
+* **Calibration facts inside the card** — `decision_choice_threshold` carries the
+  confidence formula `(p1 - 1/N) / (1 - 1/N)`, the numbers of the 2026-11-13
+  measurement (prod, n=50: p >= 0.75 gives 100% (13/13), p >= 0.55 gives 82%
+  (14/17)) and the note that `temperature`/`seed` are pointless for
+  `/v1/systemone`: the decision is deterministic.
+
+### Changed
+
+* **The `choice` gate judges the normalized confidence (`LSBN-T-41`)** —
+  `DECISION_CHOICE_THRESHOLD` (default `0.6`) applies to a `choice` answer that
+  carries `confidence`: the excess over chance, `(p1 - 1/N) / (1 - 1/N)`. `noul`,
+  `score` and a `choice` answer without `confidence` keep `DECISION_THRESHOLD` on
+  the bare label probability, and a threshold written on the question itself (the
+  question registry) still wins over both knobs.
+
+* **The prompt layout of the decision slot** — `state` now carries the note text
+  only, capped by `DECISION_NOTE_CHARS` (default `800`), while the node
+  descriptions moved into `criteria` (the 2026-11-13 measurement: 6.1-7.8 s
+  against 8.3 s, quality not worse).
+
+* **The journal names the scale of the threshold** — `decision_answer` writes
+  `applied_threshold` and `applied_scale` (`confidence` | `probability`) instead
+  of a bare `threshold`, so a number in the log is never read against a threshold
+  of the other scale. A `choice` answer that arrived without `confidence` is
+  reported once per process and falls back to the probability scale.
+
 ## [3.7.0] - 2026-11-12
 
 Release 3.7.0 — "The retry economy of splitting": the live failure of
