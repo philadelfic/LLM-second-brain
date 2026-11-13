@@ -44,7 +44,7 @@
     step, never a false FAIL.
 
     Scenarios (this base version):
-      0. MCP surface and readiness: 24 tools, `/health` shape including `queues`
+      0. MCP surface and readiness: 34 tools, `/health` shape including `queues`
          (`pending`/`waiting`/`attention`) and `slots` (`embedding`/`summary`/`judge`
          with `ok`/`last_outcome`/`paused_until`/`attention`), version, DB size.
       1. Queue and slot observability baseline (before the outage): queues are
@@ -116,7 +116,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 
-RELEASE = "3.2.0"
+RELEASE = "3.7.0"
 
 # Repository root: the script runs from `scripts/`, while the LSBN-F-11
 # scenario needs `app.services.injection_budget` (the budget constants live in
@@ -1410,7 +1410,7 @@ async def save_probe_note(c: Client, title: str, *, after_hook: bool = False,
 # ==== scenarios: 0. surface and readiness ======================================
 async def scenario_0_context(c: Client, rest: httpx2.AsyncClient,
                              instructions: str) -> None:
-    scenario(0, "MCP surface and contour readiness (24 tools, /health shape)")
+    scenario(0, "MCP surface and contour readiness (34 tools, /health shape)")
 
     listed = await c.session.list_tools()
     names = sorted(t.name for t in listed.tools)
