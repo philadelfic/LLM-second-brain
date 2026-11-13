@@ -175,7 +175,7 @@ from pydantic import Field
 from app.config import MAX_NOTE_CHARS_DEFAULT, Settings, get_settings
 from app.observability import log_tool_call, preview
 from app.services import Services
-from app.services import history
+from app.services import history, tuning
 from app.services.injection_budget import count_tokens
 from app.services.update_check import UpdateChecker
 from app.services.freshness import FreshnessValidationError, parse_updated_after
@@ -904,6 +904,21 @@ def tool_descriptions(note_limit: int) -> dict[str, str]:
             "one of date_from/date_to (YYYY-MM-DD, UTC) is required. Entries run "
             "oldest first, grouped by day, with FULL field text — built for "
             "release gates. Read-only."
+        ),
+        # LSBN-F-37: knobs travel WITH their tuning recipe — no separate
+        # reference list either in the memory or in the instructions.
+        "tuning_list": (
+            "List the tunable knobs of the service together with their tuning "
+            "recipe: what a knob changes, how to measure the effect, reference "
+            "values, how to roll back, where the effect is visible (metrics) and "
+            "what it was calibrated on. Read it before proposing a knob change; "
+            "one knob in full — `tuning_get`."
+        ),
+        "tuning_get": (
+            "Read ONE knob by key: current value, env name, slot, unit, what it "
+            "affects, whether a change is safe, the metrics to watch and the "
+            "tuning recipe with its calibration facts. An unknown key comes back "
+            "as a soft hint, not an error."
         ),
     }
 
@@ -1848,8 +1863,8 @@ def build_mcp(
     update_checker: UpdateChecker | None = None,
 ) -> MCPServer:
     """Assemble the MCP server: instructions (§5.1, the base + the namespace map) +
-            up to 24 tools (8 `memory_*` + 1 `warnings_list` + 5 `skills_*` +
-            5 `user_*` + 3 `terms_*` + 2 `history_*`) over the services.
+            the tools over the services: 8 `memory_*`, `warnings_list`, 5 `skills_*`,
+            5 `user_*`, 3 `terms_*`, 2 `history_*`, 6 `logs_*` and 2 `tuning_*`.
 
             The area handle blocks (skills/user/terms) register only when the area's
             `AREA_*_ENABLED` flag is on (#40, FR-2.1): a disabled area never enters
@@ -2831,6 +2846,31 @@ def build_mcp(
             status=status,
         )
         return _compact_warnings(result)
+
+    # --- tuning knobs (LSBN-F-37) ---------------------------------------------
+    # Thin wrappers over `app/services/tuning.py`: a knob's value arrives TOGETHER
+    # with its recipe (what it changes, how to measure, reference values, how to
+    # roll back). Reads `Settings` and the registry only — no writes, no models.
+    @mcp.tool(name="tuning_list", description=descriptions["tuning_list"])
+    async def tuning_list() -> dict[str, Any]:
+        started = time.perf_counter()
+        cards = tuning.catalog(settings)
+        log_tool_call("tuning_list", started, results=len(cards))
+        return {"tunables": cards, "total": len(cards)}
+
+    @mcp.tool(name="tuning_get", description=descriptions["tuning_get"])
+    async def tuning_get(
+        key: Annotated[str, Field(description="Knob key (see tuning_list)")],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        card = tuning.describe(settings, key)
+        if card is None:
+            log_tool_call(
+                "tuning_get", started, failed=True, reason="unknown key", key=key
+            )
+            return {"key": key, "hint": "unknown knob: see tuning_list"}
+        log_tool_call("tuning_get", started, results=1, key=key)
+        return card
 
     # --- version history: reading from MCP (#41, §7.1, §13.14) ----------------
     # Two SHARED tools on an explicit request; the services are not needed — it reads the same

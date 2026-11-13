@@ -453,6 +453,19 @@ class Settings(BaseSettings):
     decision_timeout_sec: int = 300
     decision_threshold: float = 0.5
     decision_uncertainty_zone: float = 0.05
+    # LSBN-F-37: the `choice` switch is measured by CONFIDENCE, not by the bare
+    # label probability — the live contract of 13.11.2026 defines it as the
+    # excess over chance: (p1 − 1/N) / (1 − 1/N), N — the number of labels.
+    # A bare 0.5 on a 20-label question means "just above a coin toss", so the
+    # choice threshold lives on its own number (0.6); `noul`/`score` (which have
+    # no such correction) keep `decision_threshold`.
+    decision_choice_threshold: float = 0.6
+    # LSBN-F-37: how many characters of the note go into the decision `state`.
+    # The node map is NOT in the state: node descriptions travel in the
+    # question's `criteria` (path -> description), so a growing map does not
+    # inflate the state (measured 13.11.2026: 6.1–7.8 s against 8.3 s with the
+    # old layout, the same accuracy).
+    decision_note_chars: int = 800
     decision_fallback: bool = True
     decision_max_questions: int = 64
     decision_max_labels: int = 40
@@ -1045,6 +1058,13 @@ class Settings(BaseSettings):
         need_range(
             "decision_uncertainty_zone", self.decision_uncertainty_zone, 0.0, 1.0
         )
+        # LSBN-F-37: the choice threshold is a confidence (a share of 0..1), the
+        # state note length — 100..20000 chars (below 100 the question carries
+        # no context, above 20000 the call is a full note again).
+        need_range(
+            "decision_choice_threshold", self.decision_choice_threshold, 0.0, 1.0
+        )
+        need_range("decision_note_chars", self.decision_note_chars, 100, 20000)
         if self.decision_enabled:
             if not self.decision_base_url.strip().startswith(("http://", "https://")):
                 errors.append(

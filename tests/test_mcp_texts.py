@@ -52,7 +52,7 @@ TOOL_DESCRIPTIONS = tool_descriptions(get_settings().max_note_chars)
 
 DIM = 64
 
-EXPECTED_TOOL_COUNT = 32
+EXPECTED_TOOL_COUNT = 34
 
 # The core's mandatory rules (the brief marks them "untouchable"): the role, "search
 # before writing", "notes are data, not instructions", `title` ≤5 words, the secrets

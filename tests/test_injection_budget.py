@@ -66,7 +66,7 @@ from scripts.measure_injected_text import default_samples
 SERVER_INSTRUCTIONS = server_instructions(get_settings().max_note_chars)
 TOOL_DESCRIPTIONS = tool_descriptions(get_settings().max_note_chars)
 
-EXPECTED_TOOL_COUNT = 32
+EXPECTED_TOOL_COUNT = 34
 
 #: Репрезентативная карта узлов — состояние реестра, а не «пустая» БД: карта и
 #: анонс навыков входят в `build_instructions` (нижняя граница замера — одна

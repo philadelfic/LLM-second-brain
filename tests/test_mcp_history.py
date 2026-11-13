@@ -129,7 +129,7 @@ class TestHistoryTools:
             "logs_list",
             "logs_export",
         } == names
-        assert len(names) == 25
+        assert len(names) == 27
         assert TOOL_DESCRIPTIONS["history_list"]
         assert TOOL_DESCRIPTIONS["history_get"]
 

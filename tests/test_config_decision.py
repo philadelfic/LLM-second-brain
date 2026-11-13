@@ -73,3 +73,42 @@ def test_threshold_zone_out_of_range_fatal(monkeypatch) -> None:
 def test_max_questions_out_of_range_fatal(monkeypatch) -> None:
     with pytest.raises(ConfigError, match="decision_max_questions"):
         load(monkeypatch, DECISION_MAX_QUESTIONS="65")
+
+
+# --- LSBN-F-37: порог choice и длина заметки в state ---------------------------
+
+
+def test_choice_threshold_and_note_chars_defaults(monkeypatch) -> None:
+    """Умолчания: порог choice по confidence 0.6, заметка в state — 800 знаков."""
+    settings = load(monkeypatch)
+    assert settings.decision_choice_threshold == 0.6
+    assert settings.decision_note_chars == 800
+    # Отдельный порог choice не подменяет общий порог noul/score.
+    assert settings.decision_threshold == 0.5
+
+
+def test_choice_threshold_and_note_chars_overridable(monkeypatch) -> None:
+    """Обе ручки читаются из env независимо друг от друга."""
+    settings = load(
+        monkeypatch,
+        DECISION_CHOICE_THRESHOLD="0.55",
+        DECISION_NOTE_CHARS="1200",
+        DECISION_THRESHOLD="0.8",
+    )
+    assert settings.decision_choice_threshold == 0.55
+    assert settings.decision_note_chars == 1200
+    assert settings.decision_threshold == 0.8
+
+
+def test_choice_threshold_out_of_range_fatal(monkeypatch) -> None:
+    """Порог choice вне 0..1 — фатальная ошибка конфигурации (NFR-6)."""
+    with pytest.raises(ConfigError, match="decision_choice_threshold"):
+        load(monkeypatch, DECISION_CHOICE_THRESHOLD="1.5")
+
+
+def test_note_chars_out_of_range_fatal(monkeypatch) -> None:
+    """Длина заметки в state вне 100..20000 — фатальная ошибка конфигурации."""
+    with pytest.raises(ConfigError, match="decision_note_chars"):
+        load(monkeypatch, DECISION_NOTE_CHARS="50")
+    with pytest.raises(ConfigError, match="decision_note_chars"):
+        load(monkeypatch, DECISION_NOTE_CHARS="20001")
