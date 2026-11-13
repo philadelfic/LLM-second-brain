@@ -80,6 +80,13 @@ already was the merge operation's env (0 = auto).
   fingerprint.
 - A typo in the prefix (e.g. `MERG_MODEL`) is ignored by the parser and
   produces an `unknown_operation_warning` at startup — the service starts.
+  Since 3.8.1 the scanner compares env names with the `Settings` fields
+  first: a name that IS a setting never warns, whatever the
+  `<PREFIX>_<FIELD>` mask splits off it. That is why the global knobs
+  `BACKUP_SHIP_TIMEOUT_SEC`, `SHUTDOWN_TIMEOUT_SEC`,
+  `SLOT_MIN_TIMEOUT_SEC` (and every other `Settings` field ending in an
+  operation field name) no longer produce a false warning — they are
+  configuration, not operations.
 - Example (T-23): give the merge process its own cheap model on another
   host, leaving summarize/title on the slot default:
 
