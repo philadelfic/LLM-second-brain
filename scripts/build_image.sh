@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
-# Build a contour image with the git revision baked into the OCI labels
-# (techdebt-0036, FR-4.1): the acceptance report must prove which commit and
-# which app version were checked. The image itself only reads the build args —
-# this script is the one place where the commit is taken from the working copy.
+# Build a contour image with the git revision and the app version baked into the
+# OCI labels (techdebt-0036, FR-4.1): the acceptance report must prove which
+# commit and which app version were checked. The image itself only reads the
+# build args — this script is the one place where they are resolved.
+#
+# Labels come from the working copy, never from the environment:
+#   * revision — `git rev-parse HEAD` of the tree being built;
+#   * version  — `__version__` of app/__init__.py, i.e. exactly the value the
+#                running server reports in /health. Deliberately NOT
+#                `git describe`: a deploy checkout has no release tags fetched,
+#                so describe prints "v3.8.0-3-g77052b2f" for a 3.8.1 image.
+# A missing git (or an unreadable __version__) is the only reason a label
+# degrades to "unknown" — and the script says so on stderr: it neither aborts
+# the build nor labels silently.
 #
 # Usage (from anywhere inside the repository):
 #   scripts/build_image.sh                          # llm-second-brain:test
@@ -10,24 +20,36 @@
 #
 # Then compose builds nothing new — it reuses the tagged image:
 #   docker compose -f docker-compose.test.yml up -d --no-build
-# or keep the usual `up -d --build` (compose passes no args, labels default to
-# "unknown" — use this script when the revision must be provable).
+# `docker compose up -d --build` bypasses this script: compose passes no build
+# args, so the labels fall back to the Dockerfile defaults ("unknown").
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${1:-llm-second-brain:test}"
 
-if ! command -v git >/dev/null 2>&1 || ! git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-    echo "ERROR: no git working copy under $ROOT — cannot stamp the revision" >&2
-    exit 2
+# --- revision: the commit of the tree being built --------------------------
+COMMIT="unknown"
+DIRTY=""
+if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
+    if ! git -C "$ROOT" diff --quiet || ! git -C "$ROOT" diff --cached --quiet; then
+        DIRTY="-dirty"  # uncommitted changes: the revision alone is not the code
+    fi
+else
+    echo "WARN: no git working copy under $ROOT — org.opencontainers.image.revision falls back to 'unknown'" >&2
 fi
 
-COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
-DIRTY=""
-if ! git -C "$ROOT" diff --quiet || ! git -C "$ROOT" diff --cached --quiet; then
-    DIRTY="-dirty"  # uncommitted changes: the revision alone is not the code
+# --- version: app.__version__, the same value /health reports --------------
+VERSION="unknown"
+VERSION_FILE="$ROOT/app/__init__.py"
+if [[ -r "$VERSION_FILE" ]]; then
+    VERSION="$(sed -n 's/^__version__[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$VERSION_FILE" | head -n 1)" || true
 fi
-VERSION="$(git -C "$ROOT" describe --tags --always 2>/dev/null || echo unknown)"
+if [[ -z "$VERSION" ]]; then
+    VERSION="unknown"
+    echo "WARN: no __version__ in $VERSION_FILE — org.opencontainers.image.version falls back to 'unknown'" >&2
+fi
+
 # Приёмочный образ несёт и тест-зависимости (`[dev]`: pytest/pytest-asyncio):
 # сценарий 6 приёмки гоняет юнит-регрессию изнутри раннера. Пустое значение
 # переменной extra отключает: LSB_INSTALL_DEV= scripts/build_image.sh
