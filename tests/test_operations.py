@@ -15,6 +15,7 @@ from app.services.llm_client import LLMClient, SlotSpec
 from app.services.operations import (
     OPERATION_FIELDS,
     OPERATIONS,
+    settings_env_names,
     unknown_operation_warnings,
 )
 
@@ -272,6 +273,50 @@ def test_unknown_operation_env_is_ignored_by_settings(monkeypatch) -> None:
     """Неизвестное имя не ломает парсинг Settings (extra=ignore)."""
     settings = load(monkeypatch, MERG_MODEL="typo")
     assert settings.summary_model == "slot-summary-model"
+
+
+def test_settings_timeouts_are_settings_not_operations(monkeypatch) -> None:
+    """3.8.1: глобальные `*_TIMEOUT_SEC` — поля Settings, а не операции.
+
+    Ложные WARN на проде 3.8.0: маска `<PREFIX>_<FIELD>` разбирала
+    `BACKUP_SHIP_TIMEOUT_SEC` как `BACKUP_SHIP` + `TIMEOUT_SEC` и ругалась
+    «unknown operation». Настройки при этом читаются штатно.
+    """
+    settings = load(
+        monkeypatch,
+        BACKUP_SHIP_TIMEOUT_SEC="300",
+        SHUTDOWN_TIMEOUT_SEC="30",
+        SLOT_MIN_TIMEOUT_SEC="300",
+    )
+    names = (
+        "BACKUP_SHIP_TIMEOUT_SEC",
+        "SHUTDOWN_TIMEOUT_SEC",
+        "SLOT_MIN_TIMEOUT_SEC",
+    )
+    warnings = [text for _code, text in unknown_operation_warnings(settings)]
+    assert not [text for text in warnings if any(name in text for name in names)], warnings
+    # Настройки действительно применены, а не выброшены как «операция».
+    assert settings.backup_ship_timeout_sec == 300
+    assert settings.shutdown_timeout_sec == 30
+    assert settings.slot_min_timeout_sec == 300
+
+
+def test_invented_operation_name_still_warns(monkeypatch) -> None:
+    """Выдуманное имя нет ни в Settings, ни в реестре — WARN остаётся."""
+    settings = load(monkeypatch, FROBNICATE_MODEL="typo")
+    warnings = [text for _code, text in unknown_operation_warnings(settings)]
+    assert [text for text in warnings if "FROBNICATE_MODEL" in text], warnings
+
+
+def test_known_env_names_come_from_settings_fields() -> None:
+    """Список известных env имён строится по полям Settings (3.8.1)."""
+    known = settings_env_names()
+    assert {
+        "BACKUP_SHIP_TIMEOUT_SEC",
+        "SHUTDOWN_TIMEOUT_SEC",
+        "SLOT_MIN_TIMEOUT_SEC",
+    } <= known
+    assert "MERG_MODEL" not in known
 
 
 # --- валидация конфигурации операций ----------------------------------------

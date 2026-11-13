@@ -26,6 +26,39 @@ stabilized (owner's decision: GitHub only on stabilization):
 * **3.6.2** (2026-11-12) — Parts of one note are not duplicates
 * **3.6.3** (2026-11-12) — Short notes summarize themselves
 
+## [3.8.1] - 2026-11-14
+
+Release 3.8.1 — a false alarm at startup: the config scanner mistook the global
+timeout knobs for operation names. The behaviour of the service does not change.
+
+### Fixed
+
+* **False `unknown_operation` WARNs about the global `*_TIMEOUT_SEC` settings**
+  — after the 3.8.0 rollout prod logged three `unknown operation env ...`
+  warnings on every start: `BACKUP_SHIP_TIMEOUT_SEC`, `SHUTDOWN_TIMEOUT_SEC`,
+  `SLOT_MIN_TIMEOUT_SEC`. The scanner matched the environment against the flat
+  `<PREFIX>_<FIELD>` mask of the operation registry, so a legitimate setting
+  split into a prefix (`BACKUP_SHIP`, `SHUTDOWN`, `SLOT_MIN`) and the field
+  `TIMEOUT_SEC`, and the prefix was reported as an unknown operation. The
+  settings themselves were applied (300/300/30) — only the log line was wrong.
+  The scanner now compares the env name with the `Settings` fields first
+  (`settings_env_names`): a name that is a setting is configuration, never an
+  operation, and is skipped before the mask is consulted. A typo
+  (`MERG_MODEL`, `FROBNICATE_MODEL`) still warns, and the registry check stays as
+  a fallback for operation names that carry no own `Settings` field.
+
+### Changed
+
+* `unknown_operation_warnings(settings)` takes the settings and scans as before;
+  called from the startup warning block of `app/main.py` with the live settings.
+
+### Tests
+
+* `tests/test_operations.py`: the three global timeouts produce no WARN (and are
+  really read into `Settings`), an invented name still warns,
+  `settings_env_names()` is built from the `Settings` field set. Full suite:
+  2489 passed, 13 skipped.
+
 ## [3.8.0] - 2026-11-14
 
 Release 3.8.0 — a knob travels with its recipe: tuning became a mechanism

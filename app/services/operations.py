@@ -272,7 +272,34 @@ def operations_health(settings: "Settings") -> dict[str, dict[str, object]]:
     return block
 
 
-def unknown_operation_warnings() -> list[tuple[str, str]]:
+def _settings_class() -> type["Settings"]:
+    """The Settings class, imported lazily: the module stays config-free
+    at import time (the settings type is an annotation above only)."""
+    from app.config import Settings
+
+    return Settings
+
+
+def settings_env_names(settings: "Settings | None" = None) -> frozenset[str]:
+    """The env names pydantic reads INTO Settings (upper-cased field names).
+
+            3.8.1: the scanner must not mistake a *setting* for an operation name.
+            The global `*_TIMEOUT_SEC` knobs (`BACKUP_SHIP_TIMEOUT_SEC`,
+            `SHUTDOWN_TIMEOUT_SEC`, `SLOT_MIN_TIMEOUT_SEC`, ...) are Settings
+            fields, but the flat `<PREFIX>_<FIELD>` mask reads them as
+            `BACKUP_SHIP` + `TIMEOUT_SEC` - a legitimate setting looked like an
+            unknown operation. Field names ARE the env names (see
+            `Settings.model_config`: no `env_prefix`, no aliases), so the Settings
+            field set is the authoritative list.
+
+    """
+    target = type(settings) if settings is not None else _settings_class()
+    return frozenset(name.upper() for name in target.model_fields)
+
+
+def unknown_operation_warnings(
+    settings: "Settings | None" = None,
+) -> list[tuple[str, str]]:
     """The WARN about env with an unknown operation name (the brief's decision No4).
 
             Scans the environment against the `<PREFIX>_<FIELD>` mask (the registry's
@@ -281,11 +308,19 @@ def unknown_operation_warnings() -> list[tuple[str, str]]:
             `(code, EN text)` - like `LLMClient.slot_config_warnings`; the caller
             (main.py) logs; the service starts, the warning is not fatal.
 
+            A name that is a Settings field is a SETTING, not an operation
+            (3.8.1): it never warns, whatever the mask splits off it. Only
+            a name unknown to both the settings and the registry stays a
+            typo candidate.
+
     """
+    known_settings = settings_env_names(settings)
     warnings: list[tuple[str, str]] = []
     for name in sorted(os.environ):
         match = _OPERATION_ENV_RE.match(name)
         if match is None:
+            continue
+        if name in known_settings:
             continue
         prefix = match.group(1).lower()
         if prefix in KNOWN_ENV_PREFIXES:
