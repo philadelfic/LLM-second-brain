@@ -69,6 +69,10 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     "DECISION_TIMEOUT_SEC": ("decision_timeout_sec", 300),
     "DECISION_THRESHOLD": ("decision_threshold", 0.5),
     "DECISION_UNCERTAINTY_ZONE": ("decision_uncertainty_zone", 0.05),
+    # LSBN-F-37: порог choice по confidence (а не по голой вероятности метки)
+    # и длина заметки в state вопроса разметки.
+    "DECISION_CHOICE_THRESHOLD": ("decision_choice_threshold", 0.6),
+    "DECISION_NOTE_CHARS": ("decision_note_chars", 800),
     "DECISION_FALLBACK": ("decision_fallback", True),
     "DECISION_MAX_QUESTIONS": ("decision_max_questions", 64),
     "DECISION_MAX_LABELS": ("decision_max_labels", 40),
@@ -306,7 +310,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestCompleteness:
     def test_settings_covers_full_requirements_table(self) -> None:
-        """В Settings — ровно 254 поля: 6 обязательных + 248 с умолчаниями
+        """В Settings — ровно 256 полей: 6 обязательных + 248 с умолчаниями
         (25 §8 + 3 связей заметок lsb-0010 + 6 чанковых Фазы 7 + 2 фонового дедупа
         + 3 судьи Фазы 8 + 8 неймспейсов Фазы 10 + 7 новых Фазы 11: 3 провайдера
         + 3 ключа + prompts_dir; NAMESPACE_JUDGE_THINK — умолчание None; + 21
@@ -318,7 +322,9 @@ class TestCompleteness:
         + 6 настроек джобы предупреждений №12 релиза 3.2.0: JOB_WARNINGS_*
         и WARNINGS_* + 2 потолка страницы предупреждений: WARNINGS_MAX_LIMIT_*
         + 5 настроек джобы нормализации терминов №32 релиза 3.2.0: JOB_TERMS_*
-        + 10 настроек decision-слота LSBN-F-12 релиза 3.2.0: DECISION_*;
+        + 12 настроек decision-слота: 10 от LSBN-F-12 релиза 3.2.0
+        DECISION_* и 2 от LSBN-F-37 (DECISION_CHOICE_THRESHOLD,
+        DECISION_NOTE_CHARS);
         + 4 настройки подсказки узла №28 релиза 3.2.0: MEMORY_NODE_HINT_*
         + 5 настроек подсказки «похожее» №30 релиза 3.2.0: MEMORY_SIMILAR_*
         + 1 лимит пометки заметки №24 релиза 3.2.0: COMMENT_MAX_CHARS

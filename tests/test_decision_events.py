@@ -98,7 +98,11 @@ def test_decision_answer_probabilities_logged(monkeypatch, caplog) -> None:
     assert answer["kind"] == "noul"
     assert answer["label"] == "true"
     assert answer["probability"] == pytest.approx(0.95)
-    assert judge_event.threshold == pytest.approx(0.5)
+    # LSBN-F-37 (ревью): одного `threshold` на всё событие нет — фактически
+    # применённый порог и его шкала пишутся на каждый ответ.
+    assert not hasattr(judge_event, "threshold")
+    assert answer["applied_threshold"] == pytest.approx(0.5)
+    assert answer["applied_scale"] == "probability"
     assert judge_event.model == "decision-test"
     assert isinstance(judge_event.duration_ms, int)
     assert judge_event.duration_ms >= 0
@@ -106,6 +110,10 @@ def test_decision_answer_probabilities_logged(monkeypatch, caplog) -> None:
     assert classify_event.questions == [CLASSIFY_QUESTION]
     assert classify_event.answers[CLASSIFY_QUESTION]["label"] == "work/sbos2020"
     assert classify_event.answers[CLASSIFY_QUESTION]["probability"] == pytest.approx(0.9)
+    # Метки без confidence: сравнение по голой probability и DECISION_THRESHOLD.
+    classify_answer = classify_event.answers[CLASSIFY_QUESTION]
+    assert classify_answer["applied_scale"] == "probability"
+    assert classify_answer["applied_threshold"] == pytest.approx(0.5)
 
 
 def test_no_probabilities_in_db(monkeypatch, caplog) -> None:
@@ -147,15 +155,45 @@ def test_decision_check_fields(monkeypatch, caplog) -> None:
 
 
 def test_decision_answer_fields(monkeypatch, caplog) -> None:
-    """`decision_answer`: operation/threshold/duration_ms/answers; the probabilities — there."""
+    """`decision_answer`: operation/applied_threshold/applied_scale/duration_ms/answers.
+
+    LSBN-F-37 (ревью): порог и шкала — на каждый ответ; вероятности — только в журнале.
+    """
     settings = decision_settings(monkeypatch)
     with caplog.at_level(logging.INFO, logger="app"):
         run_judge_decision(settings, caplog)
     (record,) = events(caplog, "decision_answer")
     assert record.operation == "judge"
-    assert record.threshold == pytest.approx(0.5)
+    assert not hasattr(record, "threshold")
     assert isinstance(record.duration_ms, int)
-    assert record.answers[JUDGE_QUESTION]["probability"] == pytest.approx(0.95)
+    answer = record.answers[JUDGE_QUESTION]
+    assert answer["probability"] == pytest.approx(0.95)
+    assert answer["applied_threshold"] == pytest.approx(0.5)
+    assert answer["applied_scale"] == "probability"
+
+
+def test_decision_answer_applied_confidence_scale(monkeypatch, caplog) -> None:
+    """choice по confidence: applied_scale=confidence и порог choice (LSBN-F-37)."""
+    settings = decision_settings(monkeypatch)
+    classifier, decider, decision, generative = make_classifier(
+        settings,
+        [
+            systemone(
+                {CLASSIFY_QUESTION: {"choice": "work/sbos2020", "confidence": 0.8}}
+            )
+        ],
+        [],
+    )
+    with caplog.at_level(logging.INFO, logger="app"):
+        assert classifier.classify(TEXT, KNOWN).hint_path == "work/sbos2020"
+    (record,) = events(caplog, "decision_answer")
+    answer = record.answers[CLASSIFY_QUESTION]
+    assert answer["applied_scale"] == "confidence"
+    assert answer["applied_threshold"] == pytest.approx(
+        settings.decision_choice_threshold
+    )
+    assert answer["probability"] is None
+    assert answer["confidence"] == pytest.approx(0.8)
 
 
 def test_decision_fallback_reason_enum(monkeypatch, caplog) -> None:

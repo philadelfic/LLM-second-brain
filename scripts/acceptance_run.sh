@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Приёмочный прогон релиза на тест-контуре `lsb-test` (LSB, релиз 3.2.0).
+# Приёмочный прогон релиза на тест-контуре `lsb-test` (LSB, релиз 3.7.0).
 #
 # Зачем обёртка: у приёмки есть три неочевидные тонкости, без которых часть
 # проверок молча слепая или ложно-красная (проверено 10.10.2026):
@@ -23,6 +23,12 @@
 set -euo pipefail
 
 HOST_ROOT="${LSB_HOST_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+# Данные контура живут на хосте ОТДЕЛЬНО от рабочей копии (docker-compose.test.yml
+# монтирует абсолютные хост-пути). LSB_DATA_ROOT задаёт каталог данных, когда код и
+# данные разъехались: /w берётся из рабочей копии, /data — из хост-каталога контура
+# (живой прогон 14.11.2026: с одним HOST_ROOT проверки по БД читали чужую базу и
+# краснели ложно — vector_status «0 из 1», возраст старейшей задачи рос).
+DATA_ROOT="${LSB_DATA_ROOT:-${HOST_ROOT}/test/data-test}"
 ENV_FILE="$(mktemp)"
 trap 'rm -f "$ENV_FILE"' EXIT
 
@@ -82,7 +88,7 @@ docker run --rm --user root --network lsb-test_default \
 docker run --rm --user root --network lsb-test_default \
   -v "${HOST_ROOT}/test:/w" \
   -v "${HOST_ROOT}/dev/release:/w/release" \
-  -v ${HOST_ROOT}/test/data-test:/data \
+  -v "${DATA_ROOT}:/data" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /usr/bin/docker:/usr/local/bin/docker \
   -v /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro \

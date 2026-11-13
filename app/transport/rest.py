@@ -80,7 +80,7 @@ from pydantic import BaseModel
 from app import __version__
 from app.config import Settings
 from app.services import Services
-from app.services import history
+from app.services import history, tuning
 from app.services.backup import BackupService
 from app.services.freshness import FreshnessValidationError
 # LSBN-F-22 (M3): the /health.migration block (phase/reason/progress/invariant)
@@ -740,6 +740,31 @@ def build_rest_router(settings: Settings) -> APIRouter:
             backups=backups,
             migration=migration,
         )
+
+    # LSBN-F-37: the knobs' cards — THE same registry as the MCP `tuning_*` pair
+    # (one service codebase): a value arrives together with its tuning recipe.
+    @rest_router.get("/tuning")
+    async def list_tuning() -> dict:
+        """The knobs' catalog: every knob with its recipe (LSBN-F-37).
+
+                    Key, env, slot, title, unit, the current value (from `Settings`),
+                    the effect, safety, the metrics to watch, the recipe and the
+                    calibration facts. Read-only: no writes, no model calls.
+        """
+        cards = tuning.catalog(settings)
+        return {"tunables": cards, "total": len(cards)}
+
+    @rest_router.get("/tuning/{key}")
+    async def get_tuning(key: str) -> dict:
+        """One knob's card by key (LSBN-F-37): the same shape as MCP `tuning_get`.
+
+                    An unknown key — 404 (a wrong key is an operator's typo, not a
+                    server state): the answer names it, the registry is not listed.
+        """
+        card = tuning.describe(settings, key)
+        if card is None:
+            raise HTTPException(status_code=404, detail=f"unknown knob: {key}")
+        return card
 
     @rest_router.post("/notes", status_code=201)
     async def create_note(payload: NoteCreate, request: Request) -> dict:

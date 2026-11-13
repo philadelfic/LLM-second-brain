@@ -44,7 +44,7 @@
     step, never a false FAIL.
 
     Scenarios (this base version):
-      0. MCP surface and readiness: 24 tools, `/health` shape including `queues`
+      0. MCP surface and readiness: 34 tools, `/health` shape including `queues`
          (`pending`/`waiting`/`attention`) and `slots` (`embedding`/`summary`/`judge`
          with `ok`/`last_outcome`/`paused_until`/`attention`), version, DB size.
       1. Queue and slot observability baseline (before the outage): queues are
@@ -116,7 +116,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 
-RELEASE = "3.2.0"
+RELEASE = "3.8.0"
 
 # Repository root: the script runs from `scripts/`, while the LSBN-F-11
 # scenario needs `app.services.injection_budget` (the budget constants live in
@@ -129,7 +129,7 @@ if REPO_ROOT not in sys.path:
 # MCP listing ceiling is 20 (3.1.0 canon); the REST ceiling is 50.
 MCP_LIMIT = 20
 REST_LIMIT = 50
-MCP_TOOLS_TOTAL = 31  # 3.1.0 surface (21) + warnings_list + 2 history + memory_comment_search + 6 logs tools
+MCP_TOOLS_TOTAL = 34  # 3.7.0 surface: the 3.1.0 one (31) + tuning_list/tuning_get + skills_*/logs_export; the literal stays deliberate (FR-4.4)
 # The literal is deliberate, not len(TOOL_NAMES): the surface's growth must remain
 # a conscious decision with a text-budget review (F-11, f11-03).
 HEALTH_LEGACY = ("status", "embedding_ok", "summarizer_ok", "judge_ok",
@@ -1410,7 +1410,7 @@ async def save_probe_note(c: Client, title: str, *, after_hook: bool = False,
 # ==== scenarios: 0. surface and readiness ======================================
 async def scenario_0_context(c: Client, rest: httpx2.AsyncClient,
                              instructions: str) -> None:
-    scenario(0, "MCP surface and contour readiness (24 tools, /health shape)")
+    scenario(0, "MCP surface and contour readiness (34 tools, /health shape)")
 
     listed = await c.session.list_tools()
     names = sorted(t.name for t in listed.tools)
@@ -3077,7 +3077,7 @@ async def scenario_12_comment(c: Client, rest: httpx2.AsyncClient) -> None:
 # The measurement is written into a TEMP directory: `release/3.2.0/acceptance/
 # injected-text-after.{md,json}` — the f11-01/f11-03 artifact with a hand-written delta;
 # a repeated scenario run does not overwrite it (the run's idempotency).
-INJECTED_TEXT_TOOL_COUNT = 31  # the blocks 1–5 budget surface (arch §7.1)
+INJECTED_TEXT_TOOL_COUNT = 34  # the 3.7.0 surface: the budget is measured over every tool description (arch 7.1)
 INJECTED_TEXT_BEFORE = "injected-text-before.json"
 SMOKE_MARKER = "zblorptsmoke"
 

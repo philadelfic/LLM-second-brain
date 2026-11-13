@@ -151,6 +151,8 @@ _CORE_TOOLS = frozenset(
         "history_list",
         "history_get",
         "warnings_list",
+        "tuning_list",
+        "tuning_get",
     }
 )
 

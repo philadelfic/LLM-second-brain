@@ -445,7 +445,7 @@ class TestMCPLinks:
     def test_mcp_surface_is_31_tools(self) -> None:
         """Поверхность = 23 + 1 предупреждения (№12) + 1 пометок (no24-02) + 6 логов
         (LSBN-F-10, f10-02/03): 31."""
-        assert len(TOOL_NAMES) == 32
+        assert len(TOOL_NAMES) == 34
 
 
 class TestRESTLinks:

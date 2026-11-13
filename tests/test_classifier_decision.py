@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import pathlib
 
 import httpx
 import pytest
@@ -98,8 +99,14 @@ def chat_body(hint_path: str | None = "life", confidence: float = 0.42) -> httpx
     )
 
 
-def make_classifier(settings, decision_actions: list, generative_actions: list):
-    registry = PromptRegistry(None)
+def make_classifier(
+    settings,
+    decision_actions: list,
+    generative_actions: list,
+    registry: PromptRegistry | None = None,
+):
+    """Сервис разметки на decision-слоте; `registry` — чтобы подсунуть свой файл вопросов."""
+    registry = registry or PromptRegistry(None)
     decision_recorder = Recorder(decision_actions)
     decider = DecisionService(
         settings,
@@ -146,12 +153,42 @@ def test_hint_path_from_choice(monkeypatch, caplog) -> None:
     assert list(body["questions"]) == [CLASSIFY_QUESTION]
     question = body["questions"][CLASSIFY_QUESTION]
     assert question["type"] == "choice"
-    # Варианты choice — ключи `criteria`: пути узлов без описания (`null`)
-    # плюс резервная метка `generic` с описанием из реестра.
+    # Варианты choice — ключи `criteria`: путь узла -> его описание (LSBN-F-37),
+    # плюс резервная метка `generic` со своей формулировкой.
     assert list(question["criteria"]) == ["work/sbos2020", "life", GENERIC_LABEL]
-    assert question["criteria"]["work/sbos2020"] is None
+    assert question["criteria"]["work/sbos2020"] == "рабочий проект"
+    assert question["criteria"]["life"] == "быт"
     assert question["criteria"][GENERIC_LABEL] == "the note is generic and not bound to a known section"
-    assert body["state"] == ClassificationService._user_message(TEXT, KNOWN)
+    # state — только заметка (обрезанная по DECISION_NOTE_CHARS): карта узлов
+    # ушла в criteria, поэтому state не содержит списка известных узлов.
+    assert body["state"] == TEXT
+
+
+def test_state_is_note_only_and_cut(monkeypatch, caplog) -> None:
+    """LSBN-F-37: state — заметка без списка узлов, обрезанная по DECISION_NOTE_CHARS.
+
+    Пустое описание узла уезжает в criteria как `null` (голая метка): сервер
+    такой вариант принимает, а карта узлов не раздувает state.
+    """
+    settings = decision_settings(monkeypatch, DECISION_NOTE_CHARS="100")
+    long_text = "я" * 250
+    nodes = [
+        {"path": "work/sbos2020", "description": ""},
+        {"path": "life", "description": "быт"},
+    ]
+    classifier, decider, decision, generative = make_classifier(
+        settings,
+        [choice("life", {"life": 0.9, "work/sbos2020": 0.05, GENERIC_LABEL: 0.05})],
+        [chat_body()],
+    )
+    result = classifier.classify(long_text, nodes)
+    assert result.hint_path == "life"
+    body = payloads(decision)[0]
+    assert body["state"] == long_text[: settings.decision_note_chars]
+    criteria = body["questions"][CLASSIFY_QUESTION]["criteria"]
+    assert criteria["work/sbos2020"] is None
+    assert criteria["life"] == "быт"
+    assert criteria[GENERIC_LABEL] == "the note is generic and not bound to a known section"
 
 
 def test_generic_label_maps_to_null(monkeypatch, caplog) -> None:
@@ -166,6 +203,50 @@ def test_generic_label_maps_to_null(monkeypatch, caplog) -> None:
     assert result.hint_path is None
     assert result.confidence == pytest.approx(0.8)
     assert generative.calls == 0
+
+
+def test_registry_wordings_survive_the_node_map(monkeypatch, tmp_path) -> None:
+    """Формулировки decision_questions.json не теряются в criteria (ревью LSBN-F-37).
+
+    Слияние: сначала реестр, потом живая карта узлов. Описание узла перекрывает
+    критерий своего пути, а формулировки файла для остальных меток остаются —
+    иначе тюнинг вопроса в файле умирал бы молча.
+    """
+    path = tmp_path / "decision_questions.json"
+    path.write_text(
+        json.dumps(
+            {
+                "classify": [
+                    {
+                        "name": CLASSIFY_QUESTION,
+                        "text": "Which section does the note belong to?",
+                        "kind": "choice",
+                        "labels": [GENERIC_LABEL],
+                        "criteria": {
+                            GENERIC_LABEL: "формулировка из файла реестра",
+                            "life": "быт из файла",
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = decision_settings(monkeypatch)
+    classifier, decider, decision, generative = make_classifier(
+        settings,
+        [choice("work/sbos2020", {"work/sbos2020": 0.9, GENERIC_LABEL: 0.1})],
+        [chat_body()],
+        registry=PromptRegistry(tmp_path),
+    )
+    assert classifier.classify(TEXT, KNOWN).hint_path == "work/sbos2020"
+    criteria = payloads(decision)[0]["questions"][CLASSIFY_QUESTION]["criteria"]
+    # Формулировка файла для `generic` жива: её не перетирает GENERIC_CRITERION.
+    assert criteria[GENERIC_LABEL] == "формулировка из файла реестра"
+    # Живая карта сильнее файла по тому же пути.
+    assert criteria["life"] == "быт"
+    # Узел, которого в файле нет, тоже на месте.
+    assert criteria["work/sbos2020"] == "рабочий проект"
 
 
 # --- decision не применим: выбирать не из чего --------------------------------

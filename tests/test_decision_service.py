@@ -11,6 +11,7 @@ noop без вызовов (и без счётчиков — это не пер�
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -18,6 +19,9 @@ import pytest
 from app.config import get_settings
 from app.services import build_services
 from app.services.decision import (
+    DECISION_SCALES,
+    SCALE_CONFIDENCE,
+    SCALE_PROBABILITY,
     DecisionQuestion,
     DecisionService,
     DecisionUnavailable,
@@ -149,6 +153,134 @@ def test_choice_below_threshold_low_confidence(monkeypatch) -> None:
         service.decide(STATE, [question], operation="classify")
     assert excinfo.value.reason == "low_confidence"
     assert excinfo.value.answer.label == "task"
+
+
+# --- LSBN-F-37: choice по confidence, свой порог -------------------------------
+
+
+def choice_question() -> DecisionQuestion:
+    """`choice`-вопрос с двумя вариантами (как у разметки узла)."""
+    return DecisionQuestion(
+        name="q",
+        text="Where?",
+        kind="choice",
+        labels=("task", "generic"),
+        criteria={"task": "x", "generic": "y"},
+    )
+
+
+def test_choice_accepted_by_confidence(monkeypatch) -> None:
+    """`choice` решается по confidence: вероятности метки нет, а решение есть.
+
+    Confidence 0.8 выше DECISION_CHOICE_THRESHOLD (0.6) плюс зона 0.05 — ответ
+    принимается, хотя `probability` метки вообще не пришла.
+    """
+    service, _ = make_service(
+        decision_settings(monkeypatch),
+        [answers({"q": {"choice": "task", "confidence": 0.8}})],
+    )
+    result = service.decide(STATE, [choice_question()], operation="classify")
+    assert result.answers["q"].label == "task"
+    assert result.answers["q"].probability is None
+    assert result.answers["q"].confidence == pytest.approx(0.8)
+
+
+def test_choice_high_probability_low_confidence_is_rejected(monkeypatch) -> None:
+    """Высокая вероятность метки не спасает: решает confidence (LSBN-F-37)."""
+    service, _ = make_service(
+        decision_settings(monkeypatch),
+        [
+            answers(
+                {
+                    "q": {
+                        "choice": "task",
+                        "probabilities": {"task": 0.9, "generic": 0.1},
+                        "confidence": 0.1,
+                    }
+                }
+            )
+        ],
+    )
+    with pytest.raises(DecisionUnavailable) as excinfo:
+        service.decide(STATE, [choice_question()], operation="classify")
+    assert excinfo.value.reason == "low_confidence"
+    assert excinfo.value.answer is not None
+    assert excinfo.value.answer.probability == pytest.approx(0.9)
+    assert excinfo.value.answer.confidence == pytest.approx(0.1)
+
+
+def test_choice_threshold_is_independent_of_general_threshold(monkeypatch) -> None:
+    """Порог choice берётся из DECISION_CHOICE_THRESHOLD, а не из DECISION_THRESHOLD."""
+    service, _ = make_service(
+        decision_settings(monkeypatch, DECISION_THRESHOLD="0.95"),
+        [answers({"q": {"choice": "task", "confidence": 0.7}})],
+    )
+    result = service.decide(STATE, [choice_question()], operation="classify")
+    assert result.answers["q"].label == "task"
+
+
+def test_noul_ignores_confidence(monkeypatch) -> None:
+    """У noul/score — прежняя логика: порог по probability, confidence не участвует."""
+    service, _ = make_service(
+        decision_settings(monkeypatch),
+        [answers({"q": {"noul": 0.9, "confidence": 0.05}})],
+    )
+    result = service.decide(STATE, [noul_question()], operation="judge")
+    assert result.answers["q"].label == "true"
+
+
+def test_scales_are_a_closed_vocabulary() -> None:
+    """Шкала порога — закрытый словарь: журнал пишет именно эти два имени."""
+    assert set(DECISION_SCALES) == {SCALE_CONFIDENCE, SCALE_PROBABILITY}
+
+
+def test_choice_without_confidence_falls_back_to_general_threshold(
+    monkeypatch, caplog
+) -> None:
+    """choice без confidence: голая probability и DECISION_THRESHOLD, не порог choice.
+
+    Шкалы не смешиваются (ревью LSBN-F-37): голую вероятность сравниваем с общим
+    порогом, а сам откат виден в журнале предупреждением — одна строка на сервис.
+    """
+    settings = decision_settings(
+        monkeypatch, DECISION_THRESHOLD="0.5", DECISION_CHOICE_THRESHOLD="0.6"
+    )
+    service, _ = make_service(
+        settings,
+        [
+            answers(
+                {"q": {"choice": "task", "probabilities": {"task": 0.7, "generic": 0.3}}}
+            )
+        ],
+    )
+    with caplog.at_level(logging.INFO, logger="app"):
+        result = service.decide(STATE, [choice_question()], operation="classify")
+    assert result.answers["q"].label == "task"
+    (warning,) = events_of(caplog, "decision_scale_fallback")
+    assert warning.scale == SCALE_PROBABILITY
+    assert warning.threshold == pytest.approx(0.5)
+    answer = events_of(caplog, "decision_answer")[0].answers["q"]
+    assert answer["applied_scale"] == SCALE_PROBABILITY
+    assert answer["applied_threshold"] == pytest.approx(0.5)
+    # Второй такой же ответ в том же сервисе молчит: строка одна на процесс.
+    with caplog.at_level(logging.INFO, logger="app"):
+        service.decide(STATE, [choice_question()], operation="classify")
+    assert len(events_of(caplog, "decision_scale_fallback")) == 1
+
+
+def test_question_threshold_wins_over_knobs(monkeypatch, caplog) -> None:
+    """Порог вопроса из реестра сильнее ручки — он же уходит в журнал (LSBN-F-37)."""
+    service, _ = make_service(
+        decision_settings(monkeypatch, DECISION_CHOICE_THRESHOLD="0.95"),
+        [answers({"q": {"choice": "task", "confidence": 0.8}})],
+    )
+    question = replace(choice_question(), threshold=0.7)
+    with caplog.at_level(logging.INFO, logger="app"):
+        result = service.decide(STATE, [question], operation="classify")
+    assert result.answers["q"].label == "task"
+    answer = events_of(caplog, "decision_answer")[0].answers["q"]
+    assert answer["applied_threshold"] == pytest.approx(0.7)
+    assert answer["applied_scale"] == SCALE_CONFIDENCE
 
 
 # --- свой разрыв -------------------------------------------------------------
