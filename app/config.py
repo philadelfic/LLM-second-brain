@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -120,7 +121,10 @@ class Settings(BaseSettings):
     # cap); the earlier 35000 — the explicit operator cap and the degradation
     # when the context is unknown.
     summary_num_predict: int = 0
-    merge_num_predict: int = 0  # the separate dedup-merge cap
+    # The dedup-merge cap (MERGE_NUM_PREDICT) lives in the merge operation
+    # block below since 3.9.0 (LSBN-S-5): the field is the BUDGET OF THE
+    # MERGE OPERATION, not a slot setting. The env name and the default
+    # (0 = auto) are unchanged - the merge budget must not move.
     # No49 (arch §13.4): 900 = the back-off/slot pause ceiling ("thinking
     # long" is not an error); was 60.
     summary_timeout_sec: int = 900  # the client read timeout of a call
@@ -144,6 +148,18 @@ class Settings(BaseSettings):
     # thinking" and the WARN threshold "the timeout is small for long thinking".
     slot_reasoning_min_output_tokens: int = 4096
     slot_min_timeout_sec: int = 300
+
+    # --- the slot model (release 3.9.0, LSBN-S-5) ------------------------
+    # SLOT_MODEL — the mode of the slot layer:
+    #   legacy    — the historical model: the slot GROUPS (summary/judge/
+    #               embedding) own the breakers, the env chain is
+    #               "operation -> slot -> default" (the 3.4.0 registry);
+    #   operation — the new model: every OPERATION owns its breaker and its
+    #               env; the slot layer does not take part in the chain
+    #               ("operation -> default").
+    # The default stays `legacy`: the flag is switched on per operation in
+    # the later stages of the release (the design, B2).
+    slot_model: Literal["legacy", "operation"] = "legacy"
 
     # --- operations over slots (LSBN-F-34, 3.4.0; canon 4.2.8) --------
     # Flat `<OPERATION>_<FIELD>` env (no OP_ prefix) overrides the
@@ -184,6 +200,10 @@ class Settings(BaseSettings):
     merge_base_url: str | None = None
     merge_api_key: str | None = None
     merge_think: bool | None = None
+    # The budget of the merge operation (3.9.0, LSBN-S-5): the field moved
+    # here from the summary block (the env name MERGE_NUM_PREDICT and the
+    # default 0 = auto are unchanged - the merge budget must not move).
+    merge_num_predict: int = 0
     merge_reasoning_num_predict: int | None = None
     merge_timeout_sec: int | None = None
     merge_context_tokens: int | None = None
@@ -243,6 +263,62 @@ class Settings(BaseSettings):
     embed_timeout_sec: int | None = None
     embed_context_tokens: int | None = None
     embed_model_type: str | None = None
+
+    # --- per-operation thresholds (release 3.9.0, LSBN-S-5) --------------
+    # The operation registry (app/services/operations.py) gives every operation
+    # its own knobs:
+    #   <OP>_PAUSE_AFTER — the breaker threshold of the operation (how many
+    #     consecutive failures of ONE outcome open the break);
+    #   <OP>_PAUSE_SEC   — the pause of the operation (the back-off ceiling);
+    #   <OP>_ENABLED     — the operator's switch of the operation.
+    # The semantics are "base + override" (the owner's decision, 15.11.2026):
+    # the per-operation value is UNSET by default (None) -> the global base
+    # SLOT_PAUSE_AFTER / SLOT_PAUSE_SEC applies; a set value overrides the base
+    # for that operation only. A numeric default here would ALWAYS beat the
+    # base - that is why the defaults are None, not 0.
+    # The enabled switch is the exception: unset means "the operation is on"
+    # (True) - only the operation the code has retired would be off.
+    # `decision` reuses the F-12 field DECISION_ENABLED (the reserve decision
+    # slot, off by default) instead of a second env with the same name; its
+    # thresholds are declared here like the other operations'.
+    summarize_pause_after: int | None = None
+    summarize_pause_sec: int | None = None
+    summarize_enabled: bool | None = None
+
+    title_pause_after: int | None = None
+    title_pause_sec: int | None = None
+    title_enabled: bool | None = None
+
+    merge_pause_after: int | None = None
+    merge_pause_sec: int | None = None
+    merge_enabled: bool | None = None
+
+    split_pause_after: int | None = None
+    split_pause_sec: int | None = None
+    split_enabled: bool | None = None
+
+    classify_pause_after: int | None = None
+    classify_pause_sec: int | None = None
+    classify_enabled: bool | None = None
+
+    describe_pause_after: int | None = None
+    describe_pause_sec: int | None = None
+    describe_enabled: bool | None = None
+
+    judge_pause_after: int | None = None
+    judge_pause_sec: int | None = None
+    judge_enabled: bool | None = None
+
+    structure_judge_pause_after: int | None = None
+    structure_judge_pause_sec: int | None = None
+    structure_judge_enabled: bool | None = None
+
+    embed_pause_after: int | None = None
+    embed_pause_sec: int | None = None
+    embed_enabled: bool | None = None
+
+    decision_pause_after: int | None = None
+    decision_pause_sec: int | None = None
 
     # --- output ---
     snippet_chars: int = 120
@@ -989,6 +1065,30 @@ class Settings(BaseSettings):
                         f"{prefix}_context_tokens ({context_tokens}) — "
                         "авто-бюджет всегда упирался бы в минимум"
                     )
+
+        # --- per-operation thresholds (release 3.9.0, LSBN-S-5) ---
+        # The per-operation override follows the global rules: the pause of an
+        # operation >= 30 s (a cheap pause, not a busy loop), the opening
+        # threshold >= 1. Unset (None) - the global base applies, nothing to
+        # check (the base itself is validated above).
+        for _operation in (
+            "summarize",
+            "title",
+            "merge",
+            "split",
+            "classify",
+            "describe",
+            "judge",
+            "structure_judge",
+            "embed",
+            "decision",
+        ):
+            _pause_after = getattr(self, f"{_operation}_pause_after", None)
+            if _pause_after is not None:
+                need_low(f"{_operation}_pause_after", _pause_after, 1)
+            _pause_sec = getattr(self, f"{_operation}_pause_sec", None)
+            if _pause_sec is not None:
+                need_low(f"{_operation}_pause_sec", _pause_sec, 30)
 
         # --- chunked indexing (Phase 7) ---
         if self.text_splitter.strip().lower() != "tiktoken":

@@ -12,6 +12,13 @@
     is inherited, so a partial override (only `MERGE_MODEL`) is the norm.
     Operations without overrides behave exactly as before.
 
+    Release 3.9.0 (LSBN-S-5): the OPERATION REGISTRY - `OperationSpec` +
+    `OPERATION_REGISTRY` (ten operations with their contract) and the mode flag
+    `SLOT_MODEL` (`legacy` | `operation`). In the `operation` mode the slot
+    layer does not take part in the chain ("operation env -> default") and the
+    breaker of an operation is its own. The `legacy` mode keeps the historical
+    behaviour in every respect - the flag is the ONE switch (the design, B2).
+
     The boundaries (the brief decisions):
     - the `SPLIT_*` slot as a separate slot group stays retired - the registry
       does not restore it; `split` remains an OPERATION of the summary slot
@@ -30,6 +37,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from pydantic_core import PydanticUndefined
@@ -71,6 +79,143 @@ OPERATION_FIELDS: tuple[str, ...] = (
     "model_type",
 )
 
+# --- the operation registry (release 3.9.0, LSBN-S-5) ----------------------
+# The contracts of the operations (the design, B7): the CLOSED set of the
+# answer shapes. A contract is a fact about the code (the shape of the answer
+# the operation expects from the model), not an operator switch - there is no
+# env for it.
+CONTRACTS: frozenset[str] = frozenset(
+    {"text", "marker", "label", "probability", "parts-by-delimiter"}
+)
+
+# The per-operation CONTROL fields (release 3.9.0): the thresholds of the
+# operation and its enable switch. They are operation env names too, so the
+# typo scanner must know them (`MERG_PAUSE_AFTER` is a typo like `MERG_MODEL`).
+OPERATION_CONTROL_FIELDS: tuple[str, ...] = ("pause_after", "pause_sec", "enabled")
+
+# The default provider of an operation (the code default of the slot layer:
+# the native ollama API).
+DEFAULT_PROVIDER = "ollama"
+
+# The modes of the slot layer (the design, B2): `legacy` - the slot groups own
+# the breakers and the env chain is "operation -> slot -> default"; `operation`
+# - every operation owns its breaker and the chain is "operation -> default".
+SLOT_MODEL_LEGACY = "legacy"
+SLOT_MODEL_OPERATION = "operation"
+
+
+@dataclass(frozen=True)
+class OperationSpec:
+    """One operation of the registry (release 3.9.0, LSBN-S-5).
+
+            name - the operation name: the env prefix `<OP>` and the breaker
+            key of the `operation` mode;
+            contract - the shape of the answer the operation expects (B7): a
+            fact about the code, not an operator switch;
+            enabled - the code state of the operation (the operator's switch
+            is the per-operation env `<OP>_ENABLED`);
+            legacy_slot - the slot group the operation lives in today (the
+            `legacy` mode);
+            fields - the flat env fields of the operation (`<OP>_<FIELD>`);
+            pause_after / pause_sec - the code defaults of the operation's
+            thresholds: None = "not set" -> the global base applies (the
+            owner's decision, 15.11.2026: base + override - a numeric default
+            would always beat the base).
+
+    """
+
+    name: str
+    contract: str
+    enabled: bool
+    legacy_slot: str | None
+    fields: tuple[str, ...]
+    pause_after: int | None = None
+    pause_sec: int | None = None
+
+
+# The registry of the ten operations (release 3.9.0, LSBN-S-5). The order is
+# part of the contract (the health block lists the operations this way).
+# `OPERATIONS` above stays the LEGACY layer (operation -> slot group) and is
+# not rewritten: the `legacy` mode keeps reading it.
+OPERATION_REGISTRY: dict[str, OperationSpec] = {
+    "summarize": OperationSpec(
+        name="summarize",
+        contract="text",
+        enabled=True,
+        legacy_slot="summary",
+        fields=OPERATION_FIELDS,
+    ),
+    "title": OperationSpec(
+        name="title",
+        contract="text",
+        enabled=True,
+        legacy_slot="summary",
+        fields=OPERATION_FIELDS,
+    ),
+    "merge": OperationSpec(
+        name="merge",
+        contract="parts-by-delimiter",
+        enabled=True,
+        legacy_slot="summary",
+        fields=OPERATION_FIELDS,
+    ),
+    "split": OperationSpec(
+        name="split",
+        contract="parts-by-delimiter",
+        enabled=True,
+        legacy_slot="summary",
+        fields=OPERATION_FIELDS,
+    ),
+    "classify": OperationSpec(
+        name="classify",
+        contract="label",
+        enabled=True,
+        legacy_slot="summary",
+        fields=OPERATION_FIELDS,
+    ),
+    "describe": OperationSpec(
+        name="describe",
+        contract="text",
+        enabled=True,
+        legacy_slot="summary",
+        fields=OPERATION_FIELDS,
+    ),
+    "judge": OperationSpec(
+        name="judge",
+        contract="marker",
+        enabled=True,
+        legacy_slot="judge",
+        fields=OPERATION_FIELDS,
+    ),
+    "structure_judge": OperationSpec(
+        name="structure_judge",
+        contract="marker",
+        enabled=True,
+        legacy_slot="judge",
+        fields=OPERATION_FIELDS,
+    ),
+    "embed": OperationSpec(
+        name="embed",
+        # The embedding call returns a vector, not a text answer: there is no
+        # JSON/marker/label/probability contract. `text` is the closest value
+        # of the closed set - "no structured answer" (the contract of the
+        # embedding operation is settled in a later stage of the release).
+        contract="text",
+        enabled=True,
+        legacy_slot="embedding",
+        fields=OPERATION_FIELDS,
+    ),
+    "decision": OperationSpec(
+        name="decision",
+        contract="probability",
+        enabled=True,
+        # The reserve decision slot (F-12) is its own slot group; the
+        # operation has NO job queue (it answers questions).
+        legacy_slot="decision",
+        fields=OPERATION_FIELDS,
+    ),
+}
+
 # An operation field -> a SlotSpec attribute (llm_client.SlotSpec): the operation timeout
 # lands in the client read timeout; the rest map by name.
 SPEC_FIELDS: dict[str, str] = {
@@ -105,9 +250,14 @@ KNOWN_ENV_PREFIXES: frozenset[str] = frozenset(OPERATIONS) | {
     "decision",
 }
 
-# The "flat operator" env mask: `<PREFIX>_<FIELD>` over the registry fields.
+# The "flat operator" env mask: `<PREFIX>_<FIELD>` over the registry fields
+# (the configuration fields of an operation + its control fields).
 _OPERATION_ENV_RE = re.compile(
-    r"^([A-Z][A-Z0-9_]*)_(" + "|".join(field.upper() for field in OPERATION_FIELDS) + r")$"
+    r"^([A-Z][A-Z0-9_]*)_("
+    + "|".join(
+        field.upper() for field in OPERATION_FIELDS + OPERATION_CONTROL_FIELDS
+    )
+    + r")$"
 )
 
 
@@ -144,10 +294,103 @@ def _source_of(settings: "Settings", settings_field: str) -> str:
     return "default"
 
 
+def slot_model(settings: "Settings") -> str:
+    """The active model of the slot layer: `legacy` | `operation`.
+
+            THE switch of the release 3.9.0: every point that depends on the
+            mode reads this one value (the design, B2) - the flag lives in
+            `Settings` (`SLOT_MODEL`) and is read once (the settings are
+            frozen).
+
+    """
+    return getattr(settings, "slot_model", SLOT_MODEL_LEGACY)
+
+
+def operation_mode(settings: "Settings") -> bool:
+    """Whether the operation model is active (`SLOT_MODEL=operation`)."""
+    return slot_model(settings) == SLOT_MODEL_OPERATION
+
+
+def breaker_key(operation: str, settings: "Settings") -> str:
+    """The breaker dictionary key of an operation.
+
+            `operation` mode - the operation name (one breaker per operation);
+            `legacy` mode - the slot group of the operation (as before).
+
+    """
+    if operation_mode(settings):
+        return operation
+    slot = OPERATIONS.get(operation)
+    if slot is not None:
+        return slot
+    spec = OPERATION_REGISTRY.get(operation)
+    if spec is None:
+        raise ValueError(f"неизвестная операция: {operation}")
+    return spec.legacy_slot or operation
+
+
+def pause_after(operation: str, settings: "Settings") -> int:
+    """The breaker threshold of an operation: the per-operation value, else the
+    global base `SLOT_PAUSE_AFTER` (base + override, the owner's decision of
+    15.11.2026).
+
+            The resolution is mode-agnostic: it answers "the threshold of THIS
+            operation". The `legacy` mode applies the global base to the whole
+            slot group (one breaker per group) - the per-operation value is
+            read by the `operation` mode only.
+
+    """
+    spec = OPERATION_REGISTRY.get(operation)
+    if spec is None:
+        raise ValueError(f"неизвестная операция: {operation}")
+    override = getattr(settings, f"{operation}_pause_after", None)
+    if override is not None:
+        return int(override)
+    return int(settings.slot_pause_after)
+
+
+def pause_sec(operation: str, settings: "Settings") -> int:
+    """The pause of an operation: the per-operation value, else the global base
+    `SLOT_PAUSE_SEC` (base + override, 15.11.2026). See `pause_after`."""
+    spec = OPERATION_REGISTRY.get(operation)
+    if spec is None:
+        raise ValueError(f"неизвестная операция: {operation}")
+    override = getattr(settings, f"{operation}_pause_sec", None)
+    if override is not None:
+        return int(override)
+    return int(settings.slot_pause_sec)
+
+
+def operation_enabled(operation: str, settings: "Settings") -> bool:
+    """Whether an operation is enabled: the code state (`OperationSpec.enabled`)
+    AND the operator's switch (`<OP>_ENABLED`).
+
+            Unset switch - the operation is on. The `decision` operation reuses
+            the F-12 field `DECISION_ENABLED` (the reserve decision slot, off
+            by default) - there is no second env with that name.
+
+    """
+    spec = OPERATION_REGISTRY.get(operation)
+    if spec is None:
+        raise ValueError(f"неизвестная операция: {operation}")
+    if operation == "decision":
+        override: bool | None = bool(settings.decision_enabled)
+    else:
+        override = getattr(settings, f"{operation}_enabled", None)
+    if override is None:
+        return spec.enabled
+    return bool(override) and spec.enabled
+
+
 def resolve_operation(
     operation: str, settings: "Settings"
 ) -> tuple[dict[str, object], dict[str, str]]:
     """The operation fields' effective values and each one's source: (values, sources).
+
+            The chain depends on the slot model (release 3.9.0, LSBN-S-5):
+            `legacy` - operation env -> slot env -> default (as before);
+            `operation` - operation env -> default (the slot layer does not
+            take part).
 
             values - ONLY the fields set by the flat operation env (the `op` layer);
             sources - the full coverage of OPERATION_FIELDS: `op` | `slot` |
@@ -163,6 +406,8 @@ def resolve_operation(
             `slot_reasoning_num_predict`.
 
     """
+    if operation_mode(settings):
+        return _resolve_operation_mode(operation, settings)
     slot = OPERATIONS.get(operation)
     if slot is None:
         raise ValueError(f"неизвестная операция: {operation}")
@@ -187,6 +432,31 @@ def resolve_operation(
     return values, sources
 
 
+def _resolve_operation_mode(
+    operation: str, settings: "Settings"
+) -> tuple[dict[str, object], dict[str, str]]:
+    """The `operation` mode chain: the operation env over the code defaults.
+
+            The slot group does NOT take part (the design, B1): a field the
+            operation does not set has the source `default`. The global
+            `SLOT_REASONING_NUM_PREDICT` stays the default layer of the
+            reasoning budget (a global safeguard, the owner's decision Q4).
+
+    """
+    if operation not in OPERATION_REGISTRY:
+        raise ValueError(f"неизвестная операция: {operation}")
+    sources: dict[str, str] = {}
+    values: dict[str, object] = {}
+    for field in OPERATION_FIELDS:
+        value = getattr(settings, _settings_field(operation, field), None)
+        if value is not None:
+            values[field] = value
+            sources[field] = "op"
+        else:
+            sources[field] = "default"
+    return values, sources
+
+
 def operation_overrides_active(settings: "Settings") -> bool:
     """At least one operation is overridden by flat env (the `op` layer)."""
     return any(resolve_operation(operation, settings)[1].get("op") for operation in OPERATIONS)  # noqa: E501
@@ -205,16 +475,22 @@ def _operation_budgets(operation: str, settings: "Settings") -> dict[str, object
             An unset operation's effective think - the slot group's flag.
 
     """
-    slot = OPERATIONS[operation]
+    slot = OPERATIONS.get(operation)
     values, _sources = resolve_operation(operation, settings)
 
     def effective(field: str, fallback: object) -> object:
         if field in values:
             return values[field]
+        if operation_mode(settings):
+            # The slot layer does not take part; only the global safeguard of
+            # the reasoning budget stays as the default layer.
+            if field == "reasoning_num_predict":
+                return settings.slot_reasoning_num_predict
+            return fallback
         slot_field = (
             "slot_reasoning_num_predict"
             if field == "reasoning_num_predict"
-            else _slot_settings_field(slot, field)
+            else _slot_settings_field(slot or "", field)
         )
         if type(settings).model_fields.get(slot_field) is not None:
             return getattr(settings, slot_field)
