@@ -171,6 +171,14 @@ from app.services.judge import Judge, JudgeError
 from app.services.llm_client import CHECK_AUTH_FAILED, CHECK_OK, ChatMeta
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
+from app.services.operations import (
+    OPERATION_REGISTRY,
+    SLOT_MODEL_OPERATION,
+    breaker_key,
+    pause_after,
+    pause_sec,
+    slot_model,
+)
 from app.services.promotion import PromotionService
 from app.services.slot_breaker import SlotBreaker
 from app.services.slot_budget import slot_config_fingerprint
@@ -210,6 +218,15 @@ AREAS_JOB = "areas"
 EXPIRATION_JOB = "expiration"
 # The "node order" job (lsb-0011-01): sweeping the accumulated `default`.
 NODES_JOB = "nodes"
+
+# The split jobs of the summary cycle (release 3.9.0, LSBN-S-6): in the
+# `operation` mode the single `summary` job (title-gen → summarize → merge)
+# is cut into three jobs — one per operation. Each job has its own queue,
+# its own signal and its own breaker; in the `legacy` mode (the default)
+# the whole cycle stays in the `summary` job, as before.
+TITLE_JOB = "title"
+SUMMARIZE_JOB = "summarize"
+MERGE_JOB = "merge"
 
 # The jobs' LLM slots (#39, arch §6.2): the breaker lives on the SLOT, not the job —
 # the summary slot is shared by summarization/merge/classification/descriptions and the
@@ -264,6 +281,471 @@ _SLOT_JOB_NAMES = {
     SLOT_JUDGE: JUDGE_JOB,
     NODES_JOB: NODES_JOB,
 }
+
+# An OPERATION → the job that works it (release 3.9.0, LSBN-S-9): the journal
+# field `job` stays the FACTUAL job (the operation is visible by the breaker
+# key — the `slot` field of the event), so the owner of a task row (an
+# operation in the `operation` mode) needs the name of its job: the reclass
+# tasks belong to the `nodes` job, the tasks of the summary family — to the
+# split jobs of the cycle (`title`/`summarize`/`merge`), the dedup verdict — to
+# the `judge` job. An operation without a job of its own (`describe`,
+# `structure_judge`, `embed`, `decision`) has no task rows — the name of the
+# operation is the fallback.
+_OPERATION_JOB_NAMES = {
+    "summarize": SUMMARIZE_JOB,
+    "title": TITLE_JOB,
+    "merge": MERGE_JOB,
+    "judge": JUDGE_JOB,
+    "classify": NODES_JOB,
+}
+
+# The operations whose path goes through the DECISION slot (the design, B4):
+# with the decision unavailable and the fallback off, they wait — the dedup
+# judge and the classifier walk into the decision slot. The rest
+# (summarize/title/merge/split/describe/embed) go.
+# The decision rule of the former `summary` slot (no39-05) does NOT hold for
+# the summary family (title/summarize/merge) any more: the family goes.
+_DECISION_BLOCKED_OPERATIONS = ("judge", "classify")
+
+# A task row → the operation that owns it (release 3.9.0, LSBN-S-7): the
+# attention state is counted and reset per OPERATION in the `operation` mode
+# (a title failure must not clear the attention of a summarize pair). The
+# rows keep their legacy slot values until the migration of `worker_jobs.slot`
+# (LSBN-S-14) — this map is the reader of those values. An unknown pair keeps
+# its slot value: the task is not lost (it stays visible in attention).
+_OPERATION_BY_TASK: dict[tuple[str, str], str] = {
+    (SLOT_SUMMARY, "merge"): MERGE_JOB,
+    (SLOT_SUMMARY, TITLE_JOB): TITLE_JOB,
+    (SLOT_SUMMARY, SUMMARIZE_JOB): SUMMARIZE_JOB,
+    (SLOT_JUDGE, "dedup"): SLOT_JUDGE,
+    (NODES_JOB, NODES_RECLASS_KIND): "classify",
+    # The pairs AFTER the migration of `worker_jobs.slot` (release 3.9.0,
+    # LSBN-S-14): the row carries the operation name. The map covers BOTH
+    # forms — the reader accepts the legacy value and the migrated one (the
+    # design, B5: "the new mode reads the old and the new values"), so the
+    # migration orphans no task. The pair ('judge','dedup') is the same in
+    # both forms: the operation name of the dedup judge IS the legacy slot
+    # group.
+    (MERGE_JOB, "merge"): MERGE_JOB,
+    ("classify", NODES_RECLASS_KIND): "classify",
+}
+
+# The migration of `worker_jobs.slot` to the operation names (release 3.9.0,
+# LSBN-S-14; the design, B5): the pair (slot, kind) -> the operation name.
+# A value that is not in the map is NOT migrated — it stays in the old queue
+# and is marked with attention ("the hanging tasks are not lost silently").
+SLOT_MIGRATION_MAP: dict[tuple[str, str], str] = {
+    (SLOT_SUMMARY, "merge"): MERGE_JOB,
+    (SLOT_JUDGE, "dedup"): SLOT_JUDGE,
+    (NODES_JOB, NODES_RECLASS_KIND): "classify",
+}
+
+# The reverse map — deterministic by `kind` (the design, B5): the operation
+# name -> the legacy slot group.
+SLOT_MIGRATION_REVERSE: dict[str, str] = {
+    "merge": SLOT_SUMMARY,
+    "dedup": SLOT_JUDGE,
+    "reclass": NODES_JOB,
+}
+
+# The journal event of the migration (`slot_migrated`).
+SLOT_MIGRATION_EVENT = "slot_migrated"
+
+# The meta key of the forward run: the ids of the rows it moved — the reverse
+# restores exactly them ("only the rows that were moved forward", the design,
+# B5). The meta table is the project's stamp table (the embedding meta, the
+# slot config fingerprint) — the schema of `worker_jobs` does not change.
+SLOT_MIGRATION_META_KEY = "slot_migration_forward"
+
+
+# The legacy slot groups of the DEPRECATED aggregates in `/health.slots`
+# (release 3.9.0, LSBN-S-15; the design, B6). The order — the historical order
+# of the slot keys (the consumer reads them by name, the order is the stable
+# one of the `legacy` form).
+SLOT_GROUP_ORDER: tuple[str, ...] = (
+    SLOT_EMBEDDING,
+    SLOT_SUMMARY,
+    SLOT_JUDGE,
+    SLOT_DECISION,
+)
+
+
+def slot_group_operations() -> dict[str, tuple[str, ...]]:
+    """The operations of every legacy slot group (the deprecated aggregates).
+
+            Release 3.9.0 (LSBN-S-15): the group of an operation is the field
+            `legacy_slot` of its registry spec — the same mapping the `legacy`
+            mode reads the breakers by (`operations.breaker_key`). The order of
+            the operations inside a group — the registry's order (the contract
+            of `/health.operations`).
+
+    """
+    groups: dict[str, list[str]] = {}
+    for name, spec in OPERATION_REGISTRY.items():
+        if not spec.legacy_slot:
+            continue
+        groups.setdefault(spec.legacy_slot, []).append(name)
+    return {group: tuple(names) for group, names in groups.items()}
+
+
+def _oldest_of(*ages: object) -> int | None:
+    """The oldest of the given ages (seconds) — `None` when there is none.
+
+            The helper of the aggregate queues (`/health.queues`): the age of a
+            sum of queues is the age of the oldest member (the work that has
+            been waiting the longest).
+
+    """
+    values = [int(age) for age in ages if age is not None]
+    return max(values) if values else None
+
+
+def slot_values_for_queue(slot: str, kind: str, mode: str) -> tuple[str, ...]:
+    """The slot values a queue is read under (the `operation` mode reads both).
+
+            Release 3.9.0 (LSBN-S-14): the rows keep their legacy slot value
+            until the migration of `worker_jobs.slot`; the migration moves them
+            to the operation name. The `operation` mode therefore reads BOTH
+            values — the new mode accepts the old and the new ones (the design,
+            B5), so the migration orphans no task and the work is not lost.
+            The `legacy` mode reads the legacy value only (as before — the
+            migration does not run there).
+    """
+    if mode != SLOT_MODEL_OPERATION:
+        return (slot,)
+    operation = SLOT_MIGRATION_MAP.get((slot, kind))
+    if operation is None or operation == slot:
+        return (slot,)
+    return (slot, operation)
+
+
+# The operation name of a kind (the reverse of `SLOT_MIGRATION_MAP`): the
+# rollback reads the rows that carry it.
+_OPERATION_BY_KIND: dict[str, str] = {
+    kind: operation for (_slot, kind), operation in SLOT_MIGRATION_MAP.items()
+}
+
+
+def ensure_worker_jobs_schema(settings: Settings) -> None:
+    """Create the job-queues table + its indexes (idempotently).
+
+            The schema of the worker's zone is the worker's own (not db.py):
+            the per-slot job queues are the background pipeline's internal
+            mechanics, the loops' dependency dispatcher.
+
+            The attention columns (#39, arch §5.2/§6.8) — `attempts`/
+            `last_outcome`/`last_error`/`attention_at` — are in the fresh DDL
+            and added by an idempotent ALTER over `PRAGMA table_info(worker_jobs)`
+            for a live database of the previous version.
+
+            The indexes: `idx_worker_jobs_queue (slot, kind, status, id)` — a
+            slot's pending queue is selected by the index, not a full table
+            scan; `idx_worker_jobs_attention (status, attention_at)` — the
+            "needs attention" selection; and `idx_worker_jobs_slot_attention
+            (slot, status, attention_at)` — the attention counter per slot
+            (release 3.9.0, LSBN-S-14; the design, B5). The COLUMNS do not
+            change — the index is added, the schema of the table stays.
+
+            The ALTER tolerates `duplicate column name` (lsbdef-0013): the lock
+            of the caller covers the threads of one process — a competing worker
+            process is not one of them.
+    """
+    with session(settings) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS worker_jobs ("
+            "  id           INTEGER PRIMARY KEY,"
+            "  slot         TEXT NOT NULL,"
+            "  kind         TEXT NOT NULL,"
+            "  note_id      INTEGER NOT NULL,"
+            "  payload      TEXT,"
+            "  status       TEXT NOT NULL DEFAULT 'pending',"
+            "  created_at   TEXT NOT NULL DEFAULT "
+            "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
+            "  updated_at   TEXT NOT NULL DEFAULT "
+            "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
+            "  attempts     INTEGER NOT NULL DEFAULT 0,"
+            "  last_outcome TEXT,"
+            "  last_error   TEXT,"
+            "  attention_at TEXT"
+            ")"
+        )
+        existing = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(worker_jobs)"
+            ).fetchall()
+        }
+        for name, ddl in (
+            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_outcome", "TEXT"),
+            ("last_error", "TEXT"),
+            ("attention_at", "TEXT"),
+        ):
+            if name not in existing:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE worker_jobs ADD COLUMN {name} {ddl}"
+                    )
+                except sqlite3.OperationalError as exc:
+                    # A competing process managed to add the column
+                    # (lsbdef-0013): we do not crash; the migration continues.
+                    if "duplicate column name" not in str(exc):
+                        raise
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_worker_jobs_queue "
+            "ON worker_jobs(slot, kind, status, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_worker_jobs_attention "
+            "ON worker_jobs(status, attention_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_worker_jobs_slot_attention "
+            "ON worker_jobs(slot, status, attention_at)"
+        )
+
+
+def _read_slot_migration_stamp(conn: sqlite3.Connection) -> dict | None:
+    """The stamp of the migration: the ids of the rows it moved (the meta table).
+
+            None — the stamp is missing (the migration did not run here yet);
+            a dict — the stamp of the run (an unreadable value is an empty
+            stamp — the migration does not crash on a broken value, the
+            `migration_chain` precedent).
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (SLOT_MIGRATION_META_KEY,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None  # no meta table — the stamp is optional
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["value"])
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_slot_migration_stamp(
+    conn: sqlite3.Connection,
+    direction: str,
+    migrated: int,
+    attention: int,
+    unknown: int,
+    ids: list[int],
+) -> None:
+    """Write the stamp of the migration run (the meta table).
+
+            The ids accumulate: the stamp is the list of the rows that were
+            moved FORWARD — the rollback restores exactly them.
+    """
+    known = {
+        int(value)
+        for value in ((_read_slot_migration_stamp(conn) or {}).get("ids") or [])
+        if isinstance(value, int) or str(value).isdigit()
+    }
+    known.update(ids)
+    payload = {
+        "direction": direction,
+        "migrated": migrated,
+        "attention": attention,
+        "unknown": unknown,
+        "ids": sorted(known),
+    }
+    try:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (SLOT_MIGRATION_META_KEY, json.dumps(payload, ensure_ascii=False)),
+        )
+    except sqlite3.OperationalError:
+        # No meta table — the journal event still carries the counters; the
+        # rollback falls back to the deterministic rule by `kind`.
+        return
+
+
+def _forward_slots(conn: sqlite3.Connection) -> dict:
+    """The forward migration: the rows move to the operation names.
+
+            The caller's transaction. The mapping is by the PAIR (slot, kind);
+            a pair that is not in the map is NOT migrated — it stays in the old
+            queue and is marked with attention (the "hanging" task is visible
+            and is not lost silently).
+    """
+    rows = conn.execute("SELECT id, slot, kind FROM worker_jobs").fetchall()
+    unknown: list[int] = []
+    for row in rows:
+        pair = (row["slot"], row["kind"])
+        if pair in SLOT_MIGRATION_MAP:
+            continue
+        if pair in _OPERATION_BY_TASK:
+            continue  # a known pair the map does not migrate (the value stays)
+        unknown.append(int(row["id"]))
+    migrated = 0
+    moved_ids: list[int] = []
+    for (legacy_slot, kind), operation in SLOT_MIGRATION_MAP.items():
+        if operation == legacy_slot:
+            # The identity mapping ('judge','dedup' -> 'judge'): the rows
+            # already carry the operation name — there is nothing to move.
+            continue
+        # The ids of the rows the UPDATE touches — the stamp of the run
+        # (the rollback returns exactly them).
+        ids = [
+            int(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM worker_jobs WHERE slot = ? AND kind = ?",
+                (legacy_slot, kind),
+            ).fetchall()
+        ]
+        cursor = conn.execute(
+            "UPDATE worker_jobs SET slot = ? WHERE slot = ? AND kind = ?",
+            (operation, legacy_slot, kind),
+        )
+        migrated += int(cursor.rowcount or 0)
+        moved_ids.extend(ids)
+    attention = 0
+    if unknown:
+        bindings = ", ".join("?" * len(unknown))
+        cursor = conn.execute(
+            "UPDATE worker_jobs SET attention_at = COALESCE(attention_at, "
+            "strftime('%Y-%m-%dT%H:%M:%SZ','now')), "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            f"WHERE id IN ({bindings}) AND attention_at IS NULL",
+            unknown,
+        )
+        attention = int(cursor.rowcount or 0)
+    _write_slot_migration_stamp(
+        conn, "forward", migrated, attention, len(unknown), moved_ids
+    )
+    return {
+        "direction": "forward",
+        "skipped": False,
+        "reason": None,
+        "migrated": migrated,
+        "attention": attention,
+        "unknown": len(unknown),
+    }
+
+
+def _restore_slot_row(conn: sqlite3.Connection, job_id: int) -> int:
+    """Return one row to its legacy slot value; the number of rows changed."""
+    row = conn.execute(
+        "SELECT slot, kind, attention_at FROM worker_jobs WHERE id = ?", (job_id,)
+    ).fetchone()
+    if row is None:
+        return 0
+    legacy_slot = SLOT_MIGRATION_REVERSE.get(row["kind"])
+    operation = _OPERATION_BY_KIND.get(row["kind"])
+    if legacy_slot is None or operation is None:
+        return 0
+    if legacy_slot == operation:
+        return 0  # the identity mapping — nothing to restore
+    if row["slot"] != operation:
+        return 0  # the row does not carry the operation name
+    if row["attention_at"] is not None:
+        return 0  # a frozen row is not touched
+    cursor = conn.execute(
+        "UPDATE worker_jobs SET slot = ? WHERE id = ? AND attention_at IS NULL",
+        (legacy_slot, job_id),
+    )
+    return int(cursor.rowcount or 0)
+
+
+def _reverse_slots(conn: sqlite3.Connection) -> dict:
+    """The rollback: the rows that were moved forward return to their values.
+
+            The reverse map is deterministic by `kind` (the design, B5); the
+            rows are the ones the forward run moved (the stamp of the run) —
+            with the deterministic fallback (the rows that carry the operation
+            name of their kind) when the stamp is missing.
+    """
+    stamp = _read_slot_migration_stamp(conn)
+    restored = 0
+    if stamp is None:
+        # No stamp — the migration did not run here: the deterministic
+        # fallback (the rows that carry the operation name of their kind).
+        for row in conn.execute("SELECT id FROM worker_jobs").fetchall():
+            restored += _restore_slot_row(conn, int(row["id"]))
+    else:
+        # The rows of the forward run — only them are returned back.
+        for job_id in [int(value) for value in (stamp.get("ids") or [])]:
+            restored += _restore_slot_row(conn, job_id)
+    _write_slot_migration_stamp(conn, "reverse", restored, 0, 0, [])
+    return {
+        "direction": "reverse",
+        "skipped": False,
+        "reason": None,
+        "migrated": restored,
+        "attention": 0,
+        "unknown": 0,
+    }
+
+
+def migrate_slots(settings: Settings, reverse: bool = False) -> dict:
+    """Migrate `worker_jobs.slot` to the operation names (LSBN-S-14; the design, B5).
+
+            The mapping is by the PAIR (slot, kind):
+            `('summary','merge') → 'merge'`, `('judge','dedup') → 'judge'`,
+            `('nodes','reclass') → 'classify'`. A value that is not in the map
+            is NOT migrated: it stays in the old queue and is marked with
+            attention (`attention_at`) — the "hanging" task is visible and is
+            not lost silently.
+
+            The ORDER (the design, B5): the new mode reads the old AND the new
+            values (the reader covers both pairs), THEN the migration runs,
+            THEN the flag is switched. While the flag is `legacy` the migration
+            does NOT run — the values in the DB stay the old ones and the
+            queues are read as before. The migration is called EXPLICITLY
+            (never at the start of the service).
+
+            Idempotent: the UPDATE moves the rows once; a repeated run changes
+            nothing and writes no second journal record. The journal record —
+            the event `slot_migrated` with the counters (moved, marked with
+            attention, unknown combinations) and the stamp in `meta` (the ids
+            of the moved rows).
+
+            `reverse=True` — the rollback: the rows that were moved forward
+            return to their old values (the reverse map is deterministic by
+            `kind`); the rows marked with attention are not touched.
+
+            Returns the counters: `direction`, `skipped`, `reason`, `migrated`,
+            `attention`, `unknown`.
+    """
+    direction = "reverse" if reverse else "forward"
+    if slot_model(settings) != SLOT_MODEL_OPERATION:
+        # The flag decides (the design, B5): in the `legacy` mode the values in
+        # the DB stay the old ones — the migration does not run.
+        return {
+            "direction": direction,
+            "skipped": True,
+            "reason": "legacy_mode",
+            "migrated": 0,
+            "attention": 0,
+            "unknown": 0,
+        }
+    ensure_worker_jobs_schema(settings)
+    with session(settings) as conn, transaction(conn):
+        if reverse:
+            counters = _reverse_slots(conn)
+        else:
+            counters = _forward_slots(conn)
+    if counters["migrated"] or counters["attention"]:
+        logging.getLogger("app").info(
+            "worker_jobs.slot: the slot values are migrated to the operation names"
+            if not reverse
+            else "worker_jobs.slot: the slot values are returned to the slot groups",
+            extra={
+                "event": SLOT_MIGRATION_EVENT,
+                "job": "migration",
+                "direction": direction,
+                "migrated": counters["migrated"],
+                "attention": counters["attention"],
+                "unknown": counters["unknown"],
+            },
+        )
+    return counters
 
 
 def _call_meta_fields(meta: ChatMeta) -> dict[str, object]:
@@ -357,7 +839,7 @@ _NODES_RECLASS_TAKEABLE = (
 )
 
 
-def _nodes_queue_stat_sql() -> str:
+def _nodes_queue_stat_sql(slot_values: tuple[str, ...] = (NODES_JOB,)) -> str:
     """The SQL of the `nodes` queue snapshot under the run's ACTUAL pools (FR-2.2).
 
             `pending` — exactly the work `process_nodes` can take in this run, and
@@ -373,18 +855,25 @@ def _nodes_queue_stat_sql() -> str:
             empty. SQL only, no model calls; the snapshot works for a disabled job
             too. The `:threshold` parameter — the auto-move threshold
             (`NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE`).
+
+            Release 3.9.0 (LSBN-S-14): the `reclass` tasks are read under the slot
+            values of the mode — the legacy value and the operation name in the
+            `operation` mode (the migration of `worker_jobs.slot` moves the rows
+            from one to the other; the reader covers both). The slot values are
+            bound as `:slot0`, `:slot1`, ... — the caller passes them.
     """
+    slot_bindings = ", ".join(f":slot{index}" for index in range(len(slot_values)))
     reclass_jobs = (
         "SELECT COUNT(*) FROM worker_jobs j "
         "LEFT JOIN notes n ON n.id = j.note_id "
-        "WHERE j.slot = 'nodes' AND j.kind = 'reclass' "
+        f"WHERE j.slot IN ({slot_bindings}) AND j.kind = 'reclass' "
         f"AND j.status = 'pending' AND {_NODES_RECLASS_TAKEABLE}"
     )
     reclass_age = (
         "SELECT MAX(CAST(strftime('%s','now') AS INTEGER) "
         "- CAST(strftime('%s', j.created_at) AS INTEGER)) "
         "FROM worker_jobs j LEFT JOIN notes n ON n.id = j.note_id "
-        "WHERE j.slot = 'nodes' AND j.kind = 'reclass' "
+        f"WHERE j.slot IN ({slot_bindings}) AND j.kind = 'reclass' "
         f"AND j.status = 'pending' AND {_NODES_RECLASS_TAKEABLE}"
     )
     fast_pool = (
@@ -533,14 +1022,12 @@ class BackgroundWorker:
         # SLOT_PAUSE_AFTER (auth opens immediately). The state is in process
         # memory: no restart survival needed (the slot configuration
         # is re-evaluated by the startup check, arch §13.2).
-        self._breakers: dict[str, SlotBreaker] = {
-            name: SlotBreaker(
-                name,
-                settings.slot_pause_sec,
-                open_after=settings.slot_pause_after,
-            )
-            for name in SLOT_NAMES
-        }
+        # Release 3.9.0 (LSBN-S-5): the KEY of the breaker is the operation in
+        # the `operation` mode (`SLOT_MODEL=operation`) — one breaker per
+        # operation; in the `legacy` mode the key stays the slot group (the
+        # historical behaviour). The mode is read through the ONE switch
+        # (`_mode`), never inlined.
+        self._breakers: dict[str, SlotBreaker] = self._build_breakers(settings)
         self._stopping = False
         # The "a note with a pending vector appeared" signal — wakes the embedding loop
         # right after the write (save/update/merge/title-gen), bypassing the grown
@@ -552,6 +1039,17 @@ class BackgroundWorker:
         # The "a note with a pending summary appeared" signal — wakes the
         # summarization loop immediately (save/update), bypassing the grown back-off.
         self._summary_event = asyncio.Event()
+        # The "a note with a pending title appeared" signal (release 3.9.0,
+        # LSBN-S-6): wakes the title loop of the `operation` mode. Its OWN
+        # event: a shared `asyncio.Event` would be cleared by a neighbour loop
+        # (`jobs.py` clears the event before the queue recheck) — the neighbour
+        # would lose the wakeup.
+        self._title_event = asyncio.Event()
+        # The "a merge job appeared" signal (release 3.9.0, LSBN-S-6): wakes
+        # the merge loop of the `operation` mode. The signal is set at the
+        # merge job's creation (the judge loop) — its own event, for the same
+        # reason as the title one.
+        self._merge_event = asyncio.Event()
         # The "a judge job appeared" signal — wakes the judge loop (the embedding loop
         # created a dedup job after vectorization).
         self._judge_event = asyncio.Event()
@@ -630,6 +1128,235 @@ class BackgroundWorker:
         """The areas job's current interval (diagnostics, tests, substrate 3.0.0)."""
         return self._backoff[AREAS_JOB].interval
 
+    def _mode(self) -> str:
+        """The active model of the slot layer: `legacy` | `operation`.
+
+                The ONE switch of the release 3.9.0 (the design, B2): every
+                point that depends on the mode reads this value — the flag
+                lives in `Settings` (`SLOT_MODEL`) and is read once (the
+                settings are frozen).
+
+        """
+        return slot_model(self._settings)
+
+    def _operation_slot(self, operation: str) -> str:
+        """The breaker key of an operation: the operation itself in the
+        `operation` mode, the slot group in the `legacy` mode.
+
+                The ONE point where the slot of an operation is resolved (the
+                design, B2): the `legacy` mode keeps the slot group (one
+                breaker per group — the historical behaviour), the `operation`
+                mode gives every operation its own breaker. The registry's
+                `breaker_key` is the mapping (S-5).
+
+        """
+        return breaker_key(operation, self._settings)
+
+    def _operation_service(self, operation: str) -> object | None:
+        """The service behind an operation — the probe map (LSBN-S-7).
+
+                The breaker key of the `operation` mode is the OPERATION name,
+                so the knock (the probe) must find the service by the
+                operation and not by the slot group: the summarizer serves
+                `summarize`/`title`/`merge`/`split`, the dedup judge serves
+                `judge`, the structural judge serves `structure_judge`, the
+                classifier serves `classify`, the promoter serves `describe`,
+                the embedder serves `embed` and the decision service serves
+                `decision`. An unknown operation — no service (`None`): the
+                caller answers `CHECK_OK` (the precedent of an absent
+                service).
+
+                The `legacy` mode keeps the slot map (`embedding`/`summary`/
+                `judge`) — the probe of a slot group is the service of that
+                group, as before.
+
+        """
+        if self._mode() == SLOT_MODEL_OPERATION:
+            if operation in (SUMMARIZE_JOB, TITLE_JOB, MERGE_JOB, "split"):
+                return self._summarizer
+            if operation == SLOT_JUDGE:
+                return self._judge
+            if operation == "structure_judge":
+                # Release 3.9.0 (LSBN-S-8): the structural judge is a service of
+                # its own (it lives inside the promotion trigger) — the dedup
+                # judge is a different operation with its own breaker. No
+                # trigger (a test mode) — the dedup judge, as before.
+                structure_judge = self._structure_judge()
+                return structure_judge if structure_judge is not None else self._judge
+            if operation == "classify":
+                return self._classifier
+            if operation == "describe":
+                return self._promoter
+            if operation == "embed":
+                return self._embedding
+            if operation == SLOT_DECISION:
+                return self._decision
+            return None
+        return {
+            SLOT_EMBEDDING: self._embedding,
+            SLOT_SUMMARY: self._summarizer,
+            SLOT_JUDGE: self._judge,
+        }.get(operation)
+
+    def _structure_judge(self) -> object | None:
+        """The structural judge service (the `structure_judge` operation).
+
+                The service lives inside the promotion trigger (the trigger
+                owns the describer and the structural judge); None — a test
+                mode without the trigger.
+        """
+        return getattr(self._promoter, "structure_judge", None)
+
+    def _task_operation(self, slot: str, kind: str | None = None) -> str:
+        """The owner of a task row: the operation in the `operation` mode, the
+                slot group in the `legacy` mode.
+
+                The attention state is per PAIR (a `worker_jobs` row), but the
+                wholesale reset ("the reason is gone") is per breaker key: in
+                the `operation` mode that is the operation — a title failure
+                must not clear the attention of a summarize pair (LSBN-S-7).
+
+        """
+        if self._mode() != SLOT_MODEL_OPERATION:
+            return slot
+        return _OPERATION_BY_TASK.get((slot, kind or ""), slot)
+
+    def _queue_slot_values(self, slot: str, kind: str) -> tuple[str, ...]:
+        """The slot values a queue is read under (the mode's own rule).
+
+                Release 3.9.0 (LSBN-S-14): the `operation` mode reads both the
+                legacy value and the operation name — the rows keep the legacy
+                value until the migration of `worker_jobs.slot`, and the
+                migration moves them to the operation name. The `legacy` mode
+                reads the legacy value only (as before).
+        """
+        return slot_values_for_queue(slot, kind, self._mode())
+
+    def _task_slot(self, slot: str, kind: str) -> str:
+        """The slot value a NEW task row is written with.
+
+                Release 3.9.0 (LSBN-S-14): in the `operation` mode the row
+                carries the OPERATION name — `worker_jobs.slot` = the operation
+                (the release's brief: "a slot = an operation — its own queue").
+                The map is the reader's map of the pairs (the S-7 map): the
+                merge task — `merge`, the reclass task — `classify`, the dedup
+                task — `judge`, the title/summarize tasks — their own
+                operations. A pair that is not in the map keeps the previous
+                value — the work is not lost (the same rule as for the
+                "hanging" rows of the migration).
+
+                The `legacy` mode writes the slot group, as before — the legacy
+                mode changes in nothing.
+        """
+        if self._mode() != SLOT_MODEL_OPERATION:
+            return slot
+        return _OPERATION_BY_TASK.get((slot, kind), slot)
+
+    def _job_name(self, operation: str) -> str:
+        """The job name of an operation: the operation's own job in the
+        `operation` mode (`title`/`summarize`/`merge`), the legacy `summary`
+        job in the `legacy` mode (one job for the whole cycle).
+
+                The journal field `job` and the breaker key travel together:
+                in the `legacy` mode the whole summary family belongs to the
+                `summary` job and to the `summary` slot group; in the
+                `operation` mode every operation is a job of its own.
+
+        """
+        if self._mode() == SLOT_MODEL_OPERATION:
+            return operation
+        return SUMMARY_JOB
+
+    def _breaker_paused(self, key: str) -> bool:
+        """Is the breaker under the key paused right now? No breaker under the
+        key — not paused.
+
+                The `operation` mode keys the breakers by operation (the
+                design, B2): a slot name that is not an operation (`summary`)
+                has no breaker there. The lookup is defensive for the same
+                reason as `_slot_blocked`: observability and the queue
+                recheck must not crash the loop (LSBN-S-6, the S-5 finding
+                M1 — a `KeyError` on the slot name).
+
+        """
+        breaker = self._breakers.get(key)
+        return breaker is not None and breaker.is_paused()
+
+    def _operation_blocked(self, operation: str) -> bool:
+        """Is the operation's work blocked for its loop?
+
+                The breaker of the operation (its own key in the `operation`
+                mode) plus the decision rule (no39-05): with the decision slot
+                unavailable and the fallback off, the operations whose path
+                goes through the decision slot wait — the classifier walks
+                into the decision slot. The `legacy` mode keeps the whole
+                summary cycle under one rule (as before the split).
+
+        """
+        return self._slot_blocked(self._operation_slot(operation))
+
+    def _classify_blocked(self) -> bool:
+        """Is the classifier NOT to be called (the `classify` operation is blocked)?
+
+                Release 3.9.0 (LSBN-S-9): in the `operation` mode the pause of
+                the `classify` operation stops the CLASSIFIER calls of the paths
+                that call it — the grooming (inside the `summarize` job), the
+                reclass tasks and the sweep (inside the `nodes` job). The gate
+                of a job stays the gate of its job (the `summarize` job is
+                gated by the `summarize` operation — the check is INSIDE the
+                path, the S-8 precedent: the structural judge is not called on
+                the pause of its operation). The work is not lost: the note
+                stays unclassified (the sweep of the `nodes` job takes it
+                later), the reclass task stays `pending`.
+
+                The `legacy` mode: False — the shared breaker of the `summary`
+                slot group is read by the gate of the job (as before): the
+                pause stopped the `summary` job as a whole, and it still does
+                (the classifier is not called, but the job is not the one
+                that is gated by the `classify` operation there).
+
+        """
+        if self._mode() != SLOT_MODEL_OPERATION:
+            return False
+        return self._operation_blocked("classify")
+
+    def _build_breakers(self, settings: Settings) -> dict[str, SlotBreaker]:
+        """The breaker dictionary: one breaker per SLOT GROUP (`legacy` mode)
+        or one per OPERATION (`operation` mode).
+
+                The thresholds of the `operation` mode are the per-operation
+                ones (base + override: `<OP>_PAUSE_AFTER`/`<OP>_PAUSE_SEC`,
+                else the global base); the `legacy` mode keeps the global
+                values of the slot group.
+
+                Release 3.9.0 (LSBN-S-13): the `decision` operation is NOT
+                here — its breaker lives in the decision SERVICE (arch §13.8,
+                `app/services/decision.py`): the decision call happens inside
+                the service, the worker does not see it. A second (dead)
+                breaker in the worker would show a state that is not the
+                operation's own — the health entry of the operation is
+                assembled from the service (`_decision_operation_health`).
+
+        """
+        if self._mode() == SLOT_MODEL_OPERATION:
+            return {
+                operation: SlotBreaker(
+                    operation,
+                    pause_sec(operation, settings),
+                    open_after=pause_after(operation, settings),
+                )
+                for operation in OPERATION_REGISTRY
+                if operation != SLOT_DECISION
+            }
+        return {
+            name: SlotBreaker(
+                name,
+                settings.slot_pause_sec,
+                open_after=settings.slot_pause_after,
+            )
+            for name in SLOT_NAMES
+        }
+
     def stop(self) -> None:
         """Soft stop: the loops will finish after unwinding the current iteration."""
         self._stopping = True
@@ -660,8 +1387,32 @@ class BackgroundWorker:
                     Called from save/update (an `asyncio.to_thread` thread) —
                     `asyncio.Event.set()` is thread-safe. The loop immediately leaves the
                     wait and catches up the queue without waiting out the grown back-off.
+
+                    The `operation` mode (release 3.9.0, LSBN-S-6): the summary
+                    cycle is split into three loops — the signal wakes the
+                    summarize loop AND the title loop (a note without a title
+                    waits for the title operation). The merge loop has its own
+                    signal — at the merge job's creation.
         """
         self._summary_event.set()
+        if self._mode() == SLOT_MODEL_OPERATION:
+            # The split summary cycle (release 3.9.0, LSBN-S-6): the signal
+            # wakes the title loop too — a saved note without a title (the
+            # migration path) waits for the title operation, and the note
+            # service knows only one "summary pending" signal. The merge loop
+            # has its own signal — at the merge job's creation.
+            self._title_event.set()
+
+    def notify_merge_pending(self) -> None:
+        """Wake the merge loop: a merge job appeared.
+
+                    Called at the merge job's creation (the judge loop) —
+                    `asyncio.Event.set()` is thread-safe. The `operation`
+                    mode's merge loop has its own event (LSBN-S-6): the job is
+                    taken at once, not after the grown back-off.
+
+        """
+        self._merge_event.set()
 
     def notify_judge_pending(self) -> None:
         """Wake the judge loop: a judge job (dedup) appeared.
@@ -758,8 +1509,20 @@ class BackgroundWorker:
                     Reading process memory only — no model calls. The consumer — the MCP
                     middleware of the "warn your human" hint. The full `/health.slots`
                     surface and queue observability — the no39-03 brief.
+
+                    Release 3.9.0 (LSBN-S-13): in the `operation` mode the
+                    `decision` operation's breaker lives in the service (§13.8)
+                    — its own snapshot is added here, so no operation is lost in
+                    the hint. The `legacy` mode is unchanged.
         """
-        return {name: breaker.snapshot() for name, breaker in self._breakers.items()}
+        states = {name: breaker.snapshot() for name, breaker in self._breakers.items()}
+        if self._mode() == SLOT_MODEL_OPERATION and SLOT_DECISION not in states:
+            service = self._decision
+            if service is not None:
+                snapshot = service.snapshot()
+                if snapshot["enabled"]:
+                    states[SLOT_DECISION] = snapshot["breaker"]
+        return states
 
     def slots_health(self) -> dict[str, dict]:
         """A slots snapshot for `/health.slots` (#39, arch §7.2): SQL/memory only.
@@ -775,18 +1538,16 @@ class BackgroundWorker:
                     the output) without the journal.
                     Models are NOT called: only in-memory state and SQL over `worker_jobs`
                     (assembling `/health` must not wake slots).
+
+                    The `operation` mode (release 3.9.0, LSBN-S-7): the entries are
+                    the OPERATIONS (the breakers are keyed by operation) — the block
+                    must not fall over and must not lose an operation. The full
+                    form of the operations block — the step S-15; the legacy slot
+                    keys are NOT added here.
         """
-        attention: dict[str, int] = {}
-        try:
-            self._ensure_job_table()
-            with session(self._settings) as conn:
-                rows = conn.execute(
-                    "SELECT slot, COUNT(*) AS c FROM worker_jobs "
-                    "WHERE attention_at IS NOT NULL GROUP BY slot"
-                ).fetchall()
-            attention = {rows[i]["slot"]: int(rows[i]["c"]) for i in range(len(rows))}
-        except Exception:  # noqa: BLE001 — observability does not crash /health
-            attention = {}
+        if self._mode() == SLOT_MODEL_OPERATION:
+            return self._operations_health()
+        attention = self._attention_by_slot()
         services = {
             SLOT_EMBEDDING: self._embedding,
             SLOT_SUMMARY: self._summarizer,
@@ -812,6 +1573,198 @@ class BackgroundWorker:
             health[name] = snapshot
         health[SLOT_DECISION] = self._decision_slot_health(attention)
         return health
+
+    def _operations_health(self) -> dict[str, dict]:
+        """`/health.slots` in the `operation` mode: one entry per OPERATION.
+
+                    The breakers are keyed by operation there, so the entries are
+                    the operations: every breaker of the mode gets an entry (no
+                    operation is lost) and the block never falls over (the
+                    legacy slot keys are not looked up — LSBN-S-7).
+
+                    Release 3.9.0 (LSBN-S-13): the `decision` operation's entry
+                    comes from the SERVICE — the breaker of the operation lives
+                    there (§13.8), so its own state is the truthful one (the
+                    worker keeps no second breaker for it).
+
+                    Release 3.9.0 (LSBN-S-15): the four legacy slot keys are
+                    added as DEPRECATED aggregates (the worst operation of the
+                    group) — see `_deprecated_slot_aggregates`; the `split`
+                    entry carries the marker of the nested `title` calls (the
+                    accumulated point of the previous steps).
+
+        """
+        attention = self._attention_by_operation()
+        health: dict[str, dict] = {}
+        for name, breaker in self._breakers.items():
+            snapshot = dict(breaker.snapshot())
+            service = self._operation_service(name)
+            snapshot["ok"] = getattr(service, "last_attempt_ok", None)
+            snapshot["attention"] = attention.get(name, 0)
+            meta = getattr(service, "last_meta", None)
+            snapshot["last_finish_reason"] = meta.finish_reason if meta else None
+            snapshot["last_budget"] = meta.budget if meta else None
+            snapshot["last_budget_source"] = meta.budget_source if meta else None
+            snapshot["last_had_thinking"] = meta.had_thinking if meta else None
+            snapshot["last_answer_budget"] = meta.answer_budget if meta else None
+            snapshot["last_reasoning_budget"] = meta.reasoning_budget if meta else None
+            snapshot["last_sent_budget"] = meta.sent_budget if meta else None
+            health[name] = snapshot
+        health[SLOT_DECISION] = self._decision_operation_health(attention)
+        # The nested calls of the split (the accumulated point of the previous
+        # steps, accepted on the acceptance of LSBN-S-11): the title of every
+        # part of the split is a separate call of the `title` operation, but it
+        # goes INSIDE the call of `split` — it is counted toward the `split`
+        # operation (its breaker), and one failure is counted once.
+        if "split" in health:
+            health["split"]["nested_calls"] = ["title"]
+        health.update(self._deprecated_slot_aggregates(health))
+        return health
+
+    def _deprecated_slot_aggregates(self, operations: dict[str, dict]) -> dict[str, dict]:
+        """The DEPRECATED aggregates of the legacy slot groups (`/health.slots`).
+
+                    Release 3.9.0 (LSBN-S-15; the design, B6): the old slot keys
+                    (`embedding`/`summary`/`judge`/`decision`) STAY — the consumers
+                    of the old form (the healthcheck, the canon 6.4) must not
+                    break. Each of them is the AGGREGATE of its group: the
+                    entry of the WORST operation of the group, marked with
+                    `deprecated` and carrying the list of the group's
+                    operations (`operations`).
+
+                    THE RULE OF THE AGGREGATE ("the worst of the group"):
+                    the operations of a group are compared by their severity,
+                    and the aggregate is the entry of the most severe one:
+                    (1) a PAUSED breaker is worse than a closed one — its work
+                        is blocked right now;
+                    (2) then the bigger failure counter of the series;
+                    (3) then the registry order — the first operation of the
+                        group wins a tie (the choice is deterministic).
+
+                    The aggregate is a COPY of that operation's entry: the
+                    fields of the worst operation (`ok`/`last_outcome`/
+                    `paused_until`/`attention`/the last call's diagnostics) —
+                    the group is never better than its worst member. The
+                    `legacy` mode does not use this form at all (there the
+                    entries ARE the slot groups).
+
+        """
+        groups = slot_group_operations()
+        aggregates: dict[str, dict] = {}
+        for group in SLOT_GROUP_ORDER:
+            members = [name for name in groups.get(group, ()) if name in operations]
+            if not members:
+                continue
+            worst = self._worst_operation(members, operations)
+            entry = dict(operations[worst])
+            entry["slot"] = group  # the key's own name (the entry is the group's)
+            entry["deprecated"] = True
+            entry["operations"] = list(groups[group])
+            aggregates[group] = entry
+        return aggregates
+
+    @staticmethod
+    def _worst_operation(names: list[str], entries: dict[str, dict]) -> str:
+        """The most severe operation of the group — the rule of the aggregate.
+
+                    The severity — a paused breaker first (the work is blocked
+                    now), then the failure counter; a tie — the first name of
+                    the list (the registry order). See
+                    `_deprecated_slot_aggregates` — the rule of the aggregate.
+
+        """
+        def severity(name: str) -> tuple[int, int]:
+            entry = entries[name]
+            paused = 1 if entry.get("state") == "paused" else 0
+            return paused, int(entry.get("failures") or 0)
+
+        return max(names, key=severity)
+
+    def slot_migration_pending(self) -> int:
+        """The `worker_jobs` rows that the slot migration would still move.
+
+                    Release 3.9.0 (LSBN-S-15): the counter of the migration of
+                    `worker_jobs.slot` (LSBN-S-14) for `/health` — "how many rows
+                    still carry an old slot value". The count goes through the
+                    migration MAP of S-14: a row is pending when its pair
+                    (`slot`, `kind`) is in the map and the row still carries the
+                    legacy value (the map's operation name is a different one).
+
+                    After the migration the counter is 0. The rows of the known
+                    pairs the map does NOT move (('summary','title'),
+                    ('summary','summarize')) are not counted: the new mode reads
+                    them as well (the reader's map covers both values) — they
+                    are not pending anything. The identity pair
+                    ('judge','dedup') is never counted (there is nothing to
+                    move).
+
+                    SQL only (no models called); a missing table — 0 (the
+                    observability does not break `/health`).
+
+        """
+        try:
+            self._ensure_job_table()
+            with session(self._settings) as conn:
+                total = 0
+                for (legacy_slot, kind), operation in SLOT_MIGRATION_MAP.items():
+                    if operation == legacy_slot:
+                        continue  # the identity pair — nothing to move
+                    row = conn.execute(
+                        "SELECT COUNT(*) AS c FROM worker_jobs "
+                        "WHERE slot = ? AND kind = ?",
+                        (legacy_slot, kind),
+                    ).fetchone()
+                    total += int(row["c"])
+            return total
+        except Exception:  # noqa: BLE001 — observability does not crash /health
+            return 0
+
+    def _attention_by_slot(self) -> dict[str, int]:
+        """The tasks in attention per SLOT group (the `legacy` form)."""
+        attention: dict[str, int] = {}
+        try:
+            self._ensure_job_table()
+            with session(self._settings) as conn:
+                rows = conn.execute(
+                    "SELECT slot, COUNT(*) AS c FROM worker_jobs "
+                    "WHERE attention_at IS NOT NULL GROUP BY slot"
+                ).fetchall()
+            attention = {rows[i]["slot"]: int(rows[i]["c"]) for i in range(len(rows))}
+        except Exception:  # noqa: BLE001 — observability does not crash /health
+            attention = {}
+        return attention
+
+    def _attention_by_operation(self) -> dict[str, int]:
+        """The tasks in attention per OPERATION (the `operation` mode).
+
+                    The rows keep their legacy slot values until the migration
+                    of `worker_jobs.slot` (LSBN-S-14) — the owner of a row is
+                    read through `_task_operation`.
+
+                    Only the KNOWN operations are counted (release 3.9.0,
+                    LSBN-S-9): an unknown pair (an unknown slot or kind — the
+                    rows keep their legacy values) has no operation, so it does
+                    not land in a counter of `/health` under a non-operation key
+                    (e.g. `nodes`). The task is not lost — it stays visible in
+                    `/jobs/attention` (the listing shows the row's own slot).
+
+        """
+        counts: dict[str, int] = {}
+        try:
+            self._ensure_job_table()
+            with session(self._settings) as conn:
+                rows = conn.execute(
+                    "SELECT slot, kind, COUNT(*) AS c FROM worker_jobs "
+                    "WHERE attention_at IS NOT NULL GROUP BY slot, kind"
+                ).fetchall()
+        except Exception:  # noqa: BLE001 — observability does not crash /health
+            return {}
+        for row in rows:
+            operation = self._task_operation(row["slot"], row["kind"])
+            if operation not in OPERATION_REGISTRY:
+                continue  # an unknown pair — not an operation's counter
+            counts[operation] = counts.get(operation, 0) + int(row["c"])
+        return counts
 
     def _decision_slot_health(self, attention: dict[str, int]) -> dict:
         """The `decision` slot for `/health.slots` (LSBN-F-12, §7.1): memory only.
@@ -852,18 +1805,76 @@ class BackgroundWorker:
             "enabled": False,
         }
 
+    def _decision_operation_health(self, attention: dict[str, int]) -> dict:
+        """The `decision` OPERATION for `/health.slots` (the `operation` mode).
+
+                    Release 3.9.0 (LSBN-S-13): the operation's breaker lives in
+                    the SERVICE (§13.8) — the entry is ITS snapshot (the state,
+                    the outcome, the pause and the failure counter of the
+                    operation's own breaker), not the worker's slots. The
+                    thresholds of the operation are the per-operation ones
+                    (`DECISION_PAUSE_AFTER`/`DECISION_PAUSE_SEC`, else the
+                    global base — the env prefix stays `DECISION_*`).
+
+                    The slot is off/not built — the disabled shape (§7.1), in the
+                    operation form (the breaker's fields are empty).
+
+        """
+        service = self._decision
+        if service is None:
+            return self._decision_operation_disabled_stat()
+        snapshot = service.snapshot()
+        if not snapshot["enabled"]:
+            return self._decision_operation_disabled_stat()
+        return {
+            **snapshot["breaker"],
+            "ok": snapshot["ok"],
+            "attention": attention.get(SLOT_DECISION, 0),
+            "enabled": True,
+            "last_finish_reason": None,
+            "last_budget": None,
+            "last_budget_source": None,
+            "last_had_thinking": None,
+            "last_answer_budget": None,
+            "last_reasoning_budget": None,
+            "last_sent_budget": None,
+        }
+
+    @staticmethod
+    def _decision_operation_disabled_stat() -> dict:
+        """The `decision` operation with no service (off/not built) — the
+        disabled shape in the operation form.
+
+        """
+        return {
+            "slot": SLOT_DECISION,
+            "state": "closed",
+            "last_outcome": None,
+            "paused_until": None,
+            "failures": 0,
+            "ok": None,
+            "attention": 0,
+            "enabled": False,
+            "last_finish_reason": None,
+            "last_budget": None,
+            "last_budget_source": None,
+            "last_had_thinking": None,
+            "last_answer_budget": None,
+            "last_reasoning_budget": None,
+            "last_sent_budget": None,
+        }
+
     def _probe_slot(self, slot: str) -> str:
         """One cheap probe call of a slot (no generation, #39 §6.2).
 
-                    By slot name — the corresponding service's `probe()` (a thin wrapper
-                    over `LLMClient.check()`). A missing service or a fake without `probe`
-                    (a test mode) — the `CHECK_OK` stub (the startup-check precedent).
+                    By breaker key: the SLOT name in the `legacy` mode, the
+                    OPERATION name in the `operation` mode (release 3.9.0,
+                    LSBN-S-7) — the service behind the key is resolved by
+                    `_operation_service`. A missing service or a fake without
+                    `probe` (a test mode) — the `CHECK_OK` stub (the
+                    startup-check precedent).
         """
-        service = {
-            SLOT_EMBEDDING: self._embedding,
-            SLOT_SUMMARY: self._summarizer,
-            SLOT_JUDGE: self._judge,
-        }.get(slot)
+        service = self._operation_service(slot)
         probe = getattr(service, "probe", None)
         if probe is None:
             return CHECK_OK
@@ -903,7 +1914,11 @@ class BackgroundWorker:
                     "slot_resumed",
                     slot,
                     effective_job,
-                    after_sec=self._settings.slot_pause_sec,
+                    # The pause of THIS breaker: in the `operation` mode it is
+                    # the operation's own pause (the per-operation value, else
+                    # the global base) — not the base of the configuration
+                    # (release 3.9.0, LSBN-S-13).
+                    after_sec=breaker.pause_sec,
                 )
                 return True
             outcome = (
@@ -935,6 +1950,79 @@ class BackgroundWorker:
                 paused_until=breaker.snapshot()["paused_until"],
             )
         return opened
+
+    def _note_classify_failure(self, job: str, outcome: SlotOutcome) -> None:
+        """A classifier failure of a job → the breaker of the `classify` operation.
+
+                Release 3.9.0 (LSBN-S-9): in the `operation` mode the failure
+                of the classifier of the `warnings` job is recorded at the
+                breaker of the `classify` operation — the operation owns the
+                failure, its own breaker (the design, B4). The `legacy` mode:
+                nothing — the `warnings` job never touched the breaker (the
+                failure stayed in the journal, the `warnings_classifier_failed`
+                event).
+
+                The job name stays the factual one (`warnings`); the operation
+                is visible by the breaker key.
+        """
+        if self._mode() != SLOT_MODEL_OPERATION:
+            return
+        self._note_slot_outcome(job, self._operation_slot("classify"), outcome)
+
+    def _note_split_failure(self, job: str, outcome: SlotOutcome) -> None:
+        """A splitting failure of a job → the breaker of the `split` operation.
+
+                Release 3.9.0 (LSBN-S-11): in the `operation` mode the failure
+                of the splitting of the `migration` job is recorded at the
+                breaker of the `split` operation — the operation owns the
+                failure, its own breaker (the design, B4). The `legacy` mode:
+                nothing — the job never touched the breaker (the failure stayed
+                in the journal, the `migration_split_failed` event).
+
+                The failure of the title generation INSIDE the split is a
+                failure of the split too (the unit of work is the split): it
+                comes here as well, and the breaker of the `title` operation is
+                NOT touched (one failure - one count).
+
+                The job name stays the factual one (`migration`); the operation
+                is visible by the breaker key.
+        """
+        if self._mode() != SLOT_MODEL_OPERATION:
+            return
+        self._note_slot_outcome(job, self._operation_slot("split"), outcome)
+
+    def _note_embed_failure(
+        self,
+        job: str,
+        exc: BaseException,
+        *,
+        event: str,
+        message: str,
+    ) -> None:
+        """A vectorization failure → the breaker of the `embed` operation.
+
+                Release 3.9.0 (LSBN-S-13): in the `operation` mode the failure
+                of the vectorization (the notes queue and the chunk queue) is a
+                failure of the `embed` OPERATION — it goes to the breaker of
+                that operation (its own pause, its own counter). The areas
+                path writes there through `_log_slot_failure` (as before).
+
+                The `legacy` mode keeps the path exactly as it was: the
+                vectorization failure was not a slot failure there (no event,
+                no breaker) — the `legacy` mode changes in nothing (the pilot's
+                decision 1).
+
+        """
+        if self._mode() != SLOT_MODEL_OPERATION:
+            return
+        self._log_slot_failure(
+            job,
+            self._operation_slot("embed"),
+            outcome_of(exc),
+            event=event,
+            message=message,
+            detail=str(exc),
+        )
 
     def _log_slot_failure(
         self,
@@ -1075,7 +2163,19 @@ class BackgroundWorker:
             )
 
     def _job_for_slot(self, slot: str) -> str:
-        """The owning job's name of a slot's queue (for events and /jobs/attention)."""
+        """The owning job's name of a slot's queue (for events and /jobs/attention).
+
+                The `operation` mode: the owner of a task row is an OPERATION,
+                not a slot group — the job of the operation comes from
+                `_OPERATION_JOB_NAMES` (the factual job: the reclass tasks
+                belong to the `nodes` job, the merge tasks — to the `merge`
+                job; the journal never names a job that does not exist).
+                The `legacy` mode: the slot group → its job, as before.
+        """
+        if self._mode() == SLOT_MODEL_OPERATION:
+            job = _OPERATION_JOB_NAMES.get(slot)
+            if job is not None:
+                return job
         return _SLOT_JOB_NAMES.get(slot, slot)
 
     def _log_attention_event(self, event: str, **fields: object) -> None:
@@ -1120,7 +2220,7 @@ class BackgroundWorker:
         nontransient = outcome in _NON_TRANSIENT_OUTCOMES
         with session(self._settings) as conn, transaction(conn):
             row = conn.execute(
-                "SELECT id, slot, note_id, payload, attempts, attention_at "
+                "SELECT id, slot, kind, note_id, payload, attempts, attention_at "
                 "FROM worker_jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
@@ -1163,10 +2263,13 @@ class BackgroundWorker:
             note_id = row["note_id"]
             older_id = pair.get("older_id")
         if nontransient and attention:
+            # The owner of the pair: the operation in the `operation` mode, the
+            # slot group in the `legacy` mode (LSBN-S-7).
+            owner = self._task_operation(slot, row["kind"])
             self._log_attention_event(
                 "job_attention",
-                job=self._job_for_slot(slot),
-                slot=slot,
+                job=self._job_for_slot(owner),
+                slot=owner,
                 note_id=note_id,
                 older_id=older_id,
                 outcome=value,
@@ -1187,7 +2290,7 @@ class BackgroundWorker:
         self._ensure_job_table()
         with session(self._settings) as conn, transaction(conn):
             row = conn.execute(
-                "SELECT id, slot, note_id, payload, attention_at "
+                "SELECT id, slot, kind, note_id, payload, attention_at "
                 "FROM worker_jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
@@ -1203,10 +2306,13 @@ class BackgroundWorker:
             slot = row["slot"]
             note_id = row["note_id"]
             older_id = self._load_payload(row["payload"]).get("older_id")
+        # The owner of the pair: the operation in the `operation` mode, the slot
+        # group in the `legacy` mode (LSBN-S-7).
+        owner = self._task_operation(slot, row["kind"])
         self._log_attention_event(
             "job_attention_released",
-            job=self._job_for_slot(slot),
-            slot=slot,
+            job=self._job_for_slot(owner),
+            slot=owner,
             note_id=note_id,
             older_id=older_id,
             reason=reason,
@@ -1242,6 +2348,11 @@ class BackgroundWorker:
                     §6.8/§13.3). A successful slot knock (`reason="probe"`) leads here NO
                     MORE (no39-04): "the slot revived" is not "the pair's reason is
                     gone".
+
+                    The key is the breaker key: the SLOT group in the `legacy`
+                    mode, the OPERATION in the `operation` mode (release 3.9.0,
+                    LSBN-S-7) — the neighbour operation keeps its attention.
+
         """
         self._ensure_job_table()
         # an observability hook (tests): release attempts per reason
@@ -1251,6 +2362,22 @@ class BackgroundWorker:
                 rows = conn.execute(
                     "SELECT id FROM worker_jobs WHERE attention_at IS NOT NULL"
                 ).fetchall()
+            elif self._mode() == SLOT_MODEL_OPERATION:
+                # The `operation` mode: the reset is per OPERATION (the breaker
+                # key) — the tasks of a neighbour operation keep their
+                # attention (a title failure must not clear the attention of a
+                # summarize pair). The rows keep their legacy slot values
+                # until the migration (LSBN-S-14) — the owner of a row is read
+                # through `_task_operation`.
+                rows = conn.execute(
+                    "SELECT id, slot, kind FROM worker_jobs "
+                    "WHERE attention_at IS NOT NULL"
+                ).fetchall()
+                rows = [
+                    row
+                    for row in rows
+                    if self._task_operation(row["slot"], row["kind"]) == slot
+                ]
             else:
                 rows = conn.execute(
                     "SELECT id FROM worker_jobs WHERE attention_at IS NOT NULL "
@@ -1316,14 +2443,21 @@ class BackgroundWorker:
                     gone for good, and a release would freeze the pair again.
                     SQL and vector reads only — no models called. Returns the unfrozen
                     count.
+
+                    Release 3.9.0 (LSBN-S-14): the queue is read under the slot values
+                    of the mode — the legacy value and the operation name in the
+                    `operation` mode (the migration of `worker_jobs.slot` moves the rows
+                    from one to the other; the reader covers both).
         """
         self._ensure_job_table()
+        slot_values = self._queue_slot_values(slot, kind)
+        bindings = ", ".join("?" * len(slot_values))
         with session(self._settings) as conn:
             rows = conn.execute(
                 "SELECT id, note_id, payload FROM worker_jobs "
-                "WHERE slot = ? AND kind = ? AND status = 'pending' "
+                f"WHERE slot IN ({bindings}) AND kind = ? AND status = 'pending' "
                 "AND attention_at IS NOT NULL ORDER BY id",
-                (slot, kind),
+                (*slot_values, kind),
             ).fetchall()
         released = 0
         for row in rows:
@@ -1510,12 +2644,54 @@ class BackgroundWorker:
                     `notify_summary_pending` signal (the "on demand" form, pool 6) or a
                     timeout. The summary slot breaker is checked by the framework gate
                     (`JobSpec.gate`, 3.4.1, LSBN-T-29) — the manual `if` is gone.
+
+                    The `legacy` mode only (release 3.9.0, LSBN-S-6): in the
+                    `operation` mode the cycle is cut into three jobs — the
+                    title, the summarize and the merge loops (`_process_title`,
+                    `_process_summarize`, `_process_merge`), each with its own
+                    breaker.
         """
         with history.bind_origin(f"job:{SUMMARY_JOB}"):
             processed = await asyncio.to_thread(self.process_title_pending)
             processed += await asyncio.to_thread(self.process_summary_pending)
             processed += await asyncio.to_thread(self.process_merge_pending)
         return processed
+
+    async def _process_title(self) -> int:
+        """The `title` job's run: the title generation (the `title IS NULL` work).
+
+                    One of the three jobs of the split summary cycle (release
+                    3.9.0, LSBN-S-6): its own loop, its own signal and its own
+                    breaker (the `title` operation). A title failure does not
+                    stop the summarize loop — the failure belongs to the
+                    operation that produced it.
+
+        """
+        with history.bind_origin(f"job:{TITLE_JOB}"):
+            return await asyncio.to_thread(self.process_title_pending)
+
+    async def _process_summarize(self) -> int:
+        """The `summarize` job's run: the pending summarizations.
+
+                    One of the three jobs of the split summary cycle (release
+                    3.9.0, LSBN-S-6): its own loop, its own signal and its own
+                    breaker (the `summarize` operation).
+
+        """
+        with history.bind_origin(f"job:{SUMMARIZE_JOB}"):
+            return await asyncio.to_thread(self.process_summary_pending)
+
+    async def _process_merge(self) -> int:
+        """The `merge` job's run: the pending merge jobs.
+
+                    One of the three jobs of the split summary cycle (release
+                    3.9.0, LSBN-S-6): its own loop, its own signal (set at the
+                    merge job's creation) and its own breaker (the `merge`
+                    operation).
+
+        """
+        with history.bind_origin(f"job:{MERGE_JOB}"):
+            return await asyncio.to_thread(self.process_merge_pending)
 
     async def _run_summary(self) -> None:
         """Serve the summary job with the framework loop (a single-job run).
@@ -1529,6 +2705,37 @@ class BackgroundWorker:
         if spec is None:
             return  # without a summarizer the job is not applicable (a test mode)
         await run_loop(spec, self._is_stopping, self._backoff[SUMMARY_JOB])
+
+    async def _run_title(self) -> None:
+        """Serve the `title` job with the framework loop (a single-job run).
+
+                    See `_run_summary`: an isolated run of one job of the split
+                    summary cycle (the `operation` mode).
+        """
+        spec = build_title_job(self, self._settings)
+        if spec is None:
+            return  # the `legacy` mode (or a test mode without a summarizer)
+        await run_loop(spec, self._is_stopping, self._job_backoff(spec))
+
+    async def _run_summarize(self) -> None:
+        """Serve the `summarize` job with the framework loop (a single-job run).
+
+                    See `_run_title`.
+        """
+        spec = build_summarize_job(self, self._settings)
+        if spec is None:
+            return  # the `legacy` mode (or a test mode without a summarizer)
+        await run_loop(spec, self._is_stopping, self._job_backoff(spec))
+
+    async def _run_merge(self) -> None:
+        """Serve the `merge` job with the framework loop (a single-job run).
+
+                    See `_run_title`.
+        """
+        spec = build_merge_job(self, self._settings)
+        if spec is None:
+            return  # the `legacy` mode (or a test mode without a summarizer)
+        await run_loop(spec, self._is_stopping, self._job_backoff(spec))
 
     async def _process_judge(self) -> int:
         """The judge job's run: a batch of judge jobs (dedup) in `to_thread`.
@@ -1633,14 +2840,10 @@ class BackgroundWorker:
                     Pool 5, one-time creation: the full DDL runs only at the first access
                     per worker instance (memoized on the `_jobs_table_ready` flag);
                     repeated calls (3 per job: `_create_job`, `_pending_jobs`,
-                    `_mark_job_done`) return immediately. The `idx_worker_jobs_queue`
-                    index on (slot, kind, status, id): a slot's pending queue is selected
-                    by the index, not a full table scan. The attention columns (#39, arch
-                    §5.2/§6.8) — `attempts`/`last_outcome`/`last_error`/`attention_at` —
-                    are in the fresh DDL and added by an idempotent ALTER over
-                    `PRAGMA table_info(worker_jobs)` for a live database of the previous
-                    version; the `idx_worker_jobs_attention` index serves the "needs
-                    attention" selection.
+                    `_mark_job_done`) return immediately. The DDL itself — the table,
+                    the attention columns and the indexes — lives in
+                    `ensure_worker_jobs_schema` (the module-level function; the
+                    migration of the slot values calls it too).
 
                     The DDL — under a lock (lsbdef-0013): two threads (a loop via
                     `asyncio.to_thread` + the startup attention release in `run`)
@@ -1655,55 +2858,7 @@ class BackgroundWorker:
         with self._jobs_table_lock:
             if self._jobs_table_ready:  # another thread already migrated it
                 return
-            with session(self._settings) as conn:
-                conn.execute(
-                    "CREATE TABLE IF NOT EXISTS worker_jobs ("
-                    "  id           INTEGER PRIMARY KEY,"
-                    "  slot         TEXT NOT NULL,"
-                    "  kind         TEXT NOT NULL,"
-                    "  note_id      INTEGER NOT NULL,"
-                    "  payload      TEXT,"
-                    "  status       TEXT NOT NULL DEFAULT 'pending',"
-                    "  created_at   TEXT NOT NULL DEFAULT "
-                    "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
-                    "  updated_at   TEXT NOT NULL DEFAULT "
-                    "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
-                    "  attempts     INTEGER NOT NULL DEFAULT 0,"
-                    "  last_outcome TEXT,"
-                    "  last_error   TEXT,"
-                    "  attention_at TEXT"
-                    ")"
-                )
-                existing = {
-                    row["name"]
-                    for row in conn.execute(
-                        "PRAGMA table_info(worker_jobs)"
-                    ).fetchall()
-                }
-                for name, ddl in (
-                    ("attempts", "INTEGER NOT NULL DEFAULT 0"),
-                    ("last_outcome", "TEXT"),
-                    ("last_error", "TEXT"),
-                    ("attention_at", "TEXT"),
-                ):
-                    if name not in existing:
-                        try:
-                            conn.execute(
-                                f"ALTER TABLE worker_jobs ADD COLUMN {name} {ddl}"
-                            )
-                        except sqlite3.OperationalError as exc:
-                            # A competing process managed to add the column
-                            # (lsbdef-0013): we do not crash; the migration continues.
-                            if "duplicate column name" not in str(exc):
-                                raise
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_worker_jobs_queue "
-                    "ON worker_jobs(slot, kind, status, id)"
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_worker_jobs_attention "
-                    "ON worker_jobs(status, attention_at)"
-                )
+            ensure_worker_jobs_schema(self._settings)
             self._jobs_table_ready = True
 
     def _purge_done_jobs(self) -> None:
@@ -1738,14 +2893,30 @@ class BackgroundWorker:
     def _create_job(
         self, slot: str, kind: str, note_id: int, payload: str | None = None
     ) -> None:
-        """Place a job into a slot's queue (the dependency dispatcher)."""
+        """Place a job into a slot's queue (the dependency dispatcher).
+
+                Release 3.9.0 (LSBN-S-14): the row carries the OPERATION name
+                in the `operation` mode (`worker_jobs.slot` = the operation) and
+                the slot group in the `legacy` mode (as before — the legacy mode
+                changes in nothing).
+        """
         self._ensure_job_table()
+        written = self._task_slot(slot, kind)
         with session(self._settings) as conn, transaction(conn):
             conn.execute(
                 "INSERT INTO worker_jobs (slot, kind, note_id, payload) "
                 "VALUES (?, ?, ?, ?)",
-                (slot, kind, note_id, payload),
+                (written, kind, note_id, payload),
             )
+        if kind == "merge" and written in (SLOT_SUMMARY, self._operation_slot("merge")):
+            # A merge job appeared (release 3.9.0, LSBN-S-6): the merge loop of
+            # the `operation` mode has its own signal — the job is taken at
+            # once, not after the grown back-off. The signal is set HERE — at
+            # the creation of the merge task — so every path that creates one
+            # wakes the loop. Release 3.9.0 (LSBN-S-14): the value of the task
+            # is the operation name in the `operation` mode (the legacy one in
+            # the `legacy` mode) — the check answers both.
+            self.notify_merge_pending()
 
     def _ensure_job(
         self, slot: str, kind: str, note_id: int, payload: str | None = None
@@ -1758,15 +2929,25 @@ class BackgroundWorker:
                     existing `_create_job` (judge/merge) is untouched: no dedup is needed
                     there — the "later ↔ earlier" pair and the judge's verdict give their
                     own invariants.
+
+                    Release 3.9.0 (LSBN-S-14): the row carries the OPERATION name in
+                    the `operation` mode; the "already there" check covers BOTH forms
+                    (the legacy value and the operation name) — the task is not
+                    multiplied in the window between the migration of the values and
+                    the switch of the flag. The `legacy` mode writes and checks the
+                    slot group, as before.
         """
         self._ensure_job_table()
+        written = self._task_slot(slot, kind)
+        known = self._queue_slot_values(slot, kind)
+        bindings = ", ".join("?" * len(known))
         with session(self._settings) as conn, transaction(conn):
             conn.execute(
                 "INSERT INTO worker_jobs (slot, kind, note_id, payload) "
                 "SELECT ?, ?, ?, ? WHERE NOT EXISTS ("
-                "SELECT 1 FROM worker_jobs WHERE slot = ? AND kind = ? "
+                f"SELECT 1 FROM worker_jobs WHERE slot IN ({bindings}) AND kind = ? "
                 "AND note_id = ? AND status = 'pending')",
-                (slot, kind, note_id, payload, slot, kind, note_id),
+                (written, kind, note_id, payload, *known, kind, note_id),
             )
 
     def _pending_jobs(
@@ -1777,15 +2958,23 @@ class BackgroundWorker:
                     Frozen jobs (`attention_at IS NOT NULL`, #39 §6.8) are not taken: a
                     repeating non-transient failure stops burning model calls until the
                     reason is gone (the job stays `pending`).
+
+                    Release 3.9.0 (LSBN-S-14): the queue is read under the slot values
+                    of the mode — the legacy value and the operation name in the
+                    `operation` mode (the migration of `worker_jobs.slot` moves the
+                    rows from one to the other; the reader covers both, so no task is
+                    orphaned).
         """
         self._ensure_job_table()
+        slot_values = self._queue_slot_values(slot, kind)
+        bindings = ", ".join("?" * len(slot_values))
         with session(self._settings) as conn:
             return conn.execute(
                 "SELECT id, note_id, payload FROM worker_jobs "
-                "WHERE slot = ? AND kind = ? AND status = 'pending' "
+                f"WHERE slot IN ({bindings}) AND kind = ? AND status = 'pending' "
                 "AND attention_at IS NULL "
                 "ORDER BY id LIMIT ?",
-                (slot, kind, limit),
+                (*slot_values, kind, limit),
             ).fetchall()
 
     def _mark_job_done(self, job_id: int) -> None:
@@ -1852,11 +3041,79 @@ class BackgroundWorker:
         # the queue is empty for it (otherwise a deferred task drives a busy-loop).
         # The same — with decision unavailable and fallback off: there is
         # nowhere to get a decision; the work waits (no39-05, `_decision_blocks_work`).
+        # Release 3.9.0 (LSBN-S-6): the breaker is read through the operation's
+        # key — the operation itself in the `operation` mode, the slot group in
+        # the `legacy` mode (the slot name `summary` has no breaker there —
+        # the S-5 finding M1: a direct lookup raised `KeyError`).
+        # Release 3.9.0 (LSBN-S-7): the decision rule is per operation — in the
+        # `operation` mode the summary family goes (only `judge`/`classify` wait).
         return (
             int(row["c"]) == 0
-            or self._breakers[SLOT_SUMMARY].is_paused()
-            or self._decision_blocks_work()
+            or self._breaker_paused(self._operation_slot("summarize"))
+            or self._decision_blocks_key(self._operation_slot("summarize"))
         )
+
+    def _title_queue_empty(self) -> bool:
+        """Is the title queue empty (the title work: `title IS NULL`)?
+
+                    The title queue of the split summary cycle (release 3.9.0,
+                    LSBN-S-6): the title generation is a job of its own. The
+                    predicate is the title work ONLY — the summarization and
+                    the merge have their own predicates (each loop takes its
+                    own work; a failure of one operation does not stop the
+                    others).
+
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM notes WHERE title IS NULL "
+                "AND deleted_at IS NULL"
+            ).fetchone()
+        return int(row[0]) == 0 or self._operation_blocked("title")
+
+    def _summarize_queue_empty(self) -> bool:
+        """Is the summarize queue empty (the summarization work:
+        `summary_status='pending'`)?
+
+                    The summarize queue of the split summary cycle (release
+                    3.9.0, LSBN-S-6): its own predicate — the pending
+                    summarizations only.
+
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM notes WHERE summary_status = 'pending' "
+                "AND deleted_at IS NULL"
+            ).fetchone()
+        return int(row[0]) == 0 or self._operation_blocked("summarize")
+
+    def _merge_queue_empty(self) -> bool:
+        """Is the merge queue empty (the pending merge jobs)?
+
+                    The merge queue of the split summary cycle (release 3.9.0,
+                    LSBN-S-6): the merge jobs live in `worker_jobs` — under the
+                    slot value `summary` (the legacy slot group) until the
+                    migration of the slot values (release 3.9.0, LSBN-S-14), and
+                    under the operation name `merge` after it. The `operation`
+                    mode reads BOTH values (the migration moves the rows from one
+                    to the other; the reader covers both) — no work is orphaned
+                    by the migration.
+
+                    #39 (arch §6.9/§13.9): only TAKEABLE work is counted — a
+                    frozen job (`attention_at`) cannot be taken by the loop.
+
+        """
+        self._ensure_job_table()
+        slot_values = self._queue_slot_values(SLOT_SUMMARY, "merge")
+        bindings = ", ".join("?" * len(slot_values))
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM worker_jobs "
+                f"WHERE slot IN ({bindings}) AND kind = 'merge' "
+                "AND status = 'pending' AND attention_at IS NULL",
+                slot_values,
+            ).fetchone()
+        return int(row[0]) == 0 or self._operation_blocked("merge")
 
     def _judge_queue_empty(self) -> bool:
         """Is the judge queue empty (a cheap SELECT, pool 6, lost wakeup).
@@ -1875,11 +3132,14 @@ class BackgroundWorker:
             ).fetchone()
         # #39 (arch §6.9): with the judge breaker open no batch is taken —
         # the queue is empty for the loop (no busy-loop); the same with decision
-        # unavailable and fallback off (no39-05).
+        # unavailable and fallback off (no39-05). Release 3.9.0 (LSBN-S-7): the
+        # breaker is read through the operation's key (the operation itself in
+        # the `operation` mode, the slot group in the `legacy` mode) and the
+        # decision rule is per operation there.
         return (
             int(row[0]) == 0
-            or self._breakers[SLOT_JUDGE].is_paused()
-            or self._decision_blocks_work()
+            or self._breaker_paused(self._operation_slot("judge"))
+            or self._decision_blocks_key(self._operation_slot("judge"))
         )
 
     def _embedding_queue_empty(self) -> bool:
@@ -1918,7 +3178,7 @@ class BackgroundWorker:
         # batch — the queue is empty for it (otherwise a deferred task drives a
         # busy-loop). The memory check — before SQL: the breaker closes both of the
         # job's queues at once (notes and chunks).
-        if self._slot_blocked(SLOT_EMBEDDING):
+        if self._slot_blocked(self._operation_slot("embed")):
             return True
         pending = int(self._notes.vector_queue_stat()["pending"] or 0)
         with session(self._settings) as conn:
@@ -1940,13 +3200,37 @@ class BackgroundWorker:
                     `/health.queues` contract; the probe knock after the pause expires is
                     `gate`'s concern, i.e. `worker._slot_gate`, in the framework
                     `run_loop`).
+
+                    The key is the breaker key: the SLOT group in the `legacy`
+                    mode, the OPERATION in the `operation` mode (release 3.9.0,
+                    LSBN-S-7) — the decision rule is per operation there (the
+                    design, B4): only `judge` and `classify` wait for the
+                    decision slot.
+
         """
         breaker = self._breakers.get(slot)
         return (
             breaker is not None and breaker.is_paused()
-        ) or (
-            slot in (SLOT_SUMMARY, SLOT_JUDGE) and self._decision_blocks_work()
-        )
+        ) or self._decision_blocks_key(slot)
+
+    def _decision_blocks_key(self, key: str) -> bool:
+        """Does the unavailable decision slot block this breaker key?
+
+                    The decision rule (no39-05) is per operation in the
+                    `operation` mode (release 3.9.0, LSBN-S-7; the design, B4):
+                    only the operations whose path goes through the decision
+                    slot wait — `judge` and `classify` (the classifier walks
+                    into the decision slot). The `summarize`/`title`/`merge`/
+                    `describe`/`embed` operations go. The `legacy` mode keeps
+                    the historical rule: the whole `summary` slot family and
+                    the `judge` slot wait.
+
+        """
+        if not self._decision_blocks_work():
+            return False
+        if self._mode() == SLOT_MODEL_OPERATION:
+            return key in _DECISION_BLOCKED_OPERATIONS
+        return key in (SLOT_SUMMARY, SLOT_JUDGE)
 
     def queues_health(self) -> dict[str, dict]:
         """Assemble `/health.queues` over the job registry (FR-2.2): SQL only.
@@ -1960,6 +3244,16 @@ class BackgroundWorker:
                     for ALL jobs (before, the external migration/warnings and areas did
                     not obey this). No model calls (only reading the pending state;
                     `is_gated` — memory/SQL, see `_slot_blocked`).
+
+                    Release 3.9.0 (LSBN-S-15; the design, B6): in the `operation`
+                    mode the block carries BOTH forms — the old job keys stay
+                    (`vector`/`summary`/`judge`/`areas`/`nodes`/`migration`/
+                    `warnings` — the consumers of the old form must not break) and
+                    the keys of the OPERATIONS are added (`title`/`summarize`/
+                    `merge`/`judge`/`embed`/`classify` — the counters of a key are
+                    the counters of its operation). The `legacy` mode keeps the
+                    registry's form in every respect.
+
         """
         queues: dict[str, dict] = {}
         for spec in build_job_specs(self, self._settings):
@@ -1969,7 +3263,91 @@ class BackgroundWorker:
             if spec.is_gated is not None and spec.is_gated():
                 stat = gated_queue_stat(stat)
             queues[spec.queue] = stat
+        if self._mode() == SLOT_MODEL_OPERATION:
+            queues.update(self._operation_queues(queues))
         return queues
+
+    def _operation_queues(self, queues: dict[str, dict]) -> dict[str, dict]:
+        """The queue keys of the OPERATIONS (`/health.queues`, the `operation` mode).
+
+                    Release 3.9.0 (LSBN-S-15; the design, B6): the counters of a
+                    key are the counters of its operation — the operation's own
+                    work. The keys of the operations that have a job of their own
+                    (`title`/`summarize`/`merge`/`judge`) are already in the
+                    registry's block (the split of the summary cycle — LSBN-S-6);
+                    the two operations without a job of their own are added here:
+
+                    `embed` — the work of the embed operation: the notes'
+                    vectorization (the `vector` key) and the area records (the
+                    `areas` key) — the sum of the two;
+                    `classify` — the `reclass` tasks of `worker_jobs` (the
+                    classifier's own tasks), read under the slot values of the
+                    mode (`nodes` legacy / `classify` migrated — LSBN-S-14).
+
+                    The legacy `summary` key — the summary cycle's aggregate — is
+                    restored here: in the `operation` mode the `summary` job does
+                    not exist (the cycle is cut into three jobs), but the old key
+                    must stay (the consumers of the old form). Its value is the
+                    historical one — the notes awaiting a title or a summary plus
+                    the merge jobs.
+
+        """
+        added: dict[str, dict] = {}
+        # The legacy `summary` key — the historical aggregate of the cycle.
+        if SLOT_SUMMARY not in queues:
+            added[SLOT_SUMMARY] = self._summary_queue_stat()
+        # The `embed` operation — the notes and the areas.
+        vector = queues.get("vector") or {}
+        areas = queues.get("areas") or {}
+        added["embed"] = queue_snapshot(
+            int(vector.get("pending") or 0) + int(areas.get("pending") or 0),
+            _oldest_of(vector.get("oldest_pending_sec"), areas.get("oldest_pending_sec")),
+            waiting=int(vector.get("waiting") or 0) + int(areas.get("waiting") or 0),
+            attention=int(vector.get("attention") or 0)
+            + int(areas.get("attention") or 0),
+        )
+        # The `classify` operation — the reclass tasks.
+        added["classify"] = self._classify_queue_stat()
+        return added
+
+    def _classify_queue_stat(self) -> dict:
+        """The `classify` OPERATION's queue: the `reclass` tasks.
+
+                    The classifier's own tasks — the `reclass` rows of
+                    `worker_jobs` (the reclassification after stitching) — read
+                    under the slot values of the mode (`nodes` legacy /
+                    `classify` migrated — the migration of LSBN-S-14). The sweep
+                    pools of the `nodes` job are NOT counted here: they are the
+                    nodes job's work (its own key `nodes`).
+
+                    `pending` — the tasks the classifier has yet to do;
+                    `attention` — the tasks frozen for a human (the same count
+                    the operation's entry of `/health.slots` carries); `waiting`
+                    — the attentioned ones (the framework's shape).
+
+        """
+        self._ensure_job_table()
+        slot_values = self._queue_slot_values(NODES_JOB, NODES_RECLASS_KIND)
+        bindings = ", ".join("?" * len(slot_values))
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT "
+                "COALESCE(SUM(status = 'pending'), 0) AS pending, "
+                "COALESCE(SUM(attention_at IS NOT NULL), 0) AS attention, "
+                "MAX(CASE WHEN status = 'pending' "
+                "  THEN CAST(strftime('%s','now') AS INTEGER) - "
+                "  CAST(strftime('%s', created_at) AS INTEGER) END) "
+                "AS oldest_pending_sec "
+                f"FROM worker_jobs WHERE slot IN ({bindings}) AND kind = 'reclass'",
+                slot_values,
+            ).fetchone()
+        attention = int(row["attention"])
+        return queue_snapshot(
+            row["pending"],
+            row["oldest_pending_sec"],
+            waiting=attention,
+            attention=attention,
+        )
 
     def _vector_queue_stat(self) -> dict:
         """The raw snapshot of the note-vectorization queue: pending and age.
@@ -1995,16 +3373,25 @@ class BackgroundWorker:
                     done by the framework (`is_gated` → `gated_queue_stat`, 3.4.1,
                     LSBN-T-29) — the method's own waiting/attention computation is
                     untouched.
+
+                    Release 3.9.0 (LSBN-S-15): the merge jobs are read under the slot
+                    values of the MODE — the legacy value `summary` and the operation
+                    name `merge` in the `operation` mode (the migration of
+                    `worker_jobs.slot` — LSBN-S-14). The `legacy` mode reads the
+                    legacy value only (as before — the same rows, the same
+                    counters).
         """
         self._ensure_job_table()
+        slot_values = self._queue_slot_values(SLOT_SUMMARY, "merge")
+        bindings = ", ".join("?" * len(slot_values))
         with session(self._settings) as conn:
             row = conn.execute(
                 "SELECT "
                 "(SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL "
                 "  AND (title IS NULL OR summary_status = 'pending')) "
-                "+ (SELECT COUNT(*) FROM worker_jobs WHERE slot = 'summary' "
+                f"+ (SELECT COUNT(*) FROM worker_jobs WHERE slot IN ({bindings}) "
                 "  AND status = 'pending' AND attention_at IS NULL) AS pending, "
-                "(SELECT COUNT(*) FROM worker_jobs WHERE slot = 'summary' "
+                f"(SELECT COUNT(*) FROM worker_jobs WHERE slot IN ({bindings}) "
                 "  AND status = 'pending' AND attention_at IS NOT NULL) "
                 "AS attention, "
                 "MAX("
@@ -2014,8 +3401,85 @@ class BackgroundWorker:
                 "  summary_status = 'pending')), 0), "
                 "COALESCE((SELECT MAX(CAST(strftime('%s','now') AS INTEGER) - "
                 "  CAST(strftime('%s', created_at) AS INTEGER)) FROM worker_jobs "
-                "  WHERE slot = 'summary' AND status = 'pending'), 0)"
-                ") AS oldest_pending_sec"
+                f"  WHERE slot IN ({bindings}) AND status = 'pending'), 0)"
+                ") AS oldest_pending_sec",
+                (*slot_values, *slot_values, *slot_values),
+            ).fetchone()
+        attention = int(row["attention"])
+        return queue_snapshot(
+            row["pending"],
+            row["oldest_pending_sec"],
+            waiting=attention,
+            attention=attention,
+        )
+
+    def _title_queue_stat(self) -> dict:
+        """The raw snapshot of the title queue: the notes without a title.
+
+                    The title queue of the split summary cycle (release 3.9.0,
+                    LSBN-S-6): `pending` — the notes with `title IS NULL` (the
+                    title work), `oldest_pending_sec` — their age. The pending
+                    → waiting move on a breaker is done by the framework
+                    (`is_gated` → `gated_queue_stat`, 3.4.1, LSBN-T-29).
+
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS pending, "
+                "MAX(CAST(strftime('%s','now') AS INTEGER) - "
+                "CAST(strftime('%s', updated_at) AS INTEGER)) "
+                "AS oldest_pending_sec FROM notes "
+                "WHERE title IS NULL AND deleted_at IS NULL"
+            ).fetchone()
+        return queue_snapshot(row["pending"], row["oldest_pending_sec"])
+
+    def _summarize_queue_stat(self) -> dict:
+        """The raw snapshot of the summarize queue: the pending summarizations.
+
+                    The summarize queue of the split summary cycle (release
+                    3.9.0, LSBN-S-6): `pending` — the notes with
+                    `summary_status='pending'`, `oldest_pending_sec` — their
+                    age.
+
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS pending, "
+                "MAX(CAST(strftime('%s','now') AS INTEGER) - "
+                "CAST(strftime('%s', updated_at) AS INTEGER)) "
+                "AS oldest_pending_sec FROM notes "
+                "WHERE summary_status = 'pending' AND deleted_at IS NULL"
+            ).fetchone()
+        return queue_snapshot(row["pending"], row["oldest_pending_sec"])
+
+    def _merge_queue_stat(self) -> dict:
+        """The raw snapshot of the merge queue: the pending merge jobs.
+
+                    The merge queue of the split summary cycle (release 3.9.0,
+                    LSBN-S-6): `pending` — the merge jobs WITHOUT attention
+                    (takeable now); `attention` — with attention (no39-02,
+                    waiting for a human); `waiting = attention`. The age
+                    (3.3.1, LSBN-S-3) — over ALL of the pending jobs (an
+                    attention-only state must not give `null`). The jobs are
+                    read under the slot values of the mode — the legacy value
+                    `summary` and the operation name `merge` in the `operation`
+                    mode (the migration of the values is release 3.9.0,
+                    LSBN-S-14; the reader covers both).
+
+        """
+        self._ensure_job_table()
+        slot_values = self._queue_slot_values(SLOT_SUMMARY, "merge")
+        bindings = ", ".join("?" * len(slot_values))
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(attention_at IS NULL), 0) AS pending, "
+                "COALESCE(SUM(attention_at IS NOT NULL), 0) AS attention, "
+                "MAX(CAST(strftime('%s','now') AS INTEGER) - "
+                "CAST(strftime('%s', created_at) AS INTEGER)) "
+                "AS oldest_pending_sec FROM worker_jobs "
+                f"WHERE slot IN ({bindings}) AND kind = 'merge' "
+                "AND status = 'pending'",
+                slot_values,
             ).fetchone()
         attention = int(row["attention"])
         return queue_snapshot(
@@ -2164,7 +3628,16 @@ class BackgroundWorker:
             embeddings = self._embedding.embed_texts(
                 [_embed_input(row["title"], row["text"]) for row in rows]
             )
-        except EmbeddingError:
+        except EmbeddingError as exc:
+            # Release 3.9.0 (LSBN-S-13): in the `operation` mode the failure is
+            # a failure of the `embed` operation (its own breaker); the `legacy`
+            # mode keeps the path as it was (no event, no breaker).
+            self._note_embed_failure(
+                EMBEDDING_JOB,
+                exc,
+                event="embed_failed",
+                message="vectorization failed — the notes stay pending",
+            )
             return 0
         processed = 0
         for row, vector in zip(rows, embeddings):
@@ -2241,9 +3714,12 @@ class BackgroundWorker:
             )
         except EmbeddingError as exc:
             # #39: an embedding slot failure carries the outcome type (the records — pending).
+            # Release 3.9.0 (LSBN-S-7): the breaker key is the operation — the
+            # `embed` operation in the `operation` mode, the `embedding` slot in
+            # the `legacy` mode.
             self._log_slot_failure(
                 AREAS_JOB,
-                SLOT_EMBEDDING,
+                self._operation_slot("embed"),
                 outcome_of(exc),
                 event="area_embed_failed",
                 message="area vectorization failed — records stay pending",
@@ -2294,7 +3770,11 @@ class BackgroundWorker:
                 )
         # #39 (arch §6.9): areas are encoded by the embedding slot — on its
         # breaker no batch is taken; the queue is empty for the loop (no busy-loop).
-        return pending == 0 or self._breakers[SLOT_EMBEDDING].is_paused()
+        # Release 3.9.0 (LSBN-S-6): the breaker is read through the operation's
+        # key — the `embed` operation in the `operation` mode (the slot name
+        # `embedding` has no breaker there — the S-5 finding M1: a direct
+        # lookup raised `KeyError`).
+        return pending == 0 or self._breaker_paused(self._operation_slot("embed"))
 
     # --- the judge loop: the dedup judge (Phase 8, Stage 3.2; Phase 11, #10) --
 
@@ -2428,9 +3908,10 @@ class BackgroundWorker:
                     best = self._pick_duplicate(note_id, alive, by_id)
                 except JudgeError as exc:
                     # #39 (§6.7): a slot failure carries the outcome type and a reason fragment.
+                    # Release 3.9.0 (LSBN-S-7): the breaker key is the operation.
                     self._log_slot_failure(
                         JUDGE_JOB,
-                        SLOT_JUDGE,
+                        self._operation_slot("judge"),
                         outcome_of(exc),
                         event="dedup_judge_failed",
                         message="dedup: judge undecidable — both notes kept, retry queued",
@@ -2498,6 +3979,14 @@ class BackgroundWorker:
                     A merge failure (SummaryError, NFR-3) does not spoil the data: both
                     notes stay, the work stays pending — a retry on the summary loop's
                     back-off.
+
+                    Release 3.9.0 (LSBN-S-12): in the `operation` mode the merge
+                    answers with the free text (the contract `parts-by-delimiter`)
+                    and the code names the parts: the FIRST part keeps the title of
+                    the earlier note (the decision O. Q1 of 15.11.2026 — a merge
+                    does not create a new entity, no model call is made), the other
+                    parts are written with a NULL title and go to the `title` queue.
+                    The `legacy` mode is unchanged.
         """
         if self._summarizer is None:
             return 0  # a test mode without a summarizer: merging is impossible
@@ -2523,7 +4012,8 @@ class BackgroundWorker:
                 continue
             with session(self._settings) as conn:
                 rows = conn.execute(
-                    "SELECT id, text, deleted_at, updated_at, expires_at, origin_note_id "
+                    "SELECT id, text, title, deleted_at, updated_at, expires_at, "
+                    "origin_note_id "
                     "FROM notes "
                     "WHERE id IN (?, ?)",
                     (older_id, note_id),
@@ -2548,7 +4038,7 @@ class BackgroundWorker:
                     "dedup: merge skipped — a note has a lifetime",
                     extra={
                         "event": "dedup_skipped",
-                        "job": SUMMARY_JOB,
+                        "job": self._job_name("merge"),
                         "older_id": older_id,
                         "note_id": note_id,
                         "reason": "note has a lifetime",
@@ -2570,7 +4060,7 @@ class BackgroundWorker:
                     "dedup: merge skipped — one source",
                     extra={
                         "event": "dedup_skipped",
-                        "job": SUMMARY_JOB,
+                        "job": self._job_name("merge"),
                         "older_id": older_id,
                         "note_id": note_id,
                         "reason": "same origin",
@@ -2599,13 +4089,15 @@ class BackgroundWorker:
                 payload["newer_updated_at"] = newer["updated_at"]
                 self._set_job_payload(job["id"], payload)
             try:
-                merge_result = self._summarizer.merge(older["text"], newer["text"])
+                merge_result = self._summarizer.merge(
+                    older["text"], newer["text"], title=older["title"]
+                )
                 # Observability (F-23 p. 7): a slot_call for EVERY call —
                 # the follow-up call (the 2nd round) is visible in the journal as a separate line.
                 for meta in merge_result.metas or [merge_result.meta]:
                     self._log_slot_call(
-                        SUMMARY_JOB,
-                        SLOT_SUMMARY,
+                        self._job_name("merge"),
+                        self._operation_slot("merge"),
                         meta,
                         older_id=older_id,
                         note_id=note_id,
@@ -2613,6 +4105,9 @@ class BackgroundWorker:
                 outcome = self._notes.merge_into_parts(
                     older_id,
                     note_id,
+                    # An empty title — the part of the `parts-by-delimiter`
+                    # contract: it is written with a NULL title and goes to the
+                    # `title` queue (release 3.9.0, LSBN-S-12).
                     [(part.title, part.text) for part in merge_result.parts],
                 )
                 if not outcome["merged"]:
@@ -2632,8 +4127,8 @@ class BackgroundWorker:
                 self._mark_job_done(job["id"])
                 done += 1
                 self._log_slot_failure(
-                    SUMMARY_JOB,
-                    SLOT_SUMMARY,
+                    self._job_name("merge"),
+                    self._operation_slot("merge"),
                     outcome_of(exc),
                     event="dedup_merge_deferred",
                     message=(
@@ -2655,8 +4150,8 @@ class BackgroundWorker:
                 continue
             except SummaryError as exc:
                 self._log_slot_failure(
-                    SUMMARY_JOB,
-                    SLOT_SUMMARY,
+                    self._job_name("merge"),
+                    self._operation_slot("merge"),
                     outcome_of(exc),
                     event="dedup_merge_failed",
                     message="dedup: summarizer merge failed — both notes kept, retry queued",
@@ -2675,7 +4170,7 @@ class BackgroundWorker:
                 "dedup: duplicate merged into self-contained parts",
                 extra={
                     "event": "dedup_merged",
-                    "job": SUMMARY_JOB,
+                    "job": self._job_name("merge"),
                     "older_id": older_id,
                     "note_id": note_id,
                     "cosine": payload.get("cosine"),
@@ -2732,7 +4227,7 @@ class BackgroundWorker:
                 "dedup: failed to record merge_deferred warning",
                 extra={
                     "event": "warning_open_failed",
-                    "job": SUMMARY_JOB,
+                    "job": self._job_name("merge"),
                     "older_id": older_id,
                     "note_id": note_id,
                 },
@@ -2820,7 +4315,7 @@ class BackgroundWorker:
             )
             self._log_slot_call(
                 JUDGE_JOB,
-                SLOT_JUDGE,
+                self._operation_slot("judge"),
                 result.meta,
                 note_id=note_id,
                 candidate_id=candidate_id,
@@ -2882,8 +4377,8 @@ class BackgroundWorker:
                 generated = self._summarizer.title(row["text"])
             except SummaryError as exc:
                 self._log_slot_failure(
-                    SUMMARY_JOB,
-                    SLOT_SUMMARY,
+                    self._job_name("title"),
+                    self._operation_slot("title"),
                     outcome_of(exc),
                     event="title_failed",
                     message="title: generation failed — kept null, retry by back-off",
@@ -2897,7 +4392,10 @@ class BackgroundWorker:
                     break
                 continue  # failure: the title stays NULL, a retry on back-off
             self._log_slot_call(
-                SUMMARY_JOB, SLOT_SUMMARY, generated.meta, note_id=row["id"]
+                self._job_name("title"),
+                self._operation_slot("title"),
+                generated.meta,
+                note_id=row["id"],
             )
             title = self._truncate_title(generated.text)
             if not title:
@@ -2932,7 +4430,7 @@ class BackgroundWorker:
                     "title: generated for migration note",
                     extra={
                         "event": "title_generated",
-                        "job": SUMMARY_JOB,
+                        "job": self._job_name("title"),
                         "note_id": row["id"],
                         "vector_invalidated": stale,
                     },
@@ -3017,7 +4515,7 @@ class BackgroundWorker:
                     "summary: short note — summarized without a model call",
                     extra={
                         "event": "summary_shortcircuit",
-                        "job": SUMMARY_JOB,
+                        "job": self._job_name("summarize"),
                         "note_id": row["id"],
                         "text_chars": len(text),
                         "summary_chars": len(summary),
@@ -3028,8 +4526,8 @@ class BackgroundWorker:
                     summary_result = self._summarizer.summarize(text)
                 except SummaryError as exc:
                     self._log_slot_failure(
-                        SUMMARY_JOB,
-                        SLOT_SUMMARY,
+                        self._job_name("summarize"),
+                        self._operation_slot("summarize"),
                         outcome_of(exc),
                         event="summary_failed",
                         message=(
@@ -3046,7 +4544,10 @@ class BackgroundWorker:
                         break
                     continue  # failure: the pending status stays, a retry on back-off
                 self._log_slot_call(
-                    SUMMARY_JOB, SLOT_SUMMARY, summary_result.meta, note_id=row["id"]
+                    self._job_name("summarize"),
+                    self._operation_slot("summarize"),
+                    summary_result.meta,
+                    note_id=row["id"],
                 )
                 # The length safety net (the 3.1.0 gate decision, 2026-09-19): the
                 # model may ignore the prompt ("no more than 150 characters") — what
@@ -3235,13 +4736,21 @@ class BackgroundWorker:
         """
         if self._classifier is None:
             return  # a test mode without a classifier
+        if self._classify_blocked():
+            # Release 3.9.0 (LSBN-S-9): the `classify` operation is paused —
+            # the model is NOT called. The note stays unclassified (the work is
+            # not lost: the sweep of the `nodes` job takes it after the pause).
+            return
         known = self._namespaces.list_all()["namespaces"]
         try:
             result = self._classifier.classify(text, known)
         except ClassificationError as exc:
+            # Release 3.9.0 (LSBN-S-7): the breaker key is the operation — the
+            # `classify` operation in the `operation` mode, the `summary` slot
+            # in the `legacy` mode.
             self._log_slot_failure(
                 SUMMARY_JOB,
-                SLOT_SUMMARY,
+                self._operation_slot("classify"),
                 outcome_of(exc),
                 event="classify_failed",
                 message="classify: failed — note stays in default, retry on next update",
@@ -3251,7 +4760,7 @@ class BackgroundWorker:
             )
             return
         self._log_slot_call(
-            SUMMARY_JOB, SLOT_SUMMARY, result.meta, note_id=note_id
+            SUMMARY_JOB, self._operation_slot("classify"), result.meta, note_id=note_id
         )
         # Pool 6: the move — ONE shared point `_apply_node_order` (the markup +
         # namespace/vector_status in one UPDATE, the guard inside); a failure
@@ -3292,11 +4801,33 @@ class BackgroundWorker:
                     warning with traceback into the logs, the queue loops live. A retry —
                     the next default-note classification or the next sweep run: groups are
                     not lost, they just reach the threshold later.
+
+                    Release 3.9.0 (LSBN-S-8): in the `operation` mode the structural
+                    judge has its OWN breaker — while it is closed the judge is not
+                    called (the candidate waits), and its failure is recorded at that
+                    breaker (the dedup judge's breaker is not touched). The `legacy`
+                    mode is unchanged: the failures stay inside the trigger and the
+                    whole slot group shares one breaker.
+
+                    Release 3.9.0 (LSBN-S-10): the same for the `describe`
+                    operation — its own breaker: while it is closed the
+                    description model is not called (the candidate waits), and
+                    its failure is recorded at that breaker (the neighbours —
+                    `classify`, `summarize`, `judge` — are not touched). The
+                    `legacy` mode is unchanged: the description is attempted as
+                    before (the pause of the slot group stops the job).
         """
         if self._promoter is None:
             return  # a test mode without the trigger
+        is_operation_mode = self._mode() == SLOT_MODEL_OPERATION
         try:
-            report = self._promoter.run()
+            if is_operation_mode:
+                report = self._promoter.run(
+                    judge_enabled=not self._operation_blocked("structure_judge"),
+                    describe_enabled=not self._operation_blocked("describe"),
+                )
+            else:
+                report = self._promoter.run()
         except Exception:
             logging.getLogger("app").warning(
                 "promotion: run failed — trigger deferred to next classification",
@@ -3308,6 +4839,9 @@ class BackgroundWorker:
                 exc_info=True,
             )
             return
+        if is_operation_mode:
+            self._note_structure_judge_failures(job)
+            self._note_describe_failures(job)
         if any(report.values()):
             # The summary — under one key: 'created' clashes with the LogRecord
             # attribute (the creation time) — extra does not accept it.
@@ -3318,6 +4852,58 @@ class BackgroundWorker:
                     "job": job,
                     "report": report,
                 },
+            )
+
+    def _note_structure_judge_failures(self, job: str) -> None:
+        """The structural judge's failures — at the breaker of its operation.
+
+                    Release 3.9.0 (LSBN-S-8): the failure of the structural judge
+                    is recorded at the breaker of the `structure_judge` operation —
+                    the dedup judge's breaker is NOT touched (the two operations
+                    are independent: a dead model of one does not silence the
+                    other). The candidate itself stays without a verdict (the
+                    trigger keeps it) — the work is not lost, a retry is at the
+                    next run.
+        """
+        for failure in getattr(self._promoter, "judge_failures", []):
+            error = failure.get("error")
+            self._log_slot_failure(
+                job,
+                self._operation_slot("structure_judge"),
+                outcome_of(error) if isinstance(error, BaseException)
+                else SlotOutcome.OFF_CONTRACT,
+                event="promotion_judge_failed",
+                message="promotion: structure judge failed — candidate kept, retry",
+                detail=str(error) if error is not None else None,
+                domain=failure.get("domain"),
+                slug=failure.get("slug"),
+            )
+
+    def _note_describe_failures(self, job: str) -> None:
+        """The description's failures — at the breaker of its operation.
+
+                    Release 3.9.0 (LSBN-S-10): the failure of the description
+                    generator is recorded at the breaker of the `describe`
+                    operation — the neighbours (`classify`, `summarize`, `judge`,
+                    `structure_judge`) are NOT touched (the operations are
+                    independent: a dead model of one does not silence the
+                    others). The candidate itself stays without a description
+                    (the trigger keeps it) — the work is not lost, a retry is at
+                    the next run.
+        """
+        for failure in getattr(self._promoter, "describer_failures", []):
+            error = failure.get("error")
+            self._log_slot_failure(
+                job,
+                self._operation_slot("describe"),
+                outcome_of(error)
+                if isinstance(error, BaseException)
+                else SlotOutcome.OFF_CONTRACT,
+                event="promotion_describe_failed",
+                message="promotion: description generation failed — candidate kept, retry",
+                detail=str(error) if error is not None else None,
+                domain=failure.get("domain"),
+                slug=failure.get("slug"),
             )
 
     def _auto_move_target(self, result) -> str | None:
@@ -3442,6 +5028,11 @@ class BackgroundWorker:
             return False  # waiting for the summary: the task stays pending
         if self._classifier is None:
             return False  # a test mode without a classifier
+        if self._classify_blocked():
+            # Release 3.9.0 (LSBN-S-9): the `classify` operation is paused —
+            # the model is NOT called, the task stays `pending` (the work is
+            # not lost; no attempt is counted).
+            return False
         known = self._namespaces.list_all()["namespaces"]
         text = f"{row['title']}\n{summary}" if row["title"] else summary
         try:
@@ -3450,9 +5041,10 @@ class BackgroundWorker:
             # A classifier failure does not spoil the data (FR-3.1): the note stays
             # in its current node, no markup is written, the task — pending. #39:
             # the event carries the outcome type of the summary slot's failure.
+            # Release 3.9.0 (LSBN-S-7): the breaker key is the operation.
             self._log_slot_failure(
                 NODES_JOB,
-                SLOT_SUMMARY,
+                self._operation_slot("classify"),
                 outcome_of(exc),
                 event="node_order_failed",
                 message="nodes: reclass failed — note stays in its node, retry by back-off",
@@ -3463,7 +5055,7 @@ class BackgroundWorker:
             )
             return False
         self._log_slot_call(
-            NODES_JOB, SLOT_SUMMARY, result.meta, note_id=note_id
+            NODES_JOB, self._operation_slot("classify"), result.meta, note_id=note_id
         )
         outcome, reason, target = self._apply_node_order(
             note_id,
@@ -3513,6 +5105,11 @@ class BackgroundWorker:
         limit = min(budget, self._settings.job_nodes_classifier_budget)
         if limit <= 0 or self._classifier is None:
             return 0
+        if self._classify_blocked():
+            # Release 3.9.0 (LSBN-S-9): the `classify` operation is paused —
+            # the model is NOT called, the notes stay candidates of the next
+            # run (the work is not lost).
+            return 0
         with session(self._settings) as conn:
             rows = conn.execute(_NODES_CLASSIFY_SELECT, (limit,)).fetchall()
         known = self._namespaces.list_all()["namespaces"]
@@ -3524,9 +5121,10 @@ class BackgroundWorker:
             try:
                 result = self._classifier.classify(text, known)
             except ClassificationError as exc:
+                # Release 3.9.0 (LSBN-S-7): the breaker key is the operation.
                 self._log_slot_failure(
                     NODES_JOB,
-                    SLOT_SUMMARY,
+                    self._operation_slot("classify"),
                     outcome_of(exc),
                     event="classify_failed",
                     message="nodes: classify failed — note stays in default, retry later",
@@ -3536,7 +5134,7 @@ class BackgroundWorker:
                 )
                 continue  # no marker: the note is a sweep candidate again
             self._log_slot_call(
-                NODES_JOB, SLOT_SUMMARY, result.meta, note_id=note_id
+                NODES_JOB, self._operation_slot("classify"), result.meta, note_id=note_id
             )
             outcome, reason, target = self._apply_node_order(
                 note_id,
@@ -3599,13 +5197,16 @@ class BackgroundWorker:
                     `gated_queue_stat`, 3.4.1, LSBN-T-29).
         """
         self._ensure_job_table()
+        slot_values = self._queue_slot_values(NODES_JOB, NODES_RECLASS_KIND)
+        params: dict[str, object] = {
+            "threshold": self._settings.namespace_auto_move_min_confidence
+        }
+        for index, value in enumerate(slot_values):
+            params[f"slot{index}"] = value
         with session(self._settings) as conn:
             row = conn.execute(
-                _nodes_queue_stat_sql(),
-                {
-                    "threshold":
-                        self._settings.namespace_auto_move_min_confidence
-                },
+                _nodes_queue_stat_sql(slot_values),
+                params,
             ).fetchone()
         return queue_snapshot(row["pending"], row["oldest_pending_sec"])
 
@@ -3627,7 +5228,7 @@ class BackgroundWorker:
                     (no39-05). SQL only, no model calls (FR-2.2).
         """
         return (
-            self._slot_blocked(SLOT_SUMMARY)
+            self._slot_blocked(self._operation_slot("classify"))
             or int(self._nodes_queue_stat()["pending"] or 0) == 0
         )
 
@@ -3746,6 +5347,15 @@ class BackgroundWorker:
         written = 0
         for batch, result in zip(batches, results):
             if isinstance(result, EmbeddingError):
+                # Release 3.9.0 (LSBN-S-13): in the `operation` mode the failure
+                # is a failure of the `embed` operation (its own breaker); the
+                # `legacy` mode keeps the path as it was.
+                self._note_embed_failure(
+                    EMBEDDING_JOB,
+                    result,
+                    event="chunk_embed_failed",
+                    message="chunk vectorization failed — the chunks stay pending",
+                )
                 continue  # an encoding failure: the chunks stay pending (NFR-3)
             if isinstance(result, BaseException):
                 raise result  # an unexpected failure — loud, as in the other loops
@@ -3830,9 +5440,9 @@ def build_embedding_job(worker: BackgroundWorker, settings: Settings) -> JobSpec
         wait_event=worker._embedding_event,
         idle_hook=worker._purge_done_jobs,
         queue_stat=worker._vector_queue_stat,
-        slot=SLOT_EMBEDDING,
-        gate=lambda: worker._slot_gate(SLOT_EMBEDDING, EMBEDDING_JOB),
-        is_gated=lambda: worker._slot_blocked(SLOT_EMBEDDING),
+        slot=worker._operation_slot("embed"),
+        gate=lambda: worker._slot_gate(worker._operation_slot("embed"), EMBEDDING_JOB),
+        is_gated=lambda: worker._slot_blocked(worker._operation_slot("embed")),
     )
 
 
@@ -3846,7 +5456,14 @@ def build_summary_job(
                 Without a summarizer (the Phase-3 test mode) the job is not
                 applicable — the builder returns None and it does not enter the
                 registry (the loop did not exist before either).
+
+                The `legacy` mode only (release 3.9.0, LSBN-S-6): in the
+                `operation` mode the cycle is cut into three jobs — the
+                `title`, `summarize` and `merge` ones (their own builders
+                below); the combined job does not exist there.
     """
+    if worker._mode() == SLOT_MODEL_OPERATION:
+        return None  # the split jobs take its place (LSBN-S-6)
     if worker._summarizer is None:
         return None
     return JobSpec(
@@ -3866,6 +5483,107 @@ def build_summary_job(
     )
 
 
+def build_title_job(
+    worker: BackgroundWorker, settings: Settings
+) -> JobSpec | None:
+    """The `title` job: the title generation, the `title` signal.
+
+                One of the three jobs of the split summary cycle (release 3.9.0,
+                LSBN-S-6): its own queue (the notes without a title), its own
+                signal, its own breaker (the `title` operation). The gate —
+                `_slot_gate` with the operation's breaker (with a probe knock),
+                `is_gated` — the same condition without models.
+
+                The `operation` mode only: in the `legacy` mode the whole cycle
+                is the `summary` job (as before) — the builder returns None and
+                the job does not enter the registry.
+    """
+    if worker._mode() != SLOT_MODEL_OPERATION:
+        return None
+    if worker._summarizer is None:
+        return None
+    return JobSpec(
+        name=TITLE_JOB,
+        queue=TITLE_JOB,
+        interval_sec=settings.pending_retry_sec,
+        batch=None,
+        enabled=True,
+        process=worker._process_title,
+        queue_empty=worker._title_queue_empty,
+        wait_event=worker._title_event,
+        idle_hook=None,
+        queue_stat=worker._title_queue_stat,
+        slot=worker._operation_slot("title"),
+        gate=lambda: worker._slot_gate(worker._operation_slot("title"), TITLE_JOB),
+        is_gated=lambda: worker._operation_blocked("title"),
+    )
+
+
+def build_summarize_job(
+    worker: BackgroundWorker, settings: Settings
+) -> JobSpec | None:
+    """The `summarize` job: the pending summarizations, the `summary` signal.
+
+                One of the three jobs of the split summary cycle (release 3.9.0,
+                LSBN-S-6): its own queue (`summary_status='pending'`), its own
+                signal, its own breaker (the `summarize` operation).
+
+                The `operation` mode only — see `build_title_job`.
+    """
+    if worker._mode() != SLOT_MODEL_OPERATION:
+        return None
+    if worker._summarizer is None:
+        return None
+    return JobSpec(
+        name=SUMMARIZE_JOB,
+        queue=SUMMARIZE_JOB,
+        interval_sec=settings.pending_retry_sec,
+        batch=None,
+        enabled=True,
+        process=worker._process_summarize,
+        queue_empty=worker._summarize_queue_empty,
+        wait_event=worker._summary_event,
+        idle_hook=None,
+        queue_stat=worker._summarize_queue_stat,
+        slot=worker._operation_slot("summarize"),
+        gate=lambda: worker._slot_gate(
+            worker._operation_slot("summarize"), SUMMARIZE_JOB
+        ),
+        is_gated=lambda: worker._operation_blocked("summarize"),
+    )
+
+
+def build_merge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec | None:
+    """The `merge` job: the pending merge jobs, the `merge` signal.
+
+                One of the three jobs of the split summary cycle (release 3.9.0,
+                LSBN-S-6): its own queue (the merge jobs of `worker_jobs`), its
+                own signal (set at the merge job's creation), its own breaker
+                (the `merge` operation).
+
+                The `operation` mode only — see `build_title_job`.
+    """
+    if worker._mode() != SLOT_MODEL_OPERATION:
+        return None
+    if worker._summarizer is None:
+        return None
+    return JobSpec(
+        name=MERGE_JOB,
+        queue=MERGE_JOB,
+        interval_sec=settings.pending_retry_sec,
+        batch=None,
+        enabled=True,
+        process=worker._process_merge,
+        queue_empty=worker._merge_queue_empty,
+        wait_event=worker._merge_event,
+        idle_hook=None,
+        queue_stat=worker._merge_queue_stat,
+        slot=worker._operation_slot("merge"),
+        gate=lambda: worker._slot_gate(worker._operation_slot("merge"), MERGE_JOB),
+        is_gated=lambda: worker._operation_blocked("merge"),
+    )
+
+
 def build_judge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
     """The `judge` job: a batch of judge jobs (dedup), the `judge` signal.
 
@@ -3878,6 +5596,13 @@ def build_judge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
 
                 The slot gate (3.4.1, LSBN-T-29): `gate` — `_slot_gate` (with a probe
                 knock), `is_gated` — `_slot_blocked` (snapshots without models).
+
+                Release 3.9.0 (LSBN-S-8): the judge operation goes through the
+                operation API (`_operation_slot`/`_operation_blocked`): the gate
+                and the blocked check are read from the breaker of the
+                `judge` operation — in the `operation` mode its own breaker
+                (the dedup judge and the structural judge do not share one),
+                in the `legacy` mode the `judge` slot group (as before).
     """
     return JobSpec(
         name=JUDGE_JOB,
@@ -3894,9 +5619,9 @@ def build_judge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         wait_event=worker._judge_event,
         idle_hook=None,
         queue_stat=worker._judge_queue_stat,
-        slot=SLOT_JUDGE,
-        gate=lambda: worker._slot_gate(SLOT_JUDGE, JUDGE_JOB),
-        is_gated=lambda: worker._slot_blocked(SLOT_JUDGE),
+        slot=worker._operation_slot("judge"),
+        gate=lambda: worker._slot_gate(worker._operation_slot("judge"), JUDGE_JOB),
+        is_gated=lambda: worker._operation_blocked("judge"),
     )
 
 
@@ -3921,9 +5646,9 @@ def build_areas_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         wait_event=worker._areas_event,
         idle_hook=None,
         queue_stat=worker._areas_queue_stat,
-        slot=SLOT_EMBEDDING,
-        gate=lambda: worker._slot_gate(SLOT_EMBEDDING, AREAS_JOB),
-        is_gated=lambda: worker._slot_blocked(SLOT_EMBEDDING),
+        slot=worker._operation_slot("embed"),
+        gate=lambda: worker._slot_gate(worker._operation_slot("embed"), AREAS_JOB),
+        is_gated=lambda: worker._slot_blocked(worker._operation_slot("embed")),
     )
 
 
@@ -3997,19 +5722,25 @@ def build_nodes_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         wait_event=worker._nodes_event,
         idle_hook=None,
         queue_stat=worker._nodes_queue_stat,
-        slot=SLOT_SUMMARY,
-        gate=lambda: worker._slot_gate(SLOT_SUMMARY, NODES_JOB),
-        is_gated=lambda: worker._slot_blocked(SLOT_SUMMARY),
+        slot=worker._operation_slot("classify"),
+        gate=lambda: worker._slot_gate(worker._operation_slot("classify"), NODES_JOB),
+        is_gated=lambda: worker._slot_blocked(worker._operation_slot("classify")),
     )
 
 
 # Registering the worker's loops in the framework registry (FR-1.1): the framework assembles jobs
 # from `JOB_BUILDERS`; one's own module appends its builders after their definitions
 # (the import is one-way — worker → jobs, no cycle). The order — as the loops had:
-# embedding, summary, judge, areas, expiration, nodes.
+# embedding, summary, judge, areas, expiration, nodes. Release 3.9.0 (LSBN-S-6): the
+# three split jobs of the summary cycle stand where the `summary` job stands — in the
+# `legacy` mode they do not enter the registry (the builders return None), so the
+# registry of the default mode is unchanged.
 jobs.JOB_BUILDERS += (
     build_embedding_job,
     build_summary_job,
+    build_title_job,
+    build_summarize_job,
+    build_merge_job,
     build_judge_job,
     build_areas_job,
     build_expiration_job,

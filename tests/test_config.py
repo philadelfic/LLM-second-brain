@@ -254,6 +254,8 @@ OPTIONAL_ENV: dict[str, tuple[str, object]] = {
     # поле; остальные операции генерирует цикл ниже).
     "SLOT_REASONING_NUM_PREDICT": ("slot_reasoning_num_predict", 0),
     "JUDGE_REASONING_NUM_PREDICT": ("judge_reasoning_num_predict", None),
+    # Релиз 3.9.0, LSBN-S-5: флаг режима слоя (`legacy` | `operation`).
+    "SLOT_MODEL": ("slot_model", "legacy"),
 }
 
 for _prefix in (
@@ -283,6 +285,30 @@ for _prefix in (
         OPTIONAL_ENV[f"{_prefix.upper()}_{_field}"] = (
             f"{_prefix}_{_field.lower()}",
             _default,
+        )
+
+# Релиз 3.9.0, LSBN-S-5: пороги операций — «база + переопределение»
+# (решение О. 15.11.2026): умолчание None = «не задано» → действует глобальная
+# база SLOT_PAUSE_AFTER/SLOT_PAUSE_SEC. У операции decision выключатель один —
+# историческое поле DECISION_ENABLED (слот-резерв F-12, оно уже в таблице).
+for _operation in (
+    "summarize",
+    "title",
+    "merge",
+    "split",
+    "classify",
+    "describe",
+    "judge",
+    "structure_judge",
+    "embed",
+    "decision",
+):
+    for _control in ("PAUSE_AFTER", "PAUSE_SEC", "ENABLED"):
+        if _operation == "decision" and _control == "ENABLED":
+            continue
+        OPTIONAL_ENV[f"{_operation.upper()}_{_control}"] = (
+            f"{_operation}_{_control.lower()}",
+            None,
         )
 
 
@@ -343,7 +369,11 @@ class TestCompleteness:
         + 1 сегмент верификации нарезки релиза 3.7.0:
         SPLIT_VERIFY_SEGMENT_CHARS
         + 1 граница остановки LSBN-D-16 релиза 3.7.0:
-        SHUTDOWN_TIMEOUT_SEC)."""
+        SHUTDOWN_TIMEOUT_SEC);
+        + 30 настроек релиза 3.9.0 (LSBN-S-5): флаг режима слоя SLOT_MODEL
+        и пороги операций <OP>_PAUSE_AFTER/<OP>_PAUSE_SEC/<OP>_ENABLED
+        (выключатель decision — историческое DECISION_ENABLED, оно уже в
+        таблице)."""
         expected = {field for field, _ in OPTIONAL_ENV.values()}
         expected |= {name.lower() for name in REQUIRED_ENV}
         assert set(Settings.model_fields) == expected

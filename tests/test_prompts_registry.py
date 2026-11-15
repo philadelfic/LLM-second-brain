@@ -95,12 +95,17 @@ class TestRegistryApi:
         with pytest.raises(KeyError):
             PromptRegistry().get("no_such_prompt")
 
-    def test_editable_are_exactly_four(self) -> None:
-        """4 редактируемых: + summary_split_system (LSBN-F-22 M2)."""
+    def test_editable_are_exactly_six(self) -> None:
+        """6 редактируемых: + summary_split_system_delimiter (LSBN-S-11 —
+        промпт нарезки нового контракта `parts-by-delimiter`) и
+        + summary_merge_system_delimiter (LSBN-S-12 — промпт слияния того же
+        контракта)."""
         assert EDITABLE_PROMPTS == (
             "summary_system",
             "summary_merge_system",
+            "summary_merge_system_delimiter",
             "summary_split_system",
+            "summary_split_system_delimiter",
             "judge_system",
         )
 
@@ -130,15 +135,17 @@ def _read(dirpath: pathlib.Path, name: str) -> str:
 
 
 class TestFileMechanics:
-    def test_seed_creates_four_editable_files(self, tmp_path: pathlib.Path) -> None:
-        """Первый старт с prompts_dir: ровно 4 редактируемых файла-дефолта."""
+    def test_seed_creates_six_editable_files(self, tmp_path: pathlib.Path) -> None:
+        """Первый старт с prompts_dir: ровно 6 редактируемых файла-дефолта."""
         registry = PromptRegistry(prompts_dir=tmp_path)
         files = sorted(p.name for p in tmp_path.iterdir())
         assert files == [
             "judge_system.txt",
             "seed_meta.json",
             "summary_merge_system.txt",
+            "summary_merge_system_delimiter.txt",
             "summary_split_system.txt",
+            "summary_split_system_delimiter.txt",
             "summary_system.txt",
         ]
         # Содержимое seed-файлов — встроенные тексты (стартовый дефолт).
@@ -148,10 +155,32 @@ class TestFileMechanics:
             == registry.summary_merge_system
         )
         assert (
+            _read(tmp_path, "summary_merge_system_delimiter")
+            == registry.summary_merge_system_delimiter
+        )
+        assert (
             _read(tmp_path, "summary_split_system")
             == registry.summary_split_system
         )
+        assert (
+            _read(tmp_path, "summary_split_system_delimiter")
+            == registry.summary_split_system_delimiter
+        )
         assert _read(tmp_path, "judge_system") == registry.judge_system
+
+    def test_split_delimiter_file_wins_over_builtin(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """Файл нового ключа (LSBN-S-11) побеждает встроенный текст."""
+        custom = "Раздели части строкой === PART ===, пиши плотно."
+        (tmp_path / "summary_split_system_delimiter.txt").write_text(
+            custom, encoding="utf-8"
+        )
+        registry = PromptRegistry(prompts_dir=tmp_path)
+        assert registry.summary_split_system_delimiter == custom
+        # Legacy-ключ не затронут: его файл — отдельный.
+        assert registry.summary_split_system != custom
+        assert registry.summary_split_system == PromptRegistry().summary_split_system
 
     def test_seed_is_idempotent(self, tmp_path: pathlib.Path) -> None:
         """Повторный старт не перезаписывает существующие файлы."""

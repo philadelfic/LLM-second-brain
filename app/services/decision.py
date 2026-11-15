@@ -54,6 +54,7 @@ from app.services.llm_client import (
     LLMClient,
     LLMError,
 )
+from app.services.operations import operation_mode, pause_after, pause_sec
 from app.services.slot_breaker import SlotBreaker
 from app.services.slot_outcome import SlotOutcome, classify_llm_error
 
@@ -222,11 +223,28 @@ class DecisionService:
         # The suppressed slot's switch reason: by default "the slot is not
         # there now"; `disable(outcome=unsupported)` raises it to "cannot do it".
         self._disabled_reason = "unavailable"
-        self._breaker = SlotBreaker(
-            SLOT_DECISION,
-            settings.slot_pause_sec,
-            open_after=settings.slot_pause_after,
-        )
+        # The decision breaker lives HERE, not in the worker (arch §13.8): the
+        # decision call happens inside the service, the worker does not see it;
+        # "one breaker point per slot" is preserved — the `SlotBreaker` class is
+        # the same.
+        #
+        # Release 3.9.0 (LSBN-S-13): the `decision` operation is a full operation of
+        # the registry — its own breaker with its own thresholds. In the `operation`
+        # mode the thresholds are the per-operation ones (`DECISION_PAUSE_AFTER`/
+        # `DECISION_PAUSE_SEC` — the env prefix stays `DECISION_*`), else the global
+        # base; in the `legacy` mode the slot's own base is used (as before).
+        if operation_mode(settings):
+            self._breaker = SlotBreaker(
+                SLOT_DECISION,
+                pause_sec("decision", settings),
+                open_after=pause_after("decision", settings),
+            )
+        else:
+            self._breaker = SlotBreaker(
+                SLOT_DECISION,
+                settings.slot_pause_sec,
+                open_after=settings.slot_pause_after,
+            )
         self._answers = 0
         self._fallbacks = 0
         self._by_reason: dict[str, int] = {reason: 0 for reason in DECISION_REASONS}
@@ -240,6 +258,19 @@ class DecisionService:
     def can_decide(self) -> bool:
         """May we ask for a decision (enabled and not suppressed by the startup check)."""
         return self._enabled and self._ok and self._llm is not None
+
+    @property
+    def breaker(self) -> SlotBreaker:
+        """The operation's own breaker (the state of the decision slot).
+
+                    Release 3.9.0 (LSBN-S-13): the `decision` operation's
+                    breaker — its own pause and its own thresholds (the
+                    per-operation values in the `operation` mode, the global
+                    base in the `legacy` mode). The worker reads the snapshot
+                    of it for `/health.slots`.
+
+        """
+        return self._breaker
 
     def disable(self, *, outcome: str | None = None) -> None:
         """Suppress the slot: the startup check did not confirm "can do decision".
@@ -309,7 +340,7 @@ class DecisionService:
         if outcome is None:
             self._breaker.note_success()
             self._log_slot_event(
-                "slot_resumed", job, after_sec=self._settings.slot_pause_sec
+                "slot_resumed", job, after_sec=self._breaker.pause_sec
             )
         elif self._breaker.note_failure(outcome):
             self._log_slot_event(

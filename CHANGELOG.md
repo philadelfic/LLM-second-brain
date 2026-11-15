@@ -79,7 +79,7 @@ probability (`LSBN-T-41`), and the journal names the scale it applied.
   new record with a recipe and observable metrics; an empty recipe means the
   record is not ready.
 
-* **MCP `tuning_list` / `tuning_get`, REST `GET /v1/tuning` / `GET /v1/tuning/{key}`**
+* **MCP `tuning_list` / `tuning_get`, REST `GET /tuning` / `GET /tuning/{key}`**
   — one registry behind both transports and one card shape for a future front end
   (a tooltip per handle, no separate reference list): the list answers key, value
   and effect, the card adds `hint`, `metrics`, `calibrated`, `safe`, `slot` and

@@ -127,6 +127,11 @@ class TestHealth:
             # LSBN-F-22 (M3): база без миграции — блок только с фазой-заглушкой.
             # slot — разделитель слота нарезки (LSBN-T-27): значения из конфига
             "migration": {"phase": None, "slot": {"batch": 5, "pause_sec": 600}},
+            # LSBN-S-15 (the design, B6): the mode of the slot layer and the
+            # number of the rows that still carry an old slot value — visible in
+            # BOTH modes.
+            "slot_mode": "legacy",
+            "slot_migration_pending": 0,
         }
 
     def test_contract_fields(self, client: TestClient) -> None:
@@ -153,6 +158,8 @@ class TestHealth:
             "update",
             "backups",
             "migration",  # LSBN-F-22 M3: фаза/причина/прогресс самомиграции
+            "slot_mode",  # LSBN-S-15: режим слоя (legacy|operation)
+            "slot_migration_pending",  # LSBN-S-15: строки в старых значениях
         }
         assert body["status"] == "ok"
         # techdebt-0036 (FR-4.2): версия — из приложения, не из окружения.

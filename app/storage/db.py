@@ -1730,6 +1730,31 @@ def selfheal_chunk_orphans(conn: sqlite3.Connection) -> None:
         )
 
 
+def _effective_embedding_values(settings: Settings) -> tuple[str, str]:
+    """The effective embedding model and provider (release 3.9.0, LSBN-S-18).
+
+            The `operation` mode - the values of the `embed` operation
+            (`SlotSpec.for_operation("embed", settings)` - the very source the
+            vectorization uses, app/services/embedding.py); the `legacy` mode -
+            the slot values (`EMBEDDING_MODEL` / `EMBEDDING_PROVIDER`), exactly
+            as before: there the slot value IS the effective one (the brief's
+            decision 3).
+
+            The dimension has no per-operation counterpart: it is pinned at the
+            database creation (the vec0 table) - `settings.embedding_dim`.
+
+            The imports are local: the storage layer does not pull the service
+            layer at import time (app.services imports app.storage - a cycle).
+    """
+    from app.services.llm_client import SlotSpec  # local, no import cycle
+    from app.services.operations import operation_mode
+
+    if operation_mode(settings):
+        spec, _sources = SlotSpec.for_operation("embed", settings)
+        return spec.model, spec.provider
+    return settings.embedding_model, settings.embedding_provider
+
+
 def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
     """Compare the vectorization/chunking configuration with the meta records;
     on a divergence — an auto-reindex at startup.
@@ -1763,8 +1788,18 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
     pattern: a database without the embedding_provider key (pre-Phase 11) gets
     the env record without a reindex; a provider change under the same model
     name is a reindex too (another provider's model vectors are incompatible).
+
+    Release 3.9.0 (LSBN-S-18): the model and the provider are compared and
+    written as the EFFECTIVE values of the `embed` operation (the
+    `_effective_embedding_values` helper) — in the `operation` mode the
+    operation's own env (`EMBED_MODEL` / `EMBED_PROVIDER`), in the `legacy`
+    mode the slot values (unchanged). The same effective values go into the
+    meta and into the reindex event: a slot value in the meta would make the
+    next start see a false "the model changed" (a needless reindex) or miss a
+    real change.
     """
     conn.execute(_META_DDL)
+    effective_model, effective_provider = _effective_embedding_values(settings)
     stored = _get_meta(conn, "embedding_model")
     stored_dim_raw = _get_meta(conn, "embedding_dim")
     existing_dim = vectors.existing_vec_dim(conn)
@@ -1775,9 +1810,9 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
         _create_chunk_vec_if_missing(conn, settings.embedding_dim)
         _create_area_vec_if_missing(conn, settings.embedding_dim)
         _set_chunk_meta_defaults(conn, settings)
-        _set_meta(conn, "embedding_model", settings.embedding_model)
+        _set_meta(conn, "embedding_model", effective_model)
         _set_meta(conn, "embedding_dim", str(settings.embedding_dim))
-        _set_meta(conn, "embedding_provider", settings.embedding_provider)
+        _set_meta(conn, "embedding_provider", effective_provider)
         return
     stored_dim = int(stored_dim_raw)
     # The embedding provider (Phase 11): a database without the key (pre-Phase
@@ -1785,12 +1820,12 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
     # a reindex.
     stored_provider = _get_meta(conn, "embedding_provider")
     if stored_provider is None:
-        _set_meta(conn, "embedding_provider", settings.embedding_provider)
-        stored_provider = settings.embedding_provider
+        _set_meta(conn, "embedding_provider", effective_provider)
+        stored_provider = effective_provider
     model_changed = (
-        stored != settings.embedding_model
+        stored != effective_model
         or stored_dim != settings.embedding_dim
-        or stored_provider != settings.embedding_provider
+        or stored_provider != effective_provider
     )
     # Chunk parameters: compare ONLY the previously pinned keys (an absent key
     # is the zero migration — "never changed"; written below).
@@ -1820,11 +1855,11 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
         message = "embedding provider/model/dim changed: rebuilding vector index"
         started_extra.update(
             from_model=stored,
-            to_model=settings.embedding_model,
+            to_model=effective_model,
             from_dim=stored_dim,
             to_dim=settings.embedding_dim,
             from_provider=stored_provider,
-            to_provider=settings.embedding_provider,
+            to_provider=effective_provider,
         )
     for key, (old_value, new_value) in chunk_changes.items():
         started_extra[f"from_{key}"] = old_value
@@ -1858,9 +1893,9 @@ def _sync_embedding_meta(conn: sqlite3.Connection, settings: Settings) -> None:
     with transaction(conn):
         rechunked, reused = _rechunk_all_notes(conn, settings)
         if model_changed:
-            _set_meta(conn, "embedding_model", settings.embedding_model)
+            _set_meta(conn, "embedding_model", effective_model)
             _set_meta(conn, "embedding_dim", str(settings.embedding_dim))
-            _set_meta(conn, "embedding_provider", settings.embedding_provider)
+            _set_meta(conn, "embedding_provider", effective_provider)
         for key in _CHUNK_META_KEYS:
             _set_meta(conn, key, str(getattr(settings, key)))
     pending_chunks = int(chunks.count_pending(conn))

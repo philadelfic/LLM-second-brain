@@ -17,6 +17,15 @@
 # rebuilt, ALL notes (including trash) go back to pending and the background
 # worker re-encodes them. Search/dedup thresholds are calibrated for
 # qwen3-embedding:8b — recalibrate after switching the embedding model.
+#
+# Release 3.9.0 (LSBN-S-16) — the env NAMES of the operations. Every operation
+# has its own flat env `<OP>_*` (SUMMARIZE_*, TITLE_*, MERGE_*, SPLIT_*,
+# CLASSIFY_*, DESCRIBE_*, JUDGE_*, STRUCTURE_JUDGE_*, EMBED_*). The per-operation
+# block below repeats the values of the slot blocks: the OLD group names
+# (SUMMARY_*, EMBEDDING_*) are still in force in the `legacy` mode (the mode of
+# the contour) and are removed in 3.10.0; in the `operation` mode the slot layer
+# is out of the chain, so the old names do NOT act and the startup warns about
+# them (a warning, not a failure). Keep the two blocks equal until 3.10.0.
 
 services:
   second-brain:
@@ -29,12 +38,22 @@ services:
     environment:
       # --- required ---
       MCP_AUTH_TOKEN: "CHANGE_ME"                  # Bearer token for all endpoints except /health; keep the production value in gitignored docker-compose.override.yml
+      # --- the mode switch of release 3.9.0: legacy = the old slot layer (the
+      #     contour's mode), operation = the operation layer (the `<OP>_*` names
+      #     below; the old group names do not act there). The contour stays in
+      #     legacy until the acceptance of the release. ---
+      SLOT_MODEL: "legacy"
       # --- embedding slot (vectorization) ---
       EMBEDDING_PROVIDER: "ollama"                 # ollama (default) | openai
       EMBEDDING_BASE_URL: "http://localhost:11434"  # ollama: /api/embed; openai: /v1/embeddings
       EMBEDDING_API_KEY: "CHANGE_ME"               # optional; required for the openai provider (otherwise 401/403 hint on call)
       EMBEDDING_MODEL: "qwen3-embedding:8b"  # change → automatic DB reindex at startup
       EMBEDDING_DIM: "4096"                  # dimension; fixed in DB (meta), change → reindex
+      # --- embed operation (3.9.0): the new names of the operation layer ---
+      EMBED_PROVIDER: "ollama"                  # the same values as the slot block (keep them equal until 3.10.0)
+      EMBED_BASE_URL: "http://localhost:11434"
+      EMBED_API_KEY: "CHANGE_ME"                # the key is NOT inherited from the slot: repeat it per operation
+      EMBED_MODEL: "qwen3-embedding:8b"         # the same model as the slot (a change → the same reindex)
       # --- summary slot (summarization + merge + classification + node description) ---
       SUMMARY_PROVIDER: "ollama"                 # ollama (default) | openai
       SUMMARY_BASE_URL: "http://localhost:11434"  # ollama: /api/chat; openai: /v1/chat/completions
@@ -62,6 +81,71 @@ services:
       # держать слот дольше, чем цикл джобы готов ждать).
       JUDGE_TIMEOUT_SEC: "900"
       JUDGE_CONTEXT_TOKENS: "0"        # 0 = неизвестен; с явным JUDGE_NUM_PREDICT не используется
+      # --- the operations of the summary group (3.9.0): the new names ---
+      # The six operations of the summary slot (summarize, title, merge, split,
+      # classify, describe) have their own env; the values repeat the slot
+      # block above (the old names keep working in the `legacy` mode and are
+      # removed in 3.10.0). The API key is NOT inherited from the slot.
+      SUMMARIZE_PROVIDER: "ollama"
+      SUMMARIZE_BASE_URL: "http://localhost:11434"
+      SUMMARIZE_API_KEY: "CHANGE_ME"
+      SUMMARIZE_MODEL: "ornith:35b"
+      SUMMARIZE_MODEL_TYPE: "generation"
+      SUMMARIZE_THINK: "true"
+      SUMMARIZE_NUM_PREDICT: "0"      # 0 = as much as fits (auto budget)
+      SUMMARIZE_TIMEOUT_SEC: "750"
+      TITLE_PROVIDER: "ollama"
+      TITLE_BASE_URL: "http://localhost:11434"
+      TITLE_API_KEY: "CHANGE_ME"
+      TITLE_MODEL: "ornith:35b"
+      TITLE_MODEL_TYPE: "generation"
+      TITLE_THINK: "true"
+      TITLE_NUM_PREDICT: "0"
+      TITLE_TIMEOUT_SEC: "750"
+      # MERGE_* — the merge budget is MERGE_NUM_PREDICT (below, the old block);
+      # the rest of the merge env repeats the slot values.
+      MERGE_PROVIDER: "ollama"
+      MERGE_BASE_URL: "http://localhost:11434"
+      MERGE_API_KEY: "CHANGE_ME"
+      MERGE_MODEL: "ornith:35b"
+      MERGE_MODEL_TYPE: "generation"
+      MERGE_THINK: "true"
+      MERGE_TIMEOUT_SEC: "750"
+      SPLIT_PROVIDER: "ollama"
+      SPLIT_BASE_URL: "http://localhost:11434"
+      SPLIT_API_KEY: "CHANGE_ME"
+      SPLIT_MODEL: "ornith:35b"
+      SPLIT_MODEL_TYPE: "generation"
+      SPLIT_THINK: "true"
+      SPLIT_NUM_PREDICT: "0"
+      SPLIT_TIMEOUT_SEC: "750"
+      CLASSIFY_PROVIDER: "ollama"
+      CLASSIFY_BASE_URL: "http://localhost:11434"
+      CLASSIFY_API_KEY: "CHANGE_ME"
+      CLASSIFY_MODEL: "ornith:35b"
+      CLASSIFY_MODEL_TYPE: "generation"
+      CLASSIFY_THINK: "true"
+      CLASSIFY_NUM_PREDICT: "0"
+      CLASSIFY_TIMEOUT_SEC: "750"
+      # describe: the budget (512) and think=false are the code defaults
+      # (LSBN-S-10) — they are NOT repeated here on purpose.
+      DESCRIBE_PROVIDER: "ollama"
+      DESCRIBE_BASE_URL: "http://localhost:11434"
+      DESCRIBE_API_KEY: "CHANGE_ME"
+      DESCRIBE_MODEL: "ornith:35b"
+      DESCRIBE_MODEL_TYPE: "generation"
+      DESCRIBE_TIMEOUT_SEC: "750"
+      # structure_judge (3.9.0): the structure judge of the judge group; the
+      # values repeat the judge block above (in the `legacy` mode the structure
+      # judge inherits them from the judge slot).
+      STRUCTURE_JUDGE_PROVIDER: "ollama"
+      STRUCTURE_JUDGE_BASE_URL: "http://localhost:11434"
+      STRUCTURE_JUDGE_API_KEY: "CHANGE_ME"
+      STRUCTURE_JUDGE_MODEL: "ornith:35b"
+      STRUCTURE_JUDGE_MODEL_TYPE: "generation"
+      STRUCTURE_JUDGE_THINK: "true"
+      STRUCTURE_JUDGE_NUM_PREDICT: "4096"
+      STRUCTURE_JUDGE_TIMEOUT_SEC: "900"
       # --- decision slot (LSBN-F-12, 3.2.0): OFF by default; decisions go
       #     generative as today. decision needs Ollama ≥ 0.35.1: the route is
       #     native /v1/systemone, NOT OpenAI-compatible. When enabled, all
@@ -250,6 +334,8 @@ services:
       # NAMESPACE_JUDGE_THINK is unset: the structure judge inherits JUDGE_THINK
       # (thinking). Set "false" for a non-thinking verdict — faster but
       # unstable on borderline candidates in our A/B measurements.
+      # In the `operation` mode the structure judge takes STRUCTURE_JUDGE_THINK
+      # (the operation's own env) — NAMESPACE_JUDGE_THINK stays a legacy source.
     volumes:
       - ./data:/data  # SQLite notes.db, snapshots
       - ./prompts:/app/prompts  # editable prompts (Phase 11)

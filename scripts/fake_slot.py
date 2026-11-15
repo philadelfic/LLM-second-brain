@@ -53,6 +53,16 @@
     text. One stub instance serves both roles at once: a branch's fix step — one
     command for all the slots of that branch.
 
+    The operation the stub plays (`--operation`, release 3.9.0): the names of
+    the registry (`summarize`, `title`, `merge`, `split`, `classify`,
+    `describe`, `judge`, `structure_judge`, `embed`, `decision`). The name
+    picks the ROLE of the answer (the verdict of the judge, the retelling text
+    of the summarizer, the label of the classifier); without it the role is
+    read from the prompt (the historical behaviour — one stub serves several
+    operations at once). The legacy slot-group names (`embedding`, `summary`)
+    are accepted too — the `legacy` mode lives until the acceptance — with a
+    hint about the operation name.
+
     The embedding routes are deliberately NOT emulated (501): branches 3/4/8/9 do
     not touch the vectorization slot, and a half-vector of a wrong dimension
     would only hide the real failure.
@@ -61,6 +71,7 @@
 
     Run:
       python scripts/fake_slot.py --mode auth [--port 8080] [--model NAME ...] [--verbose]
+      python scripts/fake_slot.py --mode ok --operation judge
 """
 
 from __future__ import annotations
@@ -82,6 +93,40 @@ MODES = (
     "decision-unsupported",
     "decision-low-confidence",
 )
+
+# The OPERATIONS of the registry (release 3.9.0): the stub plays one of them.
+OPERATIONS = (
+    "summarize",
+    "title",
+    "merge",
+    "split",
+    "classify",
+    "describe",
+    "judge",
+    "structure_judge",
+    "embed",
+    "decision",
+)
+
+# The legacy slot-group names: accepted (the `legacy` mode lives until the
+# acceptance) with a hint about the operation name.
+LEGACY_SLOT_NAMES = ("embedding", "summary")
+
+# The role of the answer per operation: the judge answers with the verdict
+# marker, the summarizer — with the retelling text, the classifier — with a
+# plain label answer. The operations of the summary group share the text.
+_OPERATION_ROLES = {
+    "summarize": "text",
+    "title": "text",
+    "merge": "text",
+    "split": "text",
+    "describe": "text",
+    "classify": "label",
+    "judge": "verdict",
+    "structure_judge": "verdict",
+    "embed": "text",
+    "decision": "text",
+}
 
 CHAT_PATHS = ("/api/chat", "/v1/chat/completions")
 DECISION_PATH = "/v1/systemone"
@@ -173,13 +218,26 @@ def _question_labels(question: dict[str, Any]) -> list[str]:
     return []
 
 
-def _chat_answer(mode: str, prompt: str) -> tuple[str, str]:
-    """(content, finish_reason) of the chat route's answer for a mode and prompt."""
+def _chat_answer(mode: str, prompt: str, role: str | None = None) -> tuple[str, str]:
+    """(content, finish_reason) of the chat route's answer for a mode and prompt.
+
+            `role` — the role of the OPERATION the stub plays (`--operation`,
+            release 3.9.0): `verdict` (the judge), `text` (the retelling
+            operations), `label` (the classifier). Without a role the role is
+            read from the prompt (the historical behaviour — one stub serves
+            several operations at once).
+    """
     if mode == "empty-length":
         # Reasoning ate the budget: the answer is empty; the reason — a trim by the output limit.
         return "", "length"
     if mode == "offcontract":
         return OFF_CONTRACT_TEXT, "stop"
+    if role == "verdict":
+        return JUDGE_VERDICT, "stop"
+    if role == "text":
+        return SUMMARY_TEXT, "stop"
+    if role == "label":
+        return GENERIC_TEXT, "stop"
     lowered = prompt.lower()
     if "duplicate" in lowered:  # the dedup judge's system prompt
         return JUDGE_VERDICT, "stop"
@@ -217,6 +275,11 @@ class FakeSlotHandler(BaseHTTPRequestHandler):
     @property
     def verbose(self) -> bool:
         return self.server.verbose  # type: ignore[attr-defined]
+
+    @property
+    def role(self) -> str | None:
+        """The role of the operation the stub plays (`verdict`/`text`/`label`)."""
+        return self.server.role  # type: ignore[attr-defined]
 
     def log_message(self, fmt: str, *args: Any) -> None:
         if self.verbose:
@@ -307,7 +370,7 @@ class FakeSlotHandler(BaseHTTPRequestHandler):
             for item in (messages if isinstance(messages, list) else [])
             if isinstance(item, dict)
         )
-        content, finish = _chat_answer(self.mode, prompt)
+        content, finish = _chat_answer(self.mode, prompt, self.role)
         model = payload.get("model")
         if path == "/v1/chat/completions":
             return self._send(200, {
@@ -390,18 +453,24 @@ class FakeSlotServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address: tuple[str, int], mode: str, models: tuple[str, ...],
-                 verbose: bool, *, delay: float = 0.0) -> None:
+                 verbose: bool, *, delay: float = 0.0,
+                 operation: str | None = None) -> None:
         super().__init__(address, FakeSlotHandler)
         self.mode = mode
         self.models = models
         self.verbose = verbose
         self.delay = delay
+        # The OPERATION the stub plays (release 3.9.0): the role of the answer
+        # follows it. `None` — the role is read from the prompt (as before).
+        self.operation = operation
+        self.role = _OPERATION_ROLES.get(operation or "")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Fake slot provider of the LSB 3.2.0 acceptance outage branches",
-        epilog="Modes: see MODES in this file (auth / empty-length / offcontract / decision-*)",
+        epilog="Modes: see MODES in this file (auth / empty-length / offcontract / "
+               "decision-*); the operations: see OPERATIONS",
     )
     parser.add_argument("--mode", default="ok", choices=MODES,
                         help="the way the fake answers (default: ok)")
@@ -410,6 +479,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", action="append", default=[],
                         help="a model name reported by /api/tags and /v1/models "
                              "(repeatable; default: the test contour's names)")
+    parser.add_argument("--operation", default=None,
+                        choices=list(OPERATIONS) + list(LEGACY_SLOT_NAMES),
+                        help="the OPERATION the stub plays: the role of the answer "
+                             "follows it (the legacy slot-group names are accepted "
+                             "too, with a hint)")
     parser.add_argument("--verbose", action="store_true",
                         help="log every request to stderr")
     parser.add_argument("--delay", type=float, default=0.0,
@@ -418,11 +492,26 @@ def main(argv: list[str] | None = None) -> int:
                              "observable; decision routes are not delayed)")
     args = parser.parse_args(argv)
 
+    operation = args.operation
+    if operation in LEGACY_SLOT_NAMES:
+        # The legacy slot-group names are accepted (the `legacy` mode lives until
+        # the acceptance) — with a hint about the operation name.
+        hint = {
+            "embedding": "the operation name is 'embed'",
+            "summary": "the operation names are 'summarize', 'title', 'merge', "
+                       "'split', 'classify', 'describe'",
+        }[operation]
+        print(f"note: '{operation}' is the legacy slot-group name — {hint} "
+              f"(the same channel)", file=sys.stderr, flush=True)
+        # The role of the legacy group: the group of the summarizer.
+        operation = "summarize" if operation == "summary" else "embed"
+
     models = tuple(args.model) or DEFAULT_MODELS
     server = FakeSlotServer((args.host, args.port), args.mode, models, args.verbose,
-                            delay=args.delay)
+                            delay=args.delay, operation=operation)
     print(f"fake slot: mode={args.mode} on {args.host}:{args.port}, "
-          f"models={', '.join(models)}", flush=True)
+          f"models={', '.join(models)}"
+          + (f", operation={operation}" if operation else ""), flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
