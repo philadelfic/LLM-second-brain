@@ -1290,14 +1290,20 @@ class NoteService:
                     between the scan and the merge), nothing is written. Notify after the
                     transaction. An internal method (the worker's merge path) — the
                     REST/MCP contracts do not change.
+
+                    Release 3.9.0 (LSBN-S-12): a part with an EMPTY title — the
+                    contract `parts-by-delimiter` names the parts later — is
+                    written with a NULL title, so the note goes to the `title`
+                    queue (the notes with `title IS NULL`). The `legacy`
+                    contract (a title of every part) is unchanged.
         """
         if not parts:
             raise NoteValidationError("merge_into_parts: пустой список частей")
-        prepared: list[tuple[str, str, list[tuple[str, int]]]] = []
+        prepared: list[tuple[str | None, str, list[tuple[str, int]]]] = []
         for title, text in parts:
             self._validate_text(text)
-            checked_title = self._checked_title(title)
-            prepared.append((checked_title or "", text, self._chunks_of(text)))
+            checked_title = self._merge_part_title(title)
+            prepared.append((checked_title, text, self._chunks_of(text)))
         with session(self._settings) as conn, transaction(conn):
             older = conn.execute(
                 "SELECT namespace FROM notes WHERE id = ? AND deleted_at IS NULL",
@@ -1650,6 +1656,24 @@ class NoteService:
             raise TitleValidationError(TITLE_HINT)
         assert title is not None  # is_valid_title already rejected None — for typing
         return title.strip()
+
+    @staticmethod
+    def _merge_part_title(title: str | None) -> str | None:
+        """The title of a merged part (release 3.9.0, LSBN-S-12).
+
+                    A valid title — written as is. An EMPTY title — "the title
+                    is not named yet": the part of the new
+                    `parts-by-delimiter` contract, written with a NULL title,
+                    so the note goes to the `title` queue (the notes with
+                    `title IS NULL`) and the title is generated there (the same
+                    convention as the splitting parts, LSBN-S-11). A MISSING
+                    title (None) — the validation error, as before: the
+                    `legacy` contract requires a title of every part, and its
+                    write path is unchanged.
+        """
+        if title is not None and not title.strip():
+            return None
+        return NoteService._checked_title(title)
 
     @staticmethod
     def _migration_part_title(title: str | None) -> str | None:

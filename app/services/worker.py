@@ -3186,6 +3186,14 @@ class BackgroundWorker:
                     A merge failure (SummaryError, NFR-3) does not spoil the data: both
                     notes stay, the work stays pending — a retry on the summary loop's
                     back-off.
+
+                    Release 3.9.0 (LSBN-S-12): in the `operation` mode the merge
+                    answers with the free text (the contract `parts-by-delimiter`)
+                    and the code names the parts: the FIRST part keeps the title of
+                    the earlier note (the decision O. Q1 of 15.11.2026 — a merge
+                    does not create a new entity, no model call is made), the other
+                    parts are written with a NULL title and go to the `title` queue.
+                    The `legacy` mode is unchanged.
         """
         if self._summarizer is None:
             return 0  # a test mode without a summarizer: merging is impossible
@@ -3211,7 +3219,8 @@ class BackgroundWorker:
                 continue
             with session(self._settings) as conn:
                 rows = conn.execute(
-                    "SELECT id, text, deleted_at, updated_at, expires_at, origin_note_id "
+                    "SELECT id, text, title, deleted_at, updated_at, expires_at, "
+                    "origin_note_id "
                     "FROM notes "
                     "WHERE id IN (?, ?)",
                     (older_id, note_id),
@@ -3287,7 +3296,9 @@ class BackgroundWorker:
                 payload["newer_updated_at"] = newer["updated_at"]
                 self._set_job_payload(job["id"], payload)
             try:
-                merge_result = self._summarizer.merge(older["text"], newer["text"])
+                merge_result = self._summarizer.merge(
+                    older["text"], newer["text"], title=older["title"]
+                )
                 # Observability (F-23 p. 7): a slot_call for EVERY call —
                 # the follow-up call (the 2nd round) is visible in the journal as a separate line.
                 for meta in merge_result.metas or [merge_result.meta]:
@@ -3301,6 +3312,9 @@ class BackgroundWorker:
                 outcome = self._notes.merge_into_parts(
                     older_id,
                     note_id,
+                    # An empty title — the part of the `parts-by-delimiter`
+                    # contract: it is written with a NULL title and goes to the
+                    # `title` queue (release 3.9.0, LSBN-S-12).
                     [(part.title, part.text) for part in merge_result.parts],
                 )
                 if not outcome["merged"]:

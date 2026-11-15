@@ -1,11 +1,12 @@
 """PromptRegistry - the prompt registry (Phase 11).
 
-    All prompt texts are assembled in one place. The twelve prompts split into two
+    All prompt texts are assembled in one place. The fourteen prompts split into two
     groups (the owner's ruling: "some prompts are ours to polish; nobody edits
     them"):
 
-    - **5 editable** (`summary_system`, `summary_merge_system`,
-      `summary_split_system`, `summary_split_system_delimiter`, `judge_system`):
+    - **6 editable** (`summary_system`, `summary_merge_system`,
+      `summary_merge_system_delimiter`, `summary_split_system`,
+      `summary_split_system_delimiter`, `judge_system`):
       with `prompts_dir` set they are
       written out to files (seed-if-missing - created with the built-in default as
       the starting text) and edited by the operator without an image rebuild;
@@ -25,6 +26,11 @@
     line). The editable `summary_split_system` stays the legacy JSON
     contract's: the two contracts have different shapes, so the operator's
     file of one is never applied to the other.
+
+    Release 3.9.0 (LSBN-S-12): the merge of the `operation` mode has its own
+    editable prompt too — `summary_merge_system_delimiter` (the same
+    `parts-by-delimiter` contract, the same delimiter line). The editable
+    `summary_merge_system` stays the legacy JSON contract's.
 
     The contract guard: the final `judge_system` (built-in or from a file) MUST
     contain the "DUPLICATE" and "NOT DUPLICATE" markers - the dedup verdicts are
@@ -232,6 +238,10 @@ def summary_split_system_prompt(limit: int) -> str:
 #: to it (the edge spaces trimmed) is the separator; the same text inside a
 #: line of the answer is not. It lives here (the module of the prompt that
 #: names it and of the editable key below); `summary.py` imports it.
+#:
+#: Release 3.9.0 (LSBN-S-12): the constant is SHARED by the two operations of
+#: the `parts-by-delimiter` contract — the merge and the split (one constant,
+#: two operations; the design, B7).
 SPLIT_PARTS_DELIMITER = "=== PART ==="
 
 #: The minimum length of a part (LSBN-D-17): a part shorter than this is a
@@ -273,6 +283,42 @@ def summary_split_system_parts_prompt(
         f"separated by a line that contains exactly {delimiter} and nothing "
         "else. Write no titles, no numbers and no explanations — only the "
         "parts' text. The separator line must be on its own line."
+    )
+
+
+# summary.py::MERGE_SYSTEM_PROMPT - merging duplicates, the
+# `parts-by-delimiter` contract (release 3.9.0, LSBN-S-12).
+# The answer is plain text: the parts one after another, separated by a line
+# with the delimiter (a code constant - the prompt names it verbatim). No JSON,
+# no titles - the code names the parts: the first part keeps the title of the
+# EARLIER note, the other parts get their titles later, from the `title` queue
+# (the owner's decision Q1 of 15.11.2026: at a merge no model call is made).
+# The requirements of self-sufficiency and completeness stay the legacy
+# contract's - only the shape of the answer changes (the design, D-13).
+
+def summary_merge_system_parts_prompt(
+    limit: int,
+    delimiter: str = SPLIT_PARTS_DELIMITER,
+) -> str:
+    """The merge system prompt of the `parts-by-delimiter` contract.
+
+        `limit` — the note soft limit from settings; `delimiter` — the code's
+        separator line (named verbatim).
+    """
+    return (
+        "You have two versions of the same note. Merge them into one or several "
+        "SELF-CONTAINED notes (parts): combine all information from both — facts, "
+        "names, numbers, dates, statuses, configs and paths; state each fact once, "
+        "omit repetitions; do not drop anything and do not add anything of your "
+        "own — a shortened retelling is a failure, not a merge. Every part must be "
+        "readable on its own, without references to the other parts. Use ONE part "
+        f"only if the merged text fits the {limit}-character note limit; otherwise "
+        "split the content into several parts, each within the same limit. Write "
+        "coherently, no headings, intros, quotes, or explanations. Respond in the "
+        "language of the notes. Answer with plain text: the parts one after "
+        f"another, separated by a line that contains exactly {delimiter} and "
+        "nothing else. Write no titles, no part numbering and no explanations — "
+        "only the parts' text. The separator line must be on its own line."
     )
 
 
@@ -353,6 +399,12 @@ STRUCTURE_JUDGE_USER_TEMPLATE = (
 BUILTIN_PROMPTS: dict[str, str] = {
     "summary_system": SUMMARY_SYSTEM_PROMPT,
     "summary_merge_system": summary_merge_system_prompt(MAX_NOTE_CHARS_DEFAULT),
+    # The `parts-by-delimiter` contract of the merge operation (release 3.9.0,
+    # LSBN-S-12): the operator's own file — the legacy `summary_merge_system`
+    # stays the legacy JSON contract's.
+    "summary_merge_system_delimiter": summary_merge_system_parts_prompt(
+        MAX_NOTE_CHARS_DEFAULT
+    ),
     "summary_split_system": summary_split_system_prompt(MAX_NOTE_CHARS_DEFAULT),
     # The `parts-by-delimiter` contract of the split operation (release 3.9.0,
     # LSBN-S-11): the operator's own file — the legacy `summary_split_system`
@@ -375,6 +427,11 @@ BUILTIN_PROMPTS: dict[str, str] = {
 EDITABLE_PROMPTS: tuple[str, ...] = (
     "summary_system",
     "summary_merge_system",
+    # The merge of the `operation` mode (release 3.9.0, LSBN-S-12): the prompt
+    # of the `parts-by-delimiter` contract - the operator's own file, like the
+    # other editable prompts (the legacy `summary_merge_system` belongs to the
+    # legacy JSON contract and is not reused here).
+    "summary_merge_system_delimiter",
     "summary_split_system",
     # The split of the `operation` mode (release 3.9.0, LSBN-S-11): the prompt
     # of the `parts-by-delimiter` contract - the operator's own file, like the
@@ -494,7 +551,7 @@ _DECISION_QUESTIONS_FILENAME = "decision_questions.json"
 
 
 class PromptRegistry:
-    """The built-in constants of all 12 prompts + the file overrides.
+    """The built-in constants of all 14 prompts + the file overrides.
 
             Construction = the full readiness preparation: seed-if-missing (with
             `prompts_dir` set), reading the overrides and the contract check of
@@ -502,8 +559,10 @@ class PromptRegistry:
             service start must abort (see the module docstring).
 
             Access - by the prompt names (properties, as pool 3 specified): the
-            editable `summary_system`, `summary_merge_system`, `summary_split_system`,
-            `judge_system` and the hardwired `merge_user`, `split_user`, `judge_user`,
+            editable `summary_system`, `summary_merge_system`,
+            `summary_merge_system_delimiter`, `summary_split_system`,
+            `summary_split_system_delimiter`, `judge_system` and the hardwired
+            `merge_user`, `split_user`, `judge_user`,
             `classifier_system`, `describe_system`, `describe_user`,
             `structure_judge_system`, `structure_judge_user`; the universal
             `get(name)` - for iterating over the `BUILTIN_PROMPTS` list.
@@ -524,6 +583,9 @@ class PromptRegistry:
         self._texts: dict[str, str] = {
             **BUILTIN_PROMPTS,
             "summary_merge_system": summary_merge_system_prompt(max_note_chars),
+            "summary_merge_system_delimiter": summary_merge_system_parts_prompt(
+                max_note_chars
+            ),
             "summary_split_system": summary_split_system_prompt(max_note_chars),
             "summary_split_system_delimiter": summary_split_system_parts_prompt(
                 max_note_chars
@@ -555,6 +617,22 @@ class PromptRegistry:
     def summary_merge_system(self) -> str:
         """The duplicate-merge system prompt (editable)."""
         return self._texts["summary_merge_system"]
+
+    @property
+    def summary_merge_system_delimiter(self) -> str:
+        """The merge system prompt of the `parts-by-delimiter` contract.
+
+            Release 3.9.0 (LSBN-S-12): the prompt of the NEW contract of the
+            merge operation — free text, the parts separated by the delimiter
+            line, no JSON and no titles in the answer (the code names the
+            parts: the first one keeps the title of the earlier note, the
+            others wait for the `title` queue). It is EDITABLE (its own file
+            in `prompts_dir`): the operator's ability to tune the merge
+            prompt must not depend on the slot model. The editable
+            `summary_merge_system` stays the legacy JSON contract's — the two
+            contracts have different shapes.
+        """
+        return self._texts["summary_merge_system_delimiter"]
 
     @property
     def summary_split_system(self) -> str:

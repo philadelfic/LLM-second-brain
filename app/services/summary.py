@@ -152,17 +152,23 @@ SPLIT_FACTS_FLOOR = 0.3
 #: beyond the minimum + slack the model is padding, not decomposing.
 SPLIT_PARTS_SLACK = 2
 
-# --- the answer contract of the split operation (release 3.9.0, LSBN-S-11) ----
+# --- the answer contract of the operations (release 3.9.0) -------------------
 #
 #: The contract of the `legacy` mode: the historical JSON object
 #: ``{"parts": [{"title", "text"}, ...]}`` (LSBN-F-22 M2). The mode keeps it
 #: unchanged - the rollback of the release is the flag.
-SPLIT_CONTRACT_JSON = "json-parts"
+CONTRACT_JSON = "json-parts"
 
 #: The contract of the `operation` mode: free text, the parts separated by a
 #: delimiter line (the contract of the operation in the registry - the design
-#: B7; `OPERATION_REGISTRY["split"].contract`).
-SPLIT_CONTRACT_DELIMITER = "parts-by-delimiter"
+#: B7; `OPERATION_REGISTRY["merge"].contract` / `["split"].contract`). ONE
+#: contract for the two operations of the parts (LSBN-S-11, LSBN-S-12).
+CONTRACT_DELIMITER = "parts-by-delimiter"
+
+#: The names of the split step (LSBN-S-11) — the same two values; the merge
+#: of the step LSBN-S-12 uses them too (the contracts are shared).
+SPLIT_CONTRACT_JSON = CONTRACT_JSON
+SPLIT_CONTRACT_DELIMITER = CONTRACT_DELIMITER
 
 #: The delimiter line between the parts of the answer and the minimum length
 #: of a part live in `prompts.py` (the module of the prompt that names them
@@ -178,24 +184,34 @@ SPLIT_CONTRACT_DELIMITER = "parts-by-delimiter"
 #:     was 102 characters - scraps instead of notes.
 
 
-def split_contract(settings: Settings) -> str:
-    """The answer contract of the `split` operation - the ONE switch point.
+def operation_contract(settings: Settings, operation: str) -> str:
+    """The answer contract of an operation - the ONE switch point.
 
-            The `operation` mode (release 3.9.0, LSBN-S-11): the contract of
-            the operation from the registry (`OPERATION_REGISTRY["split"]` -
+            The `operation` mode (release 3.9.0, LSBN-S-11/S-12): the contract
+            of the operation from the registry (`OPERATION_REGISTRY[operation]` -
             "parts-by-delimiter", the design B7). The `legacy` mode: the
             historical JSON contract of the parts - nothing of the new
             contract touches it (the rollback is the flag).
 
-            The contract of the `merge` operation is NOT read here: the merge
-            keeps the JSON contract until its own step of the release (S-12).
+            ONE function for the two operations of the parts (the merge and
+            the split): the contract is a fact of the operation, not of the
+            call site.
     """
     if not operation_mode(settings):
-        return SPLIT_CONTRACT_JSON
-    spec = OPERATION_REGISTRY.get("split")
+        return CONTRACT_JSON
+    spec = OPERATION_REGISTRY.get(operation)
     if spec is None:
-        return SPLIT_CONTRACT_DELIMITER
+        return CONTRACT_DELIMITER
     return spec.contract
+
+
+def split_contract(settings: Settings) -> str:
+    """The answer contract of the `split` operation (the name of the step S-11).
+
+            A thin alias of `operation_contract` — the switch point is ONE
+            function; the alias keeps the old name of the split step working.
+    """
+    return operation_contract(settings, "split")
 
 
 @dataclass(frozen=True)
@@ -534,9 +550,16 @@ class Summarizer(Protocol):
         """
         ...
 
-    def merge(self, text_a: str, text_b: str) -> MergeResult:
+    def merge(
+        self, text_a: str, text_b: str, *, title: str | None = None
+    ) -> MergeResult:
         """Merge a pair of duplicate texts into a list of self-sufficient parts
                     (dedup, Stage 2.2; LSBN-F-23).
+
+                    `title` — the title of the earlier note (release 3.9.0,
+                    LSBN-S-12): in the `parts-by-delimiter` contract the first
+                    part keeps it, the other parts are named later (the `title`
+                    queue).
         """
         ...
 
@@ -640,38 +663,66 @@ class SummaryService:
         self.last_attempt_ok = True
         return SummaryResult(text=result.content, meta=result.meta)
 
-    def merge(self, text_a: str, text_b: str) -> MergeResult:
+    def merge(
+        self, text_a: str, text_b: str, *, title: str | None = None
+    ) -> MergeResult:
         """Merge a pair of duplicate texts into a list of self-sufficient parts
                     (dedup, Stage 2.2; LSBN-F-23).
+
+                    Release 3.9.0 (LSBN-S-12): the answer contract of the
+                    operation decides the shape of the answer — the free text
+                    with the delimiter line (`parts-by-delimiter`) or the
+                    historical JSON (`legacy`). The contract is read once (the
+                    `_merge_contract` switch), the prompt and the parser follow
+                    it; the `legacy` path is byte-for-byte the old one.
+
+                    `title` — the title of the EARLIER note (the caller passes
+                    it): in the new contract the first part keeps it (the
+                    owner's decision Q1 of 15.11.2026: a merge does not create a
+                    new entity, so no model call is made for the titles).
         """
         if not text_a or not text_a.strip() or not text_b or not text_b.strip():
             raise ValueError("merge: пустая заметка недопустима")
+        contract = self._merge_contract()
         try:
             metas: list[ChatMeta] = []
-            system = self._prompts.summary_merge_system
+            system = self._merge_system_prompt(contract)
             base_user = self._prompts.merge_user.format(text_a=text_a, text_b=text_b)
             base_user += self._size_hint(len(text_a) + len(text_b))
-            parts, raw, meta = self._merge_round(system, base_user)
+            parts, raw, meta = self._merge_round(
+                system, base_user, operation="merge", contract=contract
+            )
             metas.append(meta)
             rounds = 1
-            issue = self._incomplete_reason(parts, text_a, text_b)
+            issue = self._incomplete_reason(
+                parts, text_a, text_b, operation="merge", contract=contract
+            )
             if issue is not None:
                 # The follow-up call in the same context (p. 2): the sources are already in the prompt,
                 # so it is cheaper than a new call. One retry, no more rounds.
                 followup_user = (
                     f"{base_user}\n\nYOUR ANSWER:\n{raw}\n\n{issue}\n"
-                    "Return the FULL corrected set of parts as one JSON object."
+                    f"{self._followup_instruction(contract)}"
                 )
-                parts, _raw, meta = self._merge_round(system, followup_user)
+                parts, _raw, meta = self._merge_round(
+                    system, followup_user, operation="merge", contract=contract
+                )
                 metas.append(meta)
                 rounds = 2
-                issue = self._incomplete_reason(parts, text_a, text_b)
+                issue = self._incomplete_reason(
+                    parts, text_a, text_b, operation="merge", contract=contract
+                )
                 if issue is not None:
                     raise MergeIncompleteError(
                         f"merge incomplete after {MERGE_MAX_ROUNDS} rounds: {issue}",
                         metas=metas,
                         rounds=rounds,
                     )
+            if contract == CONTRACT_DELIMITER:
+                # The titles of the parts - the code's business (the owner's
+                # decision Q1 of 15.11.2026): the first part keeps the title of
+                # the earlier note, the other parts wait for the `title` queue.
+                parts = self._merge_titles(parts, title)
         except SummaryError:
             self.last_attempt_ok = False  # the degradation becomes visible in /health
             raise
@@ -724,7 +775,7 @@ class SummaryService:
                         metas=metas,
                         rounds=rounds,
                     )
-            if contract == SPLIT_CONTRACT_DELIMITER:
+            if contract == CONTRACT_DELIMITER:
                 # The titles of the parts - the `title` operation, one call per
                 # part (the owner's decision Q1 of 15.11.2026).
                 parts = self._title_parts(parts)
@@ -742,7 +793,7 @@ class SummaryService:
         user_text: str,
         *,
         operation: str = "merge",
-        contract: str = SPLIT_CONTRACT_JSON,
+        contract: str = CONTRACT_JSON,
     ) -> tuple[list[MergePart], str, ChatMeta]:
         """One merge/split round: chat → parse the parts contract.
 
@@ -775,9 +826,9 @@ class SummaryService:
                     `title` operation). An unknown contract — the answer is
                     refused (off-contract): the structure is the code's business.
         """
-        if contract == SPLIT_CONTRACT_JSON:
+        if contract == CONTRACT_JSON:
             return _parse_merge_parts(content, label=label)
-        if contract == SPLIT_CONTRACT_DELIMITER:
+        if contract == CONTRACT_DELIMITER:
             return _parse_parts_by_delimiter(content, label=label)
         raise SummaryError(f"{label}: неизвестный контракт ответа {contract!r}")
 
@@ -786,7 +837,7 @@ class SummaryService:
         parts: list[MergePart],
         *sources: str,
         operation: str = "merge",
-        contract: str = SPLIT_CONTRACT_JSON,
+        contract: str = CONTRACT_JSON,
     ) -> str | None:
         """The reason of an incomplete merge/split or None (the F-23/F-22 briefs).
 
@@ -830,7 +881,7 @@ class SummaryService:
                     f"about {minimum} self-sufficient parts (a part well under "
                     "the limit means wasted notes)"
                 )
-            if contract == SPLIT_CONTRACT_DELIMITER:
+            if contract == CONTRACT_DELIMITER:
                 # The minimum length of a part (LSBN-D-17): a scrap is not a
                 # note - it is not written; the follow-up call asks for the
                 # facts packed densely (the "one fact per part" era produced
@@ -855,7 +906,7 @@ class SummaryService:
             # contract keeps its own threshold (SPLIT_FACTS_MIN) untouched.
             threshold = (
                 SPLIT_FACTS_FLOOR
-                if contract == SPLIT_CONTRACT_DELIMITER
+                if contract == CONTRACT_DELIMITER
                 else SPLIT_FACTS_MIN
             )
             if coverage < threshold:
@@ -938,9 +989,57 @@ class SummaryService:
             LSBN-D-17 - the micro-parts). The legacy contract: the historical
             editable prompt - unchanged.
         """
-        if contract == SPLIT_CONTRACT_DELIMITER:
+        if contract == CONTRACT_DELIMITER:
             return self._prompts.summary_split_system_delimiter
         return self._prompts.summary_split_system
+
+    def _merge_contract(self) -> str:
+        """The answer contract of the merge operation (the switch of the step).
+
+            Release 3.9.0 (LSBN-S-12): the contract comes from the registry of
+            the operations (`operation_contract`) - the `operation` mode uses the
+            `parts-by-delimiter` contract, the `legacy` mode the historical
+            JSON one. Everything else (the prompt, the parser, the follow-up
+            instruction) follows this value.
+        """
+        return operation_contract(self._settings, "merge")
+
+    def _merge_system_prompt(self, contract: str) -> str:
+        """The merge system prompt of the contract - the ONE assembly point.
+
+            The `parts-by-delimiter` contract: the editable prompt of the new
+            contract (`summary_merge_system_delimiter` — the operator's file
+            wins over the built-in text), free text, the parts separated by the
+            delimiter line, no JSON and no titles in the answer (the code names
+            the parts: the first one keeps the title of the earlier note, the
+            others wait for the `title` queue). The legacy contract: the
+            historical editable prompt - unchanged.
+        """
+        if contract == CONTRACT_DELIMITER:
+            return self._prompts.summary_merge_system_delimiter
+        return self._prompts.summary_merge_system
+
+    @staticmethod
+    def _merge_titles(parts: list[MergePart], title: str | None) -> list[MergePart]:
+        """The titles of the merged parts - the code's business (no model call).
+
+            Release 3.9.0 (LSBN-S-12; the owner's decision Q1 of 15.11.2026):
+            in the `operation` mode the answer of the merge carries no titles.
+            The FIRST part keeps the title of the EARLIER note (the caller
+            passes it: a merge does not create a new entity, so the title
+            stays). The OTHER parts get no title here: they are written with a
+            NULL title and go to the `title` queue (the notes with
+            `title IS NULL`) — the title job names them later.
+
+            An empty title of the earlier note (a titleless note) — the first
+            part is titleless too: it waits for the `title` queue as well.
+        """
+        words = (title or "").split()
+        kept = " ".join(words[:TITLE_MAX_WORDS])
+        titled: list[MergePart] = []
+        for number, part in enumerate(parts):
+            titled.append(MergePart(title=kept if number == 0 else "", text=part.text))
+        return titled
 
     @staticmethod
     def _followup_instruction(contract: str) -> str:
@@ -950,7 +1049,7 @@ class SummaryService:
             old one). The `parts-by-delimiter` contract: the parts come back
             separated by the delimiter line.
         """
-        if contract == SPLIT_CONTRACT_DELIMITER:
+        if contract == CONTRACT_DELIMITER:
             return (
                 "Return the FULL corrected set of parts, separated by a line "
                 f"with {SPLIT_PARTS_DELIMITER} and nothing else."
