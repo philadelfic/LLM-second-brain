@@ -171,6 +171,13 @@ from app.services.judge import Judge, JudgeError
 from app.services.llm_client import CHECK_AUTH_FAILED, CHECK_OK, ChatMeta
 from app.services.namespaces import NamespaceService
 from app.services.notes import NoteService
+from app.services.operations import (
+    OPERATION_REGISTRY,
+    SLOT_MODEL_OPERATION,
+    pause_after,
+    pause_sec,
+    slot_model,
+)
 from app.services.promotion import PromotionService
 from app.services.slot_breaker import SlotBreaker
 from app.services.slot_budget import slot_config_fingerprint
@@ -533,14 +540,12 @@ class BackgroundWorker:
         # SLOT_PAUSE_AFTER (auth opens immediately). The state is in process
         # memory: no restart survival needed (the slot configuration
         # is re-evaluated by the startup check, arch §13.2).
-        self._breakers: dict[str, SlotBreaker] = {
-            name: SlotBreaker(
-                name,
-                settings.slot_pause_sec,
-                open_after=settings.slot_pause_after,
-            )
-            for name in SLOT_NAMES
-        }
+        # Release 3.9.0 (LSBN-S-5): the KEY of the breaker is the operation in
+        # the `operation` mode (`SLOT_MODEL=operation`) — one breaker per
+        # operation; in the `legacy` mode the key stays the slot group (the
+        # historical behaviour). The mode is read through the ONE switch
+        # (`_mode`), never inlined.
+        self._breakers: dict[str, SlotBreaker] = self._build_breakers(settings)
         self._stopping = False
         # The "a note with a pending vector appeared" signal — wakes the embedding loop
         # right after the write (save/update/merge/title-gen), bypassing the grown
@@ -629,6 +634,45 @@ class BackgroundWorker:
     def areas_interval(self) -> float:
         """The areas job's current interval (diagnostics, tests, substrate 3.0.0)."""
         return self._backoff[AREAS_JOB].interval
+
+    def _mode(self) -> str:
+        """The active model of the slot layer: `legacy` | `operation`.
+
+                The ONE switch of the release 3.9.0 (the design, B2): every
+                point that depends on the mode reads this value — the flag
+                lives in `Settings` (`SLOT_MODEL`) and is read once (the
+                settings are frozen).
+
+        """
+        return slot_model(self._settings)
+
+    def _build_breakers(self, settings: Settings) -> dict[str, SlotBreaker]:
+        """The breaker dictionary: one breaker per SLOT GROUP (`legacy` mode)
+        or one per OPERATION (`operation` mode).
+
+                The thresholds of the `operation` mode are the per-operation
+                ones (base + override: `<OP>_PAUSE_AFTER`/`<OP>_PAUSE_SEC`,
+                else the global base); the `legacy` mode keeps the global
+                values of the slot group.
+
+        """
+        if self._mode() == SLOT_MODEL_OPERATION:
+            return {
+                operation: SlotBreaker(
+                    operation,
+                    pause_sec(operation, settings),
+                    open_after=pause_after(operation, settings),
+                )
+                for operation in OPERATION_REGISTRY
+            }
+        return {
+            name: SlotBreaker(
+                name,
+                settings.slot_pause_sec,
+                open_after=settings.slot_pause_after,
+            )
+            for name in SLOT_NAMES
+        }
 
     def stop(self) -> None:
         """Soft stop: the loops will finish after unwinding the current iteration."""
