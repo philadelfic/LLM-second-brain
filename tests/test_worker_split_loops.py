@@ -140,11 +140,17 @@ def _pending_summaries(settings) -> int:
 
 
 def _pending_merge_jobs(settings) -> int:
-    """Сколько merge-заданий ждёт в очереди."""
+    """Сколько merge-заданий ждёт в очереди.
+
+    Release 3.9.0 (LSBN-S-14): в режиме `operation` задание пишется с именем
+    операции (`merge`), в `legacy` — с именем группы слотов (`summary`).
+    """
+    slot = "merge" if settings.slot_model == "operation" else "summary"
     with session(settings) as conn:
         row = conn.execute(
-            "SELECT COUNT(*) FROM worker_jobs WHERE slot = 'summary' "
-            "AND kind = 'merge' AND status = 'pending'"
+            "SELECT COUNT(*) FROM worker_jobs WHERE slot = ? "
+            "AND kind = 'merge' AND status = 'pending'",
+            (slot,),
         ).fetchone()
     return int(row[0])
 

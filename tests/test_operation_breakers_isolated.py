@@ -300,6 +300,23 @@ def _merge_job(worker: BackgroundWorker, newer_id: int, older_id: int) -> None:
     )
 
 
+def _merge_job_id(settings) -> int:
+    """The id of the last merge task.
+
+    Release 3.9.0 (LSBN-S-14): the slot value of the task is the OPERATION
+    name in the `operation` mode and the slot group in the `legacy` mode.
+    """
+    slot = "merge" if settings.slot_model == "operation" else "summary"
+    with session(settings) as conn:
+        return int(
+            conn.execute(
+                "SELECT id FROM worker_jobs WHERE slot = ? AND kind = 'merge' "
+                "ORDER BY id DESC LIMIT 1",
+                (slot,),
+            ).fetchone()["id"]
+        )
+
+
 def _paused(worker: BackgroundWorker, key: str) -> bool:
     """Is the breaker under the key paused right now?"""
     breaker = worker._breakers.get(key)
@@ -571,13 +588,7 @@ def test_the_non_transient_outcome_counts_the_attempts_under_a_pause(
     settings = _settings(tmp_path, monkeypatch)
     worker = _worker(settings)
     worker._create_job("summary", "merge", 1)
-    with session(settings) as conn:
-        job_id = int(
-            conn.execute(
-                "SELECT id FROM worker_jobs WHERE slot = 'summary' AND kind = 'merge' "
-                "ORDER BY id DESC LIMIT 1"
-            ).fetchone()["id"]
-        )
+    job_id = _merge_job_id(settings)
     # The breaker of the merge operation is open (auth opens it at once).
     worker._note_slot_outcome(
         "merge", worker._operation_slot("merge"), SlotOutcome.AUTH

@@ -453,6 +453,61 @@ def test_the_work_is_not_lost_after_the_migration(tmp_path, monkeypatch) -> None
     assert worker._attention_by_operation() == {"merge": 1}
 
 
+# --- the writer: a new task carries the operation name in the operation mode --
+
+
+def test_a_new_task_carries_the_operation_name_in_the_operation_mode(
+    tmp_path, monkeypatch
+) -> None:
+    """In the `operation` mode the new row carries the OPERATION name.
+
+    The release's brief: "a slot = an operation — its own queue
+    (`worker_jobs.slot` = the operation name)". The map is the reader's map of
+    the pairs: the merge task — `merge`, the reclass task — `classify`, the
+    dedup task — `judge`.
+    """
+    settings = _settings(tmp_path, monkeypatch)
+    worker = _worker(settings)
+
+    worker._create_job("summary", "merge", 1)
+    worker._create_job("nodes", "reclass", 2)
+    worker._create_job("judge", "dedup", 3)
+
+    slots = {row["kind"]: row["slot"] for row in _rows(settings)}
+    assert slots == {"merge": "merge", "reclass": "classify", "dedup": "judge"}
+
+
+def test_a_new_task_carries_the_slot_group_in_the_legacy_mode(
+    tmp_path, monkeypatch
+) -> None:
+    """In the `legacy` mode the new row carries the slot group, as before."""
+    settings = _settings(tmp_path, monkeypatch, mode="legacy")
+    worker = _worker(settings)
+
+    worker._create_job("summary", "merge", 1)
+    worker._create_job("nodes", "reclass", 2)
+    worker._create_job("judge", "dedup", 3)
+
+    slots = {row["kind"]: row["slot"] for row in _rows(settings)}
+    assert slots == {"merge": "summary", "reclass": "nodes", "dedup": "judge"}
+
+
+def test_a_pair_that_is_not_in_the_map_keeps_the_previous_value(
+    tmp_path, monkeypatch
+) -> None:
+    """A pair outside the map: the row keeps the value it had.
+
+    The work is not lost (the same rule as for the "hanging" rows of the
+    migration) — the reader of the pair finds it under its own value.
+    """
+    settings = _settings(tmp_path, monkeypatch)
+    worker = _worker(settings)
+
+    worker._create_job("weird", "thing", 1)
+
+    assert _rows(settings)[0]["slot"] == "weird"
+
+
 # --- the `legacy` contour did not change -------------------------------------
 
 

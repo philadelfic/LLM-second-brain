@@ -439,14 +439,19 @@ def _set_attention(settings) -> None:
         )
 
 
-def _rows(settings) -> dict[tuple[str, str], dict]:
-    """The task rows by (slot, kind): the attempts and the attention state."""
+def _rows(settings) -> dict[str, dict]:
+    """The task rows by KIND: the attempts and the attention state.
+
+    The key is the kind, not the slot: release 3.9.0 (LSBN-S-14) the row
+    carries the OPERATION name in the `operation` mode and the slot group in
+    the `legacy` mode - the pair is the same, the value of the column is not.
+    """
     with session(settings) as conn:
         rows = conn.execute(
             "SELECT id, slot, kind, attempts, attention_at FROM worker_jobs"
         ).fetchall()
     return {
-        (row["slot"], row["kind"]): {
+        row["kind"]: {
             "id": int(row["id"]),
             "attempts": int(row["attempts"] or 0),
             "attention": row["attention_at"] is not None,
@@ -461,10 +466,10 @@ def test_attention_count_is_per_operation(operation_settings) -> None:
     worker._create_job("summary", "title", 1)
     worker._create_job("summary", "merge", 2)
     rows = _rows(operation_settings)
-    worker._note_attempt(rows[("summary", "title")]["id"], SlotOutcome.OFF_CONTRACT)
+    worker._note_attempt(rows["title"]["id"], SlotOutcome.OFF_CONTRACT)
     after = _rows(operation_settings)
-    assert after[("summary", "title")]["attempts"] == 1
-    assert after[("summary", "merge")]["attempts"] == 0
+    assert after["title"]["attempts"] == 1
+    assert after["merge"]["attempts"] == 0
     # The breaker's state is not read by the pair counter (the invariant).
     assert _paused(worker, "summarize") is False
     assert _paused(worker, "merge") is False
@@ -481,9 +486,9 @@ def test_attention_reset_by_operation_keeps_the_neighbour(operation_settings) ->
     released = worker._reset_attention_for_slot("title", "startup")
     assert released == 1
     rows = _rows(operation_settings)
-    assert rows[("summary", "title")]["attention"] is False
-    assert rows[("summary", "merge")]["attention"] is True
-    assert rows[("judge", "dedup")]["attention"] is True
+    assert rows["title"]["attention"] is False
+    assert rows["merge"]["attention"] is True
+    assert rows["dedup"]["attention"] is True
 
 
 def test_attention_reset_of_the_summary_family_is_per_operation(
@@ -498,9 +503,9 @@ def test_attention_reset_of_the_summary_family_is_per_operation(
 
     assert worker._reset_attention_for_slot("summarize", "startup") == 1
     rows = _rows(operation_settings)
-    assert rows[("summary", "summarize")]["attention"] is False
-    assert rows[("summary", "title")]["attention"] is True
-    assert rows[("summary", "merge")]["attention"] is True
+    assert rows["summarize"]["attention"] is False
+    assert rows["title"]["attention"] is True
+    assert rows["merge"]["attention"] is True
 
 
 def test_legacy_attention_reset_is_per_slot(legacy_settings) -> None:
@@ -514,9 +519,9 @@ def test_legacy_attention_reset_is_per_slot(legacy_settings) -> None:
     released = worker._reset_attention_for_slot("summary", "startup")
     assert released == 2
     rows = _rows(legacy_settings)
-    assert rows[("summary", "title")]["attention"] is False
-    assert rows[("summary", "merge")]["attention"] is False
-    assert rows[("judge", "dedup")]["attention"] is True
+    assert rows["title"]["attention"] is False
+    assert rows["merge"]["attention"] is False
+    assert rows["dedup"]["attention"] is True
 
 
 # --- criterion 5: the decision rule is per operation ------------------------

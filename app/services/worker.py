@@ -463,20 +463,22 @@ def ensure_worker_jobs_schema(settings: Settings) -> None:
         )
 
 
-def _read_slot_migration_stamp(conn: sqlite3.Connection) -> dict:
+def _read_slot_migration_stamp(conn: sqlite3.Connection) -> dict | None:
     """The stamp of the migration: the ids of the rows it moved (the meta table).
 
-            An unreadable stamp is an empty one — the migration does not crash
-            on a broken value (the `migration_chain` precedent).
+            None — the stamp is missing (the migration did not run here yet);
+            a dict — the stamp of the run (an unreadable value is an empty
+            stamp — the migration does not crash on a broken value, the
+            `migration_chain` precedent).
     """
     try:
         row = conn.execute(
             "SELECT value FROM meta WHERE key = ?", (SLOT_MIGRATION_META_KEY,)
         ).fetchone()
     except sqlite3.OperationalError:
-        return {}  # no meta table — the stamp is optional
+        return None  # no meta table — the stamp is optional
     if row is None:
-        return {}
+        return None
     try:
         payload = json.loads(row["value"])
     except (TypeError, ValueError):
@@ -499,7 +501,7 @@ def _write_slot_migration_stamp(
     """
     known = {
         int(value)
-        for value in (_read_slot_migration_stamp(conn).get("ids") or [])
+        for value in ((_read_slot_migration_stamp(conn) or {}).get("ids") or [])
         if isinstance(value, int) or str(value).isdigit()
     }
     known.update(ids)
@@ -618,16 +620,16 @@ def _reverse_slots(conn: sqlite3.Connection) -> dict:
             name of their kind) when the stamp is missing.
     """
     stamp = _read_slot_migration_stamp(conn)
-    ids = [int(value) for value in (stamp.get("ids") or [])]
     restored = 0
-    if ids:
-        for job_id in ids:
-            restored += _restore_slot_row(conn, job_id)
-    else:
-        for row in conn.execute(
-            "SELECT id FROM worker_jobs"
-        ).fetchall():
+    if stamp is None:
+        # No stamp — the migration did not run here: the deterministic
+        # fallback (the rows that carry the operation name of their kind).
+        for row in conn.execute("SELECT id FROM worker_jobs").fetchall():
             restored += _restore_slot_row(conn, int(row["id"]))
+    else:
+        # The rows of the forward run — only them are returned back.
+        for job_id in [int(value) for value in (stamp.get("ids") or [])]:
+            restored += _restore_slot_row(conn, job_id)
     _write_slot_migration_stamp(conn, "reverse", restored, 0, 0, [])
     return {
         "direction": "reverse",
@@ -1187,6 +1189,26 @@ class BackgroundWorker:
                 reads the legacy value only (as before).
         """
         return slot_values_for_queue(slot, kind, self._mode())
+
+    def _task_slot(self, slot: str, kind: str) -> str:
+        """The slot value a NEW task row is written with.
+
+                Release 3.9.0 (LSBN-S-14): in the `operation` mode the row
+                carries the OPERATION name — `worker_jobs.slot` = the operation
+                (the release's brief: "a slot = an operation — its own queue").
+                The map is the reader's map of the pairs (the S-7 map): the
+                merge task — `merge`, the reclass task — `classify`, the dedup
+                task — `judge`, the title/summarize tasks — their own
+                operations. A pair that is not in the map keeps the previous
+                value — the work is not lost (the same rule as for the
+                "hanging" rows of the migration).
+
+                The `legacy` mode writes the slot group, as before — the legacy
+                mode changes in nothing.
+        """
+        if self._mode() != SLOT_MODEL_OPERATION:
+            return slot
+        return _OPERATION_BY_TASK.get((slot, kind), slot)
 
     def _job_name(self, operation: str) -> str:
         """The job name of an operation: the operation's own job in the
@@ -2719,22 +2741,29 @@ class BackgroundWorker:
     def _create_job(
         self, slot: str, kind: str, note_id: int, payload: str | None = None
     ) -> None:
-        """Place a job into a slot's queue (the dependency dispatcher)."""
+        """Place a job into a slot's queue (the dependency dispatcher).
+
+                Release 3.9.0 (LSBN-S-14): the row carries the OPERATION name
+                in the `operation` mode (`worker_jobs.slot` = the operation) and
+                the slot group in the `legacy` mode (as before — the legacy mode
+                changes in nothing).
+        """
         self._ensure_job_table()
+        written = self._task_slot(slot, kind)
         with session(self._settings) as conn, transaction(conn):
             conn.execute(
                 "INSERT INTO worker_jobs (slot, kind, note_id, payload) "
                 "VALUES (?, ?, ?, ?)",
-                (slot, kind, note_id, payload),
+                (written, kind, note_id, payload),
             )
-        if kind == "merge" and slot in (SLOT_SUMMARY, self._operation_slot("merge")):
+        if kind == "merge" and written in (SLOT_SUMMARY, self._operation_slot("merge")):
             # A merge job appeared (release 3.9.0, LSBN-S-6): the merge loop of
             # the `operation` mode has its own signal — the job is taken at
             # once, not after the grown back-off. The signal is set HERE — at
             # the creation of the merge task — so every path that creates one
-            # wakes the loop. Release 3.9.0 (LSBN-S-7): the slot value of the
-            # task is still the legacy one (the migration of `worker_jobs.slot`
-            # is LSBN-S-14) — the check also answers the operation key.
+            # wakes the loop. Release 3.9.0 (LSBN-S-14): the value of the task
+            # is the operation name in the `operation` mode (the legacy one in
+            # the `legacy` mode) — the check answers both.
             self.notify_merge_pending()
 
     def _ensure_job(
@@ -2748,15 +2777,25 @@ class BackgroundWorker:
                     existing `_create_job` (judge/merge) is untouched: no dedup is needed
                     there — the "later ↔ earlier" pair and the judge's verdict give their
                     own invariants.
+
+                    Release 3.9.0 (LSBN-S-14): the row carries the OPERATION name in
+                    the `operation` mode; the "already there" check covers BOTH forms
+                    (the legacy value and the operation name) — the task is not
+                    multiplied in the window between the migration of the values and
+                    the switch of the flag. The `legacy` mode writes and checks the
+                    slot group, as before.
         """
         self._ensure_job_table()
+        written = self._task_slot(slot, kind)
+        known = self._queue_slot_values(slot, kind)
+        bindings = ", ".join("?" * len(known))
         with session(self._settings) as conn, transaction(conn):
             conn.execute(
                 "INSERT INTO worker_jobs (slot, kind, note_id, payload) "
                 "SELECT ?, ?, ?, ? WHERE NOT EXISTS ("
-                "SELECT 1 FROM worker_jobs WHERE slot = ? AND kind = ? "
+                f"SELECT 1 FROM worker_jobs WHERE slot IN ({bindings}) AND kind = ? "
                 "AND note_id = ? AND status = 'pending')",
-                (slot, kind, note_id, payload, slot, kind, note_id),
+                (written, kind, note_id, payload, *known, kind, note_id),
             )
 
     def _pending_jobs(
