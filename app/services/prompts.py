@@ -209,6 +209,46 @@ def summary_split_system_prompt(limit: int) -> str:
     )
 
 
+# summary.py::SPLIT_PARTS_SYSTEM_PROMPT - splitting a long note, the
+# `parts-by-delimiter` contract (release 3.9.0, LSBN-S-11).
+# The answer is plain text: the parts one after another, separated by a line
+# with the delimiter (a code constant - the prompt names it verbatim). No JSON,
+# no titles - the code asks the model for the title of every part separately
+# (the `title` operation; the owner's decision Q1 of 15.11.2026). The facts are
+# packed DENSELY: the "one fact per part" wording of the legacy contract is the
+# root of LSBN-D-17 (the micro-parts: the median length of a part was 102
+# characters).
+def summary_split_system_parts_prompt(
+    limit: int, delimiter: str, min_chars: int
+) -> str:
+    """The split system prompt of the `parts-by-delimiter` contract.
+
+        `limit` — the note soft limit from settings; `delimiter` — the code's
+        separator line (named verbatim); `min_chars` — the minimum length of
+        a part (LSBN-D-17: a scrap is not a note).
+    """
+    return (
+        "You are given ONE long note. Split it into several SELF-CONTAINED "
+        "notes (parts): every part must be readable on its own, without "
+        "references to the source or to the other parts, and must carry ITS "
+        "OWN names, numbers, dates, statuses, configs and paths. Pack the "
+        "facts DENSELY: keep the related facts in one part unless a fact "
+        "stands completely on its own; a part of a few words is a scrap, not "
+        f"a note (keep every part at least {min_chars} characters long). Do "
+        "not add anything of your own; do not lose a single fact of the "
+        f"source. Every part must stay well under the {limit}-character note "
+        "limit. Copy numbers, names, dates, versions, paths and commands "
+        "EXACTLY as they are written in the source — do not round, do not "
+        "reformat, do not split a number with a space, do not translate them; "
+        "only the connecting prose may be tightened. Write coherently, no "
+        "headings, intros, quotes, or explanations. Respond in the language of "
+        "the note. Answer with plain text: the parts one after another, "
+        f"separated by a line that contains exactly {delimiter} and nothing "
+        "else. Write no titles, no numbers and no explanations — only the "
+        "parts' text. The separator line must be on its own line."
+    )
+
+
 # and the other parts.
 # judge.py::JUDGE_SYSTEM_PROMPT - deciding note sameness (DUPLICATE/NOT DUPLICATE).
 JUDGE_SYSTEM_PROMPT = (
@@ -449,6 +489,9 @@ class PromptRegistry:
         # The names whose final text came from a non-empty file (the source
         # diagnostics in the validation errors).
         self._file_overrides: set[str] = set()
+        # The note soft limit of the build (settings.max_note_chars; 3.4.1,
+        # LSBN-T-26) - the prompts with a number are assembled from it.
+        self._max_note_chars = max_note_chars
         self.prompts_dir: Path | None = (
             Path(prompts_dir) if prompts_dir is not None else None
         )
@@ -477,6 +520,24 @@ class PromptRegistry:
     def summary_split_system(self) -> str:
         """The long-note split system prompt (editable, F-22 M2)."""
         return self._texts["summary_split_system"]
+
+    def summary_split_system_parts(self, *, delimiter: str, min_chars: int) -> str:
+        """The split system prompt of the `parts-by-delimiter` contract.
+
+            Release 3.9.0 (LSBN-S-11): the prompt of the NEW contract of the
+            split operation — free text, the parts separated by the delimiter
+            line, no JSON and no titles in the answer, the facts packed
+            densely. It is HARDWIRED (not editable): the editable
+            `summary_split_system` belongs to the legacy JSON contract - an
+            operator's file is not silently applied to another contract.
+
+            The code's constants are passed in (`delimiter`, `min_chars`): the
+            prompt names the separator verbatim and the minimum length of a
+            part (LSBN-D-17).
+        """
+        return summary_split_system_parts_prompt(
+            self._max_note_chars, delimiter, min_chars
+        )
 
     @property
     def judge_system(self) -> str:

@@ -64,6 +64,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1172,6 +1173,36 @@ def _legacy_total(settings: Settings, state: dict, phase: str) -> int | None:
         return None
 
 
+class _ReportingSplitter:
+    """The summarizer of the `migration` job: the split's failure goes to the breaker.
+
+            Release 3.9.0 (LSBN-S-11): the `migration` job works the `split`
+            operation — the failure of the splitting is recorded at the breaker
+            of the operation (its own breaker in the `operation` mode; the
+            `legacy` mode has no such recording — the reporting callback does
+            nothing there).
+
+            The narrow point of the reporting is the call itself: the service
+            sees the same summarizer contract (the failure is re-raised, the
+            `migration_split_failed` event is written as before), and the
+            outcome goes to the worker's breaker.
+    """
+
+    def __init__(
+        self, summarizer: Any, report: Callable[[SlotOutcome], None]
+    ) -> None:
+        self._summarizer = summarizer
+        self._report = report
+
+    def split(self, text: str) -> Any:
+        """The splitting call — the failure is reported and re-raised."""
+        try:
+            return self._summarizer.split(text)
+        except SummaryError as exc:
+            self._report(outcome_of(exc))
+            raise
+
+
 def build_migration_job(
     worker: "BackgroundWorker", settings: Settings
 ) -> jobs.JobSpec | None:
@@ -1194,12 +1225,27 @@ def build_migration_job(
             vectorization request, `pending_retry_sec` — the starting retry interval
             of pre-processing. Both values are visible in /health.migration.slot and in
             the startup log (`startup`); tuned by an override without a release.
+
+            Release 3.9.0 (LSBN-S-11): the job works the `split` operation — the
+            breaker key is the OPERATION in the `operation` mode (the `split`
+            breaker), the `summary` slot group in the `legacy` mode (as before).
+            The gate and the blocked check read the same key, and the failure of
+            the splitting goes to that breaker (the sink) — the `legacy` mode
+            keeps its behaviour (the job never touched the breaker).
     """
     if worker._summarizer is None:  # a test mode without a summarizer
         return None
+    # The breaker key of the job: the `split` operation in the `operation`
+    # mode, the `summary` slot group in the `legacy` mode.
+    key = worker._operation_slot("split")
     service = MigrationService(
         settings,
-        summarizer=worker._summarizer,
+        # The summarizer with the reporting of the failure (the breaker of the
+        # `split` operation - the operation owns the failure).
+        summarizer=_ReportingSplitter(
+            worker._summarizer,
+            lambda outcome: worker._note_split_failure(MIGRATION_JOB, outcome),
+        ),
         notes=worker._notes,
         warnings=worker._warnings,
         judge=worker._judge,
@@ -1223,10 +1269,10 @@ def build_migration_job(
         wait_event=None,
         idle_hook=None,
         queue_stat=service.queue_stat,
-        slot="summary",
+        slot=key,
         pause_after_run=True,
-        gate=lambda: worker._slot_gate("summary", MIGRATION_JOB),
-        is_gated=lambda: worker._slot_blocked("summary"),
+        gate=lambda: worker._slot_gate(key, MIGRATION_JOB),
+        is_gated=lambda: worker._slot_blocked(key),
     )
 
 

@@ -1446,11 +1446,11 @@ class NoteService:
         """
         if not parts:
             raise NoteValidationError("save_migration_parts: пустой список частей")
-        prepared: list[tuple[str, str, list[tuple[str, int]]]] = []
+        prepared: list[tuple[str | None, str, list[tuple[str, int]]]] = []
         for title, text in parts:
             self._validate_text(text)
-            checked_title = self._checked_title(title)
-            prepared.append((checked_title or "", text, self._chunks_of(text)))
+            checked_title = self._migration_part_title(title)
+            prepared.append((checked_title, text, self._chunks_of(text)))
         new_ids: list[int] = []
         with session(self._settings) as conn, transaction(conn):
             # The migration table may not exist in test DI builds
@@ -1480,7 +1480,7 @@ class NoteService:
                     history.note_projection(part_row),
                     source=SOURCE_MIGRATION_SPLIT,
                 )
-                created.append({"id": part_id, "title": title})
+                created.append({"id": part_id, "title": title or ""})
                 new_ids.append(part_id)
             # The source's status — in the same transaction (design §3): 'split' +
             # new_ids; an upsert — a direct call without a passed job is not lost.
@@ -1650,6 +1650,21 @@ class NoteService:
             raise TitleValidationError(TITLE_HINT)
         assert title is not None  # is_valid_title already rejected None — for typing
         return title.strip()
+
+    @staticmethod
+    def _migration_part_title(title: str | None) -> str | None:
+        """The title of a splitting part (release 3.9.0, LSBN-S-11).
+
+                    A valid title — written as is. An EMPTY title — "the title
+                    is not generated yet" (the `title` operation answered
+                    nothing): the part is saved with a NULL title, so the note
+                    goes to the title queue (the notes with `title IS NULL`) and
+                    the title is generated there. A title longer than
+                    TITLE_MAX_WORDS — the validation error (as before).
+        """
+        if title is None or not title.strip():
+            return None
+        return NoteService._checked_title(title)
 
     def _checked_comment(self, comment: str | None) -> str | None:
         """The note's comment (no24-01): None/empty/whitespace → None (a reset),

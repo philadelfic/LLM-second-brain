@@ -1312,6 +1312,28 @@ class BackgroundWorker:
             return
         self._note_slot_outcome(job, self._operation_slot("classify"), outcome)
 
+    def _note_split_failure(self, job: str, outcome: SlotOutcome) -> None:
+        """A splitting failure of a job → the breaker of the `split` operation.
+
+                Release 3.9.0 (LSBN-S-11): in the `operation` mode the failure
+                of the splitting of the `migration` job is recorded at the
+                breaker of the `split` operation — the operation owns the
+                failure, its own breaker (the design, B4). The `legacy` mode:
+                nothing — the job never touched the breaker (the failure stayed
+                in the journal, the `migration_split_failed` event).
+
+                The failure of the title generation INSIDE the split is a
+                failure of the split too (the unit of work is the split): it
+                comes here as well, and the breaker of the `title` operation is
+                NOT touched (one failure - one count).
+
+                The job name stays the factual one (`migration`); the operation
+                is visible by the breaker key.
+        """
+        if self._mode() != SLOT_MODEL_OPERATION:
+            return
+        self._note_slot_outcome(job, self._operation_slot("split"), outcome)
+
     def _log_slot_failure(
         self,
         job: str,
