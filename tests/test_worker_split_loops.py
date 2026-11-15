@@ -1,25 +1,26 @@
-"""Разрез сводного summary-цикла на три джобы (релиз 3.9.0, LSBN-S-6).
+"""The split of the combined summary cycle into three jobs (release 3.9.0, LSBN-S-6).
 
-Сводный цикл воркера `title → summarize → merge` жил в одной джобе `summary`
-с одним событием и одним breaker'ом слота. В режиме `operation`
-(`SLOT_MODEL=operation`) цикл разрезан на три джобы — `title`, `summarize`,
-`merge` — у каждой своя очередь, своё событие, свой счётчик и свой
-breaker (дизайн B3, стадия 2).
+The worker's combined cycle `title → summarize → merge` lived in ONE job
+(`summary`) with one event and one slot breaker. In the `operation` mode
+(`SLOT_MODEL=operation`) the cycle is split into three jobs — `title`,
+`summarize`, `merge` — each with its own queue, its own event, its own counter
+and its own breaker (the design, B3, stage 2).
 
-Проверяемые контракты (критерии §4 постановки):
-1. в режиме `operation` реестр джоб содержит три джобы с разными событиями
-   и разными очередями;
-2. в режиме `legacy` реестр НЕ изменился (снимок снят с базы `dev` до
-   правок);
-3. отказ title не блокирует summarize (пауза — только у своей операции);
-4. merge-сигнал доходит до merge-петли (ставится при создании задачи);
-5. работа не теряется: заметку берут обе петли, merge-задача не пропадает;
-6. в `/health.queues` в режиме `operation` видны три записи;
-7. в режиме `operation` воркер не падает на ссылках к breaker'у слота
-   `summary` (находка проверки S-5, M1).
+The checked contracts (the criteria §4 of the step):
+1. in the `operation` mode the job registry holds three jobs with different
+   events and different queues;
+2. in the `legacy` mode the registry did NOT change (the snapshot was taken
+   from the `dev` base before the edits);
+3. a failure of the title does not block summarize (the pause belongs to its
+   own operation only);
+4. the merge signal reaches the merge loop (it is set on the job creation);
+5. no work is lost: both loops take the note, the merge job does not vanish;
+6. in `/health.queues` in the `operation` mode three records are visible;
+7. in the `operation` mode the worker does not crash on the references to the
+   breaker of the `summary` slot (the finding of the S-5 check, M1).
 
-Юнит без сети: модели — фейки (`fakes.FixedSummarizer` и его наследник с
-отказом title), кодировщик — `HashEmbedder`.
+A unit test without the network: the models are fakes (`fakes.FixedSummarizer`
+and its descendant with a title failure), the embedder is `HashEmbedder`.
 """
 
 from __future__ import annotations
@@ -42,9 +43,9 @@ from app.storage.db import init_db, session, transaction
 
 DIM = 8
 
-#: Снимок реестра джоб в режиме `legacy`, снятый с базы `dev` (LSBN-S-5,
-#: коммит 4950d09) ДО этой правки: (имя джобы, её очередь, её слот).
-#: Критерий 2: реестр легаси-режима не изменился.
+#: A snapshot of the job registry in the `legacy` mode, taken from the `dev`
+#: base (LSBN-S-5, commit 4950d09) BEFORE this edit: (job name, its queue,
+#: its slot). Criterion 2: the registry of the legacy mode did not change.
 LEGACY_REGISTRY: tuple[tuple[str, str | None, str | None], ...] = (
     ("links", "links", None),
     ("migration", "migration", "summary"),
@@ -56,33 +57,34 @@ LEGACY_REGISTRY: tuple[tuple[str, str | None, str | None], ...] = (
     ("nodes", "nodes", "summary"),
 )
 
-#: Три джобы разрезанного цикла.
+#: The three jobs of the split cycle.
 SPLIT_JOBS = ("title", "summarize", "merge")
 
 
 class TitleFailingSummarizer(FixedSummarizer):
-    """Суммаризатор: заголовок всегда отказывает, выжимка работает.
+    """A summarizer: the title always fails, the summary works.
 
-    Отказ заголовка — `SummaryError` без исхода: исход читается как
-    `off_contract` (не-транзиентный) — пауза операции открывается на первом
-    таком отказе (при `SLOT_PAUSE_AFTER=1`).
+    The title failure is a `SummaryError` without an outcome: the outcome is
+    read as `off_contract` (not transient) — the pause of the operation opens
+    on the first such failure (with `SLOT_PAUSE_AFTER=1`).
     """
 
-    def title(self, text: str):  # noqa: ANN201 — сигнатура фейка
+    def title(self, text: str):  # noqa: ANN201 — the signature of the fake
         self.calls.append(text)
         self.last_attempt_ok = False
         raise SummaryError("модель вернула не-заголовок")
 
 
 def _make_settings(tmp_path, monkeypatch: pytest.MonkeyPatch, *, mode: str):
-    """Настройки теста: своя БД, режим слоёв и порог паузы в одно отказ."""
+    """Test settings: own DB, the slot mode and the pause threshold in one failure."""
     monkeypatch.setenv("DB_PATH", str(tmp_path / "notes.db"))
     monkeypatch.setenv("EMBEDDING_DIM", str(DIM))
-    # LSBN-T-37 (3.6.3): правило короткого текста выключено — тест проверяет
-    # модельный путь выжимки.
+    # LSBN-T-37 (3.6.3): the short-text rule is off — the test checks the
+    # model path of the summary.
     monkeypatch.setenv("SUMMARY_SHORT_TEXT_CHARS", "0")
-    # Порог паузы в один отказ: не-транзиентный отказ открывает паузу
-    # операции сразу — иначе паузу открыл бы только третий отказ.
+    # The pause threshold of one failure: a non-transient failure opens the
+    # pause of the operation at once — otherwise only the third failure would
+    # open it.
     monkeypatch.setenv("SLOT_PAUSE_AFTER", "1")
     if mode == "operation":
         monkeypatch.setenv("SLOT_MODEL", "operation")
@@ -97,18 +99,19 @@ def _make_settings(tmp_path, monkeypatch: pytest.MonkeyPatch, *, mode: str):
 
 @pytest.fixture
 def legacy_settings(tmp_path, monkeypatch: pytest.MonkeyPatch):
-    """Режим по умолчанию (`legacy`): реестр джоб — как до разреза."""
+    """The default mode (`legacy`): the job registry — as before the split."""
     return _make_settings(tmp_path, monkeypatch, mode="legacy")
 
 
 @pytest.fixture
 def operation_settings(tmp_path, monkeypatch: pytest.MonkeyPatch):
-    """Режим `operation`: цикл разрезан на три джобы."""
+    """The `operation` mode: the cycle is split into three jobs."""
     return _make_settings(tmp_path, monkeypatch, mode="operation")
 
 
 def make_worker(settings, summarizer=None) -> BackgroundWorker:
-    """Воркер с суммаризатором (иначе джобы сводного цикла неприменимы)."""
+    """A worker with a summarizer (otherwise the jobs of the combined cycle do
+    not apply)."""
     return BackgroundWorker(
         settings,
         HashEmbedder(DIM),
@@ -117,20 +120,20 @@ def make_worker(settings, summarizer=None) -> BackgroundWorker:
 
 
 def _registry(settings) -> list[tuple[str, str | None, str | None]]:
-    """Реестр джоб: (имя, очередь, слот) — в порядке регистрации."""
+    """The job registry: (name, queue, slot) — in the registration order."""
     worker = make_worker(settings)
     specs = build_job_specs(worker, settings)
     return [(spec.name, spec.queue, spec.slot) for spec in specs]
 
 
 def _specs(settings) -> dict:
-    """Реестр джоб по имени (для проверок гейта/события/очереди)."""
+    """The job registry by name (for the gate/event/queue checks)."""
     worker = make_worker(settings)
     return {spec.name: spec for spec in build_job_specs(worker, settings)}
 
 
 def _pending_summaries(settings) -> int:
-    """Сколько заметок ждёт выжимки (`summary_status='pending'`)."""
+    """How many notes wait for a summary (`summary_status='pending'`)."""
     with session(settings) as conn:
         row = conn.execute(
             "SELECT COUNT(*) FROM notes WHERE summary_status = 'pending' "
@@ -140,10 +143,11 @@ def _pending_summaries(settings) -> int:
 
 
 def _pending_merge_jobs(settings) -> int:
-    """Сколько merge-заданий ждёт в очереди.
+    """How many merge jobs wait in the queue.
 
-    Release 3.9.0 (LSBN-S-14): в режиме `operation` задание пишется с именем
-    операции (`merge`), в `legacy` — с именем группы слотов (`summary`).
+    Release 3.9.0 (LSBN-S-14): in the `operation` mode the job is written with
+    the operation name (`merge`), in `legacy` — with the slot group name
+    (`summary`).
     """
     slot = "merge" if settings.slot_model == "operation" else "summary"
     with session(settings) as conn:
@@ -156,7 +160,7 @@ def _pending_merge_jobs(settings) -> int:
 
 
 async def wait_until(predicate, timeout: float = 3.0) -> None:
-    """Дождаться условия живой петли (опрос с yield'ами)."""
+    """Wait for a condition of the live loop (polling with yields)."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -165,22 +169,22 @@ async def wait_until(predicate, timeout: float = 3.0) -> None:
     raise AssertionError("условие не наступило за отведённое время")
 
 
-# --- критерий 1: в режиме operation — три джобы со своим событием и очередью
+# --- criterion 1: in the operation mode — three jobs with their own event and queue
 
 
 def test_operation_registry_has_three_split_jobs(operation_settings) -> None:
-    """Реестр `operation`: три джобы разрезанного цикла, сводной нет."""
+    """The `operation` registry: the three jobs of the split cycle, no combined one."""
     names = [name for name, _queue, _slot in _registry(operation_settings)]
     for name in SPLIT_JOBS:
         assert name in names
-    assert "summary" not in names  # сводной джобы в этом режиме нет
+    assert "summary" not in names  # there is no combined job in this mode
 
 
 def test_split_jobs_have_own_event_and_queue(operation_settings) -> None:
-    """У каждой джобы — СВОЁ событие и своя очередь (общий Event делить нельзя).
+    """Each job has its OWN event and its own queue (a shared Event is not allowed).
 
-    `jobs.py` делает `spec.wait_event.clear()` перед проверкой очереди —
-    общий `asyncio.Event` стирал бы пробуждение соседней петли.
+    `jobs.py` does `spec.wait_event.clear()` before the queue check — a shared
+    `asyncio.Event` would erase the wake-up of the neighbouring loop.
     """
     specs = _specs(operation_settings)
     events = [specs[name].wait_event for name in SPLIT_JOBS]
@@ -188,13 +192,13 @@ def test_split_jobs_have_own_event_and_queue(operation_settings) -> None:
     slots = [specs[name].slot for name in SPLIT_JOBS]
 
     assert all(event is not None for event in events)
-    assert len({id(event) for event in events}) == 3  # разные объекты
+    assert len({id(event) for event in events}) == 3  # different objects
     assert len(set(queues)) == 3
     assert len(set(slots)) == 3
 
 
 def test_split_jobs_have_own_process_and_gate(operation_settings) -> None:
-    """У каждой джобы — свой обработчик и свой гейт (breaker операции)."""
+    """Each job has its own handler and its own gate (the breaker of the operation)."""
     specs = _specs(operation_settings)
     processes = [specs[name].process for name in SPLIT_JOBS]
     gates = [specs[name].gate for name in SPLIT_JOBS]
@@ -206,30 +210,31 @@ def test_split_jobs_have_own_process_and_gate(operation_settings) -> None:
     assert specs["merge"].slot == "merge"
 
 
-# --- критерий 2: в режиме legacy реестр не изменился
+# --- criterion 2: in the legacy mode the registry did not change
 
 
 def test_legacy_registry_unchanged(legacy_settings) -> None:
-    """Легаси-реестр — ровно тот, что снят с базы до правок."""
+    """The legacy registry — exactly the one taken from the base before the edits."""
     assert tuple(_registry(legacy_settings)) == LEGACY_REGISTRY
 
 
 def test_legacy_registry_has_no_split_jobs(legacy_settings) -> None:
-    """В легаси-режиме разрезанных джоб в реестре нет."""
+    """In the legacy mode the registry holds no split jobs."""
     names = {name for name, _queue, _slot in _registry(legacy_settings)}
     for name in SPLIT_JOBS:
         assert name not in names
     assert "summary" in names
 
 
-# --- критерий 3: отказ title не блокирует summarize
+# --- criterion 3: a failure of the title does not block summarize
 
 
 def test_title_failure_does_not_block_summarize(operation_settings) -> None:
-    """Отказ заголовка: пауза — только у title, выжимка обрабатывается.
+    """A title failure: the pause belongs to the title only, the summary is processed.
 
-    Заголовок падает (`off_contract`), выжимка работает: очередь summarize
-    разгружается, а пауза (`paused_until`) — только у операции `title`.
+    The title fails (`off_contract`), the summary works: the summarize queue
+    is drained, and the pause (`paused_until`) belongs to the `title` operation
+    only.
     """
     worker = make_worker(operation_settings, TitleFailingSummarizer())
     NoteService(operation_settings, HashEmbedder(DIM)).save(
@@ -237,23 +242,24 @@ def test_title_failure_does_not_block_summarize(operation_settings) -> None:
     )
     assert _pending_summaries(operation_settings) == 1
 
-    assert worker.process_title_pending() == 0  # заголовок не записан
+    assert worker.process_title_pending() == 0  # the title was not written
     assert worker._breakers["title"].snapshot()["paused_until"] is not None
     assert worker._breakers["summarize"].snapshot()["paused_until"] is None
 
-    # Гейт джобы summarize открыт, гейт title — закрыт (пауза операции).
-    # Реестр — того же воркера: пауза живёт в его памяти.
+    # The gate of the summarize job is open, the gate of the title is closed
+    # (the pause of the operation). The registry — of the same worker: the
+    # pause lives in its memory.
     specs = {spec.name: spec for spec in build_job_specs(worker, operation_settings)}
     assert specs["summarize"].gate() is True
     assert specs["title"].gate() is False
 
-    # Выжимка обрабатывается: очередь summarize разгружается.
+    # The summary is processed: the summarize queue is drained.
     assert worker.process_summary_pending() == 1
     assert _pending_summaries(operation_settings) == 0
 
 
 def test_title_failure_leaves_title_work_pending(operation_settings) -> None:
-    """Отказ заголовка не теряет работу: заметка ждёт следующего прогона."""
+    """A title failure does not lose the work: the note waits for the next run."""
     worker = make_worker(operation_settings, TitleFailingSummarizer())
     NoteService(operation_settings, HashEmbedder(DIM)).save("заметка без заголовка")
     worker.process_title_pending()
@@ -265,11 +271,12 @@ def test_title_failure_leaves_title_work_pending(operation_settings) -> None:
     assert int(row[0]) == 1
 
 
-# --- критерий 4: merge-сигнал доходит до merge-петли
+# --- criterion 4: the merge signal reaches the merge loop
 
 
 def test_merge_job_creation_wakes_merge_loop(operation_settings) -> None:
-    """Создание merge-задачи будит merge-петлю (сигнал — при создании)."""
+    """The creation of a merge job wakes the merge loop (the signal is set on
+    the creation)."""
     worker = make_worker(operation_settings)
     assert worker._merge_event.is_set() is False
     worker._create_job("summary", "merge", 1, payload=json.dumps({"older_id": 1}))
@@ -278,7 +285,7 @@ def test_merge_job_creation_wakes_merge_loop(operation_settings) -> None:
 
 @pytest.mark.asyncio
 async def test_merge_loop_takes_the_job(operation_settings) -> None:
-    """Merge-петля берёт задание по своему сигналу (без общего back-off)."""
+    """The merge loop takes the job by its signal (without a common back-off)."""
     worker = make_worker(operation_settings)
     worker._create_job("summary", "merge", 1, payload=json.dumps({"older_id": 1}))
     assert _pending_merge_jobs(operation_settings) == 1
@@ -293,12 +300,12 @@ async def test_merge_loop_takes_the_job(operation_settings) -> None:
             await task
 
 
-# --- критерий 5: работа не теряется
+# --- criterion 5: no work is lost
 
 
 def test_note_is_taken_by_both_loops(operation_settings) -> None:
-    """Заметка без заголовка и без выжимки берут обе петли (предикаты
-    независимы: `title IS NULL` и `summary_status='pending'`)."""
+    """A note without a title and without a summary is taken by both loops (the
+    predicates are independent: `title IS NULL` and `summary_status='pending'`)."""
     worker = make_worker(operation_settings)
     NoteService(operation_settings, HashEmbedder(DIM)).save(
         "заметка без заголовка и без выжимки"
@@ -315,7 +322,7 @@ def test_note_is_taken_by_both_loops(operation_settings) -> None:
 
 
 def test_merge_job_is_not_lost_by_the_split(operation_settings) -> None:
-    """Merge-задача не пропадает при разделении: петля merge её берёт."""
+    """The merge job does not vanish at the split: the merge loop takes it."""
     worker = make_worker(operation_settings)
     notes = NoteService(operation_settings, HashEmbedder(DIM))
     notes.save("первая заметка про ежедневный бэкап", title="Бэкап")
@@ -330,11 +337,11 @@ def test_merge_job_is_not_lost_by_the_split(operation_settings) -> None:
     assert _pending_merge_jobs(operation_settings) == 0
 
 
-# --- критерий 6: /health.queues в режиме operation
+# --- criterion 6: /health.queues in the operation mode
 
 
 def test_health_queues_show_three_split_queues(operation_settings) -> None:
-    """В снимке очередей — три записи разрезанного цикла.
+    """The queue snapshot holds the three records of the split cycle.
 
     Release 3.9.0 (LSBN-S-15): the legacy key `summary` is BACK in this mode —
     the old consumers must not break (the key is the historical aggregate of
@@ -345,12 +352,12 @@ def test_health_queues_show_three_split_queues(operation_settings) -> None:
     for name in SPLIT_JOBS:
         assert name in queues
         assert queues[name]["pending"] == 0
-    assert "summary" in queues  # LSBN-S-15: старый ключ возвращается
+    assert "summary" in queues  # LSBN-S-15: the old key is back
 
 
 def test_health_queues_split_queues_count_their_own_work(operation_settings) -> None:
-    """У каждой очереди — своя работа: заголовок и выжимка считаются
-    раздельно."""
+    """Each queue has its own work: the title and the summary are counted
+    separately."""
     worker = make_worker(operation_settings)
     NoteService(operation_settings, HashEmbedder(DIM)).save(
         "заметка без заголовка: ждёт и заголовок, и выжимку"
@@ -362,7 +369,8 @@ def test_health_queues_split_queues_count_their_own_work(operation_settings) -> 
 
 
 def test_legacy_health_queues_unchanged(legacy_settings) -> None:
-    """В легаси-режиме очередь сводного цикла — одна, как до правок."""
+    """In the legacy mode the queue of the combined cycle is one — as before
+    the edits."""
     worker = make_worker(legacy_settings)
     queues = worker.queues_health()
     assert "summary" in queues
@@ -370,20 +378,22 @@ def test_legacy_health_queues_unchanged(legacy_settings) -> None:
         assert name not in queues
 
 
-# --- критерий 7: в режиме operation нет KeyError на breaker'е слота summary
+# --- criterion 7: in the operation mode no KeyError on the summary slot breaker
 
 
 def test_operation_mode_breaker_lookups_do_not_raise(operation_settings) -> None:
-    """Ссылки на breaker слота `summary`/`embedding` не роняют воркер.
+    """The references to the breaker of the `summary`/`embedding` slot do not
+    crash the worker.
 
-    Находка проверки S-5 (M1): в режиме `operation` словарь `_breakers`
-    keyed по операциям — прямой lookup по имени слота давал `KeyError`.
+    The finding of the S-5 check (M1): in the `operation` mode the dictionary
+    `_breakers` is keyed by the operations — a direct lookup by a slot name
+    raised a `KeyError`.
     """
     worker = make_worker(operation_settings)
     NoteService(operation_settings, HashEmbedder(DIM)).save(
         "заметка без заголовка: очередь не пуста"
     )
-    assert worker._summary_queue_empty() is False  # сводный предикат (легаси)
+    assert worker._summary_queue_empty() is False  # the combined predicate (legacy)
     assert worker._title_queue_empty() is False
     assert worker._summarize_queue_empty() is False
     assert worker._areas_queue_empty() is True
@@ -391,11 +401,11 @@ def test_operation_mode_breaker_lookups_do_not_raise(operation_settings) -> None
 
 @pytest.mark.asyncio
 async def test_operation_mode_worker_serves_queues(operation_settings, caplog) -> None:
-    """В режиме `operation` воркер поднимается и разгружает очередь.
+    """In the `operation` mode the worker starts and drains the queue.
 
-    Проверяется и падение: исключение в итерации петли пишется событием
-    `loop_iteration_failed` (итерация не убивает петлю) — в журнале его
-    быть не должно.
+    A failure is checked too: an exception in an iteration of the loop is
+    written as the `loop_iteration_failed` event (the iteration does not kill
+    the loop) — it must not be in the log.
     """
     worker = make_worker(operation_settings)
     NoteService(operation_settings, HashEmbedder(DIM)).save(

@@ -93,7 +93,7 @@ class OutcomeDescriber:
         self.calls.append((list(summaries), slug, domain))
         raise DescriberError("генератор описаний недоступен", outcome=self.outcome)
 
-    def close(self) -> None:  # интерфейс-совместимость с DescriptionService
+    def close(self) -> None:  # interface compatibility with DescriptionService
         return None
 
 
