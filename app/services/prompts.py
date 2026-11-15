@@ -4,8 +4,9 @@
     groups (the owner's ruling: "some prompts are ours to polish; nobody edits
     them"):
 
-    - **4 editable** (`summary_system`, `summary_merge_system`,
-      `summary_split_system`, `judge_system`): with `prompts_dir` set they are
+    - **5 editable** (`summary_system`, `summary_merge_system`,
+      `summary_split_system`, `summary_split_system_delimiter`, `judge_system`):
+      with `prompts_dir` set they are
       written out to files (seed-if-missing - created with the built-in default as
       the starting text) and edited by the operator without an image rebuild;
       existing operator-edited files are NEVER overwritten; an empty file = the
@@ -17,6 +18,13 @@
       `classifier_system`, `describe_system`, `describe_user`,
       `structure_judge_system`, `structure_judge_user`): code constants only,
       never created as files.
+
+    Release 3.9.0 (LSBN-S-11): the split of the `operation` mode has its own
+    editable prompt — `summary_split_system_delimiter` (the contract
+    `parts-by-delimiter`: free text, the parts separated by the delimiter
+    line). The editable `summary_split_system` stays the legacy JSON
+    contract's: the two contracts have different shapes, so the operator's
+    file of one is never applied to the other.
 
     The contract guard: the final `judge_system` (built-in or from a file) MUST
     contain the "DUPLICATE" and "NOT DUPLICATE" markers - the dedup verdicts are
@@ -218,8 +226,27 @@ def summary_split_system_prompt(limit: int) -> str:
 # packed DENSELY: the "one fact per part" wording of the legacy contract is the
 # root of LSBN-D-17 (the micro-parts: the median length of a part was 102
 # characters).
+
+#: The delimiter line between the parts of the answer: a CODE constant - the
+#: prompt names it verbatim, the parser splits the answer by it. A line equal
+#: to it (the edge spaces trimmed) is the separator; the same text inside a
+#: line of the answer is not. It lives here (the module of the prompt that
+#: names it and of the editable key below); `summary.py` imports it.
+SPLIT_PARTS_DELIMITER = "=== PART ==="
+
+#: The minimum length of a part (LSBN-D-17): a part shorter than this is a
+#: SCRAP, not a note - it is not written; the split goes to the follow-up call
+#: (one more attempt with the history); if the follow-up does not help -
+#: `MergeIncompleteError`, the note is deferred (the work is not lost). The
+#: "one fact per part" era produced exactly that: the median length of a part
+#: on the live data was 102 characters - scraps instead of notes.
+SPLIT_PART_MIN_CHARS = 100
+
+
 def summary_split_system_parts_prompt(
-    limit: int, delimiter: str, min_chars: int
+    limit: int,
+    delimiter: str = SPLIT_PARTS_DELIMITER,
+    min_chars: int = SPLIT_PART_MIN_CHARS,
 ) -> str:
     """The split system prompt of the `parts-by-delimiter` contract.
 
@@ -327,6 +354,12 @@ BUILTIN_PROMPTS: dict[str, str] = {
     "summary_system": SUMMARY_SYSTEM_PROMPT,
     "summary_merge_system": summary_merge_system_prompt(MAX_NOTE_CHARS_DEFAULT),
     "summary_split_system": summary_split_system_prompt(MAX_NOTE_CHARS_DEFAULT),
+    # The `parts-by-delimiter` contract of the split operation (release 3.9.0,
+    # LSBN-S-11): the operator's own file — the legacy `summary_split_system`
+    # stays the legacy JSON contract's.
+    "summary_split_system_delimiter": summary_split_system_parts_prompt(
+        MAX_NOTE_CHARS_DEFAULT
+    ),
     "judge_system": JUDGE_SYSTEM_PROMPT,
     "merge_user": SUMMARY_MERGE_USER_TEMPLATE,
     "split_user": SUMMARY_SPLIT_USER_TEMPLATE,
@@ -343,6 +376,11 @@ EDITABLE_PROMPTS: tuple[str, ...] = (
     "summary_system",
     "summary_merge_system",
     "summary_split_system",
+    # The split of the `operation` mode (release 3.9.0, LSBN-S-11): the prompt
+    # of the `parts-by-delimiter` contract - the operator's own file, like the
+    # other editable prompts (the legacy `summary_split_system` belongs to the
+    # legacy JSON contract and is not reused here).
+    "summary_split_system_delimiter",
     "judge_system",
 )
 
@@ -350,15 +388,17 @@ _PROMPT_FILE_SUFFIX = ".txt"
 
 # Version of the current prompt canon (seed stamp). Bumped on every canon
 # change of the editable prompts; used for auto-migration of untouched
-# legacy seeds (lsbdef-0006). The current canon is 3.4.1 (LSBN-F-22 M2: added
-# the editable `summary_split_system` - splitting a long note into a list of
+# legacy seeds (lsbdef-0006). The current canon is 3.9.0 (LSBN-S-11: the
+# editable `summary_split_system_delimiter` — the split prompt of the
+# `parts-by-delimiter` contract; the earlier canon is 3.4.1 (LSBN-F-22 M2: the
+# editable `summary_split_system` - splitting a long note into a list of
 # self-contained parts; 3.4.0 - merging into a list of parts, LSBN-F-23; earlier
 # 3.1.0 - summaries <= 150 characters, the gate decision). The stamp was set
 # by the 3.4.0 release and does not change at 3.4.1: rewriting untouched
 # seeds goes through the current-canon comparison (_should_migrate) - the
 # in-text limit number now comes from settings, and a MAX_NOTE_CHARS change
 # rewrites the seed without a stamp bump (LSBN-T-26).
-SEED_VERSION = "3.4.1"
+SEED_VERSION = "3.9.0"
 
 # Name of the seed-stamp sidecar file in prompts_dir: version + SHA-256 of
 # the seeded content per editable prompt.
@@ -485,13 +525,13 @@ class PromptRegistry:
             **BUILTIN_PROMPTS,
             "summary_merge_system": summary_merge_system_prompt(max_note_chars),
             "summary_split_system": summary_split_system_prompt(max_note_chars),
+            "summary_split_system_delimiter": summary_split_system_parts_prompt(
+                max_note_chars
+            ),
         }
         # The names whose final text came from a non-empty file (the source
         # diagnostics in the validation errors).
         self._file_overrides: set[str] = set()
-        # The note soft limit of the build (settings.max_note_chars; 3.4.1,
-        # LSBN-T-26) - the prompts with a number are assembled from it.
-        self._max_note_chars = max_note_chars
         self.prompts_dir: Path | None = (
             Path(prompts_dir) if prompts_dir is not None else None
         )
@@ -521,23 +561,19 @@ class PromptRegistry:
         """The long-note split system prompt (editable, F-22 M2)."""
         return self._texts["summary_split_system"]
 
-    def summary_split_system_parts(self, *, delimiter: str, min_chars: int) -> str:
+    @property
+    def summary_split_system_delimiter(self) -> str:
         """The split system prompt of the `parts-by-delimiter` contract.
 
             Release 3.9.0 (LSBN-S-11): the prompt of the NEW contract of the
             split operation — free text, the parts separated by the delimiter
             line, no JSON and no titles in the answer, the facts packed
-            densely. It is HARDWIRED (not editable): the editable
-            `summary_split_system` belongs to the legacy JSON contract - an
-            operator's file is not silently applied to another contract.
-
-            The code's constants are passed in (`delimiter`, `min_chars`): the
-            prompt names the separator verbatim and the minimum length of a
-            part (LSBN-D-17).
+            densely. It is EDITABLE (its own file in `prompts_dir`): the
+            operator's ability to tune the split prompt must not depend on the
+            slot model. The editable `summary_split_system` stays the legacy
+            JSON contract's — the two contracts have different shapes.
         """
-        return summary_split_system_parts_prompt(
-            self._max_note_chars, delimiter, min_chars
-        )
+        return self._texts["summary_split_system_delimiter"]
 
     @property
     def judge_system(self) -> str:

@@ -41,6 +41,7 @@ from app.config import get_settings
 from app.services.migration import MIGRATION_JOB, build_migration_job
 from app.services.notes import NoteService
 from app.services.operations import OPERATION_REGISTRY
+from app.services.prompts import PromptRegistry
 from app.services.slot_outcome import SlotOutcome
 from app.services.summary import (
     SPLIT_FACTS_FLOOR,
@@ -198,11 +199,11 @@ class _Script:
         return len(self.requests)
 
 
-def _service(settings, answers: list) -> tuple[SummaryService, _Script]:
+def _service(settings, answers: list, registry=None) -> tuple[SummaryService, _Script]:
     """The split service over a scripted transport."""
     script = _Script(answers)
     service = SummaryService(
-        settings, transport=httpx.MockTransport(script.handler)
+        settings, transport=httpx.MockTransport(script.handler), registry=registry
     )
     return service, script
 
@@ -277,6 +278,57 @@ def test_the_contract_of_the_operation_comes_from_the_registry(tmp_path, monkeyp
     assert split_contract(settings) == SPLIT_CONTRACT_DELIMITER
     legacy = _settings(tmp_path, monkeypatch, mode="legacy")
     assert split_contract(legacy) == SPLIT_CONTRACT_JSON
+
+
+# --- the prompt of the contract: the operator's file wins --------------------
+
+
+def test_the_builtin_prompt_of_the_new_contract_is_used_without_a_file(
+    tmp_path, monkeypatch
+):
+    """No prompts_dir — the built-in text of the new contract."""
+    settings = _settings(tmp_path, monkeypatch, mode="operation")
+    service, script = _service(settings, [FREE_TEXT_ANSWER])
+    service.split(SOURCE)
+    system = _system(script.requests[0])
+    assert SPLIT_PARTS_DELIMITER in system
+    assert "DENSELY" in system
+
+
+def test_the_operator_file_wins_over_the_builtin_prompt(tmp_path, monkeypatch):
+    """The file of the new key has priority over the built-in text."""
+    settings = _settings(tmp_path, monkeypatch, mode="operation")
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    custom = "Раздели части строкой === PART === и пиши плотно."
+    (prompts / "summary_split_system_delimiter.txt").write_text(
+        custom, encoding="utf-8"
+    )
+    registry = PromptRegistry(prompts_dir=prompts, max_note_chars=LIMIT)
+    service, script = _service(settings, [FREE_TEXT_ANSWER], registry=registry)
+    service.split(SOURCE)
+    assert _system(script.requests[0]) == custom
+
+
+def test_the_legacy_prompt_file_still_wins_and_the_new_key_does_not_leak(
+    tmp_path, monkeypatch
+):
+    """The `legacy` mode: the file `summary_split_system` still wins; the new
+    key does not touch the legacy contract."""
+    settings = _settings(tmp_path, monkeypatch, mode="legacy")
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    legacy_custom = "Возьми факты и раздели заметку на части."
+    (prompts / "summary_split_system.txt").write_text(
+        legacy_custom, encoding="utf-8"
+    )
+    (prompts / "summary_split_system_delimiter.txt").write_text(
+        "ПРОМПТ НОВОГО КОНТРАКТА", encoding="utf-8"
+    )
+    registry = PromptRegistry(prompts_dir=prompts, max_note_chars=LIMIT)
+    service, script = _service(settings, [JSON_ANSWER], registry=registry)
+    service.split(SOURCE)
+    assert _system(script.requests[0]) == legacy_custom
 
 
 # --- criterion 2: the delimiter is a line of its own --------------------------

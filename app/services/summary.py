@@ -103,7 +103,11 @@ import httpx
 from app.config import TITLE_MAX_WORDS, Settings
 from app.services.llm_client import ChatMeta, ChatResult, LLMClient, LLMError, SlotSpec
 from app.services.operations import OPERATION_REGISTRY, operation_mode
-from app.services.prompts import PromptRegistry
+from app.services.prompts import (
+    SPLIT_PART_MIN_CHARS,
+    SPLIT_PARTS_DELIMITER,
+    PromptRegistry,
+)
 from app.services.slot_outcome import SlotOutcome, classify_llm_error
 
 # --- the merge contract (LSBN-F-23) -----------------------------------------
@@ -160,19 +164,18 @@ SPLIT_CONTRACT_JSON = "json-parts"
 #: B7; `OPERATION_REGISTRY["split"].contract`).
 SPLIT_CONTRACT_DELIMITER = "parts-by-delimiter"
 
-#: The delimiter line between the parts of the answer: a CODE constant - the
-#: prompt names it verbatim, the parser splits the answer by it. A line that
-#: equals it (the edge spaces trimmed) is the separator; the same text inside
-#: a line of the answer is not.
-SPLIT_PARTS_DELIMITER = "=== PART ==="
-
-#: The minimum length of a part (LSBN-D-17): a part shorter than this is a
-#: SCRAP, not a note - it is not written. It is a reason for the follow-up
-#: call (one more attempt with the history); if the follow-up does not help -
-#: `MergeIncompleteError`, the note is deferred (the work is not lost). The
-#: "one fact per part" era produced exactly that: the median length of a part
-#: on the live data was 102 characters - scraps instead of notes.
-SPLIT_PART_MIN_CHARS = 100
+#: The delimiter line between the parts of the answer and the minimum length
+#: of a part live in `prompts.py` (the module of the prompt that names them
+#: and of their editable key) - imported here:
+#:   * the delimiter - a CODE constant: the prompt names it verbatim, the
+#:     parser splits the answer by it; a line equal to it (the edge spaces
+#:     trimmed) is the separator, the same text inside a line is not;
+#:   * the minimum length of a part (LSBN-D-17) - a part shorter than it is
+#:     a SCRAP, not a note: it is not written, the split goes to the follow-up
+#:     call; if the follow-up does not help - `MergeIncompleteError`, the note
+#:     is deferred (the work is not lost). The "one fact per part" era
+#:     produced exactly that: the median length of a part on the live data
+#:     was 102 characters - scraps instead of notes.
 
 
 def split_contract(settings: Settings) -> str:
@@ -926,17 +929,17 @@ class SummaryService:
     def _split_system_prompt(self, contract: str) -> str:
         """The split system prompt of the contract - the ONE assembly point.
 
-            The `parts-by-delimiter` contract: free text, the parts separated
-            by the delimiter line, no JSON and no titles in the answer (the
+            The `parts-by-delimiter` contract: the editable prompt of the new
+            contract (`summary_split_system_delimiter` — the operator's file
+            wins over the built-in text), free text, the parts separated by
+            the delimiter line, no JSON and no titles in the answer (the
             titles are a separate `title` call), the facts packed DENSELY (the
             "one fact per part" wording of the legacy contract is the root of
             LSBN-D-17 - the micro-parts). The legacy contract: the historical
             editable prompt - unchanged.
         """
         if contract == SPLIT_CONTRACT_DELIMITER:
-            return self._prompts.summary_split_system_parts(
-                delimiter=SPLIT_PARTS_DELIMITER, min_chars=SPLIT_PART_MIN_CHARS
-            )
+            return self._prompts.summary_split_system_delimiter
         return self._prompts.summary_split_system
 
     @staticmethod
