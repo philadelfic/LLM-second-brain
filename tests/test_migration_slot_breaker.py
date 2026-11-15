@@ -24,6 +24,8 @@ from app.config import Settings, get_settings
 from app.services import jobs
 from app.services.migration import MIGRATION_JOB, build_migration_job
 from app.services.notes import NoteService
+from app.services.operations import breaker_key
+from app.services.slot_outcome import SlotOutcome
 from app.storage.db import init_db, session, transaction
 from app.storage.migration import (
     MIGRATION_NOTES_TABLE,
@@ -56,13 +58,29 @@ def _migrate_down(monkeypatch: pytest.MonkeyPatch, waiting: int) -> None:
 
 
 class _FakeWorker:
-    """Утка под build_migration_job: суммаризатор, notes, без warnings."""
+    """Утка под build_migration_job: суммаризатор, notes, без warnings.
+
+    Release 3.9.0 (LSBN-S-11): the builder asks the worker for the breaker key
+    of the `split` operation and for the sink of the splitting's failure (the
+    same contract as the `warnings` job — the S-9 precedent). The duck records
+    the reported failures instead of writing them into a breaker (it has none).
+    """
 
     def __init__(self, settings: Settings) -> None:
+        self._settings = settings
         self._summarizer = FixedSummarizer()
         self._notes = NoteService(settings)
         self._warnings = None
         self._judge = None
+        self.reported: list[tuple[str, SlotOutcome]] = []
+
+    def _operation_slot(self, operation: str) -> str:
+        """Ключ breaker'а операции (реестр операций — прецедент S-9)."""
+        return breaker_key(operation, self._settings)
+
+    def _note_split_failure(self, job: str, outcome: SlotOutcome) -> None:
+        """Отказ нарезки → breaker операции `split` (у утки — в список)."""
+        self.reported.append((job, outcome))
 
 
 def _waiting_ids() -> list[int]:
