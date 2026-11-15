@@ -282,6 +282,23 @@ _SLOT_JOB_NAMES = {
     NODES_JOB: NODES_JOB,
 }
 
+# An OPERATION → the job that works it (release 3.9.0, LSBN-S-9): the journal
+# field `job` stays the FACTUAL job (the operation is visible by the breaker
+# key — the `slot` field of the event), so the owner of a task row (an
+# operation in the `operation` mode) needs the name of its job: the reclass
+# tasks belong to the `nodes` job, the tasks of the summary family — to the
+# split jobs of the cycle (`title`/`summarize`/`merge`), the dedup verdict — to
+# the `judge` job. An operation without a job of its own (`describe`,
+# `structure_judge`, `embed`, `decision`) has no task rows — the name of the
+# operation is the fallback.
+_OPERATION_JOB_NAMES = {
+    "summarize": SUMMARIZE_JOB,
+    "title": TITLE_JOB,
+    "merge": MERGE_JOB,
+    "judge": JUDGE_JOB,
+    "classify": NODES_JOB,
+}
+
 # The operations whose path goes through the DECISION slot (the design, B4):
 # with the decision unavailable and the fallback off, they wait — the dedup
 # judge and the classifier walk into the decision slot. The rest
@@ -1105,6 +1122,13 @@ class BackgroundWorker:
                     of `worker_jobs.slot` (LSBN-S-14) — the owner of a row is
                     read through `_task_operation`.
 
+                    Only the KNOWN operations are counted (release 3.9.0,
+                    LSBN-S-9): an unknown pair (an unknown slot or kind — the
+                    rows keep their legacy values) has no operation, so it does
+                    not land in a counter of `/health` under a non-operation key
+                    (e.g. `nodes`). The task is not lost — it stays visible in
+                    `/jobs/attention` (the listing shows the row's own slot).
+
         """
         counts: dict[str, int] = {}
         try:
@@ -1118,6 +1142,8 @@ class BackgroundWorker:
             return {}
         for row in rows:
             operation = self._task_operation(row["slot"], row["kind"])
+            if operation not in OPERATION_REGISTRY:
+                continue  # an unknown pair — not an operation's counter
             counts[operation] = counts.get(operation, 0) + int(row["c"])
         return counts
 
@@ -1242,6 +1268,24 @@ class BackgroundWorker:
                 paused_until=breaker.snapshot()["paused_until"],
             )
         return opened
+
+    def _note_classify_failure(self, job: str, outcome: SlotOutcome) -> None:
+        """A classifier failure of a job → the breaker of the `classify` operation.
+
+                Release 3.9.0 (LSBN-S-9): in the `operation` mode the failure
+                of the classifier of the `warnings` job is recorded at the
+                breaker of the `classify` operation — the operation owns the
+                failure, its own breaker (the design, B4). The `legacy` mode:
+                nothing — the `warnings` job never touched the breaker (the
+                failure stayed in the journal, the `warnings_classifier_failed`
+                event).
+
+                The job name stays the factual one (`warnings`); the operation
+                is visible by the breaker key.
+        """
+        if self._mode() != SLOT_MODEL_OPERATION:
+            return
+        self._note_slot_outcome(job, self._operation_slot("classify"), outcome)
 
     def _log_slot_failure(
         self,
@@ -1382,7 +1426,19 @@ class BackgroundWorker:
             )
 
     def _job_for_slot(self, slot: str) -> str:
-        """The owning job's name of a slot's queue (for events and /jobs/attention)."""
+        """The owning job's name of a slot's queue (for events and /jobs/attention).
+
+                The `operation` mode: the owner of a task row is an OPERATION,
+                not a slot group — the job of the operation comes from
+                `_OPERATION_JOB_NAMES` (the factual job: the reclass tasks
+                belong to the `nodes` job, the merge tasks — to the `merge`
+                job; the journal never names a job that does not exist).
+                The `legacy` mode: the slot group → its job, as before.
+        """
+        if self._mode() == SLOT_MODEL_OPERATION:
+            job = _OPERATION_JOB_NAMES.get(slot)
+            if job is not None:
+                return job
         return _SLOT_JOB_NAMES.get(slot, slot)
 
     def _log_attention_event(self, event: str, **fields: object) -> None:
