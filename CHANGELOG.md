@@ -26,6 +26,64 @@ stabilized (owner's decision: GitHub only on stabilization):
 * **3.6.2** (2026-11-12) — Parts of one note are not duplicates
 * **3.6.3** (2026-11-12) — Short notes summarize themselves
 
+## [3.9.0] - 2026-11-15
+
+Release 3.9.0 — an operation is the unit: the four slot groups were a fiction that
+made unrelated operations share one breaker, one pause and one queue. Every
+operation now has its own queue, breaker, pause, backoff, answer contract and env
+prefix. The old mode lives until the acceptance; the rollback is one flag.
+
+### Added
+
+* **The operation registry (`LSBN-F-38`)** — `app/services/operations.py` holds
+  `OperationSpec` and `OPERATION_REGISTRY` (ten operations: `summarize`, `title`,
+  `merge`, `split`, `classify`, `describe`, `judge`, `structure_judge`, `embed`,
+  `decision`). The registry is the single source of the slot keys, the per-operation
+  env names (`<OP>_*`) and the pause thresholds (a global base plus a per-operation
+  override). The switch is `SLOT_MODEL=legacy|operation` — the flag selects a set of
+  data, not a different code path.
+* **Per-operation health** — in the new mode `/health.slots` carries an entry per
+  operation; the four old keys stay as deprecated aggregates (the worst operation of
+  the group), so the healthcheck and the MCP slot hint keep working.
+  `/health.queues` keeps the old job keys and adds the operation keys. Two new
+  fields — `slot_mode` and `slot_migration_pending` — are visible in both modes.
+* **A warning about the old env names** — starting in the `operation` mode with
+  `SUMMARY_*`/`EMBEDDING_*` set logs a WARN with the list of the equivalent
+  `<OP>_*` names; the start does not fail. The old names stop working in 3.10.0;
+  the global `SLOT_*` knobs stay as safeguards.
+* **Acceptance hooks take the operation names** — `scripts/slot_gate.sh`,
+  `scripts/slot_fake.sh` and `scripts/fake_slot.py` accept an operation name; the
+  old slot names still work and answer with a hint about the new name.
+
+### Changed
+
+* **The summary cycle was cut into three jobs** — `title`, `summarize` and `merge`
+  are separate queues with separate events and separate gates.
+* **Every operation got its own breaker** — a failure of `merge` pauses only
+  `merge`; the summary queue, the headings and the embeddings keep working
+  (`LSBN-D-18`). The breaker of the `decision` operation lives in the decision
+  service, where the call happens.
+* **The answer contract is the code's business** — the model returns text, the code
+  makes the structure. `split` and `merge` take free text (`parts-by-delimiter`)
+  instead of JSON (`LSBN-D-13`); a part shorter than the code threshold is not
+  written and the call is repeated (`LSBN-D-17`); the headings of the split parts
+  are a separate `title` call.
+* **`worker_jobs.slot` carries the operation name** — the migration maps the pairs
+  (`summary`,`merge`) → `merge`, (`judge`,`dedup`) → `judge`, (`nodes`,`reclass`) →
+  `classify`; it is idempotent, logs `slot_migrated`, and marks an unknown
+  combination with attention instead of losing the task. The reverse map is
+  deterministic.
+* **The embedding model is tracked per operation** — in the new mode the automatic
+  reindex, the backup remark and the reindex script compare the effective model of
+  the `embed` operation (`EMBED_MODEL`), not the group one (`LSBN-D-21`).
+
+### Fixed
+
+* **The false red of the acceptance scenario "the age of the oldest task"**
+  (`LSBN-D-19`) — the probe note was shorter than 400 characters, so the
+  short-note rule summarized it with its own text and it left the queue before the
+  scenario could measure it.
+
 ## [3.8.1] - 2026-11-14
 
 Release 3.8.1 — a false alarm at startup: the config scanner mistook the global
