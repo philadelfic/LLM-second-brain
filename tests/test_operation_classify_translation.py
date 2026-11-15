@@ -45,6 +45,7 @@ from fakes import (
 from app.config import get_settings
 from app.services.classifier import Classification, ClassificationService
 from app.services.decision import DecisionService
+from app.services.jobs import BackoffState, run_loop
 from app.services.llm_client import (
     CHECK_OK,
     CHECK_UNREACHABLE,
@@ -61,6 +62,7 @@ from app.services.worker import (
     NODES_JOB,
     NODES_RECLASS_KIND,
     BackgroundWorker,
+    build_summary_job,
 )
 from app.storage.db import init_db, session, transaction
 
@@ -571,6 +573,142 @@ def test_the_work_returns_after_the_pause(operation_settings) -> None:
 
     assert worker.process_nodes() == 1
     assert worker._pending_jobs(NODES_JOB, NODES_RECLASS_KIND, 10) == []
+
+
+# --- the pause of the operation stops the classifier calls (LSBN-S-9) --------
+
+
+def test_the_paused_classify_stops_the_grooming_call(operation_settings) -> None:
+    """The pause of `classify`: the grooming does not call the model."""
+    classifier = FixedClassifier(Classification("work", 0.9))
+    worker = _worker(operation_settings, classifier=classifier)
+    note_id = _default_note(operation_settings)
+    worker._breakers["classify"].note_failure(SlotOutcome.AUTH)
+    assert _paused(worker, "classify") is True
+
+    assert worker.process_summary_pending() == 1  # the note is summarized
+
+    assert classifier.calls == [], "the classifier was called on the pause"
+    with session(operation_settings) as conn:
+        row = conn.execute(
+            "SELECT namespace, classified_at FROM notes WHERE id = ?", (note_id,)
+        ).fetchone()
+    assert row["classified_at"] is None  # the note waits (the sweep takes it)
+
+
+def test_the_work_is_taken_after_the_pause_expires(operation_settings) -> None:
+    """After the pause the note is classified (the sweep of the `nodes` job)."""
+    classifier = FixedClassifier(Classification("work", 0.9))
+    worker = _worker(operation_settings, classifier=classifier)
+    note_id = _default_note(operation_settings)
+    worker._breakers["classify"].note_failure(SlotOutcome.AUTH)
+    worker.process_summary_pending()
+    assert classifier.calls == []
+
+    # The model is back: the breaker is resumed and the work is taken.
+    worker._breakers["classify"].note_success()
+    assert worker.process_nodes() == 1
+
+    assert len(classifier.calls) == 1
+    with session(operation_settings) as conn:
+        row = conn.execute(
+            "SELECT classified_at FROM notes WHERE id = ?", (note_id,)
+        ).fetchone()
+    assert row["classified_at"] is not None
+
+
+def test_the_paused_classify_stops_the_reclass_call(operation_settings) -> None:
+    """The pause of `classify`: the reclass task does not call the model."""
+    classifier = FixedClassifier(Classification("work", 0.9))
+    worker = _worker(operation_settings, classifier=classifier)
+    note_id = _placed_note(operation_settings)
+    worker._ensure_job(NODES_JOB, NODES_RECLASS_KIND, note_id)
+    worker._breakers["classify"].note_failure(SlotOutcome.AUTH)
+
+    assert worker.process_nodes() == 0
+
+    assert classifier.calls == [], "the classifier was called on the pause"
+    assert worker._pending_jobs(NODES_JOB, NODES_RECLASS_KIND, 10)
+
+
+def test_the_paused_classify_stops_the_sweep_call(operation_settings) -> None:
+    """The pause of `classify`: the sweep does not call the model."""
+    classifier = FixedClassifier(Classification("work", 0.9))
+    worker = _worker(operation_settings, classifier=classifier)
+    _default_note(operation_settings)
+    worker.process_summary_pending()
+    classifier.calls.clear()
+    worker._breakers["classify"].note_failure(SlotOutcome.AUTH)
+
+    assert worker.process_nodes() == 0
+
+    assert classifier.calls == [], "the classifier was called on the pause"
+
+
+def test_the_paused_classify_stops_the_warnings_call(
+    operation_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pause of `classify`: the `warnings` job does not call the model."""
+    classifier = FixedClassifier(Classification("work", 0.9))
+    worker = _worker(operation_settings, classifier=classifier)
+    spec = build_warnings_job(worker, operation_settings)
+    _placed_note(operation_settings)
+    worker._breakers["classify"].note_failure(SlotOutcome.AUTH)
+
+    # The gate of the job reads the breaker of the operation — the batch is
+    # not taken, the model is not called.
+    assert spec.gate is not None and spec.gate() is False
+    assert spec.is_gated is not None and spec.is_gated() is True
+
+    async def instant_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", instant_sleep)
+    iterations: list[int] = []
+
+    def stopping() -> bool:
+        iterations.append(1)
+        return len(iterations) > 1
+
+    asyncio.run(run_loop(spec, stopping, BackoffState(spec.interval_sec)))
+
+    assert classifier.calls == [], "the classifier was called on the pause"
+
+
+def test_the_legacy_classify_failure_stops_the_summary_job(legacy_settings) -> None:
+    """The `legacy` mode: the classifier's failure stops the `summary` job.
+
+    The shared breaker of the `summary` slot group is read by the gate of the
+    job — the pause stops the job as a whole (as before). The `operation` mode
+    has its own pause of the operation: the check is inside the path.
+    """
+    worker = _worker(legacy_settings, classifier=FixedClassifier(fail=True))
+    _default_note(legacy_settings)
+    worker.process_summary_pending()
+    assert _paused(worker, "summary") is True
+
+    spec = build_summary_job(worker, legacy_settings)
+    assert spec is not None
+    assert spec.gate is not None and spec.gate() is False
+    assert spec.is_gated is not None and spec.is_gated() is True
+
+
+def test_the_legacy_grooming_calls_the_classifier_on_the_pause(
+    legacy_settings,
+) -> None:
+    """The `legacy` mode: the pause of the slot is NOT a path-level check.
+
+    The gate of the job is the mechanism there (the whole job stops); the
+    path itself is not gated by the operation (as before).
+    """
+    classifier = FixedClassifier(fail=True)
+    worker = _worker(legacy_settings, classifier=classifier)
+    _default_note(legacy_settings)
+    worker._breakers["summary"].note_failure(SlotOutcome.AUTH)
+
+    worker.process_summary_pending()
+
+    assert classifier.calls, "the legacy path is not gated by the operation"
 
 
 # --- criterion 7: the legacy mode did not change -----------------------------

@@ -831,6 +831,31 @@ class BackgroundWorker:
         """
         return self._slot_blocked(self._operation_slot(operation))
 
+    def _classify_blocked(self) -> bool:
+        """Is the classifier NOT to be called (the `classify` operation is blocked)?
+
+                Release 3.9.0 (LSBN-S-9): in the `operation` mode the pause of
+                the `classify` operation stops the CLASSIFIER calls of the paths
+                that call it — the grooming (inside the `summarize` job), the
+                reclass tasks and the sweep (inside the `nodes` job). The gate
+                of a job stays the gate of its job (the `summarize` job is
+                gated by the `summarize` operation — the check is INSIDE the
+                path, the S-8 precedent: the structural judge is not called on
+                the pause of its operation). The work is not lost: the note
+                stays unclassified (the sweep of the `nodes` job takes it
+                later), the reclass task stays `pending`.
+
+                The `legacy` mode: False — the shared breaker of the `summary`
+                slot group is read by the gate of the job (as before): the
+                pause stopped the `summary` job as a whole, and it still does
+                (the classifier is not called, but the job is not the one
+                that is gated by the `classify` operation there).
+
+        """
+        if self._mode() != SLOT_MODEL_OPERATION:
+            return False
+        return self._operation_blocked("classify")
+
     def _build_breakers(self, settings: Settings) -> dict[str, SlotBreaker]:
         """The breaker dictionary: one breaker per SLOT GROUP (`legacy` mode)
         or one per OPERATION (`operation` mode).
@@ -3882,6 +3907,11 @@ class BackgroundWorker:
         """
         if self._classifier is None:
             return  # a test mode without a classifier
+        if self._classify_blocked():
+            # Release 3.9.0 (LSBN-S-9): the `classify` operation is paused —
+            # the model is NOT called. The note stays unclassified (the work is
+            # not lost: the sweep of the `nodes` job takes it after the pause).
+            return
         known = self._namespaces.list_all()["namespaces"]
         try:
             result = self._classifier.classify(text, known)
@@ -4132,6 +4162,11 @@ class BackgroundWorker:
             return False  # waiting for the summary: the task stays pending
         if self._classifier is None:
             return False  # a test mode without a classifier
+        if self._classify_blocked():
+            # Release 3.9.0 (LSBN-S-9): the `classify` operation is paused —
+            # the model is NOT called, the task stays `pending` (the work is
+            # not lost; no attempt is counted).
+            return False
         known = self._namespaces.list_all()["namespaces"]
         text = f"{row['title']}\n{summary}" if row["title"] else summary
         try:
@@ -4203,6 +4238,11 @@ class BackgroundWorker:
         """
         limit = min(budget, self._settings.job_nodes_classifier_budget)
         if limit <= 0 or self._classifier is None:
+            return 0
+        if self._classify_blocked():
+            # Release 3.9.0 (LSBN-S-9): the `classify` operation is paused —
+            # the model is NOT called, the notes stay candidates of the next
+            # run (the work is not lost).
             return 0
         with session(self._settings) as conn:
             rows = conn.execute(_NODES_CLASSIFY_SELECT, (limit,)).fetchall()
