@@ -139,8 +139,81 @@ HEALTH_QUEUES = ("vector", "summary", "judge", "areas", "links", "nodes",
                  "warnings", "terms-normalize")
 # №39: the slots the acceptance walks one by one (arch §13.13).
 SLOTS = ("embedding", "summary", "judge", "decision")
-# Queue that belongs to each slot for the "queue grows while the slot is down".
-SLOT_QUEUE = {"embedding": "vector", "summary": "summary", "judge": "judge"}
+# The queues of the OPERATIONS (`/health.queues` in the `operation` mode) and
+# the entries of `/health.slots` there — the surface the scenarios read in that
+# mode (the legacy keys stay as the deprecated aggregates, LSBN-S-15).
+OPERATION_QUEUES = ("summarize", "title", "merge", "embed", "classify")
+OPERATION_SLOTS = ("summarize", "title", "merge", "judge", "embed", "classify",
+                   "decision")
+# ==== the mode of the slot layer (release 3.9.0, LSBN-S-17) =====================
+# The acceptance reads the queues and the slot health BY THE NAMES OF THE MODE of
+# the contour (`/health.slot_mode`): the `legacy` mode — the slot groups
+# (`summary`/`vector`/`judge`), the `operation` mode — the OPERATIONS
+# (`summarize`/`embed`/`judge`). The two D-19 scenarios (the age of the oldest
+# task, the recovery after the break) read the queue of the operation: in the
+# `operation` mode the legacy aggregate `summary` is NOT gated by the breaker of
+# the operation, so the deferred work is invisible there — the scenario would
+# read a false red.
+SLOT_MODEL_LEGACY = "legacy"
+SLOT_MODEL_OPERATION = "operation"
+
+# The names of every slot group in both modes:
+#   health  — the key of `/health.slots` (the operation in the `operation` mode);
+#   queue   — the key of `/health.queues` (the operation's own queue);
+#   target  — the name the contour hooks take (`scripts/slot_gate.sh`,
+#             `scripts/slot_fake.sh`) — the operation name in the `operation` mode.
+SLOT_NAMES_BY_MODE: dict[str, dict[str, dict[str, str]]] = {
+    "embedding": {
+        SLOT_MODEL_LEGACY: {"health": "embedding", "queue": "vector",
+                            "target": "embedding"},
+        SLOT_MODEL_OPERATION: {"health": "embed", "queue": "vector", "target": "embed"},
+    },
+    "summary": {
+        SLOT_MODEL_LEGACY: {"health": "summary", "queue": "summary",
+                            "target": "summary"},
+        SLOT_MODEL_OPERATION: {"health": "summarize", "queue": "summarize",
+                               "target": "summarize"},
+    },
+    "judge": {
+        SLOT_MODEL_LEGACY: {"health": "judge", "queue": "judge", "target": "judge"},
+        SLOT_MODEL_OPERATION: {"health": "judge", "queue": "judge", "target": "judge"},
+    },
+    "decision": {
+        SLOT_MODEL_LEGACY: {"health": "decision", "queue": "", "target": "decision"},
+        SLOT_MODEL_OPERATION: {"health": "decision", "queue": "", "target": "decision"},
+    },
+}
+
+# The mode of the contour (the last read of `/health.slot_mode`).
+MODE = SLOT_MODEL_LEGACY
+
+
+def mode_of(snapshot: dict | None = None) -> str:
+    """The mode of the slot layer of the contour (`/health.slot_mode`).
+
+            Unknown/unreadable — the `legacy` mode (the mode the contour runs in
+            until the flag is flipped on the contour).
+    """
+    global MODE
+    value = (snapshot or {}).get("slot_mode")
+    if value in (SLOT_MODEL_LEGACY, SLOT_MODEL_OPERATION):
+        MODE = value
+    return MODE
+
+
+def slot_names(slot: str, snapshot: dict | None = None) -> dict[str, str]:
+    """The names of a slot group in the current mode.
+
+            `health` — the key of `/health.slots`; `queue` — the key of
+            `/health.queues`; `target` — the name the contour hooks take.
+            An unknown slot — itself (the `decision` channel, as before).
+    """
+    entry = SLOT_NAMES_BY_MODE.get(slot)
+    if entry is None:
+        return {"health": slot, "queue": slot, "target": slot}
+    return entry[mode_of(snapshot)]
+
+
 # #39 + LSBN-F-12: the decision slot (`/health.slots.decision`) is not a "model slot", but it
 # has its own channel: scenario 2's `judge` branch mutes it too (see `_outage_for_slot`).
 SLOT_DECISION = "decision"
@@ -600,6 +673,8 @@ async def refresh_health(rest: httpx2.AsyncClient) -> dict:
     snapshot = await health_snapshot(rest)
     if snapshot.get("status") == "ok":
         HEALTH.update(snapshot)
+        # The mode of the slot layer (LSBN-S-17): the names the scenarios read.
+        mode_of(snapshot)
     return HEALTH
 
 
@@ -1288,6 +1363,33 @@ async def _save_probe_once(c: Client, args: dict, *,
     return None, note_detail(answer)
 
 
+# The probe note's text: LONG ENOUGH to escape the short-note rule of the
+# summarizer (LSBN-T-37: a note not longer than `SUMMARY_SHORT_TEXT_CHARS` —
+# 400 by default — is summarized by its own text, WITHOUT a model call). A short
+# probe note therefore LEAVES the queue on its own, and the slot-level
+# scenarios read an empty queue while the slot is down — a false red (the live
+# run of 13.11.2026: «queue summary: pending=0, waiting=0, oldest=None» with
+# the summary slot stopped — the D-19 scenario «the age of the oldest task»).
+PROBE_TEXT_MIN_CHARS = 600
+
+
+def probe_text(tag: str, label: str) -> str:
+    """The probe note's text: its OWN (a repeated text is refused as a duplicate)
+    and longer than the short-note rule of the summarizer."""
+    head = (f"{tag} {label} — the acceptance probe note of the slot scenarios. The "
+            f"text is deliberately long: the summarizer must ask the model for it "
+            f"(the short-note rule would summarize it by its own text, the queue "
+            f"would empty itself, and the slot scenarios would read an empty "
+            f"queue instead of the deferred work). ")
+    filler = ("The queue of the operation must show this note while the slot is "
+              "down, the age of the oldest task must grow, and after the channel "
+              "returns the worker must take the note up and finish it. ")
+    text = head + filler
+    while len(text) < PROBE_TEXT_MIN_CHARS:
+        text += filler
+    return text
+
+
 async def save_probe_note_result(c: Client, title: str, *, text: str | None = None,
                                  after_hook: bool = False,
                                  rest: httpx2.AsyncClient | None = None,
@@ -1306,7 +1408,7 @@ async def save_probe_note_result(c: Client, title: str, *, text: str | None = No
             product's answer / the break); on success — `id=<n>`.
     """
     args = {
-        "text": text or f"{RUN['tag']} probe note text (observability acceptance).",
+        "text": text or probe_text(RUN["tag"], "observability baseline"),
         "title": title,
     }
     note_id, detail = await _save_probe_once(c, args, reconnect=after_hook)
@@ -1445,6 +1547,25 @@ async def scenario_0_context(c: Client, rest: httpx2.AsyncClient,
                    "last_finish_reason", "last_budget",
                    "last_budget_source", "last_had_thinking"} <= set(stat),
               f"{stat}")
+    # The `operation` mode (LSBN-S-17): the surface of the OPERATIONS is the
+    # primary one there — the legacy keys stay as the deprecated aggregates
+    # (LSBN-S-15), and the scenarios read the operations.
+    if mode_of(snapshot) == SLOT_MODEL_OPERATION:
+        for queue in OPERATION_QUEUES:
+            stat = queue_stat(snapshot, queue)
+            check(f"/health.queues reports the operation queue {queue} "
+                  "with waiting/attention",
+                  stat is not None and "waiting" in stat and "attention" in stat,
+                  f"{stat}")
+        for operation in OPERATION_SLOTS:
+            stat = slot_stat(snapshot, operation)
+            check(f"/health.slots reports the operation {operation} "
+                  "(ok/last_outcome/paused_until/attention/diagnostics)",
+                  stat is not None
+                  and {"ok", "last_outcome", "paused_until", "attention",
+                       "last_finish_reason", "last_budget",
+                       "last_budget_source", "last_had_thinking"} <= set(stat),
+                  f"{stat}")
     info(f"model slots at the start: embedding_ok={snapshot.get('embedding_ok')}, "
          f"summarizer_ok={snapshot.get('summarizer_ok')}, "
          f"judge_ok={snapshot.get('judge_ok')}")
@@ -1504,10 +1625,24 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
     `summary`/`judge` are VECTOR-DEPENDENT: their queue counts only the notes
     whose vector is ready, so the branch waits for the probe notes to be
     vectorised and refuses to run at all while the embedding slot is paused.
+
+    The names (the queue of the slot, the key of `/health.slots`, the target of
+    the contour hooks) are the names of the MODE of the contour — the slot
+    groups in the `legacy` mode, the operations in the `operation` mode
+    (LSBN-S-17).
     """
-    queue = SLOT_QUEUE[slot]
-    needs_vector = slot in VECTOR_DEPENDENT_SLOTS
     before = await health_snapshot(rest)
+    names = slot_names(slot, before)
+    queue = names["queue"]
+    needs_vector = slot in VECTOR_DEPENDENT_SLOTS
+    # The name of the MODE (the operation in the `operation` mode) — it is the
+    # key of `/health.slots`, the marker in the journal and the target of the
+    # contour hooks from here on.
+    slot = names["health"]
+    # The target of the contour hooks: the operation name in the `operation`
+    # mode, the slot-group name in the `legacy` mode.
+    target = names["target"]
+    embed_name = slot_names("embedding", before)["health"]
     stat_before = queue_stat(before, queue) or {}
     info(f"[{slot}] before the outage: queue {queue} pending="
          f"{stat_before.get('pending')}, waiting={stat_before.get('waiting')}")
@@ -1518,20 +1653,20 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
     # dependent queue honestly shows zero work — take care of that state here
     # (an honest SKIP with a hint) instead of reading it as a FAIL later.
     if needs_vector:
-        ready, ready_detail = await slot_ready(rest, "embedding")()
+        ready, ready_detail = await slot_ready(rest, embed_name)()
         if not ready:
             skip(f"[{slot}] the outage of a queue that needs a ready vector",
                  "the embedding slot is not usable, while the queue "
                  f"{queue} counts only the notes whose vector is ready: "
                  f"{ready_detail} — wait for the pause to pass "
-                 "(/health.slots.embedding.paused_until), start the slot back "
+                 f"(/health.slots.{embed_name}.paused_until), start the slot back "
                  "(LSB_SLOT_ON_CMD), then re-run the scenario")
             manual(f"scenario 2, branch [{slot}] (№39 FR-1/FR-2/FR-5.1)",
                    "the branch needs a working embedding slot: its queue is filled "
                    "only by notes whose vector is ready")
             return
 
-    proc = await run_shell(slot_cmd(CFG["slot_off_cmd"], slot))
+    proc = await run_shell(slot_cmd(CFG["slot_off_cmd"], target))
     check(f"[{slot}] the slot is stopped by the contour hook", proc.returncode == 0,
           f"rc={proc.returncode}")
     if proc.returncode != 0:
@@ -1568,7 +1703,7 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
                 # The hook does not know the `decision` target (a foreign contour with an old
                 # scripts/slot_gate.sh): the branch is honestly skipped — otherwise it
                 # measures the wrong channel and goes red falsely. We raise the slot back.
-                back = await run_shell(slot_cmd(CFG["slot_on_cmd"], slot))
+                back = await run_shell(slot_cmd(CFG["slot_on_cmd"], target))
                 teardown_note(f"[{slot}] the slot was started back (the branch "
                               "was left before its probe notes)")
                 skip(f"[{slot}] the generative judge is really the only path",
@@ -1611,14 +1746,14 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
                      f"{probe_detail} — the judge may get no pair")
         else:
             # The text is one's OWN per branch and attempt: with scenario 1's shared text
-            # (`<tag> probe note text (observability acceptance).`) the product
-            # answers "a verbatim duplicate" and saves no note, and the branch would get
-            # a FOREIGN note's id and measure its queue (the live run of 2026-10-10,
-            # the [judge] branch).
-            probe_text = (f"{RUN['tag']} {slot} outage probe text "
-                          "(observability acceptance).")
+            # the product answers "a verbatim duplicate" and saves no note, and the branch
+            # would get a FOREIGN note's id and measure its queue (the live run of
+            # 2026-10-10, the [judge] branch). It is also LONGER than the short-note
+            # rule of the summarizer (LSBN-T-37) — otherwise the note is summarized
+            # by its own text, leaves the queue, and the age check reads a false red.
+            probe_body = probe_text(RUN["tag"], f"{slot} outage")
             probe, probe_detail = await save_probe_note_result(
-                c, RUN[f"note_outage_{slot}"], text=probe_text, after_hook=True,
+                c, RUN[f"note_outage_{slot}"], text=probe_body, after_hook=True,
                 rest=rest)
             probe_ids = [probe] if probe is not None else []
         if probe is None:
@@ -1636,7 +1771,7 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
                    f"не по вине слота (memory_save → {probe_detail}); проверь "
                    "живость контура и MCP-сессии (LSB_LOGS_CMD), подними слот "
                    "(LSB_SLOT_ON_CMD) и перезапусти сценарий")
-            back = await run_shell(slot_cmd(CFG["slot_on_cmd"], slot))
+            back = await run_shell(slot_cmd(CFG["slot_on_cmd"], target))
             released = True
             check(f"[{slot}] the slot is started back by the contour hook",
                   back.returncode == 0, f"rc={back.returncode}")
@@ -1654,13 +1789,13 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
                 f"(the queue {queue} counts them)",
                 timeout=min(CFG["wait_sec"], 180.0))
             if not vector_ok:
-                live, live_detail = await slot_ready(rest, "embedding")()
+                live, live_detail = await slot_ready(rest, embed_name)()
                 if not live:
                     skip(f"[{slot}] the probe notes of the branch are vectorised "
                          f"(the queue {queue} counts them)",
                          "the embedding slot is in a pause / back-off: "
                          f"{live_detail} — wait for the pause to pass "
-                         "(/health.slots.embedding.paused_until), start the slot "
+                         f"(/health.slots.{embed_name}.paused_until), start the slot "
                          "back (LSB_SLOT_ON_CMD), then re-run the scenario")
                     manual(f"scenario 2, branch [{slot}] (№39 FR-1/FR-2/FR-5.1)",
                            "the branch needs a working embedding slot: its queue is "
@@ -1668,7 +1803,7 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
                 else:
                     check(f"[{slot}] the probe notes of the branch got their vector "
                           f"(the queue {queue} counts them)", False, vector_detail)
-                back = await run_shell(slot_cmd(CFG["slot_on_cmd"], slot))
+                back = await run_shell(slot_cmd(CFG["slot_on_cmd"], target))
                 released = True
                 check(f"[{slot}] the slot is started back by the contour hook",
                       back.returncode == 0, f"rc={back.returncode}")
@@ -1740,7 +1875,7 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
             skip(f"[{slot}] the queue_waiting event in the log",
                  "LSB_LOGS_CMD is not set (no log hook on this contour)")
 
-        proc = await run_shell(slot_cmd(CFG["slot_on_cmd"], slot))
+        proc = await run_shell(slot_cmd(CFG["slot_on_cmd"], target))
         released = True
         check(f"[{slot}] the slot is started back by the contour hook",
               proc.returncode == 0, f"rc={proc.returncode}")
@@ -1750,7 +1885,7 @@ async def _outage_for_slot(c: Client, rest: httpx2.AsyncClient, slot: str) -> No
                   back.returncode == 0, f"rc={back.returncode}")
     finally:
         if not released:
-            undo = await run_shell(slot_cmd(CFG["slot_on_cmd"], slot))
+            undo = await run_shell(slot_cmd(CFG["slot_on_cmd"], target))
             if undo.returncode == 0:
                 teardown_note(f"[{slot}] the slot was released by the teardown hook "
                               f"(the scenario did not reach its own `on` step)")
@@ -1852,8 +1987,14 @@ async def scenario_3_auth_branch(c: Client, rest: httpx2.AsyncClient) -> None:
         return
 
     slot = CFG["auth_slot"]
-    queue = SLOT_QUEUE[slot]
-    proc = await run_shell(slot_cmd(CFG["slot_auth_cmd"], slot))
+    # The names of the MODE of the contour (the operation in the `operation`
+    # mode) — the queue of the operation, the key of `/health.slots`, the
+    # marker in the journal and the target of the contour hooks (LSBN-S-17).
+    names = slot_names(slot, await health_snapshot(rest))
+    queue = names["queue"]
+    slot = names["health"]
+    target = names["target"]
+    proc = await run_shell(slot_cmd(CFG["slot_auth_cmd"], target))
     check(f"the fake provider is switched to 401 for {slot}", proc.returncode == 0,
           f"rc={proc.returncode}")
     if proc.returncode != 0:
@@ -1875,10 +2016,9 @@ async def scenario_3_auth_branch(c: Client, rest: httpx2.AsyncClient) -> None:
         # answers "a verbatim duplicate" and saves no note, and the branch would measure a foreign
         # (or empty) queue. The note's first real call opens the breaker
         # (the slot answers 401) — exactly the phase the branch checks.
-        auth_text = (f"{RUN['tag']} {slot} auth-branch probe text — the summary is "
-                     f"deferred by the open break (observability acceptance).")
+        auth_body = probe_text(RUN["tag"], f"{slot} auth branch")
         probe, probe_detail = await save_probe_note_result(
-            c, RUN["note_auth"], text=auth_text, after_hook=True, rest=rest)
+            c, RUN["note_auth"], text=auth_body, after_hook=True, rest=rest)
         if probe is None:
             info(f"[auth] the probe note of the branch is not created "
                  f"({probe_detail}) — the queue {queue} may stay empty")
@@ -1913,13 +2053,13 @@ async def scenario_3_auth_branch(c: Client, rest: httpx2.AsyncClient) -> None:
         check(f"[auth] in the phase of the open break the queue {queue} shows the work "
               f"in `waiting` (`attention == 0`)", ok, detail)
 
-        proc = await run_shell(slot_cmd(CFG["slot_auth_fix_cmd"], slot))
+        proc = await run_shell(slot_cmd(CFG["slot_auth_fix_cmd"], target))
         fixed = True
         check("[auth] the fake provider is fixed back by the contour hook",
               proc.returncode == 0, f"rc={proc.returncode}")
     finally:
         if not fixed:
-            undo = await run_shell(slot_cmd(CFG["slot_auth_fix_cmd"], slot))
+            undo = await run_shell(slot_cmd(CFG["slot_auth_fix_cmd"], target))
             if undo.returncode == 0:
                 teardown_note(f"[{slot}] the fake provider was fixed by the teardown hook")
                 warn("[auth] the scenario left before its fix step",
@@ -2367,7 +2507,10 @@ async def scenario_8_budget_raise_release(c: Client, rest: httpx2.AsyncClient) -
                  f"ids={probe_ids}, first vector ready={vector_ready} — the judge "
                  f"may get no pair")
 
-        ok, detail = await wait_until(queue_has_work(rest, "summary"),
+        # The queue of the summary work in the MODE of the contour (the operation's
+        # own queue in the `operation` mode — LSBN-S-17).
+        summary_queue = slot_names("summary", await health_snapshot(rest))["queue"]
+        ok, detail = await wait_until(queue_has_work(rest, summary_queue),
                                       "[budget] notes without a summary pile up "
                                       "(the answer is cut, not lost)",
                                       timeout=min(CFG["wait_sec"], 240.0))
@@ -2394,9 +2537,11 @@ async def scenario_8_budget_raise_release(c: Client, rest: httpx2.AsyncClient) -
         snapshot_before = await health_snapshot(rest)
         before = {
             "queues": {queue: queue_numbers(snapshot_before, queue)
-                       for queue in ("summary", "judge")},
+                       for queue in (summary_queue, "judge")},
             "slots_attention": {
-                slot: (slot_stat(snapshot_before, slot) or {}).get("attention")
+                slot: (slot_stat(snapshot_before,
+                                 slot_names(slot, snapshot_before)["health"]) or {}
+                       ).get("attention")
                 for slot in SLOTS},
             "own_pending_summaries": own_pending_summaries(),
         }
@@ -2423,9 +2568,11 @@ async def scenario_8_budget_raise_release(c: Client, rest: httpx2.AsyncClient) -
         snapshot_after = await health_snapshot(rest)
         after = {
             "queues": {queue: queue_numbers(snapshot_after, queue)
-                       for queue in ("summary", "judge")},
+                       for queue in (summary_queue, "judge")},
             "slots_attention": {
-                slot: (slot_stat(snapshot_after, slot) or {}).get("attention")
+                slot: (slot_stat(snapshot_after,
+                                 slot_names(slot, snapshot_after)["health"]) or {}
+                       ).get("attention")
                 for slot in SLOTS},
             "own_pending_summaries": own_pending_summaries(),
         }

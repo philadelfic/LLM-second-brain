@@ -6,14 +6,24 @@
 # contour hooks LSB_SLOT_AUTH_CMD / LSB_JUDGE_OFFCONTRACT_CMD / LSB_BUDGET_BREAK_CMD /
 # LSB_DECISION_*_CMD. This hook is what those hooks run:
 #
-#   on <mode> [slot ...]  start `scripts/fake_slot.py` in <mode> and re-create the
-#                         contour with the env of the branch (the slot points at
+#   on <mode> [operation ...]  start `scripts/fake_slot.py` in <mode> and re-create the
+#                         contour with the env of the branch (the operation points at
 #                         http://lsb-fake:8080; scenario 8 adds the tight budget,
 #                         scenario 9 the DECISION_* block)
 #   off                   stop the fake and put the contour back on the stock
 #                         compose file (the stock slot addresses come back)
 #   status                what is running right now (the fake's mode and the
 #                         branch env of the contour)
+#
+# The target of `on` is an OPERATION name of the registry (`summarize`, `title`,
+# `merge`, `split`, `classify`, `describe`, `judge`, `structure_judge`, `embed`,
+# `decision`). The legacy slot-group names (`embedding`, `summary`, `judge`,
+# `decision`) are accepted too — the `legacy` mode lives until the acceptance —
+# with a hint about the operation name. The env of the branch follows the mode
+# of the contour (`SLOT_MODEL`): the `operation` mode reads the env of the
+# operation (`<OP>_BASE_URL`), the `legacy` mode reads the env of the slot group
+# (`<SLOT>_BASE_URL`) — the hook sets both in the `legacy` mode (the whole group
+# goes to the fake, as before).
 #
 # Modes (the first one per branch is the break step, `ok` is the fix step):
 #   auth                     scenario 3  — 401 on every request: the slot pauses
@@ -188,6 +198,74 @@ slot_prefix() {
     esac
 }
 
+# The env prefix of an OPERATION (the `operation` mode reads `<OP>_BASE_URL`).
+# Empty - the name is not an operation (it is a legacy slot-group name).
+operation_prefix() {
+    case "$1" in
+        summarize|title|merge|split|classify|describe|judge|structure_judge|embed|decision)
+            printf '%s' "${1^^}" ;;
+        *)         return 1 ;;
+    esac
+}
+
+# The env prefix of the slot group of a target (the `legacy` mode reads
+# `<SLOT>_BASE_URL`).
+group_prefix() {
+    case "$1" in
+        summarize|summary|title|merge|split|classify|describe) printf 'SUMMARY' ;;
+        judge|structure_judge)                      printf 'JUDGE' ;;
+        embed|embedding)                            printf 'EMBEDDING' ;;
+        decision)                                   printf 'DECISION' ;;
+        *)                                          return 1 ;;
+    esac
+}
+
+# The OPERATIONS of a legacy slot group: in the `operation` mode the name of
+# the group means ALL the operations of the group (they share one channel, as
+# the slots did).
+group_operations() {
+    case "$1" in
+        summary) printf 'SUMMARIZE TITLE MERGE SPLIT CLASSIFY DESCRIBE\n' ;;
+        judge)   printf 'JUDGE STRUCTURE_JUDGE\n' ;;
+        embedding) printf 'EMBED\n' ;;
+        decision) printf 'DECISION\n' ;;
+    esac
+}
+
+# The env prefixes of a target — the env of the BRANCH:
+#   the operation's own env (`<OP>_BASE_URL`) - the `operation` mode reads it;
+#   the env of the slot group (`<SLOT>_BASE_URL`) - the `legacy` mode reads it.
+# In the `legacy` mode both are set (the operation name acts there too: the
+# chain is "operation env -> slot env -> default"); in the `operation` mode
+# only the env of the operation is set (the env of the group does not act
+# there), and the name of a GROUP means all its operations.
+branch_env_prefixes() {
+    local name="$1" mode="$2" prefix op
+    if prefix="$(operation_prefix "$name")"; then
+        printf '%s\n' "$prefix"
+        if [[ "$mode" != "operation" ]]; then
+            printf '%s\n' "$(group_prefix "$name")"
+        fi
+        return 0
+    fi
+    if [[ "$mode" == "operation" ]]; then
+        for op in $(group_operations "$name"); do
+            printf '%s\n' "$op"
+        done
+    else
+        printf '%s\n' "$(group_prefix "$name")"
+    fi
+}
+
+# The mode of the slot layer of the contour (`SLOT_MODEL`): the `operation` mode
+# reads the env of the operation, the `legacy` mode — the env of the group.
+# The contour is not up (a dry run on a foreign host) — the `legacy` default.
+contour_slot_model() {
+    local value=""
+    value="$(docker exec "$APP_CONTAINER" printenv SLOT_MODEL 2>/dev/null || true)"
+    printf '%s' "${value:-legacy}"
+}
+
 if [[ "$ACTION" == "on" ]]; then
     if [[ -z "$MODE" ]]; then
         die "on: the mode is required (${SLOT_MODES[*]} ${DECISION_MODES[*]})"; exit 2
@@ -203,15 +281,27 @@ if [[ "$ACTION" == "on" ]]; then
         fi
     else
         if [[ ${#SLOTS[@]} -eq 0 ]]; then
-            die "on $MODE: at least one slot is required (embedding|summary|judge) — "
-            die "it is the slot the branch points at $FAKE_URL"; exit 2
+            die "on $MODE: at least one operation is required (summarize|title|merge|split|"
+            die "classify|describe|judge|structure_judge|embed) — it is the operation the "
+            die "branch points at $FAKE_URL"; exit 2
         fi
         for slot in "${SLOTS[@]}"; do
-            if ! prefix="$(slot_prefix "$slot")"; then
-                die "on $MODE: unknown slot '$slot' (embedding|summary|judge)"; exit 2
+            if ! prefix="$(slot_prefix "$slot")" && ! operation_prefix "$slot" >/dev/null; then
+                die "on $MODE: unknown operation '$slot' (summarize|title|merge|split|"
+                die "classify|describe|judge|structure_judge|embed)"; exit 2
             fi
-            if [[ "$slot" == "embedding" ]]; then
-                note "the embedding slot is not emulated by the fake (its routes answer 501): "
+            # The legacy slot-group names are accepted (the `legacy` mode lives until
+            # the acceptance) — with a hint about the operation name.
+            case "$slot" in
+                embedding)
+                    note "'embedding' is the legacy slot-group name — the operation name "
+                    note "is 'embed' (the same channel)" ;;
+                summary)
+                    note "'summary' is the legacy slot-group name — the operation names "
+                    note "are 'summarize', 'title', 'merge', 'split', 'classify', 'describe'" ;;
+            esac
+            if [[ "$slot" == "embedding" || "$slot" == "embed" ]]; then
+                note "the embedding operation is not emulated by the fake (its routes answer 501): "
                 note "the branches 3/4/8/9 never touch it"
             fi
         done
@@ -401,8 +491,26 @@ if [[ "$ACTION" == "on" ]]; then
             ENV["DECISION_MODEL"]="${DECISION_MODEL}-${MODE#decision-}"
         fi
     else
+        # The env of the branch follows the MODE of the contour (`SLOT_MODEL`):
+        # the `operation` mode reads the env of the OPERATION only
+        # (`<OP>_BASE_URL`), the `legacy` mode reads the env of the slot group
+        # (`<SLOT>_BASE_URL`) — the whole group goes to the fake there, as
+        # before. In the `legacy` mode the env of the operation is set too (the
+        # chain of that mode starts with the operation env — so the operation
+        # itself points at the fake as well).
+        slot_model="$(contour_slot_model)"
         for slot in "${SLOTS[@]}"; do
-            ENV["$(slot_prefix "$slot")_BASE_URL"]="$FAKE_URL"
+            while IFS= read -r prefix; do
+                [[ -n "$prefix" ]] || continue
+                ENV["${prefix}_BASE_URL"]="$FAKE_URL"
+                if [[ "$MODE" == "empty-length" ]]; then
+                    # The tight budget of the branch — the env of the operation
+                    # in the `operation` mode, the env of the group in the
+                    # `legacy` mode (both are set — the chain picks one).
+                    ENV["${prefix}_MODEL_TYPE"]="$TIGHT_MODEL_TYPE"
+                    ENV["${prefix}_NUM_PREDICT"]="$TIGHT_NUM_PREDICT"
+                fi
+            done < <(branch_env_prefixes "$slot" "$slot_model")
         done
         # Ветви 4 и 8 проверяют отказ ГЕНЕРАТИВНОГО судьи: иначе решение берёт
         # живой decision-слот, и заглушка генеративного судьи не участвует
@@ -412,10 +520,6 @@ if [[ "$ACTION" == "on" ]]; then
         if [[ "$MODE" == "offcontract" || "$MODE" == "empty-length" ]]; then
             ENV["DECISION_ENABLED"]="false"
             ENV["DECISION_FALLBACK"]="true"
-        fi
-        if [[ "$MODE" == "empty-length" ]]; then
-            ENV["SUMMARY_MODEL_TYPE"]="$TIGHT_MODEL_TYPE"
-            ENV["SUMMARY_NUM_PREDICT"]="$TIGHT_NUM_PREDICT"
         fi
     fi
 fi
@@ -439,8 +543,11 @@ case "$ACTION" in
         echo "contour: $APP_CONTAINER state=$state"
         if [[ "$state" == "running" ]]; then
             # Только ключи ветвей: чужие переменные (в т.ч. токен) не печатаются.
+            # The operation names (`SUMMARIZE_*` and the like) are read too: in
+            # the `operation` mode the contour reads the env of the operation,
+            # not of the slot group.
             docker exec "$APP_CONTAINER" sh -c \
-                'env | grep -E "^(EMBEDDING|SUMMARY|JUDGE|DECISION)_(BASE_URL|ENABLED|MODEL_TYPE|NUM_PREDICT|MODEL|FALLBACK|THRESHOLD|UNCERTAINTY_ZONE)=" | sort' \
+                'env | grep -E "^(EMBEDDING|EMBED|SUMMARY|SUMMARIZE|TITLE|MERGE|SPLIT|CLASSIFY|DESCRIBE|JUDGE|STRUCTURE_JUDGE|DECISION)_(BASE_URL|ENABLED|MODEL_TYPE|NUM_PREDICT|MODEL|FALLBACK|THRESHOLD|UNCERTAINTY_ZONE)=" | sort' \
                 2>/dev/null || note "the contour env is unreadable"
         fi
         if [[ "$(container_state "$FAKE_CONTAINER")" == "running" ]]; then
