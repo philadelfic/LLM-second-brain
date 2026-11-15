@@ -28,6 +28,12 @@
     breaker gates it with the framework's gate (3.4.1, LSBN-T-29). A fresh
     `default` is left to the `nodes` job (§13.5): two jobs do not argue over one
     node.
+
+    Release 3.9.0 (LSBN-S-9): the job works the `classify` operation — in the
+    `operation` mode its breaker key is the OPERATION (`classify`), not the
+    `summary` slot group, and the failure of the classifier goes to that
+    breaker. The `legacy` mode keeps the slot group and the journal-only
+    failure (as before).
 """
 
 from __future__ import annotations
@@ -45,7 +51,7 @@ from app.services import jobs
 from app.services.classifier import ClassificationError
 from app.services.jobs import JobSpec, queue_snapshot
 from app.services.listing import page_fields
-from app.services.slot_outcome import outcome_of
+from app.services.slot_outcome import SlotOutcome, outcome_of
 from app.storage.db import session, transaction
 
 if TYPE_CHECKING:  # the service has no runtime dependencies (DI)
@@ -541,6 +547,36 @@ class WarningsService:
         )
 
 
+class _ReportingClassifier:
+    """The classifier of the `warnings` job: the failure goes to the breaker.
+
+            Release 3.9.0 (LSBN-S-9): the `warnings` job works the `classify`
+            operation — the failure of the classifier is recorded at the
+            breaker of the operation (its own breaker in the `operation` mode).
+            The narrow point of the reporting is the call itself: the service
+            sees the same classifier contract (the failure is re-raised, the
+            `warnings_classifier_failed` event is written as before), and the
+            outcome goes to the worker's breaker.
+
+            `report` — the worker's `_note_classify_failure`: in the `legacy`
+            mode it does nothing (the job never touched the breaker).
+    """
+
+    def __init__(
+        self, classifier: Any, report: Callable[[SlotOutcome], None]
+    ) -> None:
+        self._classifier = classifier
+        self._report = report
+
+    def classify(self, text: str, known_nodes: list) -> Any:
+        """The classifier's call — the failure is reported and re-raised."""
+        try:
+            return self._classifier.classify(text, known_nodes)
+        except ClassificationError as exc:
+            self._report(outcome_of(exc))
+            raise
+
+
 def build_warnings_job(
     worker: "BackgroundWorker", settings: Settings
 ) -> JobSpec | None:
@@ -553,11 +589,27 @@ def build_warnings_job(
             `is_gated` — `_slot_blocked` (queue snapshots without models). Before, the
             job declared a slot but kept poking the dead slot on a breaker — now the
             framework does not take the batch.
+
+            Release 3.9.0 (LSBN-S-9): the job works the `classify` operation —
+            the breaker key is the OPERATION in the `operation` mode (the
+            `classify` breaker), the `summary` slot group in the `legacy` mode
+            (as before). The gate and the blocked check read the same key, and
+            the failure of the classifier goes to that breaker (the sink).
     """
     if worker._classifier is None:  # the Phase-3 test mode — there was no loop
         return None
+    # The breaker key of the job: the `classify` operation in the `operation`
+    # mode, the `summary` slot group in the `legacy` mode.
+    key = worker._operation_slot("classify")
     service = WarningsService(
-        settings, classifier=worker._classifier, namespaces=worker._namespaces
+        settings,
+        # The classifier with the reporting of the failure (the breaker of the
+        # `classify` operation — the operation owns the failure).
+        classifier=_ReportingClassifier(
+            worker._classifier,
+            lambda outcome: worker._note_classify_failure(WARNINGS_JOB, outcome),
+        ),
+        namespaces=worker._namespaces,
     )
     batch = settings.job_warnings_batch
 
@@ -575,9 +627,9 @@ def build_warnings_job(
         wait_event=None,
         idle_hook=None,
         queue_stat=service.queue_stat,
-        slot="summary",
-        gate=lambda: worker._slot_gate("summary", WARNINGS_JOB),
-        is_gated=lambda: worker._slot_blocked("summary"),
+        slot=key,
+        gate=lambda: worker._slot_gate(key, WARNINGS_JOB),
+        is_gated=lambda: worker._slot_blocked(key),
     )
 
 

@@ -55,7 +55,7 @@ import httpx
 
 from app.config import Settings
 from app.services.decision import SLOT_DECISION, DecisionService, DecisionUnavailable
-from app.services.llm_client import ChatMeta, LLMClient, LLMError, SlotSpec
+from app.services.llm_client import CHECK_OK, ChatMeta, LLMClient, LLMError, SlotSpec
 from app.services.namespaces import NamespaceService, NamespaceValidationError
 from app.services.prompts import PromptRegistry
 from app.services.slot_outcome import SlotOutcome, classify_llm_error
@@ -124,6 +124,12 @@ class Classifier(Protocol):
 
     def classify(self, text: str, known_nodes: list[dict[str, Any]]) -> Classification:
         """Tag a default note against the known registry nodes."""
+        ...
+
+    def probe(self) -> str:
+        """A cheap probe knock of the operation (#39, arch §6.4): `check()` without
+        generation; the outcome — a CheckResult from llm_client.
+        """
         ...
 
     def close(self) -> None:
@@ -305,6 +311,30 @@ class ClassificationService:
     def close(self) -> None:
         """Close the HTTP pool (clean process shutdown)."""
         self._llm.close()
+
+    def probe(self) -> str:
+        """A cheap probe knock of the `classify` operation (release 3.9.0, LSBN-S-9).
+
+                    The path the operation works on decides the knock: the decision
+                    service (its own probe — the classifier walks into the decision
+                    slot) when the decision is the ONLY path (the fallback is off),
+                    the generative client (`check()`) otherwise — with the fallback
+                    on the generative path always works, so it is the honest thing
+                    to knock on. No client at all — `CHECK_OK` (the precedent of an
+                    absent service).
+
+                    Without this method the probe of the operation returned the
+                    `CHECK_OK` stub: the pause of the breaker was lifted while the
+                    model was down (the breaker of the operation — the `classify`
+                    one in the `operation` mode).
+        """
+        if self._decider is not None and not self._settings.decision_fallback:
+            # The decision path: the knock goes to the decision slot (the
+            # classifier's own service — the decision breaker lives inside it).
+            return self._decider.probe()
+        if self._llm is None:  # pragma: no cover — the client is always built
+            return CHECK_OK
+        return self._llm.check()
 
     @staticmethod
     def _log_decision_skipped(candidates: int) -> None:

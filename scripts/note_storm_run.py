@@ -399,10 +399,10 @@ class _BudgetedSummarizer(SummaryService):
         self._budget = budget
         self.pairs: list[tuple[str, str]] = []
 
-    def merge(self, text_a: str, text_b: str):
+    def merge(self, text_a: str, text_b: str, *, title: str | None = None):
         self._budget.spend()
         self.pairs.append((text_a, text_b))
-        return super().merge(text_a, text_b)
+        return super().merge(text_a, text_b, title=title)
 
 
 def _origin_by_text(parts: dict[int, tuple[str, int | None]]) -> dict[str, int]:

@@ -75,7 +75,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app import __version__
 from app.config import Settings
@@ -93,7 +93,7 @@ from app.services.notes import (
     NoteValidationError,
 )
 # LSBN-F-34: the /health.operations snapshot (model/provider/source per operation).
-from app.services.operations import operations_health
+from app.services.operations import operations_health, slot_model
 from app.services.search import SearchValidationError
 from app.storage.db import StorageError
 from app.storage.migration import MigrationError
@@ -382,6 +382,16 @@ class SlotStat(BaseModel):
             LSBN-T-33: `last_answer_budget`/`last_reasoning_budget`/`last_sent_budget`
             — the last call's separate budgets; "eaten by reasoning" is visible via
             `last_outcome=truncated` + `last_had_thinking=true` and the budget split.
+
+            Release 3.9.0 (LSBN-S-15; the design, B6): the three fields below
+            exist in the `operation` mode ONLY — they are absent (not `null`)
+            in the `legacy` form, so the old shape does not change:
+            `deprecated` — the entry is the DEPRECATED aggregate of a legacy
+            slot group (the worst operation of the group); `operations` — the
+            operations of that group; `nested_calls` — the operations whose
+            calls happen INSIDE this operation's call and are counted toward
+            it (the `title` calls of the parts of a split — they belong to the
+            `split` operation).
             Assembled by the worker; SQL/memory only — no models called.
     """
 
@@ -396,6 +406,11 @@ class SlotStat(BaseModel):
     last_answer_budget: int | None = None
     last_reasoning_budget: int | None = None
     last_sent_budget: int | None = None
+    # LSBN-S-15: the fields of the `operation` mode — absent in the `legacy`
+    # form (the shape of the old consumer does not change).
+    deprecated: bool | None = Field(default=None, exclude_if=lambda v: v is None)
+    operations: list[str] | None = Field(default=None, exclude_if=lambda v: v is None)
+    nested_calls: list[str] | None = Field(default=None, exclude_if=lambda v: v is None)
 
 
 class BackupStat(BaseModel):
@@ -484,6 +499,13 @@ class HealthResponse(BaseModel):
     # #14 (arch §7.2): the backups observability — a BACKUP_DIR directory scan without
     # opening the DB + the latest verify/ship outcomes from the sidecar index.
     backups: BackupStat
+    # LSBN-S-15 (the design, B6): the mode of the slot layer (`legacy` | `operation`)
+    # and the number of the `worker_jobs` rows that still carry an old slot value
+    # (the migration of LSBN-S-14). Both fields are visible in BOTH modes — the
+    # consumer sees what is happening (the `legacy` mode: the flag and the current
+    # number of the rows).
+    slot_mode: str
+    slot_migration_pending: int
 
 
 def _services(request: Request) -> Services:
@@ -739,6 +761,13 @@ def build_rest_router(settings: Settings) -> APIRouter:
             update=update,
             backups=backups,
             migration=migration,
+            # LSBN-S-15: the mode of the slot layer and the number of the rows
+            # that still carry an old slot value (SQL only — the migration of
+            # LSBN-S-14; the counter is read, the migration is not run here).
+            slot_mode=slot_model(settings),
+            slot_migration_pending=await asyncio.to_thread(
+                worker.slot_migration_pending
+            ),
         )
 
     # LSBN-F-37: the knobs' cards — THE same registry as the MCP `tuning_*` pair

@@ -73,9 +73,12 @@ import httpx
 
 from app.config import Settings
 from app.services.operations import (
+    DEFAULT_PROVIDER,
     OPERATIONS,
     OPERATION_FIELD_DEFAULTS,
+    OPERATION_REGISTRY,
     SPEC_FIELDS,
+    operation_mode,
     resolve_operation,
 )
 from app.services.ollama_gate import ollama_slot
@@ -93,6 +96,12 @@ PROVIDER_OPENAI = "openai"
 CONNECT_TIMEOUT_SEC_OLLAMA = 2.0
 CONNECT_TIMEOUT_SEC_OPENAI = 10.0
 EMBEDDING_READ_TIMEOUT_SEC = 720.0
+
+# The read timeout of an operation in the `operation` mode (release 3.9.0,
+# LSBN-S-5): the code default of a generative operation - the operator sets
+# `<OP>_TIMEOUT_SEC` for a different one. The slot groups keep their own
+# timeouts in the `legacy` mode (the slot factories).
+OPERATION_READ_TIMEOUT_SEC = 900.0
 
 # The startup check: one attempt, ~5 s - a liveness probe, not generation.
 #
@@ -338,20 +347,34 @@ class SlotSpec:
                 slot sets anything. The reserve slot (decision, the F-12 mechanics) takes
                 no part here: an operation override acts on the primary path only.
 
+                Release 3.9.0 (LSBN-S-5): in the `operation` mode the slot layer does
+                NOT take part - the base of the spec is the code default of the
+                operation (`_operation_base`) and the chain is "operation env ->
+                default". The `legacy` mode is unchanged.
+
         """
-        slot = OPERATIONS.get(operation)
-        if slot is None:
-            raise ValueError(
-                f"неизвестная операция: {operation} (реестр: "
-                + ", ".join(sorted(OPERATIONS))
-                + ")"
-            )
-        factory = {
-            "embedding": cls.for_embedding,
-            "summary": cls.for_summary,
-            "judge": cls.for_judge,
-        }[slot]
-        base = factory(settings)
+        if operation_mode(settings):
+            if operation not in OPERATION_REGISTRY:
+                raise ValueError(
+                    f"неизвестная операция: {operation} (реестр: "
+                    + ", ".join(sorted(OPERATION_REGISTRY))
+                    + ")"
+                )
+            base = cls._operation_base(operation, settings)
+        else:
+            slot = OPERATIONS.get(operation)
+            if slot is None:
+                raise ValueError(
+                    f"неизвестная операция: {operation} (реестр: "
+                    + ", ".join(sorted(OPERATIONS))
+                    + ")"
+                )
+            factory = {
+                "embedding": cls.for_embedding,
+                "summary": cls.for_summary,
+                "judge": cls.for_judge,
+            }[slot]
+            base = factory(settings)
         values, sources = resolve_operation(operation, settings)
         updates: dict[str, object] = {}
         for field, value in values.items():
@@ -364,6 +387,37 @@ class SlotSpec:
                 updates[SPEC_FIELDS[op_field]] = default
         spec = replace(base, **updates, model_source=sources["model"])
         return spec, sources
+
+    @classmethod
+    def _operation_base(cls, operation: str, settings: Settings) -> SlotSpec:
+        """The code-default base of an operation in the `operation` mode.
+
+                The slot group does not take part (the design, B1): the model,
+                the address and the key of the operation come from its own env
+                (`<OP>_*`). The global `SLOT_*` safeguards - the budget cap, the
+                prompt reserve, the reasoning threshold, the minimal timeout -
+                apply as they do in the `legacy` mode (the owner's decision Q4:
+                the global knobs are not bound to an operation).
+
+        """
+        return cls(
+            name=operation,
+            provider=DEFAULT_PROVIDER,
+            base_url="",
+            model="",
+            api_key="",
+            read_timeout=OPERATION_READ_TIMEOUT_SEC,
+            think=None,
+            model_type="generation",
+            context_tokens=0,
+            max_output_tokens=settings.slot_max_output_tokens,
+            prompt_reserve_tokens=settings.slot_prompt_reserve_tokens,
+            reasoning_min_output_tokens=settings.slot_reasoning_min_output_tokens,
+            num_predict=0,
+            reasoning_num_predict=settings.slot_reasoning_num_predict,
+            min_timeout_sec=settings.slot_min_timeout_sec,
+            model_source="default",
+        )
 
     @classmethod
     def for_decision(cls, settings: Settings) -> SlotSpec:

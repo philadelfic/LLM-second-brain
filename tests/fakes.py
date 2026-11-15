@@ -215,9 +215,12 @@ class FixedSummarizer:
         self.last_attempt_ok = True
         return SummaryResult(text=self.summary, meta=fake_meta("summary", "title"))
 
-    def merge(self, text_a: str, text_b: str) -> MergeResult:
+    def merge(
+        self, text_a: str, text_b: str, *, title: str | None = None
+    ) -> MergeResult:
         """Слияние дубликатов (Этап 2.2; контракт F-23): фиксированный ответ —
-        одна самодостаточная часть, журнал пар."""
+        одна самодостаточная часть, журнал пар. `title` — заголовок ранней
+        заметки (LSBN-S-12): в новом контракте первая часть сохраняет его."""
         self.merge_calls.append((text_a, text_b))
         self.last_attempt_ok = True
         meta = fake_meta("summary", "merge")
@@ -279,7 +282,7 @@ class FailingSummarizer:
         self.last_attempt_ok = False
         raise SummaryError(self.message)
 
-    def merge(self, text_a: str, text_b: str) -> str:
+    def merge(self, text_a: str, text_b: str, *, title: str | None = None) -> str:
         """Слияние дубликатов всегда отказывает (как summarize)."""
         self.merge_calls.append((text_a, text_b))
         self.last_attempt_ok = False
@@ -345,7 +348,9 @@ class MergeFailingSummarizer(FixedSummarizer):
         # (MergeIncompleteError, пара откладывается), а не SummaryError.
         self.incomplete: bool = False
 
-    def merge(self, text_a: str, text_b: str) -> MergeResult:
+    def merge(
+        self, text_a: str, text_b: str, *, title: str | None = None
+    ) -> MergeResult:
         self.merge_calls.append((text_a, text_b))
         if self.fail:
             self.last_attempt_ok = False

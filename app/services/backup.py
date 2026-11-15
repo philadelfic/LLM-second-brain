@@ -381,14 +381,26 @@ class BackupService:
             conn.close()
 
     def _embedding_mismatch(self, conn: sqlite3.Connection) -> bool:
-        """`meta.embedding_model` diverged from env — a remark (not a failure, §13.1)."""
+        """`meta.embedding_model` diverged from the effective model — a remark
+        (not a failure, §13.1).
+
+        Release 3.9.0 (LSBN-S-18): the comparison is with the EFFECTIVE
+        embedding model — the one the vectors are actually built with (the
+        `embed` operation in the `operation` mode, the slot value in `legacy`).
+        The meta holds that same effective value (app/storage/db.py), so the
+        remark tells the truth about the snapshot; in the `legacy` mode nothing
+        changes (the slot value IS the effective one there).
+        """
         try:
             row = conn.execute(
                 "SELECT value FROM meta WHERE key = 'embedding_model'"
             ).fetchone()
         except sqlite3.Error:
             return False
-        return row is not None and str(row[0]) != self._settings.embedding_model
+        if row is None:
+            return False
+        effective_model, _provider = db._effective_embedding_values(self._settings)
+        return str(row[0]) != effective_model
 
     def _marker_path(self, path: Path) -> Path:
         """The bad-snapshot sidecar: `<file>.bad`."""

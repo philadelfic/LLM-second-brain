@@ -45,14 +45,19 @@ docker exec lsb-test env | grep -E '^(MCP_AUTH_TOKEN|MCP_)=' > "$ENV_FILE"
 # env вшивается при СОЗДАНИИ контейнера, контур пересобирается).
 FAKE_HOOKS=()
 if [[ "${LSB_FAKE_HOOKS:-1}" != "0" ]]; then
+  # The targets of the hooks are OPERATION names (`summarize`, `judge`, ...):
+  # the hooks accept the legacy slot names too, but in the `operation` mode the
+  # env of a slot group does not act — only the env of the operation does.
+  # `LSB_AUTH_SLOT` is the logical SLOT GROUP: the runner puts the name of the
+  # mode in its place (the group in `legacy`, the operation in `operation`).
   FAKE_HOOKS=(
     -e "LSB_SLOT_AUTH_CMD=scripts/slot_fake.sh on auth"
     -e "LSB_SLOT_AUTH_FIX_CMD=scripts/slot_fake.sh on ok"
     -e "LSB_AUTH_SLOT=summary"
     -e "LSB_JUDGE_OFFCONTRACT_CMD=scripts/slot_fake.sh on offcontract judge"
     -e "LSB_JUDGE_OFFCONTRACT_FIX_CMD=scripts/slot_fake.sh off"
-    -e "LSB_BUDGET_BREAK_CMD=scripts/slot_fake.sh on empty-length summary judge"
-    -e "LSB_BUDGET_FIX_CMD=scripts/slot_fake.sh on ok summary judge"
+    -e "LSB_BUDGET_BREAK_CMD=scripts/slot_fake.sh on empty-length summarize judge"
+    -e "LSB_BUDGET_FIX_CMD=scripts/slot_fake.sh on ok summarize judge"
     -e "LSB_DECISION_ON_CMD=scripts/slot_fake.sh on decision-ok"
     -e "LSB_DECISION_UNSUPPORTED_CMD=scripts/slot_fake.sh on decision-unsupported"
     -e "LSB_DECISION_OFF_CMD=scripts/slot_fake.sh on decision-unavailable"

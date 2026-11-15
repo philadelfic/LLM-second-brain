@@ -54,6 +54,24 @@ class SlotBreaker:
         self._failures: dict[SlotOutcome, int] = {}
         self._paused_until: float | None = None
 
+    @property
+    def pause_sec(self) -> int:
+        """The pause length of THIS breaker (seconds) — its own threshold.
+
+                    The breaker keeps the number it was built with: in the
+                    `operation` mode (release 3.9.0, LSBN-S-13) every operation
+                    has its own pause (the per-operation value, else the global
+                    base `SLOT_PAUSE_SEC`), so the threshold is a property of
+                    the breaker, not of the configuration object.
+
+        """
+        return self._pause_sec
+
+    @property
+    def open_after(self) -> int:
+        """How many failures of ONE outcome open THIS break — its own threshold."""
+        return self._open_after
+
     def note_failure(self, outcome: SlotOutcome) -> bool:
         """Record a failure; True - THIS call opened the break.
 

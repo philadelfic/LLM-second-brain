@@ -18,6 +18,8 @@ independently:
 - **Provider** is `ollama` (native API) or `openai` (OpenAI-compatible API
   with Bearer). Validation: `*_PROVIDER` ∈ {`ollama`, `openai`};
   `*_BASE_URL` must be `http(s)`.
+- The slot names above are the old GROUP names: since v3.9 every operation has
+  its own env (`<OP>_*`) — see «Migration of the env names» below.
 - **API keys** are optional for both providers. Ollama without a key is fine;
   a cloud provider without a key will not work (you get a `401/403` hint on the
   first call). An `openai` provider with an empty key logs a WARN at startup
@@ -97,6 +99,50 @@ already was the merge operation's env (0 = auto).
   MERGE_TIMEOUT_SEC: "600"
   ```
 
+### Migration of the env names (v3.9)
+
+Since v3.9 every operation has its own flat env name — `<OP>_*`, the
+operation names of the registry in upper case (`SUMMARIZE_MODEL`,
+`TITLE_MODEL`, `MERGE_MODEL`, `SPLIT_MODEL`, `CLASSIFY_MODEL`,
+`DESCRIBE_MODEL`, `JUDGE_MODEL`, `STRUCTURE_JUDGE_MODEL`, `EMBED_MODEL`,
+`DECISION_MODEL`).
+
+The names of the slot **groups** (`SUMMARY_*`, `EMBEDDING_*`) are the old
+ones. In the `legacy` mode (the default) they still act exactly as before;
+in the `operation` mode (`SLOT_MODEL=operation`) the slot layer is out of the
+chain, so they **do not act** — the startup warns about every such name and
+names the equivalent operation env names. The warning is not fatal: the
+service starts.
+
+| Old group env | The operation env names that replace it |
+|---|---|
+| `SUMMARY_<FIELD>` | `SUMMARIZE_<FIELD>`, `TITLE_<FIELD>`, `MERGE_<FIELD>`, `SPLIT_<FIELD>`, `CLASSIFY_<FIELD>`, `DESCRIBE_<FIELD>` |
+| `EMBEDDING_<FIELD>` | `EMBED_<FIELD>` |
+| `JUDGE_<FIELD>` | `JUDGE_<FIELD>` (the `judge` operation — the name is unchanged) and `STRUCTURE_JUDGE_<FIELD>` (the structure judge) |
+| `DECISION_<FIELD>` | `DECISION_<FIELD>` — unchanged (the `decision` operation is the reserve slot) |
+
+`<FIELD>` is one of `PROVIDER`, `BASE_URL`, `API_KEY`, `MODEL`, `MODEL_TYPE`,
+`THINK`, `NUM_PREDICT`, `TIMEOUT_SEC`, `CONTEXT_TOKENS` — the LLM
+configuration of a slot. The other settings of a group (`EMBEDDING_DIM`,
+`EMBEDDING_BATCH_SIZE`, `SUMMARY_SHORT_TEXT_CHARS`, `MAX_SUMMARY_CHARS`, ...)
+are global settings: they act in every mode and never warn.
+
+- Example: `SUMMARY_MODEL` → `SUMMARIZE_MODEL` / `TITLE_MODEL` /
+  `MERGE_MODEL` / `SPLIT_MODEL` / `CLASSIFY_MODEL` / `DESCRIBE_MODEL`.
+- **The old group names are removed in 3.10.0.** Until then they are in
+  force in the `legacy` mode.
+- The required values (`SUMMARY_MODEL`, `SUMMARY_BASE_URL`, `JUDGE_MODEL`,
+  `JUDGE_BASE_URL`, `EMBEDDING_BASE_URL`) are required by the validator in
+  every mode — in the `operation` mode they do not act, so set the operation
+  names as well.
+- The global `SLOT_*` knobs (`SLOT_PAUSE_AFTER`, `SLOT_PAUSE_SEC`,
+  `SLOT_PROMPT_RESERVE_TOKENS`, `SLOT_MAX_OUTPUT_TOKENS`, ...) are **not**
+  old names: they are the safeguards and the base of the per-operation
+  thresholds — they act in every mode and are never warned about.
+- `JUDGE_*` and `DECISION_*` are never warned about: they are the env names
+  of the `judge` and `decision` operations (the `decision` prefix stays as it
+  is — the owner's decision Q2).
+
 ### Answer vs reasoning budget (v3.5, LSBN-T-33)
 
 The transport (`num_predict` at ollama, `max_tokens` at openai) caps the
@@ -150,6 +196,10 @@ code defect; give such operations a larger budget or a generation model.
 | `JUDGE_BASE_URL` | API address of the judge slot |
 | `JUDGE_MODEL` | dedup judge model |
 | `MCP_AUTH_TOKEN` | Bearer token for all endpoints except `/health` |
+
+The slot values above are required in every mode; in the `operation` mode they
+do not act — the operation env names (`SUMMARIZE_MODEL`, ...) take their place
+(«Migration of the env names» above).
 
 ### Providers & keys
 

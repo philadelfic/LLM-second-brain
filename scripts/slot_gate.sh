@@ -26,8 +26,18 @@
 #     secrets are never read or printed — only the address keys of the env file.
 #
 # Usage:
-#   scripts/slot_gate.sh off|on [embedding|summary|judge|decision|all] [--dry-run]
-#   scripts/slot_gate.sh status [embedding|summary|judge|decision|all] [--dry-run]
+#   scripts/slot_gate.sh off|on [OPERATION|all] [--dry-run]
+#   scripts/slot_gate.sh status [OPERATION|all] [--dry-run]
+#
+#   The target is an OPERATION name of the registry (`summarize`, `title`,
+#   `merge`, `split`, `classify`, `describe`, `judge`, `structure_judge`,
+#   `embed`, `decision`) or `all`. The legacy slot-group names (`embedding`,
+#   `summary`, `judge`, `decision`) are accepted too — the `legacy` mode lives
+#   until the acceptance — with a hint about the operation name. The gate acts
+#   on the CHANNEL of the operation (the proxy container of its slot group):
+#   the operation names of the summary group share one channel, as before.
+#   Without an action the STATE is shown (`status` — read-only, nothing is
+#   changed): `scripts/slot_gate.sh summarize`.
 #
 #   off       — close the gate (the models are unreachable for the test contour)
 #   on        — open the gate (docker: start the stopped slot proxies, or unpause
@@ -73,7 +83,10 @@
 #                    (default: lsb-test)
 #   EMBEDDING_BASE_URL / SUMMARY_BASE_URL / JUDGE_BASE_URL  (iptables only)
 #                    slot addresses, e.g. http://host:port; the environment wins
-#                    over the env file
+#                    over the env file. The env of an OPERATION
+#                    (`SUMMARIZE_BASE_URL`, `TITLE_BASE_URL`, `MERGE_BASE_URL`,
+#                    `EMBED_BASE_URL`, ...) is read FIRST — the `operation` mode
+#                    does not read the slot-group env at all.
 #   SLOT_GATE_IPTABLES  (iptables only) iptables binary (default: iptables) — a stub
 #                    may be used to rehearse the logic without touching a real
 #                    firewall
@@ -109,6 +122,47 @@ declare -A SLOT_KEY=(
     [decision]=DECISION_BASE_URL
 )
 
+# The legacy slot-group names: accepted (the `legacy` mode lives until the
+# acceptance), with a hint about the operation name that replaced them.
+legacy_hint() {
+    case "$1" in
+        embedding)
+            echo "note: 'embedding' is the legacy slot-group name — the operation name is 'embed' (the same channel)" >&2 ;;
+        summary)
+            echo "note: 'summary' is the legacy slot-group name — the operation names are 'summarize', 'title', 'merge', 'split', 'classify', 'describe' (the same channel)" >&2 ;;
+    esac
+}
+
+# The group (the channel) of a target: an operation name or a legacy group name.
+# The gate acts on the CHANNEL (the proxy container of the slot group), so an
+# operation name is resolved to its group: the operations of one group share
+# the channel (as the slots did).
+group_of() {
+    case "$1" in
+        summarize|title|merge|split|classify|describe) printf 'summary' ;;
+        judge|structure_judge)                      printf 'judge' ;;
+        embed)                                      printf 'embedding' ;;
+        decision)                                   printf 'decision' ;;
+        embedding|summary)                          printf '%s' "$1" ;;
+    esac
+}
+
+# The env keys of a target (the iptables backend): the operation's own env
+# first (the `operation` mode reads it), then the slot group's env (the
+# `legacy` mode reads it). The first key that resolves to an address wins.
+env_keys_for() {
+    local name="$1" group
+    case "$name" in
+        summarize|title|merge|split|classify|describe|judge|structure_judge|embed|decision)
+            printf '%s_BASE_URL\n' "${name^^}"
+            group="$(group_of "$name")"
+            printf '%s\n' "${SLOT_KEY[$group]}" ;;
+        *)
+            group="$(group_of "$name")"
+            printf '%s\n' "${SLOT_KEY[$group]:-}" ;;
+    esac
+}
+
 # Шапка-usage — сам этот файл (заголовочный комментарий до первой строки кода).
 usage() {
     awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"
@@ -130,7 +184,7 @@ for arg in "$@"; do
                 exit 2
             fi
             MODE="$arg" ;;
-        embedding|summary|judge|decision|all)
+        all|embedding|summary|judge|decision|summarize|title|merge|split|classify|describe|structure_judge|embed)
             TARGET="$arg" ;;
         -*)
             echo "ERROR: unknown option: $arg" >&2
@@ -143,10 +197,15 @@ for arg in "$@"; do
     esac
 done
 if [[ -z "$MODE" ]]; then
-    echo "ERROR: no action given: off|on|status" >&2
-    usage >&2
-    exit 2
+    # No action given: the STATE is shown (read-only — nothing is changed). A
+    # mute is never guessed: `off|on` must be asked for explicitly.
+    MODE="status"
+    echo "note: no action given — the state is shown (status, read-only); use 'off'/'on' to change it" >&2
 fi
+# The legacy slot-group names are accepted with a hint about the operation name.
+case "$TARGET" in
+    embedding|summary) legacy_hint "$TARGET" ;;
+esac
 
 # Режим строго из списка: неизвестное значение — ошибка запуска, а не тихий
 # откат на один из бэкендов (иначе «выключение» могло бы уйти не туда).
@@ -172,9 +231,14 @@ esac
 # нарочно — выключатель «модели недоступны» его не трогает (у decision свой
 # маршрут решения и свой прокси, и не на всяком контуре он есть), а ветвь `judge`
 # зовёт его по имени явно.
+#
+# The target is the name of an OPERATION (`summarize`, `title`, ..., `embed`,
+# `decision`): the gate works with the CHANNEL (the proxy container of the
+# slot group), so the name of an operation is resolved to its group - the
+# operations of one group share the channel (as the slots did).
 WANTED=(embedding summary judge)
 if [[ "$TARGET" != "all" ]]; then
-    WANTED=("$TARGET")
+    WANTED=("$(group_of "$TARGET")")
 elif [[ "$MODE" == "status" && "$BACKEND" == "docker" ]]; then
     # `status` обещает состояние ВСЕХ каналов слота — в том числе decision (иначе
     # выключенный канал решения не виден оператору). `off|on all` его по-прежнему
@@ -514,7 +578,7 @@ gate_docker() {
 # =============================================================================
 
 gate_iptables() {
-    local slot key url parsed host port
+    local slot key url parsed host port target_name value candidate
     local -a errors=()
     local -a notes=()
     local -a slots=()               # «slot host port»
@@ -526,14 +590,28 @@ gate_iptables() {
     local -a RULE=()
 
     for slot in "${WANTED[@]}"; do
-        key="${SLOT_KEY[$slot]}"
-        url="$(env_value "$key" || true)"
+        # The name of the target: a single target - the name of the operation
+        # (its env matters more than the env of the group), `all` - the name of
+        # the slot group.
+        target_name="$slot"
+        [[ "$TARGET" != "all" ]] && target_name="$TARGET"
+        url=""
+        key=""
+        while IFS= read -r candidate; do
+            [[ -n "$candidate" ]] || continue
+            value="$(env_value "$candidate" || true)"
+            if [[ -n "$value" ]]; then
+                url="$value"
+                key="$candidate"
+                break
+            fi
+        done < <(env_keys_for "$target_name")
         if [[ -z "$url" ]]; then
-            errors+=("the $slot slot address is not found: export $key or put it into $ENV_FILE")
+            errors+=("the $slot slot address is not found: export one of ($(env_keys_for "$target_name" | tr '\n' ' '))or put it into $ENV_FILE")
             continue
         fi
         if ! parsed="$(parse_url "$url" 2>&1)"; then
-            errors+=("the $slot slot address is unusable: $parsed")
+            errors+=("the $slot slot address is unusable ($key): $parsed")
             continue
         fi
         read -r host port <<<"$parsed"

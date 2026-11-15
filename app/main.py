@@ -40,7 +40,11 @@ from app.services.llm_client import (
     LLMClient,
     SlotSpec,
 )
-from app.services.operations import OPERATIONS, unknown_operation_warnings
+from app.services.operations import (
+    OPERATIONS,
+    legacy_slot_env_warnings,
+    unknown_operation_warnings,
+)
 from app.services.backup import BackupService
 from app.services.slot_budget import resolve_output_budget
 from app.services.update_check import UpdateChecker
@@ -175,6 +179,11 @@ def _operations_config_warnings(logger: logging.Logger, settings: Settings) -> N
     duplicates. Plus the WARN about env with an unknown operation name (a typo
     like `MERG_MODEL`) — not fatal, the service starts. Called at startup
     (lifespan), after the slot checks.
+
+    Release 3.9.0 (LSBN-S-16): plus the WARN about a legacy slot-group env
+    (`SUMMARY_MODEL`, `EMBEDDING_MODEL`, ...) in the `operation` mode — such a
+    name does not act there, so the startup names the equivalent operation env
+    names. Not fatal; the `legacy` mode is silent.
     """
     for operation in OPERATIONS:
         spec, sources = SlotSpec.for_operation(operation, settings)
@@ -198,6 +207,18 @@ def _operations_config_warnings(logger: logging.Logger, settings: Settings) -> N
             extra={
                 "event": "unknown_operation_warning",
                 "code": "unknown_operation",
+                "text": text,
+            },
+        )
+    # LSBN-S-16: a legacy slot-group env (`SUMMARY_MODEL`, `EMBEDDING_MODEL`,
+    # ...) does not act in the `operation` mode — a WARN (not fatal) that names
+    # the equivalent operation env names. The `legacy` mode is silent.
+    for _code, text in legacy_slot_env_warnings(settings):
+        logger.warning(
+            text,
+            extra={
+                "event": "legacy_slot_env_warning",
+                "code": "legacy_slot_env",
                 "text": text,
             },
         )
