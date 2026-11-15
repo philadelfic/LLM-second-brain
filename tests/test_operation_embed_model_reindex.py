@@ -13,15 +13,23 @@
       4. the meta holds the EFFECTIVE value (`EMBED_MODEL`), not the slot one;
       5. the provider of the operation (`EMBED_PROVIDER`) is visible too - a
          provider change under the same model name means incompatible vectors.
+
+    The pilot's ruling (the same root): the meta now holds the effective value,
+    so its consumers must compare against the same source:
+      6. the backup check (`embedding_mismatch`) compares the meta with the
+         EFFECTIVE model - in the `operation` mode a snapshot built with the
+         operation model is NOT a mismatch;
 """
 
 from __future__ import annotations
 
 import logging
+import sqlite3
 
 import pytest
 
 from app.config import Settings, get_settings
+from app.services.backup import EMBEDDING_MISMATCH, BackupService
 from app.storage.db import init_db, session
 
 
@@ -211,3 +219,73 @@ def test_the_legacy_mode_keeps_the_slot_value(
     assert len(started) == 1
     assert started[0].to_model == "other-slot-model"  # type: ignore[attr-defined]
     assert meta_of(settings)["embedding_model"] == "other-slot-model"
+
+
+def test_the_backup_check_compares_the_effective_model(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Criterion 6: the backup check compares the meta with the EFFECTIVE model.
+
+                In the `operation` mode the meta holds `EMBED_MODEL` - a snapshot
+                built with it is NOT a mismatch (the old comparison with the
+                slot value reported a mismatch at every check); a snapshot of
+                another model IS a mismatch.
+    """
+    settings = make_settings(
+        monkeypatch,
+        tmp_path,
+        SLOT_MODEL="operation",
+        EMBED_MODEL="op-embed-model",
+        EMBEDDING_MODEL="qwen3-embedding:8b",
+    )
+    init_db(settings)
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    service = BackupService(settings.model_copy(update={"backup_dir": str(backup_dir)}))
+    target = service.snapshot()
+
+    result = service.verify(target)
+    assert result["ok"] is True
+    assert result["checks"][EMBEDDING_MISMATCH] is False
+
+    conn = sqlite3.connect(target)
+    try:
+        conn.execute(
+            "UPDATE meta SET value = 'other-model:1b' WHERE key = 'embedding_model'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert service.verify(target)["checks"][EMBEDDING_MISMATCH] is True
+
+
+def test_the_backup_check_keeps_the_slot_value_in_legacy(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Criterion 6 in the `legacy` mode: the slot value, as before.
+
+                The slot value IS the effective one there - the check does not
+                change (a snapshot of another model is a mismatch, as before).
+    """
+    settings = make_settings(
+        monkeypatch,
+        tmp_path,
+        EMBEDDING_MODEL="slot-embed-model",
+    )
+    init_db(settings)
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    service = BackupService(settings.model_copy(update={"backup_dir": str(backup_dir)}))
+    target = service.snapshot()
+
+    assert service.verify(target)["checks"][EMBEDDING_MISMATCH] is False
+
+    conn = sqlite3.connect(target)
+    try:
+        conn.execute(
+            "UPDATE meta SET value = 'other-model:1b' WHERE key = 'embedding_model'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert service.verify(target)["checks"][EMBEDDING_MISMATCH] is True
