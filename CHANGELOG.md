@@ -5,11 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Publishing on GitHub next after 3.4.1
+## Published wave 3.5.0-3.9.0
 
-The last published GitHub release is **3.4.1** (2026-10-29). Every release below
-is already in `dev` and is published as one wave — after the prod rollout is
-stabilized (owner's decision: GitHub only on stabilization):
+The releases below were held locally after **3.4.1** (2026-10-29) and published
+as one wave on **2026-11-15**, together with **3.9.0** (the head of the wave and
+the current production release). The tags `v3.5.0`-`v3.9.0` are on this
+repository, the GitHub release page is the one of 3.9.0:
 
 * **3.5.0** (2026-11-01) — Thinking models without losing the answer
 * **3.5.1** (2026-11-11) — Tolerant parts parser and a size hint
