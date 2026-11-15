@@ -285,10 +285,9 @@ _SLOT_JOB_NAMES = {
 # The operations whose path goes through the DECISION slot (the design, B4):
 # with the decision unavailable and the fallback off, they wait — the dedup
 # judge and the classifier walk into the decision slot. The rest
-# (summarize/title/merge/split/describe/embed) go (release 3.9.0, LSBN-S-7).
-# The summary family (the design, B3: title/summarize/merge) is among them:
-# the decision rule of the former `summary` slot (no39-05) does NOT hold for
-# the family any more.
+# (summarize/title/merge/split/describe/embed) go.
+# The decision rule of the former `summary` slot (no39-05) does NOT hold for
+# the summary family (title/summarize/merge) any more: the family goes.
 _DECISION_BLOCKED_OPERATIONS = ("judge", "classify")
 
 # A task row → the operation that owns it (release 3.9.0, LSBN-S-7): the
