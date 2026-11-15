@@ -19,6 +19,13 @@
     breaker of an operation is its own. The `legacy` mode keeps the historical
     behaviour in every respect - the flag is the ONE switch (the design, B2).
 
+    Release 3.9.0 (LSBN-S-16): the env NAMES of the operations (`<OP>_*`) and the
+    WARN about the old slot-group names (`SUMMARY_*`, `EMBEDDING_*`). In the
+    `operation` mode an old group name does not act (the slot layer is out of the
+    chain), so the startup warns and names the equivalent operation env names;
+    in the `legacy` mode the old names are in force and nothing is warned about.
+    The old group names are removed in 3.10.0.
+
     The boundaries (the brief decisions):
     - the `SPLIT_*` slot as a separate slot group stays retired - the registry
       does not restore it; `split` remains an OPERATION of the summary slot
@@ -248,6 +255,40 @@ KNOWN_ENV_PREFIXES: frozenset[str] = frozenset(OPERATIONS) | {
     "summary",
     "judge",
     "decision",
+}
+
+# --- the legacy slot-group env (release 3.9.0, LSBN-S-16) ----------------
+# The slot groups whose env prefix is NOT an operation name. In the `operation`
+# mode the slot layer does not take part in the chain ("operation env ->
+# default"), so a set old group name reaches NOTHING - it must WARN (not fail)
+# and name the equivalent operation env names.
+#
+# `judge` and `decision` are NOT here: their prefixes ARE operation env names
+# (`JUDGE_*` is the env of the `judge` operation, `DECISION_*` is the env of
+# the `decision` operation - the owner's decision Q2), so such a name acts and
+# warns about nothing. The old group names are removed in 3.10.0.
+LEGACY_SLOT_GROUP_OPERATIONS: dict[str, tuple[str, ...]] = {
+    "summary": ("summarize", "title", "merge", "split", "classify", "describe"),
+    "embedding": ("embed",),
+}
+
+# The LLM-config fields of a slot group - the ones with an operation
+# counterpart. The other group settings (EMBEDDING_DIM, EMBEDDING_BATCH_SIZE,
+# SUMMARY_SHORT_TEXT_CHARS, MAX_SUMMARY_CHARS, ...) are global settings: they
+# act in every mode and never warn.
+LEGACY_SLOT_GROUP_FIELDS: dict[str, tuple[str, ...]] = {
+    "summary": (
+        "provider",
+        "base_url",
+        "api_key",
+        "model",
+        "model_type",
+        "think",
+        "num_predict",
+        "timeout_sec",
+        "context_tokens",
+    ),
+    "embedding": ("provider", "base_url", "api_key", "model"),
 }
 
 # The "flat operator" env mask: `<PREFIX>_<FIELD>` over the registry fields
@@ -608,6 +649,64 @@ def unknown_operation_warnings(
                 + ", ".join(sorted(OPERATIONS))
                 + "; the variable is ignored (typo? check the registry in "
                 "docs/CONFIG.md).",
+            )
+        )
+    return warnings
+
+
+def legacy_slot_env_plan(settings: "Settings") -> list[tuple[str, tuple[str, ...]]]:
+    """The legacy slot-group env names that do not act + their equivalents.
+
+            Release 3.9.0 (LSBN-S-16): in the `operation` mode the slot layer
+            does not take part in the chain ("operation env -> default"), so a
+            set old group name (`SUMMARY_MODEL`, `EMBEDDING_MODEL`, ...) reaches
+            nothing. The plan lists every such name with the operation env
+            names that replace it.
+
+            The `legacy` mode returns an EMPTY plan: the old names are still in
+            force (they are removed in 3.10.0) and nothing is warned about.
+
+            The global `SLOT_*` knobs are not in the plan: they are the
+            safeguards and the base of the per-operation thresholds (the owner's
+            decision Q4) - they act in every mode.
+
+    """
+    if not operation_mode(settings):
+        return []
+    plan: list[tuple[str, tuple[str, ...]]] = []
+    for group, operations in LEGACY_SLOT_GROUP_OPERATIONS.items():
+        for field in LEGACY_SLOT_GROUP_FIELDS[group]:
+            name = f"{group.upper()}_{field.upper()}"
+            if name not in os.environ:
+                continue
+            plan.append((name, tuple(env_name(op, field) for op in operations)))
+    return plan
+
+
+def legacy_slot_env_warnings(settings: "Settings") -> list[tuple[str, str]]:
+    """The WARN about a legacy slot-group env in the `operation` mode.
+
+            The old group names do not act in the `operation` mode - the startup
+            says so and names the equivalent operation env names (the example of
+            the brief: `SUMMARY_MODEL` -> `SUMMARIZE_MODEL` / `TITLE_MODEL` /
+            `MERGE_MODEL` / `SPLIT_MODEL` / `CLASSIFY_MODEL` / `DESCRIBE_MODEL`).
+            The warning is NOT fatal: the service starts.
+
+            The `legacy` mode is SILENT (the old names are in force until
+            3.10.0) and the global `SLOT_*` knobs are never mentioned (the
+            owner's decision Q4).
+
+    """
+    warnings: list[tuple[str, str]] = []
+    for name, equivalents in legacy_slot_env_plan(settings):
+        warnings.append(
+            (
+                "legacy_slot_env",
+                f"legacy slot-group env {name} does not act in the `operation` "
+                "mode (SLOT_MODEL=operation) - the slot layer is out of the "
+                "chain; use the operation env names instead: "
+                + ", ".join(equivalents)
+                + ". The old group names are removed in 3.10.0.",
             )
         )
     return warnings
