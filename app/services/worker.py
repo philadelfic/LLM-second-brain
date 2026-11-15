@@ -174,6 +174,7 @@ from app.services.notes import NoteService
 from app.services.operations import (
     OPERATION_REGISTRY,
     SLOT_MODEL_OPERATION,
+    breaker_key,
     pause_after,
     pause_sec,
     slot_model,
@@ -217,6 +218,22 @@ AREAS_JOB = "areas"
 EXPIRATION_JOB = "expiration"
 # The "node order" job (lsb-0011-01): sweeping the accumulated `default`.
 NODES_JOB = "nodes"
+
+# The split jobs of the summary cycle (release 3.9.0, LSBN-S-6): in the
+# `operation` mode the single `summary` job (title-gen → summarize → merge)
+# is cut into three jobs — one per operation. Each job has its own queue,
+# its own signal and its own breaker; in the `legacy` mode (the default)
+# the whole cycle stays in the `summary` job, as before.
+TITLE_JOB = "title"
+SUMMARIZE_JOB = "summarize"
+MERGE_JOB = "merge"
+
+# The summary family — the operations of the former `summary` slot (the
+# design, B3): the title generation, the summarization and the merge. The
+# decision rule of the summary slot (no39-05) holds for the family: with the
+# decision slot unavailable and the fallback off the family waits — the
+# classifier walks into the decision slot.
+_SUMMARY_FAMILY_OPERATIONS = (TITLE_JOB, SUMMARIZE_JOB, MERGE_JOB)
 
 # The jobs' LLM slots (#39, arch §6.2): the breaker lives on the SLOT, not the job —
 # the summary slot is shared by summarization/merge/classification/descriptions and the
@@ -557,6 +574,17 @@ class BackgroundWorker:
         # The "a note with a pending summary appeared" signal — wakes the
         # summarization loop immediately (save/update), bypassing the grown back-off.
         self._summary_event = asyncio.Event()
+        # The "a note with a pending title appeared" signal (release 3.9.0,
+        # LSBN-S-6): wakes the title loop of the `operation` mode. Its OWN
+        # event: a shared `asyncio.Event` would be cleared by a neighbour loop
+        # (`jobs.py` clears the event before the queue recheck) — the neighbour
+        # would lose the wakeup.
+        self._title_event = asyncio.Event()
+        # The "a merge job appeared" signal (release 3.9.0, LSBN-S-6): wakes
+        # the merge loop of the `operation` mode. The signal is set at the
+        # merge job's creation (the judge loop) — its own event, for the same
+        # reason as the title one.
+        self._merge_event = asyncio.Event()
         # The "a judge job appeared" signal — wakes the judge loop (the embedding loop
         # created a dedup job after vectorization).
         self._judge_event = asyncio.Event()
@@ -646,6 +674,67 @@ class BackgroundWorker:
         """
         return slot_model(self._settings)
 
+    def _operation_slot(self, operation: str) -> str:
+        """The breaker key of an operation: the operation itself in the
+        `operation` mode, the slot group in the `legacy` mode.
+
+                The ONE point where the slot of an operation is resolved (the
+                design, B2): the `legacy` mode keeps the slot group (one
+                breaker per group — the historical behaviour), the `operation`
+                mode gives every operation its own breaker. The registry's
+                `breaker_key` is the mapping (S-5).
+
+        """
+        return breaker_key(operation, self._settings)
+
+    def _job_name(self, operation: str) -> str:
+        """The job name of an operation: the operation's own job in the
+        `operation` mode (`title`/`summarize`/`merge`), the legacy `summary`
+        job in the `legacy` mode (one job for the whole cycle).
+
+                The journal field `job` and the breaker key travel together:
+                in the `legacy` mode the whole summary family belongs to the
+                `summary` job and to the `summary` slot group; in the
+                `operation` mode every operation is a job of its own.
+
+        """
+        if self._mode() == SLOT_MODEL_OPERATION:
+            return operation
+        return SUMMARY_JOB
+
+    def _breaker_paused(self, key: str) -> bool:
+        """Is the breaker under the key paused right now? No breaker under the
+        key — not paused.
+
+                The `operation` mode keys the breakers by operation (the
+                design, B2): a slot name that is not an operation (`summary`)
+                has no breaker there. The lookup is defensive for the same
+                reason as `_slot_blocked`: observability and the queue
+                recheck must not crash the loop (LSBN-S-6, the S-5 finding
+                M1 — a `KeyError` on the slot name).
+
+        """
+        breaker = self._breakers.get(key)
+        return breaker is not None and breaker.is_paused()
+
+    def _operation_blocked(self, operation: str) -> bool:
+        """Is the operation's work blocked for its loop?
+
+                The breaker of the operation (its own key in the `operation`
+                mode) plus the decision rule of the summary family (no39-05):
+                with the decision slot unavailable and the fallback off the
+                family waits — the classifier walks into the decision slot.
+                The `legacy` mode keeps the whole summary cycle under one
+                rule (as before the split).
+
+        """
+        if self._slot_blocked(self._operation_slot(operation)):
+            return True
+        return (
+            operation in _SUMMARY_FAMILY_OPERATIONS
+            and self._decision_blocks_work()
+        )
+
     def _build_breakers(self, settings: Settings) -> dict[str, SlotBreaker]:
         """The breaker dictionary: one breaker per SLOT GROUP (`legacy` mode)
         or one per OPERATION (`operation` mode).
@@ -704,8 +793,32 @@ class BackgroundWorker:
                     Called from save/update (an `asyncio.to_thread` thread) —
                     `asyncio.Event.set()` is thread-safe. The loop immediately leaves the
                     wait and catches up the queue without waiting out the grown back-off.
+
+                    The `operation` mode (release 3.9.0, LSBN-S-6): the summary
+                    cycle is split into three loops — the signal wakes the
+                    summarize loop AND the title loop (a note without a title
+                    waits for the title operation). The merge loop has its own
+                    signal — at the merge job's creation.
         """
         self._summary_event.set()
+        if self._mode() == SLOT_MODEL_OPERATION:
+            # The split summary cycle (release 3.9.0, LSBN-S-6): the signal
+            # wakes the title loop too — a saved note without a title (the
+            # migration path) waits for the title operation, and the note
+            # service knows only one "summary pending" signal. The merge loop
+            # has its own signal — at the merge job's creation.
+            self._title_event.set()
+
+    def notify_merge_pending(self) -> None:
+        """Wake the merge loop: a merge job appeared.
+
+                    Called at the merge job's creation (the judge loop) —
+                    `asyncio.Event.set()` is thread-safe. The `operation`
+                    mode's merge loop has its own event (LSBN-S-6): the job is
+                    taken at once, not after the grown back-off.
+
+        """
+        self._merge_event.set()
 
     def notify_judge_pending(self) -> None:
         """Wake the judge loop: a judge job (dedup) appeared.
@@ -1554,12 +1667,54 @@ class BackgroundWorker:
                     `notify_summary_pending` signal (the "on demand" form, pool 6) or a
                     timeout. The summary slot breaker is checked by the framework gate
                     (`JobSpec.gate`, 3.4.1, LSBN-T-29) — the manual `if` is gone.
+
+                    The `legacy` mode only (release 3.9.0, LSBN-S-6): in the
+                    `operation` mode the cycle is cut into three jobs — the
+                    title, the summarize and the merge loops (`_process_title`,
+                    `_process_summarize`, `_process_merge`), each with its own
+                    breaker.
         """
         with history.bind_origin(f"job:{SUMMARY_JOB}"):
             processed = await asyncio.to_thread(self.process_title_pending)
             processed += await asyncio.to_thread(self.process_summary_pending)
             processed += await asyncio.to_thread(self.process_merge_pending)
         return processed
+
+    async def _process_title(self) -> int:
+        """The `title` job's run: the title generation (the `title IS NULL` work).
+
+                    One of the three jobs of the split summary cycle (release
+                    3.9.0, LSBN-S-6): its own loop, its own signal and its own
+                    breaker (the `title` operation). A title failure does not
+                    stop the summarize loop — the failure belongs to the
+                    operation that produced it.
+
+        """
+        with history.bind_origin(f"job:{TITLE_JOB}"):
+            return await asyncio.to_thread(self.process_title_pending)
+
+    async def _process_summarize(self) -> int:
+        """The `summarize` job's run: the pending summarizations.
+
+                    One of the three jobs of the split summary cycle (release
+                    3.9.0, LSBN-S-6): its own loop, its own signal and its own
+                    breaker (the `summarize` operation).
+
+        """
+        with history.bind_origin(f"job:{SUMMARIZE_JOB}"):
+            return await asyncio.to_thread(self.process_summary_pending)
+
+    async def _process_merge(self) -> int:
+        """The `merge` job's run: the pending merge jobs.
+
+                    One of the three jobs of the split summary cycle (release
+                    3.9.0, LSBN-S-6): its own loop, its own signal (set at the
+                    merge job's creation) and its own breaker (the `merge`
+                    operation).
+
+        """
+        with history.bind_origin(f"job:{MERGE_JOB}"):
+            return await asyncio.to_thread(self.process_merge_pending)
 
     async def _run_summary(self) -> None:
         """Serve the summary job with the framework loop (a single-job run).
@@ -1573,6 +1728,37 @@ class BackgroundWorker:
         if spec is None:
             return  # without a summarizer the job is not applicable (a test mode)
         await run_loop(spec, self._is_stopping, self._backoff[SUMMARY_JOB])
+
+    async def _run_title(self) -> None:
+        """Serve the `title` job with the framework loop (a single-job run).
+
+                    See `_run_summary`: an isolated run of one job of the split
+                    summary cycle (the `operation` mode).
+        """
+        spec = build_title_job(self, self._settings)
+        if spec is None:
+            return  # the `legacy` mode (or a test mode without a summarizer)
+        await run_loop(spec, self._is_stopping, self._job_backoff(spec))
+
+    async def _run_summarize(self) -> None:
+        """Serve the `summarize` job with the framework loop (a single-job run).
+
+                    See `_run_title`.
+        """
+        spec = build_summarize_job(self, self._settings)
+        if spec is None:
+            return  # the `legacy` mode (or a test mode without a summarizer)
+        await run_loop(spec, self._is_stopping, self._job_backoff(spec))
+
+    async def _run_merge(self) -> None:
+        """Serve the `merge` job with the framework loop (a single-job run).
+
+                    See `_run_title`.
+        """
+        spec = build_merge_job(self, self._settings)
+        if spec is None:
+            return  # the `legacy` mode (or a test mode without a summarizer)
+        await run_loop(spec, self._is_stopping, self._job_backoff(spec))
 
     async def _process_judge(self) -> int:
         """The judge job's run: a batch of judge jobs (dedup) in `to_thread`.
@@ -1790,6 +1976,13 @@ class BackgroundWorker:
                 "VALUES (?, ?, ?, ?)",
                 (slot, kind, note_id, payload),
             )
+        if slot == SLOT_SUMMARY and kind == "merge":
+            # A merge job appeared (release 3.9.0, LSBN-S-6): the merge loop of
+            # the `operation` mode has its own signal — the job is taken at
+            # once, not after the grown back-off. The signal is set HERE — at
+            # the creation of the merge task — so every path that creates one
+            # wakes the loop.
+            self.notify_merge_pending()
 
     def _ensure_job(
         self, slot: str, kind: str, note_id: int, payload: str | None = None
@@ -1896,11 +2089,72 @@ class BackgroundWorker:
         # the queue is empty for it (otherwise a deferred task drives a busy-loop).
         # The same — with decision unavailable and fallback off: there is
         # nowhere to get a decision; the work waits (no39-05, `_decision_blocks_work`).
+        # Release 3.9.0 (LSBN-S-6): the breaker is read through the operation's
+        # key — the operation itself in the `operation` mode, the slot group in
+        # the `legacy` mode (the slot name `summary` has no breaker there —
+        # the S-5 finding M1: a direct lookup raised `KeyError`).
         return (
             int(row["c"]) == 0
-            or self._breakers[SLOT_SUMMARY].is_paused()
+            or self._breaker_paused(self._operation_slot("summarize"))
             or self._decision_blocks_work()
         )
+
+    def _title_queue_empty(self) -> bool:
+        """Is the title queue empty (the title work: `title IS NULL`)?
+
+                    The title queue of the split summary cycle (release 3.9.0,
+                    LSBN-S-6): the title generation is a job of its own. The
+                    predicate is the title work ONLY — the summarization and
+                    the merge have their own predicates (each loop takes its
+                    own work; a failure of one operation does not stop the
+                    others).
+
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM notes WHERE title IS NULL "
+                "AND deleted_at IS NULL"
+            ).fetchone()
+        return int(row[0]) == 0 or self._operation_blocked("title")
+
+    def _summarize_queue_empty(self) -> bool:
+        """Is the summarize queue empty (the summarization work:
+        `summary_status='pending'`)?
+
+                    The summarize queue of the split summary cycle (release
+                    3.9.0, LSBN-S-6): its own predicate — the pending
+                    summarizations only.
+
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM notes WHERE summary_status = 'pending' "
+                "AND deleted_at IS NULL"
+            ).fetchone()
+        return int(row[0]) == 0 or self._operation_blocked("summarize")
+
+    def _merge_queue_empty(self) -> bool:
+        """Is the merge queue empty (the pending merge jobs)?
+
+                    The merge queue of the split summary cycle (release 3.9.0,
+                    LSBN-S-6): the merge jobs live in `worker_jobs` under the
+                    slot value `summary` (the legacy slot group) — the
+                    migration of the slot values is a later step of the
+                    release (LSBN-S-14), so the jobs are read under their
+                    current value: no work is orphaned by the split.
+
+                    #39 (arch §6.9/§13.9): only TAKEABLE work is counted — a
+                    frozen job (`attention_at`) cannot be taken by the loop.
+
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM worker_jobs "
+                "WHERE slot = 'summary' AND kind = 'merge' "
+                "AND status = 'pending' AND attention_at IS NULL"
+            ).fetchone()
+        return int(row[0]) == 0 or self._operation_blocked("merge")
 
     def _judge_queue_empty(self) -> bool:
         """Is the judge queue empty (a cheap SELECT, pool 6, lost wakeup).
@@ -2060,6 +2314,77 @@ class BackgroundWorker:
                 "  CAST(strftime('%s', created_at) AS INTEGER)) FROM worker_jobs "
                 "  WHERE slot = 'summary' AND status = 'pending'), 0)"
                 ") AS oldest_pending_sec"
+            ).fetchone()
+        attention = int(row["attention"])
+        return queue_snapshot(
+            row["pending"],
+            row["oldest_pending_sec"],
+            waiting=attention,
+            attention=attention,
+        )
+
+    def _title_queue_stat(self) -> dict:
+        """The raw snapshot of the title queue: the notes without a title.
+
+                    The title queue of the split summary cycle (release 3.9.0,
+                    LSBN-S-6): `pending` — the notes with `title IS NULL` (the
+                    title work), `oldest_pending_sec` — their age. The pending
+                    → waiting move on a breaker is done by the framework
+                    (`is_gated` → `gated_queue_stat`, 3.4.1, LSBN-T-29).
+
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS pending, "
+                "MAX(CAST(strftime('%s','now') AS INTEGER) - "
+                "CAST(strftime('%s', updated_at) AS INTEGER)) "
+                "AS oldest_pending_sec FROM notes "
+                "WHERE title IS NULL AND deleted_at IS NULL"
+            ).fetchone()
+        return queue_snapshot(row["pending"], row["oldest_pending_sec"])
+
+    def _summarize_queue_stat(self) -> dict:
+        """The raw snapshot of the summarize queue: the pending summarizations.
+
+                    The summarize queue of the split summary cycle (release
+                    3.9.0, LSBN-S-6): `pending` — the notes with
+                    `summary_status='pending'`, `oldest_pending_sec` — their
+                    age.
+
+        """
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS pending, "
+                "MAX(CAST(strftime('%s','now') AS INTEGER) - "
+                "CAST(strftime('%s', updated_at) AS INTEGER)) "
+                "AS oldest_pending_sec FROM notes "
+                "WHERE summary_status = 'pending' AND deleted_at IS NULL"
+            ).fetchone()
+        return queue_snapshot(row["pending"], row["oldest_pending_sec"])
+
+    def _merge_queue_stat(self) -> dict:
+        """The raw snapshot of the merge queue: the pending merge jobs.
+
+                    The merge queue of the split summary cycle (release 3.9.0,
+                    LSBN-S-6): `pending` — the merge jobs WITHOUT attention
+                    (takeable now); `attention` — with attention (no39-02,
+                    waiting for a human); `waiting = attention`. The age
+                    (3.3.1, LSBN-S-3) — over ALL of the pending jobs (an
+                    attention-only state must not give `null`). The jobs are
+                    read under their current slot value (`summary`) — the
+                    migration of the values is a later step (LSBN-S-14).
+
+        """
+        self._ensure_job_table()
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(attention_at IS NULL), 0) AS pending, "
+                "COALESCE(SUM(attention_at IS NOT NULL), 0) AS attention, "
+                "MAX(CAST(strftime('%s','now') AS INTEGER) - "
+                "CAST(strftime('%s', created_at) AS INTEGER)) "
+                "AS oldest_pending_sec FROM worker_jobs "
+                "WHERE slot = 'summary' AND kind = 'merge' "
+                "AND status = 'pending'"
             ).fetchone()
         attention = int(row["attention"])
         return queue_snapshot(
@@ -2338,7 +2663,11 @@ class BackgroundWorker:
                 )
         # #39 (arch §6.9): areas are encoded by the embedding slot — on its
         # breaker no batch is taken; the queue is empty for the loop (no busy-loop).
-        return pending == 0 or self._breakers[SLOT_EMBEDDING].is_paused()
+        # Release 3.9.0 (LSBN-S-6): the breaker is read through the operation's
+        # key — the `embed` operation in the `operation` mode (the slot name
+        # `embedding` has no breaker there — the S-5 finding M1: a direct
+        # lookup raised `KeyError`).
+        return pending == 0 or self._breaker_paused(self._operation_slot("embed"))
 
     # --- the judge loop: the dedup judge (Phase 8, Stage 3.2; Phase 11, #10) --
 
@@ -2592,7 +2921,7 @@ class BackgroundWorker:
                     "dedup: merge skipped — a note has a lifetime",
                     extra={
                         "event": "dedup_skipped",
-                        "job": SUMMARY_JOB,
+                        "job": self._job_name("merge"),
                         "older_id": older_id,
                         "note_id": note_id,
                         "reason": "note has a lifetime",
@@ -2614,7 +2943,7 @@ class BackgroundWorker:
                     "dedup: merge skipped — one source",
                     extra={
                         "event": "dedup_skipped",
-                        "job": SUMMARY_JOB,
+                        "job": self._job_name("merge"),
                         "older_id": older_id,
                         "note_id": note_id,
                         "reason": "same origin",
@@ -2648,8 +2977,8 @@ class BackgroundWorker:
                 # the follow-up call (the 2nd round) is visible in the journal as a separate line.
                 for meta in merge_result.metas or [merge_result.meta]:
                     self._log_slot_call(
-                        SUMMARY_JOB,
-                        SLOT_SUMMARY,
+                        self._job_name("merge"),
+                        self._operation_slot("merge"),
                         meta,
                         older_id=older_id,
                         note_id=note_id,
@@ -2676,8 +3005,8 @@ class BackgroundWorker:
                 self._mark_job_done(job["id"])
                 done += 1
                 self._log_slot_failure(
-                    SUMMARY_JOB,
-                    SLOT_SUMMARY,
+                    self._job_name("merge"),
+                    self._operation_slot("merge"),
                     outcome_of(exc),
                     event="dedup_merge_deferred",
                     message=(
@@ -2699,8 +3028,8 @@ class BackgroundWorker:
                 continue
             except SummaryError as exc:
                 self._log_slot_failure(
-                    SUMMARY_JOB,
-                    SLOT_SUMMARY,
+                    self._job_name("merge"),
+                    self._operation_slot("merge"),
                     outcome_of(exc),
                     event="dedup_merge_failed",
                     message="dedup: summarizer merge failed — both notes kept, retry queued",
@@ -2719,7 +3048,7 @@ class BackgroundWorker:
                 "dedup: duplicate merged into self-contained parts",
                 extra={
                     "event": "dedup_merged",
-                    "job": SUMMARY_JOB,
+                    "job": self._job_name("merge"),
                     "older_id": older_id,
                     "note_id": note_id,
                     "cosine": payload.get("cosine"),
@@ -2776,7 +3105,7 @@ class BackgroundWorker:
                 "dedup: failed to record merge_deferred warning",
                 extra={
                     "event": "warning_open_failed",
-                    "job": SUMMARY_JOB,
+                    "job": self._job_name("merge"),
                     "older_id": older_id,
                     "note_id": note_id,
                 },
@@ -2926,8 +3255,8 @@ class BackgroundWorker:
                 generated = self._summarizer.title(row["text"])
             except SummaryError as exc:
                 self._log_slot_failure(
-                    SUMMARY_JOB,
-                    SLOT_SUMMARY,
+                    self._job_name("title"),
+                    self._operation_slot("title"),
                     outcome_of(exc),
                     event="title_failed",
                     message="title: generation failed — kept null, retry by back-off",
@@ -2941,7 +3270,10 @@ class BackgroundWorker:
                     break
                 continue  # failure: the title stays NULL, a retry on back-off
             self._log_slot_call(
-                SUMMARY_JOB, SLOT_SUMMARY, generated.meta, note_id=row["id"]
+                self._job_name("title"),
+                self._operation_slot("title"),
+                generated.meta,
+                note_id=row["id"],
             )
             title = self._truncate_title(generated.text)
             if not title:
@@ -2976,7 +3308,7 @@ class BackgroundWorker:
                     "title: generated for migration note",
                     extra={
                         "event": "title_generated",
-                        "job": SUMMARY_JOB,
+                        "job": self._job_name("title"),
                         "note_id": row["id"],
                         "vector_invalidated": stale,
                     },
@@ -3061,7 +3393,7 @@ class BackgroundWorker:
                     "summary: short note — summarized without a model call",
                     extra={
                         "event": "summary_shortcircuit",
-                        "job": SUMMARY_JOB,
+                        "job": self._job_name("summarize"),
                         "note_id": row["id"],
                         "text_chars": len(text),
                         "summary_chars": len(summary),
@@ -3072,8 +3404,8 @@ class BackgroundWorker:
                     summary_result = self._summarizer.summarize(text)
                 except SummaryError as exc:
                     self._log_slot_failure(
-                        SUMMARY_JOB,
-                        SLOT_SUMMARY,
+                        self._job_name("summarize"),
+                        self._operation_slot("summarize"),
                         outcome_of(exc),
                         event="summary_failed",
                         message=(
@@ -3090,7 +3422,10 @@ class BackgroundWorker:
                         break
                     continue  # failure: the pending status stays, a retry on back-off
                 self._log_slot_call(
-                    SUMMARY_JOB, SLOT_SUMMARY, summary_result.meta, note_id=row["id"]
+                    self._job_name("summarize"),
+                    self._operation_slot("summarize"),
+                    summary_result.meta,
+                    note_id=row["id"],
                 )
                 # The length safety net (the 3.1.0 gate decision, 2026-09-19): the
                 # model may ignore the prompt ("no more than 150 characters") — what
@@ -3890,7 +4225,14 @@ def build_summary_job(
                 Without a summarizer (the Phase-3 test mode) the job is not
                 applicable — the builder returns None and it does not enter the
                 registry (the loop did not exist before either).
+
+                The `legacy` mode only (release 3.9.0, LSBN-S-6): in the
+                `operation` mode the cycle is cut into three jobs — the
+                `title`, `summarize` and `merge` ones (their own builders
+                below); the combined job does not exist there.
     """
+    if worker._mode() == SLOT_MODEL_OPERATION:
+        return None  # the split jobs take its place (LSBN-S-6)
     if worker._summarizer is None:
         return None
     return JobSpec(
@@ -3907,6 +4249,107 @@ def build_summary_job(
         slot=SLOT_SUMMARY,
         gate=lambda: worker._slot_gate(SLOT_SUMMARY, SUMMARY_JOB),
         is_gated=lambda: worker._slot_blocked(SLOT_SUMMARY),
+    )
+
+
+def build_title_job(
+    worker: BackgroundWorker, settings: Settings
+) -> JobSpec | None:
+    """The `title` job: the title generation, the `title` signal.
+
+                One of the three jobs of the split summary cycle (release 3.9.0,
+                LSBN-S-6): its own queue (the notes without a title), its own
+                signal, its own breaker (the `title` operation). The gate —
+                `_slot_gate` with the operation's breaker (with a probe knock),
+                `is_gated` — the same condition without models.
+
+                The `operation` mode only: in the `legacy` mode the whole cycle
+                is the `summary` job (as before) — the builder returns None and
+                the job does not enter the registry.
+    """
+    if worker._mode() != SLOT_MODEL_OPERATION:
+        return None
+    if worker._summarizer is None:
+        return None
+    return JobSpec(
+        name=TITLE_JOB,
+        queue=TITLE_JOB,
+        interval_sec=settings.pending_retry_sec,
+        batch=None,
+        enabled=True,
+        process=worker._process_title,
+        queue_empty=worker._title_queue_empty,
+        wait_event=worker._title_event,
+        idle_hook=None,
+        queue_stat=worker._title_queue_stat,
+        slot=worker._operation_slot("title"),
+        gate=lambda: worker._slot_gate(worker._operation_slot("title"), TITLE_JOB),
+        is_gated=lambda: worker._operation_blocked("title"),
+    )
+
+
+def build_summarize_job(
+    worker: BackgroundWorker, settings: Settings
+) -> JobSpec | None:
+    """The `summarize` job: the pending summarizations, the `summary` signal.
+
+                One of the three jobs of the split summary cycle (release 3.9.0,
+                LSBN-S-6): its own queue (`summary_status='pending'`), its own
+                signal, its own breaker (the `summarize` operation).
+
+                The `operation` mode only — see `build_title_job`.
+    """
+    if worker._mode() != SLOT_MODEL_OPERATION:
+        return None
+    if worker._summarizer is None:
+        return None
+    return JobSpec(
+        name=SUMMARIZE_JOB,
+        queue=SUMMARIZE_JOB,
+        interval_sec=settings.pending_retry_sec,
+        batch=None,
+        enabled=True,
+        process=worker._process_summarize,
+        queue_empty=worker._summarize_queue_empty,
+        wait_event=worker._summary_event,
+        idle_hook=None,
+        queue_stat=worker._summarize_queue_stat,
+        slot=worker._operation_slot("summarize"),
+        gate=lambda: worker._slot_gate(
+            worker._operation_slot("summarize"), SUMMARIZE_JOB
+        ),
+        is_gated=lambda: worker._operation_blocked("summarize"),
+    )
+
+
+def build_merge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec | None:
+    """The `merge` job: the pending merge jobs, the `merge` signal.
+
+                One of the three jobs of the split summary cycle (release 3.9.0,
+                LSBN-S-6): its own queue (the merge jobs of `worker_jobs`), its
+                own signal (set at the merge job's creation), its own breaker
+                (the `merge` operation).
+
+                The `operation` mode only — see `build_title_job`.
+    """
+    if worker._mode() != SLOT_MODEL_OPERATION:
+        return None
+    if worker._summarizer is None:
+        return None
+    return JobSpec(
+        name=MERGE_JOB,
+        queue=MERGE_JOB,
+        interval_sec=settings.pending_retry_sec,
+        batch=None,
+        enabled=True,
+        process=worker._process_merge,
+        queue_empty=worker._merge_queue_empty,
+        wait_event=worker._merge_event,
+        idle_hook=None,
+        queue_stat=worker._merge_queue_stat,
+        slot=worker._operation_slot("merge"),
+        gate=lambda: worker._slot_gate(worker._operation_slot("merge"), MERGE_JOB),
+        is_gated=lambda: worker._operation_blocked("merge"),
     )
 
 
@@ -4050,10 +4493,16 @@ def build_nodes_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
 # Registering the worker's loops in the framework registry (FR-1.1): the framework assembles jobs
 # from `JOB_BUILDERS`; one's own module appends its builders after their definitions
 # (the import is one-way — worker → jobs, no cycle). The order — as the loops had:
-# embedding, summary, judge, areas, expiration, nodes.
+# embedding, summary, judge, areas, expiration, nodes. Release 3.9.0 (LSBN-S-6): the
+# three split jobs of the summary cycle stand where the `summary` job stands — in the
+# `legacy` mode they do not enter the registry (the builders return None), so the
+# registry of the default mode is unchanged.
 jobs.JOB_BUILDERS += (
     build_embedding_job,
     build_summary_job,
+    build_title_job,
+    build_summarize_job,
+    build_merge_job,
     build_judge_job,
     build_areas_job,
     build_expiration_job,
