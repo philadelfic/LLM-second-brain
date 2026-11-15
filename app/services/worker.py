@@ -708,12 +708,13 @@ class BackgroundWorker:
                 The breaker key of the `operation` mode is the OPERATION name,
                 so the knock (the probe) must find the service by the
                 operation and not by the slot group: the summarizer serves
-                `summarize`/`title`/`merge`/`split`, the judge serves
-                `judge`/`structure_judge`, the classifier serves `classify`,
-                the promoter serves `describe`, the embedder serves `embed`
-                and the decision service serves `decision`. An unknown
-                operation — no service (`None`): the caller answers
-                `CHECK_OK` (the precedent of an absent service).
+                `summarize`/`title`/`merge`/`split`, the dedup judge serves
+                `judge`, the structural judge serves `structure_judge`, the
+                classifier serves `classify`, the promoter serves `describe`,
+                the embedder serves `embed` and the decision service serves
+                `decision`. An unknown operation — no service (`None`): the
+                caller answers `CHECK_OK` (the precedent of an absent
+                service).
 
                 The `legacy` mode keeps the slot map (`embedding`/`summary`/
                 `judge`) — the probe of a slot group is the service of that
@@ -723,8 +724,15 @@ class BackgroundWorker:
         if self._mode() == SLOT_MODEL_OPERATION:
             if operation in (SUMMARIZE_JOB, TITLE_JOB, MERGE_JOB, "split"):
                 return self._summarizer
-            if operation in (SLOT_JUDGE, "structure_judge"):
+            if operation == SLOT_JUDGE:
                 return self._judge
+            if operation == "structure_judge":
+                # Release 3.9.0 (LSBN-S-8): the structural judge is a service of
+                # its own (it lives inside the promotion trigger) — the dedup
+                # judge is a different operation with its own breaker. No
+                # trigger (a test mode) — the dedup judge, as before.
+                structure_judge = self._structure_judge()
+                return structure_judge if structure_judge is not None else self._judge
             if operation == "classify":
                 return self._classifier
             if operation == "describe":
@@ -739,6 +747,15 @@ class BackgroundWorker:
             SLOT_SUMMARY: self._summarizer,
             SLOT_JUDGE: self._judge,
         }.get(operation)
+
+    def _structure_judge(self) -> object | None:
+        """The structural judge service (the `structure_judge` operation).
+
+                The service lives inside the promotion trigger (the trigger
+                owns the describer and the structural judge); None — a test
+                mode without the trigger.
+        """
+        return getattr(self._promoter, "structure_judge", None)
 
     def _task_operation(self, slot: str, kind: str | None = None) -> str:
         """The owner of a task row: the operation in the `operation` mode, the
@@ -3869,11 +3886,24 @@ class BackgroundWorker:
                     warning with traceback into the logs, the queue loops live. A retry —
                     the next default-note classification or the next sweep run: groups are
                     not lost, they just reach the threshold later.
+
+                    Release 3.9.0 (LSBN-S-8): in the `operation` mode the structural
+                    judge has its OWN breaker — while it is closed the judge is not
+                    called (the candidate waits), and its failure is recorded at that
+                    breaker (the dedup judge's breaker is not touched). The `legacy`
+                    mode is unchanged: the failures stay inside the trigger and the
+                    whole slot group shares one breaker.
         """
         if self._promoter is None:
             return  # a test mode without the trigger
+        is_operation_mode = self._mode() == SLOT_MODEL_OPERATION
         try:
-            report = self._promoter.run()
+            if is_operation_mode:
+                report = self._promoter.run(
+                    judge_enabled=not self._operation_blocked("structure_judge")
+                )
+            else:
+                report = self._promoter.run()
         except Exception:
             logging.getLogger("app").warning(
                 "promotion: run failed — trigger deferred to next classification",
@@ -3885,6 +3915,8 @@ class BackgroundWorker:
                 exc_info=True,
             )
             return
+        if is_operation_mode:
+            self._note_structure_judge_failures(job)
         if any(report.values()):
             # The summary — under one key: 'created' clashes with the LogRecord
             # attribute (the creation time) — extra does not accept it.
@@ -3895,6 +3927,31 @@ class BackgroundWorker:
                     "job": job,
                     "report": report,
                 },
+            )
+
+    def _note_structure_judge_failures(self, job: str) -> None:
+        """The structural judge's failures — at the breaker of its operation.
+
+                    Release 3.9.0 (LSBN-S-8): the failure of the structural judge
+                    is recorded at the breaker of the `structure_judge` operation —
+                    the dedup judge's breaker is NOT touched (the two operations
+                    are independent: a dead model of one does not silence the
+                    other). The candidate itself stays without a verdict (the
+                    trigger keeps it) — the work is not lost, a retry is at the
+                    next run.
+        """
+        for failure in getattr(self._promoter, "judge_failures", []):
+            error = failure.get("error")
+            self._log_slot_failure(
+                job,
+                self._operation_slot("structure_judge"),
+                outcome_of(error) if isinstance(error, BaseException)
+                else SlotOutcome.OFF_CONTRACT,
+                event="promotion_judge_failed",
+                message="promotion: structure judge failed — candidate kept, retry",
+                detail=str(error) if error is not None else None,
+                domain=failure.get("domain"),
+                slug=failure.get("slug"),
             )
 
     def _auto_move_target(self, result) -> str | None:
@@ -4565,6 +4622,13 @@ def build_judge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
 
                 The slot gate (3.4.1, LSBN-T-29): `gate` — `_slot_gate` (with a probe
                 knock), `is_gated` — `_slot_blocked` (snapshots without models).
+
+                Release 3.9.0 (LSBN-S-8): the judge operation goes through the
+                operation API (`_operation_slot`/`_operation_blocked`): the gate
+                and the blocked check are read from the breaker of the
+                `judge` operation — in the `operation` mode its own breaker
+                (the dedup judge and the structural judge do not share one),
+                in the `legacy` mode the `judge` slot group (as before).
     """
     return JobSpec(
         name=JUDGE_JOB,
@@ -4583,7 +4647,7 @@ def build_judge_job(worker: BackgroundWorker, settings: Settings) -> JobSpec:
         queue_stat=worker._judge_queue_stat,
         slot=worker._operation_slot("judge"),
         gate=lambda: worker._slot_gate(worker._operation_slot("judge"), JUDGE_JOB),
-        is_gated=lambda: worker._slot_blocked(worker._operation_slot("judge")),
+        is_gated=lambda: worker._operation_blocked("judge"),
     )
 
 

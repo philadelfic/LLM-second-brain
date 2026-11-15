@@ -66,7 +66,9 @@ from app.services.namespaces import (
     NamespaceService,
     count_sentences,
 )
+from app.services.operations import operation_mode
 from app.services.prompts import PromptRegistry
+from app.services.slot_outcome import SlotOutcome, classify_llm_error
 from app.storage.db import DEFAULT_NAMESPACE, session, transaction
 
 # The candidate's descriptions are built from summaries: top by confidence, deterministically.
@@ -90,7 +92,23 @@ class DescriberError(RuntimeError):
 
 
 class StructureJudgeError(RuntimeError):
-    """The structure judge gave no verdict: the server is unavailable or the answer is invalid."""
+    """The structure judge gave no verdict: the server is unavailable or the answer is invalid.
+
+            `outcome` — the call outcome (#39, arch §6.4): the transport failure
+            carries the outcome of the client error, an unrecognized verdict —
+            `off_contract` (the default). The worker reads it to record the
+            failure at the breaker of the `structure_judge` operation
+            (release 3.9.0, LSBN-S-8).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        outcome: SlotOutcome = SlotOutcome.OFF_CONTRACT,
+    ) -> None:
+        super().__init__(message)
+        self.outcome = outcome
 
 
 class Verdict:
@@ -317,9 +335,13 @@ class StructureJudgeService:
             )
         except LLMError as exc:
             # The client text is preserved: HTTP status, the slot address, the
-            # {SLOT}_API_KEY hint on an auth failure (decision #4).
+            # {SLOT}_API_KEY hint on an auth failure (decision #4). The call
+            # outcome (#39, arch §6.4) — the same mapping as the dedup judge:
+            # the worker records it at the breaker of the operation.
             self.last_attempt_ok = False
-            raise StructureJudgeError(str(exc)) from exc
+            raise StructureJudgeError(
+                str(exc), outcome=classify_llm_error(exc)
+            ) from exc
         try:
             verdict = self._parse(content)
         except StructureJudgeError:
@@ -332,16 +354,37 @@ class StructureJudgeService:
         """Close resources (interface-compatible with the other clients)."""
         self._llm.close()
 
+    def probe(self) -> str:
+        """A cheap probe knock on the slot (#39, arch §6.4): `check()` without generation;
+                the outcome — a CheckResult from llm_client.
+
+                Release 3.9.0 (LSBN-S-8): the breaker of the `structure_judge`
+                operation knocks HERE — the structural judge's own service (the
+                dedup judge is a different operation with its own breaker).
+        """
+        return self._llm.check()
+
     # --- internal -------------------------------------------------------------
 
     def _think(self) -> bool | None:
-        """The structure judge's think flag: NAMESPACE_JUDGE_THINK — the senior channel
-                    (None — the LSBN-F-34 operation chain: STRUCTURE_JUDGE_THINK →
-                    JUDGE_THINK through the client's spec). The flag is separated from the
-                    dedup judge (the Step-7 E2E — a thinking structure judge "stuck" on
-                    twin pairs at 20 tok/s, starving summarization on the shared slot;
-                    a thoughtless verdict — 10–50 tokens).
+        """The structure judge's think flag.
+
+                The `operation` mode (release 3.9.0, LSBN-S-8; the design, B1):
+                the think flag of the OPERATION `structure_judge` —
+                `STRUCTURE_JUDGE_THINK`; the legacy source
+                `NAMESPACE_JUDGE_THINK` does not take part in the new mode
+                (None — the client's spec: the operation chain
+                `STRUCTURE_JUDGE_THINK` → the default).
+
+                The `legacy` mode: `NAMESPACE_JUDGE_THINK` — the senior channel
+                (None — the LSBN-F-34 operation chain: STRUCTURE_JUDGE_THINK →
+                JUDGE_THINK through the client's spec). The flag is separated from the
+                dedup judge (the Step-7 E2E — a thinking structure judge "stuck" on
+                twin pairs at 20 tok/s, starving summarization on the shared slot;
+                a thoughtless verdict — 10–50 tokens).
         """
+        if operation_mode(self._settings):
+            return self._settings.structure_judge_think
         return self._settings.namespace_judge_think
 
     @staticmethod
@@ -397,6 +440,36 @@ class PromotionService:
         self._describer = describer
         self._judge = judge
         self._namespaces = namespaces if namespaces is not None else NamespaceService(settings)
+        # The structural judge's failures of the last run (release 3.9.0,
+        # LSBN-S-8): the worker reads them to record the failure at the
+        # breaker of the `structure_judge` operation. In the `legacy` mode
+        # nobody reads them - the failure stays swallowed (as before).
+        self._judge_failures: list[dict[str, Any]] = []
+
+    # --- the services behind the operations ----------------------------------
+
+    @property
+    def structure_judge(self) -> StructureJudge | None:
+        """The structural judge service (the `structure_judge` operation).
+
+                The service lives here (the trigger owns the describer and the
+                structural judge); the worker takes it for the probe knock of
+                the operation (release 3.9.0, LSBN-S-8). None — a test mode
+                without the trigger.
+        """
+        return self._judge
+
+    @property
+    def judge_failures(self) -> list[dict[str, Any]]:
+        """The structural judge's failures of the last run.
+
+                Each record: `reason` ("judge"), `domain`, `slug`, `path` and
+                `error` (the StructureJudgeError). The worker turns them into
+                the failures of the `structure_judge` operation (release 3.9.0,
+                LSBN-S-8) — the candidate itself stays without a verdict (the
+                work is not lost, a retry is at the next run).
+        """
+        return list(self._judge_failures)
 
     # --- reads: candidates (SQL aggregation, §5.7 "the trigger is not an LLM") ---
 
@@ -457,7 +530,7 @@ class PromotionService:
 
     # --- the pipeline run ----------------------------------------------------
 
-    def run(self) -> dict[str, Any]:
+    def run(self, *, judge_enabled: bool = True) -> dict[str, Any]:
         """Run all ready candidates; a summary {created, merged, rejected}.
 
                     Called by the worker after classifying a default note (the markup could
@@ -465,8 +538,15 @@ class PromotionService:
                     does not cancel the others (NFR-3): the candidate is skipped until the
                     next run (it does not enter the summary). The day/leaves limits are
                     checked before the LLM calls.
+
+                    `judge_enabled` — False: the structural judge is not called
+                    (its breaker is closed — release 3.9.0, LSBN-S-8); the
+                    candidates wait without a verdict (a retry is at the next
+                    run, the work is not lost). The `legacy` mode never uses it
+                    (the default).
         """
         report: dict[str, Any] = {"created": [], "merged": [], "rejected": []}
+        self._judge_failures = []  # the failures of THIS run (the worker reads them)
         if self._describer is None or self._judge is None:
             return report  # the trigger is off (a test mode)
         logger = logging.getLogger("app")
@@ -489,7 +569,7 @@ class PromotionService:
                            "reason": "leaves_limit"},
                 )
                 continue
-            action = self._promote_one(domain, slug)
+            action = self._promote_one(domain, slug, judge_enabled=judge_enabled)
             if action in ("created", "merged", "rejected"):
                 report[action].append(path)
             if action == "created":
@@ -530,16 +610,26 @@ class PromotionService:
                 extra={"event": "root_orphans", "orphans": orphans},
             )
 
-    def _promote_one(self, domain: str, slug: str) -> str | None:
+    def _promote_one(
+        self, domain: str, slug: str, *, judge_enabled: bool = True
+    ) -> str | None:
         """The full cycle of one candidate: created|merged|rejected|None.
 
                     None — a describer/judge failure (transport): the candidate stays
                     WITHOUT a verdict, a retry at the next run (NFR-3); it does not count
                     in the summary. A returned verdict is always recorded (cooldown):
                     merged/rejected — into promotions, created — by a registry node.
+
+                    `judge_enabled` — False: the structural judge is not called
+                    (its breaker is closed — release 3.9.0, LSBN-S-8); the candidate
+                    waits as after a failure (no verdict, a retry at the next run).
         """
         logger = logging.getLogger("app")
         path = f"{domain}/{slug}"
+        if not judge_enabled:
+            # The structural judge waits (the breaker of the operation is closed):
+            # no model calls, the candidate keeps its state — a retry at the next run.
+            return None
         summaries = self._group_summaries(path)
         try:
             description = self._describer.describe(summaries, slug, domain)  # type: ignore[union-attr]
@@ -566,7 +656,20 @@ class PromotionService:
                 nearest_path,
                 nearest_cosine,
             )
-        except StructureJudgeError:
+        except StructureJudgeError as exc:
+            # Release 3.9.0 (LSBN-S-8): the failure is visible to the worker — it
+            # records it at the breaker of the `structure_judge` operation. The
+            # candidate itself stays as before (without a verdict, a retry at the
+            # next run — NFR-3).
+            self._judge_failures.append(
+                {
+                    "reason": "judge",
+                    "domain": domain,
+                    "slug": slug,
+                    "path": path,
+                    "error": exc,
+                }
+            )
             logger.warning(
                 "promotion: structure judge failed — candidate kept",
                 extra={"event": "promotion_failed", "domain": domain, "slug": slug,
