@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.config import ConfigError, load_settings
 from app.services.embedding import EmbeddingService
 from app.services.worker import BackgroundWorker
+from app.storage import db
 from app.storage.db import StorageError, init_db, session, transaction
 
 
@@ -60,9 +61,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"FATAL: БД не найдена: {settings.db_path}", file=sys.stderr)
         return 2
     print(f"БД: {settings.db_path}")
+    # Release 3.9.0 (LSBN-S-18): the EFFECTIVE model — the one the re-encoding
+    # below actually uses (the `embed` operation in the `operation` mode, the
+    # slot value in `legacy`). The dimension stays as it is: it belongs to the
+    # database (one vector table).
+    effective_model, _effective_provider = db._effective_embedding_values(settings)
     print(
         f"Новая размерность: EMBEDDING_DIM={settings.embedding_dim}, "
-        f"модель: {settings.embedding_model}"
+        f"модель: {effective_model}"
     )
     if not args.yes:
         answer = input(

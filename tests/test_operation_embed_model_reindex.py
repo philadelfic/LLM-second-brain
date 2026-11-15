@@ -19,6 +19,8 @@
       6. the backup check (`embedding_mismatch`) compares the meta with the
          EFFECTIVE model - in the `operation` mode a snapshot built with the
          operation model is NOT a mismatch;
+      7. the message of the manual reindex shows the model the re-encoding
+         really uses - the effective one.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ import pytest
 from app.config import Settings, get_settings
 from app.services.backup import EMBEDDING_MISMATCH, BackupService
 from app.storage.db import init_db, session
+from scripts.reindex import main as reindex_main
 
 
 def make_settings(monkeypatch: pytest.MonkeyPatch, tmp_path, **env: str) -> Settings:
@@ -289,3 +292,43 @@ def test_the_backup_check_keeps_the_slot_value_in_legacy(
     finally:
         conn.close()
     assert service.verify(target)["checks"][EMBEDDING_MISMATCH] is True
+
+
+def test_the_reindex_message_shows_the_effective_model(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Criterion 7: the manual reindex names the model it really uses.
+
+                The script re-encodes with the effective model (the `embed`
+                operation in the `operation` mode) - the message names it, not
+                the slot value.
+    """
+    make_settings(
+        monkeypatch,
+        tmp_path,
+        SLOT_MODEL="operation",
+        EMBED_MODEL="op-embed-model",
+        EMBEDDING_MODEL="qwen3-embedding:8b",
+    )
+    init_db(get_settings())
+
+    assert reindex_main(["--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "модель: op-embed-model" in out
+    assert "qwen3-embedding:8b" not in out
+
+
+def test_the_reindex_message_keeps_the_slot_model_in_legacy(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Criterion 7 in the `legacy` mode: the slot value in the message, as before."""
+    make_settings(
+        monkeypatch,
+        tmp_path,
+        EMBEDDING_MODEL="slot-embed-model",
+    )
+    init_db(get_settings())
+
+    assert reindex_main(["--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "модель: slot-embed-model" in out
