@@ -319,7 +319,389 @@ _OPERATION_BY_TASK: dict[tuple[str, str], str] = {
     (SLOT_SUMMARY, SUMMARIZE_JOB): SUMMARIZE_JOB,
     (SLOT_JUDGE, "dedup"): SLOT_JUDGE,
     (NODES_JOB, NODES_RECLASS_KIND): "classify",
+    # The pairs AFTER the migration of `worker_jobs.slot` (release 3.9.0,
+    # LSBN-S-14): the row carries the operation name. The map covers BOTH
+    # forms — the reader accepts the legacy value and the migrated one (the
+    # design, B5: "the new mode reads the old and the new values"), so the
+    # migration orphans no task. The pair ('judge','dedup') is the same in
+    # both forms: the operation name of the dedup judge IS the legacy slot
+    # group.
+    (MERGE_JOB, "merge"): MERGE_JOB,
+    ("classify", NODES_RECLASS_KIND): "classify",
 }
+
+# The migration of `worker_jobs.slot` to the operation names (release 3.9.0,
+# LSBN-S-14; the design, B5): the pair (slot, kind) -> the operation name.
+# A value that is not in the map is NOT migrated — it stays in the old queue
+# and is marked with attention ("the hanging tasks are not lost silently").
+SLOT_MIGRATION_MAP: dict[tuple[str, str], str] = {
+    (SLOT_SUMMARY, "merge"): MERGE_JOB,
+    (SLOT_JUDGE, "dedup"): SLOT_JUDGE,
+    (NODES_JOB, NODES_RECLASS_KIND): "classify",
+}
+
+# The reverse map — deterministic by `kind` (the design, B5): the operation
+# name -> the legacy slot group.
+SLOT_MIGRATION_REVERSE: dict[str, str] = {
+    "merge": SLOT_SUMMARY,
+    "dedup": SLOT_JUDGE,
+    "reclass": NODES_JOB,
+}
+
+# The journal event of the migration (`slot_migrated`).
+SLOT_MIGRATION_EVENT = "slot_migrated"
+
+# The meta key of the forward run: the ids of the rows it moved — the reverse
+# restores exactly them ("only the rows that were moved forward", the design,
+# B5). The meta table is the project's stamp table (the embedding meta, the
+# slot config fingerprint) — the schema of `worker_jobs` does not change.
+SLOT_MIGRATION_META_KEY = "slot_migration_forward"
+
+
+def slot_values_for_queue(slot: str, kind: str, mode: str) -> tuple[str, ...]:
+    """The slot values a queue is read under (the `operation` mode reads both).
+
+            Release 3.9.0 (LSBN-S-14): the rows keep their legacy slot value
+            until the migration of `worker_jobs.slot`; the migration moves them
+            to the operation name. The `operation` mode therefore reads BOTH
+            values — the new mode accepts the old and the new ones (the design,
+            B5), so the migration orphans no task and the work is not lost.
+            The `legacy` mode reads the legacy value only (as before — the
+            migration does not run there).
+    """
+    if mode != SLOT_MODEL_OPERATION:
+        return (slot,)
+    operation = SLOT_MIGRATION_MAP.get((slot, kind))
+    if operation is None or operation == slot:
+        return (slot,)
+    return (slot, operation)
+
+
+# The operation name of a kind (the reverse of `SLOT_MIGRATION_MAP`): the
+# rollback reads the rows that carry it.
+_OPERATION_BY_KIND: dict[str, str] = {
+    kind: operation for (_slot, kind), operation in SLOT_MIGRATION_MAP.items()
+}
+
+
+def ensure_worker_jobs_schema(settings: Settings) -> None:
+    """Create the job-queues table + its indexes (idempotently).
+
+            The schema of the worker's zone is the worker's own (not db.py):
+            the per-slot job queues are the background pipeline's internal
+            mechanics, the loops' dependency dispatcher.
+
+            The attention columns (#39, arch §5.2/§6.8) — `attempts`/
+            `last_outcome`/`last_error`/`attention_at` — are in the fresh DDL
+            and added by an idempotent ALTER over `PRAGMA table_info(worker_jobs)`
+            for a live database of the previous version.
+
+            The indexes: `idx_worker_jobs_queue (slot, kind, status, id)` — a
+            slot's pending queue is selected by the index, not a full table
+            scan; `idx_worker_jobs_attention (status, attention_at)` — the
+            "needs attention" selection; and `idx_worker_jobs_slot_attention
+            (slot, status, attention_at)` — the attention counter per slot
+            (release 3.9.0, LSBN-S-14; the design, B5). The COLUMNS do not
+            change — the index is added, the schema of the table stays.
+
+            The ALTER tolerates `duplicate column name` (lsbdef-0013): the lock
+            of the caller covers the threads of one process — a competing worker
+            process is not one of them.
+    """
+    with session(settings) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS worker_jobs ("
+            "  id           INTEGER PRIMARY KEY,"
+            "  slot         TEXT NOT NULL,"
+            "  kind         TEXT NOT NULL,"
+            "  note_id      INTEGER NOT NULL,"
+            "  payload      TEXT,"
+            "  status       TEXT NOT NULL DEFAULT 'pending',"
+            "  created_at   TEXT NOT NULL DEFAULT "
+            "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
+            "  updated_at   TEXT NOT NULL DEFAULT "
+            "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
+            "  attempts     INTEGER NOT NULL DEFAULT 0,"
+            "  last_outcome TEXT,"
+            "  last_error   TEXT,"
+            "  attention_at TEXT"
+            ")"
+        )
+        existing = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(worker_jobs)"
+            ).fetchall()
+        }
+        for name, ddl in (
+            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_outcome", "TEXT"),
+            ("last_error", "TEXT"),
+            ("attention_at", "TEXT"),
+        ):
+            if name not in existing:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE worker_jobs ADD COLUMN {name} {ddl}"
+                    )
+                except sqlite3.OperationalError as exc:
+                    # A competing process managed to add the column
+                    # (lsbdef-0013): we do not crash; the migration continues.
+                    if "duplicate column name" not in str(exc):
+                        raise
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_worker_jobs_queue "
+            "ON worker_jobs(slot, kind, status, id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_worker_jobs_attention "
+            "ON worker_jobs(status, attention_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_worker_jobs_slot_attention "
+            "ON worker_jobs(slot, status, attention_at)"
+        )
+
+
+def _read_slot_migration_stamp(conn: sqlite3.Connection) -> dict:
+    """The stamp of the migration: the ids of the rows it moved (the meta table).
+
+            An unreadable stamp is an empty one — the migration does not crash
+            on a broken value (the `migration_chain` precedent).
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (SLOT_MIGRATION_META_KEY,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return {}  # no meta table — the stamp is optional
+    if row is None:
+        return {}
+    try:
+        payload = json.loads(row["value"])
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_slot_migration_stamp(
+    conn: sqlite3.Connection,
+    direction: str,
+    migrated: int,
+    attention: int,
+    unknown: int,
+    ids: list[int],
+) -> None:
+    """Write the stamp of the migration run (the meta table).
+
+            The ids accumulate: the stamp is the list of the rows that were
+            moved FORWARD — the rollback restores exactly them.
+    """
+    known = {
+        int(value)
+        for value in (_read_slot_migration_stamp(conn).get("ids") or [])
+        if isinstance(value, int) or str(value).isdigit()
+    }
+    known.update(ids)
+    payload = {
+        "direction": direction,
+        "migrated": migrated,
+        "attention": attention,
+        "unknown": unknown,
+        "ids": sorted(known),
+    }
+    try:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (SLOT_MIGRATION_META_KEY, json.dumps(payload, ensure_ascii=False)),
+        )
+    except sqlite3.OperationalError:
+        # No meta table — the journal event still carries the counters; the
+        # rollback falls back to the deterministic rule by `kind`.
+        return
+
+
+def _forward_slots(conn: sqlite3.Connection) -> dict:
+    """The forward migration: the rows move to the operation names.
+
+            The caller's transaction. The mapping is by the PAIR (slot, kind);
+            a pair that is not in the map is NOT migrated — it stays in the old
+            queue and is marked with attention (the "hanging" task is visible
+            and is not lost silently).
+    """
+    rows = conn.execute("SELECT id, slot, kind FROM worker_jobs").fetchall()
+    unknown: list[int] = []
+    for row in rows:
+        pair = (row["slot"], row["kind"])
+        if pair in SLOT_MIGRATION_MAP:
+            continue
+        if pair in _OPERATION_BY_TASK:
+            continue  # a known pair the map does not migrate (the value stays)
+        unknown.append(int(row["id"]))
+    migrated = 0
+    moved_ids: list[int] = []
+    for (legacy_slot, kind), operation in SLOT_MIGRATION_MAP.items():
+        if operation == legacy_slot:
+            # The identity mapping ('judge','dedup' -> 'judge'): the rows
+            # already carry the operation name — there is nothing to move.
+            continue
+        # The ids of the rows the UPDATE touches — the stamp of the run
+        # (the rollback returns exactly them).
+        ids = [
+            int(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM worker_jobs WHERE slot = ? AND kind = ?",
+                (legacy_slot, kind),
+            ).fetchall()
+        ]
+        cursor = conn.execute(
+            "UPDATE worker_jobs SET slot = ? WHERE slot = ? AND kind = ?",
+            (operation, legacy_slot, kind),
+        )
+        migrated += int(cursor.rowcount or 0)
+        moved_ids.extend(ids)
+    attention = 0
+    if unknown:
+        bindings = ", ".join("?" * len(unknown))
+        cursor = conn.execute(
+            "UPDATE worker_jobs SET attention_at = COALESCE(attention_at, "
+            "strftime('%Y-%m-%dT%H:%M:%SZ','now')), "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            f"WHERE id IN ({bindings}) AND attention_at IS NULL",
+            unknown,
+        )
+        attention = int(cursor.rowcount or 0)
+    _write_slot_migration_stamp(
+        conn, "forward", migrated, attention, len(unknown), moved_ids
+    )
+    return {
+        "direction": "forward",
+        "skipped": False,
+        "reason": None,
+        "migrated": migrated,
+        "attention": attention,
+        "unknown": len(unknown),
+    }
+
+
+def _restore_slot_row(conn: sqlite3.Connection, job_id: int) -> int:
+    """Return one row to its legacy slot value; the number of rows changed."""
+    row = conn.execute(
+        "SELECT slot, kind, attention_at FROM worker_jobs WHERE id = ?", (job_id,)
+    ).fetchone()
+    if row is None:
+        return 0
+    legacy_slot = SLOT_MIGRATION_REVERSE.get(row["kind"])
+    operation = _OPERATION_BY_KIND.get(row["kind"])
+    if legacy_slot is None or operation is None:
+        return 0
+    if legacy_slot == operation:
+        return 0  # the identity mapping — nothing to restore
+    if row["slot"] != operation:
+        return 0  # the row does not carry the operation name
+    if row["attention_at"] is not None:
+        return 0  # a frozen row is not touched
+    cursor = conn.execute(
+        "UPDATE worker_jobs SET slot = ? WHERE id = ? AND attention_at IS NULL",
+        (legacy_slot, job_id),
+    )
+    return int(cursor.rowcount or 0)
+
+
+def _reverse_slots(conn: sqlite3.Connection) -> dict:
+    """The rollback: the rows that were moved forward return to their values.
+
+            The reverse map is deterministic by `kind` (the design, B5); the
+            rows are the ones the forward run moved (the stamp of the run) —
+            with the deterministic fallback (the rows that carry the operation
+            name of their kind) when the stamp is missing.
+    """
+    stamp = _read_slot_migration_stamp(conn)
+    ids = [int(value) for value in (stamp.get("ids") or [])]
+    restored = 0
+    if ids:
+        for job_id in ids:
+            restored += _restore_slot_row(conn, job_id)
+    else:
+        for row in conn.execute(
+            "SELECT id FROM worker_jobs"
+        ).fetchall():
+            restored += _restore_slot_row(conn, int(row["id"]))
+    _write_slot_migration_stamp(conn, "reverse", restored, 0, 0, [])
+    return {
+        "direction": "reverse",
+        "skipped": False,
+        "reason": None,
+        "migrated": restored,
+        "attention": 0,
+        "unknown": 0,
+    }
+
+
+def migrate_slots(settings: Settings, reverse: bool = False) -> dict:
+    """Migrate `worker_jobs.slot` to the operation names (LSBN-S-14; the design, B5).
+
+            The mapping is by the PAIR (slot, kind):
+            `('summary','merge') → 'merge'`, `('judge','dedup') → 'judge'`,
+            `('nodes','reclass') → 'classify'`. A value that is not in the map
+            is NOT migrated: it stays in the old queue and is marked with
+            attention (`attention_at`) — the "hanging" task is visible and is
+            not lost silently.
+
+            The ORDER (the design, B5): the new mode reads the old AND the new
+            values (the reader covers both pairs), THEN the migration runs,
+            THEN the flag is switched. While the flag is `legacy` the migration
+            does NOT run — the values in the DB stay the old ones and the
+            queues are read as before. The migration is called EXPLICITLY
+            (never at the start of the service).
+
+            Idempotent: the UPDATE moves the rows once; a repeated run changes
+            nothing and writes no second journal record. The journal record —
+            the event `slot_migrated` with the counters (moved, marked with
+            attention, unknown combinations) and the stamp in `meta` (the ids
+            of the moved rows).
+
+            `reverse=True` — the rollback: the rows that were moved forward
+            return to their old values (the reverse map is deterministic by
+            `kind`); the rows marked with attention are not touched.
+
+            Returns the counters: `direction`, `skipped`, `reason`, `migrated`,
+            `attention`, `unknown`.
+    """
+    direction = "reverse" if reverse else "forward"
+    if slot_model(settings) != SLOT_MODEL_OPERATION:
+        # The flag decides (the design, B5): in the `legacy` mode the values in
+        # the DB stay the old ones — the migration does not run.
+        return {
+            "direction": direction,
+            "skipped": True,
+            "reason": "legacy_mode",
+            "migrated": 0,
+            "attention": 0,
+            "unknown": 0,
+        }
+    ensure_worker_jobs_schema(settings)
+    with session(settings) as conn, transaction(conn):
+        if reverse:
+            counters = _reverse_slots(conn)
+        else:
+            counters = _forward_slots(conn)
+    if counters["migrated"] or counters["attention"]:
+        logging.getLogger("app").info(
+            "worker_jobs.slot: the slot values are migrated to the operation names"
+            if not reverse
+            else "worker_jobs.slot: the slot values are returned to the slot groups",
+            extra={
+                "event": SLOT_MIGRATION_EVENT,
+                "job": "migration",
+                "direction": direction,
+                "migrated": counters["migrated"],
+                "attention": counters["attention"],
+                "unknown": counters["unknown"],
+            },
+        )
+    return counters
 
 
 def _call_meta_fields(meta: ChatMeta) -> dict[str, object]:
@@ -413,7 +795,7 @@ _NODES_RECLASS_TAKEABLE = (
 )
 
 
-def _nodes_queue_stat_sql() -> str:
+def _nodes_queue_stat_sql(slot_values: tuple[str, ...] = (NODES_JOB,)) -> str:
     """The SQL of the `nodes` queue snapshot under the run's ACTUAL pools (FR-2.2).
 
             `pending` — exactly the work `process_nodes` can take in this run, and
@@ -429,18 +811,25 @@ def _nodes_queue_stat_sql() -> str:
             empty. SQL only, no model calls; the snapshot works for a disabled job
             too. The `:threshold` parameter — the auto-move threshold
             (`NAMESPACE_AUTO_MOVE_MIN_CONFIDENCE`).
+
+            Release 3.9.0 (LSBN-S-14): the `reclass` tasks are read under the slot
+            values of the mode — the legacy value and the operation name in the
+            `operation` mode (the migration of `worker_jobs.slot` moves the rows
+            from one to the other; the reader covers both). The slot values are
+            bound as `:slot0`, `:slot1`, ... — the caller passes them.
     """
+    slot_bindings = ", ".join(f":slot{index}" for index in range(len(slot_values)))
     reclass_jobs = (
         "SELECT COUNT(*) FROM worker_jobs j "
         "LEFT JOIN notes n ON n.id = j.note_id "
-        "WHERE j.slot = 'nodes' AND j.kind = 'reclass' "
+        f"WHERE j.slot IN ({slot_bindings}) AND j.kind = 'reclass' "
         f"AND j.status = 'pending' AND {_NODES_RECLASS_TAKEABLE}"
     )
     reclass_age = (
         "SELECT MAX(CAST(strftime('%s','now') AS INTEGER) "
         "- CAST(strftime('%s', j.created_at) AS INTEGER)) "
         "FROM worker_jobs j LEFT JOIN notes n ON n.id = j.note_id "
-        "WHERE j.slot = 'nodes' AND j.kind = 'reclass' "
+        f"WHERE j.slot IN ({slot_bindings}) AND j.kind = 'reclass' "
         f"AND j.status = 'pending' AND {_NODES_RECLASS_TAKEABLE}"
     )
     fast_pool = (
@@ -787,6 +1176,17 @@ class BackgroundWorker:
         if self._mode() != SLOT_MODEL_OPERATION:
             return slot
         return _OPERATION_BY_TASK.get((slot, kind or ""), slot)
+
+    def _queue_slot_values(self, slot: str, kind: str) -> tuple[str, ...]:
+        """The slot values a queue is read under (the mode's own rule).
+
+                Release 3.9.0 (LSBN-S-14): the `operation` mode reads both the
+                legacy value and the operation name — the rows keep the legacy
+                value until the migration of `worker_jobs.slot`, and the
+                migration moves them to the operation name. The `legacy` mode
+                reads the legacy value only (as before).
+        """
+        return slot_values_for_queue(slot, kind, self._mode())
 
     def _job_name(self, operation: str) -> str:
         """The job name of an operation: the operation's own job in the
@@ -1869,14 +2269,21 @@ class BackgroundWorker:
                     gone for good, and a release would freeze the pair again.
                     SQL and vector reads only — no models called. Returns the unfrozen
                     count.
+
+                    Release 3.9.0 (LSBN-S-14): the queue is read under the slot values
+                    of the mode — the legacy value and the operation name in the
+                    `operation` mode (the migration of `worker_jobs.slot` moves the rows
+                    from one to the other; the reader covers both).
         """
         self._ensure_job_table()
+        slot_values = self._queue_slot_values(slot, kind)
+        bindings = ", ".join("?" * len(slot_values))
         with session(self._settings) as conn:
             rows = conn.execute(
                 "SELECT id, note_id, payload FROM worker_jobs "
-                "WHERE slot = ? AND kind = ? AND status = 'pending' "
+                f"WHERE slot IN ({bindings}) AND kind = ? AND status = 'pending' "
                 "AND attention_at IS NOT NULL ORDER BY id",
-                (slot, kind),
+                (*slot_values, kind),
             ).fetchall()
         released = 0
         for row in rows:
@@ -2259,14 +2666,10 @@ class BackgroundWorker:
                     Pool 5, one-time creation: the full DDL runs only at the first access
                     per worker instance (memoized on the `_jobs_table_ready` flag);
                     repeated calls (3 per job: `_create_job`, `_pending_jobs`,
-                    `_mark_job_done`) return immediately. The `idx_worker_jobs_queue`
-                    index on (slot, kind, status, id): a slot's pending queue is selected
-                    by the index, not a full table scan. The attention columns (#39, arch
-                    §5.2/§6.8) — `attempts`/`last_outcome`/`last_error`/`attention_at` —
-                    are in the fresh DDL and added by an idempotent ALTER over
-                    `PRAGMA table_info(worker_jobs)` for a live database of the previous
-                    version; the `idx_worker_jobs_attention` index serves the "needs
-                    attention" selection.
+                    `_mark_job_done`) return immediately. The DDL itself — the table,
+                    the attention columns and the indexes — lives in
+                    `ensure_worker_jobs_schema` (the module-level function; the
+                    migration of the slot values calls it too).
 
                     The DDL — under a lock (lsbdef-0013): two threads (a loop via
                     `asyncio.to_thread` + the startup attention release in `run`)
@@ -2281,55 +2684,7 @@ class BackgroundWorker:
         with self._jobs_table_lock:
             if self._jobs_table_ready:  # another thread already migrated it
                 return
-            with session(self._settings) as conn:
-                conn.execute(
-                    "CREATE TABLE IF NOT EXISTS worker_jobs ("
-                    "  id           INTEGER PRIMARY KEY,"
-                    "  slot         TEXT NOT NULL,"
-                    "  kind         TEXT NOT NULL,"
-                    "  note_id      INTEGER NOT NULL,"
-                    "  payload      TEXT,"
-                    "  status       TEXT NOT NULL DEFAULT 'pending',"
-                    "  created_at   TEXT NOT NULL DEFAULT "
-                    "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
-                    "  updated_at   TEXT NOT NULL DEFAULT "
-                    "    (strftime('%Y-%m-%dT%H:%M:%SZ','now')),"
-                    "  attempts     INTEGER NOT NULL DEFAULT 0,"
-                    "  last_outcome TEXT,"
-                    "  last_error   TEXT,"
-                    "  attention_at TEXT"
-                    ")"
-                )
-                existing = {
-                    row["name"]
-                    for row in conn.execute(
-                        "PRAGMA table_info(worker_jobs)"
-                    ).fetchall()
-                }
-                for name, ddl in (
-                    ("attempts", "INTEGER NOT NULL DEFAULT 0"),
-                    ("last_outcome", "TEXT"),
-                    ("last_error", "TEXT"),
-                    ("attention_at", "TEXT"),
-                ):
-                    if name not in existing:
-                        try:
-                            conn.execute(
-                                f"ALTER TABLE worker_jobs ADD COLUMN {name} {ddl}"
-                            )
-                        except sqlite3.OperationalError as exc:
-                            # A competing process managed to add the column
-                            # (lsbdef-0013): we do not crash; the migration continues.
-                            if "duplicate column name" not in str(exc):
-                                raise
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_worker_jobs_queue "
-                    "ON worker_jobs(slot, kind, status, id)"
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_worker_jobs_attention "
-                    "ON worker_jobs(status, attention_at)"
-                )
+            ensure_worker_jobs_schema(self._settings)
             self._jobs_table_ready = True
 
     def _purge_done_jobs(self) -> None:
@@ -2412,15 +2767,23 @@ class BackgroundWorker:
                     Frozen jobs (`attention_at IS NOT NULL`, #39 §6.8) are not taken: a
                     repeating non-transient failure stops burning model calls until the
                     reason is gone (the job stays `pending`).
+
+                    Release 3.9.0 (LSBN-S-14): the queue is read under the slot values
+                    of the mode — the legacy value and the operation name in the
+                    `operation` mode (the migration of `worker_jobs.slot` moves the
+                    rows from one to the other; the reader covers both, so no task is
+                    orphaned).
         """
         self._ensure_job_table()
+        slot_values = self._queue_slot_values(slot, kind)
+        bindings = ", ".join("?" * len(slot_values))
         with session(self._settings) as conn:
             return conn.execute(
                 "SELECT id, note_id, payload FROM worker_jobs "
-                "WHERE slot = ? AND kind = ? AND status = 'pending' "
+                f"WHERE slot IN ({bindings}) AND kind = ? AND status = 'pending' "
                 "AND attention_at IS NULL "
                 "ORDER BY id LIMIT ?",
-                (slot, kind, limit),
+                (*slot_values, kind, limit),
             ).fetchall()
 
     def _mark_job_done(self, job_id: int) -> None:
@@ -2537,22 +2900,27 @@ class BackgroundWorker:
         """Is the merge queue empty (the pending merge jobs)?
 
                     The merge queue of the split summary cycle (release 3.9.0,
-                    LSBN-S-6): the merge jobs live in `worker_jobs` under the
-                    slot value `summary` (the legacy slot group) — the
-                    migration of the slot values is a later step of the
-                    release (LSBN-S-14), so the jobs are read under their
-                    current value: no work is orphaned by the split.
+                    LSBN-S-6): the merge jobs live in `worker_jobs` — under the
+                    slot value `summary` (the legacy slot group) until the
+                    migration of the slot values (release 3.9.0, LSBN-S-14), and
+                    under the operation name `merge` after it. The `operation`
+                    mode reads BOTH values (the migration moves the rows from one
+                    to the other; the reader covers both) — no work is orphaned
+                    by the migration.
 
                     #39 (arch §6.9/§13.9): only TAKEABLE work is counted — a
                     frozen job (`attention_at`) cannot be taken by the loop.
 
         """
         self._ensure_job_table()
+        slot_values = self._queue_slot_values(SLOT_SUMMARY, "merge")
+        bindings = ", ".join("?" * len(slot_values))
         with session(self._settings) as conn:
             row = conn.execute(
                 "SELECT COUNT(*) FROM worker_jobs "
-                "WHERE slot = 'summary' AND kind = 'merge' "
-                "AND status = 'pending' AND attention_at IS NULL"
+                f"WHERE slot IN ({bindings}) AND kind = 'merge' "
+                "AND status = 'pending' AND attention_at IS NULL",
+                slot_values,
             ).fetchone()
         return int(row[0]) == 0 or self._operation_blocked("merge")
 
@@ -2798,11 +3166,15 @@ class BackgroundWorker:
                     waiting for a human); `waiting = attention`. The age
                     (3.3.1, LSBN-S-3) — over ALL of the pending jobs (an
                     attention-only state must not give `null`). The jobs are
-                    read under their current slot value (`summary`) — the
-                    migration of the values is a later step (LSBN-S-14).
+                    read under the slot values of the mode — the legacy value
+                    `summary` and the operation name `merge` in the `operation`
+                    mode (the migration of the values is release 3.9.0,
+                    LSBN-S-14; the reader covers both).
 
         """
         self._ensure_job_table()
+        slot_values = self._queue_slot_values(SLOT_SUMMARY, "merge")
+        bindings = ", ".join("?" * len(slot_values))
         with session(self._settings) as conn:
             row = conn.execute(
                 "SELECT COALESCE(SUM(attention_at IS NULL), 0) AS pending, "
@@ -2810,8 +3182,9 @@ class BackgroundWorker:
                 "MAX(CAST(strftime('%s','now') AS INTEGER) - "
                 "CAST(strftime('%s', created_at) AS INTEGER)) "
                 "AS oldest_pending_sec FROM worker_jobs "
-                "WHERE slot = 'summary' AND kind = 'merge' "
-                "AND status = 'pending'"
+                f"WHERE slot IN ({bindings}) AND kind = 'merge' "
+                "AND status = 'pending'",
+                slot_values,
             ).fetchone()
         attention = int(row["attention"])
         return queue_snapshot(
@@ -4529,13 +4902,16 @@ class BackgroundWorker:
                     `gated_queue_stat`, 3.4.1, LSBN-T-29).
         """
         self._ensure_job_table()
+        slot_values = self._queue_slot_values(NODES_JOB, NODES_RECLASS_KIND)
+        params: dict[str, object] = {
+            "threshold": self._settings.namespace_auto_move_min_confidence
+        }
+        for index, value in enumerate(slot_values):
+            params[f"slot{index}"] = value
         with session(self._settings) as conn:
             row = conn.execute(
-                _nodes_queue_stat_sql(),
-                {
-                    "threshold":
-                        self._settings.namespace_auto_move_min_confidence
-                },
+                _nodes_queue_stat_sql(slot_values),
+                params,
             ).fetchone()
         return queue_snapshot(row["pending"], row["oldest_pending_sec"])
 
