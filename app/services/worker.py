@@ -3979,6 +3979,14 @@ class BackgroundWorker:
                     breaker (the dedup judge's breaker is not touched). The `legacy`
                     mode is unchanged: the failures stay inside the trigger and the
                     whole slot group shares one breaker.
+
+                    Release 3.9.0 (LSBN-S-10): the same for the `describe`
+                    operation — its own breaker: while it is closed the
+                    description model is not called (the candidate waits), and
+                    its failure is recorded at that breaker (the neighbours —
+                    `classify`, `summarize`, `judge` — are not touched). The
+                    `legacy` mode is unchanged: the description is attempted as
+                    before (the pause of the slot group stops the job).
         """
         if self._promoter is None:
             return  # a test mode without the trigger
@@ -3986,7 +3994,8 @@ class BackgroundWorker:
         try:
             if is_operation_mode:
                 report = self._promoter.run(
-                    judge_enabled=not self._operation_blocked("structure_judge")
+                    judge_enabled=not self._operation_blocked("structure_judge"),
+                    describe_enabled=not self._operation_blocked("describe"),
                 )
             else:
                 report = self._promoter.run()
@@ -4003,6 +4012,7 @@ class BackgroundWorker:
             return
         if is_operation_mode:
             self._note_structure_judge_failures(job)
+            self._note_describe_failures(job)
         if any(report.values()):
             # The summary — under one key: 'created' clashes with the LogRecord
             # attribute (the creation time) — extra does not accept it.
@@ -4035,6 +4045,33 @@ class BackgroundWorker:
                 else SlotOutcome.OFF_CONTRACT,
                 event="promotion_judge_failed",
                 message="promotion: structure judge failed — candidate kept, retry",
+                detail=str(error) if error is not None else None,
+                domain=failure.get("domain"),
+                slug=failure.get("slug"),
+            )
+
+    def _note_describe_failures(self, job: str) -> None:
+        """The description's failures — at the breaker of its operation.
+
+                    Release 3.9.0 (LSBN-S-10): the failure of the description
+                    generator is recorded at the breaker of the `describe`
+                    operation — the neighbours (`classify`, `summarize`, `judge`,
+                    `structure_judge`) are NOT touched (the operations are
+                    independent: a dead model of one does not silence the
+                    others). The candidate itself stays without a description
+                    (the trigger keeps it) — the work is not lost, a retry is at
+                    the next run.
+        """
+        for failure in getattr(self._promoter, "describer_failures", []):
+            error = failure.get("error")
+            self._log_slot_failure(
+                job,
+                self._operation_slot("describe"),
+                outcome_of(error)
+                if isinstance(error, BaseException)
+                else SlotOutcome.OFF_CONTRACT,
+                event="promotion_describe_failed",
+                message="promotion: description generation failed — candidate kept, retry",
                 detail=str(error) if error is not None else None,
                 domain=failure.get("domain"),
                 slug=failure.get("slug"),

@@ -61,7 +61,7 @@ from typing import Any, Protocol
 import httpx
 
 from app.config import Settings
-from app.services.llm_client import LLMClient, LLMError, SlotSpec
+from app.services.llm_client import CHECK_OK, LLMClient, LLMError, SlotSpec
 from app.services.namespaces import (
     NamespaceService,
     count_sentences,
@@ -88,7 +88,23 @@ def _l2_norm(vec: list[float]) -> float:
 
 
 class DescriberError(RuntimeError):
-    """The description generator gave no text: the server is unavailable or the answer is empty."""
+    """The description generator gave no text: the server is unavailable or the answer is empty.
+
+            `outcome` — the call outcome (#39, arch §6.4): the transport failure
+            carries the outcome of the client error, an answer that does not
+            hold a description — `off_contract` (the default). The worker reads
+            it to record the failure at the breaker of the `describe` operation
+            (release 3.9.0, LSBN-S-10).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        outcome: SlotOutcome = SlotOutcome.OFF_CONTRACT,
+    ) -> None:
+        super().__init__(message)
+        self.outcome = outcome
 
 
 class StructureJudgeError(RuntimeError):
@@ -209,15 +225,30 @@ class DescriptionService:
             )
         except LLMError as exc:
             # The client text is preserved: HTTP status, the slot address, the
-            # {SLOT}_API_KEY hint on an auth failure (decision #4).
+            # {SLOT}_API_KEY hint on an auth failure (decision #4). The call
+            # outcome (#39, arch §6.4) — the same mapping as the structural
+            # judge: the worker records it at the breaker of the operation.
             self.last_attempt_ok = False
-            raise DescriberError(str(exc)) from exc
+            raise DescriberError(
+                str(exc), outcome=classify_llm_error(exc)
+            ) from exc
         self.last_attempt_ok = True
         return self._trim(content)
 
     def close(self) -> None:
         """Close resources (interface-compatible with the other clients)."""
         self._llm.close()
+
+    def probe(self) -> str:
+        """A cheap probe knock of the `describe` operation (release 3.9.0, LSBN-S-10).
+
+                `check()` of the description client without generation — the
+                outcome is a CheckResult from llm_client. The breaker of the
+                `describe` operation knocks HERE (the trigger owns the
+                describer): without this method the breaker was lifted by the
+                `CHECK_OK` stub while the model was down.
+        """
+        return self._llm.check()
 
     # --- internal -------------------------------------------------------------
 
@@ -445,6 +476,15 @@ class PromotionService:
         # breaker of the `structure_judge` operation. In the `legacy` mode
         # nobody reads them - the failure stays swallowed (as before).
         self._judge_failures: list[dict[str, Any]] = []
+        # The description's failures of the last run (release 3.9.0, LSBN-S-10):
+        # the worker reads them to record the failure at the breaker of the
+        # `describe` operation. In the `legacy` mode nobody reads them - the
+        # failure stays swallowed (as before).
+        self._describer_failures: list[dict[str, Any]] = []
+        # The last attempt of the description (release 3.9.0, LSBN-S-10): None -
+        # no attempts yet (the health does not lie before the first data),
+        # True - the last description was written, False - it failed.
+        self._last_attempt_ok: bool | None = None
 
     # --- the services behind the operations ----------------------------------
 
@@ -470,6 +510,47 @@ class PromotionService:
                 work is not lost, a retry is at the next run).
         """
         return list(self._judge_failures)
+
+    @property
+    def describer_failures(self) -> list[dict[str, Any]]:
+        """The description's failures of the last run.
+
+                Each record: `reason` ("describer"), `domain`, `slug`, `path`
+                and `error` (the DescriberError with its outcome). The worker
+                turns them into the failures of the `describe` operation
+                (release 3.9.0, LSBN-S-10) — the candidate itself stays
+                without a description (the work is not lost, a retry is at the
+                next run).
+        """
+        return list(self._describer_failures)
+
+    @property
+    def last_attempt_ok(self) -> bool | None:
+        """The last attempt of the description: True | False | None (no attempt).
+
+                Release 3.9.0 (LSBN-S-10): the `describe` operation answers the
+                `/health.slots` entry with it — the value is honest (a failure
+                is visible, no attempt is not a success). The trigger owns the
+                describer, so the operation's state lives here.
+        """
+        return self._last_attempt_ok
+
+    def probe(self) -> str:
+        """A cheap probe knock of the `describe` operation (release 3.9.0, LSBN-S-10).
+
+                The knock goes to the client of the description model (the
+                describer's own `probe()` — `check()` without generation). The
+                trigger owns the describer, so the probe of the operation is
+                the probe of the trigger: without this method the breaker of
+                the `describe` operation was lifted by the `CHECK_OK` stub while
+                the model was down.
+        """
+        probe = getattr(self._describer, "probe", None)
+        if probe is None:
+            # A describer without a knock (a test double): the honest answer
+            # is unknown — `CHECK_OK` (the precedent of an absent service).
+            return CHECK_OK
+        return probe()
 
     # --- reads: candidates (SQL aggregation, §5.7 "the trigger is not an LLM") ---
 
@@ -530,7 +611,12 @@ class PromotionService:
 
     # --- the pipeline run ----------------------------------------------------
 
-    def run(self, *, judge_enabled: bool = True) -> dict[str, Any]:
+    def run(
+        self,
+        *,
+        judge_enabled: bool = True,
+        describe_enabled: bool = True,
+    ) -> dict[str, Any]:
         """Run all ready candidates; a summary {created, merged, rejected}.
 
                     Called by the worker after classifying a default note (the markup could
@@ -544,9 +630,17 @@ class PromotionService:
                     candidates wait without a verdict (a retry is at the next
                     run, the work is not lost). The `legacy` mode never uses it
                     (the default).
+
+                    `describe_enabled` — False: the description is not
+                    generated (the breaker of the `describe` operation is closed
+                    — release 3.9.0, LSBN-S-10); the candidates wait without a
+                    description (a retry is at the next run, the work is not
+                    lost). The `legacy` mode never uses it (the default): there
+                    the pause of the slot group stops the job as a whole.
         """
         report: dict[str, Any] = {"created": [], "merged": [], "rejected": []}
         self._judge_failures = []  # the failures of THIS run (the worker reads them)
+        self._describer_failures = []  # the failures of THIS run (the worker reads them)
         if self._describer is None or self._judge is None:
             return report  # the trigger is off (a test mode)
         logger = logging.getLogger("app")
@@ -569,7 +663,12 @@ class PromotionService:
                            "reason": "leaves_limit"},
                 )
                 continue
-            action = self._promote_one(domain, slug, judge_enabled=judge_enabled)
+            action = self._promote_one(
+                domain,
+                slug,
+                judge_enabled=judge_enabled,
+                describe_enabled=describe_enabled,
+            )
             if action in ("created", "merged", "rejected"):
                 report[action].append(path)
             if action == "created":
@@ -611,7 +710,12 @@ class PromotionService:
             )
 
     def _promote_one(
-        self, domain: str, slug: str, *, judge_enabled: bool = True
+        self,
+        domain: str,
+        slug: str,
+        *,
+        judge_enabled: bool = True,
+        describe_enabled: bool = True,
     ) -> str | None:
         """The full cycle of one candidate: created|merged|rejected|None.
 
@@ -623,9 +727,24 @@ class PromotionService:
                     `judge_enabled` — False: the structural judge is not called
                     (its breaker is closed — release 3.9.0, LSBN-S-8); the candidate
                     waits as after a failure (no verdict, a retry at the next run).
+
+                    `describe_enabled` — False: the description is not generated
+                    (the breaker of the `describe` operation is closed — release
+                    3.9.0, LSBN-S-10); the candidate waits as after a failure (no
+                    description, a retry at the next run — the work is not lost).
         """
         logger = logging.getLogger("app")
         path = f"{domain}/{slug}"
+        if not describe_enabled:
+            # The description waits (the breaker of the `describe` operation is
+            # closed): no model calls, the candidate keeps its state — a retry
+            # at the next run (the work is not lost).
+            logger.warning(
+                "promotion: description generation paused — candidate kept",
+                extra={"event": "promotion_skipped", "path": path,
+                       "reason": "describe_paused"},
+            )
+            return None
         if not judge_enabled:
             # The structural judge waits (the breaker of the operation is closed):
             # no model calls, the candidate keeps its state — a retry at the next run.
@@ -633,13 +752,28 @@ class PromotionService:
         summaries = self._group_summaries(path)
         try:
             description = self._describer.describe(summaries, slug, domain)  # type: ignore[union-attr]
-        except DescriberError:
+        except DescriberError as exc:
+            # Release 3.9.0 (LSBN-S-10): the failure is visible to the worker —
+            # it records it at the breaker of the `describe` operation. The
+            # candidate itself stays as before (without a description, a retry
+            # at the next run — NFR-3).
+            self._last_attempt_ok = False
+            self._describer_failures.append(
+                {
+                    "reason": "describer",
+                    "domain": domain,
+                    "slug": slug,
+                    "path": path,
+                    "error": exc,
+                }
+            )
             logger.warning(
                 "promotion: description generation failed — candidate kept",
                 extra={"event": "promotion_failed", "domain": domain, "slug": slug,
                        "reason": "describer"},
             )
             return None  # no candidate description: a retry — the next run
+        self._last_attempt_ok = True
         nearest_path, nearest_cosine = self._nearest_node(description)
         if nearest_cosine is not None and (
             nearest_cosine >= self._settings.namespace_synonym_similarity
