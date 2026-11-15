@@ -333,14 +333,21 @@ def test_slots_health_in_operation_mode_does_not_raise(operation_settings) -> No
     assert set(OPERATION_REGISTRY) <= set(health)
 
 
-def test_slots_health_in_operation_mode_has_no_legacy_slot_keys(
+def test_slots_health_in_operation_mode_has_the_deprecated_aggregates(
     operation_settings,
 ) -> None:
-    """The legacy slot keys are NOT added in this form (the step S-15)."""
+    """The legacy slot keys are there — as the DEPRECATED aggregates.
+
+    Release 3.9.0 (LSBN-S-15; the design, B6): the old keys stay on a minor
+    (the consumers of the old form must not break) — each of them is the worst
+    operation of its group, marked `deprecated`.
+    """
     worker = make_worker(operation_settings)
     health = worker.slots_health()
-    assert "embedding" not in health
-    assert "summary" not in health
+    for group in ("embedding", "summary", "judge", "decision"):
+        assert health[group]["deprecated"] is True
+        assert health[group]["operations"]
+        assert health[group]["slot"] == group
 
 
 def test_slots_health_entries_carry_the_breaker_state(operation_settings) -> None:

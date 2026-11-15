@@ -358,6 +358,48 @@ SLOT_MIGRATION_EVENT = "slot_migrated"
 SLOT_MIGRATION_META_KEY = "slot_migration_forward"
 
 
+# The legacy slot groups of the DEPRECATED aggregates in `/health.slots`
+# (release 3.9.0, LSBN-S-15; the design, B6). The order — the historical order
+# of the slot keys (the consumer reads them by name, the order is the stable
+# one of the `legacy` form).
+SLOT_GROUP_ORDER: tuple[str, ...] = (
+    SLOT_EMBEDDING,
+    SLOT_SUMMARY,
+    SLOT_JUDGE,
+    SLOT_DECISION,
+)
+
+
+def slot_group_operations() -> dict[str, tuple[str, ...]]:
+    """The operations of every legacy slot group (the deprecated aggregates).
+
+            Release 3.9.0 (LSBN-S-15): the group of an operation is the field
+            `legacy_slot` of its registry spec — the same mapping the `legacy`
+            mode reads the breakers by (`operations.breaker_key`). The order of
+            the operations inside a group — the registry's order (the contract
+            of `/health.operations`).
+
+    """
+    groups: dict[str, list[str]] = {}
+    for name, spec in OPERATION_REGISTRY.items():
+        if not spec.legacy_slot:
+            continue
+        groups.setdefault(spec.legacy_slot, []).append(name)
+    return {group: tuple(names) for group, names in groups.items()}
+
+
+def _oldest_of(*ages: object) -> int | None:
+    """The oldest of the given ages (seconds) — `None` when there is none.
+
+            The helper of the aggregate queues (`/health.queues`): the age of a
+            sum of queues is the age of the oldest member (the work that has
+            been waiting the longest).
+
+    """
+    values = [int(age) for age in ages if age is not None]
+    return max(values) if values else None
+
+
 def slot_values_for_queue(slot: str, kind: str, mode: str) -> tuple[str, ...]:
     """The slot values a queue is read under (the `operation` mode reads both).
 
@@ -1538,14 +1580,18 @@ class BackgroundWorker:
                     The breakers are keyed by operation there, so the entries are
                     the operations: every breaker of the mode gets an entry (no
                     operation is lost) and the block never falls over (the
-                    legacy slot keys are not looked up — LSBN-S-7). The full
-                    form of the block (the deprecated slot keys as the
-                    aggregates) — the step S-15.
+                    legacy slot keys are not looked up — LSBN-S-7).
 
                     Release 3.9.0 (LSBN-S-13): the `decision` operation's entry
                     comes from the SERVICE — the breaker of the operation lives
                     there (§13.8), so its own state is the truthful one (the
                     worker keeps no second breaker for it).
+
+                    Release 3.9.0 (LSBN-S-15): the four legacy slot keys are
+                    added as DEPRECATED aggregates (the worst operation of the
+                    group) — see `_deprecated_slot_aggregates`; the `split`
+                    entry carries the marker of the nested `title` calls (the
+                    accumulated point of the previous steps).
 
         """
         attention = self._attention_by_operation()
@@ -1565,7 +1611,113 @@ class BackgroundWorker:
             snapshot["last_sent_budget"] = meta.sent_budget if meta else None
             health[name] = snapshot
         health[SLOT_DECISION] = self._decision_operation_health(attention)
+        # The nested calls of the split (the accumulated point of the previous
+        # steps, accepted on the acceptance of LSBN-S-11): the title of every
+        # part of the split is a separate call of the `title` operation, but it
+        # goes INSIDE the call of `split` — it is counted toward the `split`
+        # operation (its breaker), and one failure is counted once.
+        if "split" in health:
+            health["split"]["nested_calls"] = ["title"]
+        health.update(self._deprecated_slot_aggregates(health))
         return health
+
+    def _deprecated_slot_aggregates(self, operations: dict[str, dict]) -> dict[str, dict]:
+        """The DEPRECATED aggregates of the legacy slot groups (`/health.slots`).
+
+                    Release 3.9.0 (LSBN-S-15; the design, B6): the old slot keys
+                    (`embedding`/`summary`/`judge`/`decision`) STAY — the consumers
+                    of the old form (the healthcheck, the canon 6.4) must not
+                    break. Each of them is the AGGREGATE of its group: the
+                    entry of the WORST operation of the group, marked with
+                    `deprecated` and carrying the list of the group's
+                    operations (`operations`).
+
+                    THE RULE OF THE AGGREGATE ("the worst of the group"):
+                    the operations of a group are compared by their severity,
+                    and the aggregate is the entry of the most severe one:
+                    (1) a PAUSED breaker is worse than a closed one — its work
+                        is blocked right now;
+                    (2) then the bigger failure counter of the series;
+                    (3) then the registry order — the first operation of the
+                        group wins a tie (the choice is deterministic).
+
+                    The aggregate is a COPY of that operation's entry: the
+                    fields of the worst operation (`ok`/`last_outcome`/
+                    `paused_until`/`attention`/the last call's diagnostics) —
+                    the group is never better than its worst member. The
+                    `legacy` mode does not use this form at all (there the
+                    entries ARE the slot groups).
+
+        """
+        groups = slot_group_operations()
+        aggregates: dict[str, dict] = {}
+        for group in SLOT_GROUP_ORDER:
+            members = [name for name in groups.get(group, ()) if name in operations]
+            if not members:
+                continue
+            worst = self._worst_operation(members, operations)
+            entry = dict(operations[worst])
+            entry["slot"] = group  # the key's own name (the entry is the group's)
+            entry["deprecated"] = True
+            entry["operations"] = list(groups[group])
+            aggregates[group] = entry
+        return aggregates
+
+    @staticmethod
+    def _worst_operation(names: list[str], entries: dict[str, dict]) -> str:
+        """The most severe operation of the group — the rule of the aggregate.
+
+                    The severity — a paused breaker first (the work is blocked
+                    now), then the failure counter; a tie — the first name of
+                    the list (the registry order). See
+                    `_deprecated_slot_aggregates` — the rule of the aggregate.
+
+        """
+        def severity(name: str) -> tuple[int, int]:
+            entry = entries[name]
+            paused = 1 if entry.get("state") == "paused" else 0
+            return paused, int(entry.get("failures") or 0)
+
+        return max(names, key=severity)
+
+    def slot_migration_pending(self) -> int:
+        """The `worker_jobs` rows that the slot migration would still move.
+
+                    Release 3.9.0 (LSBN-S-15): the counter of the migration of
+                    `worker_jobs.slot` (LSBN-S-14) for `/health` — "how many rows
+                    still carry an old slot value". The count goes through the
+                    migration MAP of S-14: a row is pending when its pair
+                    (`slot`, `kind`) is in the map and the row still carries the
+                    legacy value (the map's operation name is a different one).
+
+                    After the migration the counter is 0. The rows of the known
+                    pairs the map does NOT move (('summary','title'),
+                    ('summary','summarize')) are not counted: the new mode reads
+                    them as well (the reader's map covers both values) — they
+                    are not pending anything. The identity pair
+                    ('judge','dedup') is never counted (there is nothing to
+                    move).
+
+                    SQL only (no models called); a missing table — 0 (the
+                    observability does not break `/health`).
+
+        """
+        try:
+            self._ensure_job_table()
+            with session(self._settings) as conn:
+                total = 0
+                for (legacy_slot, kind), operation in SLOT_MIGRATION_MAP.items():
+                    if operation == legacy_slot:
+                        continue  # the identity pair — nothing to move
+                    row = conn.execute(
+                        "SELECT COUNT(*) AS c FROM worker_jobs "
+                        "WHERE slot = ? AND kind = ?",
+                        (legacy_slot, kind),
+                    ).fetchone()
+                    total += int(row["c"])
+            return total
+        except Exception:  # noqa: BLE001 — observability does not crash /health
+            return 0
 
     def _attention_by_slot(self) -> dict[str, int]:
         """The tasks in attention per SLOT group (the `legacy` form)."""
@@ -3092,6 +3244,16 @@ class BackgroundWorker:
                     for ALL jobs (before, the external migration/warnings and areas did
                     not obey this). No model calls (only reading the pending state;
                     `is_gated` — memory/SQL, see `_slot_blocked`).
+
+                    Release 3.9.0 (LSBN-S-15; the design, B6): in the `operation`
+                    mode the block carries BOTH forms — the old job keys stay
+                    (`vector`/`summary`/`judge`/`areas`/`nodes`/`migration`/
+                    `warnings` — the consumers of the old form must not break) and
+                    the keys of the OPERATIONS are added (`title`/`summarize`/
+                    `merge`/`judge`/`embed`/`classify` — the counters of a key are
+                    the counters of its operation). The `legacy` mode keeps the
+                    registry's form in every respect.
+
         """
         queues: dict[str, dict] = {}
         for spec in build_job_specs(self, self._settings):
@@ -3101,7 +3263,91 @@ class BackgroundWorker:
             if spec.is_gated is not None and spec.is_gated():
                 stat = gated_queue_stat(stat)
             queues[spec.queue] = stat
+        if self._mode() == SLOT_MODEL_OPERATION:
+            queues.update(self._operation_queues(queues))
         return queues
+
+    def _operation_queues(self, queues: dict[str, dict]) -> dict[str, dict]:
+        """The queue keys of the OPERATIONS (`/health.queues`, the `operation` mode).
+
+                    Release 3.9.0 (LSBN-S-15; the design, B6): the counters of a
+                    key are the counters of its operation — the operation's own
+                    work. The keys of the operations that have a job of their own
+                    (`title`/`summarize`/`merge`/`judge`) are already in the
+                    registry's block (the split of the summary cycle — LSBN-S-6);
+                    the two operations without a job of their own are added here:
+
+                    `embed` — the work of the embed operation: the notes'
+                    vectorization (the `vector` key) and the area records (the
+                    `areas` key) — the sum of the two;
+                    `classify` — the `reclass` tasks of `worker_jobs` (the
+                    classifier's own tasks), read under the slot values of the
+                    mode (`nodes` legacy / `classify` migrated — LSBN-S-14).
+
+                    The legacy `summary` key — the summary cycle's aggregate — is
+                    restored here: in the `operation` mode the `summary` job does
+                    not exist (the cycle is cut into three jobs), but the old key
+                    must stay (the consumers of the old form). Its value is the
+                    historical one — the notes awaiting a title or a summary plus
+                    the merge jobs.
+
+        """
+        added: dict[str, dict] = {}
+        # The legacy `summary` key — the historical aggregate of the cycle.
+        if SLOT_SUMMARY not in queues:
+            added[SLOT_SUMMARY] = self._summary_queue_stat()
+        # The `embed` operation — the notes and the areas.
+        vector = queues.get("vector") or {}
+        areas = queues.get("areas") or {}
+        added["embed"] = queue_snapshot(
+            int(vector.get("pending") or 0) + int(areas.get("pending") or 0),
+            _oldest_of(vector.get("oldest_pending_sec"), areas.get("oldest_pending_sec")),
+            waiting=int(vector.get("waiting") or 0) + int(areas.get("waiting") or 0),
+            attention=int(vector.get("attention") or 0)
+            + int(areas.get("attention") or 0),
+        )
+        # The `classify` operation — the reclass tasks.
+        added["classify"] = self._classify_queue_stat()
+        return added
+
+    def _classify_queue_stat(self) -> dict:
+        """The `classify` OPERATION's queue: the `reclass` tasks.
+
+                    The classifier's own tasks — the `reclass` rows of
+                    `worker_jobs` (the reclassification after stitching) — read
+                    under the slot values of the mode (`nodes` legacy /
+                    `classify` migrated — the migration of LSBN-S-14). The sweep
+                    pools of the `nodes` job are NOT counted here: they are the
+                    nodes job's work (its own key `nodes`).
+
+                    `pending` — the tasks the classifier has yet to do;
+                    `attention` — the tasks frozen for a human (the same count
+                    the operation's entry of `/health.slots` carries); `waiting`
+                    — the attentioned ones (the framework's shape).
+
+        """
+        self._ensure_job_table()
+        slot_values = self._queue_slot_values(NODES_JOB, NODES_RECLASS_KIND)
+        bindings = ", ".join("?" * len(slot_values))
+        with session(self._settings) as conn:
+            row = conn.execute(
+                "SELECT "
+                "COALESCE(SUM(status = 'pending'), 0) AS pending, "
+                "COALESCE(SUM(attention_at IS NOT NULL), 0) AS attention, "
+                "MAX(CASE WHEN status = 'pending' "
+                "  THEN CAST(strftime('%s','now') AS INTEGER) - "
+                "  CAST(strftime('%s', created_at) AS INTEGER) END) "
+                "AS oldest_pending_sec "
+                f"FROM worker_jobs WHERE slot IN ({bindings}) AND kind = 'reclass'",
+                slot_values,
+            ).fetchone()
+        attention = int(row["attention"])
+        return queue_snapshot(
+            row["pending"],
+            row["oldest_pending_sec"],
+            waiting=attention,
+            attention=attention,
+        )
 
     def _vector_queue_stat(self) -> dict:
         """The raw snapshot of the note-vectorization queue: pending and age.
@@ -3127,16 +3373,25 @@ class BackgroundWorker:
                     done by the framework (`is_gated` → `gated_queue_stat`, 3.4.1,
                     LSBN-T-29) — the method's own waiting/attention computation is
                     untouched.
+
+                    Release 3.9.0 (LSBN-S-15): the merge jobs are read under the slot
+                    values of the MODE — the legacy value `summary` and the operation
+                    name `merge` in the `operation` mode (the migration of
+                    `worker_jobs.slot` — LSBN-S-14). The `legacy` mode reads the
+                    legacy value only (as before — the same rows, the same
+                    counters).
         """
         self._ensure_job_table()
+        slot_values = self._queue_slot_values(SLOT_SUMMARY, "merge")
+        bindings = ", ".join("?" * len(slot_values))
         with session(self._settings) as conn:
             row = conn.execute(
                 "SELECT "
                 "(SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL "
                 "  AND (title IS NULL OR summary_status = 'pending')) "
-                "+ (SELECT COUNT(*) FROM worker_jobs WHERE slot = 'summary' "
+                f"+ (SELECT COUNT(*) FROM worker_jobs WHERE slot IN ({bindings}) "
                 "  AND status = 'pending' AND attention_at IS NULL) AS pending, "
-                "(SELECT COUNT(*) FROM worker_jobs WHERE slot = 'summary' "
+                f"(SELECT COUNT(*) FROM worker_jobs WHERE slot IN ({bindings}) "
                 "  AND status = 'pending' AND attention_at IS NOT NULL) "
                 "AS attention, "
                 "MAX("
@@ -3146,8 +3401,9 @@ class BackgroundWorker:
                 "  summary_status = 'pending')), 0), "
                 "COALESCE((SELECT MAX(CAST(strftime('%s','now') AS INTEGER) - "
                 "  CAST(strftime('%s', created_at) AS INTEGER)) FROM worker_jobs "
-                "  WHERE slot = 'summary' AND status = 'pending'), 0)"
-                ") AS oldest_pending_sec"
+                f"  WHERE slot IN ({bindings}) AND status = 'pending'), 0)"
+                ") AS oldest_pending_sec",
+                (*slot_values, *slot_values, *slot_values),
             ).fetchone()
         attention = int(row["attention"])
         return queue_snapshot(

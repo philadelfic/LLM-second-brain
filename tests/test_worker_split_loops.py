@@ -334,13 +334,18 @@ def test_merge_job_is_not_lost_by_the_split(operation_settings) -> None:
 
 
 def test_health_queues_show_three_split_queues(operation_settings) -> None:
-    """В снимке очередей — три записи разрезанного цикла."""
+    """В снимке очередей — три записи разрезанного цикла.
+
+    Release 3.9.0 (LSBN-S-15): the legacy key `summary` is BACK in this mode —
+    the old consumers must not break (the key is the historical aggregate of
+    the cycle, not the counter of an operation).
+    """
     worker = make_worker(operation_settings)
     queues = worker.queues_health()
     for name in SPLIT_JOBS:
         assert name in queues
         assert queues[name]["pending"] == 0
-    assert "summary" not in queues  # сводной очереди в этом режиме нет
+    assert "summary" in queues  # LSBN-S-15: старый ключ возвращается
 
 
 def test_health_queues_split_queues_count_their_own_work(operation_settings) -> None:
