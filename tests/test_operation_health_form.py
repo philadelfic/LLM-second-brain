@@ -38,6 +38,7 @@ from fakes import (
 )
 from mcp.types import CallToolResult, TextContent
 
+from app import __version__
 from app.config import get_settings
 from app.main import create_app
 from app.services.notes import NoteService
@@ -357,12 +358,12 @@ LEGACY_HEALTH_SNAPSHOT: dict = json.loads(
       "summarizer_ok": null,
       "update": {
         "checked_at": null,
-        "current": "3.8.1",
+        "current": "<version>",
         "enabled": false,
         "hint_shown_at": null,
         "latest": null
       },
-      "version": "3.8.1",
+      "version": "<version>",
       "warnings": {
         "by_kind": {},
         "total": 0
@@ -387,6 +388,16 @@ VOLATILE = {
 #: The fields of this step — the sanctioned difference from the base.
 SANCTIONED = {"slot_mode", "slot_migration_pending"}
 
+#: The release-controlled values (LSBN-S-19) — the version string of the
+#: release. They are NOT pinned by the snapshot: a version bump must not break
+#: the proof that the legacy `/health` FORM did not change. The snapshot keeps
+#: the place (the placeholder), the value is checked against the live
+#: `app.__version__` in the same test.
+RELEASE_CONTROLLED = {"version", "current"}
+
+#: The placeholder of the release-controlled values in the snapshot.
+VERSION_PLACEHOLDER = "<version>"
+
 
 def _is_timestamp(value: str) -> bool:
     """An ISO-8601 stamp."""
@@ -397,7 +408,11 @@ def normalize(value, key: str | None = None):
     """The normalized form of a JSON value (the snapshot's rule)."""
     if isinstance(value, dict):
         return {
-            name: normalize(item, name)
+            name: (
+                VERSION_PLACEHOLDER
+                if name in RELEASE_CONTROLLED
+                else normalize(item, name)
+            )
             for name, item in value.items()
             if name not in SANCTIONED
         }
@@ -764,3 +779,8 @@ def test_the_legacy_health_form_matches_the_base_snapshot(
     # The two fields of this step — the sanctioned difference from the base.
     assert body["slot_mode"] == "legacy"
     assert body["slot_migration_pending"] == 0
+    # The version of the release — the LIVE value, not a literal (LSBN-S-19):
+    # the snapshot proves the FORM of the legacy `/health`, the version is
+    # checked separately, so a version bump does not break the snapshot.
+    assert body["version"] == __version__
+    assert body["update"]["current"] == __version__
