@@ -437,7 +437,10 @@ def test_worker_breakers_are_keyed_by_the_mode(
         FixedSummarizer("F."),
         RecordingDedup(),
     )
-    assert set(worker._breakers) == set(OPERATION_REGISTRY)
+    assert set(worker._breakers) == set(OPERATION_REGISTRY) - {"decision"}
+    # The `decision` operation's breaker lives in the SERVICE (arch §13.8) —
+    # the worker keeps no second breaker for it (release 3.9.0, LSBN-S-13).
+    assert "decision" not in worker._breakers
     # The per-operation threshold reached the breaker of the operation; the
     # unset per-operation pause falls back to the global base.
     assert worker._breakers["merge"]._open_after == 2

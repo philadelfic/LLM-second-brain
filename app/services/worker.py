@@ -865,6 +865,14 @@ class BackgroundWorker:
                 else the global base); the `legacy` mode keeps the global
                 values of the slot group.
 
+                Release 3.9.0 (LSBN-S-13): the `decision` operation is NOT
+                here — its breaker lives in the decision SERVICE (arch §13.8,
+                `app/services/decision.py`): the decision call happens inside
+                the service, the worker does not see it. A second (dead)
+                breaker in the worker would show a state that is not the
+                operation's own — the health entry of the operation is
+                assembled from the service (`_decision_operation_health`).
+
         """
         if self._mode() == SLOT_MODEL_OPERATION:
             return {
@@ -874,6 +882,7 @@ class BackgroundWorker:
                     open_after=pause_after(operation, settings),
                 )
                 for operation in OPERATION_REGISTRY
+                if operation != SLOT_DECISION
             }
         return {
             name: SlotBreaker(
@@ -1036,8 +1045,20 @@ class BackgroundWorker:
                     Reading process memory only — no model calls. The consumer — the MCP
                     middleware of the "warn your human" hint. The full `/health.slots`
                     surface and queue observability — the no39-03 brief.
+
+                    Release 3.9.0 (LSBN-S-13): in the `operation` mode the
+                    `decision` operation's breaker lives in the service (§13.8)
+                    — its own snapshot is added here, so no operation is lost in
+                    the hint. The `legacy` mode is unchanged.
         """
-        return {name: breaker.snapshot() for name, breaker in self._breakers.items()}
+        states = {name: breaker.snapshot() for name, breaker in self._breakers.items()}
+        if self._mode() == SLOT_MODEL_OPERATION and SLOT_DECISION not in states:
+            service = self._decision
+            if service is not None:
+                snapshot = service.snapshot()
+                if snapshot["enabled"]:
+                    states[SLOT_DECISION] = snapshot["breaker"]
+        return states
 
     def slots_health(self) -> dict[str, dict]:
         """A slots snapshot for `/health.slots` (#39, arch §7.2): SQL/memory only.
@@ -1099,6 +1120,11 @@ class BackgroundWorker:
                     form of the block (the deprecated slot keys as the
                     aggregates) — the step S-15.
 
+                    Release 3.9.0 (LSBN-S-13): the `decision` operation's entry
+                    comes from the SERVICE — the breaker of the operation lives
+                    there (§13.8), so its own state is the truthful one (the
+                    worker keeps no second breaker for it).
+
         """
         attention = self._attention_by_operation()
         health: dict[str, dict] = {}
@@ -1116,13 +1142,7 @@ class BackgroundWorker:
             snapshot["last_reasoning_budget"] = meta.reasoning_budget if meta else None
             snapshot["last_sent_budget"] = meta.sent_budget if meta else None
             health[name] = snapshot
-        if SLOT_DECISION in health:
-            # The decision operation's breaker lives in the SERVICE (§13.8) —
-            # its own state is the truthful one.
-            health[SLOT_DECISION] = {
-                **health[SLOT_DECISION],
-                **self._decision_slot_health(attention),
-            }
+        health[SLOT_DECISION] = self._decision_operation_health(attention)
         return health
 
     def _attention_by_slot(self) -> dict[str, int]:
@@ -1211,6 +1231,65 @@ class BackgroundWorker:
             "enabled": False,
         }
 
+    def _decision_operation_health(self, attention: dict[str, int]) -> dict:
+        """The `decision` OPERATION for `/health.slots` (the `operation` mode).
+
+                    Release 3.9.0 (LSBN-S-13): the operation's breaker lives in
+                    the SERVICE (§13.8) — the entry is ITS snapshot (the state,
+                    the outcome, the pause and the failure counter of the
+                    operation's own breaker), not the worker's slots. The
+                    thresholds of the operation are the per-operation ones
+                    (`DECISION_PAUSE_AFTER`/`DECISION_PAUSE_SEC`, else the
+                    global base — the env prefix stays `DECISION_*`).
+
+                    The slot is off/not built — the disabled shape (§7.1), in the
+                    operation form (the breaker's fields are empty).
+
+        """
+        service = self._decision
+        if service is None:
+            return self._decision_operation_disabled_stat()
+        snapshot = service.snapshot()
+        if not snapshot["enabled"]:
+            return self._decision_operation_disabled_stat()
+        return {
+            **snapshot["breaker"],
+            "ok": snapshot["ok"],
+            "attention": attention.get(SLOT_DECISION, 0),
+            "enabled": True,
+            "last_finish_reason": None,
+            "last_budget": None,
+            "last_budget_source": None,
+            "last_had_thinking": None,
+            "last_answer_budget": None,
+            "last_reasoning_budget": None,
+            "last_sent_budget": None,
+        }
+
+    @staticmethod
+    def _decision_operation_disabled_stat() -> dict:
+        """The `decision` operation with no service (off/not built) — the
+        disabled shape in the operation form.
+
+        """
+        return {
+            "slot": SLOT_DECISION,
+            "state": "closed",
+            "last_outcome": None,
+            "paused_until": None,
+            "failures": 0,
+            "ok": None,
+            "attention": 0,
+            "enabled": False,
+            "last_finish_reason": None,
+            "last_budget": None,
+            "last_budget_source": None,
+            "last_had_thinking": None,
+            "last_answer_budget": None,
+            "last_reasoning_budget": None,
+            "last_sent_budget": None,
+        }
+
     def _probe_slot(self, slot: str) -> str:
         """One cheap probe call of a slot (no generation, #39 §6.2).
 
@@ -1261,7 +1340,11 @@ class BackgroundWorker:
                     "slot_resumed",
                     slot,
                     effective_job,
-                    after_sec=self._settings.slot_pause_sec,
+                    # The pause of THIS breaker: in the `operation` mode it is
+                    # the operation's own pause (the per-operation value, else
+                    # the global base) — not the base of the configuration
+                    # (release 3.9.0, LSBN-S-13).
+                    after_sec=breaker.pause_sec,
                 )
                 return True
             outcome = (
@@ -1333,6 +1416,39 @@ class BackgroundWorker:
         if self._mode() != SLOT_MODEL_OPERATION:
             return
         self._note_slot_outcome(job, self._operation_slot("split"), outcome)
+
+    def _note_embed_failure(
+        self,
+        job: str,
+        exc: BaseException,
+        *,
+        event: str,
+        message: str,
+    ) -> None:
+        """A vectorization failure → the breaker of the `embed` operation.
+
+                Release 3.9.0 (LSBN-S-13): in the `operation` mode the failure
+                of the vectorization (the notes queue and the chunk queue) is a
+                failure of the `embed` OPERATION — it goes to the breaker of
+                that operation (its own pause, its own counter). The areas
+                path writes there through `_log_slot_failure` (as before).
+
+                The `legacy` mode keeps the path exactly as it was: the
+                vectorization failure was not a slot failure there (no event,
+                no breaker) — the `legacy` mode changes in nothing (the pilot's
+                decision 1).
+
+        """
+        if self._mode() != SLOT_MODEL_OPERATION:
+            return
+        self._log_slot_failure(
+            job,
+            self._operation_slot("embed"),
+            outcome_of(exc),
+            event=event,
+            message=message,
+            detail=str(exc),
+        )
 
     def _log_slot_failure(
         self,
@@ -2844,7 +2960,16 @@ class BackgroundWorker:
             embeddings = self._embedding.embed_texts(
                 [_embed_input(row["title"], row["text"]) for row in rows]
             )
-        except EmbeddingError:
+        except EmbeddingError as exc:
+            # Release 3.9.0 (LSBN-S-13): in the `operation` mode the failure is
+            # a failure of the `embed` operation (its own breaker); the `legacy`
+            # mode keeps the path as it was (no event, no breaker).
+            self._note_embed_failure(
+                EMBEDDING_JOB,
+                exc,
+                event="embed_failed",
+                message="vectorization failed — the notes stay pending",
+            )
             return 0
         processed = 0
         for row, vector in zip(rows, embeddings):
@@ -4551,6 +4676,15 @@ class BackgroundWorker:
         written = 0
         for batch, result in zip(batches, results):
             if isinstance(result, EmbeddingError):
+                # Release 3.9.0 (LSBN-S-13): in the `operation` mode the failure
+                # is a failure of the `embed` operation (its own breaker); the
+                # `legacy` mode keeps the path as it was.
+                self._note_embed_failure(
+                    EMBEDDING_JOB,
+                    result,
+                    event="chunk_embed_failed",
+                    message="chunk vectorization failed — the chunks stay pending",
+                )
                 continue  # an encoding failure: the chunks stay pending (NFR-3)
             if isinstance(result, BaseException):
                 raise result  # an unexpected failure — loud, as in the other loops
